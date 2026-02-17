@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = [
+    "vz-sys",
+    "vz",
+    "vz-sandbox",
+    "vz-cli",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jameslal/vz"
+
+[workspace.dependencies]
+# FFI
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSError", "NSString", "NSURL", "NSArray"] }
+block2 = "0.6"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Internal crates
+vz-sys = { path = "vz-sys" }
+vz = { path = "vz" }
+vz-sandbox = { path = "vz-sandbox" }
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
