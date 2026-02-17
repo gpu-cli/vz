@@ -35,7 +35,8 @@
 //! ```
 
 #![cfg(target_os = "macos")]
-#![forbid(unsafe_code)]
+// unsafe is required for objc2 FFI calls — kept minimal and contained
+#![allow(unsafe_code)]
 
 pub mod config;
 pub mod error;

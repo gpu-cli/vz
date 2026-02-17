@@ -1,27 +1,27 @@
-# vz — macOS Virtualization.framework for Rust
+# vz — Master Architecture Overview
 
 ## Vision
 
-A Rust-native interface to Apple's Virtualization.framework, purpose-built for sandboxing coding agents in macOS VMs. Three layers:
-
-1. **vz-sys** — Raw Objective-C FFI bindings
-2. **vz** — Safe, ergonomic Rust API
-3. **vz-sandbox** — High-level "mount a folder, run an agent, tear down" abstraction
-
-Plus a CLI (`vz-cli`) for standalone use without writing Rust.
+vz is a Rust-native library for Apple's Virtualization.framework, purpose-built for sandboxing coding agents in macOS virtual machines. It provides a safe async Rust API over the framework's Objective-C classes, a high-level sandbox abstraction for agent runtimes, and a CLI for standalone use. The goal: any coding agent on macOS (Claude Code, Codex, OpenCode, Aider) gets full OS-level isolation in a native macOS VM with sub-10-second restore times and zero network configuration.
 
 ## Problem Statement
 
-Every coding agent on macOS (Claude Code, Codex, OpenCode, Aider) needs sandboxing. Today's options:
+Every coding agent running on macOS needs sandboxing. Agents execute arbitrary code, install packages, modify filesystems, and make network calls. Without isolation, a single hallucinated `rm -rf /` or exfiltrated credential is catastrophic.
 
-- **Seatbelt (sandbox-exec)** — deprecated, process-level only, no network domain filtering, known escape vectors
-- **Linux VMs** (Vibe, VibeBox, Claude Cowork) — can't run macOS binaries, can't test macOS APIs, forces cross-compilation
-- **Tart** — excellent for CI but written in Swift, no Rust API, designed for ephemeral clones not long-lived sandboxes
-- **Docker** — Linux containers on macOS, same cross-compilation problem
+**Why Linux VMs don't solve this.** Tools like Vibe, VibeBox, and Claude Cowork run agents in Linux micro-VMs. But macOS development requires macOS: Rust binaries compiled for darwin, Xcode toolchains, SwiftUI previews, macOS-specific APIs, Homebrew packages. Cross-compiling from Linux adds friction and breaks half the toolchain.
 
-There is no Rust library for running macOS VMs as coding agent sandboxes. This project fills that gap.
+**Why existing macOS tools don't solve this:**
+
+- **Seatbelt (sandbox-exec)** — Deprecated by Apple. Process-level only, no filesystem isolation, no network domain filtering, known escape vectors. Not suitable for adversarial workloads.
+- **Tart** — Excellent macOS VM manager for CI, but written in Swift with no Rust API. Designed for ephemeral clones, not long-lived sandboxes with fast session turnover. No vsock-based communication channel.
+- **Docker** — Runs Linux containers on macOS via a hidden Linux VM. Same cross-compilation problem. Not native macOS isolation.
+- **Kata Containers / Firecracker** — Linux-only hypervisors. No macOS guest support.
+
+There is no Rust library for running macOS VMs as coding agent sandboxes. vz fills that gap.
 
 ## Architecture
+
+### Stack Diagram
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -29,309 +29,186 @@ There is no Rust library for running macOS VMs as coding agent sandboxes. This p
 │  `vz run --image base --mount project:./workspace`  │
 ├─────────────────────────────────────────────────────┤
 │                   vz-sandbox                        │
-│  Pool, Session, Channel — high-level sandbox API    │
+│  Pool, Session, Channel, Guest Agent binary         │
 ├─────────────────────────────────────────────────────┤
 │                      vz                             │
 │  Safe Rust: Vm, Config, VirtioFs, Vsock, SaveState  │
 ├─────────────────────────────────────────────────────┤
-│                    vz-sys                           │
-│  Raw FFI: objc2 bindings to Virtualization.framework│
+│              objc2-virtualization v0.3.2             │
+│  Auto-generated bindings to ALL Vz.framework classes│
 ├─────────────────────────────────────────────────────┤
 │           Apple Virtualization.framework            │
-│              (macOS 12+ / Apple Silicon)            │
+│              (macOS 14+ / Apple Silicon)            │
 └─────────────────────────────────────────────────────┘
 ```
 
-## Crate Design
-
-### vz-sys — Raw FFI Bindings
-
-Thin, unsafe bindings to Virtualization.framework using `objc2` + `block2`.
-
-**Bound classes (v0.1 scope):**
-
-| ObjC Class | Purpose |
-|-----------|---------|
-| `VZVirtualMachine` | VM lifecycle (start, pause, stop, save, restore) |
-| `VZVirtualMachineConfiguration` | CPU, memory, devices |
-| `VZMacOSBootLoader` | macOS guest boot |
-| `VZMacPlatformConfiguration` | Machine identity, hardware model, aux storage |
-| `VZMacOSRestoreImage` | IPSW download + install |
-| `VZMacOSInstaller` | Install macOS into a VM |
-| `VZVirtioFileSystemDeviceConfiguration` | VirtioFS shared directories |
-| `VZSharedDirectory` | Single directory share |
-| `VZMultipleDirectoryShare` | Multiple directory shares |
-| `VZVirtioSocketDeviceConfiguration` | vsock setup |
-| `VZVirtioSocketDevice` | vsock connections |
-| `VZVirtioSocketConnection` | Individual vsock connection |
-| `VZDiskImageStorageDeviceAttachment` | Disk images |
-| `VZVirtioBlockDeviceConfiguration` | Block storage |
-| `VZNATNetworkDeviceAttachment` | NAT networking |
-| `VZVirtioNetworkDeviceConfiguration` | Network adapter |
-| `VZMacGraphicsDeviceConfiguration` | Display (optional, for debug) |
-
-**Build requirements:**
-- `build.rs` links `Virtualization.framework`
-- `#[cfg(target_os = "macos")]` gate on everything
-- Minimum deployment target: macOS 14 (Sonoma) for save/restore
-
-### vz — Safe Rust API
-
-Ergonomic wrapper. Key types:
-
-```rust
-/// VM configuration builder
-pub struct VmConfigBuilder {
-    cpus: u32,
-    memory_bytes: u64,
-    boot_loader: BootLoader,
-    disks: Vec<DiskConfig>,
-    shared_dirs: Vec<SharedDirConfig>,
-    network: Option<NetworkConfig>,
-    vsock: bool,
-}
-
-/// A running or stopped virtual machine
-pub struct Vm { /* opaque, wraps VZVirtualMachine */ }
-
-impl Vm {
-    pub async fn start(&self) -> Result<()>;
-    pub async fn pause(&self) -> Result<()>;
-    pub async fn resume(&self) -> Result<()>;
-    pub async fn stop(&self) -> Result<()>;
-
-    /// Save full VM state to disk (macOS 14+). VM must be paused.
-    pub async fn save_state(&self, path: &Path) -> Result<()>;
-
-    /// Restore VM from saved state. Must use same configuration.
-    pub async fn restore_state(&self, path: &Path) -> Result<()>;
-
-    /// Get a vsock connection to the guest on the given port
-    pub async fn vsock_connect(&self, port: u32) -> Result<VsockStream>;
-
-    /// Listen for vsock connections from the guest
-    pub async fn vsock_listen(&self, port: u32) -> Result<VsockListener>;
-
-    /// Current VM state
-    pub fn state(&self) -> VmState;
-}
-
-pub enum VmState {
-    Stopped,
-    Running,
-    Paused,
-    Starting,
-    Stopping,
-    Saving,
-    Restoring,
-    Error,
-}
-
-pub enum BootLoader {
-    MacOS,
-    Linux { kernel: PathBuf, initrd: Option<PathBuf>, cmdline: String },
-}
-
-/// Install macOS from IPSW into a disk image
-pub async fn install_macos(ipsw: IpswSource, disk: &Path, config: &VmConfigBuilder) -> Result<()>;
-
-pub enum IpswSource {
-    Latest,            // Download latest from Apple
-    Path(PathBuf),     // Local IPSW file
-    Url(String),       // Remote URL
-}
-```
-
-**VirtioFS API:**
-
-```rust
-pub struct SharedDirConfig {
-    pub tag: String,                // Guest mount tag
-    pub source: PathBuf,            // Host directory
-    pub read_only: bool,
-}
-
-// Usage in config builder:
-let config = VmConfigBuilder::new()
-    .cpus(4)
-    .memory_gb(8)
-    .boot_macos()
-    .disk("/path/to/disk.img", 64 * GB)
-    .shared_dir("project", "./my-project", ReadWrite)
-    .shared_dir("tools", "/usr/local/bin", ReadOnly)
-    .enable_vsock()
-    .build()?;
-```
-
-**Vsock API:**
-
-```rust
-/// Bidirectional byte stream over vsock
-pub struct VsockStream { /* wraps VZVirtioSocketConnection */ }
-
-impl tokio::io::AsyncRead for VsockStream { ... }
-impl tokio::io::AsyncWrite for VsockStream { ... }
-
-/// Accept incoming vsock connections from guest
-pub struct VsockListener { /* wraps listener on VZVirtioSocketDevice */ }
-
-impl VsockListener {
-    pub async fn accept(&self) -> Result<VsockStream>;
-}
-```
-
-### vz-sandbox — High-Level Sandbox
-
-The "just give me a sandbox" layer.
-
-```rust
-/// A pool of pre-warmed macOS VMs ready for use
-pub struct SandboxPool {
-    config: SandboxConfig,
-    available: Vec<Sandbox>,
-}
-
-pub struct SandboxConfig {
-    pub image_path: PathBuf,        // Path to golden disk image
-    pub cpus: u32,
-    pub memory_gb: u32,
-    pub state_path: Option<PathBuf>, // Saved state for fast restore
-}
-
-impl SandboxPool {
-    /// Create pool and pre-warm VMs (up to 2 for macOS guests)
-    pub async fn new(config: SandboxConfig, pool_size: u8) -> Result<Self>;
-
-    /// Get a sandbox from the pool, mount a project directory
-    pub async fn acquire(&self, project_dir: &Path) -> Result<SandboxSession>;
-
-    /// Return sandbox to the pool after cleanup
-    pub async fn release(&self, session: SandboxSession) -> Result<()>;
-}
-
-/// An active sandbox session with a mounted project
-pub struct SandboxSession {
-    vm: Vm,
-    vsock: VsockStream,
-    project_mount: String,  // tag for the VirtioFS mount
-}
-
-impl SandboxSession {
-    /// Execute a command inside the sandbox via SSH or guest agent
-    pub async fn exec(&self, cmd: &str) -> Result<ExecOutput>;
-
-    /// Get the vsock channel for custom protocols (e.g., tool forwarding)
-    pub fn channel(&self) -> &VsockStream;
-
-    /// Path where the project is mounted inside the VM
-    pub fn project_path(&self) -> &str; // e.g., "/mnt/project"
-}
-
-/// Typed message protocol over vsock for tool forwarding
-pub struct Channel<Req, Resp> {
-    stream: VsockStream,
-    _phantom: PhantomData<(Req, Resp)>,
-}
-
-impl<Req: Serialize, Resp: DeserializeOwned> Channel<Req, Resp> {
-    pub async fn send(&self, req: Req) -> Result<()>;
-    pub async fn recv(&self) -> Result<Resp>;
-    pub async fn request(&self, req: Req) -> Result<Resp>;
-}
-```
-
-### vz-cli — Command Line Interface
+### Host/Guest Communication
 
 ```
-vz init                              # Download IPSW, create golden image
-vz run --image base --mount project:./workspace
-vz run --image base --mount project:./workspace --headless
-vz save --image base --state base.state
-vz restore --state base.state --mount project:./workspace
-vz exec <vm-name> -- cargo build
-vz list                              # Show running VMs
-vz stop <vm-name>
+┌─────────────── HOST ───────────────┐     ┌─────────────── GUEST ──────────────┐
+│                                    │     │                                     │
+│  Agent Runtime (HQ, Claude Code)   │     │  Guest Agent (vz-guest-agent)       │
+│       │                            │     │       │                             │
+│       ▼                            │     │       ▼                             │
+│  vz-sandbox::Channel               │     │  vsock listener (port 7450)         │
+│       │                            │     │       │                             │
+│       ▼                            │     │       ▼                             │
+│  vsock (port 7450)  ◄──────────────┼─────┼──  vsock device                     │
+│                                    │     │                                     │
+│  VirtioFS share ────────────────── │ ──► │  /mnt/workspace (auto-mounted)      │
+│  (host: ./my-project)              │     │  (read-write project files)         │
+│                                    │     │                                     │
+└────────────────────────────────────┘     └─────────────────────────────────────┘
+
+Communication:  vsock — length-prefixed JSON frames (no SSH, no network config)
+File sharing:   VirtioFS — near-native performance, configured at VM creation
 ```
+
+### Crate Responsibilities
+
+- **vz** wraps `objc2-virtualization` in safe async Rust. It owns VM lifecycle (create, start, pause, stop, save, restore), configuration building, VirtioFS mounts, and vsock streams. All ObjC completion handlers are bridged to tokio futures. All VZVirtualMachine operations are dispatched through a serial dispatch queue (mandatory Apple requirement).
+
+- **vz-sandbox** provides the high-level abstraction: a pool of pre-warmed VMs, session lifecycle (acquire a VM, mount a project, execute commands, release), and a typed Channel protocol over vsock. It also contains the guest agent binary that runs inside the VM.
+
+- **vz-cli** exposes vz-sandbox functionality as CLI commands for standalone use without writing Rust.
+
+## Crate Overview
+
+| Crate | Responsibility | Key Types |
+|-------|---------------|-----------|
+| `vz` | Safe async Rust API over objc2-virtualization | `Vm`, `VmConfig`, `VmConfigBuilder`, `VirtioFsMount`, `VsockStream`, `VsockListener`, `VmState`, `SaveState` |
+| `vz-sandbox` | High-level sandbox pool, sessions, guest agent | `SandboxPool`, `SandboxSession`, `Channel<Req, Resp>`, `GuestAgent`, `SandboxConfig` |
+| `vz-cli` | CLI for standalone use | Clap commands: `init`, `run`, `exec`, `save`, `restore`, `list`, `stop` |
 
 ## Key Design Decisions
 
-### 1. objc2 for FFI (not manual objc_msgSend)
+### 1. objc2-virtualization as foundation — no vz-sys crate
 
-The `objc2` ecosystem provides:
-- Compile-time class/method verification
-- Automatic retain/release memory management
-- Safe wrappers for Objective-C blocks (`block2` crate)
-- Foundation type conversions (NSString, NSURL, NSError)
-
-This is more work upfront than calling Tart's CLI, but produces a proper library that others can build on.
+The `objc2-virtualization` crate (v0.3.2) provides auto-generated bindings to ALL Virtualization.framework classes. These bindings are mechanically generated from Apple's headers by the objc2 project, covering every class from `VZVirtualMachine` to `VZVirtioSocketConnection`. This eliminates the need for a separate `vz-sys` crate with hand-written FFI bindings. The `vz` crate wraps `objc2-virtualization` directly with a safe, ergonomic API. The project has 3 crates, not 4.
 
 ### 2. Async-first with tokio
 
-All VM operations are async (start, stop, save, restore are completion-handler based in ObjC). We bridge to tokio futures using `block2` + `tokio::sync::oneshot`.
+All Virtualization.framework operations use Objective-C completion handlers (blocks). We bridge these to Rust futures using `block2` to create the ObjC block and `tokio::sync::oneshot` to deliver the result. Every public method on `Vm` returns a `Future`. The runtime is tokio.
 
-### 3. macOS 14 (Sonoma) minimum
+### 3. Serial dispatch queue per VM — MANDATORY
 
-We require macOS 14+ because save/restore (`saveMachineStateTo`/`restoreMachineStateFrom`) is essential for fast sandbox startup. Without it, every session requires a full 30-60s macOS boot.
+Apple requires that ALL `VZVirtualMachine` operations (start, stop, pause, resume, save, restore, delegate callbacks) execute on the same serial dispatch queue. This is not optional — violating it causes undefined behavior or crashes. We use the `dispatch2` crate to create a serial queue per VM and ensure every ObjC call is dispatched through it. This is the single most important correctness requirement in the crate.
 
-### 4. Long-lived VM model (not ephemeral clones)
+### 4. macOS 14 (Sonoma) minimum
 
-The primary use case is a single macOS VM that stays running. Project directories are swapped via VirtioFS mounts. This avoids:
-- The 2-VM limit being a bottleneck
-- 30-60s boot penalty per session
-- APFS clone management complexity
+Save/restore (`saveMachineStateTo:completionHandler:` / `restoreMachineStateFrom:completionHandler:`) was introduced in macOS 14. Without it, every sandbox session requires a full 30-60s macOS boot. With it, restore takes 5-10s. This is essential for the sandbox use case, so we set macOS 14 as the floor.
 
-The VM boots once (or restores from saved state in ~5-10s), then serves sessions sequentially.
+### 5. Long-lived VM model
 
-### 5. vsock as primary communication channel
+Rather than ephemeral clone-and-boot (Tart's CI model), vz uses a single long-lived VM. The VM boots once (or restores from saved state), then serves sessions sequentially. Project directories are swapped via VirtioFS mounts. This avoids the 2-VM kernel limit being a bottleneck, eliminates boot penalties, and sidesteps APFS clone management.
 
-vsock provides host↔guest communication without network configuration. This maps perfectly to tool-forwarding architectures where the host holds secrets and the guest holds only stubs.
+### 6. vsock for host-guest communication — not SSH
 
-## Implementation Plan
+vsock (`AF_VSOCK`) provides a socket interface between host and guest without any network configuration. No IP addresses, no SSH keys, no port forwarding. The host connects to the guest (or vice versa) using a simple port number. This maps perfectly to tool-forwarding architectures where the host holds secrets and the guest holds only stubs.
 
-### Phase 1: Foundation (vz-sys + vz)
-1. Set up objc2 bindings for core Virtualization.framework classes
-2. Implement VmConfigBuilder + Vm lifecycle (start/stop)
-3. VirtioFS shared directory support
-4. vsock host↔guest channel
-5. macOS IPSW download + install
-6. Save/restore VM state
+### 7. Push-based streaming
 
-### Phase 2: Sandbox Layer (vz-sandbox)
-1. SandboxPool with pre-warming
-2. SandboxSession with project mounting
-3. Guest agent or SSH-based command execution
-4. Typed Channel protocol over vsock
+stdout/stderr from guest command execution is streamed to the host as vsock frames in real time. The guest agent pushes output as it arrives rather than the host polling for it. Frame format: 4-byte little-endian length prefix followed by a JSON payload containing the stream type (stdout/stderr/exit) and data.
 
-### Phase 3: CLI (vz-cli)
-1. `vz init` — golden image creation
-2. `vz run` — start VM with mounts
-3. `vz exec` — run commands in VM
-4. `vz save` / `vz restore` — state management
+## Implementation Phases
+
+### Phase 1: vz crate — Safe API over objc2-virtualization
+
+Build the safe Rust wrapper. This is the foundation everything else depends on.
+
+- Dispatch queue management (serial queue per VM, `dispatch2` crate)
+- Async bridging pattern (ObjC completion handler to tokio future via `block2` + `oneshot`)
+- `VmConfigBuilder`: CPU count, memory, boot loader, disk images, VirtioFS mounts, vsock, network
+- `Vm` lifecycle: create, start, pause, resume, stop
+- VirtioFS: shared directory configuration, read-only vs read-write
+- Vsock: `VsockStream` (AsyncRead + AsyncWrite), `VsockListener`
+- Save/restore VM state (macOS 14+)
+- macOS installer: download IPSW, install to disk image
+- Delegate implementation for VM state changes
+
+### Phase 2: vz-sandbox + Guest Agent
+
+Build the high-level abstraction and the binary that runs inside the VM.
+
+- Guest agent binary (`vz-guest-agent`): listens on vsock, executes commands, streams output
+- Guest agent bootstrap: launchd plist, auto-start on boot, VirtioFS auto-mount
+- `SandboxPool`: pre-warm VMs (up to 2), manage lifecycle
+- `SandboxSession`: acquire VM, mount project, execute commands, release
+- `Channel<Req, Resp>`: typed request/response protocol over vsock with length-prefixed JSON frames
+- Session cleanup: process termination, temp file removal between sessions
+
+### Phase 3: vz-cli
+
+CLI binary for standalone use.
+
+- `vz init` — Download IPSW, create golden disk image, install macOS, install dev tools
+- `vz run` — Start VM with mounts, optional headless mode
+- `vz exec` — Run a command inside a running VM via guest agent
+- `vz save` / `vz restore` — Snapshot and restore VM state
+- `vz list` — Show running VMs and their state
+- `vz stop` — Graceful shutdown
 
 ### Phase 4: Ecosystem
-1. Guest agent binary (runs inside VM, listens on vsock)
-2. Pre-built golden images (published to OCI registry)
-3. Integration examples (HQ, Claude Code, generic agent)
+
+- Pre-built golden images with common dev tools (Xcode CLI, Homebrew, Rust, Node, Python)
+- CI integration guides (GitHub Actions on Apple Silicon runners)
+- Integration examples: HQ kernel worker backend, Claude Code sandbox, generic agent harness
+- OCI registry for distributing golden images
+
+## Phase Dependency Graph
+
+```
+Phase 1: vz crate
+    │
+    ├──────────────────────┐
+    ▼                      ▼
+Phase 2: vz-sandbox    Phase 3: vz-cli
+    │                      │
+    └──────┬───────────────┘
+           ▼
+    Phase 4: Ecosystem
+```
+
+Phase 1 must complete before Phase 2 or Phase 3 can begin. Phase 2 and Phase 3 can proceed in parallel (vz-cli can use the vz crate directly for basic VM operations before vz-sandbox exists). Phase 4 depends on both Phase 2 and Phase 3.
 
 ## Constraints & Limitations
 
-- **Apple Silicon only** — macOS guest VMs require Apple Silicon
-- **2 concurrent macOS VMs** — kernel-enforced limit; the long-lived model makes this irrelevant
-- **macOS host only** — Virtualization.framework is macOS-only
-- **No nested virtualization** — can't run VMs inside the sandbox VM
-- **No Metal passthrough** — no GPU acceleration in guests
-- **VirtioFS mounts are static** — configured at VM creation, can't add/remove at runtime
-- **Hardware-encrypted save files** — state files tied to specific Mac + user account, not portable
+| Constraint | Detail |
+|-----------|--------|
+| **Apple Silicon only** | macOS guest VMs require Apple Silicon (arm64). Intel Macs cannot run macOS guests. |
+| **2 concurrent macOS VMs** | Kernel-enforced limit. The long-lived VM model makes this irrelevant for most use cases. |
+| **macOS host only** | Virtualization.framework is a macOS-only framework. No Linux or Windows host support. |
+| **No nested virtualization** | Cannot run VMs inside the sandbox VM. Agents cannot use Docker inside the guest. |
+| **No Metal passthrough** | No GPU acceleration in guests. GPU-dependent workloads (ML training, Metal shaders) will not work. |
+| **VirtioFS mounts are static** | Shared directories must be configured at VM creation time. Cannot add or remove mounts while the VM is running. To change mounts, the VM must be stopped and recreated. |
+| **Hardware-encrypted save files** | VM state save files are encrypted by the Secure Enclave. They are tied to the specific Mac hardware and user account. Not portable between machines. |
+| **macOS 14 minimum** | Save/restore requires Sonoma or later. Older macOS versions can run VMs but cannot snapshot/restore state. |
 
-## Prior Art & References
+## Planning Documents Index
 
-- [Apple Virtualization.framework docs](https://developer.apple.com/documentation/virtualization)
-- [WWDC22: Create macOS or Linux virtual machines](https://developer.apple.com/videos/play/wwdc2022/10002/)
-- [WWDC23: Create seamless experiences with Virtualization](https://developer.apple.com/videos/play/wwdc2023/10007/)
-- [Tart (Cirrus Labs)](https://github.com/cirruslabs/tart) — Swift, macOS+Linux VMs for CI
-- [vfkit (Red Hat)](https://github.com/crc-org/vfkit) — Go, minimal Linux VM hypervisor
-- [Vibe (lynaghk)](https://github.com/lynaghk/vibe) — Rust, Linux VM for agent sandbox
-- [VibeBox](https://github.com/robcholz/vibebox) — Rust, per-project Linux micro-VMs
-- [Code-Hex/vz](https://github.com/Code-Hex/vz) — Go bindings (mature, reference implementation)
-- [virtualization-rs](https://github.com/suzusuzu/virtualization-rs) — Rust bindings (alpha)
-- [objc2](https://github.com/madsmtm/objc2) — Safe Rust bindings for Objective-C
+| Document | Covers |
+|----------|--------|
+| `00-ffi-layer.md` | objc2-virtualization usage patterns, serial dispatch queue requirement, async bridging with block2 + oneshot, delegate implementation strategy |
+| `01-safe-api.md` | vz crate design: Vm lifecycle, VmConfigBuilder, error types, state machine, public API surface |
+| `02-virtio-fs.md` | VirtioFS mount strategy, workspace root pattern, read-only vs read-write, mount tag naming, guest-side auto-mount |
+| `03-vsock-protocol.md` | vsock communication model, wire format (length-prefixed JSON), port assignments, streaming protocol, backpressure |
+| `04-guest-agent.md` | Guest agent binary architecture, bootstrap via launchd, command execution, environment setup, security model |
+| `05-sandbox.md` | vz-sandbox crate: SandboxPool lifecycle, SandboxSession acquire/release, Channel typed protocol, cleanup between sessions |
+| `06-cli.md` | vz-cli commands, UX design, golden image creation workflow, interactive vs headless modes |
+| `07-golden-image.md` | IPSW to bootable macOS VM pipeline, dev tool provisioning, image versioning, distribution |
+| `08-testing.md` | Testing strategy for a virtualization library: unit tests (mock ObjC), integration tests (real VMs), CI on Apple Silicon |
+
+## Prior Art
+
+| Project | Language | Relevance |
+|---------|----------|-----------|
+| [Tart](https://github.com/cirruslabs/tart) | Swift | Most mature macOS VM manager. CI-focused, ephemeral clone model. No Rust API. Reference for IPSW install flow and VM configuration. |
+| [vfkit](https://github.com/crc-org/vfkit) | Go | Minimal Virtualization.framework wrapper from Red Hat. Linux guests only. Clean API design reference. |
+| [Vibe](https://github.com/lynaghk/vibe) | Rust | Linux VM sandbox for coding agents. Proves the agent-in-VM model works. Linux-only. |
+| [VibeBox](https://github.com/robcholz/vibebox) | Rust | Per-project Linux micro-VMs. Similar sandbox concept, different OS target. |
+| [Code-Hex/vz](https://github.com/Code-Hex/vz) | Go | Most complete Virtualization.framework binding outside Swift. Mature, well-tested. Primary API design reference. |
+| [objc2](https://github.com/madsmtm/objc2) | Rust | Safe Rust-to-ObjC interop. Foundation of our binding strategy. Includes `objc2-virtualization` with auto-generated bindings to all Vz.framework classes. |
+| [objc2-virtualization](https://docs.rs/objc2-virtualization) | Rust | Auto-generated bindings to ALL Virtualization.framework classes (v0.3.2). Eliminates the need for hand-written FFI. Our direct dependency. |
+| [Claude Cowork](https://docs.anthropic.com) | — | Anthropic's agent sandbox. Uses Linux VMs. Demonstrates the vsock + VirtioFS communication pattern we adopt for macOS. |
+| [Kata Containers](https://katacontainers.io) | Go | VM-based container isolation. Architectural reference for the pool/session model, though Linux-only. |
+| [Firecracker](https://github.com/firecracker-microvm/firecracker) | Rust | AWS micro-VM hypervisor. Reference for fast VM startup and minimal attack surface design. Linux KVM only. |

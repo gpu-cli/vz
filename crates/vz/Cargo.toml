@@ -8,11 +8,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-vz-sys = { workspace = true }
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-virtualization = { workspace = true }
+block2 = { workspace = true }
+dispatch2 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,7 +1,6 @@
 [workspace]
 resolver = "3"
 members = [
-    "vz-sys",
     "vz",
     "vz-sandbox",
     "vz-cli",
@@ -14,10 +13,37 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/jameslal/vz"
 
 [workspace.dependencies]
-# FFI
+# FFI — objc2-virtualization provides auto-generated bindings to all
+# Virtualization.framework classes, eliminating the need for a custom vz-sys crate.
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSError", "NSString", "NSURL", "NSArray"] }
+objc2-foundation = { version = "0.3", features = ["NSObject", "NSString", "NSError", "NSURL", "NSArray"] }
+objc2-virtualization = { version = "0.3", features = [
+    "VZVirtualMachine",
+    "VZVirtualMachineConfiguration",
+    "VZMacOSBootLoader",
+    "VZMacPlatformConfiguration",
+    "VZMacOSRestoreImage",
+    "VZMacOSInstaller",
+    "VZVirtioFileSystemDeviceConfiguration",
+    "VZSharedDirectory",
+    "VZMultipleDirectoryShare",
+    "VZSingleDirectoryShare",
+    "VZVirtioSocketDeviceConfiguration",
+    "VZVirtioSocketDevice",
+    "VZVirtioSocketConnection",
+    "VZDiskImageStorageDeviceAttachment",
+    "VZVirtioBlockDeviceConfiguration",
+    "VZNATNetworkDeviceAttachment",
+    "VZVirtioNetworkDeviceConfiguration",
+    "VZMacGraphicsDeviceConfiguration",
+    "VZVirtualMachineDelegate",
+    "VZVirtualMachineStartOptions",
+    "VZMacOSVirtualMachineStartOptions",
+    "block2",
+    "dispatch2",
+] }
 block2 = "0.6"
+dispatch2 = { version = "0.3", features = ["alloc", "objc2"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }
@@ -38,7 +64,6 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 
 # Internal crates
-vz-sys = { path = "vz-sys" }
 vz = { path = "vz" }
 vz-sandbox = { path = "vz-sandbox" }
 
