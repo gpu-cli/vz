@@ -444,10 +444,7 @@ impl Vm {
     /// # Safety
     ///
     /// The caller must ensure this is called from the main thread.
-    pub unsafe fn attach_view(
-        &self,
-        view: &objc2_virtualization::VZVirtualMachineView,
-    ) {
+    pub unsafe fn attach_view(&self, view: &objc2_virtualization::VZVirtualMachineView) {
         unsafe { view.setVirtualMachine(Some(&self.handle.vm)) };
     }
 }

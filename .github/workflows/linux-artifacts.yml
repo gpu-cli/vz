@@ -1,0 +1,44 @@
+name: Linux Artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "linux/**"
+      - "crates/vz-linux/**"
+      - "crates/vz-guest-agent/**"
+      - ".github/workflows/linux-artifacts.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "linux/**"
+      - "crates/vz-linux/**"
+      - "crates/vz-guest-agent/**"
+      - ".github/workflows/linux-artifacts.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux-artifacts:
+    name: Build Linux kernel + initramfs artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build linux artifacts in Docker
+        run: make -C linux docker-build
+
+      - name: Show artifact files
+        run: ls -lh linux/out
+
+      - name: Upload linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vz-linux-artifacts
+          path: |
+            linux/out/vmlinux
+            linux/out/initramfs.img
+            linux/out/version.json

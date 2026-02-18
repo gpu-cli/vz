@@ -66,6 +66,7 @@ pub struct VmConfigBuilder {
     disk_path: Option<PathBuf>,
     disk_size_bytes: Option<u64>,
     shared_dirs: Vec<SharedDirConfig>,
+    serial_log_file: Option<PathBuf>,
     network: NetworkConfig,
     vsock: bool,
     headless: bool,
@@ -82,6 +83,7 @@ impl VmConfigBuilder {
             disk_path: None,
             disk_size_bytes: None,
             shared_dirs: Vec::new(),
+            serial_log_file: None,
             network: NetworkConfig::Nat,
             vsock: false,
             headless: true,
@@ -172,6 +174,12 @@ impl VmConfigBuilder {
         self
     }
 
+    /// Write guest serial console output to a host file.
+    pub fn serial_log_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.serial_log_file = Some(path.into());
+        self
+    }
+
     /// Set network configuration.
     pub fn network(mut self, config: NetworkConfig) -> Self {
         self.network = config;
@@ -218,6 +226,7 @@ impl VmConfigBuilder {
             disk_path,
             disk_size_bytes: self.disk_size_bytes,
             shared_dirs: self.shared_dirs,
+            serial_log_file: self.serial_log_file,
             network: self.network,
             vsock: self.vsock,
             headless: self.headless,
@@ -243,6 +252,7 @@ pub struct VmConfig {
     #[allow(dead_code)]
     pub(crate) disk_size_bytes: Option<u64>,
     pub(crate) shared_dirs: Vec<SharedDirConfig>,
+    pub(crate) serial_log_file: Option<PathBuf>,
     pub(crate) network: NetworkConfig,
     pub(crate) vsock: bool,
     /// Controls whether to attach a virtual display. Used by CLI layer.

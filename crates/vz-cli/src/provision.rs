@@ -352,7 +352,9 @@ print(base64.b64encode(binary_plist).decode())
 /// The kcpassword file uses a simple repeating XOR key to obfuscate the
 /// password. This is a well-known, reversible encoding (not encryption).
 fn encode_kcpassword(password: &str) -> Vec<u8> {
-    const KEY: [u8; 11] = [0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD, 0xEA, 0xA3, 0xB9, 0x1F];
+    const KEY: [u8; 11] = [
+        0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD, 0xEA, 0xA3, 0xB9, 0x1F,
+    ];
 
     let pass_bytes = password.as_bytes();
 
@@ -412,8 +414,9 @@ fn install_guest_agent(
     #[cfg(unix)]
     if is_root() {
         for path in [&dest_binary, &plist_path, &launch_daemons, &bin_dir] {
-            std::os::unix::fs::chown(path, Some(0), Some(0))
-                .map_err(|e| anyhow::anyhow!("chown root:wheel failed for {}: {e}", path.display()))?;
+            std::os::unix::fs::chown(path, Some(0), Some(0)).map_err(|e| {
+                anyhow::anyhow!("chown root:wheel failed for {}: {e}", path.display())
+            })?;
         }
         debug!("set root:wheel ownership on LaunchDaemon files");
     }
@@ -449,7 +452,6 @@ const GUEST_AGENT_LAUNCHD_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?
 </dict>
 </plist>
 "#;
-
 
 // ---------------------------------------------------------------------------
 // Dev tool provisioning (runs inside VM via guest agent)
@@ -845,10 +847,7 @@ pub fn provision_image(
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            let still_needs_fix = plist_path
-                .metadata()
-                .map(|m| m.uid() != 0)
-                .unwrap_or(true);
+            let still_needs_fix = plist_path.metadata().map(|m| m.uid() != 0).unwrap_or(true);
             if still_needs_fix {
                 warn!("LaunchDaemon files not owned by root — guest agent won't start until fixed");
             }
@@ -973,7 +972,9 @@ mod tests {
         // Empty password XOR'd with key = the key itself
         assert_eq!(
             encoded,
-            vec![0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD, 0xEA, 0xA3, 0xB9, 0x1F]
+            vec![
+                0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD, 0xEA, 0xA3, 0xB9, 0x1F
+            ]
         );
     }
 

@@ -19,7 +19,7 @@ repository = "https://github.com/jameslal/vz"
 # FFI — objc2-virtualization provides auto-generated bindings to all
 # Virtualization.framework classes, eliminating the need for a custom vz-sys crate.
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSObject", "NSString", "NSError", "NSURL", "NSArray", "NSData", "NSProgress"] }
+objc2-foundation = { version = "0.3", features = ["NSObject", "NSString", "NSError", "NSURL", "NSArray", "NSData", "NSProgress", "NSFileHandle"] }
 objc2-virtualization = { version = "0.3", features = [
     # Core VM
     "VZVirtualMachine",
@@ -64,6 +64,12 @@ objc2-virtualization = { version = "0.3", features = [
     "VZVirtioSocketConnection",
     "VZVirtioSocketListener",
 
+    # Serial console logging
+    "VZSerialPortAttachment",
+    "VZFileHandleSerialPortAttachment",
+    "VZSerialPortConfiguration",
+    "VZVirtioConsoleDeviceSerialPortConfiguration",
+
     # Network (parent + child features)
     "VZNetworkDeviceAttachment",
     "VZNetworkDeviceConfiguration",
@@ -106,6 +112,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+sha2 = "0.10"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

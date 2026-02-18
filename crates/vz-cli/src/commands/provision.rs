@@ -70,14 +70,13 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
         "provisioning disk image"
     );
 
-    let result = crate::provision::provision_image(
-        &image,
-        &user_config,
-        agent_path.as_deref(),
-    )?;
+    let result = crate::provision::provision_image(&image, &user_config, agent_path.as_deref())?;
 
     println!("Image provisioned successfully: {}", image.display());
-    println!("  User: {} (UID {}, auto-login enabled)", user_config.username, user_config.uid);
+    println!(
+        "  User: {} (UID {}, auto-login enabled)",
+        user_config.username, user_config.uid
+    );
     println!("  Password: {}", user_config.password);
     if agent_path.is_some() {
         println!("  Guest agent: installed (starts automatically on boot)");
@@ -86,19 +85,24 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
     if result.needs_ownership_fix {
         println!("\nWARNING: LaunchDaemon files need root ownership to work.");
         println!("Run this to fix:");
+        println!("  sudo vz provision --image {}", image.display());
+        println!("Or fix manually after mounting:");
         println!(
-            "  sudo vz provision --image {}",
+            "  hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount {}",
             image.display()
         );
-        println!("Or fix manually after mounting:");
-        println!("  hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount {}", image.display());
         println!("  # find the Data volume, then:");
-        println!("  sudo chown 0:0 /tmp/vz-provision/Library/LaunchDaemons/com.vz.guest-agent.plist");
+        println!(
+            "  sudo chown 0:0 /tmp/vz-provision/Library/LaunchDaemons/com.vz.guest-agent.plist"
+        );
         println!("  sudo chown 0:0 /tmp/vz-provision/usr/local/bin/vz-guest-agent");
     }
 
     println!("\nNext steps:");
-    println!("  vz run --image {} --name my-vm --headless", image.display());
+    println!(
+        "  vz run --image {} --name my-vm --headless",
+        image.display()
+    );
     println!("  vz exec my-vm -- whoami");
 
     Ok(())

@@ -1,0 +1,15 @@
+#!/bin/busybox sh
+
+set -eu
+
+case "$1" in
+  bound|renew)
+    [ -n "${ip:-}" ] && /bin/ip addr add "$ip"/${mask:-24} dev "$interface" || true
+    [ -n "${router:-}" ] && /bin/ip route add default via "$router" dev "$interface" || true
+    ;;
+  deconfig)
+    /bin/ip addr flush dev "$interface" || true
+    ;;
+esac
+
+exit 0

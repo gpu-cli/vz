@@ -18,16 +18,18 @@ use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
-use objc2_foundation::{NSArray, NSData, NSError, NSObject, NSString, NSURL};
+use objc2_foundation::{NSArray, NSData, NSError, NSFileHandle, NSObject, NSString, NSURL};
 use objc2_virtualization::{
-    VZDiskImageStorageDeviceAttachment, VZGenericPlatformConfiguration, VZLinuxBootLoader,
-    VZMacAuxiliaryStorage, VZMacGraphicsDeviceConfiguration, VZMacGraphicsDisplayConfiguration,
-    VZMacHardwareModel, VZMacMachineIdentifier, VZMacOSBootLoader, VZMacPlatformConfiguration,
+    VZDiskImageStorageDeviceAttachment, VZFileHandleSerialPortAttachment,
+    VZGenericPlatformConfiguration, VZLinuxBootLoader, VZMacAuxiliaryStorage,
+    VZMacGraphicsDeviceConfiguration, VZMacGraphicsDisplayConfiguration, VZMacHardwareModel,
+    VZMacMachineIdentifier, VZMacOSBootLoader, VZMacPlatformConfiguration,
     VZNATNetworkDeviceAttachment, VZSharedDirectory, VZSingleDirectoryShare,
     VZUSBKeyboardConfiguration, VZUSBScreenCoordinatePointingDeviceConfiguration,
-    VZVirtioBlockDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
-    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketDeviceConfiguration, VZVirtualMachine,
-    VZVirtualMachineConfiguration, VZVirtualMachineDelegate,
+    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
+    VZVirtioSocketDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
+    VZVirtualMachineDelegate,
 };
 use tokio::sync::{oneshot, watch};
 
@@ -450,6 +452,57 @@ pub(crate) fn build_objc_config(
         let fs_array = NSArray::from_retained_slice(&fs_devices);
         // SAFETY: setDirectorySharingDevices sets the VM's shared directory configuration.
         unsafe { vz_config.setDirectorySharingDevices(&fs_array) };
+    }
+
+    // Optional serial console log output
+    if let Some(serial_log_file) = &config.serial_log_file {
+        if let Some(parent) = serial_log_file.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                VzError::InvalidConfig(format!(
+                    "failed to create serial log directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(serial_log_file)
+            .map_err(|e| {
+                VzError::InvalidConfig(format!(
+                    "failed to create serial log file {}: {e}",
+                    serial_log_file.display()
+                ))
+            })?;
+
+        let serial_path = NSString::from_str(&serial_log_file.to_string_lossy());
+        let file_handle =
+            NSFileHandle::fileHandleForWritingAtPath(&serial_path).ok_or_else(|| {
+                VzError::InvalidConfig(format!(
+                    "failed to open serial log file handle at {}",
+                    serial_log_file.display()
+                ))
+            })?;
+
+        // SAFETY: attachment is created from a valid writable file handle.
+        let attachment = unsafe {
+            VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                VZFileHandleSerialPortAttachment::alloc(),
+                None,
+                Some(&file_handle),
+            )
+        };
+
+        // SAFETY: creates a valid virtio-console serial port config.
+        let serial_port = unsafe { VZVirtioConsoleDeviceSerialPortConfiguration::new() };
+        // SAFETY: setAttachment assigns the serial stream attachment.
+        unsafe { serial_port.setAttachment(Some(&attachment)) };
+
+        let serial_ports = NSArray::from_retained_slice(&[Retained::into_super(serial_port)]);
+        // SAFETY: setSerialPorts installs serial port configs.
+        unsafe { vz_config.setSerialPorts(&serial_ports) };
     }
 
     // Validate the configuration

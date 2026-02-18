@@ -16,6 +16,7 @@ use anyhow::Context;
 use clap::Parser;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
+use tokio::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 use vz::protocol::{
@@ -54,6 +55,10 @@ struct Args {
     /// Vsock port to listen on.
     #[arg(long, default_value_t = AGENT_PORT)]
     port: u32,
+
+    /// Seconds to keep retrying vsock bind during early boot.
+    #[arg(long, default_value_t = 30)]
+    bind_timeout_secs: u64,
 }
 
 #[tokio::main]
@@ -66,13 +71,53 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    info!(port = args.port, "starting vz-guest-agent");
+    info!(
+        port = args.port,
+        bind_timeout_secs = args.bind_timeout_secs,
+        "starting vz-guest-agent"
+    );
 
-    let listener = VsockListener::bind(args.port).context("failed to bind vsock listener")?;
+    let listener =
+        bind_vsock_listener(args.port, Duration::from_secs(args.bind_timeout_secs)).await?;
 
     info!(port = args.port, "listening on vsock");
 
     accept_loop(listener).await
+}
+
+async fn bind_vsock_listener(port: u32, timeout: Duration) -> anyhow::Result<VsockListener> {
+    let started = Instant::now();
+    let mut attempts = 0u32;
+
+    loop {
+        attempts = attempts.saturating_add(1);
+        match VsockListener::bind(port) {
+            Ok(listener) => {
+                if attempts > 1 {
+                    info!(attempts, elapsed = ?started.elapsed(), "vsock listener bind eventually succeeded");
+                }
+                return Ok(listener);
+            }
+            Err(err) => {
+                let err_text = err.to_string();
+                warn!(
+                    attempts,
+                    elapsed = ?started.elapsed(),
+                    error = %err_text,
+                    "vsock bind failed, retrying"
+                );
+
+                if started.elapsed() >= timeout {
+                    return Err(anyhow::anyhow!(
+                        "failed to bind vsock listener on port {port} after {attempts} attempts ({:?}): {err_text}",
+                        timeout,
+                    ));
+                }
+
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
 }
 
 /// Main accept loop. Accepts one connection at a time, handles it until

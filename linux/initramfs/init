@@ -1,0 +1,29 @@
+#!/bin/busybox sh
+
+set -eu
+
+echo "[vz-init] booting initramfs"
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev || true
+mount -t tmpfs tmpfs /tmp
+
+mkdir -p /run /mnt/rootfs
+
+# Optional VirtioFS rootfs mount (used by container runtime path).
+if mount -t virtiofs rootfs /mnt/rootfs 2>/dev/null; then
+  echo "[vz-init] mounted virtiofs rootfs at /mnt/rootfs"
+else
+  echo "[vz-init] no rootfs virtiofs mount available, continuing"
+fi
+
+# Optional DHCP setup if a virtio-net device is present.
+# Run in background so missing network does not block guest-agent startup.
+if [ -d /sys/class/net/eth0 ] && [ -x /sbin/udhcpc ]; then
+  /bin/ip link set dev eth0 up >/dev/console 2>&1 || true
+  /sbin/udhcpc -i eth0 -s /etc/udhcpc.script -q -b -t 5 -T 1 >/dev/console 2>&1 &
+fi
+
+echo "[vz-init] starting guest agent on vsock 7424"
+exec /usr/bin/vz-guest-agent --port 7424

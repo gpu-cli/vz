@@ -55,8 +55,8 @@ impl AsyncWrite for VsockStream {
     }
 }
 
-/// macOS-specific sockaddr_vm layout.
-/// On macOS, AF_VSOCK = 40 and the struct includes svm_len.
+/// sockaddr_vm layout on macOS.
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct SockaddrVm {
     svm_len: u8,
@@ -66,11 +66,51 @@ struct SockaddrVm {
     svm_cid: u32,
 }
 
+/// sockaddr_vm layout on Linux.
+#[cfg(not(target_os = "macos"))]
+#[repr(C)]
+struct SockaddrVm {
+    svm_family: libc::sa_family_t,
+    svm_reserved1: u16,
+    svm_port: u32,
+    svm_cid: u32,
+    svm_flags: u8,
+    svm_zero: [u8; 3],
+}
+
 /// VMADDR_CID_ANY: accept connections from any CID (i.e., the host).
 const VMADDR_CID_ANY: u32 = u32::MAX; // -1 as u32
 
 /// AF_VSOCK address family on macOS.
+#[cfg(target_os = "macos")]
 const AF_VSOCK: i32 = 40;
+
+/// AF_VSOCK address family on Linux.
+#[cfg(not(target_os = "macos"))]
+const AF_VSOCK: i32 = libc::AF_VSOCK;
+
+#[cfg(target_os = "macos")]
+fn sockaddr_vm_any(port: u32) -> SockaddrVm {
+    SockaddrVm {
+        svm_len: std::mem::size_of::<SockaddrVm>() as u8,
+        svm_family: AF_VSOCK as u8,
+        svm_reserved1: 0,
+        svm_port: port,
+        svm_cid: VMADDR_CID_ANY,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sockaddr_vm_any(port: u32) -> SockaddrVm {
+    SockaddrVm {
+        svm_family: AF_VSOCK as libc::sa_family_t,
+        svm_reserved1: 0,
+        svm_port: port,
+        svm_cid: VMADDR_CID_ANY,
+        svm_flags: 0,
+        svm_zero: [0; 3],
+    }
+}
 
 impl VsockListener {
     /// Bind a vsock listener on the given port.
@@ -87,13 +127,7 @@ impl VsockListener {
         // SAFETY: We just created this fd and it's valid.
         let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
-        let addr = SockaddrVm {
-            svm_len: std::mem::size_of::<SockaddrVm>() as u8,
-            svm_family: AF_VSOCK as u8,
-            svm_reserved1: 0,
-            svm_port: port,
-            svm_cid: VMADDR_CID_ANY,
-        };
+        let addr = sockaddr_vm_any(port);
 
         // SAFETY: bind() with a valid fd and properly initialized sockaddr.
         let ret = unsafe {

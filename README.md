@@ -148,6 +148,26 @@ No TCP, no SSH keys, no port forwarding. vsock is a direct socket between host a
 | **vz-cli** | Standalone CLI. All operations available as commands. |
 | **vz-guest-agent** | In-VM daemon. Listens on vsock, executes commands, streams output. |
 
+## Linux artifacts (automatic)
+
+For the Linux container backend (`vz-linux`), kernel/initramfs artifacts are built automatically via `linux/Makefile`.
+
+```bash
+# Local build (requires cross toolchain)
+make -C linux all
+
+# Reproducible build in Docker
+make -C linux docker-build
+```
+
+Build outputs:
+
+- `linux/out/vmlinux`
+- `linux/out/initramfs.img`
+- `linux/out/version.json`
+
+CI also builds these automatically in `.github/workflows/linux-artifacts.yml` and uploads them as `vz-linux-artifacts`.
+
 ## CLI reference
 
 | Command | Description |

@@ -72,11 +72,7 @@ pub fn run_with_gui(args: RunArgs) -> anyhow::Result<()> {
 }
 
 /// Create an NSWindow with a VZVirtualMachineView as its content view.
-fn create_vm_window(
-    mtm: MainThreadMarker,
-    vm: &Arc<vz::Vm>,
-    name: &str,
-) -> Retained<NSWindow> {
+fn create_vm_window(mtm: MainThreadMarker, vm: &Arc<vz::Vm>, name: &str) -> Retained<NSWindow> {
     let content_rect = NSRect::new(
         NSPoint { x: 200.0, y: 200.0 },
         NSSize {
@@ -133,11 +129,7 @@ unsafe fn app_activate(mtm: MainThreadMarker) {
 }
 
 /// Set up a Ctrl+C handler that cleans up and exits.
-fn ctrlc_handler(
-    rt: tokio::runtime::Handle,
-    vm: Arc<vz::Vm>,
-    name: String,
-) {
+fn ctrlc_handler(rt: tokio::runtime::Handle, vm: Arc<vz::Vm>, name: String) {
     // Use a raw signal handler since NSApplication.run() owns the main thread.
     std::thread::spawn(move || {
         // Block until SIGINT
