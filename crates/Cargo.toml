@@ -69,10 +69,20 @@ objc2-virtualization = { version = "0.3", features = [
     # Display
     "VZGraphicsDeviceConfiguration",
     "VZMacGraphicsDeviceConfiguration",
+    "VZMacGraphicsDisplayConfiguration",
+    "VZVirtualMachineView",
 
     # Block and dispatch interop
     "block2",
     "dispatch2",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSResponder",
+    "NSWindow",
+    "NSView",
+    "NSRunningApplication",
+    "NSGraphics",
 ] }
 block2 = "0.6"
 dispatch2 = { version = "0.3", features = ["alloc", "objc2"] }
@@ -101,6 +111,9 @@ shell-words = "1"
 
 # System
 libc = "0.2"
+
+# Signal handling
+ctrlc = "3"
 
 # HTTP / Download
 reqwest = { version = "0.12", features = ["stream"] }

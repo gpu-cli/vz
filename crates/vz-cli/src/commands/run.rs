@@ -38,7 +38,18 @@ pub struct RunArgs {
     pub name: Option<String>,
 }
 
-pub async fn run(args: RunArgs) -> anyhow::Result<()> {
+/// A running VM with control server, ready for interaction.
+pub struct RunningVm {
+    pub vm: Arc<vz::Vm>,
+    pub name: String,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    vm_stopped: Arc<tokio::sync::Notify>,
+    control_handle: tokio::task::JoinHandle<()>,
+}
+
+/// Create, start, register, and start the control server for a VM.
+/// Returns a RunningVm that can be waited on (headless) or displayed (GUI).
+pub async fn setup(args: &RunArgs) -> anyhow::Result<RunningVm> {
     let name = args.name.clone().unwrap_or_else(|| "default".to_string());
 
     info!(
@@ -166,6 +177,9 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     registry.save()?;
 
     println!("VM '{}' is running (PID {})", name, std::process::id());
+    if let Some(password) = crate::provision::read_saved_password(&args.image) {
+        println!("Login: dev / {password}");
+    }
 
     // Start control server
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -181,40 +195,56 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         }
     });
 
+    Ok(RunningVm {
+        vm,
+        name,
+        shutdown_tx,
+        vm_stopped,
+        control_handle,
+    })
+}
+
+/// Wait for the VM to stop (headless mode). Handles Ctrl+C and control socket stop.
+pub async fn wait_and_cleanup(running: RunningVm) -> anyhow::Result<()> {
     // Wait for Ctrl+C or VM stopped via control socket
     let stopped_by_control = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("received Ctrl+C, stopping VM");
             false
         }
-        _ = vm_stopped.notified() => {
+        _ = running.vm_stopped.notified() => {
             info!("VM stopped via control socket");
             true
         }
     };
 
+    cleanup(running, stopped_by_control).await
+}
+
+/// Clean up a running VM: stop the control server, unregister, remove socket.
+pub async fn cleanup(running: RunningVm, stopped_by_control: bool) -> anyhow::Result<()> {
     // Shutdown control server
-    let _ = shutdown_tx.send(true);
-    let _ = control_handle.await;
+    let _ = running.shutdown_tx.send(true);
+    let _ = running.control_handle.await;
 
     // Only stop VM if we got Ctrl+C (control socket already stopped it)
     if !stopped_by_control {
-        if let Err(e) = vm.request_stop().await {
+        if let Err(e) = running.vm.request_stop().await {
             warn!(error = %e, "graceful stop failed, forcing");
-            let _ = vm.stop().await;
+            let _ = running.vm.stop().await;
         }
     }
 
     // Update registry
     let mut registry = crate::registry::Registry::load()?;
-    registry.remove(&name);
+    registry.remove(&running.name);
     registry.save()?;
 
     // Clean up control socket
-    let socket = crate::control::socket_path(&name);
+    let socket = crate::control::socket_path(&running.name);
     let _ = std::fs::remove_file(&socket);
 
-    println!("VM '{}' stopped", name);
+    println!("VM '{}' stopped", running.name);
 
     if stopped_by_control {
         // Hard-exit to prevent dropping the VM object, which triggers ObjC
@@ -224,4 +254,10 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Entry point for `vz run` in headless mode.
+pub async fn run(args: RunArgs) -> anyhow::Result<()> {
+    let running = setup(&args).await?;
+    wait_and_cleanup(running).await
 }

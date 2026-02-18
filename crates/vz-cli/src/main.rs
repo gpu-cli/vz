@@ -8,6 +8,8 @@
 
 mod commands;
 mod control;
+#[allow(unsafe_code)]
+mod gui;
 mod ipsw;
 mod provision;
 mod registry;
@@ -96,6 +98,17 @@ fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
+    // GUI mode: `vz run` without --headless needs AppKit on the main thread.
+    if let Commands::Run(ref args) = cli.command {
+        if !args.headless {
+            let Commands::Run(args) = cli.command else {
+                unreachable!()
+            };
+            return gui::run_with_gui(args);
+        }
+    }
+
+    // Headless path: normal tokio runtime.
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         let result = match cli.command {

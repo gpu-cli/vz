@@ -20,6 +20,8 @@ use tracing::{debug, info, warn};
 pub struct UserConfig {
     /// Username (default: "dev").
     pub username: String,
+    /// Password (default: "dev").
+    pub password: String,
     /// User ID (default: 501, macOS first user).
     pub uid: u32,
     /// Primary group ID (default: 20, "staff" on macOS).
@@ -34,12 +36,23 @@ impl Default for UserConfig {
     fn default() -> Self {
         Self {
             username: "dev".to_string(),
+            password: generate_random_password(),
             uid: 501,
             gid: 20,
             shell: "/bin/zsh".to_string(),
             home: "/Users/dev".to_string(),
         }
     }
+}
+
+/// Generate a random 8-character hex password from /dev/urandom.
+fn generate_random_password() -> String {
+    let mut buf = [0u8; 4];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = f.read_exact(&mut buf);
+    }
+    format!("{:02x}{:02x}{:02x}{:02x}", buf[0], buf[1], buf[2], buf[3])
 }
 
 /// What dev tools to install during provisioning (Phase 2, via guest agent).
@@ -94,7 +107,7 @@ pub fn apply_auto_config(
 
     skip_setup_assistant(mount_point)?;
     create_user_account(mount_point, user_config)?;
-    enable_auto_login(mount_point, &user_config.username)?;
+    enable_auto_login(mount_point, &user_config.username, &user_config.password)?;
 
     if let Some(agent_path) = guest_agent_binary {
         install_guest_agent(mount_point, agent_path, user_config)?;
@@ -153,6 +166,9 @@ fn create_user_account(mount_point: &Path, config: &UserConfig) -> anyhow::Resul
         config.uid, config.uid as u64
     );
 
+    // Generate ShadowHashData (PBKDF2-SHA512 password hash)
+    let shadow_hash_b64 = generate_shadow_hash_data(&config.password)?;
+
     // Write the user plist (dslocal format: all values are arrays)
     let plist_content = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -160,6 +176,14 @@ fn create_user_account(mount_point: &Path, config: &UserConfig) -> anyhow::Resul
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <key>ShadowHashData</key>
+    <array>
+        <data>{shadow_hash_data}</data>
+    </array>
+    <key>authentication_authority</key>
+    <array>
+        <string>;ShadowHash;HASHLIST:&lt;SALTED-SHA512-PBKDF2&gt;</string>
+    </array>
     <key>generateduid</key>
     <array>
         <string>{generated_uid}</string>
@@ -178,7 +202,7 @@ fn create_user_account(mount_point: &Path, config: &UserConfig) -> anyhow::Resul
     </array>
     <key>passwd</key>
     <array>
-        <string>*</string>
+        <string>********</string>
     </array>
     <key>realname</key>
     <array>
@@ -195,6 +219,7 @@ fn create_user_account(mount_point: &Path, config: &UserConfig) -> anyhow::Resul
 </dict>
 </plist>
 "#,
+        shadow_hash_data = shadow_hash_b64,
         generated_uid = generated_uid,
         gid = config.gid,
         home = config.home,
@@ -234,7 +259,7 @@ fn create_user_account(mount_point: &Path, config: &UserConfig) -> anyhow::Resul
 /// 2. `/etc/kcpassword` with the XOR-obfuscated password
 ///
 /// Without both, the login screen appears and no user session starts.
-fn enable_auto_login(mount_point: &Path, username: &str) -> anyhow::Result<()> {
+fn enable_auto_login(mount_point: &Path, username: &str, password: &str) -> anyhow::Result<()> {
     // Set autoLoginUser in loginwindow plist
     let plist_path = mount_point.join("Library/Preferences/com.apple.loginwindow.plist");
     if let Some(parent) = plist_path.parent() {
@@ -260,12 +285,12 @@ fn enable_auto_login(mount_point: &Path, username: &str) -> anyhow::Result<()> {
         );
     }
 
-    // Generate kcpassword for auto-login (empty password)
+    // Generate kcpassword for auto-login
     let kcpassword_path = mount_point.join("private/etc/kcpassword");
     if let Some(parent) = kcpassword_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let kcpassword_bytes = encode_kcpassword("");
+    let kcpassword_bytes = encode_kcpassword(password);
     std::fs::write(&kcpassword_path, &kcpassword_bytes)?;
 
     #[cfg(unix)]
@@ -276,6 +301,50 @@ fn enable_auto_login(mount_point: &Path, username: &str) -> anyhow::Result<()> {
 
     debug!(user = username, "enabled auto-login with kcpassword");
     Ok(())
+}
+
+/// Generate ShadowHashData for a user password.
+///
+/// Uses PBKDF2-HMAC-SHA512 (macOS standard) to hash the password and produces
+/// a base64-encoded binary plist suitable for the `ShadowHashData` field in a
+/// dslocal user plist.
+///
+/// Shells out to python3 (always available on macOS) to compute the PBKDF2 hash
+/// and create the binary plist format.
+fn generate_shadow_hash_data(password: &str) -> anyhow::Result<String> {
+    let script = r#"
+import hashlib, os, plistlib, base64, sys
+password = sys.argv[1]
+salt = os.urandom(32)
+iterations = 40000
+entropy = hashlib.pbkdf2_hmac('sha512', password.encode('utf-8'), salt, iterations, dklen=128)
+shadow_hash = {
+    'SALTED-SHA512-PBKDF2': {
+        'entropy': entropy,
+        'salt': salt,
+        'iterations': iterations,
+    }
+}
+binary_plist = plistlib.dumps(shadow_hash, fmt=plistlib.FMT_BINARY)
+print(base64.b64encode(binary_plist).decode())
+"#;
+
+    let output = std::process::Command::new("python3")
+        .args(["-c", script, password])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("failed to generate ShadowHashData: {}", stderr.trim());
+    }
+
+    let b64 = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if b64.is_empty() {
+        anyhow::bail!("ShadowHashData generation produced empty output");
+    }
+
+    debug!(len = b64.len(), "generated ShadowHashData");
+    Ok(b64)
 }
 
 /// Encode a password using macOS kcpassword XOR cipher.
@@ -443,6 +512,15 @@ pub fn generate_provision_script(config: &ProvisionConfig) -> String {
 
     script.push_str("echo 'Provisioning complete.'\n");
     script
+}
+
+/// Read the saved password for a disk image (from the `.password` sidecar file).
+pub fn read_saved_password(image_path: &Path) -> Option<String> {
+    let password_path = image_path.with_extension("password");
+    std::fs::read_to_string(&password_path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Find the built guest agent binary.
@@ -784,6 +862,17 @@ pub fn provision_image(
     result?;
     detach_result?;
 
+    // Save password to sidecar file so `vz run` can display it.
+    // Mode 0644 — this is a local dev VM password, not a production secret.
+    let password_path = image_path.with_extension("password");
+    std::fs::write(&password_path, &user_config.password)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&password_path, std::fs::Permissions::from_mode(0o644))?;
+    }
+    info!(path = %password_path.display(), "saved credentials");
+
     info!("image provisioned successfully");
     Ok(ProvisionResult {
         needs_ownership_fix,
@@ -802,6 +891,8 @@ mod tests {
     fn default_user_config() {
         let config = UserConfig::default();
         assert_eq!(config.username, "dev");
+        assert_eq!(config.password.len(), 8, "password should be 8 hex chars");
+        assert!(config.password.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(config.uid, 501);
         assert_eq!(config.gid, 20);
         assert_eq!(config.shell, "/bin/zsh");
@@ -884,6 +975,31 @@ mod tests {
             encoded,
             vec![0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD, 0xEA, 0xA3, 0xB9, 0x1F]
         );
+    }
+
+    #[test]
+    fn encode_kcpassword_dev() {
+        let encoded = encode_kcpassword("dev");
+        assert_eq!(encoded.len(), 11); // one block (3 chars + 8 padding)
+        // "dev" = [0x64, 0x65, 0x76], XOR'd with key prefix [0x7D, 0x89, 0x52]
+        assert_eq!(encoded[0], 0x64 ^ 0x7D); // 'd' ^ 0x7D = 0x19
+        assert_eq!(encoded[1], 0x65 ^ 0x89); // 'e' ^ 0x89 = 0xEC
+        assert_eq!(encoded[2], 0x76 ^ 0x52); // 'v' ^ 0x52 = 0x24
+    }
+
+    #[test]
+    fn generate_shadow_hash_data_produces_valid_base64() {
+        use base64::Engine;
+
+        let b64 = generate_shadow_hash_data("dev").unwrap();
+        assert!(!b64.is_empty());
+        // Verify it's valid base64 that decodes to a binary plist
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .expect("should be valid base64");
+        assert!(decoded.len() > 50, "binary plist should be substantial");
+        // Binary plist magic: "bplist"
+        assert_eq!(&decoded[..6], b"bplist", "should be a binary plist");
     }
 
     #[test]

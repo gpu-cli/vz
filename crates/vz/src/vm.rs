@@ -435,6 +435,21 @@ impl Vm {
     pub fn state_stream(&self) -> watch::Receiver<VmState> {
         self.state_rx.clone()
     }
+
+    /// Attach a `VZVirtualMachineView` to this VM.
+    ///
+    /// Sets the view's `virtualMachine` property so it renders this VM's
+    /// framebuffer. Must be called from the main thread (AppKit requirement).
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure this is called from the main thread.
+    pub unsafe fn attach_view(
+        &self,
+        view: &objc2_virtualization::VZVirtualMachineView,
+    ) {
+        unsafe { view.setVirtualMachine(Some(&self.handle.vm)) };
+    }
 }
 
 impl std::fmt::Debug for Vm {

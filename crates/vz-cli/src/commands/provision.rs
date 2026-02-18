@@ -78,6 +78,7 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
 
     println!("Image provisioned successfully: {}", image.display());
     println!("  User: {} (UID {}, auto-login enabled)", user_config.username, user_config.uid);
+    println!("  Password: {}", user_config.password);
     if agent_path.is_some() {
         println!("  Guest agent: installed (starts automatically on boot)");
     }
