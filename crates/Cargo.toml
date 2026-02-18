@@ -4,6 +4,7 @@ members = [
     "vz",
     "vz-sandbox",
     "vz-cli",
+    "vz-guest-agent",
 ]
 
 [workspace.package]
@@ -16,29 +17,60 @@ repository = "https://github.com/jameslal/vz"
 # FFI — objc2-virtualization provides auto-generated bindings to all
 # Virtualization.framework classes, eliminating the need for a custom vz-sys crate.
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSObject", "NSString", "NSError", "NSURL", "NSArray"] }
+objc2-foundation = { version = "0.3", features = ["NSObject", "NSString", "NSError", "NSURL", "NSArray", "NSData", "NSProgress"] }
 objc2-virtualization = { version = "0.3", features = [
+    # Core VM
     "VZVirtualMachine",
     "VZVirtualMachineConfiguration",
-    "VZMacOSBootLoader",
-    "VZMacPlatformConfiguration",
-    "VZMacOSRestoreImage",
-    "VZMacOSInstaller",
-    "VZVirtioFileSystemDeviceConfiguration",
-    "VZSharedDirectory",
-    "VZMultipleDirectoryShare",
-    "VZSingleDirectoryShare",
-    "VZVirtioSocketDeviceConfiguration",
-    "VZVirtioSocketDevice",
-    "VZVirtioSocketConnection",
-    "VZDiskImageStorageDeviceAttachment",
-    "VZVirtioBlockDeviceConfiguration",
-    "VZNATNetworkDeviceAttachment",
-    "VZVirtioNetworkDeviceConfiguration",
-    "VZMacGraphicsDeviceConfiguration",
     "VZVirtualMachineDelegate",
     "VZVirtualMachineStartOptions",
     "VZMacOSVirtualMachineStartOptions",
+
+    # Boot and platform (parent class features required by child classes)
+    "VZBootLoader",
+    "VZMacOSBootLoader",
+    "VZPlatformConfiguration",
+    "VZMacPlatformConfiguration",
+    "VZMacOSRestoreImage",
+    "VZMacOSInstaller",
+    "VZMacHardwareModel",
+    "VZMacMachineIdentifier",
+    "VZMacAuxiliaryStorage",
+    "VZMacOSConfigurationRequirements",
+
+    # Storage (parent + child features)
+    "VZStorageDeviceAttachment",
+    "VZStorageDeviceConfiguration",
+    "VZDiskImageStorageDeviceAttachment",
+    "VZVirtioBlockDeviceConfiguration",
+
+    # Shared filesystem (VirtioFS)
+    "VZDirectorySharingDeviceConfiguration",
+    "VZVirtioFileSystemDeviceConfiguration",
+    "VZDirectoryShare",
+    "VZSharedDirectory",
+    "VZMultipleDirectoryShare",
+    "VZSingleDirectoryShare",
+
+    # Vsock
+    "VZSocketDevice",
+    "VZSocketDeviceConfiguration",
+    "VZVirtioSocketDeviceConfiguration",
+    "VZVirtioSocketDevice",
+    "VZVirtioSocketConnection",
+    "VZVirtioSocketListener",
+
+    # Network (parent + child features)
+    "VZNetworkDeviceAttachment",
+    "VZNetworkDeviceConfiguration",
+    "VZNATNetworkDeviceAttachment",
+    "VZVirtioNetworkDeviceConfiguration",
+
+    # Display
+    "VZGraphicsDeviceConfiguration",
+    "VZMacGraphicsDeviceConfiguration",
+
+    # Block and dispatch interop
     "block2",
     "dispatch2",
 ] }
@@ -59,9 +91,26 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+
+# Shell parsing
+shell-words = "1"
+
+# System
+libc = "0.2"
+
+# HTTP / Download
+reqwest = { version = "0.12", features = ["stream"] }
+tokio-stream = "0.1"
+
+# Progress UI
+indicatif = "0.17"
+
+# Testing
+tempfile = "3"
 
 # Internal crates
 vz = { path = "vz" }

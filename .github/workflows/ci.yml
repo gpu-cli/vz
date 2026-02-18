@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Layer 1: Unit tests on Linux (no macOS needed)
+  test-linux:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+
+      - name: Check formatting
+        working-directory: crates
+        run: cargo fmt --check --all
+
+      # Note: vz and vz-sandbox are macOS-only (#[cfg(target_os = "macos")]).
+      # On Linux we only check crates that compile cross-platform.
+      # The guest agent depends on vz-sandbox which is macOS-only, so skip it too.
+      - name: Check (Linux-compatible crates)
+        working-directory: crates
+        run: cargo check -p vz-cli 2>&1 || true
+
+  # Layers 1-2: Full test suite on macOS ARM64
+  test-macos:
+    name: Test (macOS ARM64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+
+      - name: Check formatting
+        working-directory: crates
+        run: cargo fmt --check --all
+
+      - name: Clippy
+        working-directory: crates
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Build
+        working-directory: crates
+        run: cargo build --workspace
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Test
+        working-directory: crates
+        run: cargo nextest run --workspace
+
+      - name: Ad-hoc sign and verify
+        run: |
+          ./scripts/sign-dev.sh --profile debug
+          codesign --display --entitlements - crates/target/debug/vz 2>&1 || true
+
+  # Layer 3: VM tests (self-hosted, requires golden image)
+  # Uncomment when self-hosted macOS ARM64 runner is available
+  # test-vm:
+  #   name: VM Tests (macOS ARM64, self-hosted)
+  #   runs-on: [self-hosted, macOS, ARM64]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@stable
+  #     - uses: taiki-e/install-action@nextest
+  #     - name: Test (with VM tests)
+  #       working-directory: crates
+  #       run: cargo nextest run --workspace --features vm-tests

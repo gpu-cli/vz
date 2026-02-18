@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build-sign-release:
+    name: Build, Sign & Release
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binaries
+        working-directory: crates
+        run: |
+          cargo build --release -p vz-cli
+          cargo build --release -p vz-guest-agent
+
+      # --- Import Developer ID certificate ---
+      - name: Import signing certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH="$RUNNER_TEMP/certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
+
+          echo -n "$APPLE_CERTIFICATE" | base64 --decode -o "$CERTIFICATE_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
+
+          # Save keychain path for later cleanup
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> "$GITHUB_ENV"
+
+      # --- Sign vz-cli with Developer ID + hardened runtime ---
+      - name: Sign vz-cli
+        run: |
+          codesign --sign "Developer ID Application: Conduit Ventures, Inc (QSL4ZJ5R3J)" \
+            --keychain "$KEYCHAIN_PATH" \
+            --entitlements entitlements/vz-cli.entitlements.plist \
+            --options runtime \
+            --timestamp \
+            --force \
+            crates/target/release/vz
+
+          codesign --verify --verbose crates/target/release/vz
+
+      # --- Sign vz-guest-agent (ad-hoc, no entitlements needed) ---
+      - name: Sign vz-guest-agent
+        run: |
+          codesign --sign "Developer ID Application: Conduit Ventures, Inc (QSL4ZJ5R3J)" \
+            --keychain "$KEYCHAIN_PATH" \
+            --options runtime \
+            --timestamp \
+            --force \
+            crates/target/release/vz-guest-agent
+
+          codesign --verify --verbose crates/target/release/vz-guest-agent
+
+      # --- Notarize vz-cli ---
+      - name: Notarize vz-cli
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          ditto -c -k --keepParent crates/target/release/vz vz-notarize.zip
+
+          xcrun notarytool submit vz-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          rm vz-notarize.zip
+
+      # --- Notarize vz-guest-agent ---
+      - name: Notarize vz-guest-agent
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          ditto -c -k --keepParent crates/target/release/vz-guest-agent vz-guest-agent-notarize.zip
+
+          xcrun notarytool submit vz-guest-agent-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          rm vz-guest-agent-notarize.zip
+
+      # --- Package ---
+      - name: Package release artifacts
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # vz-cli
+          tar -czf "vz-darwin-arm64.tar.gz" -C crates/target/release vz
+          shasum -a 256 "vz-darwin-arm64.tar.gz" > "vz-darwin-arm64.tar.gz.sha256"
+
+          # vz-guest-agent
+          tar -czf "vz-guest-agent-darwin-arm64.tar.gz" -C crates/target/release vz-guest-agent
+          shasum -a 256 "vz-guest-agent-darwin-arm64.tar.gz" > "vz-guest-agent-darwin-arm64.tar.gz.sha256"
+
+      # --- Publish to GitHub Releases ---
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            vz-darwin-arm64.tar.gz
+            vz-darwin-arm64.tar.gz.sha256
+            vz-guest-agent-darwin-arm64.tar.gz
+            vz-guest-agent-darwin-arm64.tar.gz.sha256
+
+      # --- Cleanup ---
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          if [[ -n "${KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+          fi

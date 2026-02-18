@@ -1,33 +1,29 @@
 [package]
-name = "vz-cli"
+name = "vz-guest-agent"
 version = "0.1.0"
-description = "CLI for macOS VM sandbox management"
+description = "Guest agent binary for vz macOS VM sandbox"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "vz"
+name = "vz-guest-agent"
 path = "src/main.rs"
 
 [dependencies]
-vz-sandbox = { workspace = true }
-vz = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }
-clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+base64 = { workspace = true }
+anyhow = { workspace = true }
 libc = { workspace = true }
-reqwest = { workspace = true }
-tokio-stream = { workspace = true }
-indicatif = { workspace = true }
+clap = { workspace = true }
 
-[dev-dependencies]
-tempfile = { workspace = true }
+# Reuse protocol types from vz-sandbox
+vz-sandbox = { workspace = true }
 
 [lints]
 workspace = true

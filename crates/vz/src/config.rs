@@ -8,6 +8,8 @@ use crate::VzError;
 #[derive(Debug, Clone)]
 pub enum BootLoader {
     /// Boot macOS from a disk image.
+    ///
+    /// Requires `MacPlatformConfig` to be set via `VmConfigBuilder::mac_platform`.
     MacOS,
     /// Boot Linux with a kernel, optional initrd, and command line.
     Linux {
@@ -15,6 +17,23 @@ pub enum BootLoader {
         initrd: Option<PathBuf>,
         cmdline: String,
     },
+}
+
+/// macOS platform configuration for Apple Silicon VMs.
+///
+/// These files are generated during `install_macos` and must be preserved
+/// across VM restarts. They identify the virtual hardware to the guest OS.
+#[derive(Debug, Clone)]
+pub struct MacPlatformConfig {
+    /// Path to the hardware model data file.
+    /// Created during macOS installation from the IPSW restore image.
+    pub hardware_model_path: PathBuf,
+    /// Path to the machine identifier data file.
+    /// A unique identifier for this VM instance.
+    pub machine_identifier_path: PathBuf,
+    /// Path to the auxiliary storage file (NVRAM equivalent).
+    /// Contains boot configuration and OS settings.
+    pub auxiliary_storage_path: PathBuf,
 }
 
 /// A directory shared between host and guest via VirtioFS.
@@ -43,6 +62,7 @@ pub struct VmConfigBuilder {
     cpus: u32,
     memory_bytes: u64,
     boot_loader: Option<BootLoader>,
+    mac_platform: Option<MacPlatformConfig>,
     disk_path: Option<PathBuf>,
     disk_size_bytes: Option<u64>,
     shared_dirs: Vec<SharedDirConfig>,
@@ -58,6 +78,7 @@ impl VmConfigBuilder {
             cpus: 2,
             memory_bytes: 4 * 1024 * 1024 * 1024, // 4 GB
             boot_loader: None,
+            mac_platform: None,
             disk_path: None,
             disk_size_bytes: None,
             shared_dirs: Vec::new(),
@@ -82,6 +103,15 @@ impl VmConfigBuilder {
     /// Set the boot loader.
     pub fn boot_loader(mut self, loader: BootLoader) -> Self {
         self.boot_loader = Some(loader);
+        self
+    }
+
+    /// Set the macOS platform configuration.
+    ///
+    /// Required when using `BootLoader::MacOS`. Provides the hardware model,
+    /// machine identifier, and auxiliary storage paths created during installation.
+    pub fn mac_platform(mut self, config: MacPlatformConfig) -> Self {
+        self.mac_platform = Some(config);
         self
     }
 
@@ -127,6 +157,13 @@ impl VmConfigBuilder {
             .boot_loader
             .ok_or_else(|| VzError::InvalidConfig("boot loader is required".into()))?;
 
+        // macOS boot requires platform configuration
+        if matches!(boot_loader, BootLoader::MacOS) && self.mac_platform.is_none() {
+            return Err(VzError::InvalidConfig(
+                "macOS boot loader requires mac_platform configuration".into(),
+            ));
+        }
+
         let disk_path = self
             .disk_path
             .ok_or_else(|| VzError::InvalidConfig("disk path is required".into()))?;
@@ -135,6 +172,7 @@ impl VmConfigBuilder {
             cpus: self.cpus,
             memory_bytes: self.memory_bytes,
             boot_loader,
+            mac_platform: self.mac_platform,
             disk_path,
             disk_size_bytes: self.disk_size_bytes,
             shared_dirs: self.shared_dirs,
@@ -152,15 +190,20 @@ impl Default for VmConfigBuilder {
 }
 
 /// Validated VM configuration, ready to create a VM.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VmConfig {
     pub(crate) cpus: u32,
     pub(crate) memory_bytes: u64,
     pub(crate) boot_loader: BootLoader,
+    pub(crate) mac_platform: Option<MacPlatformConfig>,
     pub(crate) disk_path: PathBuf,
+    /// Used when creating new disk images (e.g., during install).
+    #[allow(dead_code)]
     pub(crate) disk_size_bytes: Option<u64>,
     pub(crate) shared_dirs: Vec<SharedDirConfig>,
     pub(crate) network: NetworkConfig,
     pub(crate) vsock: bool,
+    /// Controls whether to attach a virtual display. Used by CLI layer.
+    #[allow(dead_code)]
     pub(crate) headless: bool,
 }

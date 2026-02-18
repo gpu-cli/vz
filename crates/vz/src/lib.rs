@@ -22,7 +22,7 @@
 //!     .enable_vsock()
 //!     .build()?;
 //!
-//! let vm = vz::Vm::create(config)?;
+//! let vm = vz::Vm::create(config).await?;
 //! vm.start().await?;
 //!
 //! // Connect to guest agent over vsock
@@ -38,13 +38,16 @@
 // unsafe is required for objc2 FFI calls — kept minimal and contained
 #![allow(unsafe_code)]
 
+pub(crate) mod bridge;
 pub mod config;
 pub mod error;
+pub mod install;
+pub mod virtio_fs;
 pub mod vm;
 pub mod vsock;
-pub mod virtio_fs;
 
-pub use config::{BootLoader, SharedDirConfig, VmConfigBuilder};
+pub use config::{BootLoader, MacPlatformConfig, SharedDirConfig, VmConfigBuilder};
 pub use error::VzError;
+pub use install::{InstallResult, IpswSource, fetch_latest_ipsw_url, install_macos};
 pub use vm::{Vm, VmState};
 pub use vsock::{VsockListener, VsockStream};
