@@ -103,6 +103,32 @@ vz stop my-vm [--force]
 - Default: sends graceful stop request
 - `--force`: immediate termination
 
+### `vz cache`
+
+Manage cached files (IPSWs, partial downloads).
+
+```
+vz cache list             # Show cached files and sizes
+vz cache clean            # Delete cached IPSWs (images and states kept)
+vz cache clean --all      # Delete everything in ~/.vz/cache/
+```
+
+### `vz cleanup`
+
+Detect and clean up orphaned VMs (stale PIDs, leaked resources).
+
+```
+vz cleanup
+```
+
+### `vz self-sign`
+
+Ad-hoc sign the vz binary with required entitlements. Needed after `cargo install vz-cli`.
+
+```
+vz self-sign
+```
+
 ## Global Options
 
 ```
@@ -127,6 +153,58 @@ VMs are tracked in `~/.vz/vms.json`:
 }
 ```
 
+## Orphaned VM Detection
+
+### The Problem
+
+macOS VMs created via Virtualization.framework persist even if the parent process crashes. If `vz run` is killed (SIGKILL, power loss, system crash), the VM keeps running but the CLI process is gone. The VM registry (`~/.vz/vms.json`) shows the VM as "running" with a stale PID.
+
+On next invocation, `vz run` may fail due to the 2-VM limit being exhausted by orphaned VMs, or resources may be silently consumed.
+
+### Detection
+
+On every `vz` command that interacts with VMs (`run`, `list`, `exec`, `stop`):
+
+1. Read `~/.vz/vms.json`.
+2. For each entry with `"state": "running"`:
+   a. Check if the PID is still alive: `kill(pid, 0)`.
+   b. If the process is dead, mark the entry as orphaned.
+3. Report orphaned VMs to the user.
+
+### Cleanup
+
+```
+vz cleanup
+```
+
+- Lists orphaned VMs (stale PID, no running process).
+- Attempts to stop any still-running VMs (the VM process may have been reparented to launchd).
+- Removes stale entries from the registry.
+- Reports freed resources.
+
+### Automatic Cleanup on `vz run`
+
+If `vz run` detects orphaned VMs and the 2-VM limit would be exceeded:
+
+1. Print warning: "Found orphaned VM 'my-vm' (PID 12345 no longer running). Cleaning up..."
+2. Clean up the orphaned entry.
+3. Proceed with the new VM.
+
+This ensures `vz run` always works if there is capacity, without requiring the user to manually run `vz cleanup`.
+
+### PID File
+
+Each running VM also writes a PID file at `~/.vz/run/<name>.pid` for faster detection:
+
+```
+~/.vz/
+├── run/
+│   ├── my-vm.pid      # Contains PID of the vz process managing this VM
+│   └── my-vm.lock     # flock() held while VM is running
+```
+
+The `.lock` file uses `flock()` — if the lock is not held, the VM is orphaned regardless of what the PID file says. This handles PID reuse correctly.
+
 ## Configuration File
 
 Optional `~/.vz/config.toml`:
@@ -143,3 +221,52 @@ dir = "~/.vz/images"
 [states]
 dir = "~/.vz/states"
 ```
+
+## Distribution
+
+### cargo install (Build from Source)
+
+```bash
+cargo install vz-cli
+```
+
+After installation, users must ad-hoc sign the binary (Virtualization.framework requires the `com.apple.security.virtualization` entitlement):
+
+```bash
+codesign --sign - \
+  --entitlements <(curl -sL https://raw.githubusercontent.com/conduit-ventures/vz/main/entitlements/vz-cli.entitlements.plist) \
+  --force \
+  "$(which vz)"
+```
+
+Consider adding a `vz self-sign` command that performs this automatically if the binary is not signed.
+
+### Homebrew Tap (Recommended for End Users)
+
+```bash
+brew tap conduit-ventures/tap
+brew install vz
+```
+
+The Homebrew formula installs a pre-built, signed, and notarized binary. No manual signing step required. The formula is updated automatically by the release workflow.
+
+### GitHub Releases
+
+Each tagged release publishes:
+- `vz-darwin-arm64.tar.gz` — Signed + notarized macOS binary
+- `vz-darwin-arm64.tar.gz.sha256` — SHA256 checksum
+
+### Install Script
+
+```bash
+curl -sSf https://vz.dev/install | sh
+```
+
+The script:
+1. Detects architecture (arm64 required — Intel Macs cannot run macOS guests)
+2. Downloads the latest signed binary from GitHub Releases
+3. Verifies SHA256 checksum
+4. Installs to `~/.vz/bin/vz`
+5. Prints PATH instructions
+
+See `09-signing.md` for full signing and distribution details.

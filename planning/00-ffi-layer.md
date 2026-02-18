@@ -228,13 +228,15 @@ use tokio::sync::watch;
 /// VM lifecycle states visible to the rest of the crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmState {
+    Stopped,
     Starting,
     Running,
     Pausing,
     Paused,
     Resuming,
     Stopping,
-    Stopped,
+    Saving,     // macOS 14+: VM state being written to disk
+    Restoring,  // macOS 14+: VM state being loaded from disk
     Error(String),
 }
 
@@ -483,10 +485,12 @@ The `vz` crate uses cumulative feature flags:
 
 ```toml
 [features]
-default = ["macos-13"]
-macos-13 = []          # Base support
-macos-14 = ["macos-13"] # Adds save/restore
+default = ["macos-14"]
+macos-14 = []          # Base: includes save/restore (project minimum)
+macos-15 = ["macos-14"] # Adds macOS 15 features when relevant
 ```
+
+The project minimum is macOS 14 (Sonoma) because save/restore is essential for the sandbox use case. There is no `macos-13` feature — we do not support macOS 13.
 
 Code gated behind version flags:
 

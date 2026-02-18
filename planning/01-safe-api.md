@@ -694,35 +694,7 @@ The `VMDelegate` is defined using `objc2::define_class!` and implements `VZVirtu
 
 The delegate holds a `watch::Sender<VmState>` (wrapped in a thread-safe container). When a callback fires, it sends the new state through the channel. Any number of receivers can observe state changes.
 
-```rust
-// Internal (in bridge.rs)
-define_class! {
-    pub(crate) struct VMDelegate;
-
-    unsafe impl ClassType for VMDelegate {
-        type Super = NSObject;
-    }
-
-    // ivars
-    impl VMDelegate {
-        state_tx: Mutex<watch::Sender<VmState>>,
-    }
-
-    // delegate methods
-    unsafe impl VZVirtualMachineDelegate for VMDelegate {
-        #[method(guestDidStopVirtualMachine:)]
-        fn guest_did_stop(&self, _vm: &VZVirtualMachine) {
-            let _ = self.state_tx.lock().send(VmState::Stopped);
-        }
-
-        #[method(virtualMachine:didStopWithError:)]
-        fn did_stop_with_error(&self, _vm: &VZVirtualMachine, error: &NSError) {
-            let msg = error.localizedDescription().to_string();
-            let _ = self.state_tx.lock().send(VmState::Error(msg));
-        }
-    }
-}
-```
+The delegate is defined using `define_class!` with the `Cell<Option<watch::Sender>>` pattern described in `00-ffi-layer.md`. Since the delegate executes exclusively on the VM's serial dispatch queue, `Cell` is sufficient and avoids unnecessary locking. See `00-ffi-layer.md` for the complete implementation.
 
 ### Summary: How a Lifecycle Call Flows
 

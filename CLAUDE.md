@@ -4,13 +4,13 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## What is vz
 
-Rust-native interface to Apple's Virtualization.framework for sandboxing coding agents in macOS VMs. Three crate layers:
+Rust-native interface to Apple's Virtualization.framework for sandboxing coding agents in macOS VMs. Three crates:
 
-1. **vz-sys** — Raw Objective-C FFI bindings via `objc2`
-2. **vz** — Safe, ergonomic async Rust API
-3. **vz-sandbox** — High-level sandbox abstraction (pool, sessions, channels)
+1. **vz** — Safe, ergonomic async Rust API wrapping `objc2-virtualization` (auto-generated bindings). All unsafe is internal; public API is 100% safe Rust.
+2. **vz-sandbox** — High-level sandbox abstraction (pool, sessions, channels, guest agent)
+3. **vz-cli** — Standalone CLI for managing macOS VMs without writing Rust
 
-Plus **vz-cli** for standalone use without writing Rust.
+There is no `vz-sys` crate. The `objc2-virtualization` crate (v0.3.2) provides auto-generated bindings to all Virtualization.framework classes, eliminating the need for hand-written FFI.
 
 ## Build & Development Commands
 
@@ -21,7 +21,6 @@ All Rust commands run from `crates/` (workspace root):
 cd crates && cargo build --workspace
 
 # Build single crate
-cd crates && cargo build -p vz-sys
 cd crates && cargo build -p vz
 
 # Test
@@ -45,13 +44,13 @@ cd crates && cargo fmt --workspace
 │  `vz run --image base --mount project:./workspace`  │
 ├─────────────────────────────────────────────────────┤
 │                   vz-sandbox                        │
-│  Pool, Session, Channel — high-level sandbox API    │
+│  Pool, Session, Channel, Guest Agent binary         │
 ├─────────────────────────────────────────────────────┤
 │                      vz                             │
 │  Safe Rust: Vm, Config, VirtioFs, Vsock, SaveState  │
 ├─────────────────────────────────────────────────────┤
-│                    vz-sys                           │
-│  Raw FFI: objc2 bindings to Virtualization.framework│
+│              objc2-virtualization v0.3.2             │
+│  Auto-generated bindings to ALL Vz.framework classes│
 ├─────────────────────────────────────────────────────┤
 │           Apple Virtualization.framework            │
 │              (macOS 14+ / Apple Silicon)            │
@@ -62,16 +61,15 @@ cd crates && cargo fmt --workspace
 
 | Crate | Purpose |
 |-------|---------|
-| `vz-sys` | Raw unsafe FFI bindings to Virtualization.framework using `objc2` + `block2` |
-| `vz` | Safe async Rust API — Vm, VmConfig, VirtioFs, Vsock, SaveState |
-| `vz-sandbox` | High-level sandbox — SandboxPool, SandboxSession, typed Channel |
+| `vz` | Safe async Rust API — Vm, VmConfig, VirtioFs, Vsock, SaveState. Wraps `objc2-virtualization` directly. |
+| `vz-sandbox` | High-level sandbox — SandboxPool, SandboxSession, typed Channel, guest agent binary |
 | `vz-cli` | CLI binary — `vz init`, `vz run`, `vz exec`, `vz save/restore` |
 
 ### Key Design Decisions
 
 - **macOS 14 (Sonoma) minimum** — required for save/restore VM state
 - **Apple Silicon only** — macOS guest VMs require Apple Silicon
-- **objc2 for FFI** — compile-time verification, safe memory management, block support
+- **objc2-virtualization for FFI** — auto-generated bindings, no hand-written sys crate, compile-time verification
 - **Async-first (tokio)** — all VM ops bridge ObjC completion handlers to tokio futures
 - **Long-lived VM model** — single VM stays running, project dirs swapped via VirtioFS mounts
 - **vsock for communication** — host↔guest channel without network config
@@ -96,8 +94,7 @@ cd crates && cargo fmt --workspace
 - Edition 2024, minimum Rust 1.85.0.
 - Error handling: `thiserror` for library errors, `anyhow` for application/CLI errors.
 - All public APIs must be documented with `///` doc comments.
-- FFI layer (`vz-sys`): unsafe is expected but must be minimal and well-commented.
-- Safe layer (`vz`): zero unsafe in public API — all unsafety contained in vz-sys.
+- All `unsafe` is contained within the `vz` crate's internal `bridge.rs` module. The public API surface is 100% safe Rust. No other crate in the workspace should contain `unsafe`.
 
 ### Platform Gating
 
@@ -116,15 +113,17 @@ compile_error!("vz requires macOS");
 ObjC completion handlers → tokio futures:
 
 ```rust
-// In vz-sys: raw ObjC call with block completion handler
-// In vz: wrap with tokio::sync::oneshot to produce a Future
+// In vz bridge.rs: dispatch onto serial queue, create RcBlock with Cell<Option<Sender>>,
+// ObjC completion handler calls tx.take().send(result),
+// public async fn awaits the oneshot receiver
 ```
 
 ## Dependencies
 
 Core dependencies:
-- `objc2` + `objc2-foundation` — Objective-C interop
+- `objc2` + `objc2-foundation` + `objc2-virtualization` — Objective-C interop and Virtualization.framework bindings
 - `block2` — Objective-C block support (for completion handlers)
+- `dispatch2` — GCD serial queue management (mandatory for VZVirtualMachine)
 - `tokio` — async runtime
 - `tracing` — logging
 - `thiserror` / `anyhow` — error handling
@@ -134,7 +133,8 @@ Core dependencies:
 ## Planning & Design
 
 Design documents live in `planning/`:
-- `planning/README.md` — Full design doc with API sketches and implementation plan
+- `planning/README.md` — Master architecture overview, crate responsibilities, implementation phases
+- 10 detailed planning docs (00-09) covering FFI, safe API, VirtioFS, vsock protocol, guest agent, sandbox, CLI, golden image, testing, and code signing
 
 ## Testing Strategy
 

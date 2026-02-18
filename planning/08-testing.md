@@ -4,7 +4,7 @@
 
 Testing a virtualization library is hard because:
 
-- Tests need macOS + Apple Silicon (no CI on GitHub Actions)
+- VM tests need macOS + Apple Silicon (self-hosted runner required)
 - VM operations are slow (boot: 30-60s, operations: seconds)
 - Tests need a golden image to exist
 - 2-VM limit constrains parallel test execution
@@ -15,11 +15,11 @@ Testing a virtualization library is hard because:
 
 - Config validation (`VmConfigBuilder`)
 - Error types
-- Wire protocol serialization/deserialization (`Request`/`Response` enums)
+- Wire protocol serialization/deserialization (`Request`/`Response` enums, including handshake)
 - State machine transitions (`VmState`)
-- Channel framing (length-prefixed JSON encode/decode)
+- Channel framing (length-prefixed JSON encode/decode, base64 round-trip)
 
-Run with: `cargo test --workspace`
+Run with: `cargo nextest run --workspace`
 
 These should be the majority of tests and run fast.
 
@@ -30,7 +30,7 @@ These should be the majority of tests and run fast.
 - `VZVirtualMachineConfiguration` validation
 - Feature detection (`isSupported`, etc.)
 
-Run with: `cargo test --workspace` on macOS (skip on other platforms with `#[cfg(target_os = "macos")]`)
+Run with: `cargo nextest run --workspace` on macOS (skip on other platforms with `#[cfg(target_os = "macos")]`)
 
 ### Layer 3: VM Tests (need macOS + golden image)
 
@@ -38,10 +38,11 @@ Run with: `cargo test --workspace` on macOS (skip on other platforms with `#[cfg
 - VirtioFS mount verification
 - vsock connection
 - Save/restore state
-- Guest agent communication
-- `SandboxSession` exec
+- Guest agent communication (including handshake negotiation)
+- `SandboxSession` exec (with timeout, as user, as root)
+- Session isolation (RestoreOnAcquire produces clean state)
 
-Run with: `cargo test --workspace --features vm-tests`
+Run with: `cargo nextest run --workspace --features vm-tests`
 
 Behind a feature flag because they need:
 
@@ -51,16 +52,19 @@ Behind a feature flag because they need:
 
 ### Layer 4: End-to-End Tests (CLI)
 
+- `vz init` (with a local IPSW, skip download)
 - `vz run` + `vz exec` + `vz stop` cycle
 - `vz save` + `vz restore` cycle
-- Error cases (missing image, invalid config)
+- `vz cache list` / `vz cache clean`
+- `vz cleanup` (orphaned VM detection)
+- Error cases (missing image, invalid config, insufficient disk space)
 
-Run with: shell scripts or `cargo test -p vz-cli --features e2e-tests`
+Run with: shell scripts or `cargo nextest run -p vz-cli --features e2e-tests`
 
 ## CI Strategy
 
-- **GitHub Actions (Linux/Windows)**: Run Layer 1 only (unit tests, no macOS needed)
-- **Self-hosted macOS runner**: Run Layers 1-3
+- **GitHub Actions (Linux)**: Run Layer 1 only (unit tests, cross-platform code compiles)
+- **Self-hosted macOS ARM64 runner**: Run Layers 1-3 (requires Apple Silicon + golden image)
 - **Manual**: Layer 4 (E2E) before releases
 
 ## Test Fixtures
@@ -69,7 +73,8 @@ Run with: shell scripts or `cargo test -p vz-cli --features e2e-tests`
 
 - Sample IPSW metadata (mock, not actual IPSW)
 - Sample config files
-- Wire protocol test vectors (JSON)
+- Wire protocol test vectors (JSON, including handshake and base64-encoded data)
+- Entitlements plist for signing verification
 
 ## Mocking
 
@@ -91,7 +96,7 @@ Use `criterion` crate, behind `--features bench` flag.
 ```
 crates/vz/tests/
 ├── config_test.rs       # Layer 1: config validation
-├── protocol_test.rs     # Layer 1: wire protocol
+├── protocol_test.rs     # Layer 1: wire protocol (including base64, handshake)
 ├── state_test.rs        # Layer 1: state machine
 ├── bridge_test.rs       # Layer 2: ObjC bridging
 ├── vm_lifecycle.rs      # Layer 3: full VM tests
@@ -100,6 +105,7 @@ crates/vz/tests/
 crates/vz-sandbox/tests/
 ├── pool_test.rs         # Layer 1: pool logic
 ├── channel_test.rs      # Layer 1: channel framing
+├── error_test.rs        # Layer 1: SandboxError variants
 └── session_test.rs      # Layer 3: full session lifecycle
 
 crates/vz-cli/tests/

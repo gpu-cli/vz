@@ -37,14 +37,14 @@ pub use channel::Channel;
 
 ```rust
 pub struct SandboxConfig {
-    /// Path to the golden disk image (e.g., ~/.vz/images/macos-15.ipsw.disk)
+    /// Path to the golden disk image (e.g., ~/.vz/images/base.img)
     pub image_path: PathBuf,
 
     /// CPU cores allocated to each VM (default: 4)
-    pub cpus: u32,
+    pub cpus: u8,
 
     /// Memory in GB allocated to each VM (default: 8)
-    pub memory_gb: u32,
+    pub memory_gb: u64,
 
     /// Path to a saved VM state for fast restore (skip full boot)
     /// If None, VMs cold-boot from the disk image
@@ -62,8 +62,8 @@ impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
             image_path: PathBuf::new(), // must be set
-            cpus: 4,
-            memory_gb: 8,
+            cpus: 4,       // Higher than vz crate default (2) — sandbox workloads need more
+            memory_gb: 8,  // Higher than vz crate default (4) — compilation is memory-hungry
             state_path: None,
             workspace_mount: PathBuf::new(), // must be set
             agent_port: 7424,
@@ -156,10 +156,15 @@ pub struct SandboxSession {
 ```rust
 impl SandboxSession {
     /// Execute a command and wait for completion. Returns collected output.
-    pub async fn exec(&self, cmd: &str) -> Result<ExecOutput>;
+    /// Timeout is optional — falls back to SandboxConfig.default_exec_timeout if None.
+    pub async fn exec(&self, cmd: &str, timeout: Option<Duration>) -> Result<ExecOutput>;
 
     /// Execute a command and return a stream of output events.
-    pub async fn exec_streaming(&self, cmd: &str) -> Result<ExecStream>;
+    /// If timeout is set, the stream will error after the duration.
+    pub async fn exec_streaming(&self, cmd: &str, timeout: Option<Duration>) -> Result<ExecStream>;
+
+    /// Execute a command as root (bypasses default user: "dev").
+    pub async fn exec_as_root(&self, cmd: &str, timeout: Option<Duration>) -> Result<ExecOutput>;
 
     /// The guest-side path to the project directory (e.g., "/mnt/workspace/my-project").
     pub fn project_path(&self) -> &str;
@@ -169,20 +174,22 @@ impl SandboxSession {
 ### exec (blocking)
 
 ```rust
-pub async fn exec(&self, cmd: &str) -> Result<ExecOutput> {
+pub async fn exec(&self, cmd: &str, timeout: Option<Duration>) -> Result<ExecOutput> {
     let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+    let timeout = timeout.or(self.config.default_exec_timeout);
 
     // Parse command into program + args (shell-split)
     let parts = shell_words::split(cmd)?;
     let (command, args) = parts.split_first().context("empty command")?;
 
-    // Send Exec request
+    // Send Exec request (default: run as "dev" user, not root)
     self.agent.send(Request::Exec {
         id,
         command: command.to_string(),
         args: args.iter().map(|s| s.to_string()).collect(),
         working_dir: Some(self.guest_project_path.clone()),
         env: vec![],
+        user: Some("dev".to_string()),
     }).await?;
 
     // Collect output until ExitCode
@@ -373,10 +380,10 @@ The complete lifecycle from pool creation to session teardown:
 
 ```rust
 let config = SandboxConfig {
-    image_path: PathBuf::from("/Users/dev/.vz/images/macos-15.disk"),
+    image_path: PathBuf::from("/Users/dev/.vz/images/base.img"),
     cpus: 4,
     memory_gb: 8,
-    state_path: Some(PathBuf::from("/Users/dev/.vz/state/warm.vmstate")),
+    state_path: Some(PathBuf::from("/Users/dev/.vz/states/base.state")),
     workspace_mount: PathBuf::from("/Users/dev/workspace"),
     agent_port: 7424,
 };
@@ -442,3 +449,198 @@ sandbox_pool.release(session).await?;
 ```
 
 The sandbox pool replaces Docker as the worker backend — instead of creating containers, HQ acquires sandbox sessions from the pool. The guest VM runs macOS natively with full Xcode/Swift/system framework support, which Docker on macOS cannot provide.
+
+## Session Isolation
+
+### The Problem
+
+The pool reuses VMs across sessions without rebooting. If session A installs malware, modifies system binaries, or plants a credential harvester, session B inherits all of it. For a sandbox library designed to run untrusted agent code, this is a security gap.
+
+### Isolation Modes
+
+`SandboxConfig` supports two isolation modes. The consumer chooses based on their security requirements.
+
+```rust
+pub enum IsolationMode {
+    /// Fast: VM stays running between sessions. No filesystem reset.
+    /// Use when sessions are trusted or when speed matters more than isolation.
+    /// ~0ms acquire time (just reconnect to guest agent).
+    Reuse,
+
+    /// Secure: VM is restored from saved state between sessions.
+    /// Every session starts from a clean, known-good snapshot.
+    /// Use when running untrusted agent code.
+    /// ~5-10s acquire time (restore from saved state).
+    RestoreOnAcquire,
+}
+```
+
+Added to `SandboxConfig`:
+
+```rust
+pub struct SandboxConfig {
+    // ... existing fields ...
+
+    /// How to isolate sessions from each other (default: RestoreOnAcquire)
+    pub isolation: IsolationMode,
+}
+```
+
+### RestoreOnAcquire Flow
+
+When `isolation == RestoreOnAcquire`:
+
+1. **acquire()** — Instead of reusing the running VM:
+   a. Stop the current VM (force stop, fast — not graceful).
+   b. Restore from `state_path` (the clean saved state with guest agent running).
+   c. Wait for guest agent to respond to `Ping`.
+   d. Connect and return the session.
+
+2. **release()** — Same as before (kill child processes, disconnect).
+
+The saved state file is created once during `vz init` (after golden image is provisioned and guest agent is confirmed running). It represents the "clean room" — no user data, no session artifacts, just a booted macOS with the guest agent listening.
+
+### Why Not APFS Snapshots
+
+macOS supports APFS snapshots (`tmutil localsnapshot`), which could theoretically provide filesystem rollback without a full VM restart. However:
+
+- APFS snapshots are copy-on-write at the block level — rolling back a snapshot does not kill running processes or reset in-memory state.
+- A compromised guest agent or running malware survives an APFS rollback.
+- Snapshot management inside the guest requires root access and coordination with the host.
+- VM state restore is simpler, more complete (resets CPU, memory, disk, and all process state), and already supported by the `vz` crate.
+
+VM state restore is the right tool for this job.
+
+### Default
+
+The default isolation mode is `RestoreOnAcquire`. The 5-10s overhead is acceptable for the sandbox use case (agent sessions run for minutes to hours). Consumers who need faster turnover can opt into `Reuse` with full awareness of the security tradeoff.
+
+## Exec Timeouts
+
+### Per-Exec Timeout
+
+The `exec` and `exec_streaming` methods accept an optional timeout:
+
+```rust
+impl SandboxSession {
+    /// Execute a command with a timeout. Returns ExecOutput or times out.
+    pub async fn exec(&self, cmd: &str, timeout: Option<Duration>) -> Result<ExecOutput>;
+
+    /// Execute a command and return a stream of output events.
+    /// If timeout is set, the stream will error after the duration.
+    pub async fn exec_streaming(&self, cmd: &str, timeout: Option<Duration>) -> Result<ExecStream>;
+}
+```
+
+When a timeout fires:
+1. Send `Signal { exec_id, signal: SIGTERM }` to the guest agent.
+2. Wait 5 seconds for the process to exit.
+3. If still running, send `Signal { exec_id, signal: SIGKILL }`.
+4. Return `SandboxError::ExecTimeout` with whatever stdout/stderr was collected.
+
+### SandboxError
+
+The `vz-sandbox` crate defines its own error type (separate from `vz::VzError`):
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum SandboxError {
+    #[error("exec timed out after {0:?}")]
+    ExecTimeout(Duration),
+
+    #[error("pool exhausted: all VMs are in use")]
+    PoolExhausted,
+
+    #[error("project dir {0} is not under workspace mount {1}")]
+    ProjectOutsideWorkspace(PathBuf, PathBuf),
+
+    #[error("guest agent unreachable after {attempts} attempts")]
+    AgentUnreachable { attempts: u32 },
+
+    #[error("handshake failed: {0}")]
+    HandshakeFailed(String),
+
+    #[error(transparent)]
+    Vm(#[from] vz::VzError),
+
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+```
+
+### Session-Level Timeout
+
+`SandboxConfig` supports a default timeout applied to all exec calls in a session:
+
+```rust
+pub struct SandboxConfig {
+    // ... existing fields ...
+
+    /// Default timeout for exec calls. None = no timeout.
+    /// Can be overridden per-exec.
+    pub default_exec_timeout: Option<Duration>,
+}
+```
+
+### Timeout Hierarchy
+
+1. Per-exec timeout (if provided) takes precedence.
+2. Session-level `default_exec_timeout` applies if no per-exec timeout.
+3. If neither is set, exec runs indefinitely (caller's responsibility to manage).
+
+## Network Isolation
+
+### The Problem
+
+By default, VMs created with `VmConfigBuilder` get NAT networking. This means an agent running inside the sandbox can make arbitrary outbound connections — exfiltrating data, downloading malware, or reaching internal services.
+
+For a security-focused sandbox, the default should be restrictive.
+
+### Network Policy in SandboxConfig
+
+```rust
+pub enum NetworkPolicy {
+    /// No network device attached to the VM.
+    /// The guest has no network interface at all.
+    /// Use for maximum isolation when network access is not needed.
+    None,
+
+    /// NAT networking — guest can reach the internet via host's network.
+    /// No inbound connections from the network to the guest.
+    Nat,
+}
+```
+
+Added to `SandboxConfig`:
+
+```rust
+pub struct SandboxConfig {
+    // ... existing fields ...
+
+    /// Network policy for sandbox VMs (default: None)
+    pub network: NetworkPolicy,
+}
+```
+
+### Default: No Network
+
+The sandbox layer defaults to `NetworkPolicy::None`. This is the secure default — an agent that needs network access must explicitly opt in.
+
+This is distinct from the `vz` crate's `VmConfigBuilder`, which defaults to NAT. The `vz` crate is a general-purpose VM library; the sandbox layer is security-first. Different defaults for different abstraction levels.
+
+### Future: Allowlist-Based Filtering
+
+A future `NetworkPolicy::Filtered` variant could provide allowlist-based outbound filtering:
+
+```rust
+NetworkPolicy::Filtered {
+    allow: vec![
+        "crates.io",
+        "registry.npmjs.org",
+        "github.com",
+        "*.githubusercontent.com",
+    ],
+}
+```
+
+This would require a transparent proxy or DNS-based filtering inside the guest. Not in scope for the initial implementation, but the enum is designed to be extended.

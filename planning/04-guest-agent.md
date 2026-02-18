@@ -187,6 +187,10 @@ async fn handle_connection(stream: VsockStream) {
                 let info = collect_system_info().await?;
                 send_frame(&writer, Response::SystemInfoResult { id, ..info }).await?;
             }
+            Request::ResourceStats { id } => {
+                let stats = collect_resource_stats().await?;
+                send_frame(&writer, Response::ResourceStatsResult { id, ..stats }).await?;
+            }
         }
     }
 }
@@ -329,3 +333,179 @@ The built binary is copied into the golden VM image during image preparation:
 # From the host, copy into the mounted guest disk image
 cp target/release/vz-guest-agent /Volumes/GuestDisk/usr/local/bin/vz-guest-agent
 ```
+
+## Non-Root Command Execution
+
+### The Problem
+
+The guest agent runs as root (via launchd). By default, all `Exec` requests run child processes as root. But most agent workloads should run as the unprivileged `dev` user — compiling code, running tests, editing files. Running everything as root is unnecessarily risky: a buggy agent command could modify system files, install rootkits, or corrupt the macOS installation.
+
+### User Field on Exec
+
+The `Exec` request includes an optional `user` field:
+
+```rust
+Exec {
+    id: u64,
+    command: String,
+    args: Vec<String>,
+    working_dir: Option<String>,
+    env: Vec<(String, String)>,
+    user: Option<String>,  // NEW: run as this user
+}
+```
+
+- If `user` is `None`: run as the agent's user (root). Backwards-compatible with protocol v1.
+- If `user` is `Some("dev")`: run the command as the `dev` user.
+
+### Implementation
+
+On macOS, the agent uses `launchctl asuser` to run the command as the specified user:
+
+```rust
+async fn spawn_as_user(user: &str, command: &str, args: &[String], working_dir: &str) -> Result<Child> {
+    // Get the UID for the username
+    let uid = get_uid_for_user(user)?;
+
+    // Use launchctl asuser to run in the user's context
+    // This sets up the correct Mach bootstrap namespace, which matters
+    // for Xcode toolchain, Homebrew, and other user-scoped services.
+    let child = tokio::process::Command::new("launchctl")
+        .arg("asuser")
+        .arg(uid.to_string())
+        .arg(command)
+        .args(args)
+        .current_dir(working_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::piped())
+        .spawn()?;
+
+    Ok(child)
+}
+```
+
+Why `launchctl asuser` instead of `su` or `sudo -u`:
+- `launchctl asuser` runs the command in the correct Mach bootstrap namespace for the user. This is important on macOS because many developer tools (Xcode, Homebrew, `security` keychain access) depend on the user's bootstrap context.
+- `su` and `sudo -u` change the Unix UID but don't set up the Mach context, which causes subtle failures with macOS-specific tooling.
+
+### Capability Gating
+
+The `user` field requires the `"user_exec"` capability announced during the handshake. If the host sends an `Exec` with `user` set and the guest agent doesn't support it, the agent responds with `ExecError` indicating the capability is missing.
+
+### Default in vz-sandbox
+
+The `SandboxSession` sets `user: Some("dev")` by default. Root execution is available but opt-in:
+
+```rust
+impl SandboxSession {
+    /// Execute as the default user (dev)
+    pub async fn exec(&self, cmd: &str, timeout: Option<Duration>) -> Result<ExecOutput>;
+
+    /// Execute as root
+    pub async fn exec_as_root(&self, cmd: &str, timeout: Option<Duration>) -> Result<ExecOutput>;
+}
+```
+
+## Vsock Security Model
+
+### Attack Surface
+
+The guest agent listens on vsock port 7424. Any process inside the guest can connect to the host via vsock (CID 2). The security question: what happens if a compromised process inside the guest connects to the host?
+
+### Host-Side Validation
+
+The host should only accept vsock connections from expected guest ports. The `vz` crate's `VsockListener` is used by the host to listen for guest-initiated connections. The host must:
+
+1. **Only listen on expected ports** — Don't create a VsockListener unless needed.
+2. **Validate the source** — `VZVirtioSocketConnection` provides the source port. Reject connections from unexpected ports.
+3. **Never expose sensitive operations on vsock** — The host-to-guest channel is for command execution. Any host-side vsock listener should be read-only or tightly scoped.
+
+### Guest-to-Host Direction
+
+In the standard vz architecture, communication is **host-initiated only**: the host connects to the guest agent on port 7424. The guest agent does not initiate connections to the host.
+
+If a compromised process inside the guest attempts to connect to the host on CID 2:
+- There is no listener on the host side (unless the consumer explicitly creates one).
+- The connection is refused.
+- The VM's vsock device does not provide a general-purpose channel to the host — only connections to ports where the host has registered a `VZVirtioSocketListener`.
+
+This is inherently secure: the guest cannot reach the host unless the host explicitly opens a listener.
+
+### Recommendations for Consumers
+
+1. Do not create host-side vsock listeners unless you have a specific use case.
+2. If you do listen for guest-initiated connections, treat all data as untrusted.
+3. The guest agent should be treated as a minimal, auditable component — resist adding features to it that could be exploited (file upload, arbitrary file read, etc.).
+
+## Connection Reconnect and Draining
+
+### The Race Condition
+
+The agent accepts one connection at a time. When the host disconnects and immediately reconnects, there is a window where:
+- The old connection's cleanup (killing child processes) is still running
+- The new connection's `Exec` requests begin executing
+
+This could cause the new session's processes to be killed by the old connection's cleanup.
+
+### Solution: Connection Draining
+
+When the agent detects a disconnect:
+
+1. Enter a "draining" state for the old connection.
+2. Kill all child processes associated with the old connection (SIGTERM → 5s → SIGKILL).
+3. Wait until all processes have exited and the process table is empty.
+4. Only then accept the next connection.
+
+If a new connection arrives during draining, it is queued in the kernel's `listen` backlog (backlog size 1). The `accept` call returns it once draining completes.
+
+### Implementation
+
+```rust
+async fn accept_loop(listener: VsockListener) {
+    loop {
+        let stream = listener.accept().await?;
+        let result = handle_connection(stream).await;
+
+        // Connection ended (EOF, error, or host disconnect).
+        // Drain: kill all child processes before accepting next connection.
+        drain_processes(&process_table).await;
+
+        // Now safe to accept next connection.
+        tracing::info!("connection drained, ready for next");
+    }
+}
+
+async fn drain_processes(table: &ProcessTable) {
+    let mut processes = table.lock().await;
+
+    // SIGTERM all children
+    for (id, entry) in processes.iter() {
+        unsafe { libc::kill(entry.child.id() as i32, libc::SIGTERM); }
+    }
+
+    // Wait up to 5 seconds for graceful exit
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !processes.is_empty() && Instant::now() < deadline {
+        // Check for exited processes
+        let mut exited = vec![];
+        for (id, entry) in processes.iter_mut() {
+            if let Ok(Some(_)) = entry.child.try_wait() {
+                exited.push(*id);
+            }
+        }
+        for id in exited {
+            processes.remove(&id);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // SIGKILL any remaining
+    for (id, entry) in processes.iter() {
+        unsafe { libc::kill(entry.child.id() as i32, libc::SIGKILL); }
+    }
+    processes.clear();
+}
+```
+
+This ensures a clean handoff between sessions with zero risk of cross-session process leakage.

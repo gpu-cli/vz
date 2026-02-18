@@ -50,10 +50,10 @@ There is no Rust library for running macOS VMs as coding agent sandboxes. vz fil
 │  Agent Runtime (HQ, Claude Code)   │     │  Guest Agent (vz-guest-agent)       │
 │       │                            │     │       │                             │
 │       ▼                            │     │       ▼                             │
-│  vz-sandbox::Channel               │     │  vsock listener (port 7450)         │
+│  vz-sandbox::Channel               │     │  vsock listener (port 7424)         │
 │       │                            │     │       │                             │
 │       ▼                            │     │       ▼                             │
-│  vsock (port 7450)  ◄──────────────┼─────┼──  vsock device                     │
+│  vsock (port 7424)  ◄──────────────┼─────┼──  vsock device                     │
 │                                    │     │                                     │
 │  VirtioFS share ────────────────── │ ──► │  /mnt/workspace (auto-mounted)      │
 │  (host: ./my-project)              │     │  (read-write project files)         │
@@ -191,12 +191,13 @@ Phase 1 must complete before Phase 2 or Phase 3 can begin. Phase 2 and Phase 3 c
 | `00-ffi-layer.md` | objc2-virtualization usage patterns, serial dispatch queue requirement, async bridging with block2 + oneshot, delegate implementation strategy |
 | `01-safe-api.md` | vz crate design: Vm lifecycle, VmConfigBuilder, error types, state machine, public API surface |
 | `02-virtio-fs.md` | VirtioFS mount strategy, workspace root pattern, read-only vs read-write, mount tag naming, guest-side auto-mount |
-| `03-vsock-protocol.md` | vsock communication model, wire format (length-prefixed JSON), port assignments, streaming protocol, backpressure |
-| `04-guest-agent.md` | Guest agent binary architecture, bootstrap via launchd, command execution, environment setup, security model |
-| `05-sandbox.md` | vz-sandbox crate: SandboxPool lifecycle, SandboxSession acquire/release, Channel typed protocol, cleanup between sessions |
-| `06-cli.md` | vz-cli commands, UX design, golden image creation workflow, interactive vs headless modes |
-| `07-golden-image.md` | IPSW to bootable macOS VM pipeline, dev tool provisioning, image versioning, distribution |
+| `03-vsock-protocol.md` | vsock communication model, wire format (length-prefixed JSON), port assignments, streaming protocol, backpressure, **connection handshake/version negotiation, base64 binary encoding, ResourceStats** |
+| `04-guest-agent.md` | Guest agent binary architecture, bootstrap via launchd, command execution, environment setup, **non-root execution via user field, vsock security model, connection draining** |
+| `05-sandbox.md` | vz-sandbox crate: SandboxPool lifecycle, SandboxSession acquire/release, Channel typed protocol, **session isolation (RestoreOnAcquire vs Reuse), exec timeouts, network isolation policy** |
+| `06-cli.md` | vz-cli commands, UX design, golden image creation workflow, interactive vs headless modes, **orphaned VM detection, distribution channels** |
+| `07-golden-image.md` | IPSW to bootable macOS VM pipeline, dev tool provisioning, image versioning, **automated first-boot provisioning (skip Setup Assistant, pre-create user), fully unattended vz init flow** |
 | `08-testing.md` | Testing strategy for a virtualization library: unit tests (mock ObjC), integration tests (real VMs), CI on Apple Silicon |
+| `09-signing.md` | **Entitlements (com.apple.security.virtualization), code signing with Developer ID, notarization, CI signing workflow, distribution (Homebrew, GitHub Releases, cargo install, install script)** |
 
 ## Prior Art
 
