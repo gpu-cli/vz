@@ -14,13 +14,13 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use vz_sandbox::channel::{self, ChannelError};
-use vz_sandbox::protocol::{
-    AGENT_PORT, Handshake, HandshakeAck, PROTOCOL_VERSION, Request, Response,
+use vz::protocol::{
+    self as protocol, AGENT_PORT, ChannelError, Handshake, HandshakeAck, PROTOCOL_VERSION, Request,
+    Response,
 };
 
 use crate::listener::VsockListener;
@@ -108,11 +108,10 @@ async fn handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut reader, writer) = tokio::io::split(stream);
-    let writer = Arc::new(Mutex::new(writer));
+    let mut stream = stream;
 
     // Wait for handshake from host
-    let handshake: Handshake = channel::read_frame(&mut reader)
+    let handshake: Handshake = protocol::read_frame(&mut stream)
         .await
         .context("failed to read handshake")?;
 
@@ -132,15 +131,13 @@ where
     let ack = HandshakeAck {
         protocol_version: negotiated_version,
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
-        capabilities: vec!["user_exec".to_string()],
+        os: std::env::consts::OS.to_string(),
+        capabilities: vec!["user_exec".to_string(), "port_forward".to_string()],
     };
 
-    {
-        let mut w = writer.lock().await;
-        channel::write_frame(&mut *w, &ack)
-            .await
-            .context("failed to write handshake ack")?;
-    }
+    protocol::write_frame(&mut stream, &ack)
+        .await
+        .context("failed to write handshake ack")?;
 
     info!(
         negotiated_version,
@@ -148,9 +145,35 @@ where
         "handshake complete"
     );
 
+    // First request may be a dedicated PortForward connection.
+    let first_request: Request = match protocol::read_frame(&mut stream).await {
+        Ok(req) => req,
+        Err(ChannelError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            info!("connection closed by host (EOF)");
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(e).context("failed to read first request frame");
+        }
+    };
+
+    if let Request::PortForward {
+        id,
+        target_port,
+        protocol,
+    } = first_request
+    {
+        handle_port_forward_connection(id, target_port, &protocol, &mut stream).await?;
+        return Ok(());
+    }
+
+    let (mut reader, writer) = tokio::io::split(stream);
+    let writer = Arc::new(Mutex::new(writer));
+    dispatch_request(first_request, writer.clone(), process_table.clone()).await;
+
     // Request dispatch loop
     loop {
-        let request: Request = match channel::read_frame(&mut reader).await {
+        let request: Request = match protocol::read_frame(&mut reader).await {
             Ok(req) => req,
             Err(ChannelError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 info!("connection closed by host (EOF)");
@@ -163,6 +186,72 @@ where
 
         dispatch_request(request, writer.clone(), process_table.clone()).await;
     }
+}
+
+/// Handle a dedicated port-forward connection.
+///
+/// This path requires the first post-handshake request to be `PortForward`.
+/// After `PortForwardReady`, the stream becomes a raw bidirectional pipe.
+async fn handle_port_forward_connection<S>(
+    id: u64,
+    target_port: u16,
+    protocol_name: &str,
+    stream: &mut S,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if protocol_name != "tcp" {
+        protocol::write_frame(
+            stream,
+            &Response::Error {
+                id,
+                error: format!("unsupported port forward protocol: {protocol_name}"),
+            },
+        )
+        .await
+        .context("failed to write PortForward protocol error")?;
+        return Ok(());
+    }
+
+    let mut target = match tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            protocol::write_frame(
+                stream,
+                &Response::Error {
+                    id,
+                    error: format!("failed to connect to localhost:{target_port}: {e}"),
+                },
+            )
+            .await
+            .context("failed to write PortForward connect error")?;
+            return Ok(());
+        }
+    };
+
+    protocol::write_frame(stream, &Response::PortForwardReady { id })
+        .await
+        .context("failed to write PortForwardReady")?;
+
+    let (to_target, to_host) = tokio::io::copy_bidirectional(stream, &mut target)
+        .await
+        .context("port forward relay failed")?;
+
+    info!(
+        id,
+        target_port,
+        bytes_to_target = to_target,
+        bytes_to_host = to_host,
+        "port forward relay finished"
+    );
+
+    // Best-effort graceful shutdown of the guest-side TCP stream.
+    if let Err(e) = target.shutdown().await {
+        warn!(error = %e, "failed to shutdown port-forward target stream");
+    }
+
+    Ok(())
 }
 
 /// Dispatch a single request to the appropriate handler.
@@ -209,6 +298,16 @@ async fn dispatch_request<W>(
         }
         Request::ResourceStats { id } => {
             handle_resource_stats(id, &writer).await;
+        }
+        Request::PortForward { id, .. } => {
+            send_response(
+                &writer,
+                &Response::Error {
+                    id,
+                    error: "port forwarding requires a dedicated connection".to_string(),
+                },
+            )
+            .await;
         }
     }
 }
@@ -674,6 +773,7 @@ fn collect_resource_stats() -> anyhow::Result<ResourceStats> {
 }
 
 /// Get a u32 sysctl value.
+#[cfg(target_os = "macos")]
 fn get_sysctl_u32(name: &str) -> anyhow::Result<u32> {
     use std::ffi::CString;
 
@@ -699,7 +799,21 @@ fn get_sysctl_u32(name: &str) -> anyhow::Result<u32> {
     Ok(value)
 }
 
+/// Get a u32 system value on non-macOS targets.
+#[cfg(not(target_os = "macos"))]
+fn get_sysctl_u32(name: &str) -> anyhow::Result<u32> {
+    match name {
+        "hw.ncpu" => {
+            let count = std::thread::available_parallelism()
+                .map_err(|e| anyhow::anyhow!("failed to get cpu count: {e}"))?;
+            Ok(count.get() as u32)
+        }
+        _ => anyhow::bail!("unsupported sysctl key on this platform: {name}"),
+    }
+}
+
 /// Get a u64 sysctl value.
+#[cfg(target_os = "macos")]
 fn get_sysctl_u64(name: &str) -> anyhow::Result<u64> {
     use std::ffi::CString;
 
@@ -723,6 +837,29 @@ fn get_sysctl_u64(name: &str) -> anyhow::Result<u64> {
     }
 
     Ok(value)
+}
+
+/// Get a u64 system value on non-macOS targets.
+#[cfg(not(target_os = "macos"))]
+fn get_sysctl_u64(name: &str) -> anyhow::Result<u64> {
+    match name {
+        "hw.memsize" => {
+            let meminfo = std::fs::read_to_string("/proc/meminfo")
+                .context("failed to read /proc/meminfo for total memory")?;
+            let line = meminfo
+                .lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .ok_or_else(|| anyhow::anyhow!("MemTotal not found in /proc/meminfo"))?;
+            let kb = line
+                .split_whitespace()
+                .nth(1)
+                .ok_or_else(|| anyhow::anyhow!("MemTotal value missing"))?
+                .parse::<u64>()
+                .context("failed to parse MemTotal from /proc/meminfo")?;
+            Ok(kb * 1024)
+        }
+        _ => anyhow::bail!("unsupported sysctl key on this platform: {name}"),
+    }
 }
 
 /// Get free bytes on a filesystem via statfs.
@@ -762,6 +899,7 @@ fn get_disk_usage(path: &str) -> anyhow::Result<(u64, u64)> {
 }
 
 /// Get the macOS version string.
+#[cfg(target_os = "macos")]
 fn get_os_version() -> String {
     // Try to read from /System/Library/CoreServices/SystemVersion.plist
     // Fallback to "macOS (unknown)"
@@ -772,6 +910,15 @@ fn get_os_version() -> String {
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|s| format!("macOS {}", s.trim()))
         .unwrap_or_else(|| "macOS (unknown)".to_string())
+}
+
+/// Get a Linux version string.
+#[cfg(not(target_os = "macos"))]
+fn get_os_version() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .map(|s| format!("Linux {}", s.trim()))
+        .unwrap_or_else(|| "Linux (unknown)".to_string())
 }
 
 /// Get the number of running processes.
@@ -794,7 +941,7 @@ where
     W: AsyncWrite + Unpin + Send,
 {
     let mut w = writer.lock().await;
-    if let Err(e) = channel::write_frame(&mut *w, response).await {
+    if let Err(e) = protocol::write_frame(&mut *w, response).await {
         error!(error = %e, "failed to send response");
     }
 }
@@ -869,7 +1016,8 @@ async fn drain_processes(process_table: Arc<Mutex<ProcessTable>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vz_sandbox::protocol::{Handshake, Request, Response};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use vz::protocol::{Handshake, Request, Response};
 
     /// Helper: run a connection handler with an in-memory duplex stream.
     async fn run_test_connection<F, Fut>(test_fn: F)
@@ -901,22 +1049,24 @@ mod tests {
                 protocol_version: 1,
                 capabilities: vec![],
             };
-            channel::write_frame(&mut writer, &handshake)
+            protocol::write_frame(&mut writer, &handshake)
                 .await
                 .expect("write handshake");
 
             // Read handshake ack
-            let ack: HandshakeAck = channel::read_frame(&mut reader).await.expect("read ack");
+            let ack: HandshakeAck = protocol::read_frame(&mut reader).await.expect("read ack");
             assert_eq!(ack.protocol_version, 1);
             assert!(!ack.agent_version.is_empty());
+            assert!(!ack.os.is_empty());
+            assert!(ack.capabilities.iter().any(|c| c == "port_forward"));
 
             // Send ping
-            channel::write_frame(&mut writer, &Request::Ping { id: 42 })
+            protocol::write_frame(&mut writer, &Request::Ping { id: 42 })
                 .await
                 .expect("write ping");
 
             // Read pong
-            let resp: Response = channel::read_frame(&mut reader).await.expect("read pong");
+            let resp: Response = protocol::read_frame(&mut reader).await.expect("read pong");
             assert_eq!(resp, Response::Pong { id: 42 });
         })
         .await;
@@ -928,7 +1078,7 @@ mod tests {
             let (mut reader, mut writer) = tokio::io::split(stream);
 
             // Handshake
-            channel::write_frame(
+            protocol::write_frame(
                 &mut writer,
                 &Handshake {
                     protocol_version: 1,
@@ -937,10 +1087,10 @@ mod tests {
             )
             .await
             .expect("handshake");
-            let _ack: HandshakeAck = channel::read_frame(&mut reader).await.expect("ack");
+            let _ack: HandshakeAck = protocol::read_frame(&mut reader).await.expect("ack");
 
             // Send exec
-            channel::write_frame(
+            protocol::write_frame(
                 &mut writer,
                 &Request::Exec {
                     id: 1,
@@ -957,7 +1107,7 @@ mod tests {
             // Collect responses until ExitCode
             let mut stdout_data = Vec::new();
             loop {
-                let resp: Response = channel::read_frame(&mut reader).await.expect("read resp");
+                let resp: Response = protocol::read_frame(&mut reader).await.expect("read resp");
                 match resp {
                     Response::Stdout { data, .. } => {
                         stdout_data.extend_from_slice(&data);
@@ -989,7 +1139,7 @@ mod tests {
             let (mut reader, mut writer) = tokio::io::split(stream);
 
             // Handshake
-            channel::write_frame(
+            protocol::write_frame(
                 &mut writer,
                 &Handshake {
                     protocol_version: 1,
@@ -998,10 +1148,10 @@ mod tests {
             )
             .await
             .expect("handshake");
-            let _ack: HandshakeAck = channel::read_frame(&mut reader).await.expect("ack");
+            let _ack: HandshakeAck = protocol::read_frame(&mut reader).await.expect("ack");
 
             // Send exec for nonexistent command
-            channel::write_frame(
+            protocol::write_frame(
                 &mut writer,
                 &Request::Exec {
                     id: 1,
@@ -1016,7 +1166,7 @@ mod tests {
             .expect("exec");
 
             // Should get ExecError
-            let resp: Response = channel::read_frame(&mut reader).await.expect("read resp");
+            let resp: Response = protocol::read_frame(&mut reader).await.expect("read resp");
             match resp {
                 Response::ExecError { id, error } => {
                     assert_eq!(id, 1);
@@ -1034,7 +1184,7 @@ mod tests {
             let (mut reader, mut writer) = tokio::io::split(stream);
 
             // Send handshake with higher version
-            channel::write_frame(
+            protocol::write_frame(
                 &mut writer,
                 &Handshake {
                     protocol_version: 99,
@@ -1045,10 +1195,70 @@ mod tests {
             .expect("handshake");
 
             // Guest should negotiate down to its max (PROTOCOL_VERSION = 1)
-            let ack: HandshakeAck = channel::read_frame(&mut reader).await.expect("ack");
+            let ack: HandshakeAck = protocol::read_frame(&mut reader).await.expect("ack");
             assert_eq!(ack.protocol_version, PROTOCOL_VERSION);
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn port_forward_relay_echo() {
+        let tcp_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind tcp listener");
+        let target_port = tcp_listener.local_addr().expect("local addr").port();
+
+        let tcp_task = tokio::spawn(async move {
+            let (mut socket, _) = tcp_listener.accept().await.expect("accept tcp");
+            let mut buf = [0u8; 64];
+            let n = socket.read(&mut buf).await.expect("read tcp payload");
+            socket
+                .write_all(&buf[..n])
+                .await
+                .expect("write tcp payload");
+        });
+
+        run_test_connection(|stream, _table| async move {
+            let (mut reader, mut writer) = tokio::io::split(stream);
+
+            protocol::write_frame(
+                &mut writer,
+                &Handshake {
+                    protocol_version: 1,
+                    capabilities: vec![],
+                },
+            )
+            .await
+            .expect("handshake");
+            let _ack: HandshakeAck = protocol::read_frame(&mut reader).await.expect("ack");
+
+            protocol::write_frame(
+                &mut writer,
+                &Request::PortForward {
+                    id: 7,
+                    target_port,
+                    protocol: "tcp".to_string(),
+                },
+            )
+            .await
+            .expect("port forward request");
+
+            let ready: Response = protocol::read_frame(&mut reader)
+                .await
+                .expect("port forward ready");
+            assert_eq!(ready, Response::PortForwardReady { id: 7 });
+
+            writer.write_all(b"ping").await.expect("write raw ping");
+
+            let mut echoed = [0u8; 4];
+            reader.read_exact(&mut echoed).await.expect("read raw echo");
+            assert_eq!(&echoed, b"ping");
+
+            writer.shutdown().await.expect("shutdown writer");
+        })
+        .await;
+
+        tcp_task.await.expect("tcp task");
     }
 
     #[test]

@@ -16,129 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tracing::debug;
+use vz::protocol::{Channel, ExecOutput, ExecStream, Request, Response};
 
-use crate::channel::Channel;
 use crate::error::SandboxError;
-use crate::protocol::{Request, Response};
-
-// ---------------------------------------------------------------------------
-// ExecOutput (buffered result)
-// ---------------------------------------------------------------------------
-
-/// Output from a command executed inside the sandbox.
-#[derive(Debug, Clone)]
-pub struct ExecOutput {
-    /// Exit code of the command (0 = success).
-    pub exit_code: i32,
-    /// Standard output collected as a string.
-    pub stdout: String,
-    /// Standard error collected as a string.
-    pub stderr: String,
-}
-
-// ---------------------------------------------------------------------------
-// ExecEvent (streaming)
-// ---------------------------------------------------------------------------
-
-/// A streaming event from a running command.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ExecEvent {
-    /// A chunk of stdout data.
-    Stdout(Vec<u8>),
-    /// A chunk of stderr data.
-    Stderr(Vec<u8>),
-    /// The command exited with the given code.
-    Exit(i32),
-}
-
-// ---------------------------------------------------------------------------
-// ExecStream
-// ---------------------------------------------------------------------------
-
-/// A stream of events from a running command.
-///
-/// Created by [`SandboxSession::exec_streaming`]. Yields [`ExecEvent`]s
-/// as stdout/stderr data arrives and terminates with an [`ExecEvent::Exit`].
-pub struct ExecStream {
-    /// The exec ID for this running command.
-    exec_id: u64,
-    /// Whether we've seen the exit event.
-    done: bool,
-    /// Channel to the guest agent (None in test mode).
-    channel: Option<Arc<Channel<Request, Response>>>,
-}
-
-impl ExecStream {
-    /// Get the exec ID for this running command.
-    pub fn exec_id(&self) -> u64 {
-        self.exec_id
-    }
-
-    /// Read the next event from the stream.
-    ///
-    /// Returns `None` after the command has exited (after yielding `ExecEvent::Exit`).
-    pub async fn next(&mut self) -> Option<ExecEvent> {
-        if self.done {
-            return None;
-        }
-
-        if let Some(ref channel) = self.channel {
-            match channel.recv().await {
-                Ok(resp) => match resp {
-                    Response::Stdout { data, exec_id } if exec_id == self.exec_id => {
-                        Some(ExecEvent::Stdout(data))
-                    }
-                    Response::Stderr { data, exec_id } if exec_id == self.exec_id => {
-                        Some(ExecEvent::Stderr(data))
-                    }
-                    Response::ExitCode { code, exec_id } if exec_id == self.exec_id => {
-                        self.done = true;
-                        Some(ExecEvent::Exit(code))
-                    }
-                    Response::ExecError { .. } => {
-                        self.done = true;
-                        Some(ExecEvent::Exit(-1))
-                    }
-                    _ => {
-                        // Skip responses for other exec_ids
-                        Box::pin(self.next()).await
-                    }
-                },
-                Err(_) => {
-                    self.done = true;
-                    Some(ExecEvent::Exit(-1))
-                }
-            }
-        } else {
-            // No channel (test mode) -- immediately return exit 0
-            self.done = true;
-            Some(ExecEvent::Exit(0))
-        }
-    }
-
-    /// Collect all remaining events into an ExecOutput.
-    ///
-    /// Consumes all stdout/stderr chunks and the final exit code.
-    pub async fn collect(mut self) -> Result<ExecOutput, SandboxError> {
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut exit_code = -1;
-
-        while let Some(event) = self.next().await {
-            match event {
-                ExecEvent::Stdout(data) => stdout.extend_from_slice(&data),
-                ExecEvent::Stderr(data) => stderr.extend_from_slice(&data),
-                ExecEvent::Exit(code) => exit_code = code,
-            }
-        }
-
-        Ok(ExecOutput {
-            exit_code,
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        })
-    }
-}
 
 // ---------------------------------------------------------------------------
 // SandboxSession
@@ -279,11 +159,7 @@ impl SandboxSession {
             channel.send(&request).await?;
         }
 
-        Ok(ExecStream {
-            exec_id,
-            done: false,
-            channel: self.channel.clone(),
-        })
+        Ok(ExecStream::new(exec_id, self.channel.clone()))
     }
 
     // -----------------------------------------------------------------------
@@ -327,7 +203,7 @@ impl SandboxSession {
                             break code;
                         }
                         Response::ExecError { error, .. } => {
-                            return Err(SandboxError::Channel(crate::channel::ChannelError::Io(
+                            return Err(SandboxError::Channel(vz::protocol::ChannelError::Io(
                                 std::io::Error::other(error),
                             )));
                         }
@@ -398,6 +274,7 @@ impl SandboxSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vz::protocol::ExecEvent;
 
     fn make_session() -> SandboxSession {
         let counter = Arc::new(AtomicU64::new(1));

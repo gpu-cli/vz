@@ -245,7 +245,7 @@ async fn handle_control_exec(
     user: Option<String>,
     workdir: Option<String>,
 ) -> ControlResponse {
-    use vz_sandbox::protocol::{self, Handshake, HandshakeAck, Request, Response};
+    use vz::protocol::{self, Handshake, HandshakeAck, Request, Response};
 
     // Connect to guest agent via vsock
     let stream = match vm.vsock_connect(protocol::AGENT_PORT).await {
@@ -264,12 +264,12 @@ async fn handle_control_exec(
         protocol_version: protocol::PROTOCOL_VERSION,
         capabilities: vec![],
     };
-    if let Err(e) = vz_sandbox::channel::write_frame(&mut writer, &handshake).await {
+    if let Err(e) = protocol::write_frame(&mut writer, &handshake).await {
         return ControlResponse::Error {
             message: format!("handshake write failed: {e}"),
         };
     }
-    let _ack: HandshakeAck = match vz_sandbox::channel::read_frame(&mut reader).await {
+    let _ack: HandshakeAck = match protocol::read_frame(&mut reader).await {
         Ok(ack) => ack,
         Err(e) => {
             return ControlResponse::Error {
@@ -296,7 +296,7 @@ async fn handle_control_exec(
         user,
     };
 
-    if let Err(e) = vz_sandbox::channel::write_frame(&mut writer, &request).await {
+    if let Err(e) = protocol::write_frame(&mut writer, &request).await {
         return ControlResponse::Error {
             message: format!("exec request failed: {e}"),
         };
@@ -307,7 +307,7 @@ async fn handle_control_exec(
     let mut stderr = Vec::new();
 
     let exit_code = loop {
-        let resp: Response = match vz_sandbox::channel::read_frame(&mut reader).await {
+        let resp: Response = match protocol::read_frame(&mut reader).await {
             Ok(r) => r,
             Err(e) => {
                 return ControlResponse::Error {

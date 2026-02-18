@@ -8,10 +8,9 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use vz::Vm;
+use vz::protocol::{self, Channel, Request, Response};
 
-use crate::channel::Channel;
 use crate::error::SandboxError;
-use crate::protocol::{self, Request, Response};
 use crate::session::SandboxSession;
 
 // ---------------------------------------------------------------------------

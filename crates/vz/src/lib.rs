@@ -6,7 +6,9 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use vz::{VmConfigBuilder, BootLoader, SharedDirConfig};
+//! # #[cfg(target_os = "macos")]
+//! # {
+//! use vz::{BootLoader, SharedDirConfig, VmConfigBuilder};
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! let config = VmConfigBuilder::new()
@@ -32,22 +34,37 @@
 //! vm.stop().await?;
 //! # Ok(())
 //! # }
+//! # }
 //! ```
 
-#![cfg(target_os = "macos")]
 // unsafe is required for objc2 FFI calls — kept minimal and contained
 #![allow(unsafe_code)]
 
+mod channel;
+pub mod protocol;
+
+#[cfg(target_os = "macos")]
 pub(crate) mod bridge;
+#[cfg(target_os = "macos")]
 pub mod config;
+#[cfg(target_os = "macos")]
 pub mod error;
+#[cfg(target_os = "macos")]
 pub mod install;
+#[cfg(target_os = "macos")]
 pub mod virtio_fs;
+#[cfg(target_os = "macos")]
 pub mod vm;
+#[cfg(target_os = "macos")]
 pub mod vsock;
 
-pub use config::{BootLoader, MacPlatformConfig, SharedDirConfig, VmConfigBuilder};
+#[cfg(target_os = "macos")]
+pub use config::{BootLoader, MacPlatformConfig, NetworkConfig, SharedDirConfig, VmConfigBuilder};
+#[cfg(target_os = "macos")]
 pub use error::VzError;
+#[cfg(target_os = "macos")]
 pub use install::{InstallResult, IpswSource, fetch_latest_ipsw_url, install_macos};
+#[cfg(target_os = "macos")]
 pub use vm::{Vm, VmState};
+#[cfg(target_os = "macos")]
 pub use vsock::{VsockListener, VsockStream};

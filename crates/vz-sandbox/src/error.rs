@@ -39,7 +39,7 @@ pub enum SandboxError {
 
     /// A channel communication error.
     #[error("channel error: {0}")]
-    Channel(#[from] crate::channel::ChannelError),
+    Channel(#[from] vz::protocol::ChannelError),
 
     /// An underlying I/O error.
     #[error(transparent)]

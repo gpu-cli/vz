@@ -78,29 +78,3 @@ async fn create_vm_fails_with_invalid_hardware_model() {
         "expected InvalidConfig, got: {err}"
     );
 }
-
-#[tokio::test]
-async fn create_vm_fails_with_linux_boot_loader() {
-    let tmp = tempfile::tempdir().unwrap();
-    let disk_path = tmp.path().join("test.img");
-    let f = std::fs::File::create(&disk_path).unwrap();
-    f.set_len(1024 * 1024 * 1024).unwrap();
-
-    let config = VmConfigBuilder::new()
-        .boot_loader(BootLoader::Linux {
-            kernel: PathBuf::from("/boot/vmlinuz"),
-            initrd: None,
-            cmdline: "console=ttyS0".into(),
-        })
-        .disk(&disk_path)
-        .build()
-        .unwrap();
-
-    let result = vz::Vm::create(config).await;
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(
-        matches!(err, VzError::InvalidConfig(ref msg) if msg.contains("Linux")),
-        "expected Linux not implemented error, got: {err}"
-    );
-}

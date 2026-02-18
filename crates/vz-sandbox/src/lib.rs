@@ -52,14 +52,14 @@
 #![cfg(target_os = "macos")]
 #![forbid(unsafe_code)]
 
-pub mod channel;
 pub mod error;
 pub mod pool;
-pub mod protocol;
 pub mod session;
 
-pub use channel::Channel;
 pub use error::SandboxError;
 pub use pool::{IsolationMode, NetworkPolicy, SandboxConfig, SandboxPool};
-pub use protocol::{Handshake, HandshakeAck, Request, Response};
-pub use session::{ExecEvent, ExecOutput, ExecStream, SandboxSession};
+pub use session::SandboxSession;
+pub use vz::protocol::{
+    Channel, ChannelError, ExecEvent, ExecOutput, ExecStream, Handshake, HandshakeAck, Request,
+    ResourceStats, Response,
+};

@@ -1843,6 +1843,7 @@ name = "vz"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "block2",
  "dispatch2",
  "libc",
@@ -1850,6 +1851,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-virtualization",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1887,14 +1889,27 @@ name = "vz-guest-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64",
  "clap",
  "libc",
- "serde",
- "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "vz",
+]
+
+[[package]]
+name = "vz-linux"
+version = "0.1.0"
+dependencies = [
+ "vz",
+]
+
+[[package]]
+name = "vz-oci"
+version = "0.1.0"
+dependencies = [
+ "vz",
+ "vz-linux",
  "vz-sandbox",
 ]
 
@@ -1903,9 +1918,7 @@ name = "vz-sandbox"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64",
  "serde",
- "serde_json",
  "shell-words",
  "thiserror",
  "tokio",

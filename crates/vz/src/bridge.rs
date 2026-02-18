@@ -20,14 +20,14 @@ use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_foundation::{NSArray, NSData, NSError, NSObject, NSString, NSURL};
 use objc2_virtualization::{
-    VZDiskImageStorageDeviceAttachment, VZMacAuxiliaryStorage, VZMacGraphicsDeviceConfiguration,
-    VZMacGraphicsDisplayConfiguration, VZMacHardwareModel, VZMacMachineIdentifier,
-    VZMacOSBootLoader, VZMacPlatformConfiguration, VZNATNetworkDeviceAttachment, VZSharedDirectory,
-    VZSingleDirectoryShare, VZUSBKeyboardConfiguration,
-    VZUSBScreenCoordinatePointingDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
-    VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
-    VZVirtioSocketDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
-    VZVirtualMachineDelegate,
+    VZDiskImageStorageDeviceAttachment, VZGenericPlatformConfiguration, VZLinuxBootLoader,
+    VZMacAuxiliaryStorage, VZMacGraphicsDeviceConfiguration, VZMacGraphicsDisplayConfiguration,
+    VZMacHardwareModel, VZMacMachineIdentifier, VZMacOSBootLoader, VZMacPlatformConfiguration,
+    VZNATNetworkDeviceAttachment, VZSharedDirectory, VZSingleDirectoryShare,
+    VZUSBKeyboardConfiguration, VZUSBScreenCoordinatePointingDeviceConfiguration,
+    VZVirtioBlockDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
+    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketDeviceConfiguration, VZVirtualMachine,
+    VZVirtualMachineConfiguration, VZVirtualMachineDelegate,
 };
 use tokio::sync::{oneshot, watch};
 
@@ -287,38 +287,65 @@ pub(crate) fn build_objc_config(
                 unsafe { vz_config.setPlatform(&platform) };
             }
         }
-        BootLoader::Linux { .. } => {
-            // Linux boot loader will be implemented in a future phase
-            return Err(VzError::InvalidConfig(
-                "Linux boot loader is not yet implemented".into(),
-            ));
+        BootLoader::Linux {
+            kernel,
+            initrd,
+            cmdline,
+        } => {
+            let kernel_url = nsurl_from_path(kernel);
+
+            // SAFETY: initWithKernelURL creates a Linux boot loader with a kernel path.
+            let boot_loader = unsafe {
+                VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url)
+            };
+
+            let cmdline = NSString::from_str(cmdline);
+            // SAFETY: setCommandLine copies the command line string.
+            unsafe { boot_loader.setCommandLine(&cmdline) };
+
+            if let Some(initrd) = initrd {
+                let initrd_url = nsurl_from_path(initrd);
+                // SAFETY: setInitialRamdiskURL accepts an optional initrd URL.
+                unsafe { boot_loader.setInitialRamdiskURL(Some(&initrd_url)) };
+            }
+
+            // SAFETY: setBootLoader accepts any VZBootLoader subclass.
+            unsafe { vz_config.setBootLoader(Some(&boot_loader)) };
+
+            // Linux guests require a generic platform configuration.
+            // SAFETY: VZGenericPlatformConfiguration::new() creates a valid generic platform.
+            let platform = unsafe { VZGenericPlatformConfiguration::new() };
+            // SAFETY: setPlatform accepts any VZPlatformConfiguration subclass.
+            unsafe { vz_config.setPlatform(&platform) };
         }
     }
 
     // Storage devices (disk images)
-    let disk_url = nsurl_from_path(&config.disk_path);
-    // SAFETY: initWithURL_readOnly_error validates the disk image path.
-    let disk_attachment = unsafe {
-        VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
-            VZDiskImageStorageDeviceAttachment::alloc(),
-            &disk_url,
-            false,
-        )
+    if let Some(disk_path) = &config.disk_path {
+        let disk_url = nsurl_from_path(disk_path);
+        // SAFETY: initWithURL_readOnly_error validates the disk image path.
+        let disk_attachment = unsafe {
+            VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+                VZDiskImageStorageDeviceAttachment::alloc(),
+                &disk_url,
+                false,
+            )
+        }
+        .map_err(|e| VzError::DiskError(ns_error_to_string(&e)))?;
+
+        // SAFETY: initWithAttachment creates a VirtioBlock device with the attachment.
+        let block_device = unsafe {
+            VZVirtioBlockDeviceConfiguration::initWithAttachment(
+                VZVirtioBlockDeviceConfiguration::alloc(),
+                &disk_attachment,
+            )
+        };
+
+        // SAFETY: NSArray::from_retained_slice creates an array from a slice of retained objects.
+        let storage_devices = NSArray::from_retained_slice(&[Retained::into_super(block_device)]);
+        // SAFETY: setStorageDevices sets the VM's storage configuration.
+        unsafe { vz_config.setStorageDevices(&storage_devices) };
     }
-    .map_err(|e| VzError::DiskError(ns_error_to_string(&e)))?;
-
-    // SAFETY: initWithAttachment creates a VirtioBlock device with the attachment.
-    let block_device = unsafe {
-        VZVirtioBlockDeviceConfiguration::initWithAttachment(
-            VZVirtioBlockDeviceConfiguration::alloc(),
-            &disk_attachment,
-        )
-    };
-
-    // SAFETY: NSArray::from_retained_slice creates an array from a slice of retained objects.
-    let storage_devices = NSArray::from_retained_slice(&[Retained::into_super(block_device)]);
-    // SAFETY: setStorageDevices sets the VM's storage configuration.
-    unsafe { vz_config.setStorageDevices(&storage_devices) };
 
     // Network
     match &config.network {

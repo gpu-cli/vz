@@ -154,7 +154,7 @@ pub async fn setup(args: &RunArgs) -> anyhow::Result<RunningVm> {
             image: args.image.to_string_lossy().to_string(),
             state: "running".to_string(),
             pid: std::process::id(),
-            vsock_port: Some(vz_sandbox::protocol::AGENT_PORT),
+            vsock_port: Some(vz::protocol::AGENT_PORT),
             cpus: Some(args.cpus),
             memory_gb: Some(args.memory),
             mounts: args

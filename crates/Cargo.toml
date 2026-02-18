@@ -5,6 +5,8 @@ members = [
     "vz-sandbox",
     "vz-cli",
     "vz-guest-agent",
+    "vz-linux",
+    "vz-oci",
 ]
 
 [workspace.package]
@@ -29,8 +31,10 @@ objc2-virtualization = { version = "0.3", features = [
     # Boot and platform (parent class features required by child classes)
     "VZBootLoader",
     "VZMacOSBootLoader",
+    "VZLinuxBootLoader",
     "VZPlatformConfiguration",
     "VZMacPlatformConfiguration",
+    "VZGenericPlatformConfiguration",
     "VZMacOSRestoreImage",
     "VZMacOSInstaller",
     "VZMacHardwareModel",
@@ -128,6 +132,8 @@ tempfile = "3"
 # Internal crates
 vz = { path = "vz" }
 vz-sandbox = { path = "vz-sandbox" }
+vz-linux = { path = "vz-linux" }
+vz-oci = { path = "vz-oci" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

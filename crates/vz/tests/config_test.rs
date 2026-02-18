@@ -37,8 +37,8 @@ fn builder_chaining_fluent() {
     // All builder methods should return Self for chaining
     let _builder = VmConfigBuilder::new()
         .cpus(4)
-        .memory_gb(8)
-        .boot_loader(BootLoader::MacOS)
+        .memory_mb(8192)
+        .boot_macos()
         .disk("/tmp/test.img")
         .disk_size(64 * 1024 * 1024 * 1024)
         .shared_dir(SharedDirConfig {
@@ -46,6 +46,11 @@ fn builder_chaining_fluent() {
             source: "/tmp/project".into(),
             read_only: false,
         })
+        .shared_dirs(vec![SharedDirConfig {
+            tag: "tools".into(),
+            source: "/tmp/tools".into(),
+            read_only: true,
+        }])
         .enable_vsock()
         .with_display();
 }
@@ -57,7 +62,7 @@ fn builder_chaining_fluent() {
 #[test]
 fn build_macos_minimal() {
     let config = VmConfigBuilder::new()
-        .boot_loader(BootLoader::MacOS)
+        .boot_macos()
         .mac_platform(MacPlatformConfig {
             hardware_model_path: PathBuf::from("/tmp/hw.model"),
             machine_identifier_path: PathBuf::from("/tmp/machine.id"),
@@ -72,7 +77,7 @@ fn build_macos_minimal() {
 #[test]
 fn build_with_shared_dirs() {
     let config = VmConfigBuilder::new()
-        .boot_loader(BootLoader::MacOS)
+        .boot_macos()
         .mac_platform(MacPlatformConfig {
             hardware_model_path: PathBuf::from("/tmp/hw.model"),
             machine_identifier_path: PathBuf::from("/tmp/machine.id"),
@@ -110,7 +115,7 @@ fn build_fails_without_boot_loader() {
 #[test]
 fn build_fails_without_disk() {
     let result = VmConfigBuilder::new()
-        .boot_loader(BootLoader::MacOS)
+        .boot_macos()
         .mac_platform(MacPlatformConfig {
             hardware_model_path: PathBuf::from("/tmp/hw.model"),
             machine_identifier_path: PathBuf::from("/tmp/machine.id"),
@@ -126,7 +131,7 @@ fn build_fails_without_disk() {
 #[test]
 fn build_macos_fails_without_mac_platform() {
     let result = VmConfigBuilder::new()
-        .boot_loader(BootLoader::MacOS)
+        .boot_macos()
         .disk("/tmp/test.img")
         .build();
 
@@ -152,6 +157,37 @@ fn builder_memory_gb_conversion() {
     let debug = format!("{:?}", builder);
     let expected_bytes = 16u64 * 1024 * 1024 * 1024;
     assert!(debug.contains(&format!("memory_bytes: {expected_bytes}")));
+}
+
+#[test]
+fn builder_memory_mb_conversion() {
+    let builder = VmConfigBuilder::new().memory_mb(512);
+    let debug = format!("{:?}", builder);
+    let expected_bytes = 512u64 * 1024 * 1024;
+    assert!(debug.contains(&format!("memory_bytes: {expected_bytes}")));
+}
+
+#[test]
+fn builder_memory_bytes_direct() {
+    let builder = VmConfigBuilder::new().memory_bytes(123_456_789);
+    let debug = format!("{:?}", builder);
+    assert!(debug.contains("memory_bytes: 123456789"));
+}
+
+#[test]
+fn build_linux_without_disk_succeeds() {
+    let config = VmConfigBuilder::new()
+        .boot_linux("/boot/vmlinuz", None::<PathBuf>, "console=ttyS0")
+        .build();
+
+    assert!(config.is_ok());
+}
+
+#[test]
+fn boot_macos_helper_sets_boot_loader() {
+    let builder = VmConfigBuilder::new().boot_macos();
+    let debug = format!("{:?}", builder);
+    assert!(debug.contains("boot_loader: Some(MacOS)"));
 }
 
 // ---------------------------------------------------------------------------

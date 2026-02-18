@@ -100,9 +100,42 @@ impl VmConfigBuilder {
         self
     }
 
+    /// Set memory in megabytes.
+    pub fn memory_mb(mut self, mb: u64) -> Self {
+        self.memory_bytes = mb * 1024 * 1024;
+        self
+    }
+
+    /// Set memory in bytes.
+    pub fn memory_bytes(mut self, bytes: u64) -> Self {
+        self.memory_bytes = bytes;
+        self
+    }
+
     /// Set the boot loader.
     pub fn boot_loader(mut self, loader: BootLoader) -> Self {
         self.boot_loader = Some(loader);
+        self
+    }
+
+    /// Convenience: configure macOS boot.
+    pub fn boot_macos(mut self) -> Self {
+        self.boot_loader = Some(BootLoader::MacOS);
+        self
+    }
+
+    /// Convenience: configure Linux boot.
+    pub fn boot_linux<K, I, C>(mut self, kernel: K, initrd: Option<I>, cmdline: C) -> Self
+    where
+        K: Into<PathBuf>,
+        I: Into<PathBuf>,
+        C: Into<String>,
+    {
+        self.boot_loader = Some(BootLoader::Linux {
+            kernel: kernel.into(),
+            initrd: initrd.map(Into::into),
+            cmdline: cmdline.into(),
+        });
         self
     }
 
@@ -130,6 +163,12 @@ impl VmConfigBuilder {
     /// Add a shared directory (VirtioFS).
     pub fn shared_dir(mut self, config: SharedDirConfig) -> Self {
         self.shared_dirs.push(config);
+        self
+    }
+
+    /// Add multiple shared directories (VirtioFS).
+    pub fn shared_dirs(mut self, configs: Vec<SharedDirConfig>) -> Self {
+        self.shared_dirs.extend(configs);
         self
     }
 
@@ -164,9 +203,12 @@ impl VmConfigBuilder {
             ));
         }
 
-        let disk_path = self
-            .disk_path
-            .ok_or_else(|| VzError::InvalidConfig("disk path is required".into()))?;
+        let disk_path = match &boot_loader {
+            BootLoader::MacOS => Some(self.disk_path.ok_or_else(|| {
+                VzError::InvalidConfig("macOS boot requires a disk image".into())
+            })?),
+            BootLoader::Linux { .. } => self.disk_path,
+        };
 
         Ok(VmConfig {
             cpus: self.cpus,
@@ -196,7 +238,7 @@ pub struct VmConfig {
     pub(crate) memory_bytes: u64,
     pub(crate) boot_loader: BootLoader,
     pub(crate) mac_platform: Option<MacPlatformConfig>,
-    pub(crate) disk_path: PathBuf,
+    pub(crate) disk_path: Option<PathBuf>,
     /// Used when creating new disk images (e.g., during install).
     #[allow(dead_code)]
     pub(crate) disk_size_bytes: Option<u64>,
