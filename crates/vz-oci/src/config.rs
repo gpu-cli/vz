@@ -106,6 +106,10 @@ pub struct RunConfig {
     pub serial_log_file: Option<PathBuf>,
     /// Optional exec timeout override.
     pub timeout: Option<Duration>,
+    /// Optional explicit container identifier.
+    ///
+    /// When unset, the runtime generates a unique ID.
+    pub container_id: Option<String>,
 }
 
 /// Registry authentication used when pulling OCI images.

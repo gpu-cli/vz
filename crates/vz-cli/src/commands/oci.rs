@@ -2,12 +2,16 @@
 
 use std::path::PathBuf;
 use std::process;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
+use tokio::time::sleep;
 use tracing::info;
 
 use vz_oci::{PortMapping, PortProtocol, RunConfig};
+
+const DETACH_START_TIMEOUT: Duration = Duration::from_secs(12);
+const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// OCI runtime top-level command and shared options.
 #[derive(Args, Debug)]
@@ -58,6 +62,9 @@ pub enum OciCommand {
 
     /// List known containers from OCI metadata.
     Ps,
+
+    /// Stop a running container process.
+    Stop(StopArgs),
 
     /// Remove container metadata and rootfs artifacts.
     Rm(RmArgs),
@@ -113,6 +120,28 @@ pub struct RunArgs {
     /// Optional file path for guest serial console output.
     #[arg(long)]
     pub serial_log_file: Option<PathBuf>,
+
+    /// Run container in background and return immediately.
+    #[arg(long)]
+    pub detach: bool,
+
+    /// Internal flag used by detached child process.
+    #[arg(long, hide = true)]
+    pub internal_detached_child: bool,
+
+    /// Internal explicit container identifier used by detached runs.
+    #[arg(long, hide = true)]
+    pub internal_container_id: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct StopArgs {
+    /// Container identifier.
+    pub id: String,
+
+    /// Force immediate termination (SIGKILL).
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]
@@ -131,6 +160,7 @@ pub async fn run(args: OciArgs) -> anyhow::Result<()> {
         OciCommand::Images => list_images(&runtime),
         OciCommand::Prune => prune_images(&runtime),
         OciCommand::Ps => list_containers(&runtime),
+        OciCommand::Stop(args) => stop_container(&runtime, args),
         OciCommand::Rm(args) => remove_container(&runtime, args),
     }
 }
@@ -179,6 +209,10 @@ async fn pull_image(runtime: &vz_oci::Runtime, args: PullArgs) -> anyhow::Result
 }
 
 async fn run_image(runtime: vz_oci::Runtime, args: RunArgs) -> anyhow::Result<()> {
+    if args.detach && !args.internal_detached_child {
+        return run_image_detached_parent(&runtime, &args).await;
+    }
+
     let run_config = build_run_config(&args)?;
     info!(image = %args.image, command = ?args.command, "running OCI container");
 
@@ -199,6 +233,63 @@ async fn run_image(runtime: vz_oci::Runtime, args: RunArgs) -> anyhow::Result<()
 
     println!("container completed successfully");
     Ok(())
+}
+
+async fn run_image_detached_parent(
+    runtime: &vz_oci::Runtime,
+    args: &RunArgs,
+) -> anyhow::Result<()> {
+    let container_id = args
+        .internal_container_id
+        .clone()
+        .unwrap_or_else(generate_detached_container_id);
+
+    let executable = std::env::current_exe()?;
+    let mut child = process::Command::new(executable)
+        .args(std::env::args_os().skip(1))
+        .arg("--internal-detached-child")
+        .arg("--internal-container-id")
+        .arg(container_id.clone())
+        .stdin(process::Stdio::null())
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .spawn()?;
+
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "detached run process exited before startup for container {container_id}: {status}"
+            );
+        }
+
+        if let Some(container) = runtime
+            .list_containers()?
+            .into_iter()
+            .find(|container| container.id == container_id)
+        {
+            match container.status {
+                vz_oci::ContainerStatus::Running => {
+                    println!("container running in background: {container_id}");
+                    return Ok(());
+                }
+                vz_oci::ContainerStatus::Stopped { exit_code } => {
+                    anyhow::bail!(
+                        "detached container {container_id} stopped during startup with exit code {exit_code}"
+                    );
+                }
+                vz_oci::ContainerStatus::Created => {}
+            }
+        }
+
+        if started.elapsed() >= DETACH_START_TIMEOUT {
+            anyhow::bail!(
+                "timed out waiting for detached container {container_id} to reach running state"
+            );
+        }
+
+        sleep(DETACH_POLL_INTERVAL).await;
+    }
 }
 
 fn list_images(runtime: &vz_oci::Runtime) -> anyhow::Result<()> {
@@ -261,6 +352,23 @@ fn list_containers(runtime: &vz_oci::Runtime) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn stop_container(runtime: &vz_oci::Runtime, args: StopArgs) -> anyhow::Result<()> {
+    let container = runtime.stop_container(&args.id, args.force)?;
+    match container.status {
+        vz_oci::ContainerStatus::Running => {
+            println!("Container {} remains running", args.id);
+        }
+        vz_oci::ContainerStatus::Created => {
+            println!("Container {} is created but not running", args.id);
+        }
+        vz_oci::ContainerStatus::Stopped { exit_code } => {
+            println!("Stopped container {} (exit {exit_code})", args.id);
+        }
+    }
+
+    Ok(())
+}
+
 fn remove_container(runtime: &vz_oci::Runtime, args: RmArgs) -> anyhow::Result<()> {
     runtime.remove_container(&args.id)?;
     println!("Removed container {id}", id = args.id);
@@ -285,7 +393,17 @@ fn build_run_config(args: &RunArgs) -> anyhow::Result<RunConfig> {
         network_enabled,
         serial_log_file: args.serial_log_file.clone(),
         timeout,
+        container_id: args.internal_container_id.clone(),
     })
+}
+
+fn generate_detached_container_id() -> String {
+    let millis = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis(),
+        Err(_) => 0,
+    };
+
+    format!("ctr-{millis}-{}", process::id())
 }
 
 fn parse_env_vars(vars: &[String]) -> anyhow::Result<Vec<(String, String)>> {
@@ -385,5 +503,28 @@ mod tests {
     fn parse_port_mapping_rejects_host_ip_prefix() {
         let mapping = parse_port_mapping("127.0.0.1:8080:80");
         assert!(mapping.is_err());
+    }
+
+    #[test]
+    fn build_run_config_sets_internal_container_id() {
+        let args = RunArgs {
+            image: "nginx:latest".to_string(),
+            command: vec!["echo".to_string(), "hello".to_string()],
+            env: vec![],
+            publish: vec![],
+            workdir: None,
+            user: None,
+            cpus: None,
+            memory_mb: None,
+            no_network: false,
+            timeout_secs: None,
+            serial_log_file: None,
+            detach: false,
+            internal_detached_child: false,
+            internal_container_id: Some("container-123".to_string()),
+        };
+
+        let run_config = build_run_config(&args).expect("run config should build");
+        assert_eq!(run_config.container_id, Some("container-123".to_string()));
     }
 }

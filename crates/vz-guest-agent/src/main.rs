@@ -49,6 +49,9 @@ struct ResourceStats {
     load_average: [f64; 3],
 }
 
+const PORT_FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const PORT_FORWARD_CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
 /// vz-guest-agent: VM sandbox command executor
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -271,7 +274,7 @@ where
         return Ok(());
     }
 
-    let mut target = match tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await {
+    let mut target = match connect_port_forward_target(target_port).await {
         Ok(stream) => stream,
         Err(e) => {
             protocol::write_frame(
@@ -309,6 +312,23 @@ where
     }
 
     Ok(())
+}
+
+async fn connect_port_forward_target(target_port: u16) -> std::io::Result<tokio::net::TcpStream> {
+    let started = Instant::now();
+
+    loop {
+        match tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => {
+                if started.elapsed() >= PORT_FORWARD_CONNECT_TIMEOUT {
+                    return Err(error);
+                }
+
+                tokio::time::sleep(PORT_FORWARD_CONNECT_RETRY_INTERVAL).await;
+            }
+        }
+    }
 }
 
 /// Dispatch a single request to the appropriate handler.
@@ -1304,6 +1324,75 @@ mod tests {
                 .await
                 .expect("port forward ready");
             assert_eq!(ready, Response::PortForwardReady { id: 7 });
+
+            writer.write_all(b"ping").await.expect("write raw ping");
+
+            let mut echoed = [0u8; 4];
+            reader.read_exact(&mut echoed).await.expect("read raw echo");
+            assert_eq!(&echoed, b"ping");
+
+            writer.shutdown().await.expect("shutdown writer");
+        })
+        .await;
+
+        tcp_task.await.expect("tcp task");
+    }
+
+    #[tokio::test]
+    async fn port_forward_relay_waits_for_delayed_target() {
+        let target_port = {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind temp port");
+            listener.local_addr().expect("local addr").port()
+        };
+
+        let tcp_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let tcp_listener = tokio::net::TcpListener::bind(("127.0.0.1", target_port))
+                .await
+                .expect("bind delayed tcp listener");
+
+            let (mut socket, _) = tcp_listener.accept().await.expect("accept delayed tcp");
+            let mut buf = [0u8; 64];
+            let n = socket
+                .read(&mut buf)
+                .await
+                .expect("read delayed tcp payload");
+            socket
+                .write_all(&buf[..n])
+                .await
+                .expect("write delayed tcp payload");
+        });
+
+        run_test_connection(|stream, _table| async move {
+            let (mut reader, mut writer) = tokio::io::split(stream);
+
+            protocol::write_frame(
+                &mut writer,
+                &Handshake {
+                    protocol_version: 1,
+                    capabilities: vec![],
+                },
+            )
+            .await
+            .expect("handshake");
+            let _ack: HandshakeAck = protocol::read_frame(&mut reader).await.expect("ack");
+
+            protocol::write_frame(
+                &mut writer,
+                &Request::PortForward {
+                    id: 8,
+                    target_port,
+                    protocol: "tcp".to_string(),
+                },
+            )
+            .await
+            .expect("port forward request");
+
+            let ready: Response = protocol::read_frame(&mut reader)
+                .await
+                .expect("port forward ready");
+            assert_eq!(ready, Response::PortForwardReady { id: 8 });
 
             writer.write_all(b"ping").await.expect("write raw ping");
 

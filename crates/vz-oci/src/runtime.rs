@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, process};
 
 use crate::container_store::{ContainerInfo, ContainerStatus, ContainerStore};
@@ -25,6 +25,9 @@ use vz_linux::{
 use crate::config::{PortMapping, PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig};
 use crate::error::OciError;
 use crate::store::{ImageInfo, PruneResult};
+
+const STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Unified runtime entrypoint.
 #[derive(Clone)]
@@ -75,18 +78,76 @@ impl Runtime {
     /// Remove container metadata and best-effort rootfs artifacts.
     pub fn remove_container(&self, id: &str) -> Result<(), OciError> {
         let containers = self.container_store.load_all().map_err(OciError::from)?;
-        let rootfs_path = containers
+        let container = containers
             .into_iter()
             .find(|container| container.id == id)
-            .and_then(|container| container.rootfs_path);
+            .ok_or_else(|| {
+                OciError::Storage(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("container '{id}' not found"),
+                ))
+            })?;
+
+        if matches!(container.status, ContainerStatus::Running) {
+            return Err(OciError::InvalidConfig(format!(
+                "cannot remove running container '{id}'; stop it first"
+            )));
+        }
 
         self.container_store.remove(id).map_err(OciError::from)?;
 
-        if let Some(path) = rootfs_path {
+        if let Some(path) = container.rootfs_path {
             let _ = fs::remove_dir_all(path);
         }
 
         Ok(())
+    }
+
+    /// Stop a running container by signaling its managing host process.
+    pub fn stop_container(&self, id: &str, force: bool) -> Result<ContainerInfo, OciError> {
+        let mut container = self
+            .container_store
+            .load_all()
+            .map_err(OciError::from)?
+            .into_iter()
+            .find(|item| item.id == id)
+            .ok_or_else(|| {
+                OciError::Storage(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("container '{id}' not found"),
+                ))
+            })?;
+
+        if !matches!(container.status, ContainerStatus::Running) {
+            return Ok(container);
+        }
+
+        if let Some(pid) = container.host_pid {
+            if is_pid_alive(pid) {
+                send_signal(pid, force)?;
+
+                if !force && !wait_for_pid_exit(pid, STOP_GRACE_PERIOD) {
+                    return Err(OciError::InvalidConfig(format!(
+                        "container process {pid} did not stop within {}s",
+                        STOP_GRACE_PERIOD.as_secs()
+                    )));
+                }
+            }
+        }
+
+        if let Some(rootfs_path) = container.rootfs_path.take() {
+            let _ = fs::remove_dir_all(rootfs_path);
+        }
+
+        container.host_pid = None;
+        container.status = ContainerStatus::Stopped {
+            exit_code: if force { -9 } else { 143 },
+        };
+        self.container_store
+            .upsert(container.clone())
+            .map_err(OciError::from)?;
+
+        Ok(container)
     }
 
     /// Remove unused manifest/config metadata and stale unpacked layer directories.
@@ -117,7 +178,7 @@ impl Runtime {
         }
 
         let image_id = self.pull(image).await?;
-        let container_id = new_container_id();
+        let container_id = run.container_id.clone().unwrap_or_else(new_container_id);
 
         let created_unix_secs = current_unix_secs();
         let mut container = ContainerInfo {
@@ -127,6 +188,7 @@ impl Runtime {
             status: ContainerStatus::Created,
             created_unix_secs,
             rootfs_path: None,
+            host_pid: Some(process::id()),
         };
 
         self.container_store
@@ -141,6 +203,7 @@ impl Runtime {
             Ok(rootfs_dir) => rootfs_dir,
             Err(err) => {
                 container.status = ContainerStatus::Stopped { exit_code: -1 };
+                container.host_pid = None;
                 self.container_store
                     .upsert(container)
                     .map_err(OciError::from)?;
@@ -150,6 +213,7 @@ impl Runtime {
 
         container.rootfs_path = Some(rootfs_dir.clone());
         container.status = ContainerStatus::Running;
+        container.host_pid = Some(process::id());
         self.container_store
             .upsert(container.clone())
             .map_err(OciError::from)?;
@@ -166,6 +230,7 @@ impl Runtime {
             },
             Err(_) => ContainerStatus::Stopped { exit_code: -1 },
         };
+        container.host_pid = None;
 
         self.container_store
             .upsert(container)
@@ -193,6 +258,7 @@ impl Runtime {
             network_enabled,
             serial_log_file,
             timeout,
+            container_id: _,
         } = run;
 
         let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
@@ -471,6 +537,53 @@ async fn relay_port_forward_connection(
     Ok(())
 }
 
+fn send_signal(pid: u32, force: bool) -> Result<(), OciError> {
+    let signal = if force { "-KILL" } else { "-TERM" };
+    let status = process::Command::new("kill")
+        .arg(signal)
+        .arg(pid.to_string())
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .status()
+        .map_err(OciError::Storage)?;
+
+    if status.success() || !is_pid_alive(pid) {
+        return Ok(());
+    }
+
+    Err(OciError::InvalidConfig(format!(
+        "failed to send {signal} to process {pid}"
+    )))
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
+    let started = Instant::now();
+
+    loop {
+        if !is_pid_alive(pid) {
+            return true;
+        }
+
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return false;
+        }
+
+        let remaining = timeout.saturating_sub(elapsed);
+        std::thread::sleep(std::cmp::min(STOP_POLL_INTERVAL, remaining));
+    }
+}
+
 fn expand_home_dir(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
     if raw == "~" {
@@ -514,6 +627,7 @@ fn resolve_run_config(
         network_enabled,
         serial_log_file,
         timeout,
+        container_id: _,
     } = run;
 
     let resolved_cmd = if !run_cmd.is_empty() {
@@ -552,6 +666,7 @@ fn resolve_run_config(
         network_enabled,
         serial_log_file,
         timeout,
+        container_id: Some(container_id.to_string()),
     })
 }
 
@@ -647,6 +762,7 @@ mod tests {
                 status: ContainerStatus::Created,
                 created_unix_secs: 100,
                 rootfs_path: None,
+                host_pid: None,
             })
             .unwrap();
 
@@ -659,6 +775,7 @@ mod tests {
                 status: ContainerStatus::Stopped { exit_code: 0 },
                 created_unix_secs: 200,
                 rootfs_path: None,
+                host_pid: None,
             })
             .unwrap();
 
@@ -688,6 +805,7 @@ mod tests {
                 status: ContainerStatus::Created,
                 created_unix_secs: 100,
                 rootfs_path: Some(rootfs_path.clone()),
+                host_pid: None,
             })
             .unwrap();
 
@@ -702,6 +820,65 @@ mod tests {
         if let OciError::Storage(io_err) = err {
             assert_eq!(io_err.kind(), io::ErrorKind::NotFound);
         }
+    }
+
+    #[test]
+    fn runtime_remove_container_rejects_running_container() {
+        let data_dir = unique_temp_dir("remove-running");
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir,
+            ..RuntimeConfig::default()
+        });
+
+        runtime
+            .container_store
+            .upsert(ContainerInfo {
+                id: "container-run".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:img1".to_string(),
+                status: ContainerStatus::Running,
+                created_unix_secs: 100,
+                rootfs_path: None,
+                host_pid: Some(process::id()),
+            })
+            .unwrap();
+
+        let error = runtime.remove_container("container-run").unwrap_err();
+        assert!(matches!(error, OciError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn runtime_stop_container_marks_container_stopped_and_cleans_rootfs() {
+        let data_dir = unique_temp_dir("stop");
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir: data_dir.clone(),
+            ..RuntimeConfig::default()
+        });
+        let rootfs_path = data_dir.join("rootfs-stop");
+        fs::create_dir_all(&rootfs_path).unwrap();
+
+        runtime
+            .container_store
+            .upsert(ContainerInfo {
+                id: "container-1".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:img1".to_string(),
+                status: ContainerStatus::Running,
+                created_unix_secs: 100,
+                rootfs_path: Some(rootfs_path.clone()),
+                host_pid: Some(4_000_000),
+            })
+            .unwrap();
+
+        let stopped = runtime.stop_container("container-1", false).unwrap();
+
+        assert!(matches!(
+            stopped.status,
+            ContainerStatus::Stopped { exit_code: 143 }
+        ));
+        assert!(stopped.rootfs_path.is_none());
+        assert!(stopped.host_pid.is_none());
+        assert!(!rootfs_path.exists());
     }
 
     #[test]
@@ -727,6 +904,7 @@ mod tests {
                 status: ContainerStatus::Created,
                 created_unix_secs: 100,
                 rootfs_path: Some(referenced_rootfs.clone()),
+                host_pid: None,
             })
             .unwrap();
 
@@ -854,6 +1032,19 @@ mod tests {
                 protocol: PortProtocol::Tcp,
             }],
         );
+    }
+
+    #[test]
+    fn resolve_run_config_sets_container_id() {
+        let image_config = ImageConfigSummary {
+            cmd: Some(vec!["default".to_string()]),
+            ..ImageConfigSummary::default()
+        };
+
+        let resolved =
+            resolve_run_config(image_config, RunConfig::default(), "container-abc").unwrap();
+
+        assert_eq!(resolved.container_id, Some("container-abc".to_string()));
     }
 
     #[test]

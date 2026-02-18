@@ -45,6 +45,7 @@ mod tests {
         let cfg = RunConfig::default();
         assert!(cfg.cmd.is_empty());
         assert!(cfg.ports.is_empty());
+        assert!(cfg.container_id.is_none());
     }
 
     #[test]

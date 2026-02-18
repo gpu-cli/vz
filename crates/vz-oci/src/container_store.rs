@@ -36,6 +36,8 @@ pub struct ContainerInfo {
     pub created_unix_secs: u64,
     /// Assembled rootfs path for this container, when known.
     pub rootfs_path: Option<PathBuf>,
+    /// Host process ID currently managing this container, if running.
+    pub host_pid: Option<u32>,
 }
 
 /// Persistent metadata index for containers.
@@ -188,6 +190,7 @@ mod tests {
                 status: ContainerStatus::Created,
                 created_unix_secs: 1700,
                 rootfs_path: None,
+                host_pid: None,
             })
             .unwrap();
 
@@ -199,6 +202,7 @@ mod tests {
                 status: ContainerStatus::Stopped { exit_code: 0 },
                 created_unix_secs: 1700,
                 rootfs_path: None,
+                host_pid: None,
             })
             .unwrap();
 
@@ -225,6 +229,7 @@ mod tests {
                 status: ContainerStatus::Created,
                 created_unix_secs: 1700,
                 rootfs_path: Some(PathBuf::from("/tmp/example")),
+                host_pid: Some(12345),
             })
             .unwrap();
 
