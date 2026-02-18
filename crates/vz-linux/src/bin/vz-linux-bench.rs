@@ -33,6 +33,10 @@ struct Args {
     #[arg(long)]
     bundle_dir: Option<PathBuf>,
 
+    /// Optional container rootfs directory to mount as VirtioFS `rootfs`.
+    #[arg(long)]
+    rootfs_dir: Option<PathBuf>,
+
     /// Optional install/cache directory (defaults to ~/.vz/linux).
     #[arg(long)]
     install_dir: Option<PathBuf>,
@@ -128,7 +132,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let vm_config = LinuxVmConfig::new(kernel, initramfs);
+    let mut vm_config = LinuxVmConfig::new(kernel, initramfs);
+    if let Some(rootfs_dir) = args.rootfs_dir {
+        vm_config = vm_config.with_rootfs_dir(rootfs_dir);
+    }
     info!(
         "Starting benchmark: iterations={} timeout={}s",
         args.iterations, args.timeout_secs
@@ -150,6 +157,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(dir) => info!("Serial log capture enabled: directory={}", dir.display()),
             None => info!("Serial log capture enabled: directory=<system temp>"),
         }
+    }
+    if let Some(rootfs_dir) = &vm_config.rootfs_dir {
+        info!(
+            "Rootfs VirtioFS enabled: directory={} tag=rootfs",
+            rootfs_dir.display()
+        );
     }
 
     let started = Instant::now();
@@ -258,7 +271,7 @@ fn print_prefixed_block(prefix: &str, text: &str) {
 fn build_http_smoke_command(url: &str, request_timeout_secs: u64) -> String {
     let quoted_url = shell_words::join([url]);
     format!(
-        "if [ -x /bin/ip ] && [ -d /sys/class/net/eth0 ]; then /bin/ip link set dev eth0 up >/dev/null 2>&1 || true; fi\nif [ -x /sbin/udhcpc ] && [ -d /sys/class/net/eth0 ]; then /sbin/udhcpc -i eth0 -s /etc/udhcpc.script -q -n -t 3 -T 1 >/dev/null 2>&1 || true; fi\n/bin/busybox wget -T {request_timeout_secs} -q -O /tmp/http-smoke.out {quoted_url}\n/bin/busybox head -c 512 /tmp/http-smoke.out"
+        "if [ -x /bin/ip ] && [ -d /sys/class/net/eth0 ]; then /bin/ip link set dev eth0 up >/dev/null 2>&1 || true; fi\nif [ -x /sbin/udhcpc ] && [ -d /sys/class/net/eth0 ]; then /sbin/udhcpc -i eth0 -s /etc/udhcpc.script -q -n -t 3 -T 1 >/dev/null 2>&1 || true; fi\nif command -v wget >/dev/null 2>&1; then\n  wget -T {request_timeout_secs} -q -O /tmp/http-smoke.out {quoted_url}\nelif command -v curl >/dev/null 2>&1; then\n  curl -fsSL --max-time {request_timeout_secs} -o /tmp/http-smoke.out {quoted_url}\nelif [ -x /usr/local/bin/busybox ]; then\n  /usr/local/bin/busybox wget -T {request_timeout_secs} -q -O /tmp/http-smoke.out {quoted_url}\nelif [ -x /bin/busybox ]; then\n  /bin/busybox wget -T {request_timeout_secs} -q -O /tmp/http-smoke.out {quoted_url}\nelse\n  echo 'http smoke failed: no wget/curl available' >&2\n  exit 127\nfi\nif command -v head >/dev/null 2>&1; then\n  head -c 512 /tmp/http-smoke.out\nelif [ -x /usr/local/bin/busybox ]; then\n  /usr/local/bin/busybox head -c 512 /tmp/http-smoke.out\nelif [ -x /bin/busybox ]; then\n  /bin/busybox head -c 512 /tmp/http-smoke.out\nelse\n  cat /tmp/http-smoke.out\nfi"
     )
 }
 

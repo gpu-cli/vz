@@ -48,6 +48,9 @@ enum Commands {
     /// Start a VM with optional mounts.
     Run(commands::run::RunArgs),
 
+    /// OCI container runtime operations.
+    Oci(Box<commands::oci::OciArgs>),
+
     /// Execute a command inside a running VM.
     Exec(commands::exec::ExecArgs),
 
@@ -114,6 +117,7 @@ fn main() -> anyhow::Result<()> {
         let result = match cli.command {
             Commands::Init(args) => commands::init::run(args).await,
             Commands::Run(args) => commands::run::run(args).await,
+            Commands::Oci(args) => commands::oci::run(*args).await,
             Commands::Exec(args) => commands::exec::run(args).await,
             Commands::Save(args) => commands::save::run(args).await,
             Commands::Restore(args) => commands::restore::run(args).await,
@@ -172,6 +176,41 @@ mod tests {
         let cli =
             Cli::try_parse_from(["vz", "run", "--image", "base.img", "--headless"]).expect("parse");
         assert!(matches!(cli.command, Commands::Run(_)));
+    }
+
+    #[test]
+    fn parse_oci_pull_subcommand() {
+        let cli = Cli::try_parse_from(["vz", "oci", "pull", "alpine:latest"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Oci(args) if matches!(args.action, commands::oci::OciCommand::Pull(_))
+        ));
+    }
+
+    #[test]
+    fn parse_oci_run_subcommand() {
+        let cli = Cli::try_parse_from(["vz", "oci", "run", "alpine:latest", "--", "echo", "hello"])
+            .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Oci(args) if matches!(args.action, commands::oci::OciCommand::Run(_))
+        ));
+    }
+
+    #[test]
+    fn parse_oci_run_with_publish_flag() {
+        let cli = Cli::try_parse_from(["vz", "oci", "run", "nginx:alpine", "--publish", "8080:80"])
+            .expect("parse");
+
+        match cli.command {
+            Commands::Oci(args) => match args.action {
+                commands::oci::OciCommand::Run(run) => {
+                    assert_eq!(run.publish, vec!["8080:80".to_string()]);
+                }
+                other => panic!("unexpected OCI action variant: {other:?}"),
+            },
+            other => panic!("unexpected command variant: {other:?}"),
+        }
     }
 
     #[test]

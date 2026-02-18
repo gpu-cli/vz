@@ -1,13 +1,25 @@
 use std::time::Duration;
 
 use tokio::time::{Instant, timeout};
-use vz::Vm;
 use vz::protocol::{self, ExecOutput, Handshake, HandshakeAck, Request, Response};
+use vz::{Vm, VsockStream};
 
 use crate::LinuxError;
 
 const HEALTHCHECK_PING_ID: u64 = 1;
 const EXEC_REQUEST_ID: u64 = 2;
+const PORT_FORWARD_REQUEST_ID: u64 = 3;
+
+/// Options for guest command execution.
+#[derive(Debug, Clone, Default)]
+pub struct ExecOptions {
+    /// Optional working directory inside the guest.
+    pub working_dir: Option<String>,
+    /// Environment variables for the process.
+    pub env: Vec<(String, String)>,
+    /// Optional user to run as.
+    pub user: Option<String>,
+}
 
 /// Connect to guest agent, perform handshake, and ping.
 pub async fn handshake_and_ping(vm: &Vm) -> Result<HandshakeAck, LinuxError> {
@@ -48,12 +60,79 @@ pub async fn handshake_and_ping(vm: &Vm) -> Result<HandshakeAck, LinuxError> {
     }
 }
 
+/// Open a dedicated guest port-forward vsock stream.
+///
+/// On success, the returned stream is a raw byte pipe to the requested
+/// `target_port` inside the guest.
+pub async fn open_port_forward_stream(
+    vm: &Vm,
+    target_port: u16,
+    protocol_name: &str,
+) -> Result<VsockStream, LinuxError> {
+    let mut stream = vm.vsock_connect(protocol::AGENT_PORT).await?;
+
+    let handshake = Handshake {
+        protocol_version: protocol::PROTOCOL_VERSION,
+        capabilities: vec!["user_exec".to_string(), "port_forward".to_string()],
+    };
+    protocol::write_frame(&mut stream, &handshake).await?;
+
+    let ack: HandshakeAck = protocol::read_frame(&mut stream).await?;
+    if ack.protocol_version == 0 {
+        return Err(LinuxError::Protocol(
+            "guest agent negotiated protocol version 0".to_string(),
+        ));
+    }
+
+    if !ack
+        .capabilities
+        .iter()
+        .any(|capability| capability == "port_forward")
+    {
+        return Err(LinuxError::Protocol(
+            "guest agent does not advertise port_forward capability".to_string(),
+        ));
+    }
+
+    protocol::write_frame(
+        &mut stream,
+        &Request::PortForward {
+            id: PORT_FORWARD_REQUEST_ID,
+            target_port,
+            protocol: protocol_name.to_string(),
+        },
+    )
+    .await?;
+
+    let response: Response = protocol::read_frame(&mut stream).await?;
+    match response {
+        Response::PortForwardReady { id } if id == PORT_FORWARD_REQUEST_ID => Ok(stream),
+        Response::Error { id, error } if id == PORT_FORWARD_REQUEST_ID => Err(
+            LinuxError::Protocol(format!("guest port forward request failed: {error}")),
+        ),
+        other => Err(LinuxError::Protocol(format!(
+            "expected PortForwardReady response, got: {other:?}"
+        ))),
+    }
+}
+
 /// Execute a command in the guest and capture buffered stdout/stderr output.
 pub async fn exec_capture(
     vm: &Vm,
     command: String,
     args: Vec<String>,
     request_timeout: Duration,
+) -> Result<ExecOutput, LinuxError> {
+    exec_capture_with_options(vm, command, args, request_timeout, ExecOptions::default()).await
+}
+
+/// Execute a command in the guest with explicit execution options.
+pub async fn exec_capture_with_options(
+    vm: &Vm,
+    command: String,
+    args: Vec<String>,
+    request_timeout: Duration,
+    options: ExecOptions,
 ) -> Result<ExecOutput, LinuxError> {
     let stream = vm.vsock_connect(protocol::AGENT_PORT).await?;
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -75,9 +154,9 @@ pub async fn exec_capture(
         id: exec_id,
         command,
         args,
-        working_dir: None,
-        env: Vec::new(),
-        user: None,
+        working_dir: options.working_dir,
+        env: options.env,
+        user: options.user,
     };
     protocol::write_frame(&mut writer, &request).await?;
 

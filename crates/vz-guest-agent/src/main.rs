@@ -1,7 +1,7 @@
 //! vz-guest-agent: runs inside macOS VM, listens on vsock, executes commands.
 //!
 //! This binary is baked into the golden VM image and managed by launchd.
-//! It listens on vsock port 7424 (default), accepts one connection at a time,
+//! It listens on vsock port 7424 (default), accepts concurrent connections,
 //! and processes Request/Response messages using length-prefixed JSON framing.
 
 // The guest agent legitimately uses unsafe for libc syscalls (vsock, sysctl, etc.)
@@ -16,6 +16,7 @@ use anyhow::Context;
 use clap::Parser;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
@@ -120,28 +121,39 @@ async fn bind_vsock_listener(port: u32, timeout: Duration) -> anyhow::Result<Vso
     }
 }
 
-/// Main accept loop. Accepts one connection at a time, handles it until
-/// disconnect, drains processes, then accepts the next.
+/// Main accept loop.
+///
+/// Each accepted connection is handled in its own task so exec/control traffic
+/// can run concurrently with dedicated port-forward streams.
 async fn accept_loop(listener: VsockListener) -> anyhow::Result<()> {
+    let mut connection_tasks = JoinSet::new();
+
     loop {
         info!("waiting for connection");
-        let stream = listener
-            .accept()
-            .await
-            .context("failed to accept vsock connection")?;
-        info!("connection accepted");
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let stream = accept_result.context("failed to accept vsock connection")?;
+                info!("connection accepted");
 
-        let process_table = Arc::new(Mutex::new(ProcessTable::new()));
+                connection_tasks.spawn(async move {
+                    let process_table = Arc::new(Mutex::new(ProcessTable::new()));
 
-        match handle_connection(stream, process_table.clone()).await {
-            Ok(()) => info!("connection closed cleanly"),
-            Err(e) => warn!(error = %e, "connection ended with error"),
+                    match handle_connection(stream, process_table.clone()).await {
+                        Ok(()) => info!("connection closed cleanly"),
+                        Err(e) => warn!(error = %e, "connection ended with error"),
+                    }
+
+                    info!("draining processes");
+                    drain_processes(process_table).await;
+                    info!("drain complete, ready for next connection");
+                });
+            }
+            join_result = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                if let Some(Err(error)) = join_result {
+                    warn!(error = %error, "connection task join failed");
+                }
+            }
         }
-
-        // Drain all child processes before accepting next connection
-        info!("draining processes");
-        drain_processes(process_table).await;
-        info!("drain complete, ready for next connection");
     }
 }
 

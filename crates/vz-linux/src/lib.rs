@@ -10,6 +10,7 @@ mod error;
 mod kernel;
 mod vm;
 
+pub use agent::{ExecOptions, open_port_forward_stream};
 pub use benchmark::{
     BootBenchmarkConfig, BootBenchmarkEvent, BootBenchmarkResult, BootSample, run_boot_benchmark,
     run_boot_benchmark_with_progress,

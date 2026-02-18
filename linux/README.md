@@ -36,6 +36,7 @@ Useful benchmark flags:
 - `--http-smoke-url URL` runs a curl-like HTTP smoke check in guest via BusyBox `wget`.
 - `--guest-log-command "..."` captures a custom guest command via `sh -lc`.
 - `--retry-log-every N` prints a readiness heartbeat every N retries.
+- `--rootfs-dir PATH` mounts a host rootfs directory via VirtioFS tag `rootfs` and benchmarks overlay+chroot rootfs boot mode.
 
 ## Inputs
 

@@ -1,11 +1,14 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::Instant;
 use vz::Vm;
 use vz::protocol::{ExecOutput, HandshakeAck};
 
-use crate::agent::{exec_capture, handshake_and_ping};
-use crate::{LinuxError, LinuxVmConfig};
+use crate::agent::{
+    exec_capture, exec_capture_with_options, handshake_and_ping, open_port_forward_stream,
+};
+use crate::{ExecOptions, LinuxError, LinuxVmConfig};
 
 const AGENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const AGENT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -13,7 +16,7 @@ const AGENT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Linux VM wrapper with guest-agent readiness helpers.
 #[derive(Debug)]
 pub struct LinuxVm {
-    vm: Vm,
+    vm: Arc<Vm>,
     config: LinuxVmConfig,
 }
 
@@ -22,7 +25,7 @@ impl LinuxVm {
     pub async fn create(config: LinuxVmConfig) -> Result<Self, LinuxError> {
         config.validate()?;
         let vm_config = config.to_vm_config()?;
-        let vm = Vm::create(vm_config).await?;
+        let vm = Arc::new(Vm::create(vm_config).await?);
         Ok(Self { vm, config })
     }
 
@@ -128,12 +131,37 @@ impl LinuxVm {
         args: Vec<String>,
         timeout: Duration,
     ) -> Result<ExecOutput, LinuxError> {
-        exec_capture(&self.vm, command, args, timeout).await
+        exec_capture(self.vm.as_ref(), command, args, timeout).await
+    }
+
+    /// Run a command on the guest with explicit execution options.
+    pub async fn exec_capture_with_options(
+        &self,
+        command: String,
+        args: Vec<String>,
+        timeout: Duration,
+        options: ExecOptions,
+    ) -> Result<ExecOutput, LinuxError> {
+        exec_capture_with_options(self.vm.as_ref(), command, args, timeout, options).await
+    }
+
+    /// Open a dedicated port-forward stream to a guest-local target port.
+    pub async fn open_port_forward_stream(
+        &self,
+        target_port: u16,
+        protocol_name: &str,
+    ) -> Result<vz::VsockStream, LinuxError> {
+        open_port_forward_stream(self.vm.as_ref(), target_port, protocol_name).await
     }
 
     /// Borrow the underlying base VM.
     pub fn inner(&self) -> &Vm {
-        &self.vm
+        self.vm.as_ref()
+    }
+
+    /// Clone the underlying base VM handle.
+    pub fn inner_shared(&self) -> Arc<Vm> {
+        Arc::clone(&self.vm)
     }
 
     /// Borrow the Linux VM config.

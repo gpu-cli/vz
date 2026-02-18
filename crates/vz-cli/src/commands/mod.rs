@@ -5,6 +5,7 @@ pub mod cleanup;
 pub mod exec;
 pub mod init;
 pub mod list;
+pub mod oci;
 pub mod provision;
 pub mod restore;
 pub mod run;
