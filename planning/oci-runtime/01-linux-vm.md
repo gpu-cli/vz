@@ -75,45 +75,280 @@ A custom kernel config targeting the minimum needed for a Virtualization.framewo
 - Security modules (SELinux, AppArmor) — the VM itself is the security boundary
 - Module loading — build everything needed as built-in (no initrd module loading)
 
-### Build
+### Kernel Config
 
-```bash
-# Cross-compile arm64 Linux kernel on macOS (or build on Linux ARM64)
-make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
-# Apply vz-linux .config overlay
-scripts/kconfig/merge_config.sh .config vz-linux.config
-make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image
+The kernel config lives at `linux/vz-linux.config` in the repository root. It is a kconfig fragment merged on top of `defconfig`:
+
+```
+# --- Virtio (Virtualization.framework guest) ---
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_NET=y
+CONFIG_VIRTIO_CONSOLE=y
+CONFIG_VIRTIO_FS=y
+CONFIG_FUSE_FS=y
+
+# --- Vsock (host↔guest communication) ---
+CONFIG_VSOCKETS=y
+CONFIG_VIRTIO_VSOCKETS=y
+
+# --- Filesystems ---
+CONFIG_OVERLAY_FS=y
+CONFIG_TMPFS=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_EXT4_FS=y
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+
+# --- Networking ---
+CONFIG_NET=y
+CONFIG_INET=y
+CONFIG_IPV6=y
+CONFIG_PACKET=y
+CONFIG_UNIX=y
+
+# --- Namespaces / cgroups (for optional inner isolation) ---
+CONFIG_NAMESPACES=y
+CONFIG_CGROUPS=y
+
+# --- Disable everything else ---
+CONFIG_MODULES=n
+CONFIG_SOUND=n
+CONFIG_USB=n
+CONFIG_DRM=n
+CONFIG_INPUT=n
+CONFIG_SELINUX=n
+CONFIG_SECURITY=n
+CONFIG_DEBUG_KERNEL=n
+CONFIG_FTRACE=n
+CONFIG_BT=n
+CONFIG_WIRELESS=n
+CONFIG_WLAN=n
+CONFIG_NFS_FS=n
+CONFIG_CIFS=n
 ```
 
-The output is `arch/arm64/boot/Image` (~10 MB uncompressed). This is what `VZLinuxBootLoader` expects.
+All drivers are built-in (`=y`), not modules. `CONFIG_MODULES=n` means no module loading at all — the kernel is self-contained.
+
+### Build Environments
+
+The kernel + initramfs are built outside of `cargo build`. The output is two binary artifacts (`vmlinux` ~10 MB, `initramfs.img` ~15 MB) that are distributed alongside the Rust binaries.
+
+#### Local Development
+
+Cross-compile on macOS using a Homebrew toolchain:
+
+```bash
+# One-time setup
+brew install aarch64-elf-gcc cpio
+
+# Build kernel + initramfs
+make -C linux/ all
+```
+
+This runs the kernel cross-compile and initramfs assembly described below. Developers only need to rebuild after changing the kconfig or the guest agent — not on every `cargo build`.
+
+Alternatively, build inside a Docker container (no Homebrew toolchain needed):
+
+```bash
+make -C linux/ docker-build
+```
+
+This runs the same Makefile targets inside a lightweight Alpine container with the cross-compile toolchain pre-installed.
+
+#### CI (GitHub Actions)
+
+The CI pipeline produces `vmlinux` and `initramfs.img` as release artifacts:
+
+```yaml
+# .github/workflows/linux-kernel.yml
+jobs:
+  build-kernel:
+    runs-on: ubuntu-24.04-arm  # Native arm64 — no cross-compile needed
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison bc libelf-dev cpio
+      - name: Build kernel + initramfs
+        run: make -C linux/ all
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vz-linux-artifacts
+          path: |
+            linux/out/vmlinux
+            linux/out/initramfs.img
+            linux/out/version.json
+```
+
+On tagged releases, the artifacts are attached to the GitHub Release. The `vz-cli` release job downloads them and bundles them into the CLI tarball.
+
+#### Makefile
+
+All build logic lives in `linux/Makefile`:
+
+```
+linux/
+├── Makefile              # Kernel + initramfs build targets
+├── vz-linux.config       # Kconfig fragment
+├── initramfs/
+│   ├── init              # PID 1 script (checked into repo)
+│   └── etc/
+│       ├── resolv.conf
+│       └── udhcpc.script
+├── Dockerfile            # Build container for docker-build target
+└── out/                  # Build output (gitignored)
+    ├── vmlinux
+    ├── initramfs.img
+    └── version.json
+```
+
+Key Makefile targets:
+
+| Target | What it does |
+|--------|-------------|
+| `make kernel` | Download kernel source (pinned version), apply config, compile `vmlinux` |
+| `make initramfs` | Build guest agent (musl), download busybox, assemble cpio archive |
+| `make all` | Both of the above |
+| `make docker-build` | Run `make all` inside a Docker container |
+| `make clean` | Remove `out/` |
+
+#### Kernel Source
+
+The Makefile downloads the pinned kernel source tarball from kernel.org:
+
+```makefile
+KERNEL_VERSION := 6.12.11
+KERNEL_SHA256  := <sha256-of-tarball>
+KERNEL_URL     := https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$(KERNEL_VERSION).tar.xz
+
+$(KERNEL_SRC):
+	curl -fSL $(KERNEL_URL) -o $(KERNEL_SRC).tar.xz
+	echo "$(KERNEL_SHA256)  $(KERNEL_SRC).tar.xz" | sha256sum -c
+	tar xf $(KERNEL_SRC).tar.xz
+```
+
+The version and hash are pinned in the Makefile. Kernel updates are an explicit commit that bumps both values.
+
+#### Busybox
+
+Statically linked arm64 busybox is downloaded from the Alpine project:
+
+```makefile
+BUSYBOX_VERSION := 1.37.0
+BUSYBOX_SHA256  := <sha256-of-binary>
+BUSYBOX_URL     := https://busybox.net/downloads/binaries/$(BUSYBOX_VERSION)-aarch64/busybox
+
+$(BUSYBOX):
+	curl -fSL $(BUSYBOX_URL) -o $(BUSYBOX)
+	echo "$(BUSYBOX_SHA256)  $(BUSYBOX)" | sha256sum -c
+	chmod +x $(BUSYBOX)
+```
+
+Pinned version + SHA256 checksum. No building from source — the official static binaries are sufficient.
 
 ### Versioning
 
-The kernel version is pinned in `vz-linux/Cargo.toml` metadata:
+The build produces `linux/out/version.json`:
+
+```json
+{
+  "kernel": "6.12.11",
+  "busybox": "1.37.0",
+  "agent": "0.1.0",
+  "built": "2026-02-17T10:00:00Z",
+  "sha256_vmlinux": "...",
+  "sha256_initramfs": "..."
+}
+```
+
+This is installed alongside the artifacts and used for version checking at runtime.
+
+The kernel version is also referenced in `vz-linux/Cargo.toml` metadata for programmatic access:
 
 ```toml
 [package.metadata.linux]
-kernel_version = "6.12"
-kernel_sha256 = "..."
+kernel_version = "6.12.11"
+artifacts_url = "https://github.com/jameslal/vz/releases/download/v{version}/vz-linux-artifacts.tar.gz"
 ```
 
-Kernel updates are explicit and tested. Users don't need to build the kernel themselves — it's distributed as a binary artifact alongside the `vz-cli` release.
+### Distribution & Provisioning
 
-### Distribution
+There are three ways the kernel + initramfs reach a user's machine:
 
-The kernel binary is bundled with `vz-cli` releases:
+#### 1. CLI bundle (default for end users)
+
+The `vz-cli` release tarball includes the artifacts:
 
 ```
-vz-cli release tarball:
+vz-v0.1.0-aarch64-apple-darwin.tar.gz:
 ├── vz                           # CLI binary (signed + notarized)
 ├── linux/
 │   ├── vmlinux                  # arm64 Linux kernel
-│   └── initramfs.img            # initramfs with guest agent
+│   ├── initramfs.img            # initramfs with guest agent
+│   └── version.json
 └── entitlements/
     └── vz-cli.entitlements.plist
 ```
 
-On first use, copied to `~/.vz/linux/`. The `vz` library crate (`vz-linux`) embeds the path and verifies the files exist at runtime.
+On first `vz run <linux-image>`, the CLI copies these to `~/.vz/linux/` if not already present or if the bundled version is newer.
+
+#### 2. Pre-download (for library users and CI environments)
+
+For consumers using `vz-linux` as a Rust library (not the CLI), the artifacts aren't bundled in the crate. Instead, `vz-linux` provides a setup function:
+
+```rust
+/// Ensure kernel + initramfs are available at ~/.vz/linux/.
+///
+/// Checks local cache first. If missing or outdated, downloads
+/// from the GitHub Release matching this crate's version.
+/// Returns the paths to vmlinux and initramfs.img.
+pub async fn ensure_kernel() -> Result<KernelPaths> {
+    let dir = vz_linux_dir();  // ~/.vz/linux/
+    let expected_version = env!("CARGO_PKG_VERSION");
+
+    // Already present and correct version?
+    if let Ok(installed) = read_version_json(&dir) {
+        if installed.agent == expected_version {
+            return Ok(KernelPaths {
+                kernel: dir.join("vmlinux"),
+                initramfs: dir.join("initramfs.img"),
+            });
+        }
+    }
+
+    // Download from GitHub Release
+    let url = format!(
+        "https://github.com/jameslal/vz/releases/download/v{}/vz-linux-artifacts.tar.gz",
+        expected_version,
+    );
+    download_and_extract(&url, &dir).await?;
+    verify_checksums(&dir)?;
+
+    Ok(KernelPaths {
+        kernel: dir.join("vmlinux"),
+        initramfs: dir.join("initramfs.img"),
+    })
+}
+```
+
+Library consumers call `ensure_kernel()` once at startup — or ahead of time in their own setup/install step. This avoids on-demand downloads during `runtime.run()`.
+
+For CI environments that can't hit the network, the artifacts can be pre-installed:
+
+```bash
+# In CI setup step, or a Dockerfile
+curl -fSL https://github.com/jameslal/vz/releases/download/v0.1.0/vz-linux-artifacts.tar.gz \
+  | tar xz -C ~/.vz/linux/
+```
+
+#### 3. Custom kernel (advanced)
+
+`LinuxVmConfig` takes explicit `kernel: PathBuf` and `initramfs: PathBuf` fields. Users who want a custom kernel (different version, extra drivers, different agent) can point to their own files. `ensure_kernel()` is a convenience, not a requirement.
 
 ## Initramfs
 
@@ -236,37 +471,20 @@ esac
 
 ### Build
 
+The `make initramfs` target in `linux/Makefile` handles assembly. The steps are:
+
+1. **Download busybox** — pinned static arm64 binary (see Busybox section above)
+2. **Build guest agent** — `cargo build --release -p vz-guest-agent --target aarch64-unknown-linux-musl`
+3. **Assemble directory tree** — copy busybox, create symlinks, copy agent + init script + configs
+4. **Pack cpio archive** — `find . | cpio -o -H newc | gzip > initramfs.img`
+
+The guest agent must be statically linked (`musl` target) since the initramfs has no dynamic linker. The `aarch64-unknown-linux-musl` Rust target must be installed:
+
 ```bash
-# Create initramfs directory structure
-mkdir -p initramfs/{bin,usr/bin,etc,dev,proc,sys,tmp}
-mkdir -p initramfs/mnt/{rootfs,overlay-work,merged}
-
-# Install busybox (statically linked arm64)
-cp busybox-arm64-static initramfs/bin/busybox
-chmod +x initramfs/bin/busybox
-
-# Create busybox symlinks
-for cmd in sh mount umount mkdir cp cat ls ip hostname chroot switch_root udhcpc; do
-    ln -s busybox initramfs/bin/$cmd
-done
-
-# Install udhcpc callback script
-cp udhcpc.script initramfs/etc/udhcpc.script
-chmod +x initramfs/etc/udhcpc.script
-
-# Install guest agent (compiled for aarch64-unknown-linux-musl)
-cargo build --release -p vz-guest-agent --target aarch64-unknown-linux-musl
-cp target/aarch64-unknown-linux-musl/release/vz-guest-agent initramfs/usr/bin/
-
-# Install init script
-cp init.sh initramfs/init
-chmod +x initramfs/init
-
-# Create the initramfs cpio archive
-cd initramfs && find . | cpio -o -H newc | gzip > ../initramfs.img
+rustup target add aarch64-unknown-linux-musl
 ```
 
-The guest agent must be statically linked (`musl` target) since the initramfs has no dynamic linker. The container rootfs may have its own libc, but the agent is copied into the new root and started before switch_root.
+The container rootfs may have its own libc, but the agent is copied into the new root and started before switch_root. The init script, resolv.conf, and udhcpc.script are checked into `linux/initramfs/` and copied during assembly.
 
 ## Guest Agent (Linux)
 
@@ -399,16 +617,13 @@ The "unlimited" Linux VM count is a major advantage. You can run dozens of conta
 
 ## Kernel + Initramfs Lifecycle
 
-### First Run
+### First Run (CLI)
 
 ```
 vz run ubuntu:24.04 -- echo hello
   │
-  ├── Check ~/.vz/linux/vmlinux exists
-  │   └── If not: extract from vz-cli bundle or download
-  │
-  ├── Check ~/.vz/linux/initramfs.img exists
-  │   └── If not: extract from vz-cli bundle or download
+  ├── Check ~/.vz/linux/vmlinux exists + version matches
+  │   └── If not: copy from CLI bundle (bundled in release tarball)
   │
   ├── Pull ubuntu:24.04 (if not cached)
   ├── Unpack layers to ~/.vz/oci/layers/
@@ -419,13 +634,39 @@ vz run ubuntu:24.04 -- echo hello
   └── Stop VM
 ```
 
+The CLI never downloads the kernel on demand — the artifacts are always bundled in the release tarball. If the files at `~/.vz/linux/` are missing or stale, they are copied from the bundle.
+
+### First Run (Library)
+
+```rust
+// Application startup — call once, not per-container
+let paths = vz_linux::ensure_kernel().await?;
+
+// Later, when creating containers
+let config = LinuxVmConfig {
+    kernel: paths.kernel,
+    initramfs: paths.initramfs,
+    ..Default::default()
+};
+```
+
+`ensure_kernel()` checks `~/.vz/linux/version.json` against the crate version. If missing or outdated, it downloads from the GitHub Release. Library consumers who want to avoid runtime downloads should pre-install in their deployment step:
+
+```bash
+# In Dockerfile or CI setup
+vz-linux-setup  # thin binary that calls ensure_kernel() and exits
+# or: curl release tarball directly
+```
+
 ### Updates
 
-When `vz` is updated, the kernel + initramfs may also update. The CLI checks the version embedded in the binary against what's installed at `~/.vz/linux/` and replaces if newer.
+When `vz` is updated, the kernel + initramfs may also update. Both the CLI and `ensure_kernel()` compare the installed `version.json` against the expected version and replace if newer.
 
 ```
 ~/.vz/linux/
 ├── vmlinux                # arm64 Linux kernel
 ├── initramfs.img          # initramfs with guest agent
-└── version.json           # { "kernel": "6.12", "agent": "0.2.0" }
+└── version.json           # { "kernel": "6.12.11", "busybox": "1.37.0", "agent": "0.1.0", ... }
 ```
+
+Version mismatches between the kernel and the guest agent are fatal — the agent protocol could have changed. The version check prevents this.

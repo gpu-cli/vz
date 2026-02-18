@@ -139,7 +139,7 @@ Expose a Docker Engine API on a Unix socket so `docker` CLI and `docker-compose`
 
 | Document | Covers |
 |----------|--------|
-| `01-linux-vm.md` | vz-linux crate: minimal kernel, initramfs, boot sequence, guest agent for Linux, resource defaults, distribution |
+| `01-linux-vm.md` | vz-linux crate: minimal kernel, initramfs, boot sequence, guest agent for Linux, resource defaults, build environments (local + CI), kernel provisioning (CLI bundle, pre-download, library API) |
 | `02-oci-images.md` | OCI image pulling, authentication, layer unpacking, image store, rootfs assembly, caching |
 | `03-container-lifecycle.md` | vz-oci crate: Runtime and Container API, container lifecycle, networking, port forwarding, environment, mounts |
 | `04-unified-api.md` | Unified Runtime API abstracting Linux and macOS backends, image reference routing, CLI integration, HQ integration |

@@ -71,6 +71,30 @@ The OCI runtime needs three builder methods not currently in the base API:
 
 These are convenience methods — the OCI runtime can work around their absence by looping `.shared_dir()` calls, using `.memory_bytes(n * 1024 * 1024)`, and matching on `NetworkConfig` to call `.network_nat()` / `.network_bridged()`. But the builder methods are cleaner.
 
+## VmConfigBuilder: Make Disk Optional for Linux Boot
+
+The current `VmConfigBuilder::build()` requires `disk_path` unconditionally:
+
+```rust
+let disk_path = self
+    .disk_path
+    .ok_or_else(|| VzError::InvalidConfig("disk path is required".into()))?;
+```
+
+Linux VMs have no disk image — the rootfs comes via VirtioFS. The builder must make `disk_path` optional when the boot loader is `BootLoader::Linux`:
+
+```rust
+// Disk is required for macOS, optional for Linux
+let disk_path = match &boot_loader {
+    BootLoader::MacOS => self
+        .disk_path
+        .ok_or_else(|| VzError::InvalidConfig("macOS boot requires a disk image".into()))?,
+    BootLoader::Linux { .. } => self.disk_path, // None is fine
+};
+```
+
+Correspondingly, `VmConfig.disk_path` changes from `PathBuf` to `Option<PathBuf>`, and `build_objc_config` in `bridge.rs` only creates a `VZVirtioBlockDeviceConfiguration` when `disk_path` is `Some`.
+
 ## Protocol Extensions: PortForward
 
 The port forwarding feature (03-container-lifecycle.md) requires two new protocol message types:
