@@ -1,10 +1,13 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, process};
 
+use crate::bundle::{BundleSpec, write_oci_bundle};
 use crate::container_store::{ContainerInfo, ContainerStatus, ContainerStore};
 use crate::image::{
     ImageConfigSummary, ImageId, ImagePuller, parse_image_config_summary_from_store,
@@ -14,20 +17,27 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::warn;
-use vz::NetworkConfig;
 use vz::Vm;
 use vz::protocol::ExecOutput;
+use vz::{NetworkConfig, SharedDirConfig};
 use vz_linux::{
-    EnsureKernelOptions, ExecOptions, LinuxError, LinuxVm, LinuxVmConfig,
-    ensure_kernel_with_options,
+    EnsureKernelOptions, ExecOptions, KernelPaths, LinuxError, LinuxVm, LinuxVmConfig,
+    OciExecOptions, ensure_kernel_with_options,
 };
 
-use crate::config::{PortMapping, PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig};
+use crate::config::{
+    ExecutionMode, OciRuntimeKind, PortMapping, PortProtocol, RunConfig, RuntimeBackend,
+    RuntimeConfig,
+};
 use crate::error::OciError;
 use crate::store::{ImageInfo, PruneResult};
 
 const STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const OCI_RUNTIME_BIN_SHARE_TAG: &str = "oci-runtime-bin";
+const OCI_DEFAULT_GUEST_STATE_DIR: &str = "/run/vz-oci";
+const OCI_BUNDLE_DIRNAME: &str = "bundles";
+const OCI_GUEST_ROOT_PATH: &str = "/";
 
 /// Unified runtime entrypoint.
 #[derive(Clone)]
@@ -221,7 +231,10 @@ impl Runtime {
         let image_config = parse_image_config_summary_from_store(&self.store, &image_id.0)?;
         let run = resolve_run_config(image_config, run, &container_id)?;
 
-        let output = self.run_rootfs(&rootfs_dir, run).await;
+        let output = match run.execution_mode {
+            ExecutionMode::GuestExec => self.run_rootfs(&rootfs_dir, run).await,
+            ExecutionMode::OciRuntime => self.run_rootfs_with_oci_runtime(&rootfs_dir, run).await,
+        };
         self.cleanup_rootfs_dir(rootfs_dir.as_ref());
 
         container.status = match &output {
@@ -239,6 +252,137 @@ impl Runtime {
         output
     }
 
+    async fn run_rootfs_with_oci_runtime(
+        &self,
+        rootfs_dir: impl AsRef<Path>,
+        run: RunConfig,
+    ) -> Result<ExecOutput, OciError> {
+        let RunConfig {
+            cmd,
+            init_process,
+            working_dir,
+            env,
+            user,
+            ports,
+            cpus,
+            memory_mb,
+            network_enabled,
+            serial_log_file,
+            execution_mode: _,
+            timeout,
+            container_id,
+            oci_annotations,
+        } = run;
+
+        let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
+
+        if !rootfs_dir.is_dir() {
+            return Err(OciError::InvalidRootfs { path: rootfs_dir });
+        }
+
+        let (command, args) = cmd
+            .split_first()
+            .ok_or_else(|| OciError::InvalidConfig("run command must not be empty".to_string()))?;
+
+        let container_id = container_id.unwrap_or_else(new_container_id);
+        let bundle_guest_root = oci_bundle_guest_root(self.config.guest_state_dir.as_deref())?;
+        let bundle_guest_path = oci_bundle_guest_path(&bundle_guest_root, &container_id);
+        let bundle_host_dir = oci_bundle_host_dir(&rootfs_dir, &bundle_guest_path);
+        let bundle_cmd = init_process.unwrap_or_else(|| cmd.clone());
+
+        write_oci_bundle(
+            &bundle_host_dir,
+            Path::new(OCI_GUEST_ROOT_PATH),
+            BundleSpec {
+                cmd: bundle_cmd,
+                env: env.clone(),
+                cwd: working_dir.clone(),
+                user: user.clone(),
+                mounts: Vec::new(),
+                oci_annotations,
+            },
+        )?;
+
+        let kernel = ensure_kernel_with_options(EnsureKernelOptions {
+            install_dir: self.config.linux_install_dir.clone(),
+            bundle_dir: self.config.linux_bundle_dir.clone(),
+            require_exact_agent_version: self.config.require_exact_agent_version,
+        })
+        .await?;
+        let runtime_binary = resolve_oci_runtime_binary_path(
+            self.config.guest_oci_runtime,
+            self.config.guest_oci_runtime_path.as_deref(),
+            &kernel,
+        )?;
+
+        let mut vm_config =
+            LinuxVmConfig::new(kernel.kernel, kernel.initramfs).with_rootfs_dir(rootfs_dir);
+        vm_config
+            .shared_dirs
+            .push(make_oci_runtime_share(&runtime_binary)?);
+        vm_config.cpus = cpus.unwrap_or(self.config.default_cpus);
+        vm_config.memory_mb = memory_mb.unwrap_or(self.config.default_memory_mb);
+        vm_config.serial_log_file = serial_log_file;
+
+        let network_enabled = network_enabled.unwrap_or(self.config.default_network_enabled);
+        if !network_enabled {
+            vm_config.network = Some(NetworkConfig::None);
+        }
+
+        let vm = LinuxVm::create(vm_config).await?;
+        vm.start().await?;
+
+        if let Err(err) = vm.wait_for_agent(self.config.agent_ready_timeout).await {
+            let _ = vm.stop().await;
+            return Err(err.into());
+        }
+
+        let port_forwards = match start_port_forwarding(vm.inner_shared(), &ports).await {
+            Ok(port_forwards) => port_forwards,
+            Err(err) => {
+                let _ = vm.stop().await;
+                return Err(err);
+            }
+        };
+
+        let lifecycle_timeout = timeout.unwrap_or(self.config.exec_timeout);
+        let lifecycle = tokio::time::timeout(
+            lifecycle_timeout,
+            run_oci_lifecycle(
+                &vm,
+                container_id,
+                bundle_guest_path,
+                command.clone(),
+                args.to_vec(),
+                OciExecOptions {
+                    env,
+                    cwd: working_dir,
+                    user,
+                },
+            ),
+        )
+        .await
+        .map_err(|_| {
+            OciError::InvalidConfig(format!(
+                "oci runtime exec timed out after {:.3}s",
+                lifecycle_timeout.as_secs_f64()
+            ))
+        })?;
+
+        if let Some(port_forwards) = port_forwards {
+            port_forwards.shutdown().await;
+        }
+
+        let stop = vm.stop().await;
+
+        match (lifecycle, stop) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Err(exec_err), Ok(())) => Err(exec_err),
+            (Ok(_), Err(stop_err)) => Err(stop_err.into()),
+            (Err(exec_err), Err(_stop_err)) => Err(exec_err),
+        }
+    }
+
     /// Run a command against a local rootfs mounted as VirtioFS `rootfs`.
     ///
     /// This is a stepping stone toward full OCI image lifecycle support.
@@ -249,6 +393,7 @@ impl Runtime {
     ) -> Result<ExecOutput, OciError> {
         let RunConfig {
             cmd,
+            init_process: _,
             working_dir,
             env,
             user,
@@ -257,8 +402,10 @@ impl Runtime {
             memory_mb,
             network_enabled,
             serial_log_file,
+            execution_mode: _,
             timeout,
             container_id: _,
+            oci_annotations: _,
         } = run;
 
         let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
@@ -277,9 +424,17 @@ impl Runtime {
             require_exact_agent_version: self.config.require_exact_agent_version,
         })
         .await?;
+        let runtime_binary = resolve_oci_runtime_binary_path(
+            self.config.guest_oci_runtime,
+            self.config.guest_oci_runtime_path.as_deref(),
+            &kernel,
+        )?;
 
         let mut vm_config =
             LinuxVmConfig::new(kernel.kernel, kernel.initramfs).with_rootfs_dir(rootfs_dir);
+        vm_config
+            .shared_dirs
+            .push(make_oci_runtime_share(&runtime_binary)?);
         vm_config.cpus = cpus.unwrap_or(self.config.default_cpus);
         vm_config.memory_mb = memory_mb.unwrap_or(self.config.default_memory_mb);
         vm_config.serial_log_file = serial_log_file;
@@ -385,6 +540,88 @@ impl Runtime {
                 let _ = fs::remove_dir_all(path);
             }
         }
+    }
+}
+
+type OciLifecycleFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, OciError>> + 'a>>;
+
+trait OciLifecycleOps {
+    fn oci_create<'a>(&'a self, id: String, bundle_path: String) -> OciLifecycleFuture<'a, ()>;
+    fn oci_start<'a>(&'a self, id: String) -> OciLifecycleFuture<'a, ()>;
+    fn oci_exec<'a>(
+        &'a self,
+        id: String,
+        command: String,
+        args: Vec<String>,
+        options: OciExecOptions,
+    ) -> OciLifecycleFuture<'a, ExecOutput>;
+    fn oci_delete<'a>(&'a self, id: String, force: bool) -> OciLifecycleFuture<'a, ()>;
+}
+
+impl OciLifecycleOps for LinuxVm {
+    fn oci_create<'a>(&'a self, id: String, bundle_path: String) -> OciLifecycleFuture<'a, ()> {
+        Box::pin(async move {
+            self.oci_create(id, bundle_path)
+                .await
+                .map_err(OciError::from)
+        })
+    }
+
+    fn oci_start<'a>(&'a self, id: String) -> OciLifecycleFuture<'a, ()> {
+        Box::pin(async move { self.oci_start(id).await.map_err(OciError::from) })
+    }
+
+    fn oci_exec<'a>(
+        &'a self,
+        id: String,
+        command: String,
+        args: Vec<String>,
+        options: OciExecOptions,
+    ) -> OciLifecycleFuture<'a, ExecOutput> {
+        Box::pin(async move {
+            let result = self
+                .oci_exec(id, command, args, options)
+                .await
+                .map_err(OciError::from)?;
+            Ok(ExecOutput {
+                exit_code: result.exit_code,
+                stdout: result.stdout,
+                stderr: result.stderr,
+            })
+        })
+    }
+
+    fn oci_delete<'a>(&'a self, id: String, force: bool) -> OciLifecycleFuture<'a, ()> {
+        Box::pin(async move { self.oci_delete(id, force).await.map_err(OciError::from) })
+    }
+}
+
+async fn run_oci_lifecycle(
+    vm: &impl OciLifecycleOps,
+    container_id: String,
+    bundle_guest_path: String,
+    command: String,
+    args: Vec<String>,
+    options: OciExecOptions,
+) -> Result<ExecOutput, OciError> {
+    vm.oci_create(container_id.clone(), bundle_guest_path)
+        .await?;
+
+    if let Err(start_error) = vm.oci_start(container_id.clone()).await {
+        let _ = vm.oci_delete(container_id, true).await;
+        return Err(start_error);
+    }
+
+    let exec = vm
+        .oci_exec(container_id.clone(), command, args, options)
+        .await;
+    let delete = vm.oci_delete(container_id, true).await;
+
+    match (exec, delete) {
+        (Ok(output), Ok(())) => Ok(output),
+        (Err(exec_err), Ok(())) => Err(exec_err),
+        (Ok(_), Err(delete_err)) => Err(delete_err),
+        (Err(exec_err), Err(_delete_err)) => Err(exec_err),
     }
 }
 
@@ -584,6 +821,94 @@ fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
     }
 }
 
+fn resolve_oci_runtime_binary_path(
+    runtime_kind: OciRuntimeKind,
+    configured_path: Option<&Path>,
+    kernel: &KernelPaths,
+) -> Result<PathBuf, OciError> {
+    let binary = configured_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| kernel.youki.clone());
+    validate_oci_runtime_binary_path(runtime_kind, &binary)?;
+    Ok(binary)
+}
+
+fn validate_oci_runtime_binary_path(
+    runtime_kind: OciRuntimeKind,
+    path: &Path,
+) -> Result<(), OciError> {
+    let expected_binary = runtime_kind.binary_name();
+    let Some(file_name) = path.file_name() else {
+        return Err(OciError::InvalidConfig(format!(
+            "guest oci runtime path must end with '{expected_binary}': {}",
+            path.display()
+        )));
+    };
+
+    if file_name != expected_binary {
+        return Err(OciError::InvalidConfig(format!(
+            "guest oci runtime path must point to '{expected_binary}': {}",
+            path.display()
+        )));
+    }
+
+    if !path.is_file() {
+        return Err(OciError::InvalidConfig(format!(
+            "guest oci runtime binary not found: {}",
+            path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+fn make_oci_runtime_share(runtime_binary: &Path) -> Result<SharedDirConfig, OciError> {
+    let Some(parent) = runtime_binary.parent() else {
+        return Err(OciError::InvalidConfig(format!(
+            "guest oci runtime path has no parent directory: {}",
+            runtime_binary.display()
+        )));
+    };
+
+    Ok(SharedDirConfig {
+        tag: OCI_RUNTIME_BIN_SHARE_TAG.to_string(),
+        source: parent.to_path_buf(),
+        read_only: true,
+    })
+}
+
+fn oci_bundle_host_dir(rootfs_dir: &Path, bundle_guest_path: &str) -> PathBuf {
+    rootfs_dir.join(bundle_guest_path.trim_start_matches('/'))
+}
+
+fn oci_bundle_guest_path(bundle_guest_root: &str, container_id: &str) -> String {
+    format!(
+        "{}/{}",
+        bundle_guest_root.trim_end_matches('/'),
+        container_id
+    )
+}
+
+fn oci_bundle_guest_root(guest_state_dir: Option<&Path>) -> Result<String, OciError> {
+    let state_dir = guest_state_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(OCI_DEFAULT_GUEST_STATE_DIR));
+
+    if !state_dir.is_absolute() {
+        return Err(OciError::InvalidConfig(format!(
+            "guest state dir must be an absolute path: {}",
+            state_dir.display()
+        )));
+    }
+
+    let state_root = state_dir.to_string_lossy().trim_end_matches('/');
+    if state_root.is_empty() {
+        return Ok(format!("/{OCI_BUNDLE_DIRNAME}"));
+    }
+
+    Ok(format!("{state_root}/{OCI_BUNDLE_DIRNAME}"))
+}
+
 fn expand_home_dir(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
     if raw == "~" {
@@ -618,6 +943,7 @@ fn resolve_run_config(
 ) -> Result<RunConfig, OciError> {
     let RunConfig {
         cmd: run_cmd,
+        init_process,
         working_dir: run_working_dir,
         env: run_env,
         user: run_user,
@@ -627,7 +953,9 @@ fn resolve_run_config(
         network_enabled,
         serial_log_file,
         timeout,
+        execution_mode,
         container_id: _,
+        oci_annotations,
     } = run;
 
     let resolved_cmd = if !run_cmd.is_empty() {
@@ -654,6 +982,11 @@ fn resolve_run_config(
     let resolved_env = merge_run_env(image_config.env, run_env, container_id);
     let working_dir = run_working_dir.or(image_config.working_dir);
     let user = run_user.or(image_config.user);
+    if init_process.as_ref().is_some_and(Vec::is_empty) {
+        return Err(OciError::InvalidConfig(
+            "init process must not be empty".to_string(),
+        ));
+    }
 
     Ok(RunConfig {
         cmd: resolved_cmd,
@@ -666,7 +999,10 @@ fn resolve_run_config(
         network_enabled,
         serial_log_file,
         timeout,
+        execution_mode,
         container_id: Some(container_id.to_string()),
+        init_process,
+        oci_annotations,
     })
 }
 
@@ -730,6 +1066,7 @@ mod tests {
     use std::io;
 
     use super::*;
+    use vz_linux::KernelVersion;
 
     fn unique_temp_dir(name: &str) -> PathBuf {
         let mut base = env::temp_dir();
@@ -975,6 +1312,218 @@ mod tests {
     }
 
     #[test]
+    fn resolve_run_config_preserves_execution_mode() {
+        let image_config = ImageConfigSummary {
+            cmd: Some(vec!["default".to_string()]),
+            ..ImageConfigSummary::default()
+        };
+
+        let run = RunConfig {
+            execution_mode: ExecutionMode::OciRuntime,
+            ..RunConfig::default()
+        };
+
+        let resolved = resolve_run_config(image_config, run, "container-123").unwrap();
+        assert_eq!(resolved.execution_mode, ExecutionMode::OciRuntime);
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedOciExec {
+        id: String,
+        command: String,
+        args: Vec<String>,
+        options: OciExecOptions,
+    }
+
+    struct MockOciLifecycleOps {
+        calls: std::sync::Mutex<Vec<&'static str>>,
+        exec_call: std::sync::Mutex<Option<RecordedOciExec>>,
+        exec_output: ExecOutput,
+        fail_start: bool,
+    }
+
+    impl OciLifecycleOps for MockOciLifecycleOps {
+        fn oci_create<'a>(
+            &'a self,
+            _id: String,
+            _bundle_path: String,
+        ) -> OciLifecycleFuture<'a, ()> {
+            self.calls.lock().unwrap().push("create");
+            Box::pin(async { Ok(()) })
+        }
+
+        fn oci_start<'a>(&'a self, _id: String) -> OciLifecycleFuture<'a, ()> {
+            self.calls.lock().unwrap().push("start");
+            let fail_start = self.fail_start;
+            Box::pin(async move {
+                if fail_start {
+                    Err(OciError::InvalidConfig("mock start failure".to_string()))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn oci_exec<'a>(
+            &'a self,
+            id: String,
+            command: String,
+            args: Vec<String>,
+            options: OciExecOptions,
+        ) -> OciLifecycleFuture<'a, ExecOutput> {
+            self.calls.lock().unwrap().push("exec");
+            *self.exec_call.lock().unwrap() = Some(RecordedOciExec {
+                id,
+                command,
+                args,
+                options,
+            });
+            let output = self.exec_output.clone();
+            Box::pin(async move { Ok(output) })
+        }
+
+        fn oci_delete<'a>(&'a self, _id: String, _force: bool) -> OciLifecycleFuture<'a, ()> {
+            self.calls.lock().unwrap().push("delete");
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn oci_runtime_lifecycle_uses_create_start_exec_delete_sequence() {
+        let mock = MockOciLifecycleOps {
+            calls: std::sync::Mutex::new(Vec::new()),
+            exec_call: std::sync::Mutex::new(None),
+            exec_output: ExecOutput {
+                exit_code: 7,
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+            },
+            fail_start: false,
+        };
+
+        let output = run_oci_lifecycle(
+            &mock,
+            "svc-web".to_string(),
+            "/run/vz-oci/bundles/svc-web".to_string(),
+            "/bin/echo".to_string(),
+            vec!["hello".to_string()],
+            OciExecOptions {
+                env: vec![("GREETING".to_string(), "hello".to_string())],
+                cwd: Some("/workspace".to_string()),
+                user: Some("1000:1001".to_string()),
+            },
+        )
+        .await
+        .expect("OCI lifecycle should succeed");
+
+        assert_eq!(
+            output,
+            ExecOutput {
+                exit_code: 7,
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+            }
+        );
+        assert_eq!(
+            *mock.calls.lock().unwrap(),
+            vec!["create", "start", "exec", "delete"]
+        );
+        assert_eq!(
+            *mock.exec_call.lock().unwrap(),
+            Some(RecordedOciExec {
+                id: "svc-web".to_string(),
+                command: "/bin/echo".to_string(),
+                args: vec!["hello".to_string()],
+                options: OciExecOptions {
+                    env: vec![("GREETING".to_string(), "hello".to_string())],
+                    cwd: Some("/workspace".to_string()),
+                    user: Some("1000:1001".to_string()),
+                },
+            }),
+        );
+    }
+
+    #[tokio::test]
+    async fn oci_runtime_lifecycle_attempts_delete_on_start_failure() {
+        let mock = MockOciLifecycleOps {
+            calls: std::sync::Mutex::new(Vec::new()),
+            exec_call: std::sync::Mutex::new(None),
+            exec_output: ExecOutput {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            fail_start: true,
+        };
+
+        let error = run_oci_lifecycle(
+            &mock,
+            "svc-start-fail".to_string(),
+            "/run/vz-oci/bundles/svc-start-fail".to_string(),
+            "/bin/echo".to_string(),
+            vec!["hello".to_string()],
+            OciExecOptions::default(),
+        )
+        .await
+        .expect_err("start failure should surface");
+        assert!(matches!(error, OciError::InvalidConfig(ref msg) if msg == "mock start failure"));
+        assert_eq!(
+            *mock.calls.lock().unwrap(),
+            vec!["create", "start", "delete"]
+        );
+    }
+
+    #[test]
+    fn oci_bundle_host_dir_is_rootfs_scoped() {
+        let rootfs_dir = PathBuf::from("/tmp/vz-oci-rootfs");
+        let guest_root = oci_bundle_guest_root(None).unwrap();
+        let guest_path = oci_bundle_guest_path(&guest_root, "svc-bundle");
+        let host_bundle = oci_bundle_host_dir(&rootfs_dir, &guest_path);
+        assert_eq!(
+            host_bundle,
+            PathBuf::from("/tmp/vz-oci-rootfs/run/vz-oci/bundles/svc-bundle")
+        );
+        assert_eq!(
+            guest_path,
+            "/run/vz-oci/bundles/svc-bundle".to_string()
+        );
+    }
+
+    #[test]
+    fn oci_bundle_guest_root_uses_custom_state_dir() {
+        let guest_root = oci_bundle_guest_root(Some(Path::new("/var/lib/vz-oci"))).unwrap();
+        assert_eq!(guest_root, "/var/lib/vz-oci/bundles".to_string());
+    }
+
+    #[test]
+    fn oci_bundle_guest_root_rejects_relative_state_dir() {
+        let error = oci_bundle_guest_root(Some(Path::new("var/lib/vz-oci"))).unwrap_err();
+        assert!(matches!(error, OciError::InvalidConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn run_rootfs_with_oci_runtime_rejects_nonexistent_rootfs() {
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir: unique_temp_dir("oci-missing-rootfs"),
+            ..RuntimeConfig::default()
+        });
+
+        let err = runtime
+            .run_rootfs_with_oci_runtime(
+                "/tmp/vz-oci-missing-rootfs",
+                RunConfig {
+                    cmd: vec!["/bin/true".to_string()],
+                    execution_mode: ExecutionMode::OciRuntime,
+                    ..RunConfig::default()
+                },
+            )
+            .await
+            .expect_err("missing rootfs should fail before VM wiring");
+
+        assert!(matches!(err, OciError::InvalidRootfs { .. }));
+    }
+
+    #[test]
     fn resolve_run_config_merges_env_with_run_precedence() {
         let image_config = ImageConfigSummary {
             env: Some(vec![
@@ -1045,6 +1594,85 @@ mod tests {
             resolve_run_config(image_config, RunConfig::default(), "container-abc").unwrap();
 
         assert_eq!(resolved.container_id, Some("container-abc".to_string()));
+    }
+
+    fn make_kernel_paths_with_youki(path: PathBuf) -> KernelPaths {
+        KernelPaths {
+            kernel: PathBuf::from("/tmp/vmlinux"),
+            initramfs: PathBuf::from("/tmp/initramfs.img"),
+            youki: path,
+            version: KernelVersion {
+                kernel: "6.12.11".to_string(),
+                busybox: "1.37.0".to_string(),
+                agent: "0.1.0".to_string(),
+                youki: "0.5.7".to_string(),
+                built: Some("2026-02-18T00:00:00Z".to_string()),
+                sha256_vmlinux: None,
+                sha256_initramfs: None,
+                sha256_youki: None,
+            },
+        }
+    }
+
+    #[test]
+    fn resolve_oci_runtime_binary_path_uses_kernel_artifact_by_default() {
+        let temp = unique_temp_dir("runtime-bin-default");
+        let youki = temp.join("youki");
+        fs::write(&youki, b"youki").unwrap();
+        let kernel = make_kernel_paths_with_youki(youki.clone());
+
+        let resolved = resolve_oci_runtime_binary_path(OciRuntimeKind::Youki, None, &kernel).unwrap();
+
+        assert_eq!(resolved, youki);
+    }
+
+    #[test]
+    fn resolve_oci_runtime_binary_path_prefers_configured_override() {
+        let temp = unique_temp_dir("runtime-bin-override");
+        let bundled_dir = temp.join("bundled");
+        let override_dir = temp.join("override");
+        fs::create_dir_all(&bundled_dir).unwrap();
+        fs::create_dir_all(&override_dir).unwrap();
+        let bundled_youki = bundled_dir.join("youki");
+        let override_youki = override_dir.join("youki");
+        fs::write(&bundled_youki, b"bundled").unwrap();
+        fs::write(&override_youki, b"override").unwrap();
+        let kernel = make_kernel_paths_with_youki(bundled_youki);
+
+        let resolved = resolve_oci_runtime_binary_path(
+            OciRuntimeKind::Youki,
+            Some(&override_youki),
+            &kernel,
+        )
+        .unwrap();
+
+        assert_eq!(resolved, override_youki);
+    }
+
+    #[test]
+    fn resolve_oci_runtime_binary_path_rejects_non_youki_name() {
+        let temp = unique_temp_dir("runtime-bin-name");
+        let bad_path = temp.join("runtime");
+        fs::write(&bad_path, b"binary").unwrap();
+        let kernel = make_kernel_paths_with_youki(temp.join("youki"));
+
+        let err =
+            resolve_oci_runtime_binary_path(OciRuntimeKind::Youki, Some(&bad_path), &kernel)
+                .unwrap_err();
+        assert!(matches!(err, OciError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn make_oci_runtime_share_uses_parent_dir_with_expected_tag() {
+        let temp = unique_temp_dir("runtime-share");
+        let youki = temp.join("youki");
+        fs::write(&youki, b"runtime").unwrap();
+
+        let share = make_oci_runtime_share(&youki).unwrap();
+
+        assert_eq!(share.tag, OCI_RUNTIME_BIN_SHARE_TAG);
+        assert_eq!(share.source, temp);
+        assert!(share.read_only);
     }
 
     #[test]

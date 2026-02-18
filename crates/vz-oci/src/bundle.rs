@@ -1,0 +1,429 @@
+use std::collections::HashMap;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use oci_spec::runtime::{
+    Mount, MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder, User, UserBuilder, VERSION,
+};
+
+use crate::error::OciError;
+
+const OCI_ROOTFS_DIRNAME: &str = "rootfs";
+pub(crate) const OCI_CONFIG_FILENAME: &str = "config.json";
+
+/// Mount entry written into an OCI runtime-spec bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BundleMount {
+    /// Mount destination path inside the container.
+    pub destination: PathBuf,
+    /// Source path on the host.
+    pub source: PathBuf,
+    /// Mount type (for example, `bind`).
+    pub typ: String,
+    /// Mount options in fstab style.
+    pub options: Vec<String>,
+}
+
+/// Process-oriented bundle settings consumed by runtime-spec generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BundleSpec {
+    /// Process command and argument vector.
+    pub cmd: Vec<String>,
+    /// Process environment key/value pairs.
+    pub env: Vec<(String, String)>,
+    /// Optional process working directory.
+    pub cwd: Option<String>,
+    /// Optional process user declaration.
+    pub user: Option<String>,
+    /// Additional mounts to include in runtime config.
+    pub mounts: Vec<BundleMount>,
+    /// Additional OCI runtime-spec annotations.
+    pub oci_annotations: Vec<(String, String)>,
+}
+
+/// Write an OCI bundle directory (`config.json` + `rootfs` link).
+pub(crate) fn write_oci_bundle(
+    bundle_dir: impl AsRef<Path>,
+    rootfs_dir: impl AsRef<Path>,
+    spec: BundleSpec,
+) -> Result<(), OciError> {
+    let bundle_dir = bundle_dir.as_ref();
+    let rootfs_dir = rootfs_dir.as_ref();
+
+    fs::create_dir_all(bundle_dir)?;
+
+    let rootfs_path = bundle_dir.join(OCI_ROOTFS_DIRNAME);
+    replace_rootfs_link(&rootfs_path, rootfs_dir)?;
+
+    let runtime_spec = build_runtime_spec(spec)?;
+    let config_path = bundle_dir.join(OCI_CONFIG_FILENAME);
+    runtime_spec.save(&config_path)?;
+
+    Ok(())
+}
+
+fn build_runtime_spec(spec: BundleSpec) -> Result<Spec, OciError> {
+    let BundleSpec {
+        cmd,
+        env,
+        cwd,
+        user,
+        mut mounts,
+        oci_annotations,
+    } = spec;
+
+    if cmd.is_empty() {
+        return Err(OciError::InvalidConfig(
+            "run command must not be empty".to_string(),
+        ));
+    }
+
+    let process = ProcessBuilder::default()
+        .args(cmd)
+        .env(
+            env.into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>(),
+        )
+        .cwd(cwd.unwrap_or_else(|| "/".to_string()))
+        .user(parse_process_user(user.as_deref())?)
+        .build()?;
+
+    sort_bundle_mounts(&mut mounts);
+    let mounts = mounts
+        .into_iter()
+        .map(to_runtime_mount)
+        .collect::<Result<Vec<_>, OciError>>()?;
+    let annotations = to_runtime_annotations(oci_annotations);
+
+    let root = RootBuilder::default()
+        .path(OCI_ROOTFS_DIRNAME)
+        .readonly(false)
+        .build()?;
+
+    let mut builder = SpecBuilder::default()
+        .version(VERSION)
+        .root(root)
+        .process(process)
+        .mounts(mounts);
+
+    if !annotations.is_empty() {
+        builder = builder.annotations(annotations);
+    }
+
+    builder.build().map_err(Into::into)
+}
+
+fn sort_bundle_mounts(mounts: &mut [BundleMount]) {
+    mounts.sort_by(|left, right| {
+        left.destination
+            .cmp(&right.destination)
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.typ.cmp(&right.typ))
+            .then_with(|| left.options.cmp(&right.options))
+    });
+}
+
+fn to_runtime_annotations(annotations: Vec<(String, String)>) -> HashMap<String, String> {
+    let mut mapped = HashMap::with_capacity(annotations.len());
+    for (key, value) in annotations {
+        mapped.insert(key, value);
+    }
+    mapped
+}
+
+fn to_runtime_mount(mount: BundleMount) -> Result<Mount, OciError> {
+    if !mount.destination.is_absolute() {
+        return Err(OciError::InvalidConfig(format!(
+            "mount destination must be absolute: {}",
+            mount.destination.display()
+        )));
+    }
+
+    if mount.typ.trim().is_empty() {
+        return Err(OciError::InvalidConfig(format!(
+            "mount type must not be empty for destination {}",
+            mount.destination.display()
+        )));
+    }
+
+    let mut builder = MountBuilder::default()
+        .destination(mount.destination)
+        .typ(mount.typ)
+        .source(mount.source);
+
+    if !mount.options.is_empty() {
+        builder = builder.options(mount.options);
+    }
+
+    builder.build().map_err(Into::into)
+}
+
+fn parse_process_user(user: Option<&str>) -> Result<User, OciError> {
+    let Some(raw) = user else {
+        return Ok(User::default());
+    };
+
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(User::default());
+    }
+
+    let parts: Vec<&str> = raw.split(':').collect();
+    if parts.len() > 2 {
+        return Err(OciError::InvalidConfig(format!(
+            "unsupported user format '{raw}'; expected '<uid|name>' or '<uid|name>:<gid>'"
+        )));
+    }
+
+    let mut builder = UserBuilder::default();
+
+    if let Some(primary) = parts.first() {
+        if !primary.is_empty() {
+            if let Ok(uid) = primary.parse::<u32>() {
+                builder = builder.uid(uid);
+            } else {
+                builder = builder.username(*primary);
+            }
+        }
+    }
+
+    if let Some(group) = parts.get(1) {
+        if !group.is_empty() {
+            let gid = group.parse::<u32>().map_err(|_| {
+                OciError::InvalidConfig(format!(
+                    "unsupported group value '{group}' in user spec '{raw}'; only numeric gid is supported"
+                ))
+            })?;
+
+            builder = builder.gid(gid);
+        }
+    }
+
+    builder.build().map_err(Into::into)
+}
+
+fn replace_rootfs_link(link_path: &Path, target: &Path) -> Result<(), OciError> {
+    match fs::symlink_metadata(link_path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_dir() && !file_type.is_symlink() {
+                fs::remove_dir_all(link_path)?;
+            } else {
+                fs::remove_file(link_path)?;
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    std::os::unix::fs::symlink(target, link_path)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::env;
+    use std::process;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let mut base = env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        base.push(format!(
+            "vz-oci-bundle-test-{name}-{}-{nanos}",
+            process::id()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    fn write_oci_bundle_generates_runtime_spec_with_expected_mappings() {
+        let temp = unique_temp_dir("mappings");
+        let rootfs_source = temp.join("rootfs-source");
+        fs::create_dir_all(&rootfs_source).unwrap();
+
+        let bundle_dir = temp.join("bundle");
+        write_oci_bundle(
+            &bundle_dir,
+            &rootfs_source,
+            BundleSpec {
+                cmd: vec!["/bin/echo".to_string(), "hello".to_string()],
+                env: vec![
+                    ("HELLO".to_string(), "world".to_string()),
+                    ("PATH".to_string(), "/usr/bin".to_string()),
+                ],
+                cwd: Some("/workspace".to_string()),
+                user: Some("1000:1001".to_string()),
+                mounts: vec![BundleMount {
+                    destination: PathBuf::from("/data"),
+                    source: PathBuf::from("/host/data"),
+                    typ: "bind".to_string(),
+                    options: vec!["rbind".to_string(), "rw".to_string()],
+                }],
+                oci_annotations: vec![
+                    ("com.example.service".to_string(), "web".to_string()),
+                    ("com.example.revision".to_string(), "42".to_string()),
+                ],
+            },
+        )
+        .unwrap();
+
+        let config_path = bundle_dir.join(OCI_CONFIG_FILENAME);
+        let rootfs_path = bundle_dir.join(OCI_ROOTFS_DIRNAME);
+        assert!(config_path.is_file());
+
+        let link_target = fs::read_link(&rootfs_path).unwrap();
+        assert_eq!(link_target, rootfs_source);
+
+        let spec = Spec::load(&config_path).unwrap();
+        let process = spec.process().as_ref().expect("process should exist");
+
+        assert_eq!(
+            process.args().as_ref().expect("args should be present"),
+            &vec!["/bin/echo".to_string(), "hello".to_string()]
+        );
+        assert_eq!(
+            process.env().as_ref().expect("env should be present"),
+            &vec!["HELLO=world".to_string(), "PATH=/usr/bin".to_string(),]
+        );
+        assert_eq!(process.cwd(), &PathBuf::from("/workspace"));
+        assert_eq!(process.user().uid(), 1000);
+        assert_eq!(process.user().gid(), 1001);
+
+        let mounts = spec.mounts().as_ref().expect("mounts should be present");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].destination(), &PathBuf::from("/data"));
+        assert_eq!(mounts[0].typ().as_deref(), Some("bind"));
+        assert_eq!(
+            mounts[0].source().as_ref(),
+            Some(&PathBuf::from("/host/data"))
+        );
+        assert_eq!(
+            mounts[0]
+                .options()
+                .as_ref()
+                .expect("mount options should exist"),
+            &vec!["rbind".to_string(), "rw".to_string()]
+        );
+        assert_eq!(
+            spec.annotations()
+                .as_ref()
+                .expect("annotations should be present")
+                .get("com.example.service")
+                .map(String::as_str),
+            Some("web")
+        );
+        assert_eq!(
+            spec.annotations()
+                .as_ref()
+                .expect("annotations should be present")
+                .get("com.example.revision")
+                .map(String::as_str),
+            Some("42")
+        );
+
+        let root = spec.root().as_ref().expect("root should be present");
+        assert_eq!(root.path(), &PathBuf::from(OCI_ROOTFS_DIRNAME));
+        assert_eq!(root.readonly(), Some(false));
+    }
+
+    #[test]
+    fn write_oci_bundle_maps_username_user_value() {
+        let temp = unique_temp_dir("username");
+        let rootfs_source = temp.join("rootfs-source");
+        fs::create_dir_all(&rootfs_source).unwrap();
+
+        let bundle_dir = temp.join("bundle");
+        write_oci_bundle(
+            &bundle_dir,
+            rootfs_source,
+            BundleSpec {
+                cmd: vec!["/bin/sh".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: Some("nobody".to_string()),
+                mounts: Vec::new(),
+                oci_annotations: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let spec = Spec::load(bundle_dir.join(OCI_CONFIG_FILENAME)).unwrap();
+        let process = spec.process().as_ref().expect("process should exist");
+
+        assert_eq!(process.user().username().as_deref(), Some("nobody"));
+        assert_eq!(process.user().uid(), 0);
+        assert_eq!(process.user().gid(), 0);
+        assert_eq!(process.cwd(), &PathBuf::from("/"));
+    }
+
+    #[test]
+    fn write_oci_bundle_sorts_mounts_deterministically() {
+        let temp = unique_temp_dir("sorted-mounts");
+        let rootfs_source = temp.join("rootfs-source");
+        fs::create_dir_all(&rootfs_source).unwrap();
+
+        let bundle_dir = temp.join("bundle");
+        write_oci_bundle(
+            &bundle_dir,
+            &rootfs_source,
+            BundleSpec {
+                cmd: vec!["/bin/echo".to_string(), "hello".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: vec![
+                    BundleMount {
+                        destination: PathBuf::from("/volumes/cache"),
+                        source: PathBuf::from("/host/cache-b"),
+                        typ: "bind".to_string(),
+                        options: vec!["rbind".to_string(), "rw".to_string()],
+                    },
+                    BundleMount {
+                        destination: PathBuf::from("/volumes/cache"),
+                        source: PathBuf::from("/host/cache-a"),
+                        typ: "bind".to_string(),
+                        options: vec!["rbind".to_string(), "rw".to_string()],
+                    },
+                    BundleMount {
+                        destination: PathBuf::from("/volumes/config"),
+                        source: PathBuf::from("/host/config"),
+                        typ: "bind".to_string(),
+                        options: vec!["rbind".to_string(), "ro".to_string()],
+                    },
+                ],
+                oci_annotations: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let spec = Spec::load(bundle_dir.join(OCI_CONFIG_FILENAME)).unwrap();
+        let mounts = spec.mounts().as_ref().expect("mounts should be present");
+        assert_eq!(mounts.len(), 3);
+        assert_eq!(mounts[0].destination(), &PathBuf::from("/volumes/cache"));
+        assert_eq!(
+            mounts[0].source().as_ref(),
+            Some(&PathBuf::from("/host/cache-a"))
+        );
+        assert_eq!(mounts[1].destination(), &PathBuf::from("/volumes/cache"));
+        assert_eq!(
+            mounts[1].source().as_ref(),
+            Some(&PathBuf::from("/host/cache-b"))
+        );
+        assert_eq!(mounts[2].destination(), &PathBuf::from("/volumes/config"));
+        assert_eq!(
+            mounts[2].source().as_ref(),
+            Some(&PathBuf::from("/host/config"))
+        );
+    }
+}

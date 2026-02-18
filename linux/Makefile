@@ -29,6 +29,13 @@ BUSYBOX_ARCHIVE := $(CACHE_DIR)/busybox-$(BUSYBOX_VERSION).tar.bz2
 BUSYBOX_SRC := $(SRC_DIR)/busybox-$(BUSYBOX_VERSION)
 BUSYBOX_BINARY := $(OUT_DIR)/busybox
 
+YOUKI_VERSION ?= 0.5.7
+YOUKI_RELEASE_ARCHIVE := youki-$(YOUKI_VERSION)-aarch64-musl.tar.gz
+YOUKI_URL ?= https://github.com/youki-dev/youki/releases/download/v$(YOUKI_VERSION)/$(YOUKI_RELEASE_ARCHIVE)
+YOUKI_ARCHIVE := $(CACHE_DIR)/$(YOUKI_RELEASE_ARCHIVE)
+YOUKI_ARCHIVE_SHA256 ?= b3002d9d39b04f797e783745f92cffec9e0caa464254be98aa0b4dfc184f0233
+YOUKI_BINARY := $(OUT_DIR)/youki
+
 GUEST_AGENT_TARGET ?= aarch64-unknown-linux-musl
 GUEST_AGENT_BUILD_TOOL ?= cargo
 GUEST_AGENT_BINARY := $(CRATES_DIR)/target/$(GUEST_AGENT_TARGET)/release/vz-guest-agent
@@ -39,19 +46,20 @@ VERSION_JSON := $(OUT_DIR)/version.json
 AGENT_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' $(CRATES_DIR)/vz-guest-agent/Cargo.toml | head -1)
 BUILD_TIMESTAMP := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-.PHONY: help all dirs clean distclean kernel initramfs guest-agent version docker-build
+.PHONY: help all dirs clean distclean kernel initramfs guest-agent youki version docker-build
 
 help:
 	@echo "Linux artifact build targets:"
-	@echo "  make all            Build vmlinux, initramfs.img, version.json"
+	@echo "  make all            Build vmlinux, initramfs.img, youki, version.json"
 	@echo "  make kernel         Build only Linux kernel image"
 	@echo "  make initramfs      Build only initramfs image"
+	@echo "  make youki          Download pinned youki linux/arm64 runtime binary"
 	@echo "  make version        Generate version.json"
 	@echo "  make docker-build   Build all artifacts in Docker"
 	@echo "  make clean          Remove linux/out"
 	@echo "  make distclean      Remove out/src/cache"
 
-all: $(KERNEL_IMAGE) $(INITRAMFS_IMAGE) $(VERSION_JSON)
+all: $(KERNEL_IMAGE) $(INITRAMFS_IMAGE) $(YOUKI_BINARY) $(VERSION_JSON)
 
 dirs:
 	mkdir -p "$(OUT_DIR)" "$(SRC_DIR)" "$(CACHE_DIR)"
@@ -96,6 +104,23 @@ $(BUSYBOX_BINARY): $(BUSYBOX_SRC)/.extracted
 	cd "$(BUSYBOX_SRC)" && make -j"$(JOBS)" ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) busybox
 	cp "$(BUSYBOX_SRC)/busybox" "$(BUSYBOX_BINARY)"
 
+$(YOUKI_ARCHIVE): | dirs
+	@echo "Downloading pinned youki $(YOUKI_VERSION) (linux/arm64 musl)"
+	curl -fL "$(YOUKI_URL)" -o "$@"
+
+$(YOUKI_BINARY): $(YOUKI_ARCHIVE) | dirs
+	@echo "Verifying and extracting youki runtime"
+	@ARCHIVE_SHA="$$(shasum -a 256 "$(YOUKI_ARCHIVE)" | cut -d' ' -f1)"; \
+	if [[ "$$ARCHIVE_SHA" != "$(YOUKI_ARCHIVE_SHA256)" ]]; then \
+		echo "youki archive checksum mismatch: expected $(YOUKI_ARCHIVE_SHA256), found $$ARCHIVE_SHA" >&2; \
+		exit 1; \
+	fi
+	rm -f "$(YOUKI_BINARY)"
+	tar -xzf "$(YOUKI_ARCHIVE)" -C "$(OUT_DIR)" youki
+	chmod +x "$(YOUKI_BINARY)"
+
+youki: $(YOUKI_BINARY)
+
 guest-agent:
 	@echo "Building vz-guest-agent for $(GUEST_AGENT_TARGET)"
 	@if [[ "$(GUEST_AGENT_BUILD_TOOL)" == "zigbuild" ]]; then \
@@ -137,11 +162,12 @@ $(INITRAMFS_IMAGE): $(BUSYBOX_BINARY) guest-agent \
 
 initramfs: $(INITRAMFS_IMAGE)
 
-$(VERSION_JSON): $(KERNEL_IMAGE) $(INITRAMFS_IMAGE)
+$(VERSION_JSON): $(KERNEL_IMAGE) $(INITRAMFS_IMAGE) $(YOUKI_BINARY)
 	@echo "Generating version metadata"
 	@KERNEL_SHA="$$(shasum -a 256 "$(KERNEL_IMAGE)" | cut -d' ' -f1)"; \
 	INITRAMFS_SHA="$$(shasum -a 256 "$(INITRAMFS_IMAGE)" | cut -d' ' -f1)"; \
-	printf '{\n  "kernel": "$(KERNEL_VERSION)",\n  "busybox": "$(BUSYBOX_VERSION)",\n  "agent": "$(AGENT_VERSION)",\n  "built": "$(BUILD_TIMESTAMP)",\n  "sha256_vmlinux": "%s",\n  "sha256_initramfs": "%s"\n}\n' "$$KERNEL_SHA" "$$INITRAMFS_SHA" > "$(VERSION_JSON)"
+	YOUKI_SHA="$$(shasum -a 256 "$(YOUKI_BINARY)" | cut -d' ' -f1)"; \
+	printf '{\n  "kernel": "$(KERNEL_VERSION)",\n  "busybox": "$(BUSYBOX_VERSION)",\n  "agent": "$(AGENT_VERSION)",\n  "youki": "$(YOUKI_VERSION)",\n  "built": "$(BUILD_TIMESTAMP)",\n  "sha256_vmlinux": "%s",\n  "sha256_initramfs": "%s",\n  "sha256_youki": "%s"\n}\n' "$$KERNEL_SHA" "$$INITRAMFS_SHA" "$$YOUKI_SHA" > "$(VERSION_JSON)"
 
 version: $(VERSION_JSON)
 

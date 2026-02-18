@@ -4,6 +4,7 @@ This directory builds the Linux boot artifacts used by `vz-linux`:
 
 - `out/vmlinux`
 - `out/initramfs.img`
+- `out/youki`
 - `out/version.json`
 
 ## Quick start
@@ -46,5 +47,6 @@ Useful benchmark flags:
 
 ## Output compatibility
 
-`version.json` includes the guest-agent version. `vz-linux::ensure_kernel()`
-uses this to reject mismatched artifact sets, and verifies SHA256 checksums when present.
+`version.json` includes guest-agent and pinned `youki` version metadata.
+`vz-linux::ensure_kernel()` uses this to reject mismatched artifact sets,
+and verifies SHA256 checksums when present.

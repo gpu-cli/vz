@@ -3,12 +3,13 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 use vz::Vm;
-use vz::protocol::{ExecOutput, HandshakeAck};
+use vz::protocol::{ExecOutput, HandshakeAck, OciContainerState, OciExecResult};
 
 use crate::agent::{
-    exec_capture, exec_capture_with_options, handshake_and_ping, open_port_forward_stream,
+    exec_capture, exec_capture_with_options, handshake_and_ping, oci_create, oci_delete, oci_exec,
+    oci_kill, oci_start, oci_state, open_port_forward_stream,
 };
-use crate::{ExecOptions, LinuxError, LinuxVmConfig};
+use crate::{ExecOptions, LinuxError, LinuxVmConfig, OciExecOptions};
 
 const AGENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const AGENT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -152,6 +153,42 @@ impl LinuxVm {
         protocol_name: &str,
     ) -> Result<vz::VsockStream, LinuxError> {
         open_port_forward_stream(self.vm.as_ref(), target_port, protocol_name).await
+    }
+
+    /// Create a container in the guest OCI runtime.
+    pub async fn oci_create(&self, id: String, bundle_path: String) -> Result<(), LinuxError> {
+        oci_create(self.vm.as_ref(), id, bundle_path).await
+    }
+
+    /// Start a created container in the guest OCI runtime.
+    pub async fn oci_start(&self, id: String) -> Result<(), LinuxError> {
+        oci_start(self.vm.as_ref(), id).await
+    }
+
+    /// Query container state from the guest OCI runtime.
+    pub async fn oci_state(&self, id: String) -> Result<OciContainerState, LinuxError> {
+        oci_state(self.vm.as_ref(), id).await
+    }
+
+    /// Execute a command in a running guest OCI container.
+    pub async fn oci_exec(
+        &self,
+        id: String,
+        command: String,
+        args: Vec<String>,
+        options: OciExecOptions,
+    ) -> Result<OciExecResult, LinuxError> {
+        oci_exec(self.vm.as_ref(), id, command, args, options).await
+    }
+
+    /// Signal a running container in the guest OCI runtime.
+    pub async fn oci_kill(&self, id: String, signal: String) -> Result<(), LinuxError> {
+        oci_kill(self.vm.as_ref(), id, signal).await
+    }
+
+    /// Delete container state from the guest OCI runtime.
+    pub async fn oci_delete(&self, id: String, force: bool) -> Result<(), LinuxError> {
+        oci_delete(self.vm.as_ref(), id, force).await
     }
 
     /// Borrow the underlying base VM.

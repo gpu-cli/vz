@@ -5,6 +5,7 @@ use std::io;
 
 use docker_credential::CredentialRetrievalError;
 use oci_distribution::errors::OciDistributionError;
+use oci_spec::OciSpecError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OciError {
@@ -62,6 +63,17 @@ pub enum OciError {
         /// Additional information from resolver or registry.
         details: String,
     },
+
+    /// The selected execution strategy is not yet implemented.
+    #[error("execution mode '{mode}' is not yet supported")]
+    UnsupportedExecutionMode {
+        /// Requested execution strategy name.
+        mode: String,
+    },
+
+    /// Runtime-spec generation or serialization failed.
+    #[error(transparent)]
+    RuntimeSpec(#[from] OciSpecError),
 
     /// The registry returned image data that did not match its advertised digest.
     #[error("digest mismatch for '{digest}': expected '{expected}', got '{actual}'")]

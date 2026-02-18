@@ -162,6 +162,48 @@ pub struct ResourceStats {
     pub load_average: [f64; 3],
 }
 
+/// OCI runtime state for a container.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OciContainerState {
+    /// Container identifier.
+    pub id: String,
+    /// OCI runtime status string (for example: `created`, `running`, `stopped`).
+    pub status: String,
+    /// Optional process ID reported by the runtime.
+    pub pid: Option<u32>,
+    /// Optional bundle path backing this container.
+    pub bundle_path: Option<String>,
+}
+
+/// OCI exec result payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OciExecResult {
+    /// Exit code returned by the OCI runtime exec operation.
+    pub exit_code: i32,
+    /// Captured stdout from the OCI runtime exec operation.
+    pub stdout: String,
+    /// Captured stderr from the OCI runtime exec operation.
+    pub stderr: String,
+}
+
+/// Typed payloads for OCI lifecycle responses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+pub enum OciPayload {
+    /// No payload for successful operations that only need an acknowledgment.
+    Empty,
+    /// Container state payload from `OciState`.
+    State {
+        /// OCI runtime state for the requested container.
+        state: OciContainerState,
+    },
+    /// Exec output payload from `OciExec`.
+    Exec {
+        /// Result of executing a command inside the running OCI container.
+        result: OciExecResult,
+    },
+}
+
 /// Request sent from host to guest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
@@ -226,6 +268,52 @@ pub enum Request {
         target_port: u16,
         /// Protocol string ("tcp" or "udp").
         protocol: String,
+    },
+    /// Create a container in the OCI runtime from a prepared bundle.
+    OciCreate {
+        /// OCI container identifier.
+        id: String,
+        /// Absolute path to the OCI bundle (`config.json` + rootfs).
+        bundle_path: String,
+    },
+    /// Start an OCI container that has already been created.
+    OciStart {
+        /// OCI container identifier.
+        id: String,
+    },
+    /// Query current OCI runtime state for a container.
+    OciState {
+        /// OCI container identifier.
+        id: String,
+    },
+    /// Execute a command in a running OCI container.
+    OciExec {
+        /// OCI container identifier.
+        id: String,
+        /// Command to run.
+        command: String,
+        /// Command arguments.
+        args: Vec<String>,
+        /// Environment variables as key-value pairs.
+        env: Vec<(String, String)>,
+        /// Working directory inside the container.
+        cwd: Option<String>,
+        /// Optional user identity inside the container.
+        user: Option<String>,
+    },
+    /// Send a signal to a running OCI container.
+    OciKill {
+        /// OCI container identifier.
+        id: String,
+        /// Signal name or value expected by the runtime (for example: `SIGTERM`).
+        signal: String,
+    },
+    /// Delete an OCI container from runtime state.
+    OciDelete {
+        /// OCI container identifier.
+        id: String,
+        /// Force delete if true.
+        force: bool,
     },
 }
 
@@ -316,6 +404,22 @@ pub enum Response {
     Ok {
         /// ID of the originating request.
         id: u64,
+    },
+    /// OCI lifecycle success response.
+    OciOk {
+        /// OCI container identifier.
+        id: String,
+        /// Typed payload for the completed OCI operation.
+        payload: OciPayload,
+    },
+    /// OCI lifecycle failure response.
+    OciError {
+        /// OCI container identifier.
+        id: String,
+        /// Runtime error code.
+        code: i32,
+        /// Human-readable error message.
+        message: String,
     },
 }
 
@@ -426,6 +530,118 @@ mod tests {
             load_average: [1.5, 2.0, 1.8],
         };
         let json = serde_json::to_string(&resp).expect("serialize");
+        let deserialized: Response = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(resp, deserialized);
+    }
+
+    #[test]
+    fn request_oci_create_round_trip() {
+        let req = Request::OciCreate {
+            id: "svc-web".to_string(),
+            bundle_path: "/run/vz-oci/bundles/svc-web".to_string(),
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains(r#""type":"OciCreate""#));
+        let deserialized: Request = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(req, deserialized);
+    }
+
+    #[test]
+    fn request_oci_start_round_trip() {
+        let req = Request::OciStart {
+            id: "svc-web".to_string(),
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains(r#""type":"OciStart""#));
+        let deserialized: Request = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(req, deserialized);
+    }
+
+    #[test]
+    fn request_oci_state_round_trip() {
+        let req = Request::OciState {
+            id: "svc-web".to_string(),
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains(r#""type":"OciState""#));
+        let deserialized: Request = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(req, deserialized);
+    }
+
+    #[test]
+    fn request_oci_exec_round_trip() {
+        let req = Request::OciExec {
+            id: "svc-web".to_string(),
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "echo ready".to_string()],
+            env: vec![
+                (
+                    "PATH".to_string(),
+                    "/usr/local/bin:/usr/bin:/bin".to_string(),
+                ),
+                ("MODE".to_string(), "prod".to_string()),
+            ],
+            cwd: Some("/workspace".to_string()),
+            user: Some("1000:1000".to_string()),
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains(r#""type":"OciExec""#));
+        let deserialized: Request = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(req, deserialized);
+    }
+
+    #[test]
+    fn request_oci_kill_round_trip() {
+        let req = Request::OciKill {
+            id: "svc-web".to_string(),
+            signal: "SIGTERM".to_string(),
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains(r#""type":"OciKill""#));
+        let deserialized: Request = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(req, deserialized);
+    }
+
+    #[test]
+    fn request_oci_delete_round_trip() {
+        let req = Request::OciDelete {
+            id: "svc-web".to_string(),
+            force: true,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains(r#""type":"OciDelete""#));
+        let deserialized: Request = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(req, deserialized);
+    }
+
+    #[test]
+    fn response_oci_ok_round_trip() {
+        let resp = Response::OciOk {
+            id: "svc-web".to_string(),
+            payload: OciPayload::State {
+                state: OciContainerState {
+                    id: "svc-web".to_string(),
+                    status: "running".to_string(),
+                    pid: Some(4242),
+                    bundle_path: Some("/run/vz-oci/bundles/svc-web".to_string()),
+                },
+            },
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(json.contains(r#""type":"OciOk""#));
+        let deserialized: Response = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(resp, deserialized);
+    }
+
+    #[test]
+    fn response_oci_error_round_trip() {
+        let resp = Response::OciError {
+            id: "svc-web".to_string(),
+            code: 125,
+            message: "bundle not found".to_string(),
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(json.contains(r#""type":"OciError""#));
         let deserialized: Response = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(resp, deserialized);
     }

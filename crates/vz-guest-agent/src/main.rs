@@ -386,6 +386,26 @@ async fn dispatch_request<W>(
             )
             .await;
         }
+        Request::OciCreate { id, .. }
+        | Request::OciStart { id }
+        | Request::OciState { id }
+        | Request::OciExec { id, .. }
+        | Request::OciKill { id, .. }
+        | Request::OciDelete { id, .. } => {
+            warn!(container_id = %id, "OCI lifecycle request is unsupported in this guest agent");
+            send_response(
+                &writer,
+                &Response::OciError {
+                    id,
+                    code: 501,
+                    message: format!(
+                        "OCI lifecycle requests are unsupported by vz-guest-agent on {} guests",
+                        std::env::consts::OS
+                    ),
+                },
+            )
+            .await;
+        }
     }
 }
 

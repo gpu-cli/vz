@@ -41,6 +41,33 @@ pub enum RuntimeBackend {
     MacOS,
 }
 
+/// How the container command is executed inside the VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExecutionMode {
+    /// Execute host-chosen command directly via guest agent `Exec` request.
+    #[default]
+    GuestExec,
+    /// Future path: run OCI workload lifecycle inside the guest using an OCI runtime.
+    OciRuntime,
+}
+
+/// Supported OCI runtime implementation for guest lifecycle operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OciRuntimeKind {
+    /// Use `youki` inside the guest.
+    #[default]
+    Youki,
+}
+
+impl OciRuntimeKind {
+    /// Expected runtime binary filename for this runtime kind.
+    pub fn binary_name(self) -> &'static str {
+        match self {
+            Self::Youki => "youki",
+        }
+    }
+}
+
 /// Top-level runtime configuration.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -52,6 +79,17 @@ pub struct RuntimeConfig {
     pub linux_install_dir: Option<PathBuf>,
     /// Optional predownloaded bundle directory for kernel artifacts.
     pub linux_bundle_dir: Option<PathBuf>,
+    /// OCI runtime implementation used for guest lifecycle operations.
+    pub guest_oci_runtime: OciRuntimeKind,
+    /// Optional host path override for the guest OCI runtime binary (`youki`).
+    ///
+    /// When unset, runtime provisioning uses the pinned artifact from
+    /// `vz-linux::ensure_kernel_with_options`.
+    pub guest_oci_runtime_path: Option<PathBuf>,
+    /// Optional guest state directory used for OCI runtime state and bundles.
+    ///
+    /// When unset, the runtime defaults to `/run/vz-oci`.
+    pub guest_state_dir: Option<PathBuf>,
     /// Require exact guest-agent version match in kernel artifact metadata.
     pub require_exact_agent_version: bool,
     /// Default CPU cores per Linux container VM.
@@ -73,6 +111,9 @@ impl Default for RuntimeConfig {
             auth: Auth::default(),
             linux_install_dir: None,
             linux_bundle_dir: None,
+            guest_oci_runtime: OciRuntimeKind::default(),
+            guest_oci_runtime_path: None,
+            guest_state_dir: None,
             require_exact_agent_version: true,
             default_cpus: 2,
             default_memory_mb: 512,
@@ -106,10 +147,18 @@ pub struct RunConfig {
     pub serial_log_file: Option<PathBuf>,
     /// Optional exec timeout override.
     pub timeout: Option<Duration>,
+    /// How to execute the workload for this run.
+    pub execution_mode: ExecutionMode,
     /// Optional explicit container identifier.
     ///
     /// When unset, the runtime generates a unique ID.
     pub container_id: Option<String>,
+    /// Optional OCI init process command used for container create/start.
+    ///
+    /// If unset, the resolved run command is used for init.
+    pub init_process: Option<Vec<String>>,
+    /// Additional OCI runtime-spec annotations for this run.
+    pub oci_annotations: Vec<(String, String)>,
 }
 
 /// Registry authentication used when pulling OCI images.

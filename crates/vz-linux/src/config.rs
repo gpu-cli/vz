@@ -109,19 +109,32 @@ impl LinuxVmConfig {
         Ok(())
     }
 
-    /// Convert to a base `vz::VmConfig`.
-    pub fn to_vm_config(&self) -> Result<VmConfig, LinuxError> {
-        let mut shared_dirs =
-            Vec::with_capacity(self.shared_dirs.len() + usize::from(self.rootfs_dir.is_some()));
+    fn ordered_shared_dirs(&self) -> Vec<SharedDirConfig> {
+        let mut shared_dirs = self.shared_dirs.clone();
+        shared_dirs.sort_by(|left, right| {
+            left.tag
+                .cmp(&right.tag)
+                .then_with(|| left.source.cmp(&right.source))
+                .then_with(|| left.read_only.cmp(&right.read_only))
+        });
 
         if let Some(rootfs_dir) = &self.rootfs_dir {
-            shared_dirs.push(SharedDirConfig {
+            let mut ordered = Vec::with_capacity(shared_dirs.len() + 1);
+            ordered.push(SharedDirConfig {
                 tag: "rootfs".to_string(),
                 source: rootfs_dir.clone(),
                 read_only: true,
             });
+            ordered.extend(shared_dirs);
+            ordered
+        } else {
+            shared_dirs
         }
-        shared_dirs.extend(self.shared_dirs.clone());
+    }
+
+    /// Convert to a base `vz::VmConfig`.
+    pub fn to_vm_config(&self) -> Result<VmConfig, LinuxError> {
+        let shared_dirs = self.ordered_shared_dirs();
 
         let mut builder = VmConfigBuilder::new()
             .cpus(u32::from(self.cpus))
@@ -245,5 +258,84 @@ mod tests {
             err.to_string()
                 .contains("shared_dirs must not contain tag 'rootfs'")
         );
+    }
+
+    #[test]
+    fn ordered_shared_dirs_places_rootfs_first_and_sorts_remaining() {
+        let mut cfg = LinuxVmConfig::default();
+        cfg.rootfs_dir = Some(PathBuf::from("/tmp/rootfs"));
+        cfg.shared_dirs = vec![
+            SharedDirConfig {
+                tag: "mount-z".to_string(),
+                source: PathBuf::from("/tmp/z"),
+                read_only: false,
+            },
+            SharedDirConfig {
+                tag: "mount-a".to_string(),
+                source: PathBuf::from("/tmp/b"),
+                read_only: false,
+            },
+            SharedDirConfig {
+                tag: "mount-a".to_string(),
+                source: PathBuf::from("/tmp/a"),
+                read_only: true,
+            },
+        ];
+
+        let ordered = cfg.ordered_shared_dirs();
+        assert_eq!(ordered.len(), 4);
+        assert_eq!(ordered[0].tag, "rootfs");
+        assert_eq!(ordered[0].source, PathBuf::from("/tmp/rootfs"));
+        assert!(ordered[0].read_only);
+        assert_eq!(ordered[1].tag, "mount-a");
+        assert_eq!(ordered[1].source, PathBuf::from("/tmp/a"));
+        assert_eq!(ordered[2].tag, "mount-a");
+        assert_eq!(ordered[2].source, PathBuf::from("/tmp/b"));
+        assert_eq!(ordered[3].tag, "mount-z");
+    }
+
+    #[test]
+    fn ordered_shared_dirs_sorts_by_tag_source_and_access_mode() {
+        let mut cfg = LinuxVmConfig::default();
+        cfg.shared_dirs = vec![
+            SharedDirConfig {
+                tag: "mount-b".to_string(),
+                source: PathBuf::from("/tmp/share"),
+                read_only: false,
+            },
+            SharedDirConfig {
+                tag: "mount-a".to_string(),
+                source: PathBuf::from("/tmp/share"),
+                read_only: false,
+            },
+            SharedDirConfig {
+                tag: "mount-a".to_string(),
+                source: PathBuf::from("/tmp/share"),
+                read_only: true,
+            },
+        ];
+
+        let ordered = cfg.ordered_shared_dirs();
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered[0].tag, "mount-a");
+        assert_eq!(ordered[0].source, PathBuf::from("/tmp/share"));
+        assert!(!ordered[0].read_only);
+        assert_eq!(ordered[1].tag, "mount-a");
+        assert_eq!(ordered[1].source, PathBuf::from("/tmp/share"));
+        assert!(ordered[1].read_only);
+        assert_eq!(ordered[2].tag, "mount-b");
+    }
+
+    #[test]
+    fn initramfs_overlay_path_uses_read_only_lower_and_writable_upper() {
+        let init_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("linux/initramfs/init");
+        let script = fs::read_to_string(&init_script).expect("read initramfs init script");
+
+        assert!(script.contains("mount -o remount,ro /mnt/rootfs"));
+        assert!(script.contains("lowerdir=/mnt/rootfs"));
+        assert!(script.contains("upperdir=/run/vz-oci/overlay/upper"));
+        assert!(script.contains("workdir=/run/vz-oci/overlay/work"));
     }
 }

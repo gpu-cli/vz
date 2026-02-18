@@ -10,7 +10,7 @@ mod error;
 mod kernel;
 mod vm;
 
-pub use agent::{ExecOptions, open_port_forward_stream};
+pub use agent::{ExecOptions, OciExecOptions, open_port_forward_stream};
 pub use benchmark::{
     BootBenchmarkConfig, BootBenchmarkEvent, BootBenchmarkResult, BootSample, run_boot_benchmark,
     run_boot_benchmark_with_progress,
@@ -22,3 +22,4 @@ pub use kernel::{
     ensure_kernel_with_options,
 };
 pub use vm::LinuxVm;
+pub use vz::protocol::{OciContainerState, OciExecResult};

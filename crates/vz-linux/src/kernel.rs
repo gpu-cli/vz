@@ -9,6 +9,7 @@ use crate::LinuxError;
 
 const KERNEL_FILE: &str = "vmlinux";
 const INITRAMFS_FILE: &str = "initramfs.img";
+const YOUKI_FILE: &str = "youki";
 const VERSION_FILE: &str = "version.json";
 
 /// Installed kernel artifact paths and metadata.
@@ -18,6 +19,8 @@ pub struct KernelPaths {
     pub kernel: PathBuf,
     /// Initramfs image path.
     pub initramfs: PathBuf,
+    /// Pinned Linux/arm64 `youki` runtime binary path.
+    pub youki: PathBuf,
     /// Parsed artifact metadata from `version.json`.
     pub version: KernelVersion,
 }
@@ -31,12 +34,16 @@ pub struct KernelVersion {
     pub busybox: String,
     /// Guest-agent version used in initramfs.
     pub agent: String,
+    /// Pinned youki runtime version.
+    pub youki: String,
     /// Build timestamp (optional).
     pub built: Option<String>,
     /// Optional SHA256 of `vmlinux`.
     pub sha256_vmlinux: Option<String>,
     /// Optional SHA256 of `initramfs.img`.
     pub sha256_initramfs: Option<String>,
+    /// Optional SHA256 of `youki`.
+    pub sha256_youki: Option<String>,
 }
 
 /// Options for resolving kernel artifacts.
@@ -160,6 +167,7 @@ async fn install_from_bundle(bundle_dir: &Path, install_dir: &Path) -> Result<()
     tokio::fs::create_dir_all(&staging).await?;
     tokio::fs::copy(&bundle.kernel, staging.join(KERNEL_FILE)).await?;
     tokio::fs::copy(&bundle.initramfs, staging.join(INITRAMFS_FILE)).await?;
+    tokio::fs::copy(&bundle.youki, staging.join(YOUKI_FILE)).await?;
     tokio::fs::copy(version_path, staging.join(VERSION_FILE)).await?;
 
     if tokio::fs::metadata(install_dir).await.is_ok() {
@@ -194,6 +202,10 @@ async fn validate_artifact_checksums(paths: &KernelPaths) -> Result<(), LinuxErr
 
     if let Some(expected) = paths.version.sha256_initramfs.as_deref() {
         validate_file_checksum(&paths.initramfs, INITRAMFS_FILE, expected).await?;
+    }
+
+    if let Some(expected) = paths.version.sha256_youki.as_deref() {
+        validate_file_checksum(&paths.youki, YOUKI_FILE, expected).await?;
     }
 
     Ok(())
@@ -238,10 +250,12 @@ async fn sha256_file(path: &Path) -> Result<String, LinuxError> {
 async fn read_kernel_paths(dir: &Path) -> Result<KernelPaths, LinuxError> {
     let kernel = dir.join(KERNEL_FILE);
     let initramfs = dir.join(INITRAMFS_FILE);
+    let youki = dir.join(YOUKI_FILE);
     let version_path = dir.join(VERSION_FILE);
 
     if tokio::fs::metadata(&kernel).await.is_err()
         || tokio::fs::metadata(&initramfs).await.is_err()
+        || tokio::fs::metadata(&youki).await.is_err()
         || tokio::fs::metadata(&version_path).await.is_err()
     {
         return Err(LinuxError::MissingKernelArtifacts {
@@ -255,6 +269,7 @@ async fn read_kernel_paths(dir: &Path) -> Result<KernelPaths, LinuxError> {
     Ok(KernelPaths {
         kernel,
         initramfs,
+        youki,
         version,
     })
 }
@@ -273,9 +288,11 @@ mod tests {
             kernel: "6.12.11".to_string(),
             busybox: "1.37.0".to_string(),
             agent,
+            youki: "0.5.7".to_string(),
             built: None,
             sha256_vmlinux: None,
             sha256_initramfs: None,
+            sha256_youki: None,
         }
     }
 
@@ -296,6 +313,7 @@ mod tests {
     ) {
         const KERNEL_BYTES: &[u8] = b"kernel";
         const INITRAMFS_BYTES: &[u8] = b"initramfs";
+        const YOUKI_BYTES: &[u8] = b"youki";
 
         tokio::fs::create_dir_all(dir).await.expect("mkdir");
         tokio::fs::write(dir.join(KERNEL_FILE), KERNEL_BYTES)
@@ -304,11 +322,15 @@ mod tests {
         tokio::fs::write(dir.join(INITRAMFS_FILE), INITRAMFS_BYTES)
             .await
             .expect("initramfs");
+        tokio::fs::write(dir.join(YOUKI_FILE), YOUKI_BYTES)
+            .await
+            .expect("youki");
 
         let mut version = sample_version(agent_version);
         if include_checksums {
             version.sha256_vmlinux = Some(sha256(KERNEL_BYTES));
             version.sha256_initramfs = Some(sha256(INITRAMFS_BYTES));
+            version.sha256_youki = Some(sha256(YOUKI_BYTES));
         }
 
         let json = serde_json::to_string_pretty(&version).expect("json");
@@ -335,6 +357,7 @@ mod tests {
         assert_eq!(paths.version.agent, expected);
         assert_eq!(paths.kernel, install.join(KERNEL_FILE));
         assert_eq!(paths.initramfs, install.join(INITRAMFS_FILE));
+        assert_eq!(paths.youki, install.join(YOUKI_FILE));
     }
 
     #[tokio::test]
@@ -356,6 +379,7 @@ mod tests {
         assert_eq!(paths.version.agent, expected);
         assert!(install.join(KERNEL_FILE).exists());
         assert!(install.join(INITRAMFS_FILE).exists());
+        assert!(install.join(YOUKI_FILE).exists());
         assert!(install.join(VERSION_FILE).exists());
     }
 
@@ -437,6 +461,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_kernel_rejects_bad_youki_checksum_without_bundle() {
+        let temp = tempdir().expect("tempdir");
+        let install = temp.path().join("linux");
+        let expected = env!("CARGO_PKG_VERSION").to_string();
+        write_artifacts_with_checksums(&install, expected, true).await;
+
+        let mut version: KernelVersion = serde_json::from_str(
+            &tokio::fs::read_to_string(install.join(VERSION_FILE))
+                .await
+                .expect("read version"),
+        )
+        .expect("parse version");
+        version.sha256_youki = Some("beadfeed".to_string());
+        tokio::fs::write(
+            install.join(VERSION_FILE),
+            serde_json::to_string_pretty(&version).expect("version json"),
+        )
+        .await
+        .expect("write version");
+
+        let err = ensure_kernel_with_options(EnsureKernelOptions {
+            install_dir: Some(install),
+            bundle_dir: None,
+            require_exact_agent_version: true,
+        })
+        .await
+        .expect_err("must fail checksum mismatch");
+
+        assert!(matches!(
+            err,
+            LinuxError::ArtifactChecksumMismatch { ref artifact, .. } if artifact == YOUKI_FILE
+        ));
+    }
+
+    #[tokio::test]
     async fn ensure_kernel_reinstalls_when_installed_checksum_is_bad() {
         let temp = tempdir().expect("tempdir");
         let install = temp.path().join("install");
@@ -463,5 +522,6 @@ mod tests {
             .expect("read installed kernel");
         assert_eq!(installed_kernel, b"kernel");
         assert_eq!(paths.version.sha256_vmlinux, Some(sha256(b"kernel")));
+        assert_eq!(paths.version.sha256_youki, Some(sha256(b"youki")));
     }
 }

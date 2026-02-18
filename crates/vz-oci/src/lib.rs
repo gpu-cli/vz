@@ -3,6 +3,7 @@
 #![cfg(target_os = "macos")]
 #![forbid(unsafe_code)]
 
+mod bundle;
 mod config;
 mod container_store;
 mod error;
@@ -10,7 +11,10 @@ mod image;
 mod runtime;
 mod store;
 
-pub use config::{Auth, PortMapping, PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig};
+pub use config::{
+    Auth, ExecutionMode, OciRuntimeKind, PortMapping, PortProtocol, RunConfig, RuntimeBackend,
+    RuntimeConfig,
+};
 pub use container_store::{ContainerInfo, ContainerStatus, ContainerStore};
 pub use error::OciError;
 pub use image::{ImageConfigSummary, ImageId, ImagePuller};
@@ -45,7 +49,10 @@ mod tests {
         let cfg = RunConfig::default();
         assert!(cfg.cmd.is_empty());
         assert!(cfg.ports.is_empty());
+        assert_eq!(cfg.execution_mode, ExecutionMode::GuestExec);
         assert!(cfg.container_id.is_none());
+        assert!(cfg.init_process.is_none());
+        assert!(cfg.oci_annotations.is_empty());
     }
 
     #[test]
@@ -53,6 +60,9 @@ mod tests {
         let cfg = RuntimeConfig::default();
 
         assert_eq!(cfg.data_dir, PathBuf::from("~/.vz/oci"));
+        assert_eq!(cfg.guest_oci_runtime, OciRuntimeKind::Youki);
+        assert!(cfg.guest_oci_runtime_path.is_none());
+        assert!(cfg.guest_state_dir.is_none());
     }
 
     #[test]

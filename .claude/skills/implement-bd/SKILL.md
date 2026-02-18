@@ -102,43 +102,19 @@ bd update <id> --status=in_progress
 
 #### For Parent Issues (epic/feature)
 
-Work through ready children, **parallelizing independent work**:
+Work through ready children in order:
 
 ```
 1. bd ready --parent <id>   # Find ready child tasks
-2. If MULTIPLE children are ready:
-   → They are independent (no deps between them) — run them IN PARALLEL
-   → Spawn one Task sub-agent per ready child (all in a single message)
-   → Each sub-agent runs: /implement-bd <child-id>
-   → Wait for all parallel agents to complete
-3. If only ONE child is ready:
-   → Work on it directly (no sub-agent needed):
+2. For each ready child:
    a. bd update <child-id> --status=in_progress
    b. RESEARCH phase (see Section 4)
    c. IMPLEMENT phase (see Section 5)
    d. VALIDATE phase (see Section 6)
    e. bd close <child-id> --reason="..."
-4. Check if more children unblocked: bd ready --parent <id>
-5. Repeat until all children done
-6. bd close <id> --reason="All tasks complete"
-```
-
-**Parallel execution details:**
-- Use the `Task` tool with `subagent_type="general-purpose"` and `mode="bypassPermissions"`
-- Launch ALL ready children in a **single message** with multiple Task tool calls
-- Each sub-agent prompt should include: the child issue ID, scope enforcement rules, and
-  the instruction to run the full implement-bd workflow (research → implement → validate → close)
-- Sub-agents share the filesystem — they must work on **different crates/files** (the beads
-  dependency DAG ensures this; independent features touch different code by design)
-- If a sub-agent fails, note it and continue — don't block siblings that succeeded
-- After all parallel agents finish, run `bd ready --parent <id>` again to find newly unblocked work
-
-**Example parallel spawn (3 independent features ready):**
-```
-# In a single message, call Task 3 times:
-Task(prompt="Implement beads issue hq-xxx.2 using the implement-bd workflow...", subagent_type="general-purpose")
-Task(prompt="Implement beads issue hq-xxx.3 using the implement-bd workflow...", subagent_type="general-purpose")
-Task(prompt="Implement beads issue hq-xxx.4 using the implement-bd workflow...", subagent_type="general-purpose")
+3. Check if more children unblocked: bd ready --parent <id>
+4. Repeat until all children done
+5. bd close <id> --reason="All tasks complete"
 ```
 
 #### For Leaf Tasks (task/bug)

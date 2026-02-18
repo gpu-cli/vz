@@ -9,7 +9,23 @@ mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev || true
 mount -t tmpfs tmpfs /tmp
 
-mkdir -p /run /mnt/rootfs
+mkdir -p /run /mnt/rootfs /mnt/merged
+
+# Optional runtime binary share (host-provided youki artifact).
+mkdir -p /mnt/oci-runtime-bin
+
+install_youki_binary() {
+  target_path="$1"
+  if [ ! -f /mnt/oci-runtime-bin/youki ]; then
+    return 0
+  fi
+
+  target_dir="${target_path%/*}"
+  mkdir -p "$target_dir" || return 1
+  cp /mnt/oci-runtime-bin/youki "$target_path" || return 1
+  /bin/busybox chmod +x "$target_path" || return 1
+  return 0
+}
 
 # Ensure loopback works for localhost services and port forwarding.
 /bin/ip link set dev lo up >/dev/console 2>&1 || true
@@ -24,11 +40,11 @@ fi
 switch_root_into_overlay_rootfs() {
   echo "[vz-init] preparing overlay rootfs"
 
-  mkdir -p /mnt/overlay-work /mnt/merged || return 1
-  mount -t tmpfs tmpfs /mnt/overlay-work || return 1
-  mkdir -p /mnt/overlay-work/upper /mnt/overlay-work/work || return 1
+  mkdir -p /run/vz-oci/overlay || return 1
+  mount -t tmpfs tmpfs /run/vz-oci || return 1
+  mkdir -p /run/vz-oci/overlay/upper /run/vz-oci/overlay/work || return 1
   mount -t overlay overlay \
-    -o lowerdir=/mnt/rootfs,upperdir=/mnt/overlay-work/upper,workdir=/mnt/overlay-work/work \
+    -o lowerdir=/mnt/rootfs,upperdir=/run/vz-oci/overlay/upper,workdir=/run/vz-oci/overlay/work \
     /mnt/merged || return 1
 
   ROOTFS=/mnt/merged
@@ -50,20 +66,43 @@ switch_root_into_overlay_rootfs() {
   cp /etc/udhcpc.script "$ROOTFS/etc/udhcpc.script" || return 1
   /bin/busybox chmod +x "$ROOTFS/etc/udhcpc.script" || return 1
 
+  install_youki_binary "$ROOTFS/usr/local/bin/youki" || return 1
+
   echo "[vz-init] entering rootfs via chroot and starting guest agent on vsock 7424"
   exec chroot "$ROOTFS" /usr/local/bin/vz-guest-agent --port 7424 --bind-timeout-secs 30
 
   return 1
 }
 
+ROOTFS_READY=0
+
 # Optional VirtioFS rootfs mount (used by container runtime path).
 if mount -t virtiofs rootfs /mnt/rootfs 2>/dev/null; then
   echo "[vz-init] mounted virtiofs rootfs at /mnt/rootfs"
+  if mount -o remount,ro /mnt/rootfs >/dev/console 2>&1; then
+    echo "[vz-init] remounted rootfs share read-only for overlay lowerdir"
+  else
+    echo "[vz-init] rootfs remount read-only not supported, relying on host share flags"
+  fi
+  ROOTFS_READY=1
+else
+  echo "[vz-init] no rootfs virtiofs mount available, continuing"
+fi
+
+if mount -t virtiofs oci-runtime-bin /mnt/oci-runtime-bin 2>/dev/null; then
+  echo "[vz-init] mounted virtiofs oci-runtime-bin at /mnt/oci-runtime-bin"
+else
+  echo "[vz-init] no oci-runtime-bin virtiofs mount available"
+fi
+
+if ! install_youki_binary /usr/local/bin/youki; then
+  echo "[vz-init] failed to stage youki in initramfs userland"
+fi
+
+if [ "$ROOTFS_READY" -eq 1 ]; then
   if ! switch_root_into_overlay_rootfs; then
     echo "[vz-init] rootfs setup failed, falling back to initramfs userland"
   fi
-else
-  echo "[vz-init] no rootfs virtiofs mount available, continuing"
 fi
 
 echo "[vz-init] starting guest agent on vsock 7424"

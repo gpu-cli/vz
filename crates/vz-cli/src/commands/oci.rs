@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use std::process;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
+use std::fmt;
 use tokio::time::sleep;
 use tracing::info;
 
@@ -70,6 +71,25 @@ pub enum OciCommand {
     Rm(RmArgs),
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum ExecutionModeArg {
+    /// Execute command directly via guest agent.
+    #[value(name = "guest-exec")]
+    GuestExec,
+    /// Placeholder for OCI runtime inside the guest.
+    #[value(name = "oci-runtime")]
+    OciRuntime,
+}
+
+impl fmt::Display for ExecutionModeArg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::GuestExec => write!(f, "guest-exec"),
+            Self::OciRuntime => write!(f, "oci-runtime"),
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 pub struct PullArgs {
     /// Image reference, for example `ubuntu:24.04`.
@@ -132,6 +152,10 @@ pub struct RunArgs {
     /// Internal explicit container identifier used by detached runs.
     #[arg(long, hide = true)]
     pub internal_container_id: Option<String>,
+
+    /// Execution strategy for workload startup.
+    #[arg(long, default_value_t = ExecutionModeArg::GuestExec)]
+    pub execution_mode: ExecutionModeArg,
 }
 
 #[derive(Args, Debug)]
@@ -392,9 +416,19 @@ fn build_run_config(args: &RunArgs) -> anyhow::Result<RunConfig> {
         memory_mb: args.memory_mb,
         network_enabled,
         serial_log_file: args.serial_log_file.clone(),
+        execution_mode: args.execution_mode.into(),
         timeout,
         container_id: args.internal_container_id.clone(),
     })
+}
+
+impl From<ExecutionModeArg> for vz_oci::ExecutionMode {
+    fn from(value: ExecutionModeArg) -> Self {
+        match value {
+            ExecutionModeArg::GuestExec => vz_oci::ExecutionMode::GuestExec,
+            ExecutionModeArg::OciRuntime => vz_oci::ExecutionMode::OciRuntime,
+        }
+    }
 }
 
 fn generate_detached_container_id() -> String {
@@ -522,6 +556,7 @@ mod tests {
             detach: false,
             internal_detached_child: false,
             internal_container_id: Some("container-123".to_string()),
+            execution_mode: ExecutionModeArg::GuestExec,
         };
 
         let run_config = build_run_config(&args).expect("run config should build");

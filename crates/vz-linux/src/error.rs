@@ -13,7 +13,7 @@ pub enum LinuxError {
 
     /// Kernel artifacts are missing and no bundle path was provided.
     #[error(
-        "missing Linux kernel artifacts in {dir}; expected vmlinux, initramfs.img, version.json"
+        "missing Linux kernel artifacts in {dir}; expected vmlinux, initramfs.img, youki, version.json"
     )]
     MissingKernelArtifacts {
         /// Directory where artifacts were expected.
@@ -34,7 +34,7 @@ pub enum LinuxError {
         "kernel artifact checksum mismatch for {artifact} at {path}: expected {expected}, found {found}"
     )]
     ArtifactChecksumMismatch {
-        /// Artifact identifier (`vmlinux` or `initramfs.img`).
+        /// Artifact identifier (`vmlinux`, `initramfs.img`, or `youki`).
         artifact: String,
         /// Artifact path that failed validation.
         path: String,
