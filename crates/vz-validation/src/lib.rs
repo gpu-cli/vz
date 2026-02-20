@@ -7,11 +7,16 @@
 #![forbid(unsafe_code)]
 
 mod cohort;
+mod manifest;
 mod report;
 mod runner;
 mod scenario;
 
 pub use cohort::{ImageCohort, ImageRef, Tier, tier1_smoke, tier2_nightly};
+pub use manifest::{
+    CohortManifest, DefaultBehavior, ImageProfile, ProbeProtocol, ServiceInfo,
+    default_manifest, MANIFEST_VERSION,
+};
 pub use report::{ScenarioOutcome, TestReport, TestResult};
 pub use runner::{ExecOutput, FailingAdapter, MockAdapter, RuntimeAdapter, ScenarioRunner};
 pub use scenario::{
