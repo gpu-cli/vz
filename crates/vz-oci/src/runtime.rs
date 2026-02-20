@@ -2894,4 +2894,483 @@ mod tests {
         let remaining = runtime.list_containers().unwrap();
         assert!(remaining.is_empty());
     }
+
+    // ── B15: Lifecycle conformance harness ──
+
+    #[tokio::test]
+    async fn lifecycle_stop_nonrunning_container_is_noop() {
+        let data_dir = unique_temp_dir("lc-stop-noop");
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir,
+            ..RuntimeConfig::default()
+        });
+
+        // Seed a Stopped container.
+        runtime
+            .container_store
+            .upsert(ContainerInfo {
+                id: "stopped-ctr".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:s1".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 0 },
+                created_unix_secs: 100,
+                started_unix_secs: Some(101),
+                stopped_unix_secs: Some(110),
+                rootfs_path: None,
+                host_pid: None,
+            })
+            .unwrap();
+
+        // Stopping a non-running container returns it unchanged.
+        let result = runtime.stop_container("stopped-ctr", false).await.unwrap();
+        assert!(matches!(
+            result.status,
+            ContainerStatus::Stopped { exit_code: 0 }
+        ));
+        assert_eq!(result.stopped_unix_secs, Some(110));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_stop_created_container_is_noop() {
+        let data_dir = unique_temp_dir("lc-stop-created");
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir,
+            ..RuntimeConfig::default()
+        });
+
+        runtime
+            .container_store
+            .upsert(ContainerInfo {
+                id: "created-ctr".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:c1".to_string(),
+                status: ContainerStatus::Created,
+                created_unix_secs: 100,
+                started_unix_secs: None,
+                stopped_unix_secs: None,
+                rootfs_path: None,
+                host_pid: Some(process::id()),
+            })
+            .unwrap();
+
+        let result = runtime.stop_container("created-ctr", false).await.unwrap();
+        assert!(matches!(result.status, ContainerStatus::Created));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_stop_missing_container_returns_error() {
+        let data_dir = unique_temp_dir("lc-stop-missing");
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir,
+            ..RuntimeConfig::default()
+        });
+
+        let err = runtime
+            .stop_container("nonexistent", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OciError::Storage(_)));
+        if let OciError::Storage(io_err) = err {
+            assert_eq!(io_err.kind(), io::ErrorKind::NotFound);
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_remove_missing_container_returns_error() {
+        let data_dir = unique_temp_dir("lc-remove-missing");
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir,
+            ..RuntimeConfig::default()
+        });
+
+        let err = runtime.remove_container("nonexistent").await.unwrap_err();
+        assert!(matches!(err, OciError::Storage(_)));
+        if let OciError::Storage(io_err) = err {
+            assert_eq!(io_err.kind(), io::ErrorKind::NotFound);
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_remove_created_container_succeeds() {
+        let data_dir = unique_temp_dir("lc-remove-created");
+        let rootfs = data_dir.join("rootfs").join("ctr-created");
+        fs::create_dir_all(&rootfs).unwrap();
+
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir,
+            ..RuntimeConfig::default()
+        });
+
+        runtime
+            .container_store
+            .upsert(ContainerInfo {
+                id: "ctr-created".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:c1".to_string(),
+                status: ContainerStatus::Created,
+                created_unix_secs: 100,
+                started_unix_secs: None,
+                stopped_unix_secs: None,
+                rootfs_path: Some(rootfs.clone()),
+                host_pid: Some(process::id()),
+            })
+            .unwrap();
+
+        runtime.remove_container("ctr-created").await.unwrap();
+        assert!(runtime.list_containers().unwrap().is_empty());
+        assert!(!rootfs.exists());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_remove_stopped_container_cleans_rootfs() {
+        let data_dir = unique_temp_dir("lc-remove-stopped-rootfs");
+        let rootfs = data_dir.join("rootfs").join("ctr-stopped");
+        fs::create_dir_all(&rootfs).unwrap();
+
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir,
+            ..RuntimeConfig::default()
+        });
+
+        runtime
+            .container_store
+            .upsert(ContainerInfo {
+                id: "ctr-stopped".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:s1".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 0 },
+                created_unix_secs: 100,
+                started_unix_secs: Some(101),
+                stopped_unix_secs: Some(110),
+                rootfs_path: Some(rootfs.clone()),
+                host_pid: None,
+            })
+            .unwrap();
+
+        runtime.remove_container("ctr-stopped").await.unwrap();
+        assert!(runtime.list_containers().unwrap().is_empty());
+        assert!(!rootfs.exists());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_exec_on_stopped_container_returns_error() {
+        let data_dir = unique_temp_dir("lc-exec-stopped");
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir,
+            ..RuntimeConfig::default()
+        });
+
+        runtime
+            .container_store
+            .upsert(ContainerInfo {
+                id: "stopped-exec".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:se".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 0 },
+                created_unix_secs: 100,
+                started_unix_secs: Some(101),
+                stopped_unix_secs: Some(110),
+                rootfs_path: None,
+                host_pid: None,
+            })
+            .unwrap();
+
+        let err = runtime
+            .exec_container(
+                "stopped-exec",
+                ExecConfig {
+                    cmd: vec!["echo".to_string(), "hello".to_string()],
+                    ..ExecConfig::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        // No VM handle exists for a stopped container.
+        assert!(matches!(err, OciError::InvalidConfig(ref msg) if msg.contains("not be running")));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_exec_on_created_container_returns_error() {
+        let data_dir = unique_temp_dir("lc-exec-created");
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir,
+            ..RuntimeConfig::default()
+        });
+
+        runtime
+            .container_store
+            .upsert(ContainerInfo {
+                id: "created-exec".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:ce".to_string(),
+                status: ContainerStatus::Created,
+                created_unix_secs: 100,
+                started_unix_secs: None,
+                stopped_unix_secs: None,
+                rootfs_path: None,
+                host_pid: Some(process::id()),
+            })
+            .unwrap();
+
+        let err = runtime
+            .exec_container(
+                "created-exec",
+                ExecConfig {
+                    cmd: vec!["echo".to_string()],
+                    ..ExecConfig::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        // No VM handle for a Created container that hasn't started.
+        assert!(matches!(err, OciError::InvalidConfig(ref msg) if msg.contains("not be running")));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_exec_on_missing_container_returns_error() {
+        let data_dir = unique_temp_dir("lc-exec-missing");
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir,
+            ..RuntimeConfig::default()
+        });
+
+        let err = runtime
+            .exec_container(
+                "ghost",
+                ExecConfig {
+                    cmd: vec!["echo".to_string()],
+                    ..ExecConfig::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, OciError::InvalidConfig(ref msg) if msg.contains("not be running")));
+    }
+
+    #[test]
+    fn lifecycle_list_containers_returns_all_states() {
+        let data_dir = unique_temp_dir("lc-list-all");
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir,
+            ..RuntimeConfig::default()
+        });
+
+        runtime
+            .container_store
+            .upsert(ContainerInfo {
+                id: "created-1".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:a".to_string(),
+                status: ContainerStatus::Created,
+                created_unix_secs: 100,
+                started_unix_secs: None,
+                stopped_unix_secs: None,
+                rootfs_path: None,
+                host_pid: Some(process::id()),
+            })
+            .unwrap();
+
+        runtime
+            .container_store
+            .upsert(ContainerInfo {
+                id: "running-1".to_string(),
+                image: "alpine:3.22".to_string(),
+                image_id: "sha256:b".to_string(),
+                status: ContainerStatus::Running,
+                created_unix_secs: 200,
+                started_unix_secs: Some(201),
+                stopped_unix_secs: None,
+                rootfs_path: None,
+                host_pid: Some(process::id()),
+            })
+            .unwrap();
+
+        runtime
+            .container_store
+            .upsert(ContainerInfo {
+                id: "stopped-1".to_string(),
+                image: "debian:bookworm".to_string(),
+                image_id: "sha256:c".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 42 },
+                created_unix_secs: 50,
+                started_unix_secs: Some(51),
+                stopped_unix_secs: Some(60),
+                rootfs_path: None,
+                host_pid: None,
+            })
+            .unwrap();
+
+        let list = runtime.list_containers().unwrap();
+        assert_eq!(list.len(), 3);
+
+        // Sorted by ID.
+        assert_eq!(list[0].id, "created-1");
+        assert!(matches!(list[0].status, ContainerStatus::Created));
+        assert_eq!(list[1].id, "running-1");
+        assert!(matches!(list[1].status, ContainerStatus::Running));
+        assert_eq!(list[2].id, "stopped-1");
+        assert!(matches!(
+            list[2].status,
+            ContainerStatus::Stopped { exit_code: 42 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_double_remove_returns_not_found() {
+        let data_dir = unique_temp_dir("lc-double-remove");
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir,
+            ..RuntimeConfig::default()
+        });
+
+        runtime
+            .container_store
+            .upsert(ContainerInfo {
+                id: "once".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:once".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 0 },
+                created_unix_secs: 100,
+                started_unix_secs: Some(101),
+                stopped_unix_secs: Some(110),
+                rootfs_path: None,
+                host_pid: None,
+            })
+            .unwrap();
+
+        runtime.remove_container("once").await.unwrap();
+
+        // Second remove should fail with NotFound.
+        let err = runtime.remove_container("once").await.unwrap_err();
+        assert!(matches!(err, OciError::Storage(_)));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_oci_sequence_create_start_exec_delete() {
+        // Validates the mock OCI lifecycle sequence end-to-end.
+        let mock = MockOciLifecycleOps::new(ExecOutput {
+            exit_code: 0,
+            stdout: "world".to_string(),
+            stderr: String::new(),
+        });
+
+        let output = run_oci_lifecycle(
+            &mock,
+            "conformance-ctr".to_string(),
+            "/run/vz-oci/bundles/conformance-ctr".to_string(),
+            "/bin/echo".to_string(),
+            vec!["hello".to_string()],
+            OciExecOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, "world");
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.as_slice(), &["create", "start", "exec", "delete"]);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_oci_kill_graceful_then_state() {
+        let mock = MockOciLifecycleOps::new(ExecOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        });
+
+        let exit_code = stop_via_oci_runtime(&mock, "kill-test", false, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        // SIGTERM exit convention: 128 + 15 = 143.
+        assert_eq!(exit_code, 143);
+        let calls = mock.calls.lock().unwrap();
+        assert!(calls.contains(&"kill:SIGTERM"));
+        assert!(calls.contains(&"state"));
+        assert!(!calls.contains(&"kill:SIGKILL"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_oci_kill_forced_sends_sigkill() {
+        let mock = MockOciLifecycleOps::new(ExecOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        });
+
+        let exit_code = stop_via_oci_runtime(&mock, "force-kill", true, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        // SIGKILL exit convention: 128 + 9 = 137.
+        assert_eq!(exit_code, 137);
+        let calls = mock.calls.lock().unwrap();
+        assert!(calls.contains(&"kill:SIGKILL"));
+        // Forced kill should not attempt SIGTERM first.
+        assert!(!calls.contains(&"kill:SIGTERM"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_oci_delete_after_start_failure() {
+        let mut mock = MockOciLifecycleOps::new(ExecOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        });
+        mock.fail_start = true;
+
+        let err = run_oci_lifecycle(
+            &mock,
+            "fail-start".to_string(),
+            "/run/vz-oci/bundles/fail-start".to_string(),
+            "/bin/echo".to_string(),
+            vec![],
+            OciExecOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, OciError::InvalidConfig(_)));
+        let calls = mock.calls.lock().unwrap();
+        // create → start (fails) → delete (cleanup).
+        assert_eq!(calls.as_slice(), &["create", "start", "delete"]);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_oci_exec_with_env_and_cwd() {
+        let mock = MockOciLifecycleOps::new(ExecOutput {
+            exit_code: 0,
+            stdout: "ok".to_string(),
+            stderr: String::new(),
+        });
+
+        let _ = run_oci_lifecycle(
+            &mock,
+            "env-cwd-ctr".to_string(),
+            "/run/vz-oci/bundles/env-cwd-ctr".to_string(),
+            "/usr/bin/env".to_string(),
+            vec![],
+            OciExecOptions {
+                env: vec![("FOO".to_string(), "bar".to_string())],
+                cwd: Some("/workspace".to_string()),
+                user: Some("1000:1000".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let recorded = mock.exec_call.lock().unwrap();
+        let exec = recorded.as_ref().unwrap();
+        assert_eq!(exec.command, "/usr/bin/env");
+        assert_eq!(
+            exec.options.env,
+            vec![("FOO".to_string(), "bar".to_string())]
+        );
+        assert_eq!(exec.options.cwd, Some("/workspace".to_string()));
+        assert_eq!(exec.options.user, Some("1000:1000".to_string()));
+    }
 }
