@@ -38,6 +38,9 @@ pub enum StackCommand {
 
     /// Show stack lifecycle events.
     Events(EventsArgs),
+
+    /// Show service logs (event history and container output).
+    Logs(LogsArgs),
 }
 
 #[derive(Args, Debug)]
@@ -110,12 +113,35 @@ pub struct EventsArgs {
     pub state_dir: Option<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+pub struct LogsArgs {
+    /// Stack name to show logs for.
+    pub name: String,
+
+    /// Filter logs to a specific service.
+    #[arg(short, long)]
+    pub service: Option<String>,
+
+    /// Follow log output (poll for new events).
+    #[arg(short, long)]
+    pub follow: bool,
+
+    /// Number of recent events to show (0 = all).
+    #[arg(short = 'n', long, default_value_t = 50)]
+    pub tail: usize,
+
+    /// State directory for stack persistence.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+}
+
 pub async fn run(args: StackArgs) -> anyhow::Result<()> {
     match args.action {
         StackCommand::Up(args) => cmd_up(args).await,
         StackCommand::Down(args) => cmd_down(args).await,
         StackCommand::Ps(args) => cmd_ps(args).await,
         StackCommand::Events(args) => cmd_events(args).await,
+        StackCommand::Logs(args) => cmd_logs(args).await,
     }
 }
 
@@ -427,6 +453,101 @@ async fn cmd_events(args: EventsArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+// ── logs ──────────────────────────────────────────────────────────
+
+async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
+    let state_dir = resolve_state_dir(args.state_dir.as_deref(), &args.name)?;
+    let db_path = state_dir.join("state.db");
+
+    if !db_path.exists() {
+        bail!("no state found for stack `{}`", args.name);
+    }
+
+    let store = StateStore::open(&db_path).with_context(|| "failed to open state store")?;
+
+    // Load initial events.
+    let records = store
+        .load_event_records(&args.name)
+        .with_context(|| "failed to load events")?;
+
+    // Filter by service if specified.
+    let filtered: Vec<&EventRecord> = records
+        .iter()
+        .filter(|r| match &args.service {
+            Some(svc) => event_service_name(&r.event).is_some_and(|n| n == svc),
+            None => true,
+        })
+        .collect();
+
+    // Apply tail: show only the last N events (0 = all).
+    let display = if args.tail > 0 && filtered.len() > args.tail {
+        &filtered[filtered.len() - args.tail..]
+    } else {
+        &filtered
+    };
+
+    for record in display {
+        print_log_line(record);
+    }
+
+    if !args.follow {
+        return Ok(());
+    }
+
+    // Follow mode: poll for new events using the cursor.
+    let mut cursor = records.last().map_or(0, |r| r.id);
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let new_records = store
+            .load_events_since(&args.name, cursor)
+            .with_context(|| "failed to poll events")?;
+
+        if new_records.is_empty() {
+            continue;
+        }
+
+        for record in &new_records {
+            if let Some(svc) = &args.service {
+                if event_service_name(&record.event).is_none_or(|n| n != svc) {
+                    continue;
+                }
+            }
+            print_log_line(record);
+        }
+
+        cursor = new_records.last().map_or(cursor, |r| r.id);
+    }
+}
+
+/// Print a single log line with timestamp, service, and event summary.
+fn print_log_line(record: &EventRecord) {
+    let service = event_service_name(&record.event).unwrap_or("-");
+    let summary = format_event_summary(&record.event);
+    println!("{} [{}] {}", record.created_at, service, summary);
+}
+
+/// Extract the service name from a stack event, if applicable.
+fn event_service_name(event: &StackEvent) -> Option<&str> {
+    match event {
+        StackEvent::ServiceCreating { service_name, .. }
+        | StackEvent::ServiceReady { service_name, .. }
+        | StackEvent::ServiceStopping { service_name, .. }
+        | StackEvent::ServiceStopped { service_name, .. }
+        | StackEvent::ServiceFailed { service_name, .. }
+        | StackEvent::PortConflict { service_name, .. }
+        | StackEvent::HealthCheckPassed { service_name, .. }
+        | StackEvent::HealthCheckFailed { service_name, .. }
+        | StackEvent::DependencyBlocked { service_name, .. } => Some(service_name),
+        StackEvent::StackApplyStarted { .. }
+        | StackEvent::StackApplyCompleted { .. }
+        | StackEvent::StackApplyFailed { .. }
+        | StackEvent::VolumeCreated { .. }
+        | StackEvent::StackDestroyed { .. } => None,
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -765,6 +886,43 @@ mod tests {
             deferred: vec![],
         };
         print_apply_result(&result);
+    }
+
+    #[test]
+    fn event_service_name_returns_name_for_service_events() {
+        let event = StackEvent::ServiceCreating {
+            stack_name: "s".into(),
+            service_name: "web".into(),
+        };
+        assert_eq!(event_service_name(&event), Some("web"));
+
+        let event = StackEvent::HealthCheckFailed {
+            stack_name: "s".into(),
+            service_name: "db".into(),
+            attempt: 1,
+            error: "timeout".into(),
+        };
+        assert_eq!(event_service_name(&event), Some("db"));
+    }
+
+    #[test]
+    fn event_service_name_returns_none_for_stack_events() {
+        let event = StackEvent::StackApplyStarted {
+            stack_name: "s".into(),
+            services_count: 2,
+        };
+        assert_eq!(event_service_name(&event), None);
+
+        let event = StackEvent::VolumeCreated {
+            stack_name: "s".into(),
+            volume_name: "v".into(),
+        };
+        assert_eq!(event_service_name(&event), None);
+
+        let event = StackEvent::StackDestroyed {
+            stack_name: "s".into(),
+        };
+        assert_eq!(event_service_name(&event), None);
     }
 
     #[test]

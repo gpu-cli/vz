@@ -44,6 +44,24 @@ pub trait ContainerRuntime {
     /// Execute a command inside a running container.
     /// Returns the exit code (0 = success).
     fn exec(&self, container_id: &str, command: &[String]) -> Result<i32, StackError>;
+
+    /// Retrieve logs (stdout/stderr) from a container.
+    ///
+    /// Returns a [`ContainerLogs`] with captured stdout and stderr.
+    /// The default implementation returns empty logs; real runtimes
+    /// should override this to read from the container log driver.
+    fn logs(&self, _container_id: &str) -> Result<ContainerLogs, StackError> {
+        Ok(ContainerLogs::default())
+    }
+}
+
+/// Container log output.
+#[derive(Debug, Clone, Default)]
+pub struct ContainerLogs {
+    /// Captured stdout.
+    pub stdout: String,
+    /// Captured stderr.
+    pub stderr: String,
 }
 
 /// Tracks host port allocations across services within a stack.

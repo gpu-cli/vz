@@ -24,7 +24,7 @@ pub use compose::parse_compose;
 pub use convert::service_to_run_config;
 pub use error::StackError;
 pub use events::{EventRecord, StackEvent};
-pub use executor::{ContainerRuntime, ExecutionResult, PortTracker, StackExecutor};
+pub use executor::{ContainerLogs, ContainerRuntime, ExecutionResult, PortTracker, StackExecutor};
 pub use health::{
     DependencyCheck, HealthPollResult, HealthPoller, HealthStatus, check_dependencies,
     is_service_ready,
