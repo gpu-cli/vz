@@ -11,6 +11,7 @@ mod events;
 mod reconcile;
 mod spec;
 mod state_store;
+mod volume;
 
 pub use error::StackError;
 pub use events::{EventRecord, StackEvent};
@@ -20,3 +21,7 @@ pub use spec::{
     StackSpec, VolumeSpec,
 };
 pub use state_store::{ServiceObservedState, ServicePhase, StateStore};
+pub use volume::{
+    ResolvedMount, ResolvedMountKind, mounts_changed, orphaned_volumes, referenced_volume_names,
+    resolve_mounts,
+};
