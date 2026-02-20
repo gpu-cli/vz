@@ -490,9 +490,7 @@ pub(crate) fn build_objc_config(
         } else {
             let dev_null = NSString::from_str("/dev/null");
             NSFileHandle::fileHandleForWritingAtPath(&dev_null).ok_or_else(|| {
-                VzError::InvalidConfig(
-                    "failed to open /dev/null for serial port".to_string(),
-                )
+                VzError::InvalidConfig("failed to open /dev/null for serial port".to_string())
             })?
         };
 

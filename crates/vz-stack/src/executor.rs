@@ -189,11 +189,8 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             )?;
         }
 
-        let service_map: HashMap<&str, &ServiceSpec> = spec
-            .services
-            .iter()
-            .map(|s| (s.name.as_str(), s))
-            .collect();
+        let service_map: HashMap<&str, &ServiceSpec> =
+            spec.services.iter().map(|s| (s.name.as_str(), s)).collect();
 
         let mut result = ExecutionResult::default();
 
@@ -245,9 +242,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         service_name: &str,
     ) -> Result<(), StackError> {
         let svc_spec = service_map.get(service_name).ok_or_else(|| {
-            StackError::InvalidSpec(format!(
-                "service '{service_name}' not found in stack spec"
-            ))
+            StackError::InvalidSpec(format!("service '{service_name}' not found in stack spec"))
         })?;
 
         // Update state to Creating.
@@ -357,11 +352,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
     }
 
     /// Execute a service removal: stop + remove container, release ports, update state.
-    fn execute_remove(
-        &mut self,
-        spec: &StackSpec,
-        service_name: &str,
-    ) -> Result<(), StackError> {
+    fn execute_remove(&mut self, spec: &StackSpec, service_name: &str) -> Result<(), StackError> {
         // Find current container_id from observed state.
         let observed = self.store.load_observed_state(&spec.name)?;
         let container_id = observed
@@ -561,10 +552,10 @@ pub(crate) mod tests_support {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::*;
     use super::tests_support::MockContainerRuntime;
-    use crate::spec::{PortSpec, ResourcesSpec, StackSpec, VolumeSpec};
+    use super::*;
     use crate::spec::MountSpec as StackMountSpec;
+    use crate::spec::{PortSpec, ResourcesSpec, StackSpec, VolumeSpec};
     use std::collections::HashMap;
 
     fn svc(name: &str, image: &str) -> ServiceSpec {
@@ -631,8 +622,16 @@ mod tests {
 
         // Verify events.
         let events = executor.store().load_events("myapp").unwrap();
-        assert!(events.iter().any(|e| matches!(e, StackEvent::ServiceCreating { .. })));
-        assert!(events.iter().any(|e| matches!(e, StackEvent::ServiceReady { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::ServiceCreating { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::ServiceReady { .. }))
+        );
     }
 
     #[test]
@@ -764,7 +763,11 @@ mod tests {
 
         // ServiceFailed event emitted.
         let events = executor.store().load_events("myapp").unwrap();
-        assert!(events.iter().any(|e| matches!(e, StackEvent::ServiceFailed { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::ServiceFailed { .. }))
+        );
     }
 
     #[test]
@@ -883,7 +886,11 @@ mod tests {
 
         // VolumeCreated event emitted.
         let events = executor.store().load_events("myapp").unwrap();
-        assert!(events.iter().any(|e| matches!(e, StackEvent::VolumeCreated { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::VolumeCreated { .. }))
+        );
     }
 
     #[test]
@@ -1164,16 +1171,15 @@ mod tests {
 
         // PortConflict event emitted.
         let events = executor.store().load_events("myapp").unwrap();
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StackEvent::PortConflict { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::PortConflict { .. }))
+        );
 
         // api should be marked Failed.
         let observed = executor.store().load_observed_state("myapp").unwrap();
-        let api = observed
-            .iter()
-            .find(|o| o.service_name == "api")
-            .unwrap();
+        let api = observed.iter().find(|o| o.service_name == "api").unwrap();
         assert_eq!(api.phase, ServicePhase::Failed);
     }
 }

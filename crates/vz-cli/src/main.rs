@@ -281,9 +281,8 @@ mod tests {
 
     #[test]
     fn parse_stack_up() {
-        let cli =
-            Cli::try_parse_from(["vz", "stack", "up", "--file", "docker-compose.yaml"])
-                .expect("parse");
+        let cli = Cli::try_parse_from(["vz", "stack", "up", "--file", "docker-compose.yaml"])
+            .expect("parse");
         assert!(matches!(
             cli.command,
             Commands::Stack(ref args)
@@ -294,7 +293,13 @@ mod tests {
     #[test]
     fn parse_stack_up_with_name() {
         let cli = Cli::try_parse_from([
-            "vz", "stack", "up", "--file", "compose.yaml", "--name", "myapp",
+            "vz",
+            "stack",
+            "up",
+            "--file",
+            "compose.yaml",
+            "--name",
+            "myapp",
         ])
         .expect("parse");
         assert!(matches!(cli.command, Commands::Stack(_)));
@@ -302,10 +307,8 @@ mod tests {
 
     #[test]
     fn parse_stack_up_dry_run() {
-        let cli = Cli::try_parse_from([
-            "vz", "stack", "up", "--file", "compose.yaml", "--dry-run",
-        ])
-        .expect("parse");
+        let cli = Cli::try_parse_from(["vz", "stack", "up", "--file", "compose.yaml", "--dry-run"])
+            .expect("parse");
         if let Commands::Stack(ref args) = cli.command {
             if let commands::stack::StackCommand::Up(ref up) = args.action {
                 assert!(up.dry_run);
@@ -339,15 +342,13 @@ mod tests {
 
     #[test]
     fn parse_stack_ps_json() {
-        let cli =
-            Cli::try_parse_from(["vz", "stack", "ps", "myapp", "--json"]).expect("parse");
+        let cli = Cli::try_parse_from(["vz", "stack", "ps", "myapp", "--json"]).expect("parse");
         assert!(matches!(cli.command, Commands::Stack(_)));
     }
 
     #[test]
     fn parse_stack_events() {
-        let cli =
-            Cli::try_parse_from(["vz", "stack", "events", "myapp"]).expect("parse");
+        let cli = Cli::try_parse_from(["vz", "stack", "events", "myapp"]).expect("parse");
         assert!(matches!(
             cli.command,
             Commands::Stack(ref args)
@@ -357,10 +358,8 @@ mod tests {
 
     #[test]
     fn parse_stack_events_with_since() {
-        let cli = Cli::try_parse_from([
-            "vz", "stack", "events", "myapp", "--since", "10",
-        ])
-        .expect("parse");
+        let cli = Cli::try_parse_from(["vz", "stack", "events", "myapp", "--since", "10"])
+            .expect("parse");
         assert!(matches!(cli.command, Commands::Stack(_)));
     }
 
@@ -377,7 +376,13 @@ mod tests {
     #[test]
     fn parse_validate_run_with_output() {
         let cli = Cli::try_parse_from([
-            "vz", "validate", "run", "--tier", "2", "--output", "report.json",
+            "vz",
+            "validate",
+            "run",
+            "--tier",
+            "2",
+            "--output",
+            "report.json",
         ])
         .expect("parse");
         assert!(matches!(cli.command, Commands::Validate(_)));
@@ -405,8 +410,8 @@ mod tests {
 
     #[test]
     fn parse_validate_list_with_tier() {
-        let cli =
-            Cli::try_parse_from(["vz", "validate", "list", "--tier", "2", "--json"]).expect("parse");
+        let cli = Cli::try_parse_from(["vz", "validate", "list", "--tier", "2", "--json"])
+            .expect("parse");
         assert!(matches!(cli.command, Commands::Validate(_)));
     }
 }

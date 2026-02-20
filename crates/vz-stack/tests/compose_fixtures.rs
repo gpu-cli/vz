@@ -118,7 +118,10 @@ fn web_redis_initial_apply_creates_both_services() {
         "redis should be created before web (topo order)"
     );
 
-    assert!(result.deferred.is_empty(), "no services should be deferred on initial apply");
+    assert!(
+        result.deferred.is_empty(),
+        "no services should be deferred on initial apply"
+    );
 }
 
 #[test]
@@ -232,7 +235,8 @@ fn web_redis_redis_health_unblocks_web_when_healthy() {
     assert!(
         created.contains(&"web"),
         "web should be created now that redis is healthy: actions={:?}, deferred={:?}",
-        result.actions, result.deferred
+        result.actions,
+        result.deferred
     );
     assert!(result.deferred.is_empty());
 }
@@ -518,15 +522,17 @@ fn web_redis_apply_emits_events() {
     let _result = vz_stack::apply(&spec, &store, &health).unwrap();
 
     let events = store.load_event_records("web-redis").unwrap();
-    assert!(
-        !events.is_empty(),
-        "apply should emit events for fixture"
-    );
+    assert!(!events.is_empty(), "apply should emit events for fixture");
 
     // Should have at least a start event and creating events.
     let event_types: Vec<String> = events
         .iter()
-        .map(|e| serde_json::to_value(&e.event).unwrap()["type"].as_str().unwrap().to_string())
+        .map(|e| {
+            serde_json::to_value(&e.event).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
         .collect();
 
     assert!(

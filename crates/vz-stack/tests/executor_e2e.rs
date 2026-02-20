@@ -44,9 +44,7 @@ impl MockRuntime {
 
 impl ContainerRuntime for MockRuntime {
     fn pull(&self, image: &str) -> Result<String, StackError> {
-        self.calls
-            .borrow_mut()
-            .push(("pull".into(), image.into()));
+        self.calls.borrow_mut().push(("pull".into(), image.into()));
         Ok(format!("sha256:{image}"))
     }
 
@@ -472,9 +470,11 @@ fn volumes_created_and_used_in_full_pipeline() {
 
     // VolumeCreated event emitted.
     let events = executor.store().load_events("vol-test").unwrap();
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, StackEvent::VolumeCreated { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, StackEvent::VolumeCreated { .. }))
+    );
 }
 
 // ── Idempotent re-apply ─────────────────────────────────────────

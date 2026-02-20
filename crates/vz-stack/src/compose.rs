@@ -226,10 +226,7 @@ fn validate_top_level_keys(root: &serde_yml::Mapping) -> Result<(), StackError> 
     Ok(())
 }
 
-fn validate_service_keys(
-    svc_name: &str,
-    svc_map: &serde_yml::Mapping,
-) -> Result<(), StackError> {
+fn validate_service_keys(svc_name: &str, svc_map: &serde_yml::Mapping) -> Result<(), StackError> {
     for key in svc_map.keys() {
         let key_str = key.as_str().unwrap_or("");
 
@@ -257,10 +254,7 @@ fn validate_service_keys(
     Ok(())
 }
 
-fn validate_volume_keys(
-    vol_name: &str,
-    vol_map: &serde_yml::Mapping,
-) -> Result<(), StackError> {
+fn validate_volume_keys(vol_name: &str, vol_map: &serde_yml::Mapping) -> Result<(), StackError> {
     for key in vol_map.keys() {
         let key_str = key.as_str().unwrap_or("");
         if !ACCEPTED_VOLUME.contains(&key_str) {
@@ -347,18 +341,14 @@ fn parse_string_or_list(
 
     if let Some(s) = value.as_str() {
         // Shell form: split on whitespace.
-        Ok(Some(
-            s.split_whitespace().map(String::from).collect(),
-        ))
+        Ok(Some(s.split_whitespace().map(String::from).collect()))
     } else if let Some(seq) = value.as_sequence() {
         let items: Result<Vec<String>, _> = seq
             .iter()
             .map(|v| {
-                v.as_str()
-                    .map(String::from)
-                    .ok_or_else(|| {
-                        StackError::ComposeParse(format!("`{key}` list items must be strings"))
-                    })
+                v.as_str().map(String::from).ok_or_else(|| {
+                    StackError::ComposeParse(format!("`{key}` list items must be strings"))
+                })
             })
             .collect();
         Ok(Some(items?))
@@ -440,10 +430,7 @@ fn parse_environment(
 /// Supports:
 /// - Short syntax: `"8080:80"`, `"8080:80/udp"`, `"80"`
 /// - Long syntax: `{ target: 80, published: 8080, protocol: tcp }`
-fn parse_ports(
-    svc_name: &str,
-    map: &serde_yml::Mapping,
-) -> Result<Vec<PortSpec>, StackError> {
+fn parse_ports(svc_name: &str, map: &serde_yml::Mapping) -> Result<Vec<PortSpec>, StackError> {
     let Some(value) = map.get(val("ports")) else {
         return Ok(vec![]);
     };
@@ -460,9 +447,7 @@ fn parse_ports(
             // Bare number like `ports: [80]`.
             let n = item.as_u64().unwrap_or(0);
             let port = u16::try_from(n).map_err(|_| {
-                StackError::ComposeParse(format!(
-                    "service `{svc_name}`: port {n} is out of range"
-                ))
+                StackError::ComposeParse(format!("service `{svc_name}`: port {n} is out of range"))
             })?;
             ports.push(PortSpec {
                 protocol: "tcp".to_string(),
@@ -526,10 +511,7 @@ fn parse_port_short(svc_name: &str, s: &str) -> Result<PortSpec, StackError> {
 }
 
 /// Parse long-form port mapping: `{ target, published, protocol }`.
-fn parse_port_long(
-    svc_name: &str,
-    obj: &serde_yml::Mapping,
-) -> Result<PortSpec, StackError> {
+fn parse_port_long(svc_name: &str, obj: &serde_yml::Mapping) -> Result<PortSpec, StackError> {
     let target = obj
         .get(val("target"))
         .and_then(|v| v.as_u64())
@@ -668,10 +650,7 @@ fn parse_mount_short(
 }
 
 /// Parse long-form mount: `{ type, source, target, read_only }`.
-fn parse_mount_long(
-    svc_name: &str,
-    obj: &serde_yml::Mapping,
-) -> Result<MountSpec, StackError> {
+fn parse_mount_long(svc_name: &str, obj: &serde_yml::Mapping) -> Result<MountSpec, StackError> {
     let mount_type = obj
         .get(val("type"))
         .and_then(|v| v.as_str())
@@ -735,10 +714,7 @@ fn parse_mount_long(
 }
 
 /// Parse `depends_on` which can be a list of strings or a mapping with conditions.
-fn parse_depends_on(
-    svc_name: &str,
-    map: &serde_yml::Mapping,
-) -> Result<Vec<String>, StackError> {
+fn parse_depends_on(svc_name: &str, map: &serde_yml::Mapping) -> Result<Vec<String>, StackError> {
     let Some(value) = map.get(val("depends_on")) else {
         return Ok(vec![]);
     };
@@ -923,9 +899,7 @@ fn parse_restart(
     };
 
     let s = value.as_str().ok_or_else(|| {
-        StackError::ComposeParse(format!(
-            "service `{svc_name}`: `restart` must be a string"
-        ))
+        StackError::ComposeParse(format!("service `{svc_name}`: `restart` must be a string"))
     })?;
 
     match s {
@@ -959,9 +933,9 @@ fn parse_volumes(root: &serde_yml::Mapping) -> Result<Vec<VolumeSpec>, StackErro
         return Ok(vec![]);
     };
 
-    let volumes_map = value.as_mapping().ok_or_else(|| {
-        StackError::ComposeParse("top-level `volumes` must be a mapping".into())
-    })?;
+    let volumes_map = value
+        .as_mapping()
+        .ok_or_else(|| StackError::ComposeParse("top-level `volumes` must be a mapping".into()))?;
 
     let mut volumes = Vec::new();
     for (key, vol_value) in volumes_map {
@@ -994,9 +968,7 @@ fn parse_volumes(root: &serde_yml::Mapping) -> Result<Vec<VolumeSpec>, StackErro
         if driver != "local" {
             return Err(StackError::ComposeUnsupportedFeature {
                 feature: format!("volumes.{vol_name}.driver"),
-                reason: format!(
-                    "only `local` driver is supported; got `{driver}`"
-                ),
+                reason: format!("only `local` driver is supported; got `{driver}`"),
             });
         }
 
@@ -1005,9 +977,7 @@ fn parse_volumes(root: &serde_yml::Mapping) -> Result<Vec<VolumeSpec>, StackErro
             .and_then(|v| v.as_mapping())
             .map(|m| {
                 m.iter()
-                    .filter_map(|(k, v)| {
-                        Some((k.as_str()?.to_string(), v.as_str()?.to_string()))
-                    })
+                    .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
                     .collect::<HashMap<String, String>>()
             });
 
@@ -1104,10 +1074,7 @@ services:
                 "daemon off;".to_string()
             ])
         );
-        assert_eq!(
-            svc.entrypoint,
-            Some(vec!["/entrypoint.sh".to_string()])
-        );
+        assert_eq!(svc.entrypoint, Some(vec!["/entrypoint.sh".to_string()]));
         assert_eq!(svc.environment.get("PORT").unwrap(), "8080");
         assert_eq!(svc.environment.get("DEBUG").unwrap(), "true");
         assert_eq!(svc.working_dir, Some("/app".to_string()));
@@ -1468,10 +1435,7 @@ services:
 "#;
         let spec = parse_compose(yaml, "myapp").unwrap();
         let hc = spec.services[0].healthcheck.as_ref().unwrap();
-        assert_eq!(
-            hc.test,
-            vec!["CMD", "curl", "-f", "http://localhost"]
-        );
+        assert_eq!(hc.test, vec!["CMD", "curl", "-f", "http://localhost"]);
         assert_eq!(hc.interval_secs, Some(30));
         assert_eq!(hc.timeout_secs, Some(5));
         assert_eq!(hc.retries, Some(3));
@@ -1515,10 +1479,7 @@ services:
             ("no", RestartPolicy::No),
             ("always", RestartPolicy::Always),
             ("unless-stopped", RestartPolicy::UnlessStopped),
-            (
-                "on-failure",
-                RestartPolicy::OnFailure { max_retries: None },
-            ),
+            ("on-failure", RestartPolicy::OnFailure { max_retries: None }),
             (
                 "on-failure:5",
                 RestartPolicy::OnFailure {

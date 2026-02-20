@@ -402,9 +402,21 @@ mod tests {
         let nginx_scenarios = m.scenarios_for_image("nginx:1.27-alpine");
         // nginx: S1(5) + S2(2) + S3(3) + S4(1) + S5(2) + S6(3) = 16
         assert_eq!(nginx_scenarios.len(), 16);
-        assert!(nginx_scenarios.iter().any(|s| s.kind == ScenarioKind::ServiceBehavior));
-        assert!(nginx_scenarios.iter().any(|s| s.kind == ScenarioKind::MountSemantics));
-        assert!(nginx_scenarios.iter().any(|s| s.kind == ScenarioKind::ComposeFixture));
+        assert!(
+            nginx_scenarios
+                .iter()
+                .any(|s| s.kind == ScenarioKind::ServiceBehavior)
+        );
+        assert!(
+            nginx_scenarios
+                .iter()
+                .any(|s| s.kind == ScenarioKind::MountSemantics)
+        );
+        assert!(
+            nginx_scenarios
+                .iter()
+                .any(|s| s.kind == ScenarioKind::ComposeFixture)
+        );
     }
 
     #[test]
@@ -433,10 +445,7 @@ mod tests {
         let json = m.to_json().unwrap();
         let deserialized = CohortManifest::from_json(&json).unwrap();
         let nginx = deserialized.profile_for("nginx:1.27-alpine").unwrap();
-        assert_eq!(
-            nginx,
-            m.profile_for("nginx:1.27-alpine").unwrap()
-        );
+        assert_eq!(nginx, m.profile_for("nginx:1.27-alpine").unwrap());
     }
 
     #[test]

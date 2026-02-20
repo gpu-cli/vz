@@ -354,10 +354,13 @@ mod tests {
 
     #[test]
     fn stress_report_round_trip() {
-        let mut report = StressReport::new("2026-02-20T00:00:00Z", StressConfig {
-            iterations: 50,
-            max_flake_rate: 0.10,
-        });
+        let mut report = StressReport::new(
+            "2026-02-20T00:00:00Z",
+            StressConfig {
+                iterations: 50,
+                max_flake_rate: 0.10,
+            },
+        );
         report.add_result(ScenarioStressResult {
             image: alpine(),
             scenario_id: "s1-test".to_string(),

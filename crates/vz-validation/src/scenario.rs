@@ -119,10 +119,7 @@ pub fn s1_entrypoint_scenarios() -> Vec<Scenario> {
             id: "s1-cmd-override".to_string(),
             kind: ScenarioKind::EntrypointCmd,
             description: "Override image CMD with explicit command".to_string(),
-            command: Some(vec![
-                "echo".to_string(),
-                "hello-from-override".to_string(),
-            ]),
+            command: Some(vec!["echo".to_string(), "hello-from-override".to_string()]),
             entrypoint: None,
             environment: HashMap::new(),
             working_dir: None,
@@ -265,9 +262,7 @@ pub fn s5_service_scenarios() -> Vec<Scenario> {
             environment: HashMap::new(),
             working_dir: None,
             user: None,
-            expectations: vec![
-                Expectation::ExitCode { code: 0 },
-            ],
+            expectations: vec![Expectation::ExitCode { code: 0 }],
         },
     ]
 }
@@ -328,9 +323,7 @@ pub fn s3_mount_scenarios() -> Vec<Scenario> {
             environment: HashMap::new(),
             working_dir: None,
             user: None,
-            expectations: vec![
-                Expectation::ExitCode { code: 0 },
-            ],
+            expectations: vec![Expectation::ExitCode { code: 0 }],
         },
     ]
 }
@@ -367,9 +360,7 @@ pub fn s6_compose_scenarios() -> Vec<Scenario> {
             environment: HashMap::new(),
             working_dir: None,
             user: None,
-            expectations: vec![
-                Expectation::ExitCode { code: 0 },
-            ],
+            expectations: vec![Expectation::ExitCode { code: 0 }],
         },
         Scenario {
             id: "s6-restart-recovery".to_string(),
@@ -470,7 +461,11 @@ mod tests {
     fn s1_scenarios_are_valid() {
         let scenarios = s1_entrypoint_scenarios();
         assert_eq!(scenarios.len(), 3);
-        assert!(scenarios.iter().all(|s| s.kind == ScenarioKind::EntrypointCmd));
+        assert!(
+            scenarios
+                .iter()
+                .all(|s| s.kind == ScenarioKind::EntrypointCmd)
+        );
         assert!(scenarios.iter().all(|s| !s.expectations.is_empty()));
     }
 
@@ -478,7 +473,11 @@ mod tests {
     fn s2_scenarios_are_valid() {
         let scenarios = s2_user_scenarios();
         assert_eq!(scenarios.len(), 2);
-        assert!(scenarios.iter().all(|s| s.kind == ScenarioKind::UserPermissions));
+        assert!(
+            scenarios
+                .iter()
+                .all(|s| s.kind == ScenarioKind::UserPermissions)
+        );
     }
 
     #[test]
@@ -492,7 +491,11 @@ mod tests {
     fn s1_env_cwd_scenarios_are_valid() {
         let scenarios = s1_env_cwd_scenarios();
         assert_eq!(scenarios.len(), 2);
-        assert!(scenarios.iter().all(|s| s.kind == ScenarioKind::EntrypointCmd));
+        assert!(
+            scenarios
+                .iter()
+                .all(|s| s.kind == ScenarioKind::EntrypointCmd)
+        );
         // env propagation scenario has environment set
         assert!(!scenarios[0].environment.is_empty());
         // working dir scenario has working_dir set
@@ -503,14 +506,22 @@ mod tests {
     fn s5_service_scenarios_are_valid() {
         let scenarios = s5_service_scenarios();
         assert_eq!(scenarios.len(), 2);
-        assert!(scenarios.iter().all(|s| s.kind == ScenarioKind::ServiceBehavior));
+        assert!(
+            scenarios
+                .iter()
+                .all(|s| s.kind == ScenarioKind::ServiceBehavior)
+        );
     }
 
     #[test]
     fn s3_mount_scenarios_are_valid() {
         let scenarios = s3_mount_scenarios();
         assert_eq!(scenarios.len(), 3);
-        assert!(scenarios.iter().all(|s| s.kind == ScenarioKind::MountSemantics));
+        assert!(
+            scenarios
+                .iter()
+                .all(|s| s.kind == ScenarioKind::MountSemantics)
+        );
         assert!(scenarios.iter().all(|s| !s.expectations.is_empty()));
     }
 
@@ -518,7 +529,11 @@ mod tests {
     fn s6_compose_scenarios_are_valid() {
         let scenarios = s6_compose_scenarios();
         assert_eq!(scenarios.len(), 3);
-        assert!(scenarios.iter().all(|s| s.kind == ScenarioKind::ComposeFixture));
+        assert!(
+            scenarios
+                .iter()
+                .all(|s| s.kind == ScenarioKind::ComposeFixture)
+        );
         assert!(scenarios.iter().all(|s| !s.expectations.is_empty()));
     }
 }

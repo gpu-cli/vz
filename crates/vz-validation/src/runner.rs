@@ -35,11 +35,7 @@ pub trait RuntimeAdapter {
     /// 2. Creating and running the container
     /// 3. Capturing stdout/stderr
     /// 4. Returning the exit code and lifecycle events
-    fn execute(
-        &self,
-        image: &ImageRef,
-        scenario: &Scenario,
-    ) -> Result<ExecOutput, String>;
+    fn execute(&self, image: &ImageRef, scenario: &Scenario) -> Result<ExecOutput, String>;
 }
 
 /// Runs scenarios against a runtime adapter and collects results.
@@ -57,29 +53,23 @@ impl<R: RuntimeAdapter> ScenarioRunner<R> {
     pub fn run_one(&self, image: &ImageRef, scenario: &Scenario) -> TestResult {
         let start = Instant::now();
 
-        let (outcome, exit_code, stdout, stderr) =
-            match self.adapter.execute(image, scenario) {
-                Ok(output) => {
-                    let failures = evaluate_expectations(&scenario.expectations, &output);
-                    let outcome = if failures.is_empty() {
-                        ScenarioOutcome::Pass
-                    } else {
-                        ScenarioOutcome::Fail { failures }
-                    };
-                    (
-                        outcome,
-                        Some(output.exit_code),
-                        Some(output.stdout),
-                        Some(output.stderr),
-                    )
-                }
-                Err(message) => (
-                    ScenarioOutcome::Error { message },
-                    None,
-                    None,
-                    None,
-                ),
-            };
+        let (outcome, exit_code, stdout, stderr) = match self.adapter.execute(image, scenario) {
+            Ok(output) => {
+                let failures = evaluate_expectations(&scenario.expectations, &output);
+                let outcome = if failures.is_empty() {
+                    ScenarioOutcome::Pass
+                } else {
+                    ScenarioOutcome::Fail { failures }
+                };
+                (
+                    outcome,
+                    Some(output.exit_code),
+                    Some(output.stdout),
+                    Some(output.stderr),
+                )
+            }
+            Err(message) => (ScenarioOutcome::Error { message }, None, None, None),
+        };
 
         let duration = start.elapsed();
 
@@ -96,23 +86,12 @@ impl<R: RuntimeAdapter> ScenarioRunner<R> {
     }
 
     /// Run all given scenarios against a single image.
-    pub fn run_image(
-        &self,
-        image: &ImageRef,
-        scenarios: &[Scenario],
-    ) -> Vec<TestResult> {
-        scenarios
-            .iter()
-            .map(|s| self.run_one(image, s))
-            .collect()
+    pub fn run_image(&self, image: &ImageRef, scenarios: &[Scenario]) -> Vec<TestResult> {
+        scenarios.iter().map(|s| self.run_one(image, s)).collect()
     }
 
     /// Run all scenarios against all images in a cohort.
-    pub fn run_cohort(
-        &self,
-        images: &[ImageRef],
-        scenarios: &[Scenario],
-    ) -> Vec<TestResult> {
+    pub fn run_cohort(&self, images: &[ImageRef], scenarios: &[Scenario]) -> Vec<TestResult> {
         images
             .iter()
             .flat_map(|img| self.run_image(img, scenarios))
@@ -121,10 +100,7 @@ impl<R: RuntimeAdapter> ScenarioRunner<R> {
 }
 
 /// Evaluate all expectations against captured output.
-fn evaluate_expectations(
-    expectations: &[Expectation],
-    output: &ExecOutput,
-) -> Vec<String> {
+fn evaluate_expectations(expectations: &[Expectation], output: &ExecOutput) -> Vec<String> {
     let mut failures = Vec::new();
 
     for exp in expectations {
@@ -139,25 +115,19 @@ fn evaluate_expectations(
             }
             Expectation::StdoutContains { substring } => {
                 if !output.stdout.contains(substring.as_str()) {
-                    failures.push(format!(
-                        "stdout does not contain `{substring}`"
-                    ));
+                    failures.push(format!("stdout does not contain `{substring}`"));
                 }
             }
             Expectation::StderrContains { substring } => {
                 if !output.stderr.contains(substring.as_str()) {
-                    failures.push(format!(
-                        "stderr does not contain `{substring}`"
-                    ));
+                    failures.push(format!("stderr does not contain `{substring}`"));
                 }
             }
             Expectation::StdoutMatches { pattern } => {
                 // Simple substring match as regex support is optional.
                 // Full regex can be added when the `regex` crate is available.
                 if !output.stdout.contains(pattern.as_str()) {
-                    failures.push(format!(
-                        "stdout does not match pattern `{pattern}`"
-                    ));
+                    failures.push(format!("stdout does not match pattern `{pattern}`"));
                 }
             }
             Expectation::LifecycleSequence { events } => {
@@ -181,11 +151,7 @@ pub struct MockAdapter {
 }
 
 impl RuntimeAdapter for MockAdapter {
-    fn execute(
-        &self,
-        _image: &ImageRef,
-        _scenario: &Scenario,
-    ) -> Result<ExecOutput, String> {
+    fn execute(&self, _image: &ImageRef, _scenario: &Scenario) -> Result<ExecOutput, String> {
         Ok(self.output.clone())
     }
 }
@@ -197,11 +163,7 @@ pub struct FailingAdapter {
 }
 
 impl RuntimeAdapter for FailingAdapter {
-    fn execute(
-        &self,
-        _image: &ImageRef,
-        _scenario: &Scenario,
-    ) -> Result<ExecOutput, String> {
+    fn execute(&self, _image: &ImageRef, _scenario: &Scenario) -> Result<ExecOutput, String> {
         Err(self.message.clone())
     }
 }
@@ -324,11 +286,14 @@ mod tests {
             output: passing_output(),
         };
         let runner = ScenarioRunner::new(adapter);
-        let images = vec![alpine(), ImageRef {
-            reference: "python:3.12-slim".to_string(),
-            digest: None,
-            label: "Python".to_string(),
-        }];
+        let images = vec![
+            alpine(),
+            ImageRef {
+                reference: "python:3.12-slim".to_string(),
+                digest: None,
+                label: "Python".to_string(),
+            },
+        ];
         let scenarios = s1_entrypoint_scenarios();
 
         let results = runner.run_cohort(&images, &scenarios);

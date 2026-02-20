@@ -307,7 +307,10 @@ async fn pull_is_idempotent() {
     assert_eq!(id1.0, id2.0, "same image should produce same ID");
 
     let images = rt.images().unwrap();
-    assert!(!images.is_empty(), "images list should contain pulled image");
+    assert!(
+        !images.is_empty(),
+        "images list should contain pulled image"
+    );
 }
 
 /// Pulling a nonexistent image should fail gracefully.

@@ -590,8 +590,7 @@ impl Runtime {
         // OCI lifecycle: create → start → exec → delete.
         // The init process must be long-lived so the container stays running for exec.
         // If no explicit init process is set, use `sleep infinity` as the default.
-        let bundle_cmd = init_process
-            .unwrap_or_else(|| vec!["sleep".into(), "infinity".into()]);
+        let bundle_cmd = init_process.unwrap_or_else(|| vec!["sleep".into(), "infinity".into()]);
 
         let bundle_mounts = mount_specs_to_bundle_mounts(&mounts)?;
 

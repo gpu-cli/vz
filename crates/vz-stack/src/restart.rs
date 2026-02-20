@@ -222,16 +222,8 @@ mod tests {
     #[test]
     fn policy_always_restarts_on_any_exit() {
         let tracker = RestartTracker::new();
-        assert!(tracker.should_restart(
-            "web",
-            ServicePhase::Failed,
-            Some(&RestartPolicy::Always)
-        ));
-        assert!(tracker.should_restart(
-            "web",
-            ServicePhase::Stopped,
-            Some(&RestartPolicy::Always)
-        ));
+        assert!(tracker.should_restart("web", ServicePhase::Failed, Some(&RestartPolicy::Always)));
+        assert!(tracker.should_restart("web", ServicePhase::Stopped, Some(&RestartPolicy::Always)));
     }
 
     #[test]

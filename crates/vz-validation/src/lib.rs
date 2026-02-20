@@ -15,8 +15,8 @@ mod stress;
 
 pub use cohort::{ImageCohort, ImageRef, Tier, tier1_smoke, tier2_nightly, tier3_weekly};
 pub use manifest::{
-    CohortManifest, DefaultBehavior, ImageProfile, ProbeProtocol, ServiceInfo,
-    default_manifest, MANIFEST_VERSION,
+    CohortManifest, DefaultBehavior, ImageProfile, MANIFEST_VERSION, ProbeProtocol, ServiceInfo,
+    default_manifest,
 };
 pub use report::{ImageSummary, ScenarioOutcome, TestReport, TestResult};
 pub use runner::{ExecOutput, FailingAdapter, MockAdapter, RuntimeAdapter, ScenarioRunner};

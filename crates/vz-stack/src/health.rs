@@ -267,10 +267,7 @@ impl HealthPoller {
             };
 
             // Track when we first saw this service running.
-            let start_time = *self
-                .start_times
-                .entry(svc.name.clone())
-                .or_insert(now);
+            let start_time = *self.start_times.entry(svc.name.clone()).or_insert(now);
 
             // Respect start_period grace.
             let start_period = hc.start_period_secs.unwrap_or(0);
@@ -767,7 +764,11 @@ mod tests {
 
     fn make_hc_spec(retries: Option<u32>) -> HealthCheckSpec {
         HealthCheckSpec {
-            test: vec!["CMD".to_string(), "curl".to_string(), "localhost".to_string()],
+            test: vec![
+                "CMD".to_string(),
+                "curl".to_string(),
+                "localhost".to_string(),
+            ],
             interval_secs: Some(5),
             timeout_secs: Some(3),
             retries,
@@ -798,12 +799,17 @@ mod tests {
     fn poller_pass_marks_service_ready() {
         let runtime = MockContainerRuntime::new();
         let store = StateStore::in_memory().unwrap();
-        let spec = stack_with_hc("app", vec![ServiceSpec {
-            healthcheck: Some(make_hc_spec(Some(3))),
-            ..svc("web")
-        }]);
+        let spec = stack_with_hc(
+            "app",
+            vec![ServiceSpec {
+                healthcheck: Some(make_hc_spec(Some(3))),
+                ..svc("web")
+            }],
+        );
 
-        store.save_observed_state("app", &running_obs("web", "ctr-1")).unwrap();
+        store
+            .save_observed_state("app", &running_obs("web", "ctr-1"))
+            .unwrap();
 
         let mut poller = HealthPoller::new();
         let result = poller.poll_all(&runtime, &store, &spec).unwrap();
@@ -820,7 +826,11 @@ mod tests {
 
         // Event emitted.
         let events = store.load_events("app").unwrap();
-        assert!(events.iter().any(|e| matches!(e, StackEvent::HealthCheckPassed { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::HealthCheckPassed { .. }))
+        );
     }
 
     #[test]
@@ -828,12 +838,17 @@ mod tests {
         let mut runtime = MockContainerRuntime::new();
         runtime.exec_exit_code = 1;
         let store = StateStore::in_memory().unwrap();
-        let spec = stack_with_hc("app", vec![ServiceSpec {
-            healthcheck: Some(make_hc_spec(Some(3))),
-            ..svc("web")
-        }]);
+        let spec = stack_with_hc(
+            "app",
+            vec![ServiceSpec {
+                healthcheck: Some(make_hc_spec(Some(3))),
+                ..svc("web")
+            }],
+        );
 
-        store.save_observed_state("app", &running_obs("web", "ctr-1")).unwrap();
+        store
+            .save_observed_state("app", &running_obs("web", "ctr-1"))
+            .unwrap();
 
         let mut poller = HealthPoller::new();
         let result = poller.poll_all(&runtime, &store, &spec).unwrap();
@@ -844,7 +859,11 @@ mod tests {
 
         // HealthCheckFailed event emitted.
         let events = store.load_events("app").unwrap();
-        assert!(events.iter().any(|e| matches!(e, StackEvent::HealthCheckFailed { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::HealthCheckFailed { .. }))
+        );
 
         // Service still Running.
         let observed = store.load_observed_state("app").unwrap();
@@ -857,12 +876,17 @@ mod tests {
         let mut runtime = MockContainerRuntime::new();
         runtime.exec_exit_code = 1;
         let store = StateStore::in_memory().unwrap();
-        let spec = stack_with_hc("app", vec![ServiceSpec {
-            healthcheck: Some(make_hc_spec(Some(2))), // 2 retries
-            ..svc("web")
-        }]);
+        let spec = stack_with_hc(
+            "app",
+            vec![ServiceSpec {
+                healthcheck: Some(make_hc_spec(Some(2))), // 2 retries
+                ..svc("web")
+            }],
+        );
 
-        store.save_observed_state("app", &running_obs("web", "ctr-1")).unwrap();
+        store
+            .save_observed_state("app", &running_obs("web", "ctr-1"))
+            .unwrap();
 
         let mut poller = HealthPoller::new();
 
@@ -885,19 +909,27 @@ mod tests {
     fn poller_skips_non_running_services() {
         let runtime = MockContainerRuntime::new();
         let store = StateStore::in_memory().unwrap();
-        let spec = stack_with_hc("app", vec![ServiceSpec {
-            healthcheck: Some(make_hc_spec(Some(3))),
-            ..svc("web")
-        }]);
+        let spec = stack_with_hc(
+            "app",
+            vec![ServiceSpec {
+                healthcheck: Some(make_hc_spec(Some(3))),
+                ..svc("web")
+            }],
+        );
 
         // Service is Pending, not Running.
-        store.save_observed_state("app", &ServiceObservedState {
-            service_name: "web".to_string(),
-            phase: ServicePhase::Pending,
-            container_id: None,
-            last_error: None,
-            ready: false,
-        }).unwrap();
+        store
+            .save_observed_state(
+                "app",
+                &ServiceObservedState {
+                    service_name: "web".to_string(),
+                    phase: ServicePhase::Pending,
+                    container_id: None,
+                    last_error: None,
+                    ready: false,
+                },
+            )
+            .unwrap();
 
         let mut poller = HealthPoller::new();
         let result = poller.poll_all(&runtime, &store, &spec).unwrap();
@@ -911,7 +943,9 @@ mod tests {
         // No healthcheck on the service.
         let spec = stack_with_hc("app", vec![svc("web")]);
 
-        store.save_observed_state("app", &running_obs("web", "ctr-1")).unwrap();
+        store
+            .save_observed_state("app", &running_obs("web", "ctr-1"))
+            .unwrap();
 
         let mut poller = HealthPoller::new();
         let result = poller.poll_all(&runtime, &store, &spec).unwrap();
@@ -923,12 +957,17 @@ mod tests {
         let mut runtime = MockContainerRuntime::new();
         runtime.exec_exit_code = 1;
         let store = StateStore::in_memory().unwrap();
-        let spec = stack_with_hc("app", vec![ServiceSpec {
-            healthcheck: Some(make_hc_spec(Some(5))),
-            ..svc("web")
-        }]);
+        let spec = stack_with_hc(
+            "app",
+            vec![ServiceSpec {
+                healthcheck: Some(make_hc_spec(Some(5))),
+                ..svc("web")
+            }],
+        );
 
-        store.save_observed_state("app", &running_obs("web", "ctr-1")).unwrap();
+        store
+            .save_observed_state("app", &running_obs("web", "ctr-1"))
+            .unwrap();
 
         let mut poller = HealthPoller::new();
 
@@ -948,7 +987,9 @@ mod tests {
     #[test]
     fn poller_clear_removes_service_state() {
         let mut poller = HealthPoller::new();
-        poller.statuses.insert("web".to_string(), HealthStatus::new("web"));
+        poller
+            .statuses
+            .insert("web".to_string(), HealthStatus::new("web"));
         poller.start_times.insert("web".to_string(), Instant::now());
 
         poller.clear("web");
@@ -959,28 +1000,31 @@ mod tests {
     #[test]
     fn poller_min_interval_returns_smallest() {
         let poller = HealthPoller::new();
-        let spec = stack_with_hc("app", vec![
-            ServiceSpec {
-                healthcheck: Some(HealthCheckSpec {
-                    test: vec!["CMD".to_string()],
-                    interval_secs: Some(30),
-                    timeout_secs: None,
-                    retries: None,
-                    start_period_secs: None,
-                }),
-                ..svc("slow")
-            },
-            ServiceSpec {
-                healthcheck: Some(HealthCheckSpec {
-                    test: vec!["CMD".to_string()],
-                    interval_secs: Some(5),
-                    timeout_secs: None,
-                    retries: None,
-                    start_period_secs: None,
-                }),
-                ..svc("fast")
-            },
-        ]);
+        let spec = stack_with_hc(
+            "app",
+            vec![
+                ServiceSpec {
+                    healthcheck: Some(HealthCheckSpec {
+                        test: vec!["CMD".to_string()],
+                        interval_secs: Some(30),
+                        timeout_secs: None,
+                        retries: None,
+                        start_period_secs: None,
+                    }),
+                    ..svc("slow")
+                },
+                ServiceSpec {
+                    healthcheck: Some(HealthCheckSpec {
+                        test: vec!["CMD".to_string()],
+                        interval_secs: Some(5),
+                        timeout_secs: None,
+                        retries: None,
+                        start_period_secs: None,
+                    }),
+                    ..svc("fast")
+                },
+            ],
+        );
         assert_eq!(poller.min_interval(&spec), Some(5));
     }
 
@@ -996,12 +1040,17 @@ mod tests {
         let mut runtime = MockContainerRuntime::new();
         runtime.fail_exec = true;
         let store = StateStore::in_memory().unwrap();
-        let spec = stack_with_hc("app", vec![ServiceSpec {
-            healthcheck: Some(make_hc_spec(Some(3))),
-            ..svc("web")
-        }]);
+        let spec = stack_with_hc(
+            "app",
+            vec![ServiceSpec {
+                healthcheck: Some(make_hc_spec(Some(3))),
+                ..svc("web")
+            }],
+        );
 
-        store.save_observed_state("app", &running_obs("web", "ctr-1")).unwrap();
+        store
+            .save_observed_state("app", &running_obs("web", "ctr-1"))
+            .unwrap();
 
         let mut poller = HealthPoller::new();
         let result = poller.poll_all(&runtime, &store, &spec).unwrap();

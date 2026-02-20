@@ -357,11 +357,17 @@ mod tests {
         let summaries = report.per_image_summary();
         assert_eq!(summaries.len(), 2);
 
-        let alpine = summaries.iter().find(|s| s.reference == "alpine:3.20").unwrap();
+        let alpine = summaries
+            .iter()
+            .find(|s| s.reference == "alpine:3.20")
+            .unwrap();
         assert_eq!(alpine.passed, 2);
         assert_eq!(alpine.failed, 1);
 
-        let nginx = summaries.iter().find(|s| s.reference == "nginx:1.27-alpine").unwrap();
+        let nginx = summaries
+            .iter()
+            .find(|s| s.reference == "nginx:1.27-alpine")
+            .unwrap();
         assert_eq!(nginx.passed, 1);
         assert_eq!(nginx.failed, 0);
     }

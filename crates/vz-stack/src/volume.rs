@@ -154,10 +154,7 @@ impl VolumeManager {
     /// Ensure all named volumes have their directories created.
     ///
     /// Returns the list of volume names that were newly created.
-    pub fn ensure_volumes(
-        &self,
-        volumes: &[VolumeSpec],
-    ) -> Result<Vec<String>, StackError> {
+    pub fn ensure_volumes(&self, volumes: &[VolumeSpec]) -> Result<Vec<String>, StackError> {
         let mut created = Vec::new();
         for vol in volumes {
             let dir = self.volumes_dir.join(&vol.name);

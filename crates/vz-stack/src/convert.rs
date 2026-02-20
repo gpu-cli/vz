@@ -66,13 +66,9 @@ fn build_cmd(spec: &ServiceSpec) -> Vec<String> {
 /// `Vec<(String, String)>` format used by vz-oci.
 ///
 /// Keys are sorted for deterministic output.
-fn convert_env(
-    env: &std::collections::HashMap<String, String>,
-) -> Vec<(String, String)> {
-    let mut pairs: Vec<(String, String)> = env
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+fn convert_env(env: &std::collections::HashMap<String, String>) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> =
+        env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
     pairs
 }
@@ -81,9 +77,7 @@ fn convert_env(
 ///
 /// When `host_port` is `None`, the container port is used as the host
 /// port (a simple default; real dynamic allocation is a later bead).
-fn convert_ports(
-    ports: &[PortSpec],
-) -> Result<Vec<vz_oci::PortMapping>, StackError> {
+fn convert_ports(ports: &[PortSpec]) -> Result<Vec<vz_oci::PortMapping>, StackError> {
     let mut mappings = Vec::with_capacity(ports.len());
     for port in ports {
         let protocol = match port.protocol.as_str() {
@@ -116,9 +110,7 @@ fn convert_mounts(resolved: &[ResolvedMount]) -> Vec<vz_oci::MountSpec> {
                 crate::volume::ResolvedMountKind::Named { .. } => {
                     (vz_oci::MountType::Bind, rm.host_path.clone())
                 }
-                crate::volume::ResolvedMountKind::Ephemeral => {
-                    (vz_oci::MountType::Tmpfs, None)
-                }
+                crate::volume::ResolvedMountKind::Ephemeral => (vz_oci::MountType::Tmpfs, None),
             };
 
             let access = if rm.read_only {
@@ -142,14 +134,8 @@ fn convert_mounts(resolved: &[ResolvedMount]) -> Vec<vz_oci::MountSpec> {
 /// CPU: plain integer string → `u8` (e.g., "2" → 2).
 /// Memory: supports "m" (megabytes) and "g" (gigabytes) suffixes
 /// (e.g., "512m" → 512, "1g" → 1024).
-fn convert_resources(
-    resources: &ResourcesSpec,
-) -> Result<(Option<u8>, Option<u64>), StackError> {
-    let cpus = resources
-        .cpu
-        .as_deref()
-        .map(parse_cpu)
-        .transpose()?;
+fn convert_resources(resources: &ResourcesSpec) -> Result<(Option<u8>, Option<u64>), StackError> {
+    let cpus = resources.cpu.as_deref().map(parse_cpu).transpose()?;
 
     let memory_mb = resources
         .memory
@@ -163,9 +149,7 @@ fn convert_resources(
 /// Parse a CPU string ("1", "2", "4") into a `u8`.
 fn parse_cpu(s: &str) -> Result<u8, StackError> {
     s.parse::<u8>().map_err(|_| {
-        StackError::InvalidSpec(format!(
-            "invalid cpu value '{s}': expected integer 1-255"
-        ))
+        StackError::InvalidSpec(format!("invalid cpu value '{s}': expected integer 1-255"))
     })
 }
 
@@ -173,14 +157,16 @@ fn parse_cpu(s: &str) -> Result<u8, StackError> {
 fn parse_memory_mb(s: &str) -> Result<u64, StackError> {
     let s = s.trim().to_lowercase();
     if let Some(num) = s.strip_suffix('g') {
-        let val: u64 = num.trim().parse().map_err(|_| {
-            StackError::InvalidSpec(format!("invalid memory value '{s}'"))
-        })?;
+        let val: u64 = num
+            .trim()
+            .parse()
+            .map_err(|_| StackError::InvalidSpec(format!("invalid memory value '{s}'")))?;
         Ok(val * 1024)
     } else if let Some(num) = s.strip_suffix('m') {
-        let val: u64 = num.trim().parse().map_err(|_| {
-            StackError::InvalidSpec(format!("invalid memory value '{s}'"))
-        })?;
+        let val: u64 = num
+            .trim()
+            .parse()
+            .map_err(|_| StackError::InvalidSpec(format!("invalid memory value '{s}'")))?;
         Ok(val)
     } else {
         // Bare number treated as megabytes.
@@ -470,7 +456,11 @@ mod tests {
             ],
             depends_on: vec!["db".to_string()],
             healthcheck: Some(HealthCheckSpec {
-                test: vec!["CMD".to_string(), "curl".to_string(), "localhost:3000".to_string()],
+                test: vec![
+                    "CMD".to_string(),
+                    "curl".to_string(),
+                    "localhost:3000".to_string(),
+                ],
                 interval_secs: Some(30),
                 timeout_secs: Some(5),
                 retries: Some(3),

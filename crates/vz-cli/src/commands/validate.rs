@@ -102,10 +102,13 @@ fn tier_from_num(num: u8) -> Result<vz_validation::Tier> {
 
 fn now_iso8601() -> String {
     // Simple timestamp without chrono dependency.
-    format!("run-{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0))
+    format!(
+        "run-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    )
 }
 
 fn cmd_run(args: RunArgs) -> Result<()> {
@@ -153,8 +156,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
 
     // Output results.
     if args.json {
-        let json = serde_json::to_string_pretty(&report)
-            .context("failed to serialize report")?;
+        let json = serde_json::to_string_pretty(&report).context("failed to serialize report")?;
         println!("{json}");
     } else {
         print_report_summary(&report);
@@ -165,8 +167,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
 
     // Write to file if requested.
     if let Some(output) = args.output {
-        let json = serde_json::to_string_pretty(&report)
-            .context("failed to serialize report")?;
+        let json = serde_json::to_string_pretty(&report).context("failed to serialize report")?;
         std::fs::write(&output, &json)
             .with_context(|| format!("failed to write report to {}", output.display()))?;
         info!("Report written to {}", output.display());
@@ -225,8 +226,8 @@ fn cmd_run_stress(
 
     // Output results.
     if args.json {
-        let json = serde_json::to_string_pretty(&report)
-            .context("failed to serialize stress report")?;
+        let json =
+            serde_json::to_string_pretty(&report).context("failed to serialize stress report")?;
         println!("{json}");
     } else {
         print_stress_summary(&report);
@@ -234,8 +235,8 @@ fn cmd_run_stress(
 
     // Write to file if requested.
     if let Some(ref output) = args.output {
-        let json = serde_json::to_string_pretty(&report)
-            .context("failed to serialize stress report")?;
+        let json =
+            serde_json::to_string_pretty(&report).context("failed to serialize stress report")?;
         std::fs::write(output, &json)
             .with_context(|| format!("failed to write report to {}", output.display()))?;
         info!("Stress report written to {}", output.display());
@@ -295,11 +296,7 @@ fn run_cohort<R: RuntimeAdapter>(
             continue;
         }
 
-        info!(
-            "Testing {} ({} scenarios)",
-            image.label,
-            scenarios.len()
-        );
+        info!("Testing {} ({} scenarios)", image.label, scenarios.len());
 
         let results = runner.run_image(image, &scenarios);
         for result in results {
@@ -344,7 +341,10 @@ fn print_per_image_summary(report: &TestReport) {
 
     println!();
     println!("Per-image outcomes:");
-    println!("  {:<30} {:>6} {:>6} {:>7}", "IMAGE", "PASS", "FAIL", "SKIP");
+    println!(
+        "  {:<30} {:>6} {:>6} {:>7}",
+        "IMAGE", "PASS", "FAIL", "SKIP"
+    );
     for s in &summaries {
         let status = if s.failed > 0 { "FAIL" } else { "OK" };
         println!(
@@ -394,8 +394,7 @@ fn cmd_list(args: ListArgs) -> Result<()> {
                 })
             })
             .collect();
-        let json = serde_json::to_string_pretty(&info)
-            .context("failed to serialize tier info")?;
+        let json = serde_json::to_string_pretty(&info).context("failed to serialize tier info")?;
         println!("{json}");
     } else {
         for tier in &tiers_to_show {
