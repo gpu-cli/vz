@@ -13,3 +13,4 @@ pub mod save;
 pub mod self_sign;
 pub mod stack;
 pub mod stop;
+pub mod validate;

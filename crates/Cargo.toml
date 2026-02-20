@@ -148,6 +148,7 @@ vz-sandbox = { path = "vz-sandbox" }
 vz-linux = { path = "vz-linux" }
 vz-oci = { path = "vz-oci" }
 vz-stack = { path = "vz-stack" }
+vz-validation = { path = "vz-validation" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

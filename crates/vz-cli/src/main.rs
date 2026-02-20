@@ -80,6 +80,9 @@ enum Commands {
 
     /// Manage multi-service stacks from Compose files.
     Stack(commands::stack::StackArgs),
+
+    /// Run validation suites against image cohorts.
+    Validate(commands::validate::ValidateArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -131,6 +134,7 @@ fn main() -> anyhow::Result<()> {
             Commands::Cleanup(args) => commands::cleanup::run(args).await,
             Commands::SelfSign(args) => commands::self_sign::run(args).await,
             Commands::Stack(args) => commands::stack::run(args).await,
+            Commands::Validate(args) => commands::validate::run(args).await,
         };
 
         if let Err(ref e) = result {
@@ -341,5 +345,51 @@ mod tests {
         ])
         .expect("parse");
         assert!(matches!(cli.command, Commands::Stack(_)));
+    }
+
+    #[test]
+    fn parse_validate_run() {
+        let cli = Cli::try_parse_from(["vz", "validate", "run", "--tier", "1"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Validate(ref args)
+                if matches!(args.action, commands::validate::ValidateCommand::Run(_))
+        ));
+    }
+
+    #[test]
+    fn parse_validate_run_with_output() {
+        let cli = Cli::try_parse_from([
+            "vz", "validate", "run", "--tier", "2", "--output", "report.json",
+        ])
+        .expect("parse");
+        assert!(matches!(cli.command, Commands::Validate(_)));
+    }
+
+    #[test]
+    fn parse_validate_manifest() {
+        let cli = Cli::try_parse_from(["vz", "validate", "manifest"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Validate(ref args)
+                if matches!(args.action, commands::validate::ValidateCommand::Manifest(_))
+        ));
+    }
+
+    #[test]
+    fn parse_validate_list() {
+        let cli = Cli::try_parse_from(["vz", "validate", "list"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Validate(ref args)
+                if matches!(args.action, commands::validate::ValidateCommand::List(_))
+        ));
+    }
+
+    #[test]
+    fn parse_validate_list_with_tier() {
+        let cli =
+            Cli::try_parse_from(["vz", "validate", "list", "--tier", "2", "--json"]).expect("parse");
+        assert!(matches!(cli.command, Commands::Validate(_)));
     }
 }

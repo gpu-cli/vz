@@ -2405,6 +2405,7 @@ dependencies = [
  "vz-oci",
  "vz-sandbox",
  "vz-stack",
+ "vz-validation",
 ]
 
 [[package]]

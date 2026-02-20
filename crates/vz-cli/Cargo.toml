@@ -16,6 +16,7 @@ vz-sandbox = { workspace = true }
 vz = { workspace = true }
 vz-oci = { workspace = true }
 vz-stack = { workspace = true }
+vz-validation = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
