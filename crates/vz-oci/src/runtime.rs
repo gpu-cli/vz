@@ -2486,4 +2486,412 @@ mod tests {
 
         assert!(matches!(err, OciError::InvalidConfig(ref msg) if msg.contains("macos")));
     }
+
+    // ── B14: Crash recovery conformance ──
+
+    /// Simulates host crash by seeding container store with stale state, then
+    /// creating a new Runtime (which triggers reconciliation in `::new()`).
+    #[test]
+    fn crash_recovery_transitions_stale_running_to_stopped() {
+        let data_dir = unique_temp_dir("crash-stale-running");
+        let store = ContainerStore::new(data_dir.clone());
+
+        // Seed: a "Running" container whose host_pid is long dead.
+        store
+            .upsert(ContainerInfo {
+                id: "running-stale".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:aaa".to_string(),
+                status: ContainerStatus::Running,
+                created_unix_secs: 100,
+                started_unix_secs: Some(101),
+                stopped_unix_secs: None,
+                rootfs_path: None,
+                host_pid: Some(999_999_999),
+            })
+            .unwrap();
+
+        // "Restart" — construct a fresh Runtime from the same data_dir.
+        let _runtime = Runtime::new(RuntimeConfig {
+            data_dir: data_dir.clone(),
+            ..RuntimeConfig::default()
+        });
+
+        let containers = ContainerStore::new(data_dir).load_all().unwrap();
+        let c = containers.iter().find(|c| c.id == "running-stale").unwrap();
+        assert!(matches!(
+            c.status,
+            ContainerStatus::Stopped { exit_code: -1 }
+        ));
+        assert!(c.stopped_unix_secs.is_some());
+        assert!(c.host_pid.is_none());
+    }
+
+    #[test]
+    fn crash_recovery_transitions_stale_created_to_stopped() {
+        let data_dir = unique_temp_dir("crash-stale-created");
+        let store = ContainerStore::new(data_dir.clone());
+
+        store
+            .upsert(ContainerInfo {
+                id: "created-stale".to_string(),
+                image: "alpine:3.22".to_string(),
+                image_id: "sha256:bbb".to_string(),
+                status: ContainerStatus::Created,
+                created_unix_secs: 200,
+                started_unix_secs: None,
+                stopped_unix_secs: None,
+                rootfs_path: None,
+                host_pid: Some(999_999_999),
+            })
+            .unwrap();
+
+        let _runtime = Runtime::new(RuntimeConfig {
+            data_dir: data_dir.clone(),
+            ..RuntimeConfig::default()
+        });
+
+        let containers = ContainerStore::new(data_dir).load_all().unwrap();
+        let c = containers.iter().find(|c| c.id == "created-stale").unwrap();
+        assert!(matches!(
+            c.status,
+            ContainerStatus::Stopped { exit_code: -1 }
+        ));
+        assert!(c.host_pid.is_none());
+    }
+
+    #[test]
+    fn crash_recovery_preserves_alive_running_container() {
+        let data_dir = unique_temp_dir("crash-alive");
+        let store = ContainerStore::new(data_dir.clone());
+
+        store
+            .upsert(ContainerInfo {
+                id: "alive".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:ccc".to_string(),
+                status: ContainerStatus::Running,
+                created_unix_secs: 300,
+                started_unix_secs: Some(301),
+                stopped_unix_secs: None,
+                rootfs_path: None,
+                host_pid: Some(process::id()),
+            })
+            .unwrap();
+
+        let _runtime = Runtime::new(RuntimeConfig {
+            data_dir: data_dir.clone(),
+            ..RuntimeConfig::default()
+        });
+
+        let containers = ContainerStore::new(data_dir).load_all().unwrap();
+        let c = containers.iter().find(|c| c.id == "alive").unwrap();
+        assert!(matches!(c.status, ContainerStatus::Running));
+        assert_eq!(c.host_pid, Some(process::id()));
+    }
+
+    #[test]
+    fn crash_recovery_does_not_alter_stopped_containers() {
+        let data_dir = unique_temp_dir("crash-stopped");
+        let store = ContainerStore::new(data_dir.clone());
+
+        store
+            .upsert(ContainerInfo {
+                id: "already-done".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:ddd".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 42 },
+                created_unix_secs: 50,
+                started_unix_secs: Some(51),
+                stopped_unix_secs: Some(60),
+                rootfs_path: None,
+                host_pid: None,
+            })
+            .unwrap();
+
+        let _runtime = Runtime::new(RuntimeConfig {
+            data_dir: data_dir.clone(),
+            ..RuntimeConfig::default()
+        });
+
+        let containers = ContainerStore::new(data_dir).load_all().unwrap();
+        let c = containers.iter().find(|c| c.id == "already-done").unwrap();
+        assert!(matches!(
+            c.status,
+            ContainerStatus::Stopped { exit_code: 42 }
+        ));
+        assert_eq!(c.stopped_unix_secs, Some(60));
+    }
+
+    #[test]
+    fn crash_recovery_mixed_state_reconciles_correctly() {
+        let data_dir = unique_temp_dir("crash-mixed");
+        let rootfs_root = data_dir.join("rootfs");
+        let store = ContainerStore::new(data_dir.clone());
+
+        // Stale running container with rootfs.
+        let stale_rootfs = rootfs_root.join("stale-ctr");
+        fs::create_dir_all(&stale_rootfs).unwrap();
+        store
+            .upsert(ContainerInfo {
+                id: "stale-ctr".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:s1".to_string(),
+                status: ContainerStatus::Running,
+                created_unix_secs: 100,
+                started_unix_secs: Some(101),
+                stopped_unix_secs: None,
+                rootfs_path: Some(stale_rootfs.clone()),
+                host_pid: Some(999_999_999),
+            })
+            .unwrap();
+
+        // Alive running container with rootfs.
+        let alive_rootfs = rootfs_root.join("alive-ctr");
+        fs::create_dir_all(&alive_rootfs).unwrap();
+        store
+            .upsert(ContainerInfo {
+                id: "alive-ctr".to_string(),
+                image: "alpine:3.22".to_string(),
+                image_id: "sha256:a1".to_string(),
+                status: ContainerStatus::Running,
+                created_unix_secs: 200,
+                started_unix_secs: Some(201),
+                stopped_unix_secs: None,
+                rootfs_path: Some(alive_rootfs.clone()),
+                host_pid: Some(process::id()),
+            })
+            .unwrap();
+
+        // Already stopped container.
+        store
+            .upsert(ContainerInfo {
+                id: "stopped-ctr".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:p1".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 0 },
+                created_unix_secs: 50,
+                started_unix_secs: Some(51),
+                stopped_unix_secs: Some(60),
+                rootfs_path: None,
+                host_pid: None,
+            })
+            .unwrap();
+
+        // Orphaned rootfs with no container record.
+        let orphan_rootfs = rootfs_root.join("orphan-dir");
+        fs::create_dir_all(&orphan_rootfs).unwrap();
+
+        // Simulate restart.
+        let _runtime = Runtime::new(RuntimeConfig {
+            data_dir: data_dir.clone(),
+            ..RuntimeConfig::default()
+        });
+
+        let containers = ContainerStore::new(data_dir).load_all().unwrap();
+        assert_eq!(containers.len(), 3);
+
+        // Stale container: reconciled to stopped, rootfs cleaned.
+        let stale = containers.iter().find(|c| c.id == "stale-ctr").unwrap();
+        assert!(matches!(
+            stale.status,
+            ContainerStatus::Stopped { exit_code: -1 }
+        ));
+        assert!(stale.rootfs_path.is_none());
+        assert!(!stale_rootfs.exists());
+
+        // Alive container: untouched, rootfs preserved.
+        let alive = containers.iter().find(|c| c.id == "alive-ctr").unwrap();
+        assert!(matches!(alive.status, ContainerStatus::Running));
+        assert!(alive_rootfs.is_dir());
+
+        // Stopped container: unchanged.
+        let stopped = containers.iter().find(|c| c.id == "stopped-ctr").unwrap();
+        assert!(matches!(
+            stopped.status,
+            ContainerStatus::Stopped { exit_code: 0 }
+        ));
+
+        // Orphaned rootfs: cleaned up.
+        assert!(!orphan_rootfs.exists());
+    }
+
+    #[test]
+    fn crash_recovery_is_idempotent() {
+        let data_dir = unique_temp_dir("crash-idempotent");
+        let store = ContainerStore::new(data_dir.clone());
+
+        store
+            .upsert(ContainerInfo {
+                id: "stale-idem".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:idem".to_string(),
+                status: ContainerStatus::Running,
+                created_unix_secs: 100,
+                started_unix_secs: Some(101),
+                stopped_unix_secs: None,
+                rootfs_path: None,
+                host_pid: Some(999_999_999),
+            })
+            .unwrap();
+
+        // First restart — reconciles the stale container.
+        let _rt1 = Runtime::new(RuntimeConfig {
+            data_dir: data_dir.clone(),
+            ..RuntimeConfig::default()
+        });
+
+        let after_first = ContainerStore::new(data_dir.clone()).load_all().unwrap();
+        let c1 = after_first.iter().find(|c| c.id == "stale-idem").unwrap();
+        assert!(matches!(
+            c1.status,
+            ContainerStatus::Stopped { exit_code: -1 }
+        ));
+        let stopped_ts = c1.stopped_unix_secs;
+
+        // Second restart — should produce identical state.
+        let _rt2 = Runtime::new(RuntimeConfig {
+            data_dir: data_dir.clone(),
+            ..RuntimeConfig::default()
+        });
+
+        let after_second = ContainerStore::new(data_dir).load_all().unwrap();
+        let c2 = after_second.iter().find(|c| c.id == "stale-idem").unwrap();
+        assert!(matches!(
+            c2.status,
+            ContainerStatus::Stopped { exit_code: -1 }
+        ));
+        // Timestamp should not be overwritten on second restart since it's already Stopped.
+        assert_eq!(c2.stopped_unix_secs, stopped_ts);
+    }
+
+    #[test]
+    fn crash_recovery_stale_container_with_no_pid_is_reconciled() {
+        let data_dir = unique_temp_dir("crash-no-pid");
+        let store = ContainerStore::new(data_dir.clone());
+
+        // A Created container with no host_pid — the creating process crashed
+        // before recording its PID.
+        store
+            .upsert(ContainerInfo {
+                id: "no-pid".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:nopid".to_string(),
+                status: ContainerStatus::Created,
+                created_unix_secs: 100,
+                started_unix_secs: None,
+                stopped_unix_secs: None,
+                rootfs_path: None,
+                host_pid: None,
+            })
+            .unwrap();
+
+        let _runtime = Runtime::new(RuntimeConfig {
+            data_dir: data_dir.clone(),
+            ..RuntimeConfig::default()
+        });
+
+        let containers = ContainerStore::new(data_dir).load_all().unwrap();
+        let c = containers.iter().find(|c| c.id == "no-pid").unwrap();
+        // host_pid is None → is_some_and returns false → treated as stale.
+        assert!(matches!(
+            c.status,
+            ContainerStatus::Stopped { exit_code: -1 }
+        ));
+    }
+
+    #[test]
+    fn crash_recovery_metadata_persists_across_restarts() {
+        let data_dir = unique_temp_dir("crash-persist");
+        let store = ContainerStore::new(data_dir.clone());
+
+        store
+            .upsert(ContainerInfo {
+                id: "persist-1".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:p1".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 0 },
+                created_unix_secs: 100,
+                started_unix_secs: Some(101),
+                stopped_unix_secs: Some(110),
+                rootfs_path: None,
+                host_pid: None,
+            })
+            .unwrap();
+
+        store
+            .upsert(ContainerInfo {
+                id: "persist-2".to_string(),
+                image: "alpine:3.22".to_string(),
+                image_id: "sha256:p2".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 1 },
+                created_unix_secs: 200,
+                started_unix_secs: Some(201),
+                stopped_unix_secs: Some(210),
+                rootfs_path: None,
+                host_pid: None,
+            })
+            .unwrap();
+
+        // Restart #1
+        let rt1 = Runtime::new(RuntimeConfig {
+            data_dir: data_dir.clone(),
+            ..RuntimeConfig::default()
+        });
+        let list1 = rt1.list_containers().unwrap();
+        assert_eq!(list1.len(), 2);
+
+        // Restart #2
+        let rt2 = Runtime::new(RuntimeConfig {
+            data_dir: data_dir.clone(),
+            ..RuntimeConfig::default()
+        });
+        let list2 = rt2.list_containers().unwrap();
+        assert_eq!(list2.len(), 2);
+
+        // Original metadata is unchanged.
+        let c1 = list2.iter().find(|c| c.id == "persist-1").unwrap();
+        assert_eq!(c1.image, "ubuntu:24.04");
+        assert_eq!(c1.started_unix_secs, Some(101));
+        assert_eq!(c1.stopped_unix_secs, Some(110));
+
+        let c2 = list2.iter().find(|c| c.id == "persist-2").unwrap();
+        assert_eq!(c2.image, "alpine:3.22");
+        assert!(matches!(
+            c2.status,
+            ContainerStatus::Stopped { exit_code: 1 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_reconciled_container_can_be_removed() {
+        let data_dir = unique_temp_dir("crash-remove");
+        let store = ContainerStore::new(data_dir.clone());
+
+        store
+            .upsert(ContainerInfo {
+                id: "remove-me".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:rm".to_string(),
+                status: ContainerStatus::Running,
+                created_unix_secs: 100,
+                started_unix_secs: Some(101),
+                stopped_unix_secs: None,
+                rootfs_path: None,
+                host_pid: Some(999_999_999),
+            })
+            .unwrap();
+
+        // Restart reconciles it to Stopped.
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir: data_dir.clone(),
+            ..RuntimeConfig::default()
+        });
+
+        // Removing the reconciled (now Stopped) container should succeed.
+        runtime.remove_container("remove-me").await.unwrap();
+
+        let remaining = runtime.list_containers().unwrap();
+        assert!(remaining.is_empty());
+    }
 }
