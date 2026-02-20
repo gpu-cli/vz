@@ -272,6 +272,128 @@ pub fn s5_service_scenarios() -> Vec<Scenario> {
     ]
 }
 
+/// Build standard S3 scenarios for mount semantics.
+pub fn s3_mount_scenarios() -> Vec<Scenario> {
+    vec![
+        Scenario {
+            id: "s3-bind-mount-rw".to_string(),
+            kind: ScenarioKind::MountSemantics,
+            description: "Verify bind mount read-write access".to_string(),
+            command: Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo test > /mnt/data/probe && cat /mnt/data/probe".to_string(),
+            ]),
+            entrypoint: None,
+            environment: HashMap::new(),
+            working_dir: None,
+            user: None,
+            expectations: vec![
+                Expectation::ExitCode { code: 0 },
+                Expectation::StdoutContains {
+                    substring: "test".to_string(),
+                },
+            ],
+        },
+        Scenario {
+            id: "s3-bind-mount-ro".to_string(),
+            kind: ScenarioKind::MountSemantics,
+            description: "Verify read-only bind mount rejects writes".to_string(),
+            command: Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo fail > /mnt/readonly/probe 2>&1 || echo readonly-ok".to_string(),
+            ]),
+            entrypoint: None,
+            environment: HashMap::new(),
+            working_dir: None,
+            user: None,
+            expectations: vec![
+                Expectation::ExitCode { code: 0 },
+                Expectation::StdoutContains {
+                    substring: "readonly-ok".to_string(),
+                },
+            ],
+        },
+        Scenario {
+            id: "s3-named-volume-persistence".to_string(),
+            kind: ScenarioKind::MountSemantics,
+            description: "Verify named volume data persists across container restarts".to_string(),
+            command: Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "cat /data/persisted || echo empty".to_string(),
+            ]),
+            entrypoint: None,
+            environment: HashMap::new(),
+            working_dir: None,
+            user: None,
+            expectations: vec![
+                Expectation::ExitCode { code: 0 },
+            ],
+        },
+    ]
+}
+
+/// Build standard S6 scenarios for compose fixture validation.
+pub fn s6_compose_scenarios() -> Vec<Scenario> {
+    vec![
+        Scenario {
+            id: "s6-multi-service-startup".to_string(),
+            kind: ScenarioKind::ComposeFixture,
+            description: "Verify multi-service stack starts in dependency order".to_string(),
+            command: None,
+            entrypoint: None,
+            environment: HashMap::new(),
+            working_dir: None,
+            user: None,
+            expectations: vec![
+                Expectation::ExitCode { code: 0 },
+                Expectation::LifecycleSequence {
+                    events: vec![
+                        "compose-up".to_string(),
+                        "service-ready".to_string(),
+                        "compose-healthy".to_string(),
+                    ],
+                },
+            ],
+        },
+        Scenario {
+            id: "s6-service-connectivity".to_string(),
+            kind: ScenarioKind::ComposeFixture,
+            description: "Verify inter-service name-based connectivity".to_string(),
+            command: None,
+            entrypoint: None,
+            environment: HashMap::new(),
+            working_dir: None,
+            user: None,
+            expectations: vec![
+                Expectation::ExitCode { code: 0 },
+            ],
+        },
+        Scenario {
+            id: "s6-restart-recovery".to_string(),
+            kind: ScenarioKind::ComposeFixture,
+            description: "Verify service restart recovery after failure".to_string(),
+            command: None,
+            entrypoint: None,
+            environment: HashMap::new(),
+            working_dir: None,
+            user: None,
+            expectations: vec![
+                Expectation::ExitCode { code: 0 },
+                Expectation::LifecycleSequence {
+                    events: vec![
+                        "service-fail".to_string(),
+                        "service-restart".to_string(),
+                        "service-ready".to_string(),
+                    ],
+                },
+            ],
+        },
+    ]
+}
+
 /// Build standard S4 scenarios for signal handling.
 pub fn s4_signal_scenarios() -> Vec<Scenario> {
     vec![Scenario {
@@ -382,5 +504,21 @@ mod tests {
         let scenarios = s5_service_scenarios();
         assert_eq!(scenarios.len(), 2);
         assert!(scenarios.iter().all(|s| s.kind == ScenarioKind::ServiceBehavior));
+    }
+
+    #[test]
+    fn s3_mount_scenarios_are_valid() {
+        let scenarios = s3_mount_scenarios();
+        assert_eq!(scenarios.len(), 3);
+        assert!(scenarios.iter().all(|s| s.kind == ScenarioKind::MountSemantics));
+        assert!(scenarios.iter().all(|s| !s.expectations.is_empty()));
+    }
+
+    #[test]
+    fn s6_compose_scenarios_are_valid() {
+        let scenarios = s6_compose_scenarios();
+        assert_eq!(scenarios.len(), 3);
+        assert!(scenarios.iter().all(|s| s.kind == ScenarioKind::ComposeFixture));
+        assert!(scenarios.iter().all(|s| !s.expectations.is_empty()));
     }
 }

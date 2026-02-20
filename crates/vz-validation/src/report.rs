@@ -146,6 +146,48 @@ impl TestReport {
             self.duration.as_millis(),
         )
     }
+
+    /// Generate per-image outcome summaries for nightly reporting.
+    pub fn per_image_summary(&self) -> Vec<ImageSummary> {
+        let mut map: std::collections::HashMap<String, (usize, usize, usize)> =
+            std::collections::HashMap::new();
+
+        for result in &self.results {
+            let entry = map.entry(result.image.reference.clone()).or_default();
+            if result.outcome.is_pass() {
+                entry.0 += 1;
+            } else if result.outcome.is_failure() {
+                entry.1 += 1;
+            } else {
+                entry.2 += 1;
+            }
+        }
+
+        let mut summaries: Vec<ImageSummary> = map
+            .into_iter()
+            .map(|(reference, (passed, failed, skipped))| ImageSummary {
+                reference,
+                passed,
+                failed,
+                skipped,
+            })
+            .collect();
+        summaries.sort_by(|a, b| a.reference.cmp(&b.reference));
+        summaries
+    }
+}
+
+/// Per-image outcome summary for nightly reports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageSummary {
+    /// Image reference.
+    pub reference: String,
+    /// Number of passed scenarios.
+    pub passed: usize,
+    /// Number of failed scenarios.
+    pub failed: usize,
+    /// Number of skipped scenarios.
+    pub skipped: usize,
 }
 
 mod duration_serde {
@@ -294,5 +336,47 @@ mod tests {
         assert!(line.contains("1 passed"));
         assert!(line.contains("1 failed"));
         assert!(line.contains("1234ms"));
+    }
+
+    #[test]
+    fn per_image_summary_groups_correctly() {
+        let mut report = TestReport::new(Tier::Tier2, "2026-02-20T00:00:00Z");
+        report.add_result(sample_result(true));
+        report.add_result(sample_result(true));
+        report.add_result(sample_result(false));
+
+        // Add a result for a different image.
+        let mut nginx_result = sample_result(true);
+        nginx_result.image = ImageRef {
+            reference: "nginx:1.27-alpine".to_string(),
+            digest: None,
+            label: "Nginx".to_string(),
+        };
+        report.add_result(nginx_result);
+
+        let summaries = report.per_image_summary();
+        assert_eq!(summaries.len(), 2);
+
+        let alpine = summaries.iter().find(|s| s.reference == "alpine:3.20").unwrap();
+        assert_eq!(alpine.passed, 2);
+        assert_eq!(alpine.failed, 1);
+
+        let nginx = summaries.iter().find(|s| s.reference == "nginx:1.27-alpine").unwrap();
+        assert_eq!(nginx.passed, 1);
+        assert_eq!(nginx.failed, 0);
+    }
+
+    #[test]
+    fn image_summary_round_trip() {
+        let summary = ImageSummary {
+            reference: "alpine:3.20".to_string(),
+            passed: 5,
+            failed: 1,
+            skipped: 0,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let deserialized: ImageSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.reference, "alpine:3.20");
+        assert_eq!(deserialized.passed, 5);
     }
 }

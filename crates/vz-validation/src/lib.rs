@@ -17,9 +17,10 @@ pub use manifest::{
     CohortManifest, DefaultBehavior, ImageProfile, ProbeProtocol, ServiceInfo,
     default_manifest, MANIFEST_VERSION,
 };
-pub use report::{ScenarioOutcome, TestReport, TestResult};
+pub use report::{ImageSummary, ScenarioOutcome, TestReport, TestResult};
 pub use runner::{ExecOutput, FailingAdapter, MockAdapter, RuntimeAdapter, ScenarioRunner};
 pub use scenario::{
     Expectation, Scenario, ScenarioKind, s1_entrypoint_scenarios, s1_env_cwd_scenarios,
-    s2_user_scenarios, s4_signal_scenarios, s5_service_scenarios,
+    s2_user_scenarios, s3_mount_scenarios, s4_signal_scenarios, s5_service_scenarios,
+    s6_compose_scenarios,
 };

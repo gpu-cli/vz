@@ -147,6 +147,10 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         println!("{json}");
     } else {
         print_report_summary(&report);
+        // For nightly (Tier 2+), show per-image summary.
+        if args.tier >= 2 {
+            print_per_image_summary(&report);
+        }
     }
 
     // Write to file if requested.
@@ -220,6 +224,24 @@ fn print_report_summary(report: &TestReport) {
         if let vz_validation::ScenarioOutcome::Error { message } = &result.outcome {
             println!("         error: {message}");
         }
+    }
+}
+
+fn print_per_image_summary(report: &TestReport) {
+    let summaries = report.per_image_summary();
+    if summaries.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("Per-image outcomes:");
+    println!("  {:<30} {:>6} {:>6} {:>7}", "IMAGE", "PASS", "FAIL", "SKIP");
+    for s in &summaries {
+        let status = if s.failed > 0 { "FAIL" } else { "OK" };
+        println!(
+            "  {:<30} {:>6} {:>6} {:>7}  [{}]",
+            s.reference, s.passed, s.failed, s.skipped, status
+        );
     }
 }
 

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::cohort::{ImageCohort, Tier, tier1_smoke, tier2_nightly};
 use crate::scenario::{
     Scenario, ScenarioKind, s1_entrypoint_scenarios, s1_env_cwd_scenarios, s2_user_scenarios,
-    s4_signal_scenarios, s5_service_scenarios,
+    s3_mount_scenarios, s4_signal_scenarios, s5_service_scenarios, s6_compose_scenarios,
 };
 
 /// Current manifest format version.
@@ -140,11 +140,15 @@ impl CohortManifest {
                 ScenarioKind::SignalHandling => {
                     scenarios.extend(s4_signal_scenarios());
                 }
+                ScenarioKind::MountSemantics => {
+                    scenarios.extend(s3_mount_scenarios());
+                }
                 ScenarioKind::ServiceBehavior => {
                     scenarios.extend(s5_service_scenarios());
                 }
-                // S3, S6 builders will be added in future beads.
-                _ => {}
+                ScenarioKind::ComposeFixture => {
+                    scenarios.extend(s6_compose_scenarios());
+                }
             }
         }
 
@@ -294,6 +298,7 @@ fn build_applicability() -> HashMap<String, Vec<ScenarioKind>> {
         ScenarioKind::MountSemantics,
         ScenarioKind::SignalHandling,
         ScenarioKind::ServiceBehavior,
+        ScenarioKind::ComposeFixture,
     ];
 
     app.insert("alpine:3.20".to_string(), utility_scenarios.clone());
@@ -393,11 +398,13 @@ mod tests {
             assert!(applicable.contains(&s.kind));
         }
 
-        // Service images get S5 scenarios too.
+        // Service images get S3, S5, S6 scenarios too.
         let nginx_scenarios = m.scenarios_for_image("nginx:1.27-alpine");
-        // nginx: S1 (5) + S2 (2) + S4 (1) + S5 (2) + S3 (no builder) = 10
-        assert_eq!(nginx_scenarios.len(), 10);
+        // nginx: S1(5) + S2(2) + S3(3) + S4(1) + S5(2) + S6(3) = 16
+        assert_eq!(nginx_scenarios.len(), 16);
         assert!(nginx_scenarios.iter().any(|s| s.kind == ScenarioKind::ServiceBehavior));
+        assert!(nginx_scenarios.iter().any(|s| s.kind == ScenarioKind::MountSemantics));
+        assert!(nginx_scenarios.iter().any(|s| s.kind == ScenarioKind::ComposeFixture));
     }
 
     #[test]
@@ -438,10 +445,20 @@ mod tests {
         // Tier 1 has 3 images:
         // alpine: S1(5) + S2(2) + S4(1) = 8
         // python: S1(5) + S2(2) + S4(1) = 8
-        // nginx:  S1(5) + S2(2) + S4(1) + S5(2) = 10 (S3 has no builder)
+        // nginx:  S1(5) + S2(2) + S3(3) + S4(1) + S5(2) + S6(3) = 16
         let size = m.test_matrix_size(Tier::Tier1);
         assert!(size > 0);
-        assert_eq!(size, 26);
+        assert_eq!(size, 32);
+    }
+
+    #[test]
+    fn test_matrix_size_tier2() {
+        let m = test_manifest();
+        // Tier 2 has 6 images:
+        // alpine(8) + python(8) + node(8) = 24 (utility)
+        // nginx(16) + redis(16) + postgres(16) = 48 (service)
+        let size = m.test_matrix_size(Tier::Tier2);
+        assert_eq!(size, 72);
     }
 
     #[test]
