@@ -8,6 +8,7 @@ members = [
     "vz-linux",
     "vz-oci",
     "vz-stack",
+    "vz-validation",
 ]
 
 [workspace.package]

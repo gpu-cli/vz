@@ -1,0 +1,282 @@
+//! Scenario definitions for validation testing.
+//!
+//! Each scenario specifies what to execute and what constitutes a pass.
+
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+/// Category of validation scenario.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ScenarioKind {
+    /// S1: Entrypoint/Cmd resolution (image defaults, CLI override, args).
+    EntrypointCmd,
+    /// S2: User and permissions (UID/GID, username, file ownership).
+    UserPermissions,
+    /// S3: Mount semantics (bind rw, bind ro, named volume persistence).
+    MountSemantics,
+    /// S4: Signal handling (SIGTERM graceful, SIGKILL forced).
+    SignalHandling,
+    /// S5: Service image behavior (nginx reachable, redis ping, postgres readiness).
+    ServiceBehavior,
+    /// S6: Compose fixture validation (multi-service startup, connectivity).
+    ComposeFixture,
+}
+
+impl ScenarioKind {
+    /// Human-readable label for reporting.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::EntrypointCmd => "entrypoint-cmd",
+            Self::UserPermissions => "user-permissions",
+            Self::MountSemantics => "mount-semantics",
+            Self::SignalHandling => "signal-handling",
+            Self::ServiceBehavior => "service-behavior",
+            Self::ComposeFixture => "compose-fixture",
+        }
+    }
+}
+
+/// A single validation scenario to execute.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Scenario {
+    /// Unique scenario identifier (e.g., "s1-default-cmd").
+    pub id: String,
+    /// Category.
+    pub kind: ScenarioKind,
+    /// Human-readable description.
+    pub description: String,
+    /// Command to execute (overrides image default if set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+    /// Entrypoint override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<Vec<String>>,
+    /// Environment variables for the scenario.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub environment: HashMap<String, String>,
+    /// Working directory override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// User override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Expected outcome conditions.
+    pub expectations: Vec<Expectation>,
+}
+
+/// A condition that must be met for a scenario to pass.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum Expectation {
+    /// Process exits with a specific code.
+    #[serde(rename = "exit_code")]
+    ExitCode {
+        /// Expected exit code.
+        code: i32,
+    },
+    /// Stdout contains a specific substring.
+    #[serde(rename = "stdout_contains")]
+    StdoutContains {
+        /// Expected substring.
+        substring: String,
+    },
+    /// Stderr contains a specific substring.
+    #[serde(rename = "stderr_contains")]
+    StderrContains {
+        /// Expected substring.
+        substring: String,
+    },
+    /// Stdout matches a regex pattern.
+    #[serde(rename = "stdout_matches")]
+    StdoutMatches {
+        /// Regex pattern.
+        pattern: String,
+    },
+    /// The lifecycle sequence includes expected steps.
+    #[serde(rename = "lifecycle_sequence")]
+    LifecycleSequence {
+        /// Expected sequence of lifecycle events.
+        events: Vec<String>,
+    },
+}
+
+/// Build standard S1 scenarios for entrypoint/cmd resolution.
+pub fn s1_entrypoint_scenarios() -> Vec<Scenario> {
+    vec![
+        Scenario {
+            id: "s1-image-defaults".to_string(),
+            kind: ScenarioKind::EntrypointCmd,
+            description: "Run with image default entrypoint and cmd".to_string(),
+            command: None,
+            entrypoint: None,
+            environment: HashMap::new(),
+            working_dir: None,
+            user: None,
+            expectations: vec![Expectation::ExitCode { code: 0 }],
+        },
+        Scenario {
+            id: "s1-cmd-override".to_string(),
+            kind: ScenarioKind::EntrypointCmd,
+            description: "Override image CMD with explicit command".to_string(),
+            command: Some(vec![
+                "echo".to_string(),
+                "hello-from-override".to_string(),
+            ]),
+            entrypoint: None,
+            environment: HashMap::new(),
+            working_dir: None,
+            user: None,
+            expectations: vec![
+                Expectation::ExitCode { code: 0 },
+                Expectation::StdoutContains {
+                    substring: "hello-from-override".to_string(),
+                },
+            ],
+        },
+        Scenario {
+            id: "s1-entrypoint-override".to_string(),
+            kind: ScenarioKind::EntrypointCmd,
+            description: "Override both entrypoint and command".to_string(),
+            command: Some(vec!["world".to_string()]),
+            entrypoint: Some(vec!["echo".to_string()]),
+            environment: HashMap::new(),
+            working_dir: None,
+            user: None,
+            expectations: vec![
+                Expectation::ExitCode { code: 0 },
+                Expectation::StdoutContains {
+                    substring: "world".to_string(),
+                },
+            ],
+        },
+    ]
+}
+
+/// Build standard S2 scenarios for user/permissions.
+pub fn s2_user_scenarios() -> Vec<Scenario> {
+    vec![
+        Scenario {
+            id: "s2-default-user".to_string(),
+            kind: ScenarioKind::UserPermissions,
+            description: "Run as image default user".to_string(),
+            command: Some(vec!["id".to_string()]),
+            entrypoint: None,
+            environment: HashMap::new(),
+            working_dir: None,
+            user: None,
+            expectations: vec![Expectation::ExitCode { code: 0 }],
+        },
+        Scenario {
+            id: "s2-numeric-uid".to_string(),
+            kind: ScenarioKind::UserPermissions,
+            description: "Run as explicit numeric UID".to_string(),
+            command: Some(vec!["id".to_string(), "-u".to_string()]),
+            entrypoint: None,
+            environment: HashMap::new(),
+            working_dir: None,
+            user: Some("1000".to_string()),
+            expectations: vec![
+                Expectation::ExitCode { code: 0 },
+                Expectation::StdoutContains {
+                    substring: "1000".to_string(),
+                },
+            ],
+        },
+    ]
+}
+
+/// Build standard S4 scenarios for signal handling.
+pub fn s4_signal_scenarios() -> Vec<Scenario> {
+    vec![Scenario {
+        id: "s4-lifecycle-sequence".to_string(),
+        kind: ScenarioKind::SignalHandling,
+        description: "Verify create/start/stop/delete lifecycle".to_string(),
+        command: Some(vec!["sleep".to_string(), "infinity".to_string()]),
+        entrypoint: None,
+        environment: HashMap::new(),
+        working_dir: None,
+        user: None,
+        expectations: vec![Expectation::LifecycleSequence {
+            events: vec![
+                "create".to_string(),
+                "start".to_string(),
+                "stop".to_string(),
+                "delete".to_string(),
+            ],
+        }],
+    }]
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn scenario_kind_labels() {
+        assert_eq!(ScenarioKind::EntrypointCmd.label(), "entrypoint-cmd");
+        assert_eq!(ScenarioKind::UserPermissions.label(), "user-permissions");
+        assert_eq!(ScenarioKind::MountSemantics.label(), "mount-semantics");
+        assert_eq!(ScenarioKind::SignalHandling.label(), "signal-handling");
+        assert_eq!(ScenarioKind::ServiceBehavior.label(), "service-behavior");
+        assert_eq!(ScenarioKind::ComposeFixture.label(), "compose-fixture");
+    }
+
+    #[test]
+    fn scenario_round_trip() {
+        let scenario = &s1_entrypoint_scenarios()[1]; // s1-cmd-override
+        let json = serde_json::to_string(scenario).unwrap();
+        let deserialized: Scenario = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.id, scenario.id);
+        assert_eq!(deserialized.kind, scenario.kind);
+        assert_eq!(deserialized.expectations.len(), 2);
+    }
+
+    #[test]
+    fn expectation_variants_round_trip() {
+        let expectations = vec![
+            Expectation::ExitCode { code: 0 },
+            Expectation::StdoutContains {
+                substring: "hello".to_string(),
+            },
+            Expectation::StderrContains {
+                substring: "warn".to_string(),
+            },
+            Expectation::StdoutMatches {
+                pattern: r"uid=\d+".to_string(),
+            },
+            Expectation::LifecycleSequence {
+                events: vec!["create".to_string(), "start".to_string()],
+            },
+        ];
+        for exp in &expectations {
+            let json = serde_json::to_string(exp).unwrap();
+            let deserialized: Expectation = serde_json::from_str(&json).unwrap();
+            assert_eq!(&deserialized, exp);
+        }
+    }
+
+    #[test]
+    fn s1_scenarios_are_valid() {
+        let scenarios = s1_entrypoint_scenarios();
+        assert_eq!(scenarios.len(), 3);
+        assert!(scenarios.iter().all(|s| s.kind == ScenarioKind::EntrypointCmd));
+        assert!(scenarios.iter().all(|s| !s.expectations.is_empty()));
+    }
+
+    #[test]
+    fn s2_scenarios_are_valid() {
+        let scenarios = s2_user_scenarios();
+        assert_eq!(scenarios.len(), 2);
+        assert!(scenarios.iter().all(|s| s.kind == ScenarioKind::UserPermissions));
+    }
+
+    #[test]
+    fn s4_scenarios_are_valid() {
+        let scenarios = s4_signal_scenarios();
+        assert_eq!(scenarios.len(), 1);
+        assert!(scenarios[0].kind == ScenarioKind::SignalHandling);
+    }
+}
