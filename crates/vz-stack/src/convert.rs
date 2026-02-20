@@ -1,0 +1,507 @@
+//! Convert vz-stack [`ServiceSpec`] into vz-oci [`RunConfig`].
+//!
+//! This is the bridge between the stack control plane (typed specs) and
+//! the OCI runtime (container execution). Each field is mapped with
+//! explicit semantics documented per conversion function.
+
+use std::path::PathBuf;
+
+use crate::error::StackError;
+use crate::spec::{PortSpec, ResourcesSpec, ServiceSpec};
+use crate::volume::ResolvedMount;
+
+/// Convert a [`ServiceSpec`] into a vz-oci [`RunConfig`].
+///
+/// Mounts must be pre-resolved via [`crate::resolve_mounts`] because
+/// named volumes need a concrete host directory. Port mappings with
+/// `host_port: None` are assigned the container port as the host port
+/// (real allocation deferred to a later bead).
+pub fn service_to_run_config(
+    spec: &ServiceSpec,
+    resolved_mounts: &[ResolvedMount],
+) -> Result<vz_oci::RunConfig, StackError> {
+    let cmd = build_cmd(spec);
+    let env = convert_env(&spec.environment);
+    let ports = convert_ports(&spec.ports)?;
+    let mounts = convert_mounts(resolved_mounts);
+    let (cpus, memory_mb) = convert_resources(&spec.resources)?;
+
+    Ok(vz_oci::RunConfig {
+        cmd,
+        working_dir: spec.working_dir.clone(),
+        env,
+        user: spec.user.clone(),
+        ports,
+        mounts,
+        cpus,
+        memory_mb,
+        // Stack containers should have networking for inter-service communication.
+        network_enabled: Some(true),
+        // Use OCI runtime for full lifecycle (create → start → stop).
+        execution_mode: vz_oci::ExecutionMode::OciRuntime,
+        // Remaining fields use defaults; future beads may populate them.
+        ..Default::default()
+    })
+}
+
+/// Build the command vector from entrypoint and command overrides.
+///
+/// If both entrypoint and command are set, they are concatenated
+/// (entrypoint as the process, command as arguments) — matching
+/// Docker/OCI semantics.
+fn build_cmd(spec: &ServiceSpec) -> Vec<String> {
+    match (&spec.entrypoint, &spec.command) {
+        (Some(ep), Some(cmd)) => {
+            let mut full = ep.clone();
+            full.extend(cmd.iter().cloned());
+            full
+        }
+        (Some(ep), None) => ep.clone(),
+        (None, Some(cmd)) => cmd.clone(),
+        (None, None) => Vec::new(),
+    }
+}
+
+/// Convert a `HashMap<String, String>` environment into the
+/// `Vec<(String, String)>` format used by vz-oci.
+///
+/// Keys are sorted for deterministic output.
+fn convert_env(
+    env: &std::collections::HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs
+}
+
+/// Convert stack [`PortSpec`] entries to vz-oci [`PortMapping`] entries.
+///
+/// When `host_port` is `None`, the container port is used as the host
+/// port (a simple default; real dynamic allocation is a later bead).
+fn convert_ports(
+    ports: &[PortSpec],
+) -> Result<Vec<vz_oci::PortMapping>, StackError> {
+    let mut mappings = Vec::with_capacity(ports.len());
+    for port in ports {
+        let protocol = match port.protocol.as_str() {
+            "tcp" => vz_oci::PortProtocol::Tcp,
+            "udp" => vz_oci::PortProtocol::Udp,
+            other => {
+                return Err(StackError::InvalidSpec(format!(
+                    "unsupported port protocol '{other}'"
+                )));
+            }
+        };
+        mappings.push(vz_oci::PortMapping {
+            host: port.host_port.unwrap_or(port.container_port),
+            container: port.container_port,
+            protocol,
+        });
+    }
+    Ok(mappings)
+}
+
+/// Convert pre-resolved mounts into vz-oci [`MountSpec`] entries.
+fn convert_mounts(resolved: &[ResolvedMount]) -> Vec<vz_oci::MountSpec> {
+    resolved
+        .iter()
+        .map(|rm| {
+            let (mount_type, source) = match &rm.kind {
+                crate::volume::ResolvedMountKind::Bind => {
+                    (vz_oci::MountType::Bind, rm.host_path.clone())
+                }
+                crate::volume::ResolvedMountKind::Named { .. } => {
+                    (vz_oci::MountType::Bind, rm.host_path.clone())
+                }
+                crate::volume::ResolvedMountKind::Ephemeral => {
+                    (vz_oci::MountType::Tmpfs, None)
+                }
+            };
+
+            let access = if rm.read_only {
+                vz_oci::MountAccess::ReadOnly
+            } else {
+                vz_oci::MountAccess::ReadWrite
+            };
+
+            vz_oci::MountSpec {
+                source,
+                target: PathBuf::from(&rm.target),
+                mount_type,
+                access,
+            }
+        })
+        .collect()
+}
+
+/// Parse resource strings into typed values for vz-oci.
+///
+/// CPU: plain integer string → `u8` (e.g., "2" → 2).
+/// Memory: supports "m" (megabytes) and "g" (gigabytes) suffixes
+/// (e.g., "512m" → 512, "1g" → 1024).
+fn convert_resources(
+    resources: &ResourcesSpec,
+) -> Result<(Option<u8>, Option<u64>), StackError> {
+    let cpus = resources
+        .cpu
+        .as_deref()
+        .map(parse_cpu)
+        .transpose()?;
+
+    let memory_mb = resources
+        .memory
+        .as_deref()
+        .map(parse_memory_mb)
+        .transpose()?;
+
+    Ok((cpus, memory_mb))
+}
+
+/// Parse a CPU string ("1", "2", "4") into a `u8`.
+fn parse_cpu(s: &str) -> Result<u8, StackError> {
+    s.parse::<u8>().map_err(|_| {
+        StackError::InvalidSpec(format!(
+            "invalid cpu value '{s}': expected integer 1-255"
+        ))
+    })
+}
+
+/// Parse a memory string with suffix ("512m", "1g", "2048m") into MB.
+fn parse_memory_mb(s: &str) -> Result<u64, StackError> {
+    let s = s.trim().to_lowercase();
+    if let Some(num) = s.strip_suffix('g') {
+        let val: u64 = num.trim().parse().map_err(|_| {
+            StackError::InvalidSpec(format!("invalid memory value '{s}'"))
+        })?;
+        Ok(val * 1024)
+    } else if let Some(num) = s.strip_suffix('m') {
+        let val: u64 = num.trim().parse().map_err(|_| {
+            StackError::InvalidSpec(format!("invalid memory value '{s}'"))
+        })?;
+        Ok(val)
+    } else {
+        // Bare number treated as megabytes.
+        s.parse::<u64>().map_err(|_| {
+            StackError::InvalidSpec(format!(
+                "invalid memory value '{s}': expected number with 'm' or 'g' suffix"
+            ))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use crate::spec::{HealthCheckSpec, MountSpec as StackMountSpec, RestartPolicy};
+    use crate::volume::{ResolvedMount, ResolvedMountKind};
+    use std::collections::HashMap;
+
+    fn minimal_service() -> ServiceSpec {
+        ServiceSpec {
+            name: "web".to_string(),
+            image: "nginx:latest".to_string(),
+            command: None,
+            entrypoint: None,
+            environment: HashMap::new(),
+            working_dir: None,
+            user: None,
+            mounts: vec![],
+            ports: vec![],
+            depends_on: vec![],
+            healthcheck: None,
+            restart_policy: None,
+            resources: ResourcesSpec::default(),
+        }
+    }
+
+    #[test]
+    fn minimal_service_converts() {
+        let spec = minimal_service();
+        let config = service_to_run_config(&spec, &[]).unwrap();
+        assert!(config.cmd.is_empty());
+        assert!(config.env.is_empty());
+        assert!(config.ports.is_empty());
+        assert!(config.mounts.is_empty());
+        assert_eq!(config.working_dir, None);
+        assert_eq!(config.user, None);
+        assert_eq!(config.cpus, None);
+        assert_eq!(config.memory_mb, None);
+        assert_eq!(config.network_enabled, Some(true));
+        assert_eq!(config.execution_mode, vz_oci::ExecutionMode::OciRuntime);
+    }
+
+    #[test]
+    fn command_only() {
+        let mut spec = minimal_service();
+        spec.command = Some(vec!["echo".to_string(), "hello".to_string()]);
+        let config = service_to_run_config(&spec, &[]).unwrap();
+        assert_eq!(config.cmd, vec!["echo", "hello"]);
+    }
+
+    #[test]
+    fn entrypoint_only() {
+        let mut spec = minimal_service();
+        spec.entrypoint = Some(vec!["/bin/sh".to_string()]);
+        let config = service_to_run_config(&spec, &[]).unwrap();
+        assert_eq!(config.cmd, vec!["/bin/sh"]);
+    }
+
+    #[test]
+    fn entrypoint_plus_command() {
+        let mut spec = minimal_service();
+        spec.entrypoint = Some(vec!["/bin/sh".to_string(), "-c".to_string()]);
+        spec.command = Some(vec!["echo hi".to_string()]);
+        let config = service_to_run_config(&spec, &[]).unwrap();
+        assert_eq!(config.cmd, vec!["/bin/sh", "-c", "echo hi"]);
+    }
+
+    #[test]
+    fn environment_sorted() {
+        let mut spec = minimal_service();
+        spec.environment = HashMap::from([
+            ("ZZZ".to_string(), "last".to_string()),
+            ("AAA".to_string(), "first".to_string()),
+            ("MMM".to_string(), "middle".to_string()),
+        ]);
+        let config = service_to_run_config(&spec, &[]).unwrap();
+        assert_eq!(config.env[0], ("AAA".to_string(), "first".to_string()));
+        assert_eq!(config.env[1], ("MMM".to_string(), "middle".to_string()));
+        assert_eq!(config.env[2], ("ZZZ".to_string(), "last".to_string()));
+    }
+
+    #[test]
+    fn working_dir_and_user() {
+        let mut spec = minimal_service();
+        spec.working_dir = Some("/app".to_string());
+        spec.user = Some("1000:1000".to_string());
+        let config = service_to_run_config(&spec, &[]).unwrap();
+        assert_eq!(config.working_dir, Some("/app".to_string()));
+        assert_eq!(config.user, Some("1000:1000".to_string()));
+    }
+
+    #[test]
+    fn port_tcp_with_host() {
+        let mut spec = minimal_service();
+        spec.ports = vec![PortSpec {
+            protocol: "tcp".to_string(),
+            container_port: 80,
+            host_port: Some(8080),
+        }];
+        let config = service_to_run_config(&spec, &[]).unwrap();
+        assert_eq!(config.ports.len(), 1);
+        assert_eq!(config.ports[0].host, 8080);
+        assert_eq!(config.ports[0].container, 80);
+        assert_eq!(config.ports[0].protocol, vz_oci::PortProtocol::Tcp);
+    }
+
+    #[test]
+    fn port_udp() {
+        let mut spec = minimal_service();
+        spec.ports = vec![PortSpec {
+            protocol: "udp".to_string(),
+            container_port: 53,
+            host_port: Some(5353),
+        }];
+        let config = service_to_run_config(&spec, &[]).unwrap();
+        assert_eq!(config.ports[0].protocol, vz_oci::PortProtocol::Udp);
+    }
+
+    #[test]
+    fn port_no_host_defaults_to_container() {
+        let mut spec = minimal_service();
+        spec.ports = vec![PortSpec {
+            protocol: "tcp".to_string(),
+            container_port: 3000,
+            host_port: None,
+        }];
+        let config = service_to_run_config(&spec, &[]).unwrap();
+        assert_eq!(config.ports[0].host, 3000);
+    }
+
+    #[test]
+    fn port_invalid_protocol() {
+        let mut spec = minimal_service();
+        spec.ports = vec![PortSpec {
+            protocol: "sctp".to_string(),
+            container_port: 80,
+            host_port: Some(80),
+        }];
+        let err = service_to_run_config(&spec, &[]).unwrap_err();
+        assert!(matches!(err, StackError::InvalidSpec(_)));
+    }
+
+    #[test]
+    fn bind_mount_converts() {
+        let resolved = vec![ResolvedMount {
+            host_path: Some(PathBuf::from("/host/data")),
+            target: "/container/data".to_string(),
+            read_only: true,
+            kind: ResolvedMountKind::Bind,
+        }];
+        let spec = minimal_service();
+        let config = service_to_run_config(&spec, &resolved).unwrap();
+        assert_eq!(config.mounts.len(), 1);
+        assert_eq!(config.mounts[0].source, Some(PathBuf::from("/host/data")));
+        assert_eq!(config.mounts[0].target, PathBuf::from("/container/data"));
+        assert_eq!(config.mounts[0].mount_type, vz_oci::MountType::Bind);
+        assert_eq!(config.mounts[0].access, vz_oci::MountAccess::ReadOnly);
+    }
+
+    #[test]
+    fn named_volume_mount_converts_as_bind() {
+        let resolved = vec![ResolvedMount {
+            host_path: Some(PathBuf::from("/volumes/dbdata")),
+            target: "/var/lib/db".to_string(),
+            read_only: false,
+            kind: ResolvedMountKind::Named {
+                volume_name: "dbdata".to_string(),
+            },
+        }];
+        let spec = minimal_service();
+        let config = service_to_run_config(&spec, &resolved).unwrap();
+        assert_eq!(config.mounts[0].mount_type, vz_oci::MountType::Bind);
+        assert_eq!(config.mounts[0].access, vz_oci::MountAccess::ReadWrite);
+    }
+
+    #[test]
+    fn ephemeral_mount_converts_as_tmpfs() {
+        let resolved = vec![ResolvedMount {
+            host_path: None,
+            target: "/tmp".to_string(),
+            read_only: false,
+            kind: ResolvedMountKind::Ephemeral,
+        }];
+        let spec = minimal_service();
+        let config = service_to_run_config(&spec, &resolved).unwrap();
+        assert_eq!(config.mounts[0].mount_type, vz_oci::MountType::Tmpfs);
+        assert!(config.mounts[0].source.is_none());
+    }
+
+    #[test]
+    fn resources_cpu_and_memory() {
+        let mut spec = minimal_service();
+        spec.resources = ResourcesSpec {
+            cpu: Some("4".to_string()),
+            memory: Some("1g".to_string()),
+        };
+        let config = service_to_run_config(&spec, &[]).unwrap();
+        assert_eq!(config.cpus, Some(4));
+        assert_eq!(config.memory_mb, Some(1024));
+    }
+
+    #[test]
+    fn resources_memory_megabytes() {
+        let mut spec = minimal_service();
+        spec.resources = ResourcesSpec {
+            cpu: None,
+            memory: Some("512m".to_string()),
+        };
+        let config = service_to_run_config(&spec, &[]).unwrap();
+        assert_eq!(config.memory_mb, Some(512));
+    }
+
+    #[test]
+    fn resources_memory_bare_number() {
+        let mut spec = minimal_service();
+        spec.resources = ResourcesSpec {
+            cpu: None,
+            memory: Some("256".to_string()),
+        };
+        let config = service_to_run_config(&spec, &[]).unwrap();
+        assert_eq!(config.memory_mb, Some(256));
+    }
+
+    #[test]
+    fn resources_invalid_cpu() {
+        let mut spec = minimal_service();
+        spec.resources = ResourcesSpec {
+            cpu: Some("not-a-number".to_string()),
+            memory: None,
+        };
+        let err = service_to_run_config(&spec, &[]).unwrap_err();
+        assert!(matches!(err, StackError::InvalidSpec(_)));
+    }
+
+    #[test]
+    fn resources_invalid_memory() {
+        let mut spec = minimal_service();
+        spec.resources = ResourcesSpec {
+            cpu: None,
+            memory: Some("lots".to_string()),
+        };
+        let err = service_to_run_config(&spec, &[]).unwrap_err();
+        assert!(matches!(err, StackError::InvalidSpec(_)));
+    }
+
+    #[test]
+    fn full_service_converts() {
+        let spec = ServiceSpec {
+            name: "api".to_string(),
+            image: "myapp:latest".to_string(),
+            command: Some(vec!["serve".to_string()]),
+            entrypoint: Some(vec!["/app/bin".to_string()]),
+            environment: HashMap::from([
+                ("PORT".to_string(), "3000".to_string()),
+                ("ENV".to_string(), "production".to_string()),
+            ]),
+            working_dir: Some("/app".to_string()),
+            user: Some("node".to_string()),
+            mounts: vec![StackMountSpec::Bind {
+                source: "/host/config".to_string(),
+                target: "/config".to_string(),
+                read_only: true,
+            }],
+            ports: vec![
+                PortSpec {
+                    protocol: "tcp".to_string(),
+                    container_port: 3000,
+                    host_port: Some(3000),
+                },
+                PortSpec {
+                    protocol: "tcp".to_string(),
+                    container_port: 9090,
+                    host_port: None,
+                },
+            ],
+            depends_on: vec!["db".to_string()],
+            healthcheck: Some(HealthCheckSpec {
+                test: vec!["CMD".to_string(), "curl".to_string(), "localhost:3000".to_string()],
+                interval_secs: Some(30),
+                timeout_secs: Some(5),
+                retries: Some(3),
+                start_period_secs: Some(10),
+            }),
+            restart_policy: Some(RestartPolicy::Always),
+            resources: ResourcesSpec {
+                cpu: Some("2".to_string()),
+                memory: Some("1g".to_string()),
+            },
+        };
+
+        let resolved_mounts = vec![ResolvedMount {
+            host_path: Some(PathBuf::from("/host/config")),
+            target: "/config".to_string(),
+            read_only: true,
+            kind: ResolvedMountKind::Bind,
+        }];
+
+        let config = service_to_run_config(&spec, &resolved_mounts).unwrap();
+        assert_eq!(config.cmd, vec!["/app/bin", "serve"]);
+        assert_eq!(config.env.len(), 2);
+        assert_eq!(config.env[0], ("ENV".to_string(), "production".to_string()));
+        assert_eq!(config.env[1], ("PORT".to_string(), "3000".to_string()));
+        assert_eq!(config.working_dir, Some("/app".to_string()));
+        assert_eq!(config.user, Some("node".to_string()));
+        assert_eq!(config.ports.len(), 2);
+        assert_eq!(config.ports[0].host, 3000);
+        assert_eq!(config.ports[1].host, 9090); // defaults to container port
+        assert_eq!(config.mounts.len(), 1);
+        assert_eq!(config.cpus, Some(2));
+        assert_eq!(config.memory_mb, Some(1024));
+    }
+}

@@ -7,8 +7,10 @@
 #![forbid(unsafe_code)]
 
 mod compose;
+mod convert;
 mod error;
 mod events;
+mod executor;
 mod health;
 mod network;
 mod reconcile;
@@ -17,6 +19,8 @@ mod state_store;
 mod volume;
 
 pub use compose::parse_compose;
+pub use convert::service_to_run_config;
+pub use executor::{ContainerRuntime, ExecutionResult, StackExecutor};
 pub use error::StackError;
 pub use events::{EventRecord, StackEvent};
 pub use health::{DependencyCheck, HealthStatus, check_dependencies, is_service_ready};
@@ -31,6 +35,6 @@ pub use spec::{
 };
 pub use state_store::{ServiceObservedState, ServicePhase, StateStore};
 pub use volume::{
-    ResolvedMount, ResolvedMountKind, mounts_changed, orphaned_volumes, referenced_volume_names,
-    resolve_mounts,
+    ResolvedMount, ResolvedMountKind, VolumeManager, mounts_changed, orphaned_volumes,
+    referenced_volume_names, resolve_mounts,
 };

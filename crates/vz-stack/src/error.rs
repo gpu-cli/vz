@@ -33,4 +33,8 @@ pub enum StackError {
     /// Compose file validation failed.
     #[error("compose validation error: {0}")]
     ComposeValidation(String),
+
+    /// Filesystem operation failed (volume create/remove).
+    #[error("volume IO error: {0}")]
+    VolumeIo(#[from] std::io::Error),
 }

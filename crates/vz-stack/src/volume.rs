@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use crate::error::StackError;
 use crate::spec::{MountSpec, VolumeSpec};
@@ -124,6 +125,139 @@ pub fn orphaned_volumes(defined: &[VolumeSpec], referenced: &HashSet<String>) ->
         .filter(|v| !referenced.contains(&v.name))
         .map(|v| v.name.clone())
         .collect()
+}
+
+/// Manages on-disk volume directories for a stack.
+///
+/// Named volumes are stored as directories under a stack-scoped data dir:
+/// `<base_dir>/<stack_name>/volumes/<volume_name>/`.
+pub struct VolumeManager {
+    /// Root directory for this stack's volumes.
+    volumes_dir: PathBuf,
+}
+
+impl VolumeManager {
+    /// Create a new volume manager for the given stack data directory.
+    ///
+    /// The volumes subdirectory is `<stack_data_dir>/volumes/`.
+    pub fn new(stack_data_dir: &Path) -> Self {
+        Self {
+            volumes_dir: stack_data_dir.join("volumes"),
+        }
+    }
+
+    /// Root directory where volume subdirectories are stored.
+    pub fn volumes_dir(&self) -> &Path {
+        &self.volumes_dir
+    }
+
+    /// Ensure all named volumes have their directories created.
+    ///
+    /// Returns the list of volume names that were newly created.
+    pub fn ensure_volumes(
+        &self,
+        volumes: &[VolumeSpec],
+    ) -> Result<Vec<String>, StackError> {
+        let mut created = Vec::new();
+        for vol in volumes {
+            let dir = self.volumes_dir.join(&vol.name);
+            if !dir.exists() {
+                std::fs::create_dir_all(&dir)?;
+                info!(volume = %vol.name, path = %dir.display(), "created volume directory");
+                created.push(vol.name.clone());
+            }
+        }
+        Ok(created)
+    }
+
+    /// Ensure a single named volume directory exists.
+    ///
+    /// Returns `true` if the directory was newly created.
+    pub fn ensure_volume(&self, name: &str) -> Result<bool, StackError> {
+        let dir = self.volumes_dir.join(name);
+        if dir.exists() {
+            return Ok(false);
+        }
+        std::fs::create_dir_all(&dir)?;
+        info!(volume = %name, path = %dir.display(), "created volume directory");
+        Ok(true)
+    }
+
+    /// Remove a named volume directory and its contents.
+    ///
+    /// Returns `true` if the directory existed and was removed.
+    pub fn remove_volume(&self, name: &str) -> Result<bool, StackError> {
+        let dir = self.volumes_dir.join(name);
+        if !dir.exists() {
+            return Ok(false);
+        }
+        std::fs::remove_dir_all(&dir)?;
+        info!(volume = %name, path = %dir.display(), "removed volume directory");
+        Ok(true)
+    }
+
+    /// Remove all volumes that are orphaned (defined but not referenced).
+    ///
+    /// Returns the list of volume names that were removed.
+    pub fn remove_orphaned(
+        &self,
+        defined: &[VolumeSpec],
+        referenced: &HashSet<String>,
+    ) -> Result<Vec<String>, StackError> {
+        let orphans = orphaned_volumes(defined, referenced);
+        let mut removed = Vec::new();
+        for name in orphans {
+            if self.remove_volume(&name)? {
+                removed.push(name);
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Remove all volume directories for this stack.
+    ///
+    /// Returns the number of volume directories removed.
+    pub fn remove_all(&self) -> Result<usize, StackError> {
+        if !self.volumes_dir.exists() {
+            return Ok(0);
+        }
+        let mut count = 0;
+        for entry in std::fs::read_dir(&self.volumes_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(entry.path())?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// List all volume directories that currently exist on disk.
+    pub fn list_volumes(&self) -> Result<Vec<String>, StackError> {
+        if !self.volumes_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&self.volumes_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    /// Resolve mount specs using this manager's volumes directory.
+    pub fn resolve_mounts(
+        &self,
+        mounts: &[MountSpec],
+        volumes: &[VolumeSpec],
+    ) -> Result<Vec<ResolvedMount>, StackError> {
+        resolve_mounts(mounts, volumes, &self.volumes_dir)
+    }
 }
 
 #[cfg(test)]
@@ -357,5 +491,155 @@ mod tests {
             Some(PathBuf::from("/data/volumes/cache"))
         );
         assert_eq!(resolved[2].kind, ResolvedMountKind::Ephemeral);
+    }
+
+    // --- VolumeManager tests ---
+
+    fn test_volumes() -> Vec<VolumeSpec> {
+        vec![
+            VolumeSpec {
+                name: "dbdata".to_string(),
+                driver: "local".to_string(),
+                driver_opts: None,
+            },
+            VolumeSpec {
+                name: "cache".to_string(),
+                driver: "local".to_string(),
+                driver_opts: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn manager_ensure_creates_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = VolumeManager::new(tmp.path());
+
+        let created = mgr.ensure_volumes(&test_volumes()).unwrap();
+        assert_eq!(created.len(), 2);
+        assert!(created.contains(&"dbdata".to_string()));
+        assert!(created.contains(&"cache".to_string()));
+
+        // Directories exist on disk.
+        assert!(mgr.volumes_dir().join("dbdata").is_dir());
+        assert!(mgr.volumes_dir().join("cache").is_dir());
+    }
+
+    #[test]
+    fn manager_ensure_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = VolumeManager::new(tmp.path());
+
+        mgr.ensure_volumes(&test_volumes()).unwrap();
+        // Second call creates nothing.
+        let created = mgr.ensure_volumes(&test_volumes()).unwrap();
+        assert!(created.is_empty());
+    }
+
+    #[test]
+    fn manager_ensure_single_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = VolumeManager::new(tmp.path());
+
+        assert!(mgr.ensure_volume("mydata").unwrap());
+        assert!(mgr.volumes_dir().join("mydata").is_dir());
+        // Second call returns false.
+        assert!(!mgr.ensure_volume("mydata").unwrap());
+    }
+
+    #[test]
+    fn manager_remove_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = VolumeManager::new(tmp.path());
+
+        mgr.ensure_volume("mydata").unwrap();
+        assert!(mgr.remove_volume("mydata").unwrap());
+        assert!(!mgr.volumes_dir().join("mydata").exists());
+        // Removing non-existent returns false.
+        assert!(!mgr.remove_volume("mydata").unwrap());
+    }
+
+    #[test]
+    fn manager_remove_volume_with_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = VolumeManager::new(tmp.path());
+
+        mgr.ensure_volume("mydata").unwrap();
+        // Write a file inside the volume.
+        let file = mgr.volumes_dir().join("mydata").join("test.txt");
+        std::fs::write(&file, "hello").unwrap();
+        assert!(file.exists());
+
+        assert!(mgr.remove_volume("mydata").unwrap());
+        assert!(!mgr.volumes_dir().join("mydata").exists());
+    }
+
+    #[test]
+    fn manager_remove_orphaned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = VolumeManager::new(tmp.path());
+
+        mgr.ensure_volumes(&test_volumes()).unwrap();
+
+        // Only "dbdata" is referenced.
+        let referenced: HashSet<String> = ["dbdata".to_string()].into();
+        let removed = mgr.remove_orphaned(&test_volumes(), &referenced).unwrap();
+        assert_eq!(removed, vec!["cache".to_string()]);
+        assert!(mgr.volumes_dir().join("dbdata").is_dir());
+        assert!(!mgr.volumes_dir().join("cache").exists());
+    }
+
+    #[test]
+    fn manager_remove_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = VolumeManager::new(tmp.path());
+
+        mgr.ensure_volumes(&test_volumes()).unwrap();
+        let count = mgr.remove_all().unwrap();
+        assert_eq!(count, 2);
+        assert!(mgr.list_volumes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn manager_remove_all_when_none_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = VolumeManager::new(tmp.path());
+        assert_eq!(mgr.remove_all().unwrap(), 0);
+    }
+
+    #[test]
+    fn manager_list_volumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = VolumeManager::new(tmp.path());
+
+        mgr.ensure_volumes(&test_volumes()).unwrap();
+        let names = mgr.list_volumes().unwrap();
+        assert_eq!(names, vec!["cache", "dbdata"]); // sorted
+    }
+
+    #[test]
+    fn manager_list_empty_when_no_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = VolumeManager::new(tmp.path());
+        assert!(mgr.list_volumes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn manager_resolve_mounts_uses_volumes_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = VolumeManager::new(tmp.path());
+
+        let mounts = vec![MountSpec::Named {
+            source: "dbdata".to_string(),
+            target: "/var/lib/db".to_string(),
+            read_only: false,
+        }];
+
+        let resolved = mgr.resolve_mounts(&mounts, &test_volumes()).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].host_path,
+            Some(mgr.volumes_dir().join("dbdata"))
+        );
     }
 }
