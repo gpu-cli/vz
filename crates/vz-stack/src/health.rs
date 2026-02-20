@@ -4,11 +4,20 @@
 //! phase, health check configuration, and health check results.
 //! Provides dependency readiness checking so the reconciler can
 //! defer service creation until all dependencies are satisfied.
+//!
+//! The [`HealthPoller`] runs one health check cycle across all
+//! running services, updating observed state and emitting events.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
-use crate::spec::{HealthCheckSpec, ServiceSpec};
-use crate::state_store::{ServiceObservedState, ServicePhase};
+use tracing::{debug, info, warn};
+
+use crate::error::StackError;
+use crate::events::StackEvent;
+use crate::executor::ContainerRuntime;
+use crate::spec::{HealthCheckSpec, ServiceSpec, StackSpec};
+use crate::state_store::{ServiceObservedState, ServicePhase, StateStore};
 
 /// Result of checking whether a service's dependencies are satisfied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +164,244 @@ pub fn check_dependencies(
     } else {
         waiting_on.sort();
         DependencyCheck::Blocked { waiting_on }
+    }
+}
+
+/// Default health check interval when not specified (30s).
+const DEFAULT_INTERVAL_SECS: u64 = 30;
+/// Default health check retries threshold when not specified.
+const DEFAULT_RETRIES: u32 = 3;
+
+/// Polls health checks for running services in a stack.
+///
+/// Call [`poll_all`](HealthPoller::poll_all) periodically (at the
+/// smallest configured interval) to run one cycle of health checks.
+/// The poller respects `start_period_secs` grace periods and marks
+/// services as `Failed` when consecutive failures exceed the
+/// `retries` threshold.
+pub struct HealthPoller {
+    /// Health status per service name.
+    statuses: HashMap<String, HealthStatus>,
+    /// When each service was first observed as Running (for start_period grace).
+    start_times: HashMap<String, Instant>,
+}
+
+/// Result of a single health poll cycle.
+#[derive(Debug, Clone, Default)]
+pub struct HealthPollResult {
+    /// Services that became ready this cycle.
+    pub newly_ready: Vec<String>,
+    /// Services that exceeded retries and were marked failed.
+    pub newly_failed: Vec<String>,
+    /// Number of health checks executed.
+    pub checks_run: usize,
+}
+
+impl HealthPoller {
+    /// Create a new poller with no tracked state.
+    pub fn new() -> Self {
+        Self {
+            statuses: HashMap::new(),
+            start_times: HashMap::new(),
+        }
+    }
+
+    /// Access the current health statuses (keyed by service name).
+    pub fn statuses(&self) -> &HashMap<String, HealthStatus> {
+        &self.statuses
+    }
+
+    /// Compute the minimum poll interval across all health-checked
+    /// services in the spec, in seconds. Returns `None` if no
+    /// services have health checks.
+    pub fn min_interval(&self, spec: &StackSpec) -> Option<u64> {
+        spec.services
+            .iter()
+            .filter_map(|s| s.healthcheck.as_ref())
+            .map(|hc| hc.interval_secs.unwrap_or(DEFAULT_INTERVAL_SECS))
+            .min()
+    }
+
+    /// Run one health check cycle for all running services with
+    /// health checks.
+    ///
+    /// For each service that is Running and has a `HealthCheckSpec`:
+    /// - Skips if still within the `start_period_secs` grace window.
+    /// - Executes the health check command via `runtime.exec()`.
+    /// - Records pass/fail in [`HealthStatus`].
+    /// - On first pass: sets `observed.ready = true` and emits
+    ///   [`StackEvent::HealthCheckPassed`].
+    /// - On consecutive failures exceeding `retries`: marks service
+    ///   as `Failed` and emits [`StackEvent::HealthCheckFailed`].
+    pub fn poll_all<R: ContainerRuntime>(
+        &mut self,
+        runtime: &R,
+        store: &StateStore,
+        spec: &StackSpec,
+    ) -> Result<HealthPollResult, StackError> {
+        let observed = store.load_observed_state(&spec.name)?;
+        let observed_map: HashMap<&str, &ServiceObservedState> = observed
+            .iter()
+            .map(|o| (o.service_name.as_str(), o))
+            .collect();
+
+        let mut result = HealthPollResult::default();
+        let now = Instant::now();
+
+        for svc in &spec.services {
+            let Some(hc) = &svc.healthcheck else {
+                continue;
+            };
+
+            let Some(obs) = observed_map.get(svc.name.as_str()) else {
+                continue;
+            };
+
+            // Only check Running services.
+            if obs.phase != ServicePhase::Running {
+                continue;
+            }
+
+            let Some(ref container_id) = obs.container_id else {
+                continue;
+            };
+
+            // Track when we first saw this service running.
+            let start_time = *self
+                .start_times
+                .entry(svc.name.clone())
+                .or_insert(now);
+
+            // Respect start_period grace.
+            let start_period = hc.start_period_secs.unwrap_or(0);
+            let elapsed = now.duration_since(start_time).as_secs();
+            if elapsed < start_period {
+                debug!(
+                    service = %svc.name,
+                    remaining = start_period - elapsed,
+                    "within start period grace, skipping health check"
+                );
+                continue;
+            }
+
+            // Execute health check command.
+            let exit_code = match runtime.exec(container_id, &hc.test) {
+                Ok(code) => code,
+                Err(e) => {
+                    warn!(service = %svc.name, error = %e, "health check exec failed");
+                    // Treat exec errors as a failed check.
+                    1
+                }
+            };
+
+            let status = self
+                .statuses
+                .entry(svc.name.clone())
+                .or_insert_with(|| HealthStatus::new(&svc.name));
+
+            result.checks_run += 1;
+
+            if exit_code == 0 {
+                let was_ready = status.consecutive_passes >= 1;
+                status.record_pass();
+
+                if !was_ready {
+                    // First pass — mark ready.
+                    info!(service = %svc.name, "health check passed, service ready");
+                    store.save_observed_state(
+                        &spec.name,
+                        &ServiceObservedState {
+                            service_name: svc.name.clone(),
+                            phase: ServicePhase::Running,
+                            container_id: Some(container_id.clone()),
+                            last_error: None,
+                            ready: true,
+                        },
+                    )?;
+                    store.emit_event(
+                        &spec.name,
+                        &StackEvent::HealthCheckPassed {
+                            stack_name: spec.name.clone(),
+                            service_name: svc.name.clone(),
+                        },
+                    )?;
+                    result.newly_ready.push(svc.name.clone());
+                }
+            } else {
+                status.record_failure();
+
+                let retries = hc.retries.unwrap_or(DEFAULT_RETRIES);
+
+                if status.consecutive_failures >= retries {
+                    // Exceeded retries — mark failed.
+                    warn!(
+                        service = %svc.name,
+                        failures = status.consecutive_failures,
+                        retries,
+                        "health check retries exhausted, marking failed"
+                    );
+                    store.save_observed_state(
+                        &spec.name,
+                        &ServiceObservedState {
+                            service_name: svc.name.clone(),
+                            phase: ServicePhase::Failed,
+                            container_id: Some(container_id.clone()),
+                            last_error: Some(format!(
+                                "health check failed {} consecutive times",
+                                status.consecutive_failures
+                            )),
+                            ready: false,
+                        },
+                    )?;
+                    store.emit_event(
+                        &spec.name,
+                        &StackEvent::HealthCheckFailed {
+                            stack_name: spec.name.clone(),
+                            service_name: svc.name.clone(),
+                            attempt: status.consecutive_failures,
+                            error: format!("exit code {exit_code}"),
+                        },
+                    )?;
+                    result.newly_failed.push(svc.name.clone());
+                } else {
+                    store.emit_event(
+                        &spec.name,
+                        &StackEvent::HealthCheckFailed {
+                            stack_name: spec.name.clone(),
+                            service_name: svc.name.clone(),
+                            attempt: status.consecutive_failures,
+                            error: format!("exit code {exit_code}"),
+                        },
+                    )?;
+                    debug!(
+                        service = %svc.name,
+                        failures = status.consecutive_failures,
+                        retries,
+                        "health check failed, will retry"
+                    );
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Clear tracked state for a service (e.g., when it is removed).
+    pub fn clear(&mut self, service_name: &str) {
+        self.statuses.remove(service_name);
+        self.start_times.remove(service_name);
+    }
+
+    /// Clear all tracked state.
+    pub fn clear_all(&mut self) {
+        self.statuses.clear();
+        self.start_times.clear();
+    }
+}
+
+impl Default for HealthPoller {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -511,5 +758,256 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let deserialized: ServiceObservedState = serde_json::from_str(&json).unwrap();
         assert!(deserialized.ready);
+    }
+
+    // ── HealthPoller tests ──
+
+    use crate::executor::tests_support::MockContainerRuntime;
+    use crate::spec::StackSpec;
+
+    fn make_hc_spec(retries: Option<u32>) -> HealthCheckSpec {
+        HealthCheckSpec {
+            test: vec!["CMD".to_string(), "curl".to_string(), "localhost".to_string()],
+            interval_secs: Some(5),
+            timeout_secs: Some(3),
+            retries,
+            start_period_secs: None,
+        }
+    }
+
+    fn stack_with_hc(name: &str, services: Vec<ServiceSpec>) -> StackSpec {
+        StackSpec {
+            name: name.to_string(),
+            services,
+            networks: vec![],
+            volumes: vec![],
+        }
+    }
+
+    fn running_obs(name: &str, container_id: &str) -> ServiceObservedState {
+        ServiceObservedState {
+            service_name: name.to_string(),
+            phase: ServicePhase::Running,
+            container_id: Some(container_id.to_string()),
+            last_error: None,
+            ready: false,
+        }
+    }
+
+    #[test]
+    fn poller_pass_marks_service_ready() {
+        let runtime = MockContainerRuntime::new();
+        let store = StateStore::in_memory().unwrap();
+        let spec = stack_with_hc("app", vec![ServiceSpec {
+            healthcheck: Some(make_hc_spec(Some(3))),
+            ..svc("web")
+        }]);
+
+        store.save_observed_state("app", &running_obs("web", "ctr-1")).unwrap();
+
+        let mut poller = HealthPoller::new();
+        let result = poller.poll_all(&runtime, &store, &spec).unwrap();
+
+        assert_eq!(result.checks_run, 1);
+        assert_eq!(result.newly_ready, vec!["web".to_string()]);
+        assert!(result.newly_failed.is_empty());
+
+        // Observed state should have ready=true.
+        let observed = store.load_observed_state("app").unwrap();
+        let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+        assert!(web.ready);
+        assert_eq!(web.phase, ServicePhase::Running);
+
+        // Event emitted.
+        let events = store.load_events("app").unwrap();
+        assert!(events.iter().any(|e| matches!(e, StackEvent::HealthCheckPassed { .. })));
+    }
+
+    #[test]
+    fn poller_failure_emits_event_without_failing_service() {
+        let mut runtime = MockContainerRuntime::new();
+        runtime.exec_exit_code = 1;
+        let store = StateStore::in_memory().unwrap();
+        let spec = stack_with_hc("app", vec![ServiceSpec {
+            healthcheck: Some(make_hc_spec(Some(3))),
+            ..svc("web")
+        }]);
+
+        store.save_observed_state("app", &running_obs("web", "ctr-1")).unwrap();
+
+        let mut poller = HealthPoller::new();
+        let result = poller.poll_all(&runtime, &store, &spec).unwrap();
+
+        assert_eq!(result.checks_run, 1);
+        assert!(result.newly_ready.is_empty());
+        assert!(result.newly_failed.is_empty()); // Not yet at retries threshold.
+
+        // HealthCheckFailed event emitted.
+        let events = store.load_events("app").unwrap();
+        assert!(events.iter().any(|e| matches!(e, StackEvent::HealthCheckFailed { .. })));
+
+        // Service still Running.
+        let observed = store.load_observed_state("app").unwrap();
+        let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+        assert_eq!(web.phase, ServicePhase::Running);
+    }
+
+    #[test]
+    fn poller_retries_exhausted_marks_failed() {
+        let mut runtime = MockContainerRuntime::new();
+        runtime.exec_exit_code = 1;
+        let store = StateStore::in_memory().unwrap();
+        let spec = stack_with_hc("app", vec![ServiceSpec {
+            healthcheck: Some(make_hc_spec(Some(2))), // 2 retries
+            ..svc("web")
+        }]);
+
+        store.save_observed_state("app", &running_obs("web", "ctr-1")).unwrap();
+
+        let mut poller = HealthPoller::new();
+
+        // First failure — not yet at threshold.
+        let r1 = poller.poll_all(&runtime, &store, &spec).unwrap();
+        assert!(r1.newly_failed.is_empty());
+
+        // Second failure — hits retries=2 threshold.
+        let r2 = poller.poll_all(&runtime, &store, &spec).unwrap();
+        assert_eq!(r2.newly_failed, vec!["web".to_string()]);
+
+        // Service now Failed.
+        let observed = store.load_observed_state("app").unwrap();
+        let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+        assert_eq!(web.phase, ServicePhase::Failed);
+        assert!(web.last_error.as_ref().unwrap().contains("2 consecutive"));
+    }
+
+    #[test]
+    fn poller_skips_non_running_services() {
+        let runtime = MockContainerRuntime::new();
+        let store = StateStore::in_memory().unwrap();
+        let spec = stack_with_hc("app", vec![ServiceSpec {
+            healthcheck: Some(make_hc_spec(Some(3))),
+            ..svc("web")
+        }]);
+
+        // Service is Pending, not Running.
+        store.save_observed_state("app", &ServiceObservedState {
+            service_name: "web".to_string(),
+            phase: ServicePhase::Pending,
+            container_id: None,
+            last_error: None,
+            ready: false,
+        }).unwrap();
+
+        let mut poller = HealthPoller::new();
+        let result = poller.poll_all(&runtime, &store, &spec).unwrap();
+        assert_eq!(result.checks_run, 0);
+    }
+
+    #[test]
+    fn poller_skips_services_without_healthcheck() {
+        let runtime = MockContainerRuntime::new();
+        let store = StateStore::in_memory().unwrap();
+        // No healthcheck on the service.
+        let spec = stack_with_hc("app", vec![svc("web")]);
+
+        store.save_observed_state("app", &running_obs("web", "ctr-1")).unwrap();
+
+        let mut poller = HealthPoller::new();
+        let result = poller.poll_all(&runtime, &store, &spec).unwrap();
+        assert_eq!(result.checks_run, 0);
+    }
+
+    #[test]
+    fn poller_pass_after_failures_resets_and_becomes_ready() {
+        let mut runtime = MockContainerRuntime::new();
+        runtime.exec_exit_code = 1;
+        let store = StateStore::in_memory().unwrap();
+        let spec = stack_with_hc("app", vec![ServiceSpec {
+            healthcheck: Some(make_hc_spec(Some(5))),
+            ..svc("web")
+        }]);
+
+        store.save_observed_state("app", &running_obs("web", "ctr-1")).unwrap();
+
+        let mut poller = HealthPoller::new();
+
+        // Two failures.
+        poller.poll_all(&runtime, &store, &spec).unwrap();
+        poller.poll_all(&runtime, &store, &spec).unwrap();
+        assert_eq!(poller.statuses()["web"].consecutive_failures, 2);
+
+        // Now a pass.
+        runtime.exec_exit_code = 0;
+        let result = poller.poll_all(&runtime, &store, &spec).unwrap();
+        assert_eq!(result.newly_ready, vec!["web".to_string()]);
+        assert_eq!(poller.statuses()["web"].consecutive_passes, 1);
+        assert_eq!(poller.statuses()["web"].consecutive_failures, 0);
+    }
+
+    #[test]
+    fn poller_clear_removes_service_state() {
+        let mut poller = HealthPoller::new();
+        poller.statuses.insert("web".to_string(), HealthStatus::new("web"));
+        poller.start_times.insert("web".to_string(), Instant::now());
+
+        poller.clear("web");
+        assert!(poller.statuses().get("web").is_none());
+        assert!(poller.start_times.get("web").is_none());
+    }
+
+    #[test]
+    fn poller_min_interval_returns_smallest() {
+        let poller = HealthPoller::new();
+        let spec = stack_with_hc("app", vec![
+            ServiceSpec {
+                healthcheck: Some(HealthCheckSpec {
+                    test: vec!["CMD".to_string()],
+                    interval_secs: Some(30),
+                    timeout_secs: None,
+                    retries: None,
+                    start_period_secs: None,
+                }),
+                ..svc("slow")
+            },
+            ServiceSpec {
+                healthcheck: Some(HealthCheckSpec {
+                    test: vec!["CMD".to_string()],
+                    interval_secs: Some(5),
+                    timeout_secs: None,
+                    retries: None,
+                    start_period_secs: None,
+                }),
+                ..svc("fast")
+            },
+        ]);
+        assert_eq!(poller.min_interval(&spec), Some(5));
+    }
+
+    #[test]
+    fn poller_min_interval_none_when_no_healthchecks() {
+        let poller = HealthPoller::new();
+        let spec = stack_with_hc("app", vec![svc("web")]);
+        assert_eq!(poller.min_interval(&spec), None);
+    }
+
+    #[test]
+    fn poller_exec_error_treated_as_failure() {
+        let mut runtime = MockContainerRuntime::new();
+        runtime.fail_exec = true;
+        let store = StateStore::in_memory().unwrap();
+        let spec = stack_with_hc("app", vec![ServiceSpec {
+            healthcheck: Some(make_hc_spec(Some(3))),
+            ..svc("web")
+        }]);
+
+        store.save_observed_state("app", &running_obs("web", "ctr-1")).unwrap();
+
+        let mut poller = HealthPoller::new();
+        let result = poller.poll_all(&runtime, &store, &spec).unwrap();
+
+        assert_eq!(result.checks_run, 1);
+        assert!(result.newly_ready.is_empty());
+        assert_eq!(poller.statuses()["web"].consecutive_failures, 1);
     }
 }

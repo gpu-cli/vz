@@ -8,6 +8,7 @@
 //!
 //! State transitions and lifecycle events are persisted to the [`StateStore`].
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use tracing::{error, info};
@@ -15,6 +16,7 @@ use tracing::{error, info};
 use crate::convert::service_to_run_config;
 use crate::error::StackError;
 use crate::events::StackEvent;
+use crate::network::{PublishedPort, resolve_ports};
 use crate::reconcile::Action;
 use crate::spec::{ServiceSpec, StackSpec};
 use crate::state_store::{ServiceObservedState, ServicePhase, StateStore};
@@ -38,6 +40,68 @@ pub trait ContainerRuntime {
 
     /// Remove a stopped container and its resources.
     fn remove(&self, container_id: &str) -> Result<(), StackError>;
+
+    /// Execute a command inside a running container.
+    /// Returns the exit code (0 = success).
+    fn exec(&self, container_id: &str, command: &[String]) -> Result<i32, StackError>;
+}
+
+/// Tracks host port allocations across services within a stack.
+///
+/// Ensures no two services bind to the same host port and supports
+/// ephemeral port allocation for ports without an explicit host binding.
+pub struct PortTracker {
+    /// Allocated ports keyed by service name.
+    allocated: HashMap<String, Vec<PublishedPort>>,
+}
+
+impl PortTracker {
+    /// Create an empty tracker.
+    pub fn new() -> Self {
+        Self {
+            allocated: HashMap::new(),
+        }
+    }
+
+    /// All host ports currently allocated across all services.
+    pub fn in_use(&self) -> HashSet<u16> {
+        self.allocated
+            .values()
+            .flat_map(|ports| ports.iter().map(|p| p.host_port))
+            .collect()
+    }
+
+    /// Allocate ports for a service. Returns the resolved port mappings.
+    ///
+    /// Explicit host_ports are verified against currently allocated ports.
+    /// `None` host_ports get an ephemeral port assigned.
+    pub fn allocate(
+        &mut self,
+        service_name: &str,
+        ports: &[crate::spec::PortSpec],
+    ) -> Result<Vec<PublishedPort>, StackError> {
+        let in_use = self.in_use();
+        let resolved = resolve_ports(ports, &in_use)?;
+        self.allocated
+            .insert(service_name.to_string(), resolved.clone());
+        Ok(resolved)
+    }
+
+    /// Release all ports for a service.
+    pub fn release(&mut self, service_name: &str) {
+        self.allocated.remove(service_name);
+    }
+
+    /// Get the published ports for a service (if any).
+    pub fn ports_for(&self, service_name: &str) -> Option<&[PublishedPort]> {
+        self.allocated.get(service_name).map(|v| v.as_slice())
+    }
+}
+
+impl Default for PortTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Executes reconciler actions through an OCI container runtime.
@@ -45,6 +109,7 @@ pub struct StackExecutor<R: ContainerRuntime> {
     runtime: R,
     store: StateStore,
     volumes: VolumeManager,
+    ports: PortTracker,
 }
 
 /// Result of executing a batch of actions.
@@ -74,6 +139,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             runtime,
             store,
             volumes: VolumeManager::new(data_dir),
+            ports: PortTracker::new(),
         }
     }
 
@@ -87,13 +153,22 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         &self.volumes
     }
 
+    /// Access the port tracker.
+    pub fn ports(&self) -> &PortTracker {
+        &self.ports
+    }
+
     /// Execute a batch of reconciler actions for the given stack spec.
     ///
     /// Each action is processed in order. Failures on one service do not
     /// prevent other services from being processed; errors are collected
     /// and returned in [`ExecutionResult`].
+    ///
+    /// Port allocation is tracked across services: explicit host ports
+    /// are validated for conflicts, and `None` host ports get ephemeral
+    /// assignments. Ports are released on service removal.
     pub fn execute(
-        &self,
+        &mut self,
         spec: &StackSpec,
         actions: &[Action],
     ) -> Result<ExecutionResult, StackError> {
@@ -109,7 +184,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             )?;
         }
 
-        let service_map: std::collections::HashMap<&str, &ServiceSpec> = spec
+        let service_map: HashMap<&str, &ServiceSpec> = spec
             .services
             .iter()
             .map(|s| (s.name.as_str(), s))
@@ -157,11 +232,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         Ok(result)
     }
 
-    /// Execute a service create: pull image, convert spec, create container.
+    /// Execute a service create: pull image, convert spec, allocate ports, create container.
     fn execute_create(
-        &self,
+        &mut self,
         spec: &StackSpec,
-        service_map: &std::collections::HashMap<&str, &ServiceSpec>,
+        service_map: &HashMap<&str, &ServiceSpec>,
         service_name: &str,
     ) -> Result<(), StackError> {
         let svc_spec = service_map.get(service_name).ok_or_else(|| {
@@ -202,8 +277,44 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             .volumes
             .resolve_mounts(&svc_spec.mounts, &spec.volumes)?;
 
+        // Allocate ports (resolves ephemeral ports, checks conflicts).
+        let published = match self.ports.allocate(service_name, &svc_spec.ports) {
+            Ok(p) => p,
+            Err(e) => {
+                // Emit PortConflict event if allocation fails.
+                if let Some(first_port) = svc_spec.ports.first() {
+                    self.store.emit_event(
+                        &spec.name,
+                        &StackEvent::PortConflict {
+                            stack_name: spec.name.clone(),
+                            service_name: service_name.to_string(),
+                            port: first_port.host_port.unwrap_or(first_port.container_port),
+                        },
+                    )?;
+                }
+                self.mark_failed(spec, service_name, &e.to_string())?;
+                return Err(e);
+            }
+        };
+
         // Convert ServiceSpec → RunConfig.
-        let run_config = service_to_run_config(svc_spec, &resolved_mounts)?;
+        let mut run_config = service_to_run_config(svc_spec, &resolved_mounts)?;
+
+        // Override ports with resolved allocations.
+        run_config.ports = published
+            .iter()
+            .map(|p| {
+                let protocol = match p.protocol.as_str() {
+                    "udp" => vz_oci::PortProtocol::Udp,
+                    _ => vz_oci::PortProtocol::Tcp,
+                };
+                vz_oci::PortMapping {
+                    host: p.host_port,
+                    container: p.container_port,
+                    protocol,
+                }
+            })
+            .collect();
 
         // Create and start container.
         info!(service = %service_name, image = %svc_spec.image, "creating container");
@@ -240,9 +351,9 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         Ok(())
     }
 
-    /// Execute a service removal: stop + remove container, update state.
+    /// Execute a service removal: stop + remove container, release ports, update state.
     fn execute_remove(
-        &self,
+        &mut self,
         spec: &StackSpec,
         service_name: &str,
     ) -> Result<(), StackError> {
@@ -274,6 +385,9 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 error!(service = %service_name, error = %e, "failed to remove container");
             }
         }
+
+        // Release allocated ports.
+        self.ports.release(service_name);
 
         // Update state to Stopped.
         self.store.save_observed_state(
@@ -331,90 +445,110 @@ impl<R: ContainerRuntime> StackExecutor<R> {
     }
 }
 
-/// Mock container runtime for testing.
-///
-/// Records all operations and can be configured to fail specific calls.
+/// Test support: mock container runtime shared across test modules.
 #[cfg(test)]
-pub(crate) struct MockContainerRuntime {
-    /// Container IDs to return on create calls (cycled).
-    pub container_ids: Vec<String>,
-    /// Whether pull should fail.
-    pub fail_pull: bool,
-    /// Whether create should fail.
-    pub fail_create: bool,
-    /// Whether stop should fail.
-    pub fail_stop: bool,
-    /// Tracks calls: (operation, arg).
-    pub calls: std::cell::RefCell<Vec<(String, String)>>,
-    /// Counter for create calls (to cycle through container_ids).
-    create_counter: std::cell::Cell<usize>,
-}
+pub(crate) mod tests_support {
+    use super::*;
 
-#[cfg(test)]
-impl MockContainerRuntime {
-    fn new() -> Self {
-        Self {
-            container_ids: vec!["ctr-001".to_string()],
-            fail_pull: false,
-            fail_create: false,
-            fail_stop: false,
-            calls: std::cell::RefCell::new(Vec::new()),
-            create_counter: std::cell::Cell::new(0),
+    /// Mock container runtime for testing.
+    ///
+    /// Records all operations and can be configured to fail specific calls.
+    pub struct MockContainerRuntime {
+        /// Container IDs to return on create calls (cycled).
+        pub container_ids: Vec<String>,
+        /// Whether pull should fail.
+        pub fail_pull: bool,
+        /// Whether create should fail.
+        pub fail_create: bool,
+        /// Whether stop should fail.
+        pub fail_stop: bool,
+        /// Exit code to return from exec calls.
+        pub exec_exit_code: i32,
+        /// Whether exec should fail with an error (not just non-zero exit).
+        pub fail_exec: bool,
+        /// Tracks calls: (operation, arg).
+        pub calls: std::cell::RefCell<Vec<(String, String)>>,
+        /// Counter for create calls (to cycle through container_ids).
+        create_counter: std::cell::Cell<usize>,
+    }
+
+    impl MockContainerRuntime {
+        pub fn new() -> Self {
+            Self {
+                container_ids: vec!["ctr-001".to_string()],
+                fail_pull: false,
+                fail_create: false,
+                fail_stop: false,
+                exec_exit_code: 0,
+                fail_exec: false,
+                calls: std::cell::RefCell::new(Vec::new()),
+                create_counter: std::cell::Cell::new(0),
+            }
+        }
+
+        pub fn with_ids(ids: Vec<&str>) -> Self {
+            Self {
+                container_ids: ids.into_iter().map(String::from).collect(),
+                ..Self::new()
+            }
+        }
+
+        pub fn call_log(&self) -> Vec<(String, String)> {
+            self.calls.borrow().clone()
         }
     }
 
-    fn with_ids(ids: Vec<&str>) -> Self {
-        Self {
-            container_ids: ids.into_iter().map(String::from).collect(),
-            ..Self::new()
+    impl ContainerRuntime for MockContainerRuntime {
+        fn pull(&self, image: &str) -> Result<String, StackError> {
+            self.calls
+                .borrow_mut()
+                .push(("pull".to_string(), image.to_string()));
+            if self.fail_pull {
+                return Err(StackError::InvalidSpec("mock pull failure".to_string()));
+            }
+            Ok(format!("sha256:{image}"))
         }
-    }
 
-    fn call_log(&self) -> Vec<(String, String)> {
-        self.calls.borrow().clone()
-    }
-}
-
-#[cfg(test)]
-impl ContainerRuntime for MockContainerRuntime {
-    fn pull(&self, image: &str) -> Result<String, StackError> {
-        self.calls
-            .borrow_mut()
-            .push(("pull".to_string(), image.to_string()));
-        if self.fail_pull {
-            return Err(StackError::InvalidSpec("mock pull failure".to_string()));
+        fn create(&self, image: &str, _config: vz_oci::RunConfig) -> Result<String, StackError> {
+            self.calls
+                .borrow_mut()
+                .push(("create".to_string(), image.to_string()));
+            if self.fail_create {
+                return Err(StackError::InvalidSpec("mock create failure".to_string()));
+            }
+            let idx = self.create_counter.get();
+            let id = self.container_ids[idx % self.container_ids.len()].clone();
+            self.create_counter.set(idx + 1);
+            Ok(id)
         }
-        Ok(format!("sha256:{image}"))
-    }
 
-    fn create(&self, image: &str, _config: vz_oci::RunConfig) -> Result<String, StackError> {
-        self.calls
-            .borrow_mut()
-            .push(("create".to_string(), image.to_string()));
-        if self.fail_create {
-            return Err(StackError::InvalidSpec("mock create failure".to_string()));
+        fn stop(&self, container_id: &str) -> Result<(), StackError> {
+            self.calls
+                .borrow_mut()
+                .push(("stop".to_string(), container_id.to_string()));
+            if self.fail_stop {
+                return Err(StackError::InvalidSpec("mock stop failure".to_string()));
+            }
+            Ok(())
         }
-        let idx = self.create_counter.get();
-        let id = self.container_ids[idx % self.container_ids.len()].clone();
-        self.create_counter.set(idx + 1);
-        Ok(id)
-    }
 
-    fn stop(&self, container_id: &str) -> Result<(), StackError> {
-        self.calls
-            .borrow_mut()
-            .push(("stop".to_string(), container_id.to_string()));
-        if self.fail_stop {
-            return Err(StackError::InvalidSpec("mock stop failure".to_string()));
+        fn remove(&self, container_id: &str) -> Result<(), StackError> {
+            self.calls
+                .borrow_mut()
+                .push(("remove".to_string(), container_id.to_string()));
+            Ok(())
         }
-        Ok(())
-    }
 
-    fn remove(&self, container_id: &str) -> Result<(), StackError> {
-        self.calls
-            .borrow_mut()
-            .push(("remove".to_string(), container_id.to_string()));
-        Ok(())
+        fn exec(&self, container_id: &str, command: &[String]) -> Result<i32, StackError> {
+            self.calls.borrow_mut().push((
+                "exec".to_string(),
+                format!("{container_id}:{}", command.join(" ")),
+            ));
+            if self.fail_exec {
+                return Err(StackError::InvalidSpec("mock exec failure".to_string()));
+            }
+            Ok(self.exec_exit_code)
+        }
     }
 }
 
@@ -423,6 +557,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use super::tests_support::MockContainerRuntime;
     use crate::spec::{PortSpec, ResourcesSpec, StackSpec, VolumeSpec};
     use crate::spec::MountSpec as StackMountSpec;
     use std::collections::HashMap;
@@ -471,7 +606,7 @@ mod tests {
     #[test]
     fn create_single_service() {
         let runtime = MockContainerRuntime::new();
-        let executor = make_executor(runtime);
+        let mut executor = make_executor(runtime);
         let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
 
         let actions = vec![Action::ServiceCreate {
@@ -498,7 +633,7 @@ mod tests {
     #[test]
     fn create_multiple_services() {
         let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-db"]);
-        let executor = make_executor(runtime);
+        let mut executor = make_executor(runtime);
         let spec = stack(
             "myapp",
             vec![svc("web", "nginx:latest"), svc("db", "postgres:16")],
@@ -524,7 +659,7 @@ mod tests {
     #[test]
     fn remove_service() {
         let runtime = MockContainerRuntime::new();
-        let executor = make_executor(runtime);
+        let mut executor = make_executor(runtime);
         let spec = stack("myapp", vec![]);
 
         // Simulate existing running container.
@@ -564,7 +699,7 @@ mod tests {
     #[test]
     fn recreate_service() {
         let runtime = MockContainerRuntime::with_ids(vec!["ctr-new"]);
-        let executor = make_executor(runtime);
+        let mut executor = make_executor(runtime);
         let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
 
         // Simulate existing running container.
@@ -605,7 +740,7 @@ mod tests {
     fn pull_failure_marks_service_failed() {
         let mut runtime = MockContainerRuntime::new();
         runtime.fail_pull = true;
-        let executor = make_executor(runtime);
+        let mut executor = make_executor(runtime);
         let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
 
         let actions = vec![Action::ServiceCreate {
@@ -631,7 +766,7 @@ mod tests {
     fn create_failure_marks_service_failed() {
         let mut runtime = MockContainerRuntime::new();
         runtime.fail_create = true;
-        let executor = make_executor(runtime);
+        let mut executor = make_executor(runtime);
         let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
 
         let actions = vec![Action::ServiceCreate {
@@ -651,7 +786,7 @@ mod tests {
         let mut runtime = MockContainerRuntime::with_ids(vec!["ctr-db"]);
         runtime.fail_pull = false;
         runtime.fail_create = false;
-        let executor = make_executor(runtime);
+        let mut executor = make_executor(runtime);
 
         let spec = stack(
             "myapp",
@@ -677,7 +812,7 @@ mod tests {
     #[test]
     fn remove_with_no_container_id() {
         let runtime = MockContainerRuntime::new();
-        let executor = make_executor(runtime);
+        let mut executor = make_executor(runtime);
         let spec = stack("myapp", vec![]);
 
         // Service observed but no container_id.
@@ -711,7 +846,7 @@ mod tests {
     fn volumes_created_before_containers() {
         let runtime = MockContainerRuntime::new();
         let tmp = tempfile::tempdir().unwrap();
-        let executor = make_executor_with_dir(runtime, tmp.path());
+        let mut executor = make_executor_with_dir(runtime, tmp.path());
 
         let spec = StackSpec {
             name: "myapp".to_string(),
@@ -749,7 +884,7 @@ mod tests {
     #[test]
     fn service_with_ports_creates_correctly() {
         let runtime = MockContainerRuntime::new();
-        let executor = make_executor(runtime);
+        let mut executor = make_executor(runtime);
 
         let spec = stack(
             "myapp",
@@ -779,7 +914,7 @@ mod tests {
     fn stop_failure_does_not_prevent_state_update() {
         let mut runtime = MockContainerRuntime::new();
         runtime.fail_stop = true;
-        let executor = make_executor(runtime);
+        let mut executor = make_executor(runtime);
         let spec = stack("myapp", vec![]);
 
         executor
@@ -814,7 +949,7 @@ mod tests {
     fn execution_result_errors_collected() {
         let mut runtime = MockContainerRuntime::new();
         runtime.fail_pull = true;
-        let executor = make_executor(runtime);
+        let mut executor = make_executor(runtime);
 
         let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
 
@@ -826,5 +961,214 @@ mod tests {
         assert_eq!(result.errors.len(), 1);
         assert_eq!(result.errors[0].0, "web");
         assert!(result.errors[0].1.contains("mock pull failure"));
+    }
+
+    // ── Port tracking tests ──
+
+    #[test]
+    fn port_tracker_allocates_explicit_port() {
+        let mut tracker = PortTracker::new();
+        let ports = vec![PortSpec {
+            protocol: "tcp".to_string(),
+            container_port: 80,
+            host_port: Some(8080),
+        }];
+        let published = tracker.allocate("web", &ports).unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].host_port, 8080);
+        assert_eq!(published[0].container_port, 80);
+        assert!(tracker.in_use().contains(&8080));
+    }
+
+    #[test]
+    fn port_tracker_allocates_ephemeral_port() {
+        let mut tracker = PortTracker::new();
+        let ports = vec![PortSpec {
+            protocol: "tcp".to_string(),
+            container_port: 3000,
+            host_port: None,
+        }];
+        let published = tracker.allocate("api", &ports).unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].container_port, 3000);
+        // Ephemeral port should be assigned.
+        assert!(published[0].host_port > 0);
+        assert!(tracker.in_use().contains(&published[0].host_port));
+    }
+
+    #[test]
+    fn port_tracker_detects_cross_service_conflict() {
+        let mut tracker = PortTracker::new();
+        let ports_a = vec![PortSpec {
+            protocol: "tcp".to_string(),
+            container_port: 80,
+            host_port: Some(8080),
+        }];
+        tracker.allocate("web", &ports_a).unwrap();
+
+        // Second service trying the same host port should fail.
+        let ports_b = vec![PortSpec {
+            protocol: "tcp".to_string(),
+            container_port: 3000,
+            host_port: Some(8080),
+        }];
+        let result = tracker.allocate("api", &ports_b);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn port_tracker_release_frees_port() {
+        let mut tracker = PortTracker::new();
+        let ports = vec![PortSpec {
+            protocol: "tcp".to_string(),
+            container_port: 80,
+            host_port: Some(9090),
+        }];
+        tracker.allocate("web", &ports).unwrap();
+        assert!(tracker.in_use().contains(&9090));
+
+        tracker.release("web");
+        assert!(!tracker.in_use().contains(&9090));
+        assert!(tracker.ports_for("web").is_none());
+    }
+
+    #[test]
+    fn port_tracker_reuse_after_release() {
+        let mut tracker = PortTracker::new();
+        let ports = vec![PortSpec {
+            protocol: "tcp".to_string(),
+            container_port: 80,
+            host_port: Some(9090),
+        }];
+        tracker.allocate("web", &ports).unwrap();
+        tracker.release("web");
+
+        // Another service can now use the same port.
+        let ports2 = vec![PortSpec {
+            protocol: "tcp".to_string(),
+            container_port: 3000,
+            host_port: Some(9090),
+        }];
+        let published = tracker.allocate("api", &ports2).unwrap();
+        assert_eq!(published[0].host_port, 9090);
+    }
+
+    #[test]
+    fn executor_tracks_ports_on_create() {
+        let runtime = MockContainerRuntime::new();
+        let mut executor = make_executor(runtime);
+
+        let spec = stack(
+            "myapp",
+            vec![ServiceSpec {
+                ports: vec![PortSpec {
+                    protocol: "tcp".to_string(),
+                    container_port: 80,
+                    host_port: Some(8080),
+                }],
+                ..svc("web", "nginx:latest")
+            }],
+        );
+
+        let actions = vec![Action::ServiceCreate {
+            service_name: "web".to_string(),
+        }];
+
+        let result = executor.execute(&spec, &actions).unwrap();
+        assert!(result.all_succeeded());
+
+        // Ports should be tracked.
+        let ports = executor.ports().ports_for("web").unwrap();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].host_port, 8080);
+    }
+
+    #[test]
+    fn executor_releases_ports_on_remove() {
+        let runtime = MockContainerRuntime::new();
+        let mut executor = make_executor(runtime);
+
+        let spec = stack(
+            "myapp",
+            vec![ServiceSpec {
+                ports: vec![PortSpec {
+                    protocol: "tcp".to_string(),
+                    container_port: 80,
+                    host_port: Some(8080),
+                }],
+                ..svc("web", "nginx:latest")
+            }],
+        );
+
+        // Create first.
+        let create_actions = vec![Action::ServiceCreate {
+            service_name: "web".to_string(),
+        }];
+        executor.execute(&spec, &create_actions).unwrap();
+        assert!(executor.ports().ports_for("web").is_some());
+
+        // Remove should release ports.
+        let remove_actions = vec![Action::ServiceRemove {
+            service_name: "web".to_string(),
+        }];
+        let result = executor.execute(&spec, &remove_actions).unwrap();
+        assert!(result.all_succeeded());
+        assert!(executor.ports().ports_for("web").is_none());
+        assert!(executor.ports().in_use().is_empty());
+    }
+
+    #[test]
+    fn executor_port_conflict_emits_event() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-api"]);
+        let mut executor = make_executor(runtime);
+
+        let spec = stack(
+            "myapp",
+            vec![
+                ServiceSpec {
+                    ports: vec![PortSpec {
+                        protocol: "tcp".to_string(),
+                        container_port: 80,
+                        host_port: Some(8080),
+                    }],
+                    ..svc("web", "nginx:latest")
+                },
+                ServiceSpec {
+                    ports: vec![PortSpec {
+                        protocol: "tcp".to_string(),
+                        container_port: 3000,
+                        host_port: Some(8080), // conflict with web
+                    }],
+                    ..svc("api", "node:20")
+                },
+            ],
+        );
+
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "api".to_string(),
+            },
+        ];
+
+        let result = executor.execute(&spec, &actions).unwrap();
+        assert_eq!(result.succeeded, 1); // web succeeds
+        assert_eq!(result.failed, 1); // api fails (port conflict)
+
+        // PortConflict event emitted.
+        let events = executor.store().load_events("myapp").unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StackEvent::PortConflict { .. })));
+
+        // api should be marked Failed.
+        let observed = executor.store().load_observed_state("myapp").unwrap();
+        let api = observed
+            .iter()
+            .find(|o| o.service_name == "api")
+            .unwrap();
+        assert_eq!(api.phase, ServicePhase::Failed);
     }
 }

@@ -14,21 +14,26 @@ mod executor;
 mod health;
 mod network;
 mod reconcile;
+mod restart;
 mod spec;
 mod state_store;
 mod volume;
 
 pub use compose::parse_compose;
 pub use convert::service_to_run_config;
-pub use executor::{ContainerRuntime, ExecutionResult, StackExecutor};
+pub use executor::{ContainerRuntime, ExecutionResult, PortTracker, StackExecutor};
 pub use error::StackError;
 pub use events::{EventRecord, StackEvent};
-pub use health::{DependencyCheck, HealthStatus, check_dependencies, is_service_ready};
+pub use health::{
+    DependencyCheck, HealthPollResult, HealthPoller, HealthStatus, check_dependencies,
+    is_service_ready,
+};
 pub use network::{
     GvproxyBackend, GvproxyConfig, NetworkBackend, NetworkHandle, PortConflict, PublishedPort,
     detect_port_conflicts, locate_gvproxy, ports_changed, resolve_ports,
 };
 pub use reconcile::{Action, ApplyResult, DeferredService, apply};
+pub use restart::{RestartTracker, compute_restarts};
 pub use spec::{
     HealthCheckSpec, MountSpec, NetworkSpec, PortSpec, ResourcesSpec, RestartPolicy, ServiceSpec,
     StackSpec, VolumeSpec,
