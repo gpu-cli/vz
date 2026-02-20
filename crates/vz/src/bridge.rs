@@ -454,37 +454,47 @@ pub(crate) fn build_objc_config(
         unsafe { vz_config.setDirectorySharingDevices(&fs_array) };
     }
 
-    // Optional serial console log output
-    if let Some(serial_log_file) = &config.serial_log_file {
-        if let Some(parent) = serial_log_file.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                VzError::InvalidConfig(format!(
-                    "failed to create serial log directory {}: {e}",
-                    parent.display()
-                ))
-            })?;
-        }
+    // Serial console: always configure a serial port so the kernel's `console=hvc0`
+    // has a working device. Without this, the kernel/initramfs blocks on console writes
+    // and the guest agent never starts. When no log file is specified, write to /dev/null.
+    {
+        let file_handle = if let Some(serial_log_file) = &config.serial_log_file {
+            if let Some(parent) = serial_log_file.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    VzError::InvalidConfig(format!(
+                        "failed to create serial log directory {}: {e}",
+                        parent.display()
+                    ))
+                })?;
+            }
 
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(serial_log_file)
-            .map_err(|e| {
-                VzError::InvalidConfig(format!(
-                    "failed to create serial log file {}: {e}",
-                    serial_log_file.display()
-                ))
-            })?;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(serial_log_file)
+                .map_err(|e| {
+                    VzError::InvalidConfig(format!(
+                        "failed to create serial log file {}: {e}",
+                        serial_log_file.display()
+                    ))
+                })?;
 
-        let serial_path = NSString::from_str(&serial_log_file.to_string_lossy());
-        let file_handle =
+            let serial_path = NSString::from_str(&serial_log_file.to_string_lossy());
             NSFileHandle::fileHandleForWritingAtPath(&serial_path).ok_or_else(|| {
                 VzError::InvalidConfig(format!(
                     "failed to open serial log file handle at {}",
                     serial_log_file.display()
                 ))
-            })?;
+            })?
+        } else {
+            let dev_null = NSString::from_str("/dev/null");
+            NSFileHandle::fileHandleForWritingAtPath(&dev_null).ok_or_else(|| {
+                VzError::InvalidConfig(
+                    "failed to open /dev/null for serial port".to_string(),
+                )
+            })?
+        };
 
         // SAFETY: attachment is created from a valid writable file handle.
         let attachment = unsafe {

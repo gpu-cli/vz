@@ -40,7 +40,7 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const OCI_RUNTIME_BIN_SHARE_TAG: &str = "oci-runtime-bin";
 const OCI_DEFAULT_GUEST_STATE_DIR: &str = "/run/vz-oci";
 const OCI_BUNDLE_DIRNAME: &str = "bundles";
-const OCI_GUEST_ROOT_PATH: &str = "/";
+const OCI_GUEST_ROOT_PATH: &str = "/run/vz-oci/base-rootfs";
 
 /// Unified runtime entrypoint.
 #[derive(Clone)]
@@ -587,7 +587,11 @@ impl Runtime {
         let bundle_guest_root = oci_bundle_guest_root(self.config.guest_state_dir.as_deref())?;
         let bundle_guest_path = oci_bundle_guest_path(&bundle_guest_root, &container_id);
         let bundle_host_dir = oci_bundle_host_dir(&rootfs_dir, &bundle_guest_path);
-        let bundle_cmd = init_process.unwrap_or_else(|| cmd.clone());
+        // OCI lifecycle: create → start → exec → delete.
+        // The init process must be long-lived so the container stays running for exec.
+        // If no explicit init process is set, use `sleep infinity` as the default.
+        let bundle_cmd = init_process
+            .unwrap_or_else(|| vec!["sleep".into(), "infinity".into()]);
 
         let bundle_mounts = mount_specs_to_bundle_mounts(&mounts)?;
 
