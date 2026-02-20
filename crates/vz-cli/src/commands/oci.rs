@@ -9,7 +9,7 @@ use std::fmt;
 use tokio::time::sleep;
 use tracing::info;
 
-use vz_oci::{PortMapping, PortProtocol, RunConfig};
+use vz_oci::{MountAccess, MountSpec, MountType, PortMapping, PortProtocol, RunConfig};
 
 const DETACH_START_TIMEOUT: Duration = Duration::from_secs(12);
 const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -53,7 +53,7 @@ pub enum OciCommand {
     Pull(PullArgs),
 
     /// Run a container from an OCI image.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
 
     /// List cached OCI images.
     Images,
@@ -153,6 +153,10 @@ pub struct RunArgs {
     #[arg(long, hide = true)]
     pub internal_container_id: Option<String>,
 
+    /// Bind mount a host directory into the container (`SOURCE:TARGET[:ro]`).
+    #[arg(long = "volume", value_name = "SOURCE:TARGET[:ro]")]
+    pub volume: Vec<String>,
+
     /// Execution strategy for workload startup.
     #[arg(long, default_value_t = ExecutionModeArg::GuestExec)]
     pub execution_mode: ExecutionModeArg,
@@ -180,12 +184,12 @@ pub async fn run(args: OciArgs) -> anyhow::Result<()> {
 
     match args.action {
         OciCommand::Pull(args) => pull_image(&runtime, args).await,
-        OciCommand::Run(args) => run_image(runtime, args).await,
+        OciCommand::Run(args) => run_image(runtime, *args).await,
         OciCommand::Images => list_images(&runtime),
         OciCommand::Prune => prune_images(&runtime),
         OciCommand::Ps => list_containers(&runtime),
-        OciCommand::Stop(args) => stop_container(&runtime, args),
-        OciCommand::Rm(args) => remove_container(&runtime, args),
+        OciCommand::Stop(args) => stop_container(&runtime, args).await,
+        OciCommand::Rm(args) => remove_container(&runtime, args).await,
     }
 }
 
@@ -376,8 +380,8 @@ fn list_containers(runtime: &vz_oci::Runtime) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn stop_container(runtime: &vz_oci::Runtime, args: StopArgs) -> anyhow::Result<()> {
-    let container = runtime.stop_container(&args.id, args.force)?;
+async fn stop_container(runtime: &vz_oci::Runtime, args: StopArgs) -> anyhow::Result<()> {
+    let container = runtime.stop_container(&args.id, args.force).await?;
     match container.status {
         vz_oci::ContainerStatus::Running => {
             println!("Container {} remains running", args.id);
@@ -393,8 +397,8 @@ fn stop_container(runtime: &vz_oci::Runtime, args: StopArgs) -> anyhow::Result<(
     Ok(())
 }
 
-fn remove_container(runtime: &vz_oci::Runtime, args: RmArgs) -> anyhow::Result<()> {
-    runtime.remove_container(&args.id)?;
+async fn remove_container(runtime: &vz_oci::Runtime, args: RmArgs) -> anyhow::Result<()> {
+    runtime.remove_container(&args.id).await?;
     println!("Removed container {id}", id = args.id);
     Ok(())
 }
@@ -402,6 +406,7 @@ fn remove_container(runtime: &vz_oci::Runtime, args: RmArgs) -> anyhow::Result<(
 fn build_run_config(args: &RunArgs) -> anyhow::Result<RunConfig> {
     let env = parse_env_vars(&args.env)?;
     let ports = parse_port_mappings(&args.publish)?;
+    let mounts = parse_volume_mounts(&args.volume)?;
 
     let network_enabled = if args.no_network { Some(false) } else { None };
     let timeout = args.timeout_secs.map(Duration::from_secs);
@@ -412,6 +417,7 @@ fn build_run_config(args: &RunArgs) -> anyhow::Result<RunConfig> {
         env,
         user: args.user.clone(),
         ports,
+        mounts,
         cpus: args.cpus,
         memory_mb: args.memory_mb,
         network_enabled,
@@ -419,6 +425,8 @@ fn build_run_config(args: &RunArgs) -> anyhow::Result<RunConfig> {
         execution_mode: args.execution_mode.into(),
         timeout,
         container_id: args.internal_container_id.clone(),
+        init_process: None,
+        oci_annotations: Vec::new(),
     })
 }
 
@@ -503,6 +511,49 @@ fn parse_port_mapping(spec: &str) -> anyhow::Result<PortMapping> {
     })
 }
 
+fn parse_volume_mounts(specs: &[String]) -> anyhow::Result<Vec<MountSpec>> {
+    let mut mounts = Vec::with_capacity(specs.len());
+    for spec in specs {
+        mounts.push(parse_volume_mount(spec)?);
+    }
+    Ok(mounts)
+}
+
+fn parse_volume_mount(spec: &str) -> anyhow::Result<MountSpec> {
+    let parts: Vec<&str> = spec.split(':').collect();
+
+    let (source, target, access) = match parts.len() {
+        2 => (parts[0], parts[1], MountAccess::ReadWrite),
+        3 => {
+            let access = match parts[2] {
+                "ro" => MountAccess::ReadOnly,
+                "rw" => MountAccess::ReadWrite,
+                other => anyhow::bail!(
+                    "invalid --volume access mode '{other}' in '{spec}', expected 'ro' or 'rw'"
+                ),
+            };
+            (parts[0], parts[1], access)
+        }
+        _ => anyhow::bail!(
+            "invalid --volume value '{spec}', expected SOURCE:TARGET or SOURCE:TARGET:ro"
+        ),
+    };
+
+    if source.is_empty() {
+        anyhow::bail!("invalid --volume value '{spec}', source path must not be empty");
+    }
+    if target.is_empty() || !target.starts_with('/') {
+        anyhow::bail!("invalid --volume value '{spec}', target must be an absolute path");
+    }
+
+    Ok(MountSpec {
+        source: Some(PathBuf::from(source)),
+        target: PathBuf::from(target),
+        mount_type: MountType::Bind,
+        access,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,6 +597,7 @@ mod tests {
             command: vec!["echo".to_string(), "hello".to_string()],
             env: vec![],
             publish: vec![],
+            volume: vec![],
             workdir: None,
             user: None,
             cpus: None,
@@ -561,5 +613,52 @@ mod tests {
 
         let run_config = build_run_config(&args).expect("run config should build");
         assert_eq!(run_config.container_id, Some("container-123".to_string()));
+    }
+
+    #[test]
+    fn parse_volume_mount_bind_rw() {
+        let mount = parse_volume_mount("/host/path:/container/path").unwrap();
+        assert_eq!(mount.source, Some(PathBuf::from("/host/path")));
+        assert_eq!(mount.target, PathBuf::from("/container/path"));
+        assert_eq!(mount.mount_type, MountType::Bind);
+        assert_eq!(mount.access, MountAccess::ReadWrite);
+    }
+
+    #[test]
+    fn parse_volume_mount_bind_ro() {
+        let mount = parse_volume_mount("/host/path:/container/path:ro").unwrap();
+        assert_eq!(mount.source, Some(PathBuf::from("/host/path")));
+        assert_eq!(mount.target, PathBuf::from("/container/path"));
+        assert_eq!(mount.access, MountAccess::ReadOnly);
+    }
+
+    #[test]
+    fn parse_volume_mount_bind_explicit_rw() {
+        let mount = parse_volume_mount("/src:/dst:rw").unwrap();
+        assert_eq!(mount.access, MountAccess::ReadWrite);
+    }
+
+    #[test]
+    fn parse_volume_mount_rejects_relative_target() {
+        let result = parse_volume_mount("/host:relative");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_volume_mount_rejects_empty_source() {
+        let result = parse_volume_mount(":/container/path");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_volume_mount_rejects_invalid_access_mode() {
+        let result = parse_volume_mount("/host:/container:wx");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_volume_mount_rejects_bare_path() {
+        let result = parse_volume_mount("/just/one/path");
+        assert!(result.is_err());
     }
 }

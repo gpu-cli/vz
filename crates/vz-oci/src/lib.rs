@@ -12,8 +12,8 @@ mod runtime;
 mod store;
 
 pub use config::{
-    Auth, ExecutionMode, OciRuntimeKind, PortMapping, PortProtocol, RunConfig, RuntimeBackend,
-    RuntimeConfig,
+    Auth, ExecutionMode, MountAccess, MountSpec, MountType, OciRuntimeKind, PortMapping,
+    PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig,
 };
 pub use container_store::{ContainerInfo, ContainerStatus, ContainerStore};
 pub use error::OciError;

@@ -124,6 +124,39 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// Mount type for container volume bindings.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum MountType {
+    /// Bind mount from host to container.
+    #[default]
+    Bind,
+    /// Ephemeral tmpfs mount inside the container.
+    Tmpfs,
+}
+
+/// Access mode for container mounts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MountAccess {
+    /// Read-write access (default).
+    #[default]
+    ReadWrite,
+    /// Read-only access.
+    ReadOnly,
+}
+
+/// A volume/bind mount specification for a container run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountSpec {
+    /// Host source path (required for bind mounts, ignored for tmpfs).
+    pub source: Option<PathBuf>,
+    /// Container destination path (absolute).
+    pub target: PathBuf,
+    /// Mount type.
+    pub mount_type: MountType,
+    /// Access mode.
+    pub access: MountAccess,
+}
+
 /// Per-run options for a Linux rootfs-backed container VM.
 #[derive(Debug, Clone, Default)]
 pub struct RunConfig {
@@ -137,6 +170,8 @@ pub struct RunConfig {
     pub user: Option<String>,
     /// Host-to-container port mappings.
     pub ports: Vec<PortMapping>,
+    /// Volume/bind mount specifications.
+    pub mounts: Vec<MountSpec>,
     /// Optional CPU override.
     pub cpus: Option<u8>,
     /// Optional memory override in MB.
