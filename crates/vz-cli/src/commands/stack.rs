@@ -13,8 +13,9 @@ use clap::{Args, Subcommand};
 use tracing::info;
 
 use vz_stack::{
-    ApplyResult, ContainerRuntime, EventRecord, ExecutionResult, ServiceObservedState,
-    ServicePhase, StackError, StackEvent, StackExecutor, StackSpec, StateStore, parse_compose,
+    ApplyResult, ContainerRuntime, EventRecord, ExecutionResult, OrchestrationConfig, RoundReport,
+    ServiceObservedState, ServicePhase, StackError, StackEvent, StackExecutor, StackOrchestrator,
+    StackSpec, StateStore, parse_compose,
 };
 
 /// Manage multi-service stacks from Compose files.
@@ -56,6 +57,11 @@ pub struct UpArgs {
     /// Show planned actions without executing them.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Start services and return immediately without waiting for
+    /// health checks to converge.
+    #[arg(short, long)]
+    pub detach: bool,
 }
 
 #[derive(Args, Debug)]
@@ -193,16 +199,13 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
         .with_context(|| format!("failed to read compose file: {}", args.file.display()))?;
 
     let stack_name = resolve_stack_name(args.name.as_deref(), &args.file)?;
-    let spec = parse_compose(&yaml, &stack_name)
-        .with_context(|| "failed to parse compose file")?;
+    let spec = parse_compose(&yaml, &stack_name).with_context(|| "failed to parse compose file")?;
 
     let state_dir = resolve_state_dir(args.state_dir.as_deref(), &spec.name)?;
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("failed to create state directory: {}", state_dir.display()))?;
 
     let db_path = state_dir.join("state.db");
-    let store = StateStore::open(&db_path)
-        .with_context(|| format!("failed to open state store: {}", db_path.display()))?;
 
     info!(
         stack = %spec.name,
@@ -210,40 +213,91 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
         "applying stack"
     );
 
-    let health_statuses = HashMap::new();
-    let result = vz_stack::apply(&spec, &store, &health_statuses)
-        .with_context(|| "stack apply failed")?;
-
-    print_apply_result(&result);
-
-    if result.actions.is_empty() {
-        return Ok(());
-    }
-
     if args.dry_run {
+        let store = StateStore::open(&db_path)
+            .with_context(|| format!("failed to open state store: {}", db_path.display()))?;
+        let health_statuses = HashMap::new();
+        let result = vz_stack::apply(&spec, &store, &health_statuses)
+            .with_context(|| "stack apply failed")?;
+        print_apply_result(&result);
         println!("\n--dry-run: skipping execution");
         return Ok(());
     }
 
-    // Execute actions through the OCI runtime.
-    let oci_runtime = OciContainerRuntime::new(&state_dir)
-        .with_context(|| "failed to initialize OCI runtime")?;
+    // Set up runtime, executor, and orchestrator.
+    let oci_runtime =
+        OciContainerRuntime::new(&state_dir).with_context(|| "failed to initialize OCI runtime")?;
 
-    let exec_store = StateStore::open(&db_path)
-        .with_context(|| "failed to open execution state store")?;
+    let exec_store =
+        StateStore::open(&db_path).with_context(|| "failed to open execution state store")?;
+    let reconcile_store =
+        StateStore::open(&db_path).with_context(|| "failed to open reconciliation state store")?;
 
-    let mut executor = StackExecutor::new(oci_runtime, exec_store, &state_dir);
-    let exec_result = executor
-        .execute(&spec, &result.actions)
-        .with_context(|| "execution failed")?;
+    let executor = StackExecutor::new(oci_runtime, exec_store, &state_dir);
 
-    print_execution_result(&exec_result);
-
-    if !exec_result.all_succeeded() {
-        bail!(
-            "{} action(s) failed",
-            exec_result.failed,
+    if args.detach {
+        // Detach mode: single apply+execute pass, return immediately.
+        let mut orchestrator = StackOrchestrator::new(
+            executor,
+            reconcile_store,
+            OrchestrationConfig {
+                max_rounds: 1,
+                ..Default::default()
+            },
         );
+
+        let result = orchestrator
+            .run(
+                &spec,
+                Some(&mut |report: &RoundReport| {
+                    if let Some(ref apply) = report.apply_result.actions.first() {
+                        let _ = apply; // suppress unused warning
+                        print_apply_result(&report.apply_result);
+                    }
+                    if let Some(ref exec) = report.exec_result {
+                        print_execution_result(exec);
+                    }
+                }),
+            )
+            .with_context(|| "stack up failed")?;
+
+        println!(
+            "\nDetached: {} ready, {} failed.",
+            result.services_ready, result.services_failed
+        );
+    } else {
+        // Foreground mode: full orchestration loop until convergence.
+        let mut orchestrator =
+            StackOrchestrator::new(executor, reconcile_store, OrchestrationConfig::default());
+
+        let result = orchestrator
+            .run(
+                &spec,
+                Some(&mut |report: &RoundReport| {
+                    print_round_report(report);
+                }),
+            )
+            .with_context(|| "stack orchestration failed")?;
+
+        if result.converged {
+            println!(
+                "\nStack converged in {} round(s): {} ready, {} failed.",
+                result.rounds, result.services_ready, result.services_failed
+            );
+        } else {
+            println!(
+                "\nStack did not converge after {} rounds: {} ready, {} failed.",
+                result.rounds, result.services_ready, result.services_failed
+            );
+        }
+
+        if result.services_failed > 0 {
+            bail!("{} service(s) failed", result.services_failed);
+        }
+
+        if !result.converged {
+            bail!("stack did not converge");
+        }
     }
 
     Ok(())
@@ -259,8 +313,7 @@ async fn cmd_down(args: DownArgs) -> anyhow::Result<()> {
         bail!("no state found for stack `{}`", args.name);
     }
 
-    let store = StateStore::open(&db_path)
-        .with_context(|| "failed to open state store")?;
+    let store = StateStore::open(&db_path).with_context(|| "failed to open state store")?;
 
     // Load current desired state to get the stack name, then apply empty spec.
     let current = store
@@ -298,11 +351,11 @@ async fn cmd_down(args: DownArgs) -> anyhow::Result<()> {
     }
 
     // Execute removal actions through the OCI runtime.
-    let oci_runtime = OciContainerRuntime::new(&state_dir)
-        .with_context(|| "failed to initialize OCI runtime")?;
+    let oci_runtime =
+        OciContainerRuntime::new(&state_dir).with_context(|| "failed to initialize OCI runtime")?;
 
-    let exec_store = StateStore::open(&db_path)
-        .with_context(|| "failed to open execution state store")?;
+    let exec_store =
+        StateStore::open(&db_path).with_context(|| "failed to open execution state store")?;
 
     let mut executor = StackExecutor::new(oci_runtime, exec_store, &state_dir);
     let exec_result = executor
@@ -324,8 +377,7 @@ async fn cmd_ps(args: PsArgs) -> anyhow::Result<()> {
         bail!("no state found for stack `{}`", args.name);
     }
 
-    let store = StateStore::open(&db_path)
-        .with_context(|| "failed to open state store")?;
+    let store = StateStore::open(&db_path).with_context(|| "failed to open state store")?;
 
     let observed = store
         .load_observed_state(&args.name)
@@ -352,8 +404,7 @@ async fn cmd_events(args: EventsArgs) -> anyhow::Result<()> {
         bail!("no state found for stack `{}`", args.name);
     }
 
-    let store = StateStore::open(&db_path)
-        .with_context(|| "failed to open state store")?;
+    let store = StateStore::open(&db_path).with_context(|| "failed to open state store")?;
 
     let records = if args.since > 0 {
         store
@@ -381,7 +432,10 @@ async fn cmd_events(args: EventsArgs) -> anyhow::Result<()> {
 // ── Helpers ────────────────────────────────────────────────────────
 
 /// Resolve the stack name from explicit flag or parent directory of compose file.
-fn resolve_stack_name(explicit: Option<&str>, compose_path: &std::path::Path) -> anyhow::Result<String> {
+fn resolve_stack_name(
+    explicit: Option<&str>,
+    compose_path: &std::path::Path,
+) -> anyhow::Result<String> {
     if let Some(name) = explicit {
         return Ok(name.to_string());
     }
@@ -397,14 +451,48 @@ fn resolve_stack_name(explicit: Option<&str>, compose_path: &std::path::Path) ->
 }
 
 /// Resolve the state directory for a stack.
-fn resolve_state_dir(explicit: Option<&std::path::Path>, stack_name: &str) -> anyhow::Result<PathBuf> {
+fn resolve_state_dir(
+    explicit: Option<&std::path::Path>,
+    stack_name: &str,
+) -> anyhow::Result<PathBuf> {
     if let Some(dir) = explicit {
         return Ok(dir.to_path_buf());
     }
 
     // Default: ~/.vz/stacks/<stack_name>/
     let home = std::env::var("HOME").with_context(|| "HOME not set")?;
-    Ok(PathBuf::from(home).join(".vz").join("stacks").join(stack_name))
+    Ok(PathBuf::from(home)
+        .join(".vz")
+        .join("stacks")
+        .join(stack_name))
+}
+
+fn print_round_report(report: &RoundReport) {
+    if !report.apply_result.actions.is_empty() {
+        print_apply_result(&report.apply_result);
+    }
+
+    if let Some(ref exec) = report.exec_result {
+        print_execution_result(exec);
+    }
+
+    if let Some(ref health) = report.health_result {
+        for name in &health.newly_ready {
+            println!("  health ok  {name}");
+        }
+        for name in &health.newly_failed {
+            println!("  health fail  {name}");
+        }
+    }
+
+    if report.services_pending > 0 {
+        println!(
+            "  [{}/{} ready, {} pending]",
+            report.services_ready,
+            report.services_ready + report.services_pending + report.services_failed,
+            report.services_pending
+        );
+    }
 }
 
 fn print_apply_result(result: &ApplyResult) {
@@ -458,10 +546,7 @@ fn print_ps_table(observed: &[ServiceObservedState]) {
     }
 
     // Header.
-    println!(
-        "{:<20} {:<14} {:<40}",
-        "SERVICE", "STATUS", "CONTAINER ID"
-    );
+    println!("{:<20} {:<14} {:<40}", "SERVICE", "STATUS", "CONTAINER ID");
     println!("{}", "-".repeat(74));
 
     for svc in observed {
@@ -485,18 +570,12 @@ fn print_events_table(records: &[EventRecord]) {
         return;
     }
 
-    println!(
-        "{:>6}  {:<24} EVENT",
-        "ID", "TIME"
-    );
+    println!("{:>6}  {:<24} EVENT", "ID", "TIME");
     println!("{}", "-".repeat(72));
 
     for record in records {
         let summary = format_event_summary(&record.event);
-        println!(
-            "{:>6}  {:<24} {}",
-            record.id, record.created_at, summary
-        );
+        println!("{:>6}  {:<24} {}", record.id, record.created_at, summary);
     }
 }
 
@@ -532,9 +611,7 @@ fn format_event_summary(event: &StackEvent) -> String {
             ..
         } => format!("failed: {service_name}: {error}"),
         StackEvent::PortConflict {
-            service_name,
-            port,
-            ..
+            service_name, port, ..
         } => format!("port conflict: {service_name} port {port}"),
         StackEvent::VolumeCreated { volume_name, .. } => {
             format!("volume created: {volume_name}")
@@ -570,8 +647,7 @@ mod tests {
 
     #[test]
     fn resolve_stack_name_explicit() {
-        let name =
-            resolve_stack_name(Some("myapp"), &PathBuf::from("compose.yaml")).unwrap();
+        let name = resolve_stack_name(Some("myapp"), &PathBuf::from("compose.yaml")).unwrap();
         assert_eq!(name, "myapp");
     }
 

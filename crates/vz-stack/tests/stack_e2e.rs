@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use vz_oci::{ExecConfig, RuntimeConfig};
 use vz_stack::{
-    Action, ContainerRuntime, StackError, StackEvent, StackExecutor, StateStore, apply,
-    parse_compose,
+    Action, ContainerRuntime, OrchestrationConfig, StackError, StackEvent, StackExecutor,
+    StackOrchestrator, StateStore, apply, parse_compose,
 };
 
 /// Bridge the async `vz_oci::Runtime` to the sync `ContainerRuntime` trait.
@@ -175,7 +175,10 @@ services:
         .iter()
         .filter(|e| matches!(e, StackEvent::ServiceReady { .. }))
         .count();
-    assert!(creating_count >= 2, "should have at least 2 creating events");
+    assert!(
+        creating_count >= 2,
+        "should have at least 2 creating events"
+    );
     assert!(ready_count >= 2, "should have at least 2 ready events");
 
     // Exec a command inside the worker container to prove it's alive.
@@ -188,10 +191,7 @@ services:
         .unwrap();
     let exit_code = executor
         .runtime()
-        .exec(
-            worker_id,
-            &["echo".into(), "stack-e2e".into()],
-        )
+        .exec(worker_id, &["echo".into(), "stack-e2e".into()])
         .unwrap();
     assert_eq!(exit_code, 0, "exec inside worker should succeed");
 
@@ -256,4 +256,76 @@ services:
         service_name: "app".into(),
     }];
     executor.execute(&spec, &down).unwrap();
+}
+
+/// Exercise the orchestration loop: deploy 2 services through the
+/// StackOrchestrator and verify convergence with real OCI containers.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn orchestrator_converges_two_services() {
+    let yaml = r#"
+services:
+  db:
+    image: alpine:latest
+    command: ["sleep", "300"]
+
+  api:
+    image: alpine:latest
+    command: ["sleep", "300"]
+    depends_on:
+      - db
+"#;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("state.db");
+    let oci_data = tmp.path().join("oci-data");
+    std::fs::create_dir_all(&oci_data).unwrap();
+
+    let spec = parse_compose(yaml, "orch-test").unwrap();
+
+    let bridge = OciContainerRuntime::new(&oci_data);
+    let exec_store = StateStore::open(&db_path).unwrap();
+    let reconcile_store = StateStore::open(&db_path).unwrap();
+    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+
+    let mut orchestrator =
+        StackOrchestrator::new(executor, reconcile_store, OrchestrationConfig::default());
+
+    let result = orchestrator.run(&spec, None).unwrap();
+
+    assert!(result.converged, "stack should converge");
+    assert_eq!(result.services_ready, 2, "both services should be ready");
+    assert_eq!(result.services_failed, 0, "no services should fail");
+    assert_eq!(
+        result.rounds, 1,
+        "should converge in 1 round without health checks"
+    );
+
+    // Verify observed state through the executor's store.
+    let observed = orchestrator
+        .executor()
+        .store()
+        .load_observed_state("orch-test")
+        .unwrap();
+    assert_eq!(observed.len(), 2);
+    for name in &["db", "api"] {
+        let svc = observed
+            .iter()
+            .find(|o| o.service_name == *name)
+            .unwrap_or_else(|| panic!("service '{name}' should be in observed state"));
+        assert!(
+            svc.container_id.is_some(),
+            "service '{name}' should have a container ID"
+        );
+    }
+
+    // Teardown through the orchestrator's executor.
+    let down_spec = vz_stack::StackSpec {
+        name: "orch-test".to_string(),
+        services: vec![],
+        networks: vec![],
+        volumes: vec![],
+    };
+    let down_result = orchestrator.run(&down_spec, None).unwrap();
+    assert!(down_result.converged);
 }
