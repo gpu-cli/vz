@@ -16,4 +16,21 @@ pub enum StackError {
     /// Network backend operation failed.
     #[error("network error: {0}")]
     Network(String),
+
+    /// Compose YAML parsing failed.
+    #[error("compose parse error: {0}")]
+    ComposeParse(String),
+
+    /// Compose file uses an unsupported feature.
+    #[error("unsupported compose feature `{feature}`: {reason}")]
+    ComposeUnsupportedFeature {
+        /// The unsupported key or feature name.
+        feature: String,
+        /// Actionable message explaining why and what to do instead.
+        reason: String,
+    },
+
+    /// Compose file validation failed.
+    #[error("compose validation error: {0}")]
+    ComposeValidation(String),
 }

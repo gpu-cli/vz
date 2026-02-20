@@ -1,0 +1,1962 @@
+//! Compose YAML subset importer.
+//!
+//! Parses a Docker Compose YAML file into a typed [`StackSpec`],
+//! accepting only the feature subset defined in the v1 compliance
+//! contract. Unsupported keys are rejected with stable error codes
+//! before any reconciliation starts.
+
+use std::collections::HashMap;
+
+use serde_yml::Value;
+
+use crate::error::StackError;
+use crate::spec::{
+    HealthCheckSpec, MountSpec, PortSpec, ResourcesSpec, RestartPolicy, ServiceSpec, StackSpec,
+    VolumeSpec,
+};
+
+// ── Accepted key sets ──────────────────────────────────────────────
+
+/// Top-level keys allowed in the Compose file.
+const ACCEPTED_TOP_LEVEL: &[&str] = &["version", "name", "services", "volumes"];
+
+/// Service-level keys allowed inside `services.<name>`.
+const ACCEPTED_SERVICE: &[&str] = &[
+    "image",
+    "command",
+    "entrypoint",
+    "environment",
+    "working_dir",
+    "user",
+    "ports",
+    "volumes",
+    "depends_on",
+    "healthcheck",
+    "restart",
+];
+
+/// Volume-level keys allowed inside `volumes.<name>`.
+const ACCEPTED_VOLUME: &[&str] = &["driver", "driver_opts"];
+
+// ── Rejected keys with stable error messages ───────────────────────
+
+/// Top-level keys explicitly rejected with stable error codes.
+const REJECTED_TOP_LEVEL: &[(&str, &str)] = &[
+    (
+        "networks",
+        "custom network definitions are not supported; all services share a default stack network",
+    ),
+    (
+        "configs",
+        "Compose configs are not supported; use environment variables or bind mounts instead",
+    ),
+    (
+        "secrets",
+        "Compose secrets are not supported; use environment variables or bind mounts instead",
+    ),
+];
+
+/// Service-level keys explicitly rejected with stable error codes.
+const REJECTED_SERVICE: &[(&str, &str)] = &[
+    (
+        "build",
+        "image building is not supported; use pre-built OCI images",
+    ),
+    (
+        "deploy",
+        "deployment directives are not supported in this runtime",
+    ),
+    (
+        "profiles",
+        "conditional profiles are not supported; define separate compose files instead",
+    ),
+    (
+        "extends",
+        "service inheritance is not supported; duplicate the configuration instead",
+    ),
+    (
+        "devices",
+        "device pass-through is not supported in this runtime",
+    ),
+    (
+        "extra_hosts",
+        "host file modifications are not supported in this runtime",
+    ),
+    (
+        "ipc",
+        "IPC mode configuration is not supported; each service runs in its own namespace",
+    ),
+    (
+        "pid",
+        "PID namespace configuration is not supported; each service runs in its own namespace",
+    ),
+    (
+        "cgroup",
+        "cgroup mode configuration is not supported in this runtime",
+    ),
+    (
+        "runtime",
+        "container runtime selection is not supported; youki is used for all services",
+    ),
+];
+
+// ── Public API ─────────────────────────────────────────────────────
+
+/// Parse a Compose YAML string into a [`StackSpec`].
+///
+/// The `stack_name` is used as the stack namespace when the Compose
+/// file does not contain a top-level `name` key.
+///
+/// Returns an error if:
+/// - The YAML is malformed.
+/// - Any unsupported key is present (with a stable error code).
+/// - Required fields are missing or have invalid types.
+pub fn parse_compose(yaml: &str, stack_name: &str) -> Result<StackSpec, StackError> {
+    let root: Value =
+        serde_yml::from_str(yaml).map_err(|e| StackError::ComposeParse(e.to_string()))?;
+
+    let root_map = root
+        .as_mapping()
+        .ok_or_else(|| StackError::ComposeParse("compose file must be a YAML mapping".into()))?;
+
+    // ── Validate top-level keys ────────────────────────────────────
+    validate_top_level_keys(root_map)?;
+
+    // ── Resolve stack name ─────────────────────────────────────────
+    let name = root_map
+        .get(val("name"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| stack_name.to_string());
+
+    // ── Parse services ─────────────────────────────────────────────
+    let services_map = root_map
+        .get(val("services"))
+        .and_then(|v| v.as_mapping())
+        .ok_or_else(|| StackError::ComposeParse("`services` must be a YAML mapping".into()))?;
+
+    // Collect volume names from top-level for mount validation.
+    let volume_names: Vec<String> = root_map
+        .get(val("volumes"))
+        .and_then(|v| v.as_mapping())
+        .map(|m| {
+            m.keys()
+                .filter_map(|k| k.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut services = Vec::new();
+    for (key, svc_value) in services_map {
+        let svc_name = key
+            .as_str()
+            .ok_or_else(|| StackError::ComposeParse("service name must be a string".into()))?;
+        let svc = parse_service(svc_name, svc_value, &volume_names)?;
+        services.push(svc);
+    }
+
+    // Sort services by name for deterministic output.
+    services.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // ── Parse volumes ──────────────────────────────────────────────
+    let volumes = parse_volumes(root_map)?;
+
+    // ── Validate dependency references ─────────────────────────────
+    let service_names: Vec<&str> = services.iter().map(|s| s.name.as_str()).collect();
+    for svc in &services {
+        for dep in &svc.depends_on {
+            if !service_names.contains(&dep.as_str()) {
+                return Err(StackError::ComposeValidation(format!(
+                    "service `{}` depends on `{}` which is not defined",
+                    svc.name, dep,
+                )));
+            }
+        }
+    }
+
+    // ── Validate named volume references ───────────────────────────
+    for svc in &services {
+        for mount in &svc.mounts {
+            if let MountSpec::Named { source, .. } = mount {
+                if !volume_names.contains(source) {
+                    return Err(StackError::ComposeValidation(format!(
+                        "service `{}` references volume `{}` which is not defined in top-level `volumes`",
+                        svc.name, source,
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(StackSpec {
+        name,
+        services,
+        networks: vec![],
+        volumes,
+    })
+}
+
+// ── Validation ─────────────────────────────────────────────────────
+
+fn validate_top_level_keys(root: &serde_yml::Mapping) -> Result<(), StackError> {
+    for key in root.keys() {
+        let key_str = key.as_str().unwrap_or("");
+
+        // Check rejected keys first (stable error codes).
+        for &(rejected, reason) in REJECTED_TOP_LEVEL {
+            if key_str == rejected {
+                return Err(StackError::ComposeUnsupportedFeature {
+                    feature: rejected.to_string(),
+                    reason: reason.to_string(),
+                });
+            }
+        }
+
+        // Check accepted keys.
+        if !ACCEPTED_TOP_LEVEL.contains(&key_str) {
+            return Err(StackError::ComposeUnsupportedFeature {
+                feature: key_str.to_string(),
+                reason: format!(
+                    "unknown top-level key; accepted keys are: {}",
+                    ACCEPTED_TOP_LEVEL.join(", ")
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_service_keys(
+    svc_name: &str,
+    svc_map: &serde_yml::Mapping,
+) -> Result<(), StackError> {
+    for key in svc_map.keys() {
+        let key_str = key.as_str().unwrap_or("");
+
+        // Check rejected keys first (stable error codes).
+        for &(rejected, reason) in REJECTED_SERVICE {
+            if key_str == rejected {
+                return Err(StackError::ComposeUnsupportedFeature {
+                    feature: format!("services.{svc_name}.{rejected}"),
+                    reason: reason.to_string(),
+                });
+            }
+        }
+
+        // Check accepted keys.
+        if !ACCEPTED_SERVICE.contains(&key_str) {
+            return Err(StackError::ComposeUnsupportedFeature {
+                feature: format!("services.{svc_name}.{key_str}"),
+                reason: format!(
+                    "unknown service key; accepted keys are: {}",
+                    ACCEPTED_SERVICE.join(", ")
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_volume_keys(
+    vol_name: &str,
+    vol_map: &serde_yml::Mapping,
+) -> Result<(), StackError> {
+    for key in vol_map.keys() {
+        let key_str = key.as_str().unwrap_or("");
+        if !ACCEPTED_VOLUME.contains(&key_str) {
+            return Err(StackError::ComposeUnsupportedFeature {
+                feature: format!("volumes.{vol_name}.{key_str}"),
+                reason: format!(
+                    "unknown volume key; accepted keys are: {}",
+                    ACCEPTED_VOLUME.join(", ")
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+// ── Service parsing ────────────────────────────────────────────────
+
+fn parse_service(
+    name: &str,
+    value: &Value,
+    defined_volumes: &[String],
+) -> Result<ServiceSpec, StackError> {
+    let svc_map = value.as_mapping().ok_or_else(|| {
+        StackError::ComposeParse(format!("service `{name}` must be a YAML mapping"))
+    })?;
+
+    validate_service_keys(name, svc_map)?;
+
+    let image = svc_map
+        .get(val("image"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            StackError::ComposeValidation(format!("service `{name}` is missing required `image`"))
+        })?
+        .to_string();
+
+    let command = parse_string_or_list(svc_map, "command")?;
+    let entrypoint = parse_string_or_list(svc_map, "entrypoint")?;
+    let environment = parse_environment(name, svc_map)?;
+    let working_dir = svc_map
+        .get(val("working_dir"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let user = svc_map
+        .get(val("user"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let ports = parse_ports(name, svc_map)?;
+    let mounts = parse_mounts(name, svc_map, defined_volumes)?;
+    let depends_on = parse_depends_on(name, svc_map)?;
+    let healthcheck = parse_healthcheck(name, svc_map)?;
+    let restart_policy = parse_restart(name, svc_map)?;
+
+    Ok(ServiceSpec {
+        name: name.to_string(),
+        image,
+        command,
+        entrypoint,
+        environment,
+        working_dir,
+        user,
+        mounts,
+        ports,
+        depends_on,
+        healthcheck,
+        restart_policy,
+        resources: ResourcesSpec::default(),
+    })
+}
+
+// ── Field parsers ──────────────────────────────────────────────────
+
+/// Parse a field that can be either a single string or a list of strings.
+///
+/// Compose allows both `command: "foo bar"` (shell form, split on spaces)
+/// and `command: ["foo", "bar"]` (exec form).
+fn parse_string_or_list(
+    map: &serde_yml::Mapping,
+    key: &str,
+) -> Result<Option<Vec<String>>, StackError> {
+    let Some(value) = map.get(val(key)) else {
+        return Ok(None);
+    };
+
+    if let Some(s) = value.as_str() {
+        // Shell form: split on whitespace.
+        Ok(Some(
+            s.split_whitespace().map(String::from).collect(),
+        ))
+    } else if let Some(seq) = value.as_sequence() {
+        let items: Result<Vec<String>, _> = seq
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(String::from)
+                    .ok_or_else(|| {
+                        StackError::ComposeParse(format!("`{key}` list items must be strings"))
+                    })
+            })
+            .collect();
+        Ok(Some(items?))
+    } else {
+        Err(StackError::ComposeParse(format!(
+            "`{key}` must be a string or list of strings"
+        )))
+    }
+}
+
+/// Parse environment variables from Compose format.
+///
+/// Supports both object and list forms:
+/// ```yaml
+/// environment:
+///   KEY: value
+/// ```
+/// or:
+/// ```yaml
+/// environment:
+///   - KEY=value
+/// ```
+fn parse_environment(
+    svc_name: &str,
+    map: &serde_yml::Mapping,
+) -> Result<HashMap<String, String>, StackError> {
+    let Some(value) = map.get(val("environment")) else {
+        return Ok(HashMap::new());
+    };
+
+    if let Some(obj) = value.as_mapping() {
+        let mut env = HashMap::new();
+        for (k, v) in obj {
+            let key = k.as_str().ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: environment key must be a string"
+                ))
+            })?;
+            // Values can be strings, numbers, or booleans in YAML.
+            let val_str = match v {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                Value::Null => String::new(),
+                _ => {
+                    return Err(StackError::ComposeParse(format!(
+                        "service `{svc_name}`: environment value for `{key}` must be a scalar"
+                    )));
+                }
+            };
+            env.insert(key.to_string(), val_str);
+        }
+        Ok(env)
+    } else if let Some(seq) = value.as_sequence() {
+        let mut env = HashMap::new();
+        for item in seq {
+            let s = item.as_str().ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: environment list items must be strings"
+                ))
+            })?;
+            if let Some((key, val)) = s.split_once('=') {
+                env.insert(key.to_string(), val.to_string());
+            } else {
+                // Bare key without value.
+                env.insert(s.to_string(), String::new());
+            }
+        }
+        Ok(env)
+    } else {
+        Err(StackError::ComposeParse(format!(
+            "service `{svc_name}`: `environment` must be a mapping or list"
+        )))
+    }
+}
+
+/// Parse port mappings from Compose format.
+///
+/// Supports:
+/// - Short syntax: `"8080:80"`, `"8080:80/udp"`, `"80"`
+/// - Long syntax: `{ target: 80, published: 8080, protocol: tcp }`
+fn parse_ports(
+    svc_name: &str,
+    map: &serde_yml::Mapping,
+) -> Result<Vec<PortSpec>, StackError> {
+    let Some(value) = map.get(val("ports")) else {
+        return Ok(vec![]);
+    };
+
+    let seq = value.as_sequence().ok_or_else(|| {
+        StackError::ComposeParse(format!("service `{svc_name}`: `ports` must be a list"))
+    })?;
+
+    let mut ports = Vec::new();
+    for item in seq {
+        if let Some(s) = item.as_str() {
+            ports.push(parse_port_short(svc_name, s)?);
+        } else if item.as_u64().is_some() {
+            // Bare number like `ports: [80]`.
+            let n = item.as_u64().unwrap_or(0);
+            let port = u16::try_from(n).map_err(|_| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: port {n} is out of range"
+                ))
+            })?;
+            ports.push(PortSpec {
+                protocol: "tcp".to_string(),
+                container_port: port,
+                host_port: None,
+            });
+        } else if let Some(obj) = item.as_mapping() {
+            ports.push(parse_port_long(svc_name, obj)?);
+        } else {
+            return Err(StackError::ComposeParse(format!(
+                "service `{svc_name}`: port entry must be a string, number, or mapping"
+            )));
+        }
+    }
+    Ok(ports)
+}
+
+/// Parse short-form port syntax: `"[host:]container[/protocol]"`.
+fn parse_port_short(svc_name: &str, s: &str) -> Result<PortSpec, StackError> {
+    // Split off protocol suffix.
+    let (port_part, protocol) = if let Some((p, proto)) = s.rsplit_once('/') {
+        (p, proto.to_string())
+    } else {
+        (s, "tcp".to_string())
+    };
+
+    // Split host:container.
+    let (host_port, container_port) = if let Some((host, container)) = port_part.rsplit_once(':') {
+        // Handle optional bind address: "127.0.0.1:8080:80" → ignore IP, take last two.
+        let host_str = if host.contains(':') {
+            // Has bind address — take the part after the last colon.
+            host.rsplit_once(':').map(|(_, h)| h).unwrap_or(host)
+        } else {
+            host
+        };
+        let h: u16 = host_str.parse().map_err(|_| {
+            StackError::ComposeParse(format!(
+                "service `{svc_name}`: invalid host port `{host_str}` in `{s}`"
+            ))
+        })?;
+        let c: u16 = container.parse().map_err(|_| {
+            StackError::ComposeParse(format!(
+                "service `{svc_name}`: invalid container port `{container}` in `{s}`"
+            ))
+        })?;
+        (Some(h), c)
+    } else {
+        let c: u16 = port_part.parse().map_err(|_| {
+            StackError::ComposeParse(format!(
+                "service `{svc_name}`: invalid port `{port_part}` in `{s}`"
+            ))
+        })?;
+        (None, c)
+    };
+
+    Ok(PortSpec {
+        protocol,
+        container_port,
+        host_port,
+    })
+}
+
+/// Parse long-form port mapping: `{ target, published, protocol }`.
+fn parse_port_long(
+    svc_name: &str,
+    obj: &serde_yml::Mapping,
+) -> Result<PortSpec, StackError> {
+    let target = obj
+        .get(val("target"))
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            StackError::ComposeParse(format!(
+                "service `{svc_name}`: port long-form requires `target`"
+            ))
+        })?;
+    let container_port = u16::try_from(target).map_err(|_| {
+        StackError::ComposeParse(format!(
+            "service `{svc_name}`: port target {target} is out of range"
+        ))
+    })?;
+
+    let host_port = obj
+        .get(val("published"))
+        .and_then(|v| v.as_u64())
+        .map(|n| {
+            u16::try_from(n).map_err(|_| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: port published {n} is out of range"
+                ))
+            })
+        })
+        .transpose()?;
+
+    let protocol = obj
+        .get(val("protocol"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("tcp")
+        .to_string();
+
+    Ok(PortSpec {
+        protocol,
+        container_port,
+        host_port,
+    })
+}
+
+/// Parse volume/mount entries for a service.
+///
+/// Supports:
+/// - Short syntax: `"source:target[:ro]"`, `"/path"` (ephemeral)
+/// - Long syntax: `{ type, source, target, read_only }` (not yet needed)
+fn parse_mounts(
+    svc_name: &str,
+    map: &serde_yml::Mapping,
+    defined_volumes: &[String],
+) -> Result<Vec<MountSpec>, StackError> {
+    let Some(value) = map.get(val("volumes")) else {
+        return Ok(vec![]);
+    };
+
+    let seq = value.as_sequence().ok_or_else(|| {
+        StackError::ComposeParse(format!("service `{svc_name}`: `volumes` must be a list"))
+    })?;
+
+    let mut mounts = Vec::new();
+    for item in seq {
+        if let Some(s) = item.as_str() {
+            mounts.push(parse_mount_short(svc_name, s, defined_volumes)?);
+        } else if let Some(obj) = item.as_mapping() {
+            mounts.push(parse_mount_long(svc_name, obj)?);
+        } else {
+            return Err(StackError::ComposeParse(format!(
+                "service `{svc_name}`: volume entry must be a string or mapping"
+            )));
+        }
+    }
+    Ok(mounts)
+}
+
+/// Parse short-form mount syntax: `"source:target[:ro]"` or `"/target"`.
+fn parse_mount_short(
+    svc_name: &str,
+    s: &str,
+    defined_volumes: &[String],
+) -> Result<MountSpec, StackError> {
+    let parts: Vec<&str> = s.split(':').collect();
+
+    match parts.len() {
+        1 => {
+            // Single path: ephemeral mount if it starts with /, otherwise error.
+            let path = parts[0];
+            if path.starts_with('/') {
+                Ok(MountSpec::Ephemeral {
+                    target: path.to_string(),
+                })
+            } else {
+                Err(StackError::ComposeParse(format!(
+                    "service `{svc_name}`: volume `{s}` must be an absolute path or `source:target`"
+                )))
+            }
+        }
+        2 | 3 => {
+            let source = parts[0];
+            let target = parts[1];
+            let read_only = parts.get(2).is_some_and(|&opt| opt == "ro");
+
+            if !target.starts_with('/') {
+                return Err(StackError::ComposeParse(format!(
+                    "service `{svc_name}`: mount target `{target}` must be an absolute path"
+                )));
+            }
+
+            // Determine mount type by source format.
+            if source.starts_with('/') || source.starts_with('.') {
+                // Absolute or relative host path → bind mount.
+                Ok(MountSpec::Bind {
+                    source: source.to_string(),
+                    target: target.to_string(),
+                    read_only,
+                })
+            } else if defined_volumes.contains(&source.to_string()) {
+                // Named volume.
+                Ok(MountSpec::Named {
+                    source: source.to_string(),
+                    target: target.to_string(),
+                    read_only,
+                })
+            } else {
+                // Source doesn't look like a path and isn't a defined volume.
+                // Treat as a named volume reference — validation later will
+                // catch undefined volumes.
+                Ok(MountSpec::Named {
+                    source: source.to_string(),
+                    target: target.to_string(),
+                    read_only,
+                })
+            }
+        }
+        _ => Err(StackError::ComposeParse(format!(
+            "service `{svc_name}`: invalid mount syntax `{s}`"
+        ))),
+    }
+}
+
+/// Parse long-form mount: `{ type, source, target, read_only }`.
+fn parse_mount_long(
+    svc_name: &str,
+    obj: &serde_yml::Mapping,
+) -> Result<MountSpec, StackError> {
+    let mount_type = obj
+        .get(val("type"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            StackError::ComposeParse(format!(
+                "service `{svc_name}`: long-form volume requires `type`"
+            ))
+        })?;
+    let target = obj
+        .get(val("target"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            StackError::ComposeParse(format!(
+                "service `{svc_name}`: long-form volume requires `target`"
+            ))
+        })?
+        .to_string();
+    let read_only = obj
+        .get(val("read_only"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    match mount_type {
+        "bind" => {
+            let source = obj
+                .get(val("source"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    StackError::ComposeParse(format!(
+                        "service `{svc_name}`: bind mount requires `source`"
+                    ))
+                })?
+                .to_string();
+            Ok(MountSpec::Bind {
+                source,
+                target,
+                read_only,
+            })
+        }
+        "volume" => {
+            let source = obj
+                .get(val("source"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    StackError::ComposeParse(format!(
+                        "service `{svc_name}`: volume mount requires `source`"
+                    ))
+                })?
+                .to_string();
+            Ok(MountSpec::Named {
+                source,
+                target,
+                read_only,
+            })
+        }
+        "tmpfs" => Ok(MountSpec::Ephemeral { target }),
+        _ => Err(StackError::ComposeParse(format!(
+            "service `{svc_name}`: unsupported mount type `{mount_type}`"
+        ))),
+    }
+}
+
+/// Parse `depends_on` which can be a list of strings or a mapping with conditions.
+fn parse_depends_on(
+    svc_name: &str,
+    map: &serde_yml::Mapping,
+) -> Result<Vec<String>, StackError> {
+    let Some(value) = map.get(val("depends_on")) else {
+        return Ok(vec![]);
+    };
+
+    if let Some(seq) = value.as_sequence() {
+        // Simple list: depends_on: [db, cache]
+        seq.iter()
+            .map(|v| {
+                v.as_str().map(String::from).ok_or_else(|| {
+                    StackError::ComposeParse(format!(
+                        "service `{svc_name}`: `depends_on` items must be strings"
+                    ))
+                })
+            })
+            .collect()
+    } else if let Some(obj) = value.as_mapping() {
+        // Conditional form: depends_on: { db: { condition: service_healthy } }
+        // We accept both forms but treat all conditions as service_started.
+        obj.keys()
+            .map(|k| {
+                k.as_str().map(String::from).ok_or_else(|| {
+                    StackError::ComposeParse(format!(
+                        "service `{svc_name}`: `depends_on` keys must be strings"
+                    ))
+                })
+            })
+            .collect()
+    } else {
+        Err(StackError::ComposeParse(format!(
+            "service `{svc_name}`: `depends_on` must be a list or mapping"
+        )))
+    }
+}
+
+/// Parse healthcheck configuration.
+fn parse_healthcheck(
+    svc_name: &str,
+    map: &serde_yml::Mapping,
+) -> Result<Option<HealthCheckSpec>, StackError> {
+    let Some(value) = map.get(val("healthcheck")) else {
+        return Ok(None);
+    };
+
+    let obj = value.as_mapping().ok_or_else(|| {
+        StackError::ComposeParse(format!(
+            "service `{svc_name}`: `healthcheck` must be a mapping"
+        ))
+    })?;
+
+    // `disable: true` means no health check.
+    if obj
+        .get(val("disable"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+
+    let test = obj
+        .get(val("test"))
+        .ok_or_else(|| {
+            StackError::ComposeParse(format!(
+                "service `{svc_name}`: `healthcheck` requires `test`"
+            ))
+        })
+        .and_then(|v| {
+            if let Some(seq) = v.as_sequence() {
+                seq.iter()
+                    .map(|item| {
+                        item.as_str().map(String::from).ok_or_else(|| {
+                            StackError::ComposeParse(format!(
+                                "service `{svc_name}`: healthcheck test items must be strings"
+                            ))
+                        })
+                    })
+                    .collect()
+            } else if let Some(s) = v.as_str() {
+                // Shell form: `test: curl localhost`
+                Ok(vec!["CMD-SHELL".to_string(), s.to_string()])
+            } else {
+                Err(StackError::ComposeParse(format!(
+                    "service `{svc_name}`: healthcheck `test` must be a string or list"
+                )))
+            }
+        })?;
+
+    let interval_secs = parse_duration_field(svc_name, obj, "interval")?;
+    let timeout_secs = parse_duration_field(svc_name, obj, "timeout")?;
+    let start_period_secs = parse_duration_field(svc_name, obj, "start_period")?;
+    let retries = obj
+        .get(val("retries"))
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+
+    Ok(Some(HealthCheckSpec {
+        test,
+        interval_secs,
+        timeout_secs,
+        retries,
+        start_period_secs,
+    }))
+}
+
+/// Parse a Compose duration field (e.g., `interval: 30s`, `timeout: 5s`).
+///
+/// Supports:
+/// - Bare seconds as integer: `30`
+/// - Duration string: `"30s"`, `"1m"`, `"1m30s"`
+fn parse_duration_field(
+    svc_name: &str,
+    obj: &serde_yml::Mapping,
+    key: &str,
+) -> Result<Option<u64>, StackError> {
+    let Some(value) = obj.get(val(key)) else {
+        return Ok(None);
+    };
+
+    if let Some(n) = value.as_u64() {
+        return Ok(Some(n));
+    }
+
+    if let Some(s) = value.as_str() {
+        return parse_duration_string(s).map(Some).ok_or_else(|| {
+            StackError::ComposeParse(format!(
+                "service `{svc_name}`: invalid duration `{s}` for `{key}`"
+            ))
+        });
+    }
+
+    Err(StackError::ComposeParse(format!(
+        "service `{svc_name}`: `{key}` must be a number or duration string"
+    )))
+}
+
+/// Parse a Compose-style duration string into seconds.
+///
+/// Supports: `"30s"`, `"5m"`, `"1h"`, `"1m30s"`.
+fn parse_duration_string(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    let mut total: u64 = 0;
+    let mut current = String::new();
+
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            current.push(ch);
+        } else {
+            let n: u64 = current.parse().ok()?;
+            current.clear();
+            match ch {
+                'h' => total += n * 3600,
+                'm' => total += n * 60,
+                's' => total += n,
+                _ => return None,
+            }
+        }
+    }
+
+    // If trailing digits without a unit, treat as seconds.
+    if !current.is_empty() {
+        let n: u64 = current.parse().ok()?;
+        total += n;
+    }
+
+    if total == 0 && s != "0s" && s != "0" {
+        return None;
+    }
+
+    Some(total)
+}
+
+/// Parse restart policy string.
+fn parse_restart(
+    svc_name: &str,
+    map: &serde_yml::Mapping,
+) -> Result<Option<RestartPolicy>, StackError> {
+    let Some(value) = map.get(val("restart")) else {
+        return Ok(None);
+    };
+
+    let s = value.as_str().ok_or_else(|| {
+        StackError::ComposeParse(format!(
+            "service `{svc_name}`: `restart` must be a string"
+        ))
+    })?;
+
+    match s {
+        "no" => Ok(Some(RestartPolicy::No)),
+        "always" => Ok(Some(RestartPolicy::Always)),
+        "unless-stopped" => Ok(Some(RestartPolicy::UnlessStopped)),
+        _ if s.starts_with("on-failure") => {
+            let max_retries = if let Some(count_str) = s.strip_prefix("on-failure:") {
+                let count: u32 = count_str.parse().map_err(|_| {
+                    StackError::ComposeParse(format!(
+                        "service `{svc_name}`: invalid retry count in `{s}`"
+                    ))
+                })?;
+                Some(count)
+            } else {
+                None
+            };
+            Ok(Some(RestartPolicy::OnFailure { max_retries }))
+        }
+        _ => Err(StackError::ComposeParse(format!(
+            "service `{svc_name}`: unknown restart policy `{s}`; \
+             accepted values: no, always, on-failure, on-failure:N, unless-stopped"
+        ))),
+    }
+}
+
+// ── Volume parsing ─────────────────────────────────────────────────
+
+fn parse_volumes(root: &serde_yml::Mapping) -> Result<Vec<VolumeSpec>, StackError> {
+    let Some(value) = root.get(val("volumes")) else {
+        return Ok(vec![]);
+    };
+
+    let volumes_map = value.as_mapping().ok_or_else(|| {
+        StackError::ComposeParse("top-level `volumes` must be a mapping".into())
+    })?;
+
+    let mut volumes = Vec::new();
+    for (key, vol_value) in volumes_map {
+        let vol_name = key
+            .as_str()
+            .ok_or_else(|| StackError::ComposeParse("volume name must be a string".into()))?;
+
+        // Empty value (just the name) is valid — uses defaults.
+        if vol_value.is_null() {
+            volumes.push(VolumeSpec {
+                name: vol_name.to_string(),
+                driver: "local".to_string(),
+                driver_opts: None,
+            });
+            continue;
+        }
+
+        let vol_map = vol_value.as_mapping().ok_or_else(|| {
+            StackError::ComposeParse(format!("volume `{vol_name}` must be a mapping or empty"))
+        })?;
+
+        validate_volume_keys(vol_name, vol_map)?;
+
+        let driver = vol_map
+            .get(val("driver"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("local")
+            .to_string();
+
+        if driver != "local" {
+            return Err(StackError::ComposeUnsupportedFeature {
+                feature: format!("volumes.{vol_name}.driver"),
+                reason: format!(
+                    "only `local` driver is supported; got `{driver}`"
+                ),
+            });
+        }
+
+        let driver_opts = vol_map
+            .get(val("driver_opts"))
+            .and_then(|v| v.as_mapping())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| {
+                        Some((k.as_str()?.to_string(), v.as_str()?.to_string()))
+                    })
+                    .collect::<HashMap<String, String>>()
+            });
+
+        volumes.push(VolumeSpec {
+            name: vol_name.to_string(),
+            driver,
+            driver_opts,
+        });
+    }
+
+    // Sort for determinism.
+    volumes.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(volumes)
+}
+
+// ── Helpers ────────────────────────────────────────────────────────
+
+/// Create a `serde_yml::Value::String` for use as a map key.
+fn val(s: &str) -> Value {
+    Value::String(s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    // ── parse_compose: basic ──────────────────────────────────────
+
+    #[test]
+    fn minimal_compose() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.name, "myapp");
+        assert_eq!(spec.services.len(), 1);
+        assert_eq!(spec.services[0].name, "web");
+        assert_eq!(spec.services[0].image, "nginx:latest");
+    }
+
+    #[test]
+    fn compose_with_name_override() {
+        let yaml = r#"
+name: custom-name
+services:
+  web:
+    image: nginx:latest
+"#;
+        let spec = parse_compose(yaml, "fallback").unwrap();
+        assert_eq!(spec.name, "custom-name");
+    }
+
+    #[test]
+    fn version_key_accepted() {
+        let yaml = r#"
+version: "3.8"
+services:
+  web:
+    image: nginx:latest
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services.len(), 1);
+    }
+
+    // ── Service fields ────────────────────────────────────────────
+
+    #[test]
+    fn full_service_spec() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    command: ["nginx", "-g", "daemon off;"]
+    entrypoint: ["/entrypoint.sh"]
+    environment:
+      PORT: "8080"
+      DEBUG: "true"
+    working_dir: /app
+    user: "1000:1000"
+    restart: always
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let svc = &spec.services[0];
+        assert_eq!(svc.image, "nginx:latest");
+        assert_eq!(
+            svc.command,
+            Some(vec![
+                "nginx".to_string(),
+                "-g".to_string(),
+                "daemon off;".to_string()
+            ])
+        );
+        assert_eq!(
+            svc.entrypoint,
+            Some(vec!["/entrypoint.sh".to_string()])
+        );
+        assert_eq!(svc.environment.get("PORT").unwrap(), "8080");
+        assert_eq!(svc.environment.get("DEBUG").unwrap(), "true");
+        assert_eq!(svc.working_dir, Some("/app".to_string()));
+        assert_eq!(svc.user, Some("1000:1000".to_string()));
+        assert_eq!(svc.restart_policy, Some(RestartPolicy::Always));
+    }
+
+    #[test]
+    fn command_shell_form() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    command: nginx -g daemon off;
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(
+            spec.services[0].command,
+            Some(vec![
+                "nginx".to_string(),
+                "-g".to_string(),
+                "daemon".to_string(),
+                "off;".to_string(),
+            ])
+        );
+    }
+
+    // ── Environment parsing ───────────────────────────────────────
+
+    #[test]
+    fn environment_list_form() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    environment:
+      - PORT=8080
+      - DEBUG=true
+      - EMPTY_VAR
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let env = &spec.services[0].environment;
+        assert_eq!(env.get("PORT").unwrap(), "8080");
+        assert_eq!(env.get("DEBUG").unwrap(), "true");
+        assert_eq!(env.get("EMPTY_VAR").unwrap(), "");
+    }
+
+    #[test]
+    fn environment_numeric_and_bool_values() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    environment:
+      PORT: 8080
+      DEBUG: true
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let env = &spec.services[0].environment;
+        assert_eq!(env.get("PORT").unwrap(), "8080");
+        assert_eq!(env.get("DEBUG").unwrap(), "true");
+    }
+
+    // ── Port parsing ──────────────────────────────────────────────
+
+    #[test]
+    fn ports_short_host_container() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    ports:
+      - "8080:80"
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let port = &spec.services[0].ports[0];
+        assert_eq!(port.host_port, Some(8080));
+        assert_eq!(port.container_port, 80);
+        assert_eq!(port.protocol, "tcp");
+    }
+
+    #[test]
+    fn ports_short_container_only() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    ports:
+      - "80"
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let port = &spec.services[0].ports[0];
+        assert_eq!(port.host_port, None);
+        assert_eq!(port.container_port, 80);
+    }
+
+    #[test]
+    fn ports_short_with_protocol() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    ports:
+      - "8080:80/udp"
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let port = &spec.services[0].ports[0];
+        assert_eq!(port.protocol, "udp");
+        assert_eq!(port.host_port, Some(8080));
+        assert_eq!(port.container_port, 80);
+    }
+
+    #[test]
+    fn ports_short_with_bind_address() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    ports:
+      - "127.0.0.1:8080:80"
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let port = &spec.services[0].ports[0];
+        assert_eq!(port.host_port, Some(8080));
+        assert_eq!(port.container_port, 80);
+    }
+
+    #[test]
+    fn ports_long_form() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    ports:
+      - target: 80
+        published: 8080
+        protocol: udp
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let port = &spec.services[0].ports[0];
+        assert_eq!(port.container_port, 80);
+        assert_eq!(port.host_port, Some(8080));
+        assert_eq!(port.protocol, "udp");
+    }
+
+    #[test]
+    fn ports_bare_number() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    ports:
+      - 80
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let port = &spec.services[0].ports[0];
+        assert_eq!(port.container_port, 80);
+        assert_eq!(port.host_port, None);
+    }
+
+    // ── Mount parsing ─────────────────────────────────────────────
+
+    #[test]
+    fn mount_bind_short() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    volumes:
+      - /host/data:/container/data
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(
+            spec.services[0].mounts[0],
+            MountSpec::Bind {
+                source: "/host/data".to_string(),
+                target: "/container/data".to_string(),
+                read_only: false,
+            }
+        );
+    }
+
+    #[test]
+    fn mount_bind_read_only() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    volumes:
+      - /host/data:/container/data:ro
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(
+            spec.services[0].mounts[0],
+            MountSpec::Bind {
+                source: "/host/data".to_string(),
+                target: "/container/data".to_string(),
+                read_only: true,
+            }
+        );
+    }
+
+    #[test]
+    fn mount_named_volume() {
+        let yaml = r#"
+services:
+  db:
+    image: postgres:15
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+volumes:
+  dbdata:
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(
+            spec.services[0].mounts[0],
+            MountSpec::Named {
+                source: "dbdata".to_string(),
+                target: "/var/lib/postgresql/data".to_string(),
+                read_only: false,
+            }
+        );
+    }
+
+    #[test]
+    fn mount_ephemeral() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    volumes:
+      - /tmp/scratch
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(
+            spec.services[0].mounts[0],
+            MountSpec::Ephemeral {
+                target: "/tmp/scratch".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn mount_long_form_bind() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    volumes:
+      - type: bind
+        source: /host/path
+        target: /container/path
+        read_only: true
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(
+            spec.services[0].mounts[0],
+            MountSpec::Bind {
+                source: "/host/path".to_string(),
+                target: "/container/path".to_string(),
+                read_only: true,
+            }
+        );
+    }
+
+    #[test]
+    fn mount_long_form_volume() {
+        let yaml = r#"
+services:
+  db:
+    image: postgres:15
+    volumes:
+      - type: volume
+        source: dbdata
+        target: /var/lib/postgresql/data
+volumes:
+  dbdata:
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(
+            spec.services[0].mounts[0],
+            MountSpec::Named {
+                source: "dbdata".to_string(),
+                target: "/var/lib/postgresql/data".to_string(),
+                read_only: false,
+            }
+        );
+    }
+
+    #[test]
+    fn mount_long_form_tmpfs() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    volumes:
+      - type: tmpfs
+        target: /tmp
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(
+            spec.services[0].mounts[0],
+            MountSpec::Ephemeral {
+                target: "/tmp".to_string(),
+            }
+        );
+    }
+
+    // ── depends_on parsing ────────────────────────────────────────
+
+    #[test]
+    fn depends_on_list_form() {
+        let yaml = r#"
+services:
+  db:
+    image: postgres:15
+  web:
+    image: nginx:latest
+    depends_on:
+      - db
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let web = spec.services.iter().find(|s| s.name == "web").unwrap();
+        assert_eq!(web.depends_on, vec!["db".to_string()]);
+    }
+
+    #[test]
+    fn depends_on_mapping_form() {
+        let yaml = r#"
+services:
+  db:
+    image: postgres:15
+  web:
+    image: nginx:latest
+    depends_on:
+      db:
+        condition: service_healthy
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let web = spec.services.iter().find(|s| s.name == "web").unwrap();
+        assert_eq!(web.depends_on, vec!["db".to_string()]);
+    }
+
+    // ── Healthcheck parsing ───────────────────────────────────────
+
+    #[test]
+    fn healthcheck_list_test() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let hc = spec.services[0].healthcheck.as_ref().unwrap();
+        assert_eq!(
+            hc.test,
+            vec!["CMD", "curl", "-f", "http://localhost"]
+        );
+        assert_eq!(hc.interval_secs, Some(30));
+        assert_eq!(hc.timeout_secs, Some(5));
+        assert_eq!(hc.retries, Some(3));
+        assert_eq!(hc.start_period_secs, Some(10));
+    }
+
+    #[test]
+    fn healthcheck_shell_form() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    healthcheck:
+      test: curl -f http://localhost
+      interval: 10
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let hc = spec.services[0].healthcheck.as_ref().unwrap();
+        assert_eq!(hc.test, vec!["CMD-SHELL", "curl -f http://localhost"]);
+        assert_eq!(hc.interval_secs, Some(10));
+    }
+
+    #[test]
+    fn healthcheck_disabled() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    healthcheck:
+      disable: true
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert!(spec.services[0].healthcheck.is_none());
+    }
+
+    // ── Restart policy parsing ────────────────────────────────────
+
+    #[test]
+    fn restart_policies() {
+        let cases = vec![
+            ("no", RestartPolicy::No),
+            ("always", RestartPolicy::Always),
+            ("unless-stopped", RestartPolicy::UnlessStopped),
+            (
+                "on-failure",
+                RestartPolicy::OnFailure { max_retries: None },
+            ),
+            (
+                "on-failure:5",
+                RestartPolicy::OnFailure {
+                    max_retries: Some(5),
+                },
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let yaml = format!(
+                r#"
+services:
+  web:
+    image: nginx:latest
+    restart: {input}
+"#
+            );
+            let spec = parse_compose(&yaml, "myapp").unwrap();
+            assert_eq!(
+                spec.services[0].restart_policy,
+                Some(expected),
+                "failed for restart: {input}"
+            );
+        }
+    }
+
+    // ── Volume parsing (top-level) ────────────────────────────────
+
+    #[test]
+    fn volumes_top_level_empty() {
+        let yaml = r#"
+services:
+  db:
+    image: postgres:15
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+volumes:
+  dbdata:
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.volumes.len(), 1);
+        assert_eq!(spec.volumes[0].name, "dbdata");
+        assert_eq!(spec.volumes[0].driver, "local");
+        assert!(spec.volumes[0].driver_opts.is_none());
+    }
+
+    #[test]
+    fn volumes_top_level_with_driver_opts() {
+        let yaml = r#"
+services:
+  db:
+    image: postgres:15
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+volumes:
+  dbdata:
+    driver: local
+    driver_opts:
+      type: none
+      device: /data/db
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let opts = spec.volumes[0].driver_opts.as_ref().unwrap();
+        assert_eq!(opts.get("type").unwrap(), "none");
+        assert_eq!(opts.get("device").unwrap(), "/data/db");
+    }
+
+    // ── Duration parsing ──────────────────────────────────────────
+
+    #[test]
+    fn duration_parsing() {
+        assert_eq!(parse_duration_string("30s"), Some(30));
+        assert_eq!(parse_duration_string("5m"), Some(300));
+        assert_eq!(parse_duration_string("1h"), Some(3600));
+        assert_eq!(parse_duration_string("1m30s"), Some(90));
+        assert_eq!(parse_duration_string("1h30m15s"), Some(5415));
+        assert_eq!(parse_duration_string("0s"), Some(0));
+    }
+
+    // ── Rejection tests ───────────────────────────────────────────
+
+    #[test]
+    fn reject_build() {
+        let yaml = r#"
+services:
+  web:
+    build: .
+    image: nginx:latest
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("build"), "error should mention `build`: {msg}");
+        assert!(
+            msg.contains("pre-built OCI images"),
+            "error should be actionable: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_networks_top_level() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+networks:
+  frontend:
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("networks"),
+            "error should mention `networks`: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_deploy() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    deploy:
+      replicas: 3
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("deploy"));
+    }
+
+    #[test]
+    fn reject_extends() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    extends:
+      service: base
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("extends"));
+    }
+
+    #[test]
+    fn reject_configs() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+configs:
+  myconfig:
+    file: ./config.txt
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("configs"));
+    }
+
+    #[test]
+    fn reject_secrets() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+secrets:
+  mysecret:
+    file: ./secret.txt
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("secrets"));
+    }
+
+    #[test]
+    fn reject_devices() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    devices:
+      - /dev/sda:/dev/xvdc
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("devices"));
+    }
+
+    #[test]
+    fn reject_ipc() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    ipc: host
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("ipc"));
+    }
+
+    #[test]
+    fn reject_pid() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    pid: host
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("pid"));
+    }
+
+    #[test]
+    fn reject_runtime() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    runtime: runc
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("runtime"));
+    }
+
+    #[test]
+    fn reject_profiles() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    profiles:
+      - debug
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("profiles"));
+    }
+
+    #[test]
+    fn reject_extra_hosts() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("extra_hosts"));
+    }
+
+    #[test]
+    fn reject_cgroup() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    cgroup: host
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("cgroup"));
+    }
+
+    #[test]
+    fn reject_unknown_top_level_key() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+x-custom:
+  foo: bar
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("x-custom"));
+    }
+
+    #[test]
+    fn reject_unknown_service_key() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    container_name: my-web
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("container_name"));
+    }
+
+    #[test]
+    fn reject_non_local_volume_driver() {
+        let yaml = r#"
+services:
+  db:
+    image: postgres:15
+volumes:
+  dbdata:
+    driver: nfs
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("nfs") || msg.contains("local"), "{msg}");
+    }
+
+    // ── Validation tests ──────────────────────────────────────────
+
+    #[test]
+    fn validate_undefined_dependency() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    depends_on:
+      - nonexistent
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("nonexistent"));
+    }
+
+    #[test]
+    fn validate_undefined_volume_reference() {
+        let yaml = r#"
+services:
+  db:
+    image: postgres:15
+    volumes:
+      - missing_vol:/data
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("missing_vol"));
+    }
+
+    #[test]
+    fn missing_image_fails() {
+        let yaml = r#"
+services:
+  web:
+    command: ["echo", "hello"]
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("image"));
+    }
+
+    // ── Multi-service compose ─────────────────────────────────────
+
+    #[test]
+    fn web_redis_compose() {
+        let yaml = r#"
+services:
+  web:
+    image: myapp:latest
+    ports:
+      - "8080:80"
+    depends_on:
+      - redis
+    environment:
+      REDIS_URL: redis://redis:6379
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis-data:
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+
+        // Services sorted by name.
+        assert_eq!(spec.services.len(), 2);
+        assert_eq!(spec.services[0].name, "redis");
+        assert_eq!(spec.services[1].name, "web");
+
+        // Redis service.
+        let redis = &spec.services[0];
+        assert_eq!(redis.image, "redis:7-alpine");
+        assert_eq!(redis.ports[0].container_port, 6379);
+        assert_eq!(redis.ports[0].host_port, Some(6379));
+        assert!(redis.healthcheck.is_some());
+        let hc = redis.healthcheck.as_ref().unwrap();
+        assert_eq!(hc.interval_secs, Some(10));
+        assert_eq!(hc.timeout_secs, Some(3));
+        assert_eq!(hc.retries, Some(5));
+        assert_eq!(
+            redis.mounts[0],
+            MountSpec::Named {
+                source: "redis-data".to_string(),
+                target: "/data".to_string(),
+                read_only: false,
+            }
+        );
+
+        // Web service.
+        let web = &spec.services[1];
+        assert_eq!(web.depends_on, vec!["redis".to_string()]);
+        assert_eq!(
+            web.environment.get("REDIS_URL").unwrap(),
+            "redis://redis:6379"
+        );
+        assert_eq!(web.ports[0].host_port, Some(8080));
+        assert_eq!(web.ports[0].container_port, 80);
+
+        // Volume.
+        assert_eq!(spec.volumes.len(), 1);
+        assert_eq!(spec.volumes[0].name, "redis-data");
+    }
+
+    #[test]
+    fn services_sorted_deterministically() {
+        let yaml = r#"
+services:
+  zeta:
+    image: img:latest
+  alpha:
+    image: img:latest
+  middle:
+    image: img:latest
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let names: Vec<&str> = spec.services.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "middle", "zeta"]);
+    }
+
+    #[test]
+    fn relative_path_bind_mount() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    volumes:
+      - ./src:/app/src
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(
+            spec.services[0].mounts[0],
+            MountSpec::Bind {
+                source: "./src".to_string(),
+                target: "/app/src".to_string(),
+                read_only: false,
+            }
+        );
+    }
+}

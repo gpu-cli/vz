@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod compose;
 mod error;
 mod events;
 mod health;
@@ -15,6 +16,7 @@ mod spec;
 mod state_store;
 mod volume;
 
+pub use compose::parse_compose;
 pub use error::StackError;
 pub use events::{EventRecord, StackEvent};
 pub use health::{DependencyCheck, HealthStatus, check_dependencies, is_service_ready};
