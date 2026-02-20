@@ -71,6 +71,7 @@ impl Runtime {
             vm_handles: Arc::new(Mutex::new(HashMap::new())),
         };
 
+        runtime.reconcile_stale_containers();
         runtime.cleanup_orphaned_rootfs();
 
         runtime
@@ -174,6 +175,7 @@ impl Runtime {
 
         container.host_pid = None;
         container.status = ContainerStatus::Stopped { exit_code };
+        container.stopped_unix_secs = Some(current_unix_secs());
         self.container_store
             .upsert(container.clone())
             .map_err(OciError::from)?;
@@ -218,6 +220,8 @@ impl Runtime {
             image_id: image_id.0.clone(),
             status: ContainerStatus::Created,
             created_unix_secs,
+            started_unix_secs: None,
+            stopped_unix_secs: None,
             rootfs_path: None,
             host_pid: Some(process::id()),
         };
@@ -234,6 +238,7 @@ impl Runtime {
             Ok(rootfs_dir) => rootfs_dir,
             Err(err) => {
                 container.status = ContainerStatus::Stopped { exit_code: -1 };
+                container.stopped_unix_secs = Some(current_unix_secs());
                 container.host_pid = None;
                 self.container_store
                     .upsert(container)
@@ -244,6 +249,7 @@ impl Runtime {
 
         container.rootfs_path = Some(rootfs_dir.clone());
         container.status = ContainerStatus::Running;
+        container.started_unix_secs = Some(current_unix_secs());
         container.host_pid = Some(process::id());
         self.container_store
             .upsert(container.clone())
@@ -270,6 +276,7 @@ impl Runtime {
             },
             Err(_) => ContainerStatus::Stopped { exit_code: -1 },
         };
+        container.stopped_unix_secs = Some(current_unix_secs());
         container.host_pid = None;
 
         self.container_store
@@ -305,6 +312,8 @@ impl Runtime {
             image_id: image_id.0.clone(),
             status: ContainerStatus::Created,
             created_unix_secs,
+            started_unix_secs: None,
+            stopped_unix_secs: None,
             rootfs_path: None,
             host_pid: Some(process::id()),
         };
@@ -321,6 +330,7 @@ impl Runtime {
             Ok(rootfs_dir) => rootfs_dir,
             Err(err) => {
                 container.status = ContainerStatus::Stopped { exit_code: -1 };
+                container.stopped_unix_secs = Some(current_unix_secs());
                 container.host_pid = None;
                 self.container_store
                     .upsert(container)
@@ -343,6 +353,7 @@ impl Runtime {
         {
             Ok(()) => {
                 container.status = ContainerStatus::Running;
+                container.started_unix_secs = Some(current_unix_secs());
                 container.host_pid = Some(process::id());
                 self.container_store
                     .upsert(container)
@@ -351,6 +362,7 @@ impl Runtime {
             }
             Err(err) => {
                 container.status = ContainerStatus::Stopped { exit_code: -1 };
+                container.stopped_unix_secs = Some(current_unix_secs());
                 container.host_pid = None;
                 self.container_store
                     .upsert(container)
@@ -784,6 +796,18 @@ impl Runtime {
             (Err(exec_err), Ok(())) => Err(exec_err.into()),
             (Ok(_), Err(stop_err)) => Err(stop_err.into()),
             (Err(exec_err), Err(_stop_err)) => Err(exec_err.into()),
+        }
+    }
+
+    /// Reconcile containers whose managing host PID is no longer alive.
+    ///
+    /// Transitions stale `Running`/`Created` containers to `Stopped` and
+    /// cleans up their rootfs. Called automatically during `Runtime::new()`.
+    fn reconcile_stale_containers(&self) {
+        if let Ok(reconciled) = self.container_store.reconcile_stale() {
+            for id in &reconciled {
+                tracing::info!(container_id = %id, "reconciled stale container");
+            }
         }
     }
 
@@ -1480,6 +1504,8 @@ mod tests {
                 image_id: "sha256:img2".to_string(),
                 status: ContainerStatus::Created,
                 created_unix_secs: 100,
+                started_unix_secs: None,
+                stopped_unix_secs: None,
                 rootfs_path: None,
                 host_pid: None,
             })
@@ -1493,6 +1519,8 @@ mod tests {
                 image_id: "sha256:img1".to_string(),
                 status: ContainerStatus::Stopped { exit_code: 0 },
                 created_unix_secs: 200,
+                started_unix_secs: None,
+                stopped_unix_secs: None,
                 rootfs_path: None,
                 host_pid: None,
             })
@@ -1523,6 +1551,8 @@ mod tests {
                 image_id: "sha256:img1".to_string(),
                 status: ContainerStatus::Created,
                 created_unix_secs: 100,
+                started_unix_secs: None,
+                stopped_unix_secs: None,
                 rootfs_path: Some(rootfs_path.clone()),
                 host_pid: None,
             })
@@ -1557,6 +1587,8 @@ mod tests {
                 image_id: "sha256:img1".to_string(),
                 status: ContainerStatus::Running,
                 created_unix_secs: 100,
+                started_unix_secs: None,
+                stopped_unix_secs: None,
                 rootfs_path: None,
                 host_pid: Some(process::id()),
             })
@@ -1694,8 +1726,10 @@ mod tests {
                 image_id: "sha256:img1".to_string(),
                 status: ContainerStatus::Created,
                 created_unix_secs: 100,
+                started_unix_secs: None,
+                stopped_unix_secs: None,
                 rootfs_path: Some(referenced_rootfs.clone()),
-                host_pid: None,
+                host_pid: Some(std::process::id()),
             })
             .unwrap();
 

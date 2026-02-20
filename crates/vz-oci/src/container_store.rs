@@ -34,6 +34,12 @@ pub struct ContainerInfo {
     pub status: ContainerStatus,
     /// Unix epoch seconds when metadata was created.
     pub created_unix_secs: u64,
+    /// Unix epoch seconds when the container was started, if applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_unix_secs: Option<u64>,
+    /// Unix epoch seconds when the container stopped, if applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_unix_secs: Option<u64>,
     /// Assembled rootfs path for this container, when known.
     pub rootfs_path: Option<PathBuf>,
     /// Host process ID currently managing this container, if running.
@@ -86,6 +92,56 @@ impl ContainerStore {
         self.write_all(&containers)
     }
 
+    /// Find a single container by ID.
+    pub fn find(&self, id: &str) -> io::Result<Option<ContainerInfo>> {
+        let containers = self.load_all()?;
+        Ok(containers.into_iter().find(|c| c.id == id))
+    }
+
+    /// Reconcile stale containers whose host PID is no longer alive.
+    ///
+    /// Containers in `Running` or `Created` state whose `host_pid` no longer
+    /// exists are transitioned to `Stopped { exit_code: -1 }` with their
+    /// rootfs cleaned up. Returns the IDs of reconciled containers.
+    pub fn reconcile_stale(&self) -> io::Result<Vec<String>> {
+        let mut containers = self.load_all()?;
+        let mut reconciled = Vec::new();
+
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+
+        for container in &mut containers {
+            let is_active = matches!(
+                container.status,
+                ContainerStatus::Running | ContainerStatus::Created
+            );
+            if !is_active {
+                continue;
+            }
+
+            let pid_alive = container.host_pid.is_some_and(is_process_alive);
+
+            if !pid_alive {
+                container.status = ContainerStatus::Stopped { exit_code: -1 };
+                container.stopped_unix_secs = Some(now_secs);
+                container.host_pid = None;
+
+                if let Some(rootfs) = container.rootfs_path.take() {
+                    let _ = fs::remove_dir_all(rootfs);
+                }
+
+                reconciled.push(container.id.clone());
+            }
+        }
+
+        if !reconciled.is_empty() {
+            self.write_all(&containers)?;
+        }
+
+        Ok(reconciled)
+    }
+
     /// Remove a container metadata record by ID.
     pub fn remove(&self, id: &str) -> io::Result<()> {
         let mut containers = self.load_all()?;
@@ -127,6 +183,16 @@ fn write_atomic(destination: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 
     fs::rename(&tmp, destination)
+}
+
+/// Check if a process with the given PID is alive.
+fn is_process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 fn unique_temp_path(path: &Path) -> PathBuf {
@@ -189,6 +255,8 @@ mod tests {
                 image_id: "sha256:base".to_string(),
                 status: ContainerStatus::Created,
                 created_unix_secs: 1700,
+                started_unix_secs: None,
+                stopped_unix_secs: None,
                 rootfs_path: None,
                 host_pid: None,
             })
@@ -201,6 +269,8 @@ mod tests {
                 image_id: "sha256:base".to_string(),
                 status: ContainerStatus::Stopped { exit_code: 0 },
                 created_unix_secs: 1700,
+                started_unix_secs: None,
+                stopped_unix_secs: None,
                 rootfs_path: None,
                 host_pid: None,
             })
@@ -228,6 +298,8 @@ mod tests {
                 image_id: "sha256:base".to_string(),
                 status: ContainerStatus::Created,
                 created_unix_secs: 1700,
+                started_unix_secs: None,
+                stopped_unix_secs: None,
                 rootfs_path: Some(PathBuf::from("/tmp/example")),
                 host_pid: Some(12345),
             })
@@ -238,5 +310,165 @@ mod tests {
         let remaining = store.load_all().unwrap();
         assert!(remaining.is_empty());
         assert!(store.remove("container-1").is_err());
+    }
+
+    #[test]
+    fn find_returns_matching_container() {
+        let root = unique_temp_dir("find");
+        let store = ContainerStore::new(root);
+
+        store
+            .upsert(ContainerInfo {
+                id: "ctr-a".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:a".to_string(),
+                status: ContainerStatus::Running,
+                created_unix_secs: 100,
+                started_unix_secs: Some(101),
+                stopped_unix_secs: None,
+                rootfs_path: None,
+                host_pid: Some(std::process::id()),
+            })
+            .unwrap();
+
+        let found = store.find("ctr-a").unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, "ctr-a");
+
+        let missing = store.find("ctr-none").unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn reconcile_stale_transitions_dead_pid_containers() {
+        let root = unique_temp_dir("reconcile");
+        let store = ContainerStore::new(root);
+
+        // Container with a PID that definitely doesn't exist.
+        store
+            .upsert(ContainerInfo {
+                id: "stale-running".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:a".to_string(),
+                status: ContainerStatus::Running,
+                created_unix_secs: 100,
+                started_unix_secs: Some(101),
+                stopped_unix_secs: None,
+                rootfs_path: None,
+                host_pid: Some(999_999_999),
+            })
+            .unwrap();
+
+        // Container with our own PID — should remain running.
+        store
+            .upsert(ContainerInfo {
+                id: "alive-running".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:b".to_string(),
+                status: ContainerStatus::Running,
+                created_unix_secs: 200,
+                started_unix_secs: Some(201),
+                stopped_unix_secs: None,
+                rootfs_path: None,
+                host_pid: Some(std::process::id()),
+            })
+            .unwrap();
+
+        // Already stopped container — should be untouched.
+        store
+            .upsert(ContainerInfo {
+                id: "already-stopped".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:c".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 0 },
+                created_unix_secs: 50,
+                started_unix_secs: Some(51),
+                stopped_unix_secs: Some(60),
+                rootfs_path: None,
+                host_pid: None,
+            })
+            .unwrap();
+
+        let reconciled = store.reconcile_stale().unwrap();
+
+        assert_eq!(reconciled, vec!["stale-running".to_string()]);
+
+        let containers = store.load_all().unwrap();
+        let stale = containers.iter().find(|c| c.id == "stale-running").unwrap();
+        assert!(matches!(
+            stale.status,
+            ContainerStatus::Stopped { exit_code: -1 }
+        ));
+        assert!(stale.stopped_unix_secs.is_some());
+        assert!(stale.host_pid.is_none());
+
+        let alive = containers.iter().find(|c| c.id == "alive-running").unwrap();
+        assert!(matches!(alive.status, ContainerStatus::Running));
+        assert_eq!(alive.host_pid, Some(std::process::id()));
+    }
+
+    #[test]
+    fn reconcile_stale_cleans_up_rootfs() {
+        let root = unique_temp_dir("reconcile-rootfs");
+        let store = ContainerStore::new(root.clone());
+
+        let rootfs_dir = root.join("stale-rootfs");
+        fs::create_dir_all(&rootfs_dir).unwrap();
+
+        store
+            .upsert(ContainerInfo {
+                id: "stale-with-rootfs".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:a".to_string(),
+                status: ContainerStatus::Running,
+                created_unix_secs: 100,
+                started_unix_secs: Some(101),
+                stopped_unix_secs: None,
+                rootfs_path: Some(rootfs_dir.clone()),
+                host_pid: Some(999_999_999),
+            })
+            .unwrap();
+
+        let reconciled = store.reconcile_stale().unwrap();
+        assert_eq!(reconciled.len(), 1);
+        assert!(!rootfs_dir.exists());
+    }
+
+    #[test]
+    fn serde_round_trip_with_new_timestamp_fields() {
+        let original = ContainerInfo {
+            id: "ctr-serde".to_string(),
+            image: "alpine:3.22".to_string(),
+            image_id: "sha256:serde".to_string(),
+            status: ContainerStatus::Stopped { exit_code: 42 },
+            created_unix_secs: 1000,
+            started_unix_secs: Some(1001),
+            stopped_unix_secs: Some(1010),
+            rootfs_path: None,
+            host_pid: None,
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: ContainerInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, original);
+    }
+
+    #[test]
+    fn serde_backward_compat_missing_timestamp_fields() {
+        // Simulate old JSON without started_unix_secs/stopped_unix_secs.
+        let json = r#"{
+            "id": "old-ctr",
+            "image": "ubuntu:24.04",
+            "image_id": "sha256:old",
+            "status": "Created",
+            "created_unix_secs": 500,
+            "rootfs_path": null,
+            "host_pid": null
+        }"#;
+
+        let info: ContainerInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.id, "old-ctr");
+        assert!(info.started_unix_secs.is_none());
+        assert!(info.stopped_unix_secs.is_none());
     }
 }
