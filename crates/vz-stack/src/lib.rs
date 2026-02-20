@@ -13,7 +13,7 @@ mod spec;
 mod state_store;
 
 pub use error::StackError;
-pub use events::StackEvent;
+pub use events::{EventRecord, StackEvent};
 pub use reconcile::{ApplyResult, apply};
 pub use spec::{
     HealthCheckSpec, MountSpec, NetworkSpec, PortSpec, ResourcesSpec, RestartPolicy, ServiceSpec,

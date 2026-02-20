@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::StackSpec;
 use crate::error::StackError;
-use crate::events::StackEvent;
+use crate::events::{EventRecord, StackEvent};
 
 /// Observable phase of a service within a stack.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -177,18 +177,74 @@ impl StateStore {
 
     /// Load all events for a stack, ordered by creation time.
     pub fn load_events(&self, stack_name: &str) -> Result<Vec<StackEvent>, StackError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT event_json FROM events WHERE stack_name = ?1 ORDER BY created_at ASC",
-        )?;
-        let rows = stmt.query_map(params![stack_name], |row| row.get::<_, String>(0))?;
+        Ok(self
+            .load_event_records(stack_name)?
+            .into_iter()
+            .map(|r| r.event)
+            .collect())
+    }
 
-        let mut events = Vec::new();
-        for json_result in rows {
-            let json = json_result?;
+    /// Load all event records for a stack, including id and timestamp.
+    pub fn load_event_records(&self, stack_name: &str) -> Result<Vec<EventRecord>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, stack_name, event_json, created_at
+             FROM events WHERE stack_name = ?1
+             ORDER BY id ASC",
+        )?;
+        Self::collect_event_records(&mut stmt, params![stack_name])
+    }
+
+    /// Load events created after a given event ID (exclusive).
+    ///
+    /// This enables incremental streaming: a consumer stores the last
+    /// seen `EventRecord::id` and polls for new events using this method.
+    pub fn load_events_since(
+        &self,
+        stack_name: &str,
+        after_id: i64,
+    ) -> Result<Vec<EventRecord>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, stack_name, event_json, created_at
+             FROM events WHERE stack_name = ?1 AND id > ?2
+             ORDER BY id ASC",
+        )?;
+        Self::collect_event_records(&mut stmt, params![stack_name, after_id])
+    }
+
+    /// Count the total number of events for a stack.
+    pub fn event_count(&self, stack_name: &str) -> Result<usize, StackError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM events WHERE stack_name = ?1")?;
+        let count: i64 = stmt.query_row(params![stack_name], |row| row.get(0))?;
+        Ok(count as usize)
+    }
+
+    fn collect_event_records(
+        stmt: &mut rusqlite::Statement<'_>,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<EventRecord>, StackError> {
+        let rows = stmt.query_map(params, |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+
+        let mut records = Vec::new();
+        for row_result in rows {
+            let (id, stack_name, json, created_at) = row_result?;
             let event: StackEvent = serde_json::from_str(&json)?;
-            events.push(event);
+            records.push(EventRecord {
+                id,
+                stack_name,
+                created_at,
+                event,
+            });
         }
-        Ok(events)
+        Ok(records)
     }
 }
 
@@ -442,5 +498,210 @@ mod tests {
 
         assert_eq!(loaded1.name, "app1");
         assert_eq!(loaded2.name, "app2");
+    }
+
+    // ── B17: Event pipeline tests ──
+
+    #[test]
+    fn event_records_include_id_and_timestamp() {
+        let store = StateStore::in_memory().unwrap();
+
+        store
+            .emit_event(
+                "myapp",
+                &StackEvent::ServiceCreating {
+                    stack_name: "myapp".to_string(),
+                    service_name: "web".to_string(),
+                },
+            )
+            .unwrap();
+
+        let records = store.load_event_records("myapp").unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].id > 0);
+        assert!(!records[0].created_at.is_empty());
+        assert_eq!(records[0].stack_name, "myapp");
+        assert!(matches!(
+            records[0].event,
+            StackEvent::ServiceCreating { .. }
+        ));
+    }
+
+    #[test]
+    fn load_events_since_returns_only_newer_events() {
+        let store = StateStore::in_memory().unwrap();
+
+        store
+            .emit_event(
+                "myapp",
+                &StackEvent::StackApplyStarted {
+                    stack_name: "myapp".to_string(),
+                    services_count: 1,
+                },
+            )
+            .unwrap();
+
+        store
+            .emit_event(
+                "myapp",
+                &StackEvent::ServiceCreating {
+                    stack_name: "myapp".to_string(),
+                    service_name: "web".to_string(),
+                },
+            )
+            .unwrap();
+
+        store
+            .emit_event(
+                "myapp",
+                &StackEvent::ServiceReady {
+                    stack_name: "myapp".to_string(),
+                    service_name: "web".to_string(),
+                    runtime_id: "ctr-1".to_string(),
+                },
+            )
+            .unwrap();
+
+        let all = store.load_event_records("myapp").unwrap();
+        assert_eq!(all.len(), 3);
+
+        // Stream from after the first event.
+        let cursor = all[0].id;
+        let newer = store.load_events_since("myapp", cursor).unwrap();
+        assert_eq!(newer.len(), 2);
+        assert!(matches!(newer[0].event, StackEvent::ServiceCreating { .. }));
+        assert!(matches!(newer[1].event, StackEvent::ServiceReady { .. }));
+
+        // Stream from after the second event.
+        let cursor2 = newer[0].id;
+        let newest = store.load_events_since("myapp", cursor2).unwrap();
+        assert_eq!(newest.len(), 1);
+        assert!(matches!(newest[0].event, StackEvent::ServiceReady { .. }));
+    }
+
+    #[test]
+    fn load_events_since_with_zero_returns_all() {
+        let store = StateStore::in_memory().unwrap();
+
+        store
+            .emit_event(
+                "myapp",
+                &StackEvent::StackApplyStarted {
+                    stack_name: "myapp".to_string(),
+                    services_count: 1,
+                },
+            )
+            .unwrap();
+
+        let all = store.load_events_since("myapp", 0).unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn load_events_since_with_future_cursor_returns_empty() {
+        let store = StateStore::in_memory().unwrap();
+
+        store
+            .emit_event(
+                "myapp",
+                &StackEvent::StackApplyStarted {
+                    stack_name: "myapp".to_string(),
+                    services_count: 1,
+                },
+            )
+            .unwrap();
+
+        let empty = store.load_events_since("myapp", 999_999).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn event_count_returns_correct_total() {
+        let store = StateStore::in_memory().unwrap();
+
+        assert_eq!(store.event_count("myapp").unwrap(), 0);
+
+        store
+            .emit_event(
+                "myapp",
+                &StackEvent::StackApplyStarted {
+                    stack_name: "myapp".to_string(),
+                    services_count: 1,
+                },
+            )
+            .unwrap();
+
+        store
+            .emit_event(
+                "myapp",
+                &StackEvent::StackApplyCompleted {
+                    stack_name: "myapp".to_string(),
+                    succeeded: 1,
+                    failed: 0,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(store.event_count("myapp").unwrap(), 2);
+        assert_eq!(store.event_count("other").unwrap(), 0);
+    }
+
+    #[test]
+    fn event_records_ids_are_monotonically_increasing() {
+        let store = StateStore::in_memory().unwrap();
+
+        for i in 0..5 {
+            store
+                .emit_event(
+                    "myapp",
+                    &StackEvent::ServiceCreating {
+                        stack_name: "myapp".to_string(),
+                        service_name: format!("svc-{i}"),
+                    },
+                )
+                .unwrap();
+        }
+
+        let records = store.load_event_records("myapp").unwrap();
+        assert_eq!(records.len(), 5);
+        for window in records.windows(2) {
+            assert!(window[1].id > window[0].id);
+        }
+    }
+
+    #[test]
+    fn new_event_variants_persist_and_load() {
+        let store = StateStore::in_memory().unwrap();
+
+        let events = vec![
+            StackEvent::ServiceStopping {
+                stack_name: "myapp".to_string(),
+                service_name: "web".to_string(),
+            },
+            StackEvent::ServiceStopped {
+                stack_name: "myapp".to_string(),
+                service_name: "web".to_string(),
+                exit_code: 137,
+            },
+            StackEvent::PortConflict {
+                stack_name: "myapp".to_string(),
+                service_name: "web".to_string(),
+                port: 8080,
+            },
+            StackEvent::VolumeCreated {
+                stack_name: "myapp".to_string(),
+                volume_name: "dbdata".to_string(),
+            },
+            StackEvent::StackDestroyed {
+                stack_name: "myapp".to_string(),
+            },
+        ];
+
+        for event in &events {
+            store.emit_event("myapp", event).unwrap();
+        }
+
+        let loaded = store.load_events("myapp").unwrap();
+        assert_eq!(loaded, events);
     }
 }
