@@ -190,7 +190,7 @@ pub struct ImageSummary {
     pub skipped: usize,
 }
 
-mod duration_serde {
+pub(crate) mod duration_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::time::Duration;
 

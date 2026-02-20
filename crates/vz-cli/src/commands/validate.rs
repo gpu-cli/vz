@@ -13,8 +13,8 @@ use clap::{Args, Subcommand};
 use tracing::info;
 
 use vz_validation::{
-    CohortManifest, ExecOutput, MockAdapter, RuntimeAdapter, ScenarioRunner, TestReport,
-    default_manifest,
+    CohortManifest, ExecOutput, MockAdapter, RuntimeAdapter, ScenarioRunner, StressConfig,
+    StressReport, TestReport, default_manifest, stress_scenario,
 };
 
 /// Validate OCI image cohorts with tiered test suites.
@@ -52,6 +52,14 @@ pub struct RunArgs {
     /// Output report as JSON to stdout.
     #[arg(long)]
     pub json: bool,
+
+    /// Number of stress iterations (Tier 3 only).
+    #[arg(long, default_value = "100")]
+    pub iterations: usize,
+
+    /// Maximum allowed flake rate (0.0-1.0, Tier 3 only).
+    #[arg(long, default_value = "0.05")]
+    pub max_flake_rate: f64,
 }
 
 /// Arguments for `vz validate manifest`.
@@ -114,6 +122,11 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         cohort.images.len()
     );
 
+    // Tier 3 uses stress mode with repeated iterations.
+    if args.tier == 3 {
+        return cmd_run_stress(&args, &manifest, cohort);
+    }
+
     let start = Instant::now();
     let timestamp = now_iso8601();
     let mut report = TestReport::new(tier, &timestamp);
@@ -123,8 +136,6 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         let runner = ScenarioRunner::new(adapter);
         run_cohort(&runner, &manifest, cohort, &mut report);
     } else {
-        // Real runtime adapter: for now, use MockAdapter with a passing output.
-        // This will be replaced with the real OCI runtime adapter in future beads.
         let adapter = MockAdapter {
             output: ExecOutput {
                 exit_code: 0,
@@ -147,7 +158,6 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         println!("{json}");
     } else {
         print_report_summary(&report);
-        // For nightly (Tier 2+), show per-image summary.
         if args.tier >= 2 {
             print_per_image_summary(&report);
         }
@@ -171,6 +181,105 @@ fn cmd_run(args: RunArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn cmd_run_stress(
+    args: &RunArgs,
+    manifest: &CohortManifest,
+    cohort: &vz_validation::ImageCohort,
+) -> Result<()> {
+    let config = StressConfig {
+        iterations: args.iterations,
+        max_flake_rate: args.max_flake_rate,
+    };
+
+    let start = Instant::now();
+    let timestamp = now_iso8601();
+    let mut report = StressReport::new(&timestamp, config.clone());
+
+    // Both dry-run and real mode use a mock for now (real adapter in future beads).
+    let mock = MockAdapter {
+        output: ExecOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            lifecycle_events: Vec::new(),
+        },
+    };
+    let runner = ScenarioRunner::new(mock);
+
+    for image in &cohort.images {
+        let scenarios = manifest.scenarios_for_image(&image.reference);
+        for scenario in &scenarios {
+            info!(
+                "Stress testing {} / {} ({} iterations)",
+                image.label, scenario.id, config.iterations
+            );
+            let result = stress_scenario(&runner, image, scenario, config.iterations);
+            report.add_result(result);
+        }
+    }
+
+    let duration = start.elapsed();
+    report.finalize(duration);
+
+    // Output results.
+    if args.json {
+        let json = serde_json::to_string_pretty(&report)
+            .context("failed to serialize stress report")?;
+        println!("{json}");
+    } else {
+        print_stress_summary(&report);
+    }
+
+    // Write to file if requested.
+    if let Some(ref output) = args.output {
+        let json = serde_json::to_string_pretty(&report)
+            .context("failed to serialize stress report")?;
+        std::fs::write(output, &json)
+            .with_context(|| format!("failed to write report to {}", output.display()))?;
+        info!("Stress report written to {}", output.display());
+    }
+
+    if !report.all_passed() {
+        bail!(
+            "stress test failed: {} hard failures, {} flaky (>{:.0}% rate)",
+            report.hard_failure_count(),
+            report.flaky_count(),
+            report.config.max_flake_rate * 100.0,
+        );
+    }
+
+    Ok(())
+}
+
+fn print_stress_summary(report: &StressReport) {
+    println!("{}", report.summary_line());
+    println!();
+
+    for result in &report.results {
+        let status = if result.hard_failure {
+            "HARD-FAIL"
+        } else if result.flake_rate > report.config.max_flake_rate {
+            "FLAKY"
+        } else {
+            "STABLE"
+        };
+
+        println!(
+            "  [{status:<9}] {image} / {scenario}: {passed}/{total} passed ({flake:.1}% flake, {avg}ms avg)",
+            image = result.image.label,
+            scenario = result.scenario_id,
+            passed = result.passed,
+            total = result.iterations,
+            flake = result.flake_rate * 100.0,
+            avg = result.avg_duration.as_millis(),
+        );
+
+        if let Some(ref failure) = result.first_failure {
+            println!("            first failure: {failure}");
+        }
+    }
 }
 
 fn run_cohort<R: RuntimeAdapter>(
@@ -269,6 +378,7 @@ fn cmd_list(args: ListArgs) -> Result<()> {
         vec![
             vz_validation::Tier::Tier1,
             vz_validation::Tier::Tier2,
+            vz_validation::Tier::Tier3,
         ]
     };
 

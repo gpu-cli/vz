@@ -11,8 +11,9 @@ mod manifest;
 mod report;
 mod runner;
 mod scenario;
+mod stress;
 
-pub use cohort::{ImageCohort, ImageRef, Tier, tier1_smoke, tier2_nightly};
+pub use cohort::{ImageCohort, ImageRef, Tier, tier1_smoke, tier2_nightly, tier3_weekly};
 pub use manifest::{
     CohortManifest, DefaultBehavior, ImageProfile, ProbeProtocol, ServiceInfo,
     default_manifest, MANIFEST_VERSION,
@@ -24,3 +25,4 @@ pub use scenario::{
     s2_user_scenarios, s3_mount_scenarios, s4_signal_scenarios, s5_service_scenarios,
     s6_compose_scenarios,
 };
+pub use stress::{ScenarioStressResult, StressConfig, StressReport, stress_scenario};

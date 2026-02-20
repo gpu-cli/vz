@@ -131,6 +131,39 @@ pub fn tier2_nightly() -> ImageCohort {
     }
 }
 
+/// Build the Tier 3 weekly stress cohort.
+///
+/// Uses a subset of Tier 2 images focused on exercising repeated lifecycle
+/// operations and concurrent stack scenarios.
+pub fn tier3_weekly() -> ImageCohort {
+    ImageCohort {
+        name: "tier-3-weekly".to_string(),
+        tier: Tier::Tier3,
+        images: vec![
+            ImageRef {
+                reference: "alpine:3.20".to_string(),
+                digest: None,
+                label: "Alpine 3.20".to_string(),
+            },
+            ImageRef {
+                reference: "nginx:1.27-alpine".to_string(),
+                digest: None,
+                label: "Nginx 1.27 Alpine".to_string(),
+            },
+            ImageRef {
+                reference: "redis:7-alpine".to_string(),
+                digest: None,
+                label: "Redis 7 Alpine".to_string(),
+            },
+        ],
+        scenarios: vec![
+            ScenarioKind::EntrypointCmd,
+            ScenarioKind::SignalHandling,
+            ScenarioKind::ServiceBehavior,
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -186,6 +219,17 @@ mod tests {
                 img.reference
             );
         }
+    }
+
+    #[test]
+    fn tier3_weekly_uses_representative_subset() {
+        let t3 = tier3_weekly();
+        assert_eq!(t3.tier, Tier::Tier3);
+        assert_eq!(t3.images.len(), 3);
+        let refs: Vec<&str> = t3.images.iter().map(|i| i.reference.as_str()).collect();
+        assert!(refs.contains(&"alpine:3.20"));
+        assert!(refs.contains(&"nginx:1.27-alpine"));
+        assert!(refs.contains(&"redis:7-alpine"));
     }
 
     #[test]

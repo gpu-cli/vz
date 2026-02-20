@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cohort::{ImageCohort, Tier, tier1_smoke, tier2_nightly};
+use crate::cohort::{ImageCohort, Tier, tier1_smoke, tier2_nightly, tier3_weekly};
 use crate::scenario::{
     Scenario, ScenarioKind, s1_entrypoint_scenarios, s1_env_cwd_scenarios, s2_user_scenarios,
     s3_mount_scenarios, s4_signal_scenarios, s5_service_scenarios, s6_compose_scenarios,
@@ -175,7 +175,7 @@ impl CohortManifest {
 
 /// Build the default manifest with all standard cohorts and profiles.
 pub fn default_manifest(updated_at: &str) -> CohortManifest {
-    let cohorts = vec![tier1_smoke(), tier2_nightly()];
+    let cohorts = vec![tier1_smoke(), tier2_nightly(), tier3_weekly()];
 
     let profiles = build_profiles();
     let applicability = build_applicability();
@@ -335,11 +335,11 @@ mod tests {
     }
 
     #[test]
-    fn manifest_has_both_tiers() {
+    fn manifest_has_all_tiers() {
         let m = test_manifest();
         assert!(m.cohort_for_tier(Tier::Tier1).is_some());
         assert!(m.cohort_for_tier(Tier::Tier2).is_some());
-        assert!(m.cohort_for_tier(Tier::Tier3).is_none());
+        assert!(m.cohort_for_tier(Tier::Tier3).is_some());
     }
 
     #[test]
@@ -462,9 +462,12 @@ mod tests {
     }
 
     #[test]
-    fn test_matrix_size_nonexistent_tier() {
+    fn test_matrix_size_tier3() {
         let m = test_manifest();
-        assert_eq!(m.test_matrix_size(Tier::Tier3), 0);
+        // Tier 3 has 3 images: alpine(8), nginx(16), redis(16)
+        let size = m.test_matrix_size(Tier::Tier3);
+        assert!(size > 0);
+        assert_eq!(size, 40);
     }
 
     #[test]
