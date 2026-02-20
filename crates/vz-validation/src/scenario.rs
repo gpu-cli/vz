@@ -186,6 +186,92 @@ pub fn s2_user_scenarios() -> Vec<Scenario> {
     ]
 }
 
+/// Build S1 extension scenarios for env/cwd propagation.
+pub fn s1_env_cwd_scenarios() -> Vec<Scenario> {
+    let mut env = HashMap::new();
+    env.insert("VZ_TEST_VAR".to_string(), "hello-from-env".to_string());
+
+    vec![
+        Scenario {
+            id: "s1-env-propagation".to_string(),
+            kind: ScenarioKind::EntrypointCmd,
+            description: "Verify environment variable propagation".to_string(),
+            command: Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo $VZ_TEST_VAR".to_string(),
+            ]),
+            entrypoint: None,
+            environment: env,
+            working_dir: None,
+            user: None,
+            expectations: vec![
+                Expectation::ExitCode { code: 0 },
+                Expectation::StdoutContains {
+                    substring: "hello-from-env".to_string(),
+                },
+            ],
+        },
+        Scenario {
+            id: "s1-working-dir".to_string(),
+            kind: ScenarioKind::EntrypointCmd,
+            description: "Verify working directory override".to_string(),
+            command: Some(vec!["pwd".to_string()]),
+            entrypoint: None,
+            environment: HashMap::new(),
+            working_dir: Some("/tmp".to_string()),
+            user: None,
+            expectations: vec![
+                Expectation::ExitCode { code: 0 },
+                Expectation::StdoutContains {
+                    substring: "/tmp".to_string(),
+                },
+            ],
+        },
+    ]
+}
+
+/// Build standard S5 scenarios for service image behavior.
+pub fn s5_service_scenarios() -> Vec<Scenario> {
+    vec![
+        Scenario {
+            id: "s5-service-start".to_string(),
+            kind: ScenarioKind::ServiceBehavior,
+            description: "Verify service image starts and reaches ready state".to_string(),
+            command: None,
+            entrypoint: None,
+            environment: HashMap::new(),
+            working_dir: None,
+            user: None,
+            expectations: vec![
+                Expectation::ExitCode { code: 0 },
+                Expectation::LifecycleSequence {
+                    events: vec![
+                        "create".to_string(),
+                        "start".to_string(),
+                        "ready".to_string(),
+                        "stop".to_string(),
+                        "delete".to_string(),
+                    ],
+                },
+            ],
+        },
+        Scenario {
+            id: "s5-port-reachable".to_string(),
+            kind: ScenarioKind::ServiceBehavior,
+            description: "Verify published port is reachable after service start".to_string(),
+            command: None,
+            entrypoint: None,
+            environment: HashMap::new(),
+            working_dir: None,
+            user: None,
+            expectations: vec![
+                Expectation::ExitCode { code: 0 },
+            ],
+        },
+    ]
+}
+
 /// Build standard S4 scenarios for signal handling.
 pub fn s4_signal_scenarios() -> Vec<Scenario> {
     vec![Scenario {
@@ -278,5 +364,23 @@ mod tests {
         let scenarios = s4_signal_scenarios();
         assert_eq!(scenarios.len(), 1);
         assert!(scenarios[0].kind == ScenarioKind::SignalHandling);
+    }
+
+    #[test]
+    fn s1_env_cwd_scenarios_are_valid() {
+        let scenarios = s1_env_cwd_scenarios();
+        assert_eq!(scenarios.len(), 2);
+        assert!(scenarios.iter().all(|s| s.kind == ScenarioKind::EntrypointCmd));
+        // env propagation scenario has environment set
+        assert!(!scenarios[0].environment.is_empty());
+        // working dir scenario has working_dir set
+        assert!(scenarios[1].working_dir.is_some());
+    }
+
+    #[test]
+    fn s5_service_scenarios_are_valid() {
+        let scenarios = s5_service_scenarios();
+        assert_eq!(scenarios.len(), 2);
+        assert!(scenarios.iter().all(|s| s.kind == ScenarioKind::ServiceBehavior));
     }
 }

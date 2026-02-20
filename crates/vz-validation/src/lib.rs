@@ -20,6 +20,6 @@ pub use manifest::{
 pub use report::{ScenarioOutcome, TestReport, TestResult};
 pub use runner::{ExecOutput, FailingAdapter, MockAdapter, RuntimeAdapter, ScenarioRunner};
 pub use scenario::{
-    Expectation, Scenario, ScenarioKind, s1_entrypoint_scenarios, s2_user_scenarios,
-    s4_signal_scenarios,
+    Expectation, Scenario, ScenarioKind, s1_entrypoint_scenarios, s1_env_cwd_scenarios,
+    s2_user_scenarios, s4_signal_scenarios, s5_service_scenarios,
 };

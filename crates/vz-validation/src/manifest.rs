@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::cohort::{ImageCohort, Tier, tier1_smoke, tier2_nightly};
 use crate::scenario::{
-    Scenario, ScenarioKind, s1_entrypoint_scenarios, s2_user_scenarios, s4_signal_scenarios,
+    Scenario, ScenarioKind, s1_entrypoint_scenarios, s1_env_cwd_scenarios, s2_user_scenarios,
+    s4_signal_scenarios, s5_service_scenarios,
 };
 
 /// Current manifest format version.
@@ -131,6 +132,7 @@ impl CohortManifest {
             match kind {
                 ScenarioKind::EntrypointCmd => {
                     scenarios.extend(s1_entrypoint_scenarios());
+                    scenarios.extend(s1_env_cwd_scenarios());
                 }
                 ScenarioKind::UserPermissions => {
                     scenarios.extend(s2_user_scenarios());
@@ -138,7 +140,10 @@ impl CohortManifest {
                 ScenarioKind::SignalHandling => {
                     scenarios.extend(s4_signal_scenarios());
                 }
-                // S3, S5, S6 builders will be added in future beads.
+                ScenarioKind::ServiceBehavior => {
+                    scenarios.extend(s5_service_scenarios());
+                }
+                // S3, S6 builders will be added in future beads.
                 _ => {}
             }
         }
@@ -379,14 +384,20 @@ mod tests {
     fn scenarios_for_image_filters_correctly() {
         let m = test_manifest();
         let alpine_scenarios = m.scenarios_for_image("alpine:3.20");
-        // Alpine gets S1 (3 scenarios) + S2 (2 scenarios) + S4 (1 scenario) = 6
-        assert_eq!(alpine_scenarios.len(), 6);
+        // Alpine gets S1 (3 base + 2 env/cwd) + S2 (2) + S4 (1) = 8
+        assert_eq!(alpine_scenarios.len(), 8);
 
         // All scenarios should be from applicable kinds.
         let applicable = m.applicable_scenarios("alpine:3.20");
         for s in &alpine_scenarios {
             assert!(applicable.contains(&s.kind));
         }
+
+        // Service images get S5 scenarios too.
+        let nginx_scenarios = m.scenarios_for_image("nginx:1.27-alpine");
+        // nginx: S1 (5) + S2 (2) + S4 (1) + S5 (2) + S3 (no builder) = 10
+        assert_eq!(nginx_scenarios.len(), 10);
+        assert!(nginx_scenarios.iter().any(|s| s.kind == ScenarioKind::ServiceBehavior));
     }
 
     #[test]
@@ -424,15 +435,13 @@ mod tests {
     #[test]
     fn test_matrix_size_tier1() {
         let m = test_manifest();
-        // Tier 1 has 3 images. Each gets scenarios filtered by applicable kinds.
-        // But Tier 1 cohort only lists EntrypointCmd + UserPermissions.
-        // scenarios_for_image returns ALL applicable, not just tier-scoped.
-        // The matrix size counts scenarios_for_image per image in the cohort.
+        // Tier 1 has 3 images:
+        // alpine: S1(5) + S2(2) + S4(1) = 8
+        // python: S1(5) + S2(2) + S4(1) = 8
+        // nginx:  S1(5) + S2(2) + S4(1) + S5(2) = 10 (S3 has no builder)
         let size = m.test_matrix_size(Tier::Tier1);
         assert!(size > 0);
-        // alpine: 6 (3 S1 + 2 S2 + 1 S4), python: 6, nginx: 6 = 18
-        // But nginx also gets MountSemantics + ServiceBehavior which have no builders yet.
-        assert_eq!(size, 18);
+        assert_eq!(size, 26);
     }
 
     #[test]

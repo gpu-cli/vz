@@ -78,6 +78,7 @@ pub fn tier1_smoke() -> ImageCohort {
         scenarios: vec![
             ScenarioKind::EntrypointCmd,
             ScenarioKind::UserPermissions,
+            ScenarioKind::SignalHandling,
         ],
     }
 }
