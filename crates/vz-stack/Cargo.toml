@@ -14,5 +14,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 rusqlite = { version = "0.34", features = ["bundled"] }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints]
 workspace = true

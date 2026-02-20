@@ -8,6 +8,7 @@
 
 mod error;
 mod events;
+mod network;
 mod reconcile;
 mod spec;
 mod state_store;
@@ -15,6 +16,10 @@ mod volume;
 
 pub use error::StackError;
 pub use events::{EventRecord, StackEvent};
+pub use network::{
+    GvproxyBackend, GvproxyConfig, NetworkBackend, NetworkHandle, PortConflict, PublishedPort,
+    detect_port_conflicts, locate_gvproxy, ports_changed, resolve_ports,
+};
 pub use reconcile::{Action, ApplyResult, apply};
 pub use spec::{
     HealthCheckSpec, MountSpec, NetworkSpec, PortSpec, ResourcesSpec, RestartPolicy, ServiceSpec,

@@ -12,4 +12,8 @@ pub enum StackError {
     /// Invalid stack specification.
     #[error("invalid stack spec: {0}")]
     InvalidSpec(String),
+
+    /// Network backend operation failed.
+    #[error("network error: {0}")]
+    Network(String),
 }
