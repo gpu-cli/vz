@@ -165,6 +165,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use crate::spec::ServiceSpec;
 
     fn svc(name: &str, policy: Option<RestartPolicy>) -> ServiceSpec {
         ServiceSpec {

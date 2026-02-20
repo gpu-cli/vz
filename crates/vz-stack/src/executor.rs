@@ -158,6 +158,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         &self.ports
     }
 
+    /// Access the underlying container runtime.
+    pub fn runtime(&self) -> &R {
+        &self.runtime
+    }
+
     /// Execute a batch of reconciler actions for the given stack spec.
     ///
     /// Each action is processed in order. Failures on one service do not
