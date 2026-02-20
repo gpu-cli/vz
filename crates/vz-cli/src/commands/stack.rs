@@ -1,18 +1,20 @@
 //! `vz stack` — multi-service stack lifecycle commands.
 //!
 //! Provides `up`, `down`, `ps`, and `events` subcommands backed by
-//! the `vz-stack` control plane.
+//! the `vz-stack` control plane. The [`OciContainerRuntime`] bridges
+//! the async `vz_oci::Runtime` to the sync [`ContainerRuntime`] trait
+//! using `block_in_place` + `block_on`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
 use tracing::info;
 
 use vz_stack::{
-    ApplyResult, EventRecord, ServiceObservedState, ServicePhase, StackEvent, StackSpec,
-    StateStore, parse_compose,
+    ApplyResult, ContainerRuntime, EventRecord, ExecutionResult, ServiceObservedState,
+    ServicePhase, StackError, StackEvent, StackExecutor, StackSpec, StateStore, parse_compose,
 };
 
 /// Manage multi-service stacks from Compose files.
@@ -50,6 +52,10 @@ pub struct UpArgs {
     /// State directory for stack persistence.
     #[arg(long)]
     pub state_dir: Option<PathBuf>,
+
+    /// Show planned actions without executing them.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -60,6 +66,10 @@ pub struct DownArgs {
     /// State directory for stack persistence.
     #[arg(long)]
     pub state_dir: Option<PathBuf>,
+
+    /// Show planned actions without executing them.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -103,6 +113,79 @@ pub async fn run(args: StackArgs) -> anyhow::Result<()> {
     }
 }
 
+// ── OCI container runtime bridge ──────────────────────────────────
+
+/// Bridges the async `vz_oci::Runtime` to the sync [`ContainerRuntime`] trait.
+///
+/// Each method uses `tokio::task::block_in_place` + `Handle::block_on`
+/// to call async OCI runtime methods from within the synchronous
+/// executor context.
+struct OciContainerRuntime {
+    runtime: vz_oci::Runtime,
+    handle: tokio::runtime::Handle,
+}
+
+impl OciContainerRuntime {
+    fn new(oci_data_dir: &Path) -> anyhow::Result<Self> {
+        let config = vz_oci::RuntimeConfig {
+            data_dir: oci_data_dir.to_path_buf(),
+            ..Default::default()
+        };
+        let runtime = vz_oci::Runtime::new(config);
+        let handle = tokio::runtime::Handle::current();
+        Ok(Self { runtime, handle })
+    }
+}
+
+impl ContainerRuntime for OciContainerRuntime {
+    fn pull(&self, image: &str) -> Result<String, StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.runtime.pull(image))
+                .map(|id| id.0)
+                .map_err(|e| StackError::Network(format!("pull failed: {e}")))
+        })
+    }
+
+    fn create(&self, image: &str, config: vz_oci::RunConfig) -> Result<String, StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.runtime.create_container(image, config))
+                .map_err(|e| StackError::Network(format!("create failed: {e}")))
+        })
+    }
+
+    fn stop(&self, container_id: &str) -> Result<(), StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.runtime.stop_container(container_id, false))
+                .map(|_| ())
+                .map_err(|e| StackError::Network(format!("stop failed: {e}")))
+        })
+    }
+
+    fn remove(&self, container_id: &str) -> Result<(), StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.runtime.remove_container(container_id))
+                .map_err(|e| StackError::Network(format!("remove failed: {e}")))
+        })
+    }
+
+    fn exec(&self, container_id: &str, command: &[String]) -> Result<i32, StackError> {
+        tokio::task::block_in_place(|| {
+            let exec_config = vz_oci::ExecConfig {
+                cmd: command.to_vec(),
+                ..Default::default()
+            };
+            self.handle
+                .block_on(self.runtime.exec_container(container_id, exec_config))
+                .map(|output| output.exit_code)
+                .map_err(|e| StackError::Network(format!("exec failed: {e}")))
+        })
+    }
+}
+
 // ── up ─────────────────────────────────────────────────────────────
 
 async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
@@ -132,6 +215,36 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
         .with_context(|| "stack apply failed")?;
 
     print_apply_result(&result);
+
+    if result.actions.is_empty() {
+        return Ok(());
+    }
+
+    if args.dry_run {
+        println!("\n--dry-run: skipping execution");
+        return Ok(());
+    }
+
+    // Execute actions through the OCI runtime.
+    let oci_runtime = OciContainerRuntime::new(&state_dir)
+        .with_context(|| "failed to initialize OCI runtime")?;
+
+    let exec_store = StateStore::open(&db_path)
+        .with_context(|| "failed to open execution state store")?;
+
+    let mut executor = StackExecutor::new(oci_runtime, exec_store, &state_dir);
+    let exec_result = executor
+        .execute(&spec, &result.actions)
+        .with_context(|| "execution failed")?;
+
+    print_execution_result(&exec_result);
+
+    if !exec_result.all_succeeded() {
+        bail!(
+            "{} action(s) failed",
+            exec_result.failed,
+        );
+    }
 
     Ok(())
 }
@@ -174,6 +287,29 @@ async fn cmd_down(args: DownArgs) -> anyhow::Result<()> {
         .with_context(|| "stack teardown failed")?;
 
     print_apply_result(&result);
+
+    if result.actions.is_empty() {
+        return Ok(());
+    }
+
+    if args.dry_run {
+        println!("\n--dry-run: skipping execution");
+        return Ok(());
+    }
+
+    // Execute removal actions through the OCI runtime.
+    let oci_runtime = OciContainerRuntime::new(&state_dir)
+        .with_context(|| "failed to initialize OCI runtime")?;
+
+    let exec_store = StateStore::open(&db_path)
+        .with_context(|| "failed to open execution state store")?;
+
+    let mut executor = StackExecutor::new(oci_runtime, exec_store, &state_dir);
+    let exec_result = executor
+        .execute(&empty_spec, &result.actions)
+        .with_context(|| "teardown execution failed")?;
+
+    print_execution_result(&exec_result);
 
     Ok(())
 }
@@ -301,6 +437,20 @@ fn print_apply_result(result: &ApplyResult) {
     );
 }
 
+fn print_execution_result(result: &ExecutionResult) {
+    if result.all_succeeded() {
+        println!("\nAll {} action(s) succeeded.", result.succeeded);
+    } else {
+        println!(
+            "\n{} succeeded, {} failed.",
+            result.succeeded, result.failed
+        );
+        for (service, error) in &result.errors {
+            println!("  error: {service}: {error}");
+        }
+    }
+}
+
 fn print_ps_table(observed: &[ServiceObservedState]) {
     if observed.is_empty() {
         println!("No services found.");
@@ -309,22 +459,23 @@ fn print_ps_table(observed: &[ServiceObservedState]) {
 
     // Header.
     println!(
-        "{:<20} {:<12} {:<40}",
+        "{:<20} {:<14} {:<40}",
         "SERVICE", "STATUS", "CONTAINER ID"
     );
-    println!("{}", "-".repeat(72));
+    println!("{}", "-".repeat(74));
 
     for svc in observed {
         let status = match svc.phase {
-            ServicePhase::Pending => "pending",
-            ServicePhase::Creating => "creating",
-            ServicePhase::Running => "running",
-            ServicePhase::Stopping => "stopping",
-            ServicePhase::Stopped => "stopped",
-            ServicePhase::Failed => "failed",
+            ServicePhase::Pending => "pending".to_string(),
+            ServicePhase::Creating => "creating".to_string(),
+            ServicePhase::Running if svc.ready => "running (ready)".to_string(),
+            ServicePhase::Running => "running".to_string(),
+            ServicePhase::Stopping => "stopping".to_string(),
+            ServicePhase::Stopped => "stopped".to_string(),
+            ServicePhase::Failed => "failed".to_string(),
         };
         let cid = svc.container_id.as_deref().unwrap_or("-");
-        println!("{:<20} {:<12} {:<40}", svc.service_name, status, cid);
+        println!("{:<20} {:<14} {:<40}", svc.service_name, status, cid);
     }
 }
 

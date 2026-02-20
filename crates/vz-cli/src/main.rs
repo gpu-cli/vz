@@ -301,6 +301,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_stack_up_dry_run() {
+        let cli = Cli::try_parse_from([
+            "vz", "stack", "up", "--file", "compose.yaml", "--dry-run",
+        ])
+        .expect("parse");
+        if let Commands::Stack(ref args) = cli.command {
+            if let commands::stack::StackCommand::Up(ref up) = args.action {
+                assert!(up.dry_run);
+            } else {
+                panic!("expected Up");
+            }
+        } else {
+            panic!("expected Stack");
+        }
+    }
+
+    #[test]
     fn parse_stack_down() {
         let cli = Cli::try_parse_from(["vz", "stack", "down", "myapp"]).expect("parse");
         assert!(matches!(
