@@ -44,6 +44,9 @@ pub struct ServiceObservedState {
     /// Last error message, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Whether the service is ready (health checks passing or no check defined).
+    #[serde(default)]
+    pub ready: bool,
 }
 
 /// Durable state store backed by a single SQLite database file.
@@ -352,6 +355,7 @@ mod tests {
             phase: ServicePhase::Running,
             container_id: Some("ctr-abc".to_string()),
             last_error: None,
+            ready: true,
         };
 
         let state2 = ServiceObservedState {
@@ -359,6 +363,7 @@ mod tests {
             phase: ServicePhase::Pending,
             container_id: None,
             last_error: None,
+            ready: false,
         };
 
         store.save_observed_state("myapp", &state1).unwrap();
@@ -379,6 +384,7 @@ mod tests {
             phase: ServicePhase::Creating,
             container_id: None,
             last_error: None,
+            ready: false,
         };
 
         store.save_observed_state("myapp", &initial).unwrap();
@@ -388,6 +394,7 @@ mod tests {
             phase: ServicePhase::Running,
             container_id: Some("ctr-xyz".to_string()),
             last_error: None,
+            ready: true,
         };
 
         store.save_observed_state("myapp", &updated).unwrap();

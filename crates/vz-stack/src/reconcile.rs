@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::error::StackError;
 use crate::events::StackEvent;
+use crate::health::{DependencyCheck, HealthStatus, check_dependencies};
 use crate::spec::{ServiceSpec, StackSpec};
 use crate::state_store::{ServiceObservedState, ServicePhase, StateStore};
 
@@ -48,6 +49,17 @@ impl Action {
 pub struct ApplyResult {
     /// Actions that were planned (and would be executed by a real runtime).
     pub actions: Vec<Action>,
+    /// Services deferred because their dependencies are not ready.
+    pub deferred: Vec<DeferredService>,
+}
+
+/// A service whose creation was deferred due to unready dependencies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredService {
+    /// Service name that was deferred.
+    pub service_name: String,
+    /// Dependencies that are not yet ready.
+    pub waiting_on: Vec<String>,
 }
 
 /// Persist desired state, compute action plan, and update observed state.
@@ -56,9 +68,18 @@ pub struct ApplyResult {
 /// 1. Persists the desired spec in the state store.
 /// 2. Loads current observed state.
 /// 3. Computes a deterministic, dependency-ordered action plan.
-/// 4. Updates observed state for each action (create/remove).
-/// 5. Emits lifecycle events for observability.
-pub fn apply(spec: &StackSpec, store: &StateStore) -> Result<ApplyResult, StackError> {
+/// 4. Gates service creation on dependency readiness.
+/// 5. Updates observed state for each action (create/remove).
+/// 6. Emits lifecycle events for observability.
+///
+/// Services whose dependencies are not ready are deferred and
+/// reported in [`ApplyResult::deferred`]. Re-applying the same
+/// spec after dependencies become ready will create them.
+pub fn apply(
+    spec: &StackSpec,
+    store: &StateStore,
+    health_statuses: &HashMap<String, HealthStatus>,
+) -> Result<ApplyResult, StackError> {
     // 1. Persist desired state.
     store.save_desired_state(&spec.name, spec)?;
 
@@ -74,10 +95,22 @@ pub fn apply(spec: &StackSpec, store: &StateStore) -> Result<ApplyResult, StackE
     // 3. Load current observed state.
     let observed = store.load_observed_state(&spec.name)?;
 
-    // 4. Compute action plan.
-    let actions = compute_actions(&spec.services, &observed);
+    // 4. Compute action plan with dependency gating.
+    let (actions, deferred) = compute_actions(&spec.services, &observed, health_statuses);
 
-    // 5. Execute action plan (update observed state).
+    // 5. Emit events for deferred services.
+    for d in &deferred {
+        store.emit_event(
+            &spec.name,
+            &StackEvent::DependencyBlocked {
+                stack_name: spec.name.clone(),
+                service_name: d.service_name.clone(),
+                waiting_on: d.waiting_on.clone(),
+            },
+        )?;
+    }
+
+    // 6. Execute action plan (update observed state).
     let mut succeeded = 0;
     let failed = 0;
     for action in &actions {
@@ -90,6 +123,7 @@ pub fn apply(spec: &StackSpec, store: &StateStore) -> Result<ApplyResult, StackE
                         phase: ServicePhase::Pending,
                         container_id: None,
                         last_error: None,
+                        ready: false,
                     },
                 )?;
                 store.emit_event(
@@ -109,6 +143,7 @@ pub fn apply(spec: &StackSpec, store: &StateStore) -> Result<ApplyResult, StackE
                         phase: ServicePhase::Pending,
                         container_id: None,
                         last_error: None,
+                        ready: false,
                     },
                 )?;
                 store.emit_event(
@@ -128,6 +163,7 @@ pub fn apply(spec: &StackSpec, store: &StateStore) -> Result<ApplyResult, StackE
                         phase: ServicePhase::Stopped,
                         container_id: None,
                         last_error: None,
+                        ready: false,
                     },
                 )?;
                 store.emit_event(
@@ -143,7 +179,7 @@ pub fn apply(spec: &StackSpec, store: &StateStore) -> Result<ApplyResult, StackE
         }
     }
 
-    // 6. Emit completion event.
+    // 7. Emit completion event.
     store.emit_event(
         &spec.name,
         &StackEvent::StackApplyCompleted {
@@ -153,7 +189,7 @@ pub fn apply(spec: &StackSpec, store: &StateStore) -> Result<ApplyResult, StackE
         },
     )?;
 
-    Ok(ApplyResult { actions })
+    Ok(ApplyResult { actions, deferred })
 }
 
 /// Compute a deterministic, dependency-ordered action plan.
@@ -163,12 +199,14 @@ pub fn apply(spec: &StackSpec, store: &StateStore) -> Result<ApplyResult, StackE
 /// - `ServiceRecreate` for services whose image changed
 /// - `ServiceRemove` for services in observed but not desired
 ///
+/// Services whose dependencies are not ready are deferred.
 /// Actions are topologically sorted by `depends_on` with name-based
 /// tie-breaking for deterministic ordering.
 fn compute_actions(
     desired_services: &[ServiceSpec],
     observed: &[ServiceObservedState],
-) -> Vec<Action> {
+    health_statuses: &HashMap<String, HealthStatus>,
+) -> (Vec<Action>, Vec<DeferredService>) {
     let observed_map: HashMap<&str, &ServiceObservedState> = observed
         .iter()
         .map(|o| (o.service_name.as_str(), o))
@@ -177,26 +215,35 @@ fn compute_actions(
     let desired_names: HashSet<&str> = desired_services.iter().map(|s| s.name.as_str()).collect();
 
     let mut actions = Vec::new();
+    let mut deferred = Vec::new();
 
     // Services to create or recreate.
     for svc in desired_services {
-        match observed_map.get(svc.name.as_str()) {
-            None => {
-                actions.push(Action::ServiceCreate {
-                    service_name: svc.name.clone(),
-                });
-            }
+        let needs_create = match observed_map.get(svc.name.as_str()) {
+            None => true,
             Some(obs) => {
                 // If observed state is Pending/Failed/Stopped, treat as needing creation.
-                if matches!(
+                matches!(
                     obs.phase,
                     ServicePhase::Pending | ServicePhase::Failed | ServicePhase::Stopped
-                ) {
+                )
+            }
+        };
+
+        if needs_create {
+            // Check dependency readiness before allowing creation.
+            match check_dependencies(svc, observed, desired_services, health_statuses) {
+                DependencyCheck::Ready => {
                     actions.push(Action::ServiceCreate {
                         service_name: svc.name.clone(),
                     });
                 }
-                // Running/Creating/Stopping are left alone — already converging.
+                DependencyCheck::Blocked { waiting_on } => {
+                    deferred.push(DeferredService {
+                        service_name: svc.name.clone(),
+                        waiting_on,
+                    });
+                }
             }
         }
     }
@@ -219,7 +266,7 @@ fn compute_actions(
         .map(|s| (s.name.as_str(), s.depends_on.as_slice()))
         .collect();
 
-    topo_sort(&actions, &dep_map)
+    (topo_sort(&actions, &dep_map), deferred)
 }
 
 /// Topologically sort actions respecting depends_on relationships.
@@ -373,12 +420,50 @@ mod tests {
         }
     }
 
+    fn svc_with_healthcheck(name: &str, image: &str) -> ServiceSpec {
+        use crate::spec::HealthCheckSpec;
+        ServiceSpec {
+            healthcheck: Some(HealthCheckSpec {
+                test: vec!["CMD".to_string(), "true".to_string()],
+                interval_secs: Some(5),
+                timeout_secs: Some(3),
+                retries: Some(3),
+                start_period_secs: None,
+            }),
+            ..svc(name, image)
+        }
+    }
+
     fn spec(name: &str, services: Vec<ServiceSpec>) -> StackSpec {
         StackSpec {
             name: name.to_string(),
             services,
             networks: vec![],
             volumes: vec![],
+        }
+    }
+
+    fn no_health() -> HashMap<String, HealthStatus> {
+        HashMap::new()
+    }
+
+    fn obs(name: &str, phase: ServicePhase) -> ServiceObservedState {
+        ServiceObservedState {
+            service_name: name.to_string(),
+            phase,
+            container_id: None,
+            last_error: None,
+            ready: false,
+        }
+    }
+
+    fn obs_running(name: &str) -> ServiceObservedState {
+        ServiceObservedState {
+            service_name: name.to_string(),
+            phase: ServicePhase::Running,
+            container_id: Some(format!("ctr-{name}")),
+            last_error: None,
+            ready: true,
         }
     }
 
@@ -389,8 +474,9 @@ mod tests {
         let desired = vec![svc("web", "nginx:latest"), svc("db", "postgres:16")];
         let observed = vec![];
 
-        let actions = compute_actions(&desired, &observed);
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health());
         assert_eq!(actions.len(), 2);
+        assert!(deferred.is_empty());
         assert!(
             actions
                 .iter()
@@ -401,36 +487,18 @@ mod tests {
     #[test]
     fn compute_actions_noop_when_converged() {
         let desired = vec![svc("web", "nginx:latest")];
-        let observed = vec![ServiceObservedState {
-            service_name: "web".to_string(),
-            phase: ServicePhase::Running,
-            container_id: Some("ctr-1".to_string()),
-            last_error: None,
-        }];
+        let observed = vec![obs_running("web")];
 
-        let actions = compute_actions(&desired, &observed);
+        let (actions, _) = compute_actions(&desired, &observed, &no_health());
         assert!(actions.is_empty());
     }
 
     #[test]
     fn compute_actions_removes_extra_services() {
         let desired = vec![svc("web", "nginx:latest")];
-        let observed = vec![
-            ServiceObservedState {
-                service_name: "web".to_string(),
-                phase: ServicePhase::Running,
-                container_id: Some("ctr-1".to_string()),
-                last_error: None,
-            },
-            ServiceObservedState {
-                service_name: "old-svc".to_string(),
-                phase: ServicePhase::Running,
-                container_id: Some("ctr-old".to_string()),
-                last_error: None,
-            },
-        ];
+        let observed = vec![obs_running("web"), obs_running("old-svc")];
 
-        let actions = compute_actions(&desired, &observed);
+        let (actions, _) = compute_actions(&desired, &observed, &no_health());
         assert_eq!(actions.len(), 1);
         assert_eq!(
             actions[0],
@@ -443,14 +511,9 @@ mod tests {
     #[test]
     fn compute_actions_recreates_pending_services() {
         let desired = vec![svc("web", "nginx:latest")];
-        let observed = vec![ServiceObservedState {
-            service_name: "web".to_string(),
-            phase: ServicePhase::Pending,
-            container_id: None,
-            last_error: None,
-        }];
+        let observed = vec![obs("web", ServicePhase::Pending)];
 
-        let actions = compute_actions(&desired, &observed);
+        let (actions, _) = compute_actions(&desired, &observed, &no_health());
         assert_eq!(actions.len(), 1);
         assert_eq!(
             actions[0],
@@ -464,13 +527,11 @@ mod tests {
     fn compute_actions_recreates_failed_services() {
         let desired = vec![svc("web", "nginx:latest")];
         let observed = vec![ServiceObservedState {
-            service_name: "web".to_string(),
-            phase: ServicePhase::Failed,
-            container_id: None,
             last_error: Some("oom".to_string()),
+            ..obs("web", ServicePhase::Failed)
         }];
 
-        let actions = compute_actions(&desired, &observed);
+        let (actions, _) = compute_actions(&desired, &observed, &no_health());
         assert_eq!(actions.len(), 1);
         assert_eq!(
             actions[0],
@@ -483,14 +544,9 @@ mod tests {
     #[test]
     fn compute_actions_recreates_stopped_services() {
         let desired = vec![svc("web", "nginx:latest")];
-        let observed = vec![ServiceObservedState {
-            service_name: "web".to_string(),
-            phase: ServicePhase::Stopped,
-            container_id: None,
-            last_error: None,
-        }];
+        let observed = vec![obs("web", ServicePhase::Stopped)];
 
-        let actions = compute_actions(&desired, &observed);
+        let (actions, _) = compute_actions(&desired, &observed, &no_health());
         assert_eq!(actions.len(), 1);
     }
 
@@ -504,7 +560,7 @@ mod tests {
         ];
         let observed = vec![];
 
-        let actions = compute_actions(&desired, &observed);
+        let (actions, _) = compute_actions(&desired, &observed, &no_health());
         let names: Vec<&str> = actions.iter().map(|a| a.service_name()).collect();
 
         // db must come before web.
@@ -522,7 +578,7 @@ mod tests {
         ];
         let observed = vec![];
 
-        let actions = compute_actions(&desired, &observed);
+        let (actions, _) = compute_actions(&desired, &observed, &no_health());
         let names: Vec<&str> = actions.iter().map(|a| a.service_name()).collect();
 
         // db → api → app
@@ -543,7 +599,7 @@ mod tests {
         ];
         let observed = vec![];
 
-        let actions = compute_actions(&desired, &observed);
+        let (actions, _) = compute_actions(&desired, &observed, &no_health());
         let names: Vec<&str> = actions.iter().map(|a| a.service_name()).collect();
         assert_eq!(names, vec!["alpha", "bravo", "charlie"]);
     }
@@ -558,8 +614,8 @@ mod tests {
         ];
         let observed = vec![];
 
-        let run1 = compute_actions(&desired, &observed);
-        let run2 = compute_actions(&desired, &observed);
+        let (run1, _) = compute_actions(&desired, &observed, &no_health());
+        let (run2, _) = compute_actions(&desired, &observed, &no_health());
         assert_eq!(run1, run2);
     }
 
@@ -567,22 +623,9 @@ mod tests {
     fn topo_sort_removes_dependents_before_dependencies() {
         // When removing, dependents should be removed before dependencies.
         let desired = vec![]; // remove everything
-        let observed = vec![
-            ServiceObservedState {
-                service_name: "web".to_string(),
-                phase: ServicePhase::Running,
-                container_id: Some("ctr-w".to_string()),
-                last_error: None,
-            },
-            ServiceObservedState {
-                service_name: "db".to_string(),
-                phase: ServicePhase::Running,
-                container_id: Some("ctr-d".to_string()),
-                last_error: None,
-            },
-        ];
+        let observed = vec![obs_running("web"), obs_running("db")];
 
-        let actions = compute_actions(&desired, &observed);
+        let (actions, _) = compute_actions(&desired, &observed, &no_health());
         assert_eq!(actions.len(), 2);
         // Both are removes, sorted by name since no deps in this case.
         assert!(
@@ -592,6 +635,114 @@ mod tests {
         );
     }
 
+    // ── Dependency gating tests ──
+
+    #[test]
+    fn dep_gating_no_healthcheck_creates_all_in_batch() {
+        // Without health checks, all services are created in one pass
+        // (topo sorted). No gating needed.
+        let desired = vec![
+            svc("db", "postgres:16"),
+            svc_with_deps("web", "nginx:latest", vec!["db"]),
+        ];
+        let observed = vec![];
+
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health());
+
+        assert_eq!(actions.len(), 2);
+        assert!(deferred.is_empty());
+        // db comes before web (topo order).
+        assert_eq!(actions[0].service_name(), "db");
+        assert_eq!(actions[1].service_name(), "web");
+    }
+
+    #[test]
+    fn dep_gating_failed_dep_blocks() {
+        // db is Failed → web is deferred.
+        let desired = vec![
+            svc("db", "postgres:16"),
+            svc_with_deps("web", "nginx:latest", vec!["db"]),
+        ];
+        let observed = vec![obs("db", ServicePhase::Failed)];
+
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health());
+
+        // db gets ServiceCreate (recreate from Failed), web is deferred.
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].service_name(), "db");
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].service_name, "web");
+    }
+
+    #[test]
+    fn dep_gating_healthcheck_blocks_until_healthy() {
+        // db has a health check and is Running but not yet healthy.
+        let desired = vec![
+            svc_with_healthcheck("db", "postgres:16"),
+            svc_with_deps("web", "nginx:latest", vec!["db"]),
+        ];
+        let observed = vec![obs_running("db")];
+
+        // No health status → health check hasn't passed → web is deferred.
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health());
+
+        assert!(actions.is_empty()); // db is Running, no action needed.
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].service_name, "web");
+    }
+
+    #[test]
+    fn dep_gating_healthcheck_unblocks_when_healthy() {
+        // db has a health check and is Running + healthy.
+        let desired = vec![
+            svc_with_healthcheck("db", "postgres:16"),
+            svc_with_deps("web", "nginx:latest", vec!["db"]),
+        ];
+        let observed = vec![obs_running("db")];
+
+        let mut health = HashMap::new();
+        let mut db_health = HealthStatus::new("db");
+        db_health.record_pass();
+        health.insert("db".to_string(), db_health);
+
+        let (actions, deferred) = compute_actions(&desired, &observed, &health);
+
+        // web should now be created.
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].service_name(), "web");
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn dep_gating_chain_all_in_one_pass_without_healthcheck() {
+        // app → api → db. No health checks. All created in one pass.
+        let desired = vec![
+            svc("db", "postgres:16"),
+            svc_with_deps("api", "api:latest", vec!["db"]),
+            svc_with_deps("app", "myapp:latest", vec!["api"]),
+        ];
+        let observed = vec![];
+
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health());
+
+        assert_eq!(actions.len(), 3);
+        assert!(deferred.is_empty());
+        // Topo order: db → api → app.
+        let names: Vec<&str> = actions.iter().map(|a| a.service_name()).collect();
+        assert_eq!(names, vec!["db", "api", "app"]);
+    }
+
+    #[test]
+    fn dep_gating_no_deps_always_proceeds() {
+        let desired = vec![svc("web", "nginx:latest")];
+        let observed = vec![];
+
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health());
+
+        assert_eq!(actions.len(), 1);
+        assert!(deferred.is_empty());
+    }
+
     // ── Apply integration tests ──
 
     #[test]
@@ -599,7 +750,7 @@ mod tests {
         let store = StateStore::in_memory().unwrap();
         let s = spec("myapp", vec![svc("web", "nginx:latest")]);
 
-        let result = apply(&s, &store).unwrap();
+        let result = apply(&s, &store, &no_health()).unwrap();
         assert_eq!(result.actions.len(), 1);
         assert_eq!(
             result.actions[0],
@@ -619,7 +770,7 @@ mod tests {
         let s = spec("myapp", vec![svc("web", "nginx:latest")]);
 
         // First apply creates the service.
-        apply(&s, &store).unwrap();
+        apply(&s, &store, &no_health()).unwrap();
 
         // Simulate the service becoming Running.
         store
@@ -630,12 +781,13 @@ mod tests {
                     phase: ServicePhase::Running,
                     container_id: Some("ctr-1".to_string()),
                     last_error: None,
+                    ready: true,
                 },
             )
             .unwrap();
 
         // Second apply should produce no actions.
-        let result = apply(&s, &store).unwrap();
+        let result = apply(&s, &store, &no_health()).unwrap();
         assert!(result.actions.is_empty());
     }
 
@@ -648,26 +800,18 @@ mod tests {
             "myapp",
             vec![svc("web", "nginx:latest"), svc("db", "postgres:16")],
         );
-        apply(&s1, &store).unwrap();
+        apply(&s1, &store, &no_health()).unwrap();
 
         // Simulate both Running.
         for name in &["web", "db"] {
             store
-                .save_observed_state(
-                    "myapp",
-                    &ServiceObservedState {
-                        service_name: name.to_string(),
-                        phase: ServicePhase::Running,
-                        container_id: Some(format!("ctr-{name}")),
-                        last_error: None,
-                    },
-                )
+                .save_observed_state("myapp", &obs_running(name))
                 .unwrap();
         }
 
         // Remove db from the spec.
         let s2 = spec("myapp", vec![svc("web", "nginx:latest")]);
-        let result = apply(&s2, &store).unwrap();
+        let result = apply(&s2, &store, &no_health()).unwrap();
 
         assert_eq!(result.actions.len(), 1);
         assert_eq!(
@@ -683,7 +827,7 @@ mod tests {
         let store = StateStore::in_memory().unwrap();
         let s = spec("myapp", vec![svc("web", "nginx:latest")]);
 
-        apply(&s, &store).unwrap();
+        apply(&s, &store, &no_health()).unwrap();
 
         let events = store.load_events("myapp").unwrap();
         // Started + ServiceCreating + Completed.
@@ -694,20 +838,83 @@ mod tests {
     }
 
     #[test]
-    fn apply_with_dependency_ordering() {
+    fn apply_with_healthcheck_gating() {
         let store = StateStore::in_memory().unwrap();
+        // db has a health check; web depends on db.
         let s = spec(
             "myapp",
             vec![
-                svc_with_deps("web", "nginx:latest", vec!["api"]),
-                svc_with_deps("api", "api:latest", vec!["db"]),
-                svc("db", "postgres:16"),
+                svc_with_healthcheck("db", "postgres:16"),
+                svc_with_deps("web", "nginx:latest", vec!["db"]),
             ],
         );
 
-        let result = apply(&s, &store).unwrap();
-        let names: Vec<&str> = result.actions.iter().map(|a| a.service_name()).collect();
-        assert_eq!(names, vec!["db", "api", "web"]);
+        // First apply: db is created, web is created too (both in batch, topo sorted).
+        let r1 = apply(&s, &store, &no_health()).unwrap();
+        assert_eq!(r1.actions.len(), 2);
+        assert_eq!(r1.actions[0].service_name(), "db");
+        assert_eq!(r1.actions[1].service_name(), "web");
+
+        // Simulate db Running but health check NOT yet passing.
+        store
+            .save_observed_state("myapp", &obs_running("db"))
+            .unwrap();
+        store
+            .save_observed_state("myapp", &obs_running("web"))
+            .unwrap();
+
+        // Both are running, second apply is a no-op.
+        let r2 = apply(&s, &store, &no_health()).unwrap();
+        assert!(r2.actions.is_empty());
+
+        // Now test: if web was stopped, it should be deferred until db is healthy.
+        store
+            .save_observed_state("myapp", &obs("web", ServicePhase::Stopped))
+            .unwrap();
+
+        // Apply with no health status: web is deferred (db has healthcheck, not passed).
+        let r3 = apply(&s, &store, &no_health()).unwrap();
+        assert!(r3.actions.is_empty()); // No create for web.
+        assert_eq!(r3.deferred.len(), 1);
+        assert_eq!(r3.deferred[0].service_name, "web");
+
+        // Apply with db healthy: web should be created.
+        let mut health = HashMap::new();
+        let mut db_health = HealthStatus::new("db");
+        db_health.record_pass();
+        health.insert("db".to_string(), db_health);
+
+        let r4 = apply(&s, &store, &health).unwrap();
+        assert_eq!(r4.actions.len(), 1);
+        assert_eq!(r4.actions[0].service_name(), "web");
+        assert!(r4.deferred.is_empty());
+    }
+
+    #[test]
+    fn apply_emits_dependency_blocked_events() {
+        let store = StateStore::in_memory().unwrap();
+        // db is Failed, web depends on db → web is deferred.
+        store
+            .save_observed_state("myapp", &obs("db", ServicePhase::Failed))
+            .unwrap();
+
+        let s = spec(
+            "myapp",
+            vec![
+                svc("db", "postgres:16"),
+                svc_with_deps("web", "nginx:latest", vec!["db"]),
+            ],
+        );
+
+        let result = apply(&s, &store, &no_health()).unwrap();
+        assert_eq!(result.deferred.len(), 1);
+
+        let events = store.load_events("myapp").unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::DependencyBlocked { .. }))
+        );
     }
 
     #[test]
@@ -716,16 +923,11 @@ mod tests {
         let store2 = StateStore::in_memory().unwrap();
         let s = spec(
             "myapp",
-            vec![
-                svc_with_deps("web", "nginx:latest", vec!["api"]),
-                svc_with_deps("api", "api:latest", vec!["db"]),
-                svc("db", "postgres:16"),
-                svc("cache", "redis:7"),
-            ],
+            vec![svc("db", "postgres:16"), svc("cache", "redis:7")],
         );
 
-        let r1 = apply(&s, &store1).unwrap();
-        let r2 = apply(&s, &store2).unwrap();
+        let r1 = apply(&s, &store1, &no_health()).unwrap();
+        let r2 = apply(&s, &store2, &no_health()).unwrap();
         assert_eq!(r1.actions, r2.actions);
     }
 
@@ -734,7 +936,7 @@ mod tests {
         let store = StateStore::in_memory().unwrap();
         let s = spec("myapp", vec![]);
 
-        let result = apply(&s, &store).unwrap();
+        let result = apply(&s, &store, &no_health()).unwrap();
         assert!(result.actions.is_empty());
     }
 }

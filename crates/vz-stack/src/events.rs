@@ -106,6 +106,36 @@ pub enum StackEvent {
         /// Stack name.
         stack_name: String,
     },
+    /// A service health check passed.
+    #[serde(rename = "health_check_passed")]
+    HealthCheckPassed {
+        /// Stack name.
+        stack_name: String,
+        /// Service name.
+        service_name: String,
+    },
+    /// A service health check failed.
+    #[serde(rename = "health_check_failed")]
+    HealthCheckFailed {
+        /// Stack name.
+        stack_name: String,
+        /// Service name.
+        service_name: String,
+        /// Consecutive failure count.
+        attempt: u32,
+        /// Error description.
+        error: String,
+    },
+    /// A service is blocked waiting on dependencies.
+    #[serde(rename = "dependency_blocked")]
+    DependencyBlocked {
+        /// Stack name.
+        stack_name: String,
+        /// Service that is waiting.
+        service_name: String,
+        /// Dependencies not yet ready.
+        waiting_on: Vec<String>,
+    },
 }
 
 /// Persisted event record with metadata from the store.
@@ -177,6 +207,21 @@ mod tests {
             },
             StackEvent::StackDestroyed {
                 stack_name: "myapp".to_string(),
+            },
+            StackEvent::HealthCheckPassed {
+                stack_name: "myapp".to_string(),
+                service_name: "web".to_string(),
+            },
+            StackEvent::HealthCheckFailed {
+                stack_name: "myapp".to_string(),
+                service_name: "web".to_string(),
+                attempt: 3,
+                error: "connection refused".to_string(),
+            },
+            StackEvent::DependencyBlocked {
+                stack_name: "myapp".to_string(),
+                service_name: "web".to_string(),
+                waiting_on: vec!["db".to_string()],
             },
         ];
 
