@@ -196,6 +196,21 @@ pub struct RunConfig {
     pub oci_annotations: Vec<(String, String)>,
 }
 
+/// Options for executing a command in an already-running container.
+#[derive(Debug, Clone, Default)]
+pub struct ExecConfig {
+    /// Command and arguments to execute.
+    pub cmd: Vec<String>,
+    /// Optional working directory inside the container.
+    pub working_dir: Option<String>,
+    /// Environment variables for the process.
+    pub env: Vec<(String, String)>,
+    /// Optional user to run as inside the container.
+    pub user: Option<String>,
+    /// Optional exec timeout override.
+    pub timeout: Option<Duration>,
+}
+
 /// Registry authentication used when pulling OCI images.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Auth {

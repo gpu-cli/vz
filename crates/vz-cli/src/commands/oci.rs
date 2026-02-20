@@ -9,7 +9,7 @@ use std::fmt;
 use tokio::time::sleep;
 use tracing::info;
 
-use vz_oci::{MountAccess, MountSpec, MountType, PortMapping, PortProtocol, RunConfig};
+use vz_oci::{ExecConfig, MountAccess, MountSpec, MountType, PortMapping, PortProtocol, RunConfig};
 
 const DETACH_START_TIMEOUT: Duration = Duration::from_secs(12);
 const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -54,6 +54,12 @@ pub enum OciCommand {
 
     /// Run a container from an OCI image.
     Run(Box<RunArgs>),
+
+    /// Create and start a long-lived container (no exec, stays running).
+    Create(Box<CreateArgs>),
+
+    /// Execute a command in an already-running container.
+    Exec(ExecArgs),
 
     /// List cached OCI images.
     Images,
@@ -163,6 +169,82 @@ pub struct RunArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct CreateArgs {
+    /// Image reference, for example `ubuntu:24.04`.
+    pub image: String,
+
+    /// Command and arguments for the container init process.
+    #[arg(last = true)]
+    pub command: Vec<String>,
+
+    /// Environment override (`KEY=VALUE`). Can be repeated.
+    #[arg(long, value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+
+    /// Publish a host port to a container port (`HOST:CONTAINER[/PROTO]`).
+    #[arg(short = 'p', long = "publish", value_name = "HOST:CONTAINER[/PROTO]")]
+    pub publish: Vec<String>,
+
+    /// Bind mount a host directory into the container (`SOURCE:TARGET[:ro]`).
+    #[arg(long = "volume", value_name = "SOURCE:TARGET[:ro]")]
+    pub volume: Vec<String>,
+
+    /// Working directory in the container.
+    #[arg(long)]
+    pub workdir: Option<String>,
+
+    /// User to execute the command as.
+    #[arg(long)]
+    pub user: Option<String>,
+
+    /// Number of vCPUs.
+    #[arg(long)]
+    pub cpus: Option<u8>,
+
+    /// Memory in MB.
+    #[arg(long)]
+    pub memory_mb: Option<u64>,
+
+    /// Disable network access for this container.
+    #[arg(long)]
+    pub no_network: bool,
+
+    /// Optional file path for guest serial console output.
+    #[arg(long)]
+    pub serial_log_file: Option<PathBuf>,
+
+    /// Explicit container identifier.
+    #[arg(long)]
+    pub name: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ExecArgs {
+    /// Container identifier.
+    pub id: String,
+
+    /// Command and arguments to execute.
+    #[arg(last = true)]
+    pub command: Vec<String>,
+
+    /// Environment override (`KEY=VALUE`). Can be repeated.
+    #[arg(long, value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+
+    /// Working directory inside the container.
+    #[arg(long)]
+    pub workdir: Option<String>,
+
+    /// User to execute the command as.
+    #[arg(long)]
+    pub user: Option<String>,
+
+    /// Execution timeout in seconds.
+    #[arg(long)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Args, Debug)]
 pub struct StopArgs {
     /// Container identifier.
     pub id: String,
@@ -185,6 +267,8 @@ pub async fn run(args: OciArgs) -> anyhow::Result<()> {
     match args.action {
         OciCommand::Pull(args) => pull_image(&runtime, args).await,
         OciCommand::Run(args) => run_image(runtime, *args).await,
+        OciCommand::Create(args) => create_container(&runtime, *args).await,
+        OciCommand::Exec(args) => exec_container(&runtime, args).await,
         OciCommand::Images => list_images(&runtime),
         OciCommand::Prune => prune_images(&runtime),
         OciCommand::Ps => list_containers(&runtime),
@@ -318,6 +402,67 @@ async fn run_image_detached_parent(
 
         sleep(DETACH_POLL_INTERVAL).await;
     }
+}
+
+async fn create_container(runtime: &vz_oci::Runtime, args: CreateArgs) -> anyhow::Result<()> {
+    let env = parse_env_vars(&args.env)?;
+    let ports = parse_port_mappings(&args.publish)?;
+    let mounts = parse_volume_mounts(&args.volume)?;
+    let network_enabled = if args.no_network { Some(false) } else { None };
+
+    let run_config = RunConfig {
+        cmd: args.command.clone(),
+        working_dir: args.workdir,
+        env,
+        user: args.user,
+        ports,
+        mounts,
+        cpus: args.cpus,
+        memory_mb: args.memory_mb,
+        network_enabled,
+        serial_log_file: args.serial_log_file,
+        execution_mode: vz_oci::ExecutionMode::OciRuntime,
+        timeout: None,
+        container_id: args.name,
+        init_process: if args.command.is_empty() {
+            None
+        } else {
+            Some(args.command)
+        },
+        oci_annotations: Vec::new(),
+    };
+
+    info!(image = %args.image, "creating long-lived container");
+    let container_id = runtime.create_container(&args.image, run_config).await?;
+    println!("{container_id}");
+    Ok(())
+}
+
+async fn exec_container(runtime: &vz_oci::Runtime, args: ExecArgs) -> anyhow::Result<()> {
+    let env = parse_env_vars(&args.env)?;
+    let timeout = args.timeout_secs.map(Duration::from_secs);
+
+    let exec_config = ExecConfig {
+        cmd: args.command,
+        working_dir: args.workdir,
+        env,
+        user: args.user,
+        timeout,
+    };
+
+    let output = runtime.exec_container(&args.id, exec_config).await?;
+
+    if !output.stdout.is_empty() {
+        print!("{}", output.stdout);
+    }
+    if !output.stderr.is_empty() {
+        eprint!("{}", output.stderr);
+    }
+    if output.exit_code != 0 {
+        process::exit(output.exit_code.rem_euclid(256));
+    }
+
+    Ok(())
 }
 
 fn list_images(runtime: &vz_oci::Runtime) -> anyhow::Result<()> {
