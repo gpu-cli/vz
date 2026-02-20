@@ -14,7 +14,7 @@ mod state_store;
 
 pub use error::StackError;
 pub use events::{EventRecord, StackEvent};
-pub use reconcile::{ApplyResult, apply};
+pub use reconcile::{Action, ApplyResult, apply};
 pub use spec::{
     HealthCheckSpec, MountSpec, NetworkSpec, PortSpec, ResourcesSpec, RestartPolicy, ServiceSpec,
     StackSpec, VolumeSpec,
