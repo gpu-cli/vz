@@ -77,6 +77,9 @@ enum Commands {
 
     /// Ad-hoc sign the vz binary with required entitlements.
     SelfSign(commands::self_sign::SelfSignArgs),
+
+    /// Manage multi-service stacks from Compose files.
+    Stack(commands::stack::StackArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -127,6 +130,7 @@ fn main() -> anyhow::Result<()> {
             Commands::Provision(args) => commands::provision::run(args).await,
             Commands::Cleanup(args) => commands::cleanup::run(args).await,
             Commands::SelfSign(args) => commands::self_sign::run(args).await,
+            Commands::Stack(args) => commands::stack::run(args).await,
         };
 
         if let Err(ref e) = result {
@@ -269,5 +273,73 @@ mod tests {
     fn parse_self_sign() {
         let cli = Cli::try_parse_from(["vz", "self-sign"]).expect("parse");
         assert!(matches!(cli.command, Commands::SelfSign(_)));
+    }
+
+    #[test]
+    fn parse_stack_up() {
+        let cli =
+            Cli::try_parse_from(["vz", "stack", "up", "--file", "docker-compose.yaml"])
+                .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Stack(ref args)
+                if matches!(args.action, commands::stack::StackCommand::Up(_))
+        ));
+    }
+
+    #[test]
+    fn parse_stack_up_with_name() {
+        let cli = Cli::try_parse_from([
+            "vz", "stack", "up", "--file", "compose.yaml", "--name", "myapp",
+        ])
+        .expect("parse");
+        assert!(matches!(cli.command, Commands::Stack(_)));
+    }
+
+    #[test]
+    fn parse_stack_down() {
+        let cli = Cli::try_parse_from(["vz", "stack", "down", "myapp"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Stack(ref args)
+                if matches!(args.action, commands::stack::StackCommand::Down(_))
+        ));
+    }
+
+    #[test]
+    fn parse_stack_ps() {
+        let cli = Cli::try_parse_from(["vz", "stack", "ps", "myapp"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Stack(ref args)
+                if matches!(args.action, commands::stack::StackCommand::Ps(_))
+        ));
+    }
+
+    #[test]
+    fn parse_stack_ps_json() {
+        let cli =
+            Cli::try_parse_from(["vz", "stack", "ps", "myapp", "--json"]).expect("parse");
+        assert!(matches!(cli.command, Commands::Stack(_)));
+    }
+
+    #[test]
+    fn parse_stack_events() {
+        let cli =
+            Cli::try_parse_from(["vz", "stack", "events", "myapp"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Stack(ref args)
+                if matches!(args.action, commands::stack::StackCommand::Events(_))
+        ));
+    }
+
+    #[test]
+    fn parse_stack_events_with_since() {
+        let cli = Cli::try_parse_from([
+            "vz", "stack", "events", "myapp", "--since", "10",
+        ])
+        .expect("parse");
+        assert!(matches!(cli.command, Commands::Stack(_)));
     }
 }

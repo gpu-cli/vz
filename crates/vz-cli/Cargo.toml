@@ -15,6 +15,7 @@ path = "src/main.rs"
 vz-sandbox = { workspace = true }
 vz = { workspace = true }
 vz-oci = { workspace = true }
+vz-stack = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

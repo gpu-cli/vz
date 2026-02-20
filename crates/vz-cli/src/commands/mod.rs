@@ -11,4 +11,5 @@ pub mod restore;
 pub mod run;
 pub mod save;
 pub mod self_sign;
+pub mod stack;
 pub mod stop;
