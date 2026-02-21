@@ -129,10 +129,16 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
         .build()?;
 
     sort_bundle_mounts(&mut mounts);
-    let mounts = mounts
+    let user_mounts = mounts
         .into_iter()
         .map(to_runtime_mount)
         .collect::<Result<Vec<_>, OciError>>()?;
+
+    // Combine default Linux mounts with user-specified mounts.
+    // User mounts come after defaults so they can override.
+    let mut all_mounts = default_linux_mounts()?;
+    all_mounts.extend(user_mounts);
+
     let annotations = to_runtime_annotations(oci_annotations);
 
     let root = RootBuilder::default()
@@ -144,7 +150,7 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
         .version(VERSION)
         .root(root)
         .process(process)
-        .mounts(mounts);
+        .mounts(all_mounts);
 
     if !annotations.is_empty() {
         builder = builder.annotations(annotations);
@@ -261,6 +267,95 @@ fn to_runtime_mount(mount: BundleMount) -> Result<Mount, OciError> {
     }
 
     builder.build().map_err(Into::into)
+}
+
+/// Standard Linux container mounts (proc, dev, devpts, shm, mqueue, sysfs, cgroup).
+///
+/// `SpecBuilder::default()` does not include these — only `Spec::default()` does.
+/// Without them, real-world services (redis, postgres, etc.) fail because they
+/// need `/proc`, `/dev`, and `/dev/shm`.
+fn default_linux_mounts() -> Result<Vec<Mount>, OciError> {
+    Ok(vec![
+        MountBuilder::default()
+            .destination("/proc")
+            .typ("proc")
+            .source("proc")
+            .options(vec![
+                "nosuid".into(),
+                "noexec".into(),
+                "nodev".into(),
+            ])
+            .build()?,
+        MountBuilder::default()
+            .destination("/dev")
+            .typ("tmpfs")
+            .source("tmpfs")
+            .options(vec![
+                "nosuid".into(),
+                "strictatime".into(),
+                "mode=755".into(),
+                "size=65536k".into(),
+            ])
+            .build()?,
+        MountBuilder::default()
+            .destination("/dev/pts")
+            .typ("devpts")
+            .source("devpts")
+            .options(vec![
+                "nosuid".into(),
+                "noexec".into(),
+                "newinstance".into(),
+                "ptmxmode=0666".into(),
+                "mode=0620".into(),
+                "gid=5".into(),
+            ])
+            .build()?,
+        MountBuilder::default()
+            .destination("/dev/shm")
+            .typ("tmpfs")
+            .source("shm")
+            .options(vec![
+                "nosuid".into(),
+                "noexec".into(),
+                "nodev".into(),
+                "mode=1777".into(),
+                "size=65536k".into(),
+            ])
+            .build()?,
+        MountBuilder::default()
+            .destination("/dev/mqueue")
+            .typ("mqueue")
+            .source("mqueue")
+            .options(vec![
+                "nosuid".into(),
+                "noexec".into(),
+                "nodev".into(),
+            ])
+            .build()?,
+        MountBuilder::default()
+            .destination("/sys")
+            .typ("sysfs")
+            .source("sysfs")
+            .options(vec![
+                "nosuid".into(),
+                "noexec".into(),
+                "nodev".into(),
+                "ro".into(),
+            ])
+            .build()?,
+        MountBuilder::default()
+            .destination("/sys/fs/cgroup")
+            .typ("cgroup")
+            .source("cgroup")
+            .options(vec![
+                "nosuid".into(),
+                "noexec".into(),
+                "nodev".into(),
+                "relatime".into(),
+                "ro".into(),
+            ])
+            .build()?,
+    ])
 }
 
 /// Docker-equivalent default capabilities for container processes.
@@ -439,15 +534,20 @@ mod tests {
         assert_eq!(process.user().gid(), 1001);
 
         let mounts = spec.mounts().as_ref().expect("mounts should be present");
-        assert_eq!(mounts.len(), 1);
-        assert_eq!(mounts[0].destination(), &PathBuf::from("/data"));
-        assert_eq!(mounts[0].typ().as_deref(), Some("bind"));
+        // 7 default Linux mounts + 1 user mount
+        assert_eq!(mounts.len(), 8);
+        // First 7 are defaults (proc, dev, devpts, shm, mqueue, sysfs, cgroup).
+        assert_eq!(mounts[0].destination(), &PathBuf::from("/proc"));
+        assert_eq!(mounts[6].destination(), &PathBuf::from("/sys/fs/cgroup"));
+        // User mount comes last.
+        assert_eq!(mounts[7].destination(), &PathBuf::from("/data"));
+        assert_eq!(mounts[7].typ().as_deref(), Some("bind"));
         assert_eq!(
-            mounts[0].source().as_ref(),
+            mounts[7].source().as_ref(),
             Some(&PathBuf::from("/host/data"))
         );
         assert_eq!(
-            mounts[0]
+            mounts[7]
                 .options()
                 .as_ref()
                 .expect("mount options should exist"),
@@ -555,20 +655,22 @@ mod tests {
 
         let spec = Spec::load(bundle_dir.join(OCI_CONFIG_FILENAME)).unwrap();
         let mounts = spec.mounts().as_ref().expect("mounts should be present");
-        assert_eq!(mounts.len(), 3);
-        assert_eq!(mounts[0].destination(), &PathBuf::from("/volumes/cache"));
+        // 7 default Linux mounts + 3 user mounts = 10
+        assert_eq!(mounts.len(), 10);
+        // User mounts come after defaults, sorted by destination then source.
+        assert_eq!(mounts[7].destination(), &PathBuf::from("/volumes/cache"));
         assert_eq!(
-            mounts[0].source().as_ref(),
+            mounts[7].source().as_ref(),
             Some(&PathBuf::from("/host/cache-a"))
         );
-        assert_eq!(mounts[1].destination(), &PathBuf::from("/volumes/cache"));
+        assert_eq!(mounts[8].destination(), &PathBuf::from("/volumes/cache"));
         assert_eq!(
-            mounts[1].source().as_ref(),
+            mounts[8].source().as_ref(),
             Some(&PathBuf::from("/host/cache-b"))
         );
-        assert_eq!(mounts[2].destination(), &PathBuf::from("/volumes/config"));
+        assert_eq!(mounts[9].destination(), &PathBuf::from("/volumes/config"));
         assert_eq!(
-            mounts[2].source().as_ref(),
+            mounts[9].source().as_ref(),
             Some(&PathBuf::from("/host/config"))
         );
     }

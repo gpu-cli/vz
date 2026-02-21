@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn referenced_volume_names_collects_named_only() {
-        let mounts = vec![
+        let mounts = [
             MountSpec::Bind {
                 source: "/host".to_string(),
                 target: "/a".to_string(),

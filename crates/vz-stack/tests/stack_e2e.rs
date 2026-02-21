@@ -43,6 +43,26 @@ impl OciContainerRuntime {
             handle: tokio::runtime::Handle::current(),
         }
     }
+
+    /// Exec with full stdout/stderr capture (bypasses ContainerRuntime trait).
+    /// Returns `(exit_code, stdout, stderr)`.
+    fn exec_with_output(&self, container_id: &str, cmd: Vec<String>) -> (i32, String, String) {
+        tokio::task::block_in_place(|| {
+            let out = self
+                .handle
+                .block_on(self.runtime.exec_container(
+                    container_id,
+                    ExecConfig {
+                        cmd,
+                        timeout: Some(Duration::from_secs(30)),
+                        ..ExecConfig::default()
+                    },
+                ))
+                .unwrap();
+            (out.exit_code, out.stdout, out.stderr)
+        })
+    }
+
 }
 
 impl ContainerRuntime for OciContainerRuntime {
@@ -90,6 +110,76 @@ impl ContainerRuntime for OciContainerRuntime {
                 .block_on(self.runtime.exec_container(container_id, exec_config))
                 .map(|output| output.exit_code)
                 .map_err(|e| StackError::Network(format!("exec failed: {e}")))
+        })
+    }
+
+    fn boot_shared_vm(
+        &self,
+        stack_id: &str,
+        ports: &[vz_oci::PortMapping],
+    ) -> Result<(), StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.runtime.boot_shared_vm(stack_id, ports.to_vec()))
+                .map_err(|e| StackError::Network(format!("boot_shared_vm failed: {e}")))
+        })
+    }
+
+    fn network_setup(
+        &self,
+        stack_id: &str,
+        services: &[vz_oci::NetworkServiceConfig],
+    ) -> Result<(), StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.runtime.network_setup(stack_id, services.to_vec()))
+                .map_err(|e| StackError::Network(format!("network_setup failed: {e}")))
+        })
+    }
+
+    fn network_teardown(
+        &self,
+        stack_id: &str,
+        service_names: &[String],
+    ) -> Result<(), StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(
+                    self.runtime
+                        .network_teardown(stack_id, service_names.to_vec()),
+                )
+                .map_err(|e| StackError::Network(format!("network_teardown failed: {e}")))
+        })
+    }
+
+    fn create_in_stack(
+        &self,
+        stack_id: &str,
+        image: &str,
+        config: vz_oci::RunConfig,
+    ) -> Result<String, StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(
+                    self.runtime
+                        .create_container_in_stack(stack_id, image, config),
+                )
+                .map_err(|e| StackError::Network(format!("create_in_stack failed: {e}")))
+        })
+    }
+
+    fn shutdown_shared_vm(&self, stack_id: &str) -> Result<(), StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.runtime.shutdown_shared_vm(stack_id))
+                .map_err(|e| StackError::Network(format!("shutdown_shared_vm failed: {e}")))
+        })
+    }
+
+    fn has_shared_vm(&self, stack_id: &str) -> bool {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.runtime.has_shared_vm(stack_id))
         })
     }
 }
@@ -329,4 +419,147 @@ services:
     };
     let down_result = orchestrator.run(&down_spec, None).unwrap();
     assert!(down_result.converged);
+}
+
+// ── Real service tests ──────────────────────────────────────────
+
+/// Boot real Postgres and Redis services, wait for health checks to pass,
+/// then verify functionality via exec.
+///
+/// This proves vz stack can run real services, not just alpine sleep containers.
+/// Postgres is verified with `psql SELECT 1`, Redis with `redis-cli PING`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn real_services_postgres_and_redis() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,vz_oci=debug,vz_linux=debug,vz_stack=debug")
+        .with_test_writer()
+        .try_init();
+
+    let yaml = r#"
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: app
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "app"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  cache:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+"#;
+
+    // Use persistent data dir for image cache (avoid Docker Hub rate limits).
+    let home = std::env::var("HOME").unwrap();
+    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    std::fs::create_dir_all(&oci_data).unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("state.db");
+
+    let spec = parse_compose(yaml, "real-svc").unwrap();
+    assert_eq!(spec.services.len(), 2);
+
+    let bridge = OciContainerRuntime::new(&oci_data);
+    let exec_store = StateStore::open(&db_path).unwrap();
+    let reconcile_store = StateStore::open(&db_path).unwrap();
+    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+
+    let orch_config = OrchestrationConfig {
+        poll_interval: Some(2),
+        max_rounds: 30,
+    };
+    let mut orchestrator = StackOrchestrator::new(executor, reconcile_store, orch_config);
+
+    let result = orchestrator.run(&spec, None).unwrap();
+
+    assert!(
+        result.converged,
+        "stack should converge: ready={}, failed={}, rounds={}",
+        result.services_ready, result.services_failed, result.rounds
+    );
+    assert_eq!(result.services_ready, 2, "both services should be ready");
+
+    // Get container IDs from observed state.
+    let observed = orchestrator
+        .executor()
+        .store()
+        .load_observed_state("real-svc")
+        .unwrap();
+
+    let db_container_id = observed
+        .iter()
+        .find(|o| o.service_name == "db")
+        .unwrap_or_else(|| panic!("db should be in observed state"))
+        .container_id
+        .as_ref()
+        .unwrap();
+    let cache_container_id = observed
+        .iter()
+        .find(|o| o.service_name == "cache")
+        .unwrap_or_else(|| panic!("cache should be in observed state"))
+        .container_id
+        .as_ref()
+        .unwrap();
+
+    let rt = orchestrator.executor().runtime();
+
+    // Verify Postgres: run SQL query via psql.
+    let (exit_code, stdout, _) = rt.exec_with_output(
+        db_container_id,
+        vec![
+            "psql".into(),
+            "-U".into(),
+            "app".into(),
+            "-d".into(),
+            "app".into(),
+            "-c".into(),
+            "SELECT 1".into(),
+        ],
+    );
+    assert_eq!(exit_code, 0, "psql SELECT 1 should succeed");
+    assert!(
+        stdout.contains('1'),
+        "psql output should contain '1': {stdout}"
+    );
+
+    // Verify Redis: run PING via redis-cli.
+    let (exit_code, stdout, _) = rt.exec_with_output(
+        cache_container_id,
+        vec!["redis-cli".into(), "PING".into()],
+    );
+    assert_eq!(exit_code, 0, "redis-cli PING should succeed");
+    assert!(
+        stdout.contains("PONG"),
+        "redis-cli output should contain 'PONG': {stdout}"
+    );
+
+    // Teardown: remove containers then shut down the shared VM.
+    let down_spec = vz_stack::StackSpec {
+        name: "real-svc".to_string(),
+        services: vec![],
+        networks: vec![],
+        volumes: vec![],
+        secrets: vec![],
+    };
+    let down_result = orchestrator.run(&down_spec, None).unwrap();
+    assert!(down_result.converged, "teardown should converge");
+
+    // Shut down the shared VM.
+    let _ = orchestrator
+        .executor()
+        .runtime()
+        .shutdown_shared_vm("real-svc");
 }

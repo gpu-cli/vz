@@ -812,6 +812,36 @@ impl Runtime {
         self.stack_vms.lock().await.contains_key(stack_id)
     }
 
+    /// Execute a raw command in the shared VM (not through the OCI runtime).
+    ///
+    /// Useful for diagnostics, inspecting the guest filesystem, or running
+    /// non-containerized commands inside the VM.
+    pub async fn exec_in_shared_vm(
+        &self,
+        stack_id: &str,
+        command: String,
+        args: Vec<String>,
+        timeout: Duration,
+    ) -> Result<ExecOutput, OciError> {
+        let vm = self
+            .stack_vms
+            .lock()
+            .await
+            .get(stack_id)
+            .cloned()
+            .ok_or_else(|| {
+                OciError::InvalidConfig(format!("no shared VM running for stack '{stack_id}'"))
+            })?;
+
+        let result = vm.exec_capture(command, args, timeout).await?;
+
+        Ok(ExecOutput {
+            exit_code: result.exit_code,
+            stdout: result.stdout,
+            stderr: result.stderr,
+        })
+    }
+
     /// Set up per-service network isolation inside the shared VM.
     ///
     /// Creates a bridge and per-service network namespaces so that

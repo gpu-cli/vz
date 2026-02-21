@@ -167,6 +167,23 @@ pub fn check_dependencies(
     }
 }
 
+/// Resolve Docker health check command convention.
+///
+/// Docker uses a prefix to indicate how the command should be executed:
+/// - `["CMD", "arg1", "arg2", ...]` → execute directly: `["arg1", "arg2", ...]`
+/// - `["CMD-SHELL", "cmd string"]` → execute via shell: `["/bin/sh", "-c", "cmd string"]`
+/// - Anything else → execute as-is
+fn resolve_healthcheck_command(test: &[String]) -> Vec<String> {
+    match test.first().map(|s| s.as_str()) {
+        Some("CMD") => test[1..].to_vec(),
+        Some("CMD-SHELL") => {
+            let shell_cmd = test[1..].join(" ");
+            vec!["/bin/sh".to_string(), "-c".to_string(), shell_cmd]
+        }
+        _ => test.to_vec(),
+    }
+}
+
 /// Default health check interval when not specified (30s).
 const DEFAULT_INTERVAL_SECS: u64 = 30;
 /// Default health check retries threshold when not specified.
@@ -282,8 +299,17 @@ impl HealthPoller {
             }
 
             // Execute health check command.
-            let exit_code = match runtime.exec(container_id, &hc.test) {
-                Ok(code) => code,
+            // Docker convention: ["CMD", "arg1", ...] → exec directly,
+            // ["CMD-SHELL", "cmd"] → exec through /bin/sh -c.
+            let cmd = resolve_healthcheck_command(&hc.test);
+            debug!(service = %svc.name, cmd = ?cmd, "running health check");
+            let exit_code = match runtime.exec(container_id, &cmd) {
+                Ok(code) => {
+                    if code != 0 {
+                        debug!(service = %svc.name, exit_code = code, cmd = ?cmd, "health check returned non-zero");
+                    }
+                    code
+                }
                 Err(e) => {
                     warn!(service = %svc.name, error = %e, "health check exec failed");
                     // Treat exec errors as a failed check.
@@ -996,8 +1022,8 @@ mod tests {
         poller.start_times.insert("web".to_string(), Instant::now());
 
         poller.clear("web");
-        assert!(poller.statuses().get("web").is_none());
-        assert!(poller.start_times.get("web").is_none());
+        assert!(!poller.statuses().contains_key("web"));
+        assert!(!poller.start_times.contains_key("web"));
     }
 
     #[test]

@@ -638,6 +638,7 @@ fn expect_state_payload(id: &str, payload: OciPayload) -> Result<OciContainerSta
     }
 }
 
+#[cfg(test)]
 fn expect_exec_payload(id: &str, payload: OciPayload) -> Result<OciExecResult, LinuxError> {
     match payload {
         OciPayload::Exec { result } => Ok(result),
@@ -773,7 +774,16 @@ pub async fn oci_state(vm: &Vm, id: String) -> Result<OciContainerState, LinuxEr
     expect_state_payload(&id, payload)
 }
 
-/// Dispatch `OciExec` to the Linux guest agent.
+/// Execute a command inside an OCI container via `nsenter`.
+///
+/// youki 0.5.7's `exec` subcommand has a bug where it fails to enter the
+/// container's mount namespace, causing commands to see the host (VM) root
+/// filesystem instead of the container's.  We work around this by:
+///
+///  1. Calling `youki state <id>` to discover the container's init PID.
+///  2. Using `nsenter` to directly join the container's mount, PID, and
+///     IPC namespaces via `/proc/{pid}/ns/*`, with `--root` set to the
+///     init process's root.
 pub async fn oci_exec(
     vm: &Vm,
     id: String,
@@ -781,20 +791,66 @@ pub async fn oci_exec(
     args: Vec<String>,
     options: OciExecOptions,
 ) -> Result<OciExecResult, LinuxError> {
-    let (stream, _ack) = connect_and_handshake(vm, &oci_handshake()).await?;
-    let payload = dispatch_oci_request_handshaked(
-        stream,
-        Request::OciExec {
-            id: id.clone(),
-            command,
-            args,
-            env: options.env,
-            cwd: options.cwd,
+    // 1. Get the container's init PID.
+    let state = oci_state(vm, id.clone()).await?;
+    let pid = state.pid.ok_or_else(|| {
+        LinuxError::Protocol(format!(
+            "container '{id}' has no PID — cannot exec via nsenter"
+        ))
+    })?;
+
+    // 2. Build the nsenter command.
+    let mut nsenter_args = vec![
+        format!("--mount=/proc/{pid}/ns/mnt"),
+        format!("--net=/proc/{pid}/ns/net"),
+        format!("--pid=/proc/{pid}/ns/pid"),
+        format!("--ipc=/proc/{pid}/ns/ipc"),
+        format!("--uts=/proc/{pid}/ns/uts"),
+        format!("--root=/proc/{pid}/root"),
+    ];
+    if let Some(ref cwd) = options.cwd {
+        nsenter_args.push(format!("--wd={cwd}"));
+    }
+    nsenter_args.push("--".to_string());
+
+    // Inject environment variables via `env` so they apply inside the
+    // container's namespace rather than on the nsenter process itself.
+    let has_path = options.env.iter().any(|(k, _)| k == "PATH");
+    let need_env = !options.env.is_empty() || !has_path;
+    if need_env {
+        nsenter_args.push("env".to_string());
+        if !has_path {
+            nsenter_args.push(
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+            );
+        }
+        for (key, value) in &options.env {
+            nsenter_args.push(format!("{key}={value}"));
+        }
+    }
+
+    nsenter_args.push(command);
+    nsenter_args.extend(args);
+
+    // 3. Dispatch as a plain exec (not via youki).
+    let result = exec_capture_with_options(
+        vm,
+        "nsenter".to_string(),
+        nsenter_args,
+        Duration::from_secs(120),
+        ExecOptions {
+            working_dir: None,
+            env: Vec::new(),
             user: options.user,
         },
     )
     .await?;
-    expect_exec_payload(&id, payload)
+
+    Ok(OciExecResult {
+        exit_code: result.exit_code,
+        stdout: result.stdout,
+        stderr: result.stderr,
+    })
 }
 
 /// Dispatch `OciKill` to the Linux guest agent.
