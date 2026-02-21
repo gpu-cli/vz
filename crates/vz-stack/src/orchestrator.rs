@@ -446,10 +446,11 @@ mod tests {
         assert_eq!(result.services_ready, 2);
 
         // Verify db was created before web.
+        // Multi-service stacks use create_in_stack instead of create.
         let calls = orch.executor.runtime().call_log();
         let create_calls: Vec<&str> = calls
             .iter()
-            .filter(|(op, _)| op == "create")
+            .filter(|(op, _)| op == "create" || op == "create_in_stack")
             .map(|(_, arg)| arg.as_str())
             .collect();
         assert_eq!(create_calls.len(), 2);

@@ -617,6 +617,7 @@ pub(crate) mod tests_support {
     /// Mock container runtime for testing.
     ///
     /// Records all operations and can be configured to fail specific calls.
+    /// Supports shared VM tracking for multi-service stack testing.
     pub struct MockContainerRuntime {
         /// Container IDs to return on create calls (cycled).
         pub container_ids: Vec<String>,
@@ -634,6 +635,13 @@ pub(crate) mod tests_support {
         pub calls: std::cell::RefCell<Vec<(String, String)>>,
         /// Counter for create calls (to cycle through container_ids).
         create_counter: std::cell::Cell<usize>,
+        /// Tracks which stacks have a shared VM running.
+        shared_vms: std::cell::RefCell<HashSet<String>>,
+        /// Captured RunConfigs from create_in_stack calls, keyed by container_id.
+        pub captured_configs: std::cell::RefCell<Vec<(String, vz_oci::RunConfig)>>,
+        /// Captured NetworkServiceConfigs from network_setup calls.
+        pub captured_network_services:
+            std::cell::RefCell<Vec<(String, Vec<vz_oci::NetworkServiceConfig>)>>,
     }
 
     impl MockContainerRuntime {
@@ -647,6 +655,9 @@ pub(crate) mod tests_support {
                 fail_exec: false,
                 calls: std::cell::RefCell::new(Vec::new()),
                 create_counter: std::cell::Cell::new(0),
+                shared_vms: std::cell::RefCell::new(HashSet::new()),
+                captured_configs: std::cell::RefCell::new(Vec::new()),
+                captured_network_services: std::cell::RefCell::new(Vec::new()),
             }
         }
 
@@ -673,7 +684,7 @@ pub(crate) mod tests_support {
             Ok(format!("sha256:{image}"))
         }
 
-        fn create(&self, image: &str, _config: vz_oci::RunConfig) -> Result<String, StackError> {
+        fn create(&self, image: &str, config: vz_oci::RunConfig) -> Result<String, StackError> {
             self.calls
                 .borrow_mut()
                 .push(("create".to_string(), image.to_string()));
@@ -683,6 +694,9 @@ pub(crate) mod tests_support {
             let idx = self.create_counter.get();
             let id = self.container_ids[idx % self.container_ids.len()].clone();
             self.create_counter.set(idx + 1);
+            self.captured_configs
+                .borrow_mut()
+                .push((id.clone(), config));
             Ok(id)
         }
 
@@ -712,6 +726,99 @@ pub(crate) mod tests_support {
                 return Err(StackError::InvalidSpec("mock exec failure".to_string()));
             }
             Ok(self.exec_exit_code)
+        }
+
+        fn boot_shared_vm(
+            &self,
+            stack_id: &str,
+            ports: &[vz_oci::PortMapping],
+        ) -> Result<(), StackError> {
+            self.calls.borrow_mut().push((
+                "boot_shared_vm".to_string(),
+                format!(
+                    "{}:{}",
+                    stack_id,
+                    ports
+                        .iter()
+                        .map(|p| format!("{}:{}", p.host, p.container))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            ));
+            self.shared_vms
+                .borrow_mut()
+                .insert(stack_id.to_string());
+            Ok(())
+        }
+
+        fn network_setup(
+            &self,
+            stack_id: &str,
+            services: &[vz_oci::NetworkServiceConfig],
+        ) -> Result<(), StackError> {
+            self.calls.borrow_mut().push((
+                "network_setup".to_string(),
+                format!(
+                    "{}:{}",
+                    stack_id,
+                    services
+                        .iter()
+                        .map(|s| format!("{}={}", s.name, s.addr))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            ));
+            self.captured_network_services
+                .borrow_mut()
+                .push((stack_id.to_string(), services.to_vec()));
+            Ok(())
+        }
+
+        fn network_teardown(
+            &self,
+            stack_id: &str,
+            service_names: &[String],
+        ) -> Result<(), StackError> {
+            self.calls.borrow_mut().push((
+                "network_teardown".to_string(),
+                format!("{}:{}", stack_id, service_names.join(",")),
+            ));
+            Ok(())
+        }
+
+        fn create_in_stack(
+            &self,
+            stack_id: &str,
+            image: &str,
+            config: vz_oci::RunConfig,
+        ) -> Result<String, StackError> {
+            self.calls.borrow_mut().push((
+                "create_in_stack".to_string(),
+                format!("{stack_id}:{image}"),
+            ));
+            if self.fail_create {
+                return Err(StackError::InvalidSpec("mock create failure".to_string()));
+            }
+            let idx = self.create_counter.get();
+            let id = self.container_ids[idx % self.container_ids.len()].clone();
+            self.create_counter.set(idx + 1);
+            self.captured_configs
+                .borrow_mut()
+                .push((id.clone(), config));
+            Ok(id)
+        }
+
+        fn shutdown_shared_vm(&self, stack_id: &str) -> Result<(), StackError> {
+            self.calls.borrow_mut().push((
+                "shutdown_shared_vm".to_string(),
+                stack_id.to_string(),
+            ));
+            self.shared_vms.borrow_mut().remove(stack_id);
+            Ok(())
+        }
+
+        fn has_shared_vm(&self, stack_id: &str) -> bool {
+            self.shared_vms.borrow().contains(stack_id)
         }
     }
 }
@@ -1350,5 +1457,331 @@ mod tests {
         let observed = executor.store().load_observed_state("myapp").unwrap();
         let api = observed.iter().find(|o| o.service_name == "api").unwrap();
         assert_eq!(api.phase, ServicePhase::Failed);
+    }
+
+    // ── Docker Compose network conformance tests ──
+
+    /// Helper: two-service stack for network tests.
+    fn network_stack() -> StackSpec {
+        stack(
+            "netapp",
+            vec![
+                ServiceSpec {
+                    ports: vec![PortSpec {
+                        protocol: "tcp".to_string(),
+                        container_port: 80,
+                        host_port: Some(8080),
+                    }],
+                    ..svc("web", "nginx:latest")
+                },
+                ServiceSpec {
+                    ports: vec![PortSpec {
+                        protocol: "tcp".to_string(),
+                        container_port: 5432,
+                        host_port: Some(5432),
+                    }],
+                    ..svc("db", "postgres:16")
+                },
+            ],
+        )
+    }
+
+    /// Helper: three-service stack.
+    fn three_service_stack() -> StackSpec {
+        stack(
+            "triapp",
+            vec![
+                svc("web", "nginx:latest"),
+                svc("api", "node:20"),
+                svc("db", "postgres:16"),
+            ],
+        )
+    }
+
+    #[test]
+    fn shared_vm_boots_before_container_creates() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-db"]);
+        let mut executor = make_executor(runtime);
+        let spec = network_stack();
+
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+        ];
+
+        let result = executor.execute(&spec, &actions).unwrap();
+        assert!(result.all_succeeded());
+
+        // Verify ordering: boot_shared_vm → network_setup → create_in_stack × 2.
+        let call_log = executor.runtime.call_log();
+        let ops: Vec<&str> = call_log.iter().map(|(op, _)| op.as_str()).collect();
+        assert_eq!(ops[0], "boot_shared_vm");
+        assert_eq!(ops[1], "network_setup");
+        // Remaining: pull + create_in_stack for each service.
+        assert!(ops.contains(&"create_in_stack"));
+        assert!(!ops.contains(&"create"), "should use create_in_stack, not create");
+    }
+
+    #[test]
+    fn network_setup_assigns_correct_ips() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-db"]);
+        let mut executor = make_executor(runtime);
+        let spec = network_stack();
+
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+        ];
+
+        executor.execute(&spec, &actions).unwrap();
+
+        // Verify network_setup was called with correct service configs.
+        let captured = executor.runtime.captured_network_services.borrow();
+        assert_eq!(captured.len(), 1);
+        let (stack_id, services) = &captured[0];
+        assert_eq!(stack_id, "netapp");
+        assert_eq!(services.len(), 2);
+
+        // web gets 172.20.0.2/24, db gets 172.20.0.3/24.
+        assert_eq!(services[0].name, "web");
+        assert_eq!(services[0].addr, "172.20.0.2/24");
+        assert_eq!(services[1].name, "db");
+        assert_eq!(services[1].addr, "172.20.0.3/24");
+    }
+
+    #[test]
+    fn service_to_service_hosts_use_real_ips() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-db"]);
+        let mut executor = make_executor(runtime);
+        let spec = network_stack();
+
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+        ];
+
+        executor.execute(&spec, &actions).unwrap();
+
+        // Verify extra_hosts use real IPs, not 127.0.0.1.
+        let configs = executor.runtime.captured_configs.borrow();
+
+        // Find web's config.
+        let web_config = configs.iter().find(|(id, _)| id == "ctr-web");
+        assert!(web_config.is_some(), "web config not captured");
+        let web_hosts = &web_config.unwrap().1.extra_hosts;
+        // web should have db mapped to 172.20.0.3 (db is index 1, so .3).
+        let db_host = web_hosts.iter().find(|(h, _)| h == "db");
+        assert!(db_host.is_some(), "db not in web's extra_hosts");
+        assert_eq!(db_host.unwrap().1, "172.20.0.3");
+
+        // Find db's config.
+        let db_config = configs.iter().find(|(id, _)| id == "ctr-db");
+        assert!(db_config.is_some(), "db config not captured");
+        let db_hosts = &db_config.unwrap().1.extra_hosts;
+        // db should have web mapped to 172.20.0.2.
+        let web_host = db_hosts.iter().find(|(h, _)| h == "web");
+        assert!(web_host.is_some(), "web not in db's extra_hosts");
+        assert_eq!(web_host.unwrap().1, "172.20.0.2");
+    }
+
+    #[test]
+    fn containers_join_per_service_network_namespace() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-db"]);
+        let mut executor = make_executor(runtime);
+        let spec = network_stack();
+
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+        ];
+
+        executor.execute(&spec, &actions).unwrap();
+
+        let configs = executor.runtime.captured_configs.borrow();
+
+        // web should join /var/run/netns/web.
+        let web_config = configs.iter().find(|(id, _)| id == "ctr-web").unwrap();
+        assert_eq!(
+            web_config.1.network_namespace_path,
+            Some("/var/run/netns/web".to_string())
+        );
+
+        // db should join /var/run/netns/db.
+        let db_config = configs.iter().find(|(id, _)| id == "ctr-db").unwrap();
+        assert_eq!(
+            db_config.1.network_namespace_path,
+            Some("/var/run/netns/db".to_string())
+        );
+    }
+
+    #[test]
+    fn same_container_port_no_conflict_with_shared_vm() {
+        // Two services both bind container port 80 but in different netns.
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-api"]);
+        let mut executor = make_executor(runtime);
+
+        let spec = stack(
+            "portapp",
+            vec![
+                ServiceSpec {
+                    ports: vec![PortSpec {
+                        protocol: "tcp".to_string(),
+                        container_port: 80,
+                        host_port: Some(8080),
+                    }],
+                    ..svc("web", "nginx:latest")
+                },
+                ServiceSpec {
+                    ports: vec![PortSpec {
+                        protocol: "tcp".to_string(),
+                        container_port: 80,
+                        host_port: Some(8081),
+                    }],
+                    ..svc("api", "node:20")
+                },
+            ],
+        );
+
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "api".to_string(),
+            },
+        ];
+
+        let result = executor.execute(&spec, &actions).unwrap();
+        // Both succeed: different host ports, same container port is fine with netns.
+        assert!(result.all_succeeded());
+        assert_eq!(result.succeeded, 2);
+    }
+
+    #[test]
+    fn three_service_ip_allocation() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-api", "ctr-db"]);
+        let mut executor = make_executor(runtime);
+        let spec = three_service_stack();
+
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "api".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+        ];
+
+        executor.execute(&spec, &actions).unwrap();
+
+        let captured = executor.runtime.captured_network_services.borrow();
+        let (_, services) = &captured[0];
+        assert_eq!(services.len(), 3);
+        // 172.20.0.1 = bridge, services get .2, .3, .4.
+        assert_eq!(services[0].addr, "172.20.0.2/24");
+        assert_eq!(services[1].addr, "172.20.0.3/24");
+        assert_eq!(services[2].addr, "172.20.0.4/24");
+
+        // Verify cross-service host resolution for web.
+        let configs = executor.runtime.captured_configs.borrow();
+        let web_config = configs.iter().find(|(id, _)| id == "ctr-web").unwrap();
+        let web_hosts = &web_config.1.extra_hosts;
+        assert_eq!(web_hosts.len(), 2); // api + db
+        assert!(web_hosts.iter().any(|(h, ip)| h == "api" && ip == "172.20.0.3"));
+        assert!(web_hosts.iter().any(|(h, ip)| h == "db" && ip == "172.20.0.4"));
+    }
+
+    #[test]
+    fn single_service_stack_skips_shared_vm() {
+        let runtime = MockContainerRuntime::new();
+        let mut executor = make_executor(runtime);
+        let spec = stack("solo", vec![svc("web", "nginx:latest")]);
+
+        let actions = vec![Action::ServiceCreate {
+            service_name: "web".to_string(),
+        }];
+
+        let result = executor.execute(&spec, &actions).unwrap();
+        assert!(result.all_succeeded());
+
+        // Should use create, not create_in_stack.
+        let call_log = executor.runtime.call_log();
+        let ops: Vec<&str> = call_log.iter().map(|(op, _)| op.as_str()).collect();
+        assert!(!ops.contains(&"boot_shared_vm"));
+        assert!(!ops.contains(&"network_setup"));
+        assert!(ops.contains(&"create"));
+        assert!(!ops.contains(&"create_in_stack"));
+    }
+
+    #[test]
+    fn single_service_uses_localhost_hosts() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-db"]);
+        let mut executor = make_executor(runtime);
+        // Single service — no shared VM.
+        let spec = stack("solo", vec![svc("web", "nginx:latest")]);
+
+        let actions = vec![Action::ServiceCreate {
+            service_name: "web".to_string(),
+        }];
+
+        executor.execute(&spec, &actions).unwrap();
+
+        // No extra_hosts since there's only one service.
+        let configs = executor.runtime.captured_configs.borrow();
+        let web_config = configs.iter().find(|(id, _)| id == "ctr-web").unwrap();
+        assert!(web_config.1.extra_hosts.is_empty());
+        assert!(web_config.1.network_namespace_path.is_none());
+    }
+
+    #[test]
+    fn shared_vm_not_rebooted_on_second_execute() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-db", "ctr-new"]);
+        let mut executor = make_executor(runtime);
+        let spec = network_stack();
+
+        // First execute: boots shared VM.
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+        ];
+        executor.execute(&spec, &actions).unwrap();
+
+        // Second execute with a recreate: should NOT reboot.
+        let actions2 = vec![Action::ServiceRecreate {
+            service_name: "web".to_string(),
+        }];
+        executor.execute(&spec, &actions2).unwrap();
+
+        // boot_shared_vm should only appear once.
+        let boot_count = executor
+            .runtime
+            .call_log()
+            .iter()
+            .filter(|(op, _)| op == "boot_shared_vm")
+            .count();
+        assert_eq!(boot_count, 1, "shared VM should not be rebooted");
     }
 }
