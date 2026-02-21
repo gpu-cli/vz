@@ -6,6 +6,7 @@
 //! before any reconciliation starts.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use serde_yml::Value;
 
@@ -26,6 +27,7 @@ const ACCEPTED_SERVICE: &[&str] = &[
     "command",
     "entrypoint",
     "environment",
+    "env_file",
     "working_dir",
     "user",
     "ports",
@@ -104,11 +106,56 @@ const REJECTED_SERVICE: &[(&str, &str)] = &[
 /// The `stack_name` is used as the stack namespace when the Compose
 /// file does not contain a top-level `name` key.
 ///
+/// This variant performs no filesystem access. `env_file` directives
+/// are accepted but ignored and `${VAR}` references are not expanded.
+/// Use [`parse_compose_with_dir`] for full env_file and variable
+/// expansion support.
+///
 /// Returns an error if:
 /// - The YAML is malformed.
 /// - Any unsupported key is present (with a stable error code).
 /// - Required fields are missing or have invalid types.
 pub fn parse_compose(yaml: &str, stack_name: &str) -> Result<StackSpec, StackError> {
+    parse_compose_inner(yaml, stack_name, None)
+}
+
+/// Parse a Compose YAML string with env_file and variable expansion.
+///
+/// Before parsing, this function:
+/// 1. Loads a `.env` file from `compose_dir` (if present) as expansion
+///    context.
+/// 2. Expands `${VAR}`, `${VAR:-default}`, and `$VAR` references in
+///    the YAML string using the loaded variables.
+/// 3. Resolves `env_file` paths relative to `compose_dir` and merges
+///    their contents into each service's environment. Service-level
+///    `environment` entries take precedence over `env_file` entries.
+pub fn parse_compose_with_dir(
+    yaml: &str,
+    stack_name: &str,
+    compose_dir: &Path,
+) -> Result<StackSpec, StackError> {
+    // Load .env from compose directory if it exists.
+    let dot_env_path = compose_dir.join(".env");
+    let dot_env = if dot_env_path.is_file() {
+        let content = std::fs::read_to_string(&dot_env_path).map_err(|e| {
+            StackError::ComposeParse(format!("failed to read {}: {e}", dot_env_path.display()))
+        })?;
+        parse_env_file_content(&content)
+    } else {
+        HashMap::new()
+    };
+
+    // Expand variables in the YAML string.
+    let expanded = expand_variables(yaml, &dot_env);
+
+    parse_compose_inner(&expanded, stack_name, Some(compose_dir))
+}
+
+fn parse_compose_inner(
+    yaml: &str,
+    stack_name: &str,
+    compose_dir: Option<&Path>,
+) -> Result<StackSpec, StackError> {
     let root: Value =
         serde_yml::from_str(yaml).map_err(|e| StackError::ComposeParse(e.to_string()))?;
 
@@ -148,7 +195,7 @@ pub fn parse_compose(yaml: &str, stack_name: &str) -> Result<StackSpec, StackErr
         let svc_name = key
             .as_str()
             .ok_or_else(|| StackError::ComposeParse("service name must be a string".into()))?;
-        let svc = parse_service(svc_name, svc_value, &volume_names)?;
+        let svc = parse_service(svc_name, svc_value, &volume_names, compose_dir)?;
         services.push(svc);
     }
 
@@ -273,6 +320,7 @@ fn parse_service(
     name: &str,
     value: &Value,
     defined_volumes: &[String],
+    compose_dir: Option<&Path>,
 ) -> Result<ServiceSpec, StackError> {
     let svc_map = value.as_mapping().ok_or_else(|| {
         StackError::ComposeParse(format!("service `{name}` must be a YAML mapping"))
@@ -290,7 +338,12 @@ fn parse_service(
 
     let command = parse_string_or_list(svc_map, "command")?;
     let entrypoint = parse_string_or_list(svc_map, "entrypoint")?;
-    let environment = parse_environment(name, svc_map)?;
+
+    // Load env_file entries first, then overlay with explicit environment.
+    let mut environment = load_env_file_entries(name, svc_map, compose_dir)?;
+    let explicit_env = parse_environment(name, svc_map)?;
+    environment.extend(explicit_env);
+
     let working_dir = svc_map
         .get(val("working_dir"))
         .and_then(|v| v.as_str())
@@ -958,6 +1011,159 @@ fn parse_extra_hosts(
     }
 
     Ok(hosts)
+}
+
+// ── env_file and variable expansion ─────────────────────────────────
+
+/// Parse an `.env` file's content into key-value pairs.
+///
+/// Supports:
+/// - `KEY=VALUE` lines
+/// - Lines starting with `#` are comments
+/// - Blank lines are ignored
+/// - Optional quoting: `KEY="value"` or `KEY='value'` (quotes stripped)
+/// - Lines prefixed with `export ` are accepted
+pub fn parse_env_file_content(content: &str) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Strip optional `export ` prefix.
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, val)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let val = val.trim();
+        // Strip surrounding quotes.
+        let val = if (val.starts_with('"') && val.ends_with('"'))
+            || (val.starts_with('\'') && val.ends_with('\''))
+        {
+            &val[1..val.len() - 1]
+        } else {
+            val
+        };
+        env.insert(key.to_string(), val.to_string());
+    }
+    env
+}
+
+/// Expand `${VAR}`, `${VAR:-default}`, and `$VAR` references in a string.
+///
+/// Looks up each variable in `vars`. If not found:
+/// - `${VAR}` / `$VAR` → empty string
+/// - `${VAR:-default}` → the default value
+pub fn expand_variables(input: &str, vars: &HashMap<String, String>) -> String {
+    let mut result = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        if chars[i] == '$' && i + 1 < len {
+            if chars[i + 1] == '{' {
+                // ${VAR} or ${VAR:-default}
+                if let Some(close) = chars[i + 2..].iter().position(|&c| c == '}') {
+                    let inner: String = chars[i + 2..i + 2 + close].iter().collect();
+                    let value = if let Some((name, default)) = inner.split_once(":-") {
+                        vars.get(name)
+                            .filter(|v| !v.is_empty())
+                            .map(|v| v.as_str())
+                            .unwrap_or(default)
+                    } else {
+                        vars.get(inner.as_str()).map(|v| v.as_str()).unwrap_or("")
+                    };
+                    result.push_str(value);
+                    i += 2 + close + 1; // skip past '}'
+                } else {
+                    // Unclosed brace, emit literally.
+                    result.push('$');
+                    i += 1;
+                }
+            } else if chars[i + 1] == '$' {
+                // $$ → literal $
+                result.push('$');
+                i += 2;
+            } else if chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_' {
+                // $VAR (simple form)
+                let start = i + 1;
+                let mut end = start;
+                while end < len && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
+                    end += 1;
+                }
+                let name: String = chars[start..end].iter().collect();
+                let value = vars.get(name.as_str()).map(|v| v.as_str()).unwrap_or("");
+                result.push_str(value);
+                i = end;
+            } else {
+                // Not a variable reference.
+                result.push('$');
+                i += 1;
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    result
+}
+
+/// Load `env_file` entries for a service into a HashMap.
+///
+/// If `compose_dir` is `None`, `env_file` directives are silently ignored.
+/// If `compose_dir` is `Some`, file paths are resolved relative to it.
+fn load_env_file_entries(
+    svc_name: &str,
+    map: &serde_yml::Mapping,
+    compose_dir: Option<&Path>,
+) -> Result<HashMap<String, String>, StackError> {
+    let Some(value) = map.get(val("env_file")) else {
+        return Ok(HashMap::new());
+    };
+
+    let compose_dir = match compose_dir {
+        Some(d) => d,
+        None => return Ok(HashMap::new()),
+    };
+
+    let paths = if let Some(s) = value.as_str() {
+        vec![s.to_string()]
+    } else if let Some(seq) = value.as_sequence() {
+        seq.iter()
+            .map(|v| {
+                v.as_str().map(String::from).ok_or_else(|| {
+                    StackError::ComposeParse(format!(
+                        "service `{svc_name}`: `env_file` entries must be strings"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        return Err(StackError::ComposeParse(format!(
+            "service `{svc_name}`: `env_file` must be a string or list of strings"
+        )));
+    };
+
+    let mut env = HashMap::new();
+    for path_str in &paths {
+        let env_path = compose_dir.join(path_str);
+        let content = std::fs::read_to_string(&env_path).map_err(|e| {
+            StackError::ComposeParse(format!(
+                "service `{svc_name}`: failed to read env_file `{}`: {e}",
+                env_path.display()
+            ))
+        })?;
+        // Later files override earlier ones.
+        env.extend(parse_env_file_content(&content));
+    }
+
+    Ok(env)
 }
 
 // ── Volume parsing ─────────────────────────────────────────────────
@@ -1957,5 +2163,218 @@ services:
                 read_only: false,
             }
         );
+    }
+
+    // ── env_file and variable expansion ──────────────────────────
+
+    #[test]
+    fn parse_env_file_basic() {
+        let content = r#"
+# This is a comment
+KEY1=value1
+KEY2=value2
+
+# Another comment
+KEY3=value with spaces
+"#;
+        let env = parse_env_file_content(content);
+        assert_eq!(env.get("KEY1").unwrap(), "value1");
+        assert_eq!(env.get("KEY2").unwrap(), "value2");
+        assert_eq!(env.get("KEY3").unwrap(), "value with spaces");
+        assert_eq!(env.len(), 3);
+    }
+
+    #[test]
+    fn parse_env_file_quoted_values() {
+        let content = r#"
+SINGLE='single quoted'
+DOUBLE="double quoted"
+UNQUOTED=plain
+"#;
+        let env = parse_env_file_content(content);
+        assert_eq!(env.get("SINGLE").unwrap(), "single quoted");
+        assert_eq!(env.get("DOUBLE").unwrap(), "double quoted");
+        assert_eq!(env.get("UNQUOTED").unwrap(), "plain");
+    }
+
+    #[test]
+    fn parse_env_file_export_prefix() {
+        let content = "export DB_HOST=localhost\nexport DB_PORT=5432\n";
+        let env = parse_env_file_content(content);
+        assert_eq!(env.get("DB_HOST").unwrap(), "localhost");
+        assert_eq!(env.get("DB_PORT").unwrap(), "5432");
+    }
+
+    #[test]
+    fn parse_env_file_empty_value() {
+        let content = "EMPTY=\n";
+        let env = parse_env_file_content(content);
+        assert_eq!(env.get("EMPTY").unwrap(), "");
+    }
+
+    #[test]
+    fn expand_braced_variable() {
+        let mut vars = HashMap::new();
+        vars.insert("DB_HOST".to_string(), "localhost".to_string());
+        vars.insert("DB_PORT".to_string(), "5432".to_string());
+        let result = expand_variables("host=${DB_HOST} port=${DB_PORT}", &vars);
+        assert_eq!(result, "host=localhost port=5432");
+    }
+
+    #[test]
+    fn expand_simple_variable() {
+        let mut vars = HashMap::new();
+        vars.insert("TAG".to_string(), "latest".to_string());
+        let result = expand_variables("image: nginx:$TAG", &vars);
+        assert_eq!(result, "image: nginx:latest");
+    }
+
+    #[test]
+    fn expand_default_value() {
+        let vars = HashMap::new();
+        let result = expand_variables("port=${PORT:-8080}", &vars);
+        assert_eq!(result, "port=8080");
+    }
+
+    #[test]
+    fn expand_default_not_used_when_set() {
+        let mut vars = HashMap::new();
+        vars.insert("PORT".to_string(), "3000".to_string());
+        let result = expand_variables("port=${PORT:-8080}", &vars);
+        assert_eq!(result, "port=3000");
+    }
+
+    #[test]
+    fn expand_default_used_when_empty() {
+        let mut vars = HashMap::new();
+        vars.insert("PORT".to_string(), String::new());
+        let result = expand_variables("port=${PORT:-8080}", &vars);
+        assert_eq!(result, "port=8080");
+    }
+
+    #[test]
+    fn expand_missing_variable_empty() {
+        let vars = HashMap::new();
+        let result = expand_variables("val=${MISSING}", &vars);
+        assert_eq!(result, "val=");
+    }
+
+    #[test]
+    fn expand_dollar_dollar_literal() {
+        let vars = HashMap::new();
+        let result = expand_variables("cost: $$100", &vars);
+        assert_eq!(result, "cost: $100");
+    }
+
+    #[test]
+    fn expand_no_variables_unchanged() {
+        let vars = HashMap::new();
+        let input = "plain text without variables";
+        assert_eq!(expand_variables(input, &vars), input);
+    }
+
+    #[test]
+    fn env_file_accepted_without_dir() {
+        // env_file is accepted but silently ignored without compose_dir.
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    env_file: .env
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].image, "nginx:latest");
+    }
+
+    #[test]
+    fn env_file_loads_from_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("app.env");
+        std::fs::write(&env_path, "DB_HOST=postgres\nDB_PORT=5432\n").unwrap();
+
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    env_file: app.env
+"#;
+        let spec = parse_compose_with_dir(yaml, "myapp", dir.path()).unwrap();
+        let env = &spec.services[0].environment;
+        assert_eq!(env.get("DB_HOST").unwrap(), "postgres");
+        assert_eq!(env.get("DB_PORT").unwrap(), "5432");
+    }
+
+    #[test]
+    fn env_file_list_loads_multiple() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("base.env"), "A=1\nB=2\n").unwrap();
+        std::fs::write(dir.path().join("override.env"), "B=99\nC=3\n").unwrap();
+
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    env_file:
+      - base.env
+      - override.env
+"#;
+        let spec = parse_compose_with_dir(yaml, "myapp", dir.path()).unwrap();
+        let env = &spec.services[0].environment;
+        assert_eq!(env.get("A").unwrap(), "1");
+        assert_eq!(env.get("B").unwrap(), "99"); // overridden
+        assert_eq!(env.get("C").unwrap(), "3");
+    }
+
+    #[test]
+    fn explicit_env_overrides_env_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "PORT=3000\nHOST=0.0.0.0\n").unwrap();
+
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    env_file: .env
+    environment:
+      PORT: "8080"
+"#;
+        let spec = parse_compose_with_dir(yaml, "myapp", dir.path()).unwrap();
+        let env = &spec.services[0].environment;
+        assert_eq!(env.get("PORT").unwrap(), "8080"); // explicit wins
+        assert_eq!(env.get("HOST").unwrap(), "0.0.0.0"); // from env_file
+    }
+
+    #[test]
+    fn variable_expansion_in_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "TAG=v2.1\nPORT=9090\n").unwrap();
+
+        let yaml = r#"
+services:
+  web:
+    image: myapp:${TAG}
+    ports:
+      - "${PORT}:80"
+"#;
+        let spec = parse_compose_with_dir(yaml, "myapp", dir.path()).unwrap();
+        assert_eq!(spec.services[0].image, "myapp:v2.1");
+        assert_eq!(spec.services[0].ports[0].host_port, Some(9090));
+        assert_eq!(spec.services[0].ports[0].container_port, 80);
+    }
+
+    #[test]
+    fn variable_expansion_with_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        // No .env file — all defaults should kick in.
+        let yaml = r#"
+services:
+  web:
+    image: nginx:${TAG:-latest}
+    environment:
+      PORT: "${PORT:-8080}"
+"#;
+        let spec = parse_compose_with_dir(yaml, "myapp", dir.path()).unwrap();
+        assert_eq!(spec.services[0].image, "nginx:latest");
+        assert_eq!(spec.services[0].environment.get("PORT").unwrap(), "8080");
     }
 }

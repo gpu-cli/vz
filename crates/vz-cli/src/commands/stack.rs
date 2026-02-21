@@ -15,7 +15,7 @@ use tracing::info;
 use vz_stack::{
     ApplyResult, ContainerRuntime, EventRecord, ExecutionResult, OrchestrationConfig, RoundReport,
     ServiceObservedState, ServicePhase, StackError, StackEvent, StackExecutor, StackOrchestrator,
-    StackSpec, StateStore, parse_compose,
+    StackSpec, StateStore, parse_compose_with_dir,
 };
 
 /// Manage multi-service stacks from Compose files.
@@ -224,8 +224,16 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
     let yaml = std::fs::read_to_string(&args.file)
         .with_context(|| format!("failed to read compose file: {}", args.file.display()))?;
 
+    let compose_dir = args
+        .file
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+
     let stack_name = resolve_stack_name(args.name.as_deref(), &args.file)?;
-    let spec = parse_compose(&yaml, &stack_name).with_context(|| "failed to parse compose file")?;
+    let spec = parse_compose_with_dir(&yaml, &stack_name, &compose_dir)
+        .with_context(|| "failed to parse compose file")?;
 
     let state_dir = resolve_state_dir(args.state_dir.as_deref(), &spec.name)?;
     std::fs::create_dir_all(&state_dir)
