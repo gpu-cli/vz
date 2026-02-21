@@ -464,7 +464,18 @@ impl Runtime {
                 )
             })?;
 
-        let bundle_mounts = mount_specs_to_bundle_mounts(&run.mounts)?;
+        let mut bundle_mounts = mount_specs_to_bundle_mounts(&run.mounts)?;
+
+        // Generate /etc/hosts file for inter-service hostname resolution.
+        if !run.extra_hosts.is_empty() {
+            write_hosts_file(&bundle_host_dir, &run.extra_hosts)?;
+            bundle_mounts.push(BundleMount {
+                destination: PathBuf::from("/etc/hosts"),
+                source: PathBuf::from(format!("{bundle_guest_path}/hosts")),
+                typ: "bind".to_string(),
+                options: vec!["rbind".to_string(), "ro".to_string()],
+            });
+        }
 
         write_oci_bundle(
             &bundle_host_dir,
@@ -571,6 +582,7 @@ impl Runtime {
             timeout,
             container_id,
             oci_annotations,
+            extra_hosts,
         } = run;
 
         let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
@@ -592,7 +604,17 @@ impl Runtime {
         // If no explicit init process is set, use `sleep infinity` as the default.
         let bundle_cmd = init_process.unwrap_or_else(|| vec!["sleep".into(), "infinity".into()]);
 
-        let bundle_mounts = mount_specs_to_bundle_mounts(&mounts)?;
+        let mut bundle_mounts = mount_specs_to_bundle_mounts(&mounts)?;
+
+        if !extra_hosts.is_empty() {
+            write_hosts_file(&bundle_host_dir, &extra_hosts)?;
+            bundle_mounts.push(BundleMount {
+                destination: PathBuf::from("/etc/hosts"),
+                source: PathBuf::from(format!("{bundle_guest_path}/hosts")),
+                typ: "bind".to_string(),
+                options: vec!["rbind".to_string(), "ro".to_string()],
+            });
+        }
 
         write_oci_bundle(
             &bundle_host_dir,
@@ -720,6 +742,7 @@ impl Runtime {
             timeout,
             container_id: _,
             oci_annotations: _,
+            extra_hosts: _,
         } = run;
 
         let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
@@ -1283,6 +1306,25 @@ fn make_oci_runtime_share(runtime_binary: &Path) -> Result<SharedDirConfig, OciE
     })
 }
 
+/// Write an `/etc/hosts` file into the OCI bundle directory.
+///
+/// The generated file contains standard localhost entries plus one line
+/// per extra host mapping (hostname → IP).
+fn write_hosts_file(
+    bundle_dir: &Path,
+    extra_hosts: &[(String, String)],
+) -> Result<(), OciError> {
+    use std::io::Write;
+    let hosts_path = bundle_dir.join("hosts");
+    let mut f = fs::File::create(&hosts_path)?;
+    writeln!(f, "127.0.0.1\tlocalhost")?;
+    writeln!(f, "::1\tlocalhost")?;
+    for (hostname, ip) in extra_hosts {
+        writeln!(f, "{ip}\t{hostname}")?;
+    }
+    Ok(())
+}
+
 fn oci_bundle_host_dir(rootfs_dir: &Path, bundle_guest_path: &str) -> PathBuf {
     rootfs_dir.join(bundle_guest_path.trim_start_matches('/'))
 }
@@ -1364,6 +1406,7 @@ fn resolve_run_config(
         execution_mode,
         container_id: _,
         oci_annotations,
+        extra_hosts,
     } = run;
 
     let resolved_cmd = if !run_cmd.is_empty() {
@@ -1412,6 +1455,7 @@ fn resolve_run_config(
         container_id: Some(container_id.to_string()),
         init_process,
         oci_annotations,
+        extra_hosts,
     })
 }
 
@@ -2015,6 +2059,21 @@ mod tests {
     fn oci_bundle_guest_root_rejects_relative_state_dir() {
         let error = oci_bundle_guest_root(Some(Path::new("var/lib/vz-oci"))).unwrap_err();
         assert!(matches!(error, OciError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn write_hosts_file_generates_correct_content() {
+        let tmp = unique_temp_dir("hosts-gen");
+        let hosts = vec![
+            ("db".to_string(), "127.0.0.1".to_string()),
+            ("cache".to_string(), "10.0.0.5".to_string()),
+        ];
+        write_hosts_file(&tmp, &hosts).unwrap();
+        let content = fs::read_to_string(tmp.join("hosts")).unwrap();
+        assert!(content.contains("127.0.0.1\tlocalhost"));
+        assert!(content.contains("::1\tlocalhost"));
+        assert!(content.contains("127.0.0.1\tdb"));
+        assert!(content.contains("10.0.0.5\tcache"));
     }
 
     #[tokio::test]

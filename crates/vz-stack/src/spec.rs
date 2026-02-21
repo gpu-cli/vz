@@ -64,6 +64,9 @@ pub struct ServiceSpec {
     /// Resource constraints.
     #[serde(default)]
     pub resources: ResourcesSpec,
+    /// Extra `/etc/hosts` entries as `(hostname, ip)` pairs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_hosts: Vec<(String, String)>,
 }
 
 /// Mount specification for container volumes.
@@ -247,6 +250,7 @@ mod tests {
                     cpu: Some("2".to_string()),
                     memory: Some("512m".to_string()),
                 },
+                extra_hosts: vec![],
             }],
             networks: vec![NetworkSpec {
                 name: "frontend".to_string(),

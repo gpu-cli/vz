@@ -277,6 +277,7 @@ mod tests {
                     healthcheck: None,
                     restart_policy: None,
                     resources: Default::default(),
+                    extra_hosts: vec![],
                 },
                 ServiceSpec {
                     name: "db".to_string(),
@@ -295,6 +296,7 @@ mod tests {
                     healthcheck: None,
                     restart_policy: None,
                     resources: Default::default(),
+                    extra_hosts: vec![],
                 },
             ],
             networks: vec![],

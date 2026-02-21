@@ -334,6 +334,18 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             })
             .collect();
 
+        // Auto-inject sibling service hostnames for inter-service resolution.
+        // All services in the stack share the VM network, so map names to 127.0.0.1.
+        for svc in &spec.services {
+            if svc.name != service_name
+                && !run_config.extra_hosts.iter().any(|(h, _)| h == &svc.name)
+            {
+                run_config
+                    .extra_hosts
+                    .push((svc.name.clone(), "127.0.0.1".to_string()));
+            }
+        }
+
         // Create and start container.
         info!(service = %service_name, image = %svc_spec.image, "creating container");
         let container_id = match self.runtime.create(&svc_spec.image, run_config) {
@@ -591,6 +603,7 @@ mod tests {
             healthcheck: None,
             restart_policy: None,
             resources: ResourcesSpec::default(),
+            extra_hosts: vec![],
         }
     }
 

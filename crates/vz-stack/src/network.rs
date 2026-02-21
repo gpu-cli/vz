@@ -396,6 +396,7 @@ mod tests {
             healthcheck: None,
             restart_policy: None,
             resources: Default::default(),
+            extra_hosts: vec![],
         }
     }
 

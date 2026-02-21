@@ -39,6 +39,7 @@ pub fn service_to_run_config(
         network_enabled: Some(true),
         // Use OCI runtime for full lifecycle (create → start → stop).
         execution_mode: vz_oci::ExecutionMode::OciRuntime,
+        extra_hosts: spec.extra_hosts.clone(),
         // Remaining fields use defaults; future beads may populate them.
         ..Default::default()
     })
@@ -202,6 +203,7 @@ mod tests {
             healthcheck: None,
             restart_policy: None,
             resources: ResourcesSpec::default(),
+            extra_hosts: vec![],
         }
     }
 
@@ -414,6 +416,19 @@ mod tests {
     }
 
     #[test]
+    fn extra_hosts_passed_through() {
+        let mut spec = minimal_service();
+        spec.extra_hosts = vec![
+            ("db".to_string(), "127.0.0.1".to_string()),
+            ("cache".to_string(), "10.0.0.5".to_string()),
+        ];
+        let config = service_to_run_config(&spec, &[]).unwrap();
+        assert_eq!(config.extra_hosts.len(), 2);
+        assert_eq!(config.extra_hosts[0], ("db".to_string(), "127.0.0.1".to_string()));
+        assert_eq!(config.extra_hosts[1], ("cache".to_string(), "10.0.0.5".to_string()));
+    }
+
+    #[test]
     fn resources_invalid_memory() {
         let mut spec = minimal_service();
         spec.resources = ResourcesSpec {
@@ -471,6 +486,7 @@ mod tests {
                 cpu: Some("2".to_string()),
                 memory: Some("1g".to_string()),
             },
+            extra_hosts: vec![],
         };
 
         let resolved_mounts = vec![ResolvedMount {

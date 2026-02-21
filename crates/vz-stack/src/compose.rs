@@ -33,6 +33,7 @@ const ACCEPTED_SERVICE: &[&str] = &[
     "depends_on",
     "healthcheck",
     "restart",
+    "extra_hosts",
 ];
 
 /// Volume-level keys allowed inside `volumes.<name>`.
@@ -77,10 +78,6 @@ const REJECTED_SERVICE: &[(&str, &str)] = &[
     (
         "devices",
         "device pass-through is not supported in this runtime",
-    ),
-    (
-        "extra_hosts",
-        "host file modifications are not supported in this runtime",
     ),
     (
         "ipc",
@@ -307,6 +304,7 @@ fn parse_service(
     let depends_on = parse_depends_on(name, svc_map)?;
     let healthcheck = parse_healthcheck(name, svc_map)?;
     let restart_policy = parse_restart(name, svc_map)?;
+    let extra_hosts = parse_extra_hosts(name, svc_map)?;
 
     Ok(ServiceSpec {
         name: name.to_string(),
@@ -322,6 +320,7 @@ fn parse_service(
         healthcheck,
         restart_policy,
         resources: ResourcesSpec::default(),
+        extra_hosts,
     })
 }
 
@@ -924,6 +923,41 @@ fn parse_restart(
              accepted values: no, always, on-failure, on-failure:N, unless-stopped"
         ))),
     }
+}
+
+/// Parse `extra_hosts` entries in `"hostname:ip"` format.
+fn parse_extra_hosts(
+    svc_name: &str,
+    map: &serde_yml::Mapping,
+) -> Result<Vec<(String, String)>, StackError> {
+    let Some(value) = map.get(val("extra_hosts")) else {
+        return Ok(vec![]);
+    };
+
+    let seq = value.as_sequence().ok_or_else(|| {
+        StackError::ComposeParse(format!(
+            "service `{svc_name}`: `extra_hosts` must be a list"
+        ))
+    })?;
+
+    let mut hosts = Vec::with_capacity(seq.len());
+    for entry in seq {
+        let s = entry.as_str().ok_or_else(|| {
+            StackError::ComposeParse(format!(
+                "service `{svc_name}`: `extra_hosts` entries must be strings"
+            ))
+        })?;
+
+        let (hostname, ip) = s.split_once(':').ok_or_else(|| {
+            StackError::ComposeParse(format!(
+                "service `{svc_name}`: `extra_hosts` entry must be \"hostname:ip\", got \"{s}\""
+            ))
+        })?;
+
+        hosts.push((hostname.to_string(), ip.to_string()));
+    }
+
+    Ok(hosts)
 }
 
 // ── Volume parsing ─────────────────────────────────────────────────
@@ -1712,16 +1746,20 @@ services:
     }
 
     #[test]
-    fn reject_extra_hosts() {
+    fn parse_extra_hosts_entries() {
         let yaml = r#"
 services:
   web:
     image: nginx:latest
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - "myhost:192.168.1.10"
+      - "other:10.0.0.1"
 "#;
-        let err = parse_compose(yaml, "myapp").unwrap_err();
-        assert!(err.to_string().contains("extra_hosts"));
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let web = &spec.services[0];
+        assert_eq!(web.extra_hosts.len(), 2);
+        assert_eq!(web.extra_hosts[0], ("myhost".to_string(), "192.168.1.10".to_string()));
+        assert_eq!(web.extra_hosts[1], ("other".to_string(), "10.0.0.1".to_string()));
     }
 
     #[test]

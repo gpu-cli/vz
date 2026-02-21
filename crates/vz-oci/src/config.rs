@@ -194,6 +194,12 @@ pub struct RunConfig {
     pub init_process: Option<Vec<String>>,
     /// Additional OCI runtime-spec annotations for this run.
     pub oci_annotations: Vec<(String, String)>,
+    /// Extra `/etc/hosts` entries as `(hostname, ip)` pairs.
+    ///
+    /// When non-empty, the runtime generates an `/etc/hosts` file in the
+    /// OCI bundle directory and bind-mounts it into the container. This
+    /// enables inter-service hostname resolution without a DNS server.
+    pub extra_hosts: Vec<(String, String)>,
 }
 
 /// Options for executing a command in an already-running container.

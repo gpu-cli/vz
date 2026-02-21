@@ -430,6 +430,7 @@ async fn create_container(runtime: &vz_oci::Runtime, args: CreateArgs) -> anyhow
             Some(args.command)
         },
         oci_annotations: Vec::new(),
+        extra_hosts: Vec::new(),
     };
 
     info!(image = %args.image, "creating long-lived container");
@@ -572,6 +573,7 @@ fn build_run_config(args: &RunArgs) -> anyhow::Result<RunConfig> {
         container_id: args.internal_container_id.clone(),
         init_process: None,
         oci_annotations: Vec::new(),
+        extra_hosts: Vec::new(),
     })
 }
 

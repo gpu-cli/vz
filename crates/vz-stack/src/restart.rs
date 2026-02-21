@@ -182,6 +182,7 @@ mod tests {
             healthcheck: None,
             restart_policy: policy,
             resources: Default::default(),
+            extra_hosts: vec![],
         }
     }
 
