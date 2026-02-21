@@ -13,8 +13,9 @@ mod store;
 
 pub use config::{
     Auth, ExecConfig, ExecutionMode, MountAccess, MountSpec, MountType, OciRuntimeKind,
-    PortMapping, PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig, StackVmConfig,
+    PortMapping, PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig,
 };
+pub use vz_linux::NetworkServiceConfig;
 pub use container_store::{ContainerInfo, ContainerStatus, ContainerStore};
 pub use error::OciError;
 pub use image::{ImageConfigSummary, ImageId, ImagePuller};

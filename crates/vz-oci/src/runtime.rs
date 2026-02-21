@@ -30,7 +30,7 @@ use vz::protocol::OciContainerState;
 
 use crate::config::{
     ExecConfig, ExecutionMode, MountAccess, MountSpec, MountType, OciRuntimeKind, PortMapping,
-    PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig, StackVmConfig,
+    PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig,
 };
 use crate::error::OciError;
 use crate::store::{ImageInfo, PruneResult};
@@ -394,17 +394,25 @@ impl Runtime {
 
     // ── Shared stack VM API ──────────────────────────────────────────
 
+    /// Return the rootfs store directory where assembled rootfs trees are stored.
+    ///
+    /// This is the parent directory of all per-container rootfs directories.
+    /// For a shared stack VM, it is used as the VirtioFS `rootfs` share so
+    /// that each container's assembled rootfs appears at `/<container_id>/`
+    /// inside the guest.
+    pub fn rootfs_store_dir(&self) -> PathBuf {
+        self.config.data_dir.join("rootfs")
+    }
+
     /// Boot a shared VM for a multi-service stack.
     ///
     /// The VM runs a single kernel with the guest agent, and multiple OCI
     /// containers can be created inside it via
     /// [`create_container_in_stack`](Self::create_container_in_stack).
     ///
-    /// Each service's assembled rootfs is shared with the guest as a VirtioFS
-    /// mount tagged `rootfs-<index>`. The guest agent (or init) is responsible
-    /// for making these accessible at
-    /// `/run/vz-oci/rootfs/<container-id>/` so that OCI bundles can reference
-    /// them.
+    /// The rootfs store directory is shared via VirtioFS so that each
+    /// container's assembled rootfs appears at `/<container_id>/` inside
+    /// the guest after overlay+chroot.
     ///
     /// # Errors
     ///
@@ -413,7 +421,7 @@ impl Runtime {
     pub async fn boot_shared_vm(
         &self,
         stack_id: &str,
-        config: StackVmConfig,
+        ports: Vec<PortMapping>,
     ) -> Result<(), OciError> {
         // Guard against double-boot.
         if self.stack_vms.lock().await.contains_key(stack_id) {
@@ -421,6 +429,9 @@ impl Runtime {
                 "shared VM already running for stack '{stack_id}'"
             )));
         }
+
+        let rootfs_store = self.rootfs_store_dir();
+        fs::create_dir_all(&rootfs_store)?;
 
         let kernel = ensure_kernel_with_options(EnsureKernelOptions {
             install_dir: self.config.linux_install_dir.clone(),
@@ -435,18 +446,15 @@ impl Runtime {
             &kernel,
         )?;
 
-        let mount_shares = mount_specs_to_shared_dirs(&config.extra_mounts);
         let mut vm_config = LinuxVmConfig::new(kernel.kernel, kernel.initramfs)
-            .with_rootfs_dir(config.rootfs_dir);
+            .with_rootfs_dir(rootfs_store);
         vm_config
             .shared_dirs
             .push(make_oci_runtime_share(&runtime_binary)?);
-        vm_config.shared_dirs.extend(mount_shares);
-        vm_config.cpus = config.cpus;
-        vm_config.memory_mb = config.memory_mb;
-        vm_config.serial_log_file = config.serial_log_file;
+        vm_config.cpus = self.config.default_cpus;
+        vm_config.memory_mb = self.config.default_memory_mb;
 
-        if !config.network_enabled {
+        if !self.config.default_network_enabled {
             vm_config.network = Some(NetworkConfig::None);
         }
 
@@ -461,7 +469,7 @@ impl Runtime {
         let vm = Arc::new(vm);
 
         // Set up port forwarding for all services' ports.
-        if let Err(err) = start_port_forwarding(vm.inner_shared(), &config.ports).await {
+        if let Err(err) = start_port_forwarding(vm.inner_shared(), &ports).await {
             let _ = vm.stop().await;
             return Err(err);
         }
@@ -545,13 +553,21 @@ impl Runtime {
         let run = resolve_run_config(image_config, run, &container_id)?;
 
         // Build OCI bundle referencing the assembled rootfs (shared via VirtioFS).
+        //
+        // In a shared VM, the rootfs store directory is the VirtioFS share.
+        // Each container's assembled rootfs appears at `/<container_id>/` inside
+        // the guest after overlay+chroot. The bundle is written under the
+        // container's rootfs dir so its guest path is `/<container_id>/<bundle>`.
         let oci_container_id = run
             .container_id
             .clone()
             .unwrap_or_else(|| container_id.to_string());
         let bundle_guest_root = oci_bundle_guest_root(self.config.guest_state_dir.as_deref())?;
-        let bundle_guest_path = oci_bundle_guest_path(&bundle_guest_root, &oci_container_id);
-        let bundle_host_dir = oci_bundle_host_dir(&rootfs_dir, &bundle_guest_path);
+        let bundle_relative_path = oci_bundle_guest_path(&bundle_guest_root, &oci_container_id);
+        // Host: <data_dir>/rootfs/<container_id>/<bundle_path>
+        let bundle_host_dir = oci_bundle_host_dir(&rootfs_dir, &bundle_relative_path);
+        // Guest: /<container_id>/<bundle_path>
+        let bundle_guest_path = format!("/{container_id}{bundle_relative_path}");
 
         let bundle_cmd = run
             .init_process
@@ -581,9 +597,11 @@ impl Runtime {
             });
         }
 
+        // Rootfs symlink: points to /<container_id>/ inside the guest.
+        let guest_rootfs_path = format!("/{container_id}");
         write_oci_bundle(
             &bundle_host_dir,
-            Path::new(OCI_GUEST_ROOT_PATH),
+            Path::new(&guest_rootfs_path),
             BundleSpec {
                 cmd: bundle_cmd,
                 env: run.env.clone(),
@@ -596,7 +614,7 @@ impl Runtime {
         )?;
 
         // OCI create + start inside the shared VM.
-        if let Err(err) = vm.oci_create(oci_container_id.clone(), bundle_guest_path).await {
+        if let Err(err) = vm.oci_create(oci_container_id.clone(), bundle_guest_path.clone()).await {
             container.status = ContainerStatus::Stopped { exit_code: -1 };
             container.stopped_unix_secs = Some(current_unix_secs());
             container.host_pid = None;
@@ -699,6 +717,55 @@ impl Runtime {
     /// Check whether a shared VM is running for the given stack.
     pub async fn has_shared_vm(&self, stack_id: &str) -> bool {
         self.stack_vms.lock().await.contains_key(stack_id)
+    }
+
+    /// Set up per-service network isolation inside the shared VM.
+    ///
+    /// Creates a bridge and per-service network namespaces so that
+    /// containers can communicate using real IP addresses.
+    pub async fn network_setup(
+        &self,
+        stack_id: &str,
+        services: Vec<vz::protocol::NetworkServiceConfig>,
+    ) -> Result<(), OciError> {
+        let vm = self
+            .stack_vms
+            .lock()
+            .await
+            .get(stack_id)
+            .cloned()
+            .ok_or_else(|| {
+                OciError::InvalidConfig(format!(
+                    "no shared VM running for stack '{stack_id}'"
+                ))
+            })?;
+
+        vm.network_setup(stack_id.to_string(), services)
+            .await
+            .map_err(OciError::from)
+    }
+
+    /// Tear down per-service network resources inside the shared VM.
+    pub async fn network_teardown(
+        &self,
+        stack_id: &str,
+        service_names: Vec<String>,
+    ) -> Result<(), OciError> {
+        let vm = self
+            .stack_vms
+            .lock()
+            .await
+            .get(stack_id)
+            .cloned()
+            .ok_or_else(|| {
+                OciError::InvalidConfig(format!(
+                    "no shared VM running for stack '{stack_id}'"
+                ))
+            })?;
+
+        vm.network_teardown(stack_id.to_string(), service_names)
+            .await
+            .map_err(OciError::from)
     }
 
     // ── Single-container exec ──────────────────────────────────────

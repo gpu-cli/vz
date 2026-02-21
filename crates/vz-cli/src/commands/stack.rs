@@ -220,12 +220,42 @@ impl ContainerRuntime for OciContainerRuntime {
     fn boot_shared_vm(
         &self,
         stack_id: &str,
-        config: vz_oci::StackVmConfig,
+        ports: &[vz_oci::PortMapping],
     ) -> Result<(), StackError> {
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.runtime.boot_shared_vm(stack_id, config))
+                .block_on(self.runtime.boot_shared_vm(stack_id, ports.to_vec()))
                 .map_err(|e| StackError::Network(format!("boot_shared_vm failed: {e}")))
+        })
+    }
+
+    fn network_setup(
+        &self,
+        stack_id: &str,
+        services: &[vz_oci::NetworkServiceConfig],
+    ) -> Result<(), StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(
+                    self.runtime
+                        .network_setup(stack_id, services.to_vec()),
+                )
+                .map_err(|e| StackError::Network(format!("network_setup failed: {e}")))
+        })
+    }
+
+    fn network_teardown(
+        &self,
+        stack_id: &str,
+        service_names: &[String],
+    ) -> Result<(), StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(
+                    self.runtime
+                        .network_teardown(stack_id, service_names.to_vec()),
+                )
+                .map_err(|e| StackError::Network(format!("network_teardown failed: {e}")))
         })
     }
 

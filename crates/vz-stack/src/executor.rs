@@ -61,7 +61,29 @@ pub trait ContainerRuntime {
     fn boot_shared_vm(
         &self,
         _stack_id: &str,
-        _config: vz_oci::StackVmConfig,
+        _ports: &[vz_oci::PortMapping],
+    ) -> Result<(), StackError> {
+        Ok(())
+    }
+
+    /// Set up per-service network namespaces inside the shared VM.
+    ///
+    /// Creates a bridge and per-service netns with veth pairs so that
+    /// containers can communicate using real IP addresses (Docker Compose
+    /// style networking).
+    fn network_setup(
+        &self,
+        _stack_id: &str,
+        _services: &[vz_oci::NetworkServiceConfig],
+    ) -> Result<(), StackError> {
+        Ok(())
+    }
+
+    /// Tear down network namespaces for a stack.
+    fn network_teardown(
+        &self,
+        _stack_id: &str,
+        _service_names: &[String],
     ) -> Result<(), StackError> {
         Ok(())
     }
@@ -226,6 +248,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
     /// Port allocation is tracked across services: explicit host ports
     /// are validated for conflicts, and `None` host ports get ephemeral
     /// assignments. Ports are released on service removal.
+    ///
+    /// For multi-service stacks, a shared VM is booted before creating
+    /// containers, and per-service network namespaces are set up so
+    /// that containers can communicate using real IP addresses (Docker
+    /// Compose style networking).
     pub fn execute(
         &mut self,
         spec: &StackSpec,
@@ -241,6 +268,54 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     volume_name: vol_name.clone(),
                 },
             )?;
+        }
+
+        // Boot shared VM and set up networking if there are create actions
+        // and no shared VM is running yet.
+        let has_creates = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::ServiceCreate { .. } | Action::ServiceRecreate { .. }
+            )
+        });
+
+        if has_creates && !self.runtime.has_shared_vm(&spec.name) && spec.services.len() > 1 {
+            // Collect all ports from all services for the shared VM.
+            let all_ports: Vec<vz_oci::PortMapping> = spec
+                .services
+                .iter()
+                .flat_map(|svc| {
+                    svc.ports.iter().map(|p| {
+                        let protocol = match p.protocol.as_str() {
+                            "udp" => vz_oci::PortProtocol::Udp,
+                            _ => vz_oci::PortProtocol::Tcp,
+                        };
+                        vz_oci::PortMapping {
+                            host: p.host_port.unwrap_or(p.container_port),
+                            container: p.container_port,
+                            protocol,
+                        }
+                    })
+                })
+                .collect();
+
+            info!(stack = %spec.name, services = spec.services.len(), "booting shared VM");
+            self.runtime.boot_shared_vm(&spec.name, &all_ports)?;
+
+            // Set up per-service network namespaces.
+            let network_services: Vec<vz_oci::NetworkServiceConfig> = spec
+                .services
+                .iter()
+                .enumerate()
+                .map(|(i, svc)| vz_oci::NetworkServiceConfig {
+                    name: svc.name.clone(),
+                    // 172.20.0.1 = bridge, services start at .2
+                    addr: format!("172.20.0.{}/24", i + 2),
+                })
+                .collect();
+
+            info!(stack = %spec.name, "setting up per-service network namespaces");
+            self.runtime.network_setup(&spec.name, &network_services)?;
         }
 
         let service_map: HashMap<&str, &ServiceSpec> =
@@ -371,24 +446,51 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             .collect();
 
         // Auto-inject sibling service hostnames for inter-service resolution.
-        // All services in the stack share the VM network, so map names to 127.0.0.1.
-        for svc in &spec.services {
-            if svc.name != service_name
-                && !run_config.extra_hosts.iter().any(|(h, _)| h == &svc.name)
-            {
-                run_config
-                    .extra_hosts
-                    .push((svc.name.clone(), "127.0.0.1".to_string()));
+        let use_shared_vm = self.runtime.has_shared_vm(&spec.name);
+        if use_shared_vm {
+            // Shared VM with per-service netns: use real IPs (172.20.0.x).
+            for (i, svc) in spec.services.iter().enumerate() {
+                if svc.name != service_name
+                    && !run_config.extra_hosts.iter().any(|(h, _)| h == &svc.name)
+                {
+                    let ip = format!("172.20.0.{}", i + 2);
+                    run_config.extra_hosts.push((svc.name.clone(), ip));
+                }
+            }
+
+            // Join the per-service network namespace.
+            run_config.network_namespace_path =
+                Some(format!("/var/run/netns/{service_name}"));
+        } else {
+            // Single VM per container: all services share 127.0.0.1.
+            for svc in &spec.services {
+                if svc.name != service_name
+                    && !run_config.extra_hosts.iter().any(|(h, _)| h == &svc.name)
+                {
+                    run_config
+                        .extra_hosts
+                        .push((svc.name.clone(), "127.0.0.1".to_string()));
+                }
             }
         }
 
         // Create and start container.
         info!(service = %service_name, image = %svc_spec.image, "creating container");
-        let container_id = match self.runtime.create(&svc_spec.image, run_config) {
-            Ok(id) => id,
-            Err(e) => {
-                self.mark_failed(spec, service_name, &e.to_string())?;
-                return Err(e);
+        let container_id = if use_shared_vm {
+            match self.runtime.create_in_stack(&spec.name, &svc_spec.image, run_config) {
+                Ok(id) => id,
+                Err(e) => {
+                    self.mark_failed(spec, service_name, &e.to_string())?;
+                    return Err(e);
+                }
+            }
+        } else {
+            match self.runtime.create(&svc_spec.image, run_config) {
+                Ok(id) => id,
+                Err(e) => {
+                    self.mark_failed(spec, service_name, &e.to_string())?;
+                    return Err(e);
+                }
             }
         };
 

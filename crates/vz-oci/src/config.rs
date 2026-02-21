@@ -224,36 +224,6 @@ pub struct ExecConfig {
     pub timeout: Option<Duration>,
 }
 
-/// Configuration for booting a shared VM that hosts multiple containers in a
-/// stack.
-///
-/// Unlike [`RunConfig`] (which boots one VM per container), a stack VM is
-/// created once and reused for all services in the stack. Individual
-/// containers are then created inside it via
-/// [`Runtime::create_container_in_stack`](crate::Runtime::create_container_in_stack).
-#[derive(Debug, Clone)]
-pub struct StackVmConfig {
-    /// Number of virtual CPUs.
-    pub cpus: u8,
-    /// Memory allocation in megabytes.
-    pub memory_mb: u64,
-    /// Whether networking is enabled in the VM.
-    pub network_enabled: bool,
-    /// Host-to-guest port mappings (combined from all services).
-    pub ports: Vec<PortMapping>,
-    /// Optional serial log file path.
-    pub serial_log_file: Option<PathBuf>,
-    /// Path to the VM's root filesystem directory.
-    ///
-    /// For a stack VM this should be a base Linux rootfs that contains
-    /// the guest agent and OCI runtime. Individual service rootfs
-    /// directories are shared as additional VirtioFS mounts.
-    pub rootfs_dir: PathBuf,
-    /// Additional VirtioFS bind mounts to share with the guest
-    /// (e.g., named volumes, project directories).
-    pub extra_mounts: Vec<MountSpec>,
-}
-
 /// Registry authentication used when pulling OCI images.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Auth {
