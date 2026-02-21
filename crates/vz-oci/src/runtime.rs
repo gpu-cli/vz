@@ -40,7 +40,6 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const OCI_RUNTIME_BIN_SHARE_TAG: &str = "oci-runtime-bin";
 const OCI_DEFAULT_GUEST_STATE_DIR: &str = "/run/vz-oci";
 const OCI_BUNDLE_DIRNAME: &str = "bundles";
-const OCI_GUEST_ROOT_PATH: &str = "/run/vz-oci/base-rootfs";
 
 /// Unified runtime entrypoint.
 #[derive(Clone)]
@@ -62,6 +61,11 @@ pub struct Runtime {
     /// Used to determine whether a container's VM is shared and should
     /// not be torn down when the container is stopped individually.
     container_stack: Arc<Mutex<HashMap<String, String>>>,
+    /// Active port-forwarding handles keyed by container ID.
+    ///
+    /// Kept alive so the TCP listeners and relay tasks continue running.
+    /// Dropped when the container is stopped or removed.
+    port_forwards: Arc<Mutex<HashMap<String, PortForwarding>>>,
 }
 
 impl Runtime {
@@ -82,6 +86,7 @@ impl Runtime {
             vm_handles: Arc::new(Mutex::new(HashMap::new())),
             stack_vms: Arc::new(Mutex::new(HashMap::new())),
             container_stack: Arc::new(Mutex::new(HashMap::new())),
+            port_forwards: Arc::new(Mutex::new(HashMap::new())),
         };
 
         runtime.reconcile_stale_containers();
@@ -125,6 +130,11 @@ impl Runtime {
             return Err(OciError::InvalidConfig(format!(
                 "cannot remove running container '{id}'; stop it first"
             )));
+        }
+
+        // Shut down port forwarding for this container.
+        if let Some(pf) = self.port_forwards.lock().await.remove(id) {
+            pf.shutdown().await;
         }
 
         // Best-effort OCI delete via guest runtime if VM is still up.
@@ -187,6 +197,11 @@ impl Runtime {
         }
         self.vm_handles.lock().await.remove(id);
         self.container_stack.lock().await.remove(id);
+
+        // Shut down port forwarding for this container.
+        if let Some(pf) = self.port_forwards.lock().await.remove(id) {
+            pf.shutdown().await;
+        }
 
         if let Some(rootfs_path) = container.rootfs_path.take() {
             let _ = fs::remove_dir_all(rootfs_path);
@@ -597,48 +612,29 @@ impl Runtime {
 
         let bundle_mounts = mount_specs_to_bundle_mounts(&run.mounts)?;
 
-        // Per-container overlay: VirtioFS doesn't support mknod, which the OCI
-        // runtime needs for default devices (/dev/null etc). We create a local
-        // overlay in the guest with VirtioFS as lowerdir and tmpfs as upperdir
-        // so that mknod writes go to the tmpfs layer.
+        // Per-container overlay: VirtioFS doesn't support mknod, so we create a
+        // guest-side overlay with tmpfs as upperdir for device nodes.
         let vz_rootfs_path = format!("/vz-rootfs/{container_id}");
-        let container_overlay = format!("/run/vz-oci/containers/{container_id}");
-        let guest_rootfs_path = format!("{container_overlay}/merged");
         tracing::debug!("step 3a: setup per-container overlay in guest");
-        let overlay_cmd = format!(
-            "mkdir -p {container_overlay} && \
-             mount -t tmpfs tmpfs {container_overlay} && \
-             mkdir -p {container_overlay}/upper {container_overlay}/work {container_overlay}/merged && \
-             mount -t overlay overlay \
-             -o lowerdir={vz_rootfs_path},upperdir={container_overlay}/upper,workdir={container_overlay}/work \
-             {container_overlay}/merged"
-        );
-        let overlay_result = vm
-            .exec_capture(
-                "sh".to_string(),
-                vec!["-c".to_string(), overlay_cmd],
-                Duration::from_secs(10),
-            )
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "step 3a FAILED: per-container overlay setup");
-                OciError::from(e)
-            })?;
-        if overlay_result.exit_code != 0 {
-            let msg = format!(
-                "per-container overlay setup failed (exit {}): {}",
-                overlay_result.exit_code,
-                overlay_result.stderr.trim()
-            );
-            tracing::error!("{}", msg);
-            container.status = ContainerStatus::Stopped { exit_code: -1 };
-            container.stopped_unix_secs = Some(current_unix_secs());
-            container.host_pid = None;
-            self.container_store
-                .upsert(container)
-                .map_err(OciError::from)?;
-            return Err(OciError::Linux(LinuxError::Protocol(msg)));
-        }
+        let guest_rootfs_path = match setup_guest_container_overlay(
+            vm.as_ref(),
+            &vz_rootfs_path,
+            &container_id,
+        )
+        .await
+        {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::error!(error = %err, "step 3a FAILED: per-container overlay setup");
+                container.status = ContainerStatus::Stopped { exit_code: -1 };
+                container.stopped_unix_secs = Some(current_unix_secs());
+                container.host_pid = None;
+                self.container_store
+                    .upsert(container)
+                    .map_err(OciError::from)?;
+                return Err(err);
+            }
+        };
         tracing::debug!("step 3a OK");
 
         // extra_hosts are written AFTER the container starts (step 5) via
@@ -658,6 +654,7 @@ impl Runtime {
                 mounts: bundle_mounts,
                 oci_annotations: run.oci_annotations.clone(),
                 network_namespace_path: run.network_namespace_path.clone(),
+                share_host_network: false,
                 cpu_quota: run.cpu_quota,
                 cpu_period: run.cpu_period,
             },
@@ -953,6 +950,12 @@ impl Runtime {
                 )
             })?;
 
+        // Per-container overlay path: VirtioFS doesn't support mknod, so we
+        // create a guest-side overlay with tmpfs as upperdir. The path is
+        // deterministic so we can write the bundle config before booting.
+        let container_overlay = format!("/run/vz-oci/containers/{oci_container_id}");
+        let guest_rootfs_path = format!("{container_overlay}/merged");
+
         let mut bundle_mounts = mount_specs_to_bundle_mounts(&run.mounts)?;
 
         // Generate /etc/hosts file for inter-service hostname resolution.
@@ -960,7 +963,7 @@ impl Runtime {
             write_hosts_file(&bundle_host_dir, &run.extra_hosts)?;
             bundle_mounts.push(BundleMount {
                 destination: PathBuf::from("/etc/hosts"),
-                source: PathBuf::from(format!("{bundle_guest_path}/hosts")),
+                source: PathBuf::from(format!("{bundle_guest_path}/etc/hosts")),
                 typ: "bind".to_string(),
                 options: vec!["rbind".to_string(), "ro".to_string()],
             });
@@ -968,7 +971,7 @@ impl Runtime {
 
         write_oci_bundle(
             &bundle_host_dir,
-            Path::new(OCI_GUEST_ROOT_PATH),
+            Path::new(&guest_rootfs_path),
             BundleSpec {
                 cmd: bundle_cmd,
                 env: run.env.clone(),
@@ -977,6 +980,7 @@ impl Runtime {
                 mounts: bundle_mounts,
                 oci_annotations: run.oci_annotations.clone(),
                 network_namespace_path: None,
+                share_host_network: true,
                 cpu_quota: run.cpu_quota,
                 cpu_period: run.cpu_period,
             },
@@ -1020,13 +1024,24 @@ impl Runtime {
             return Err(err.into());
         }
 
-        let vm = Arc::new(vm);
-
-        // Set up port forwarding (best-effort; failures tear down the VM).
-        if let Err(err) = start_port_forwarding(vm.inner_shared(), &run.ports).await {
+        // Set up per-container overlay so youki can mknod on tmpfs.
+        if let Err(err) =
+            setup_guest_container_overlay(&vm, "/vz-rootfs", &oci_container_id).await
+        {
             let _ = vm.stop().await;
             return Err(err);
         }
+
+        let vm = Arc::new(vm);
+
+        // Set up port forwarding; failures tear down the VM.
+        let port_forwarding = match start_port_forwarding(vm.inner_shared(), &run.ports).await {
+            Ok(pf) => pf,
+            Err(err) => {
+                let _ = vm.stop().await;
+                return Err(err);
+            }
+        };
 
         // OCI create + start.
         if let Err(err) = vm
@@ -1048,6 +1063,14 @@ impl Runtime {
             .lock()
             .await
             .insert(container_id.to_string(), vm);
+
+        // Keep port forwarding alive for the container's lifetime.
+        if let Some(pf) = port_forwarding {
+            self.port_forwards
+                .lock()
+                .await
+                .insert(container_id.to_string(), pf);
+        }
 
         Ok(())
     }
@@ -1099,13 +1122,19 @@ impl Runtime {
         // If no explicit init process is set, use `sleep infinity` as the default.
         let bundle_cmd = init_process.unwrap_or_else(|| vec!["sleep".into(), "infinity".into()]);
 
+        // Per-container overlay path: VirtioFS doesn't support mknod, so we
+        // create a guest-side overlay with tmpfs as upperdir. The path is
+        // deterministic so we can write the bundle config before booting.
+        let container_overlay = format!("/run/vz-oci/containers/{container_id}");
+        let guest_rootfs_path = format!("{container_overlay}/merged");
+
         let mut bundle_mounts = mount_specs_to_bundle_mounts(&mounts)?;
 
         if !extra_hosts.is_empty() {
             write_hosts_file(&bundle_host_dir, &extra_hosts)?;
             bundle_mounts.push(BundleMount {
                 destination: PathBuf::from("/etc/hosts"),
-                source: PathBuf::from(format!("{bundle_guest_path}/hosts")),
+                source: PathBuf::from(format!("{bundle_guest_path}/etc/hosts")),
                 typ: "bind".to_string(),
                 options: vec!["rbind".to_string(), "ro".to_string()],
             });
@@ -1113,7 +1142,7 @@ impl Runtime {
 
         write_oci_bundle(
             &bundle_host_dir,
-            Path::new(OCI_GUEST_ROOT_PATH),
+            Path::new(&guest_rootfs_path),
             BundleSpec {
                 cmd: bundle_cmd,
                 env: env.clone(),
@@ -1122,6 +1151,7 @@ impl Runtime {
                 mounts: bundle_mounts,
                 oci_annotations,
                 network_namespace_path: None,
+                share_host_network: true,
                 cpu_quota: None,
                 cpu_period: None,
             },
@@ -1161,6 +1191,14 @@ impl Runtime {
         if let Err(err) = vm.wait_for_agent(self.config.agent_ready_timeout).await {
             let _ = vm.stop().await;
             return Err(err.into());
+        }
+
+        // Set up per-container overlay so youki can mknod on tmpfs.
+        if let Err(err) =
+            setup_guest_container_overlay(&vm, "/vz-rootfs", &container_id).await
+        {
+            let _ = vm.stop().await;
+            return Err(err);
         }
 
         // Register VM handle so external stop/remove can reach the guest.
@@ -1860,6 +1898,51 @@ fn oci_bundle_guest_root(guest_state_dir: Option<&Path>) -> Result<String, OciEr
     }
 
     Ok(format!("{state_root}/{OCI_BUNDLE_DIRNAME}"))
+}
+
+/// Set up a per-container overlay in the guest VM.
+///
+/// VirtioFS doesn't support mknod, which the OCI runtime needs for default
+/// devices (/dev/null etc). This creates a local overlay in the guest with
+/// VirtioFS as lowerdir and tmpfs as upperdir so that mknod writes go to the
+/// tmpfs layer.
+///
+/// Returns the guest-side merged rootfs path for use in the OCI bundle spec.
+async fn setup_guest_container_overlay(
+    vm: &LinuxVm,
+    vz_rootfs_path: &str,
+    container_id: &str,
+) -> Result<String, OciError> {
+    let container_overlay = format!("/run/vz-oci/containers/{container_id}");
+    let guest_rootfs_path = format!("{container_overlay}/merged");
+
+    let overlay_cmd = format!(
+        "mkdir -p {container_overlay} && \
+         mount -t tmpfs tmpfs {container_overlay} && \
+         mkdir -p {container_overlay}/upper {container_overlay}/work {container_overlay}/merged && \
+         mount -t overlay overlay \
+         -o lowerdir={vz_rootfs_path},upperdir={container_overlay}/upper,workdir={container_overlay}/work \
+         {container_overlay}/merged"
+    );
+
+    let result = vm
+        .exec_capture(
+            "sh".to_string(),
+            vec!["-c".to_string(), overlay_cmd],
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(OciError::from)?;
+
+    if result.exit_code != 0 {
+        return Err(OciError::Linux(LinuxError::Protocol(format!(
+            "per-container overlay setup failed (exit {}): {}",
+            result.exit_code,
+            result.stderr.trim()
+        ))));
+    }
+
+    Ok(guest_rootfs_path)
 }
 
 fn expand_home_dir(path: &Path) -> PathBuf {

@@ -269,25 +269,36 @@ async fn port_forwarding_tcp() {
     // Give the listener a moment to start.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Connect from the host.
-    let stream = tokio::net::TcpStream::connect("127.0.0.1:18080").await;
-    match stream {
-        Ok(mut conn) => {
-            use tokio::io::AsyncReadExt;
-            let mut buf = vec![0u8; 64];
-            let n = conn.read(&mut buf).await.unwrap_or(0);
-            let response = String::from_utf8_lossy(&buf[..n]);
-            assert!(
-                response.contains("pong"),
-                "expected 'pong', got: {response}"
-            );
-        }
-        Err(e) => {
-            // Port forwarding may not be fully wired — record as a known gap.
-            eprintln!("WARN: port forwarding connection failed: {e}");
-            eprintln!("This may indicate the vsock relay is not fully operational");
+    // Connect from the host — retry a few times to allow the listener to start.
+    use tokio::io::AsyncReadExt;
+    let mut conn = None;
+    for attempt in 1..=5 {
+        match tokio::net::TcpStream::connect("127.0.0.1:18080").await {
+            Ok(stream) => {
+                conn = Some(stream);
+                break;
+            }
+            Err(e) if attempt < 5 => {
+                eprintln!("port forward connect attempt {attempt}/5 failed: {e}, retrying...");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(e) => panic!("port forwarding connection failed after 5 attempts: {e}"),
         }
     }
+    let mut conn = conn.unwrap();
+    let mut buf = vec![0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(10), conn.read(&mut buf))
+        .await
+        .expect("port forward read timed out")
+        .expect("port forward read failed");
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        response.contains("pong"),
+        "expected 'pong', got: {response}"
+    );
+
+    // Drop the connection before cleanup to unblock the relay.
+    drop(conn);
 
     // Cleanup.
     let _ = rt.stop_container(&container_id, true).await;

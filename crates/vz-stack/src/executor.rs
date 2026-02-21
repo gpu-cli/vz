@@ -9,11 +9,11 @@
 //! State transitions and lifecycle events are persisted to the [`StateStore`].
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tracing::{error, info};
 
-use crate::convert::service_to_run_config;
+use crate::convert::{secrets_to_mounts, service_to_run_config};
 use crate::error::StackError;
 use crate::events::StackEvent;
 use crate::network::{PublishedPort, resolve_ports};
@@ -184,6 +184,7 @@ impl Default for PortTracker {
 pub struct StackExecutor<R: ContainerRuntime> {
     runtime: R,
     store: StateStore,
+    data_dir: PathBuf,
     volumes: VolumeManager,
     ports: PortTracker,
 }
@@ -209,11 +210,13 @@ impl ExecutionResult {
 impl<R: ContainerRuntime> StackExecutor<R> {
     /// Create a new executor with the given runtime, state store, and data directory.
     ///
-    /// The data directory is used for named volume storage under `<data_dir>/volumes/`.
+    /// The data directory is used for named volume storage under `<data_dir>/volumes/`
+    /// and secret staging under `<data_dir>/secrets/`.
     pub fn new(runtime: R, store: StateStore, data_dir: &Path) -> Self {
         Self {
             runtime,
             store,
+            data_dir: data_dir.to_path_buf(),
             volumes: VolumeManager::new(data_dir),
             ports: PortTracker::new(),
         }
@@ -432,8 +435,37 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             }
         };
 
+        // Stage secret files and generate bind mounts.
+        let secret_mounts = if svc_spec.secrets.is_empty() {
+            vec![]
+        } else {
+            let secrets_dir = self.data_dir.join("secrets").join(&spec.name);
+            std::fs::create_dir_all(&secrets_dir)?;
+            for secret_ref in &svc_spec.secrets {
+                let secret_def = spec
+                    .secrets
+                    .iter()
+                    .find(|d| d.name == secret_ref.source)
+                    .ok_or_else(|| {
+                        StackError::InvalidSpec(format!(
+                            "secret '{}' referenced by service '{}' not defined at top level",
+                            secret_ref.source, service_name,
+                        ))
+                    })?;
+                let content = std::fs::read(&secret_def.file).map_err(|e| {
+                    StackError::InvalidSpec(format!(
+                        "failed to read secret file '{}': {}",
+                        secret_def.file, e,
+                    ))
+                })?;
+                std::fs::write(secrets_dir.join(&secret_ref.source), content)?;
+            }
+            secrets_to_mounts(&svc_spec.secrets, &secrets_dir)
+        };
+
         // Convert ServiceSpec → RunConfig.
-        let mut run_config = service_to_run_config(svc_spec, &resolved_mounts, &[])?;
+        let mut run_config =
+            service_to_run_config(svc_spec, &resolved_mounts, &secret_mounts)?;
 
         // Override ports with resolved allocations.
         // In shared VM mode, set target_host to the service IP so port

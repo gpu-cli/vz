@@ -49,6 +49,11 @@ pub(crate) struct BundleSpec {
     /// to this path (e.g., `/var/run/netns/svc-web`). The
     /// namespace must be created before the container starts.
     pub network_namespace_path: Option<String>,
+    /// Share the host (guest VM) network namespace instead of creating
+    /// a new isolated one. When `true`, the network namespace entry is
+    /// removed from the OCI spec so the container process uses the
+    /// host's network stack directly.
+    pub share_host_network: bool,
     /// CPU quota in microseconds per `cpu_period`.
     ///
     /// For example, `cpus: 0.5` → quota=50000, period=100000
@@ -100,6 +105,7 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
         mut mounts,
         oci_annotations,
         network_namespace_path,
+        share_host_network,
         cpu_quota,
         cpu_period,
     } = spec;
@@ -146,7 +152,9 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
 
     let mut spec = builder.build()?;
 
-    if let Some(netns_path) = network_namespace_path {
+    if share_host_network {
+        remove_network_namespace(&mut spec);
+    } else if let Some(netns_path) = network_namespace_path {
         set_network_namespace_path(&mut spec, &netns_path);
     }
 
@@ -155,6 +163,18 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
     }
 
     Ok(spec)
+}
+
+/// Remove the network namespace entry so the container shares the host's
+/// network stack. If no linux section or namespaces exist, this is a no-op.
+fn remove_network_namespace(spec: &mut Spec) {
+    let Some(linux) = spec.linux_mut() else {
+        return;
+    };
+    let Some(namespaces) = linux.namespaces_mut() else {
+        return;
+    };
+    namespaces.retain(|ns| ns.typ() != LinuxNamespaceType::Network);
 }
 
 /// Update the network namespace entry in the spec's linux section to join
@@ -389,6 +409,7 @@ mod tests {
                     ("com.example.revision".to_string(), "42".to_string()),
                 ],
                 network_namespace_path: None,
+                share_host_network: false,
                 cpu_quota: None,
                 cpu_period: None,
             },
@@ -472,6 +493,7 @@ mod tests {
                 mounts: Vec::new(),
                 oci_annotations: Vec::new(),
                 network_namespace_path: None,
+                share_host_network: false,
                 cpu_quota: None,
                 cpu_period: None,
             },
@@ -524,6 +546,7 @@ mod tests {
                 ],
                 oci_annotations: Vec::new(),
                 network_namespace_path: None,
+                share_host_network: false,
                 cpu_quota: None,
                 cpu_period: None,
             },
@@ -568,6 +591,7 @@ mod tests {
                 mounts: Vec::new(),
                 oci_annotations: Vec::new(),
                 network_namespace_path: Some("/var/run/netns/svc-web".to_string()),
+                share_host_network: false,
                 cpu_quota: None,
                 cpu_period: None,
             },
@@ -608,6 +632,7 @@ mod tests {
                 mounts: Vec::new(),
                 oci_annotations: Vec::new(),
                 network_namespace_path: None,
+                share_host_network: false,
                 cpu_quota: None,
                 cpu_period: None,
             },
@@ -630,5 +655,45 @@ mod tests {
             .find(|n| n.typ() == LinuxNamespaceType::Network)
             .expect("default network namespace exists");
         assert!(netns.path().is_none(), "expected no netns path by default");
+    }
+
+    #[test]
+    fn write_oci_bundle_share_host_network_removes_netns() {
+        let temp = unique_temp_dir("share-host-net");
+        let rootfs_source = temp.join("rootfs-source");
+        fs::create_dir_all(&rootfs_source).unwrap();
+
+        let bundle_dir = temp.join("bundle");
+        write_oci_bundle(
+            &bundle_dir,
+            &rootfs_source,
+            BundleSpec {
+                cmd: vec!["/bin/sh".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: Vec::new(),
+                oci_annotations: Vec::new(),
+                network_namespace_path: None,
+                share_host_network: true,
+                cpu_quota: None,
+                cpu_period: None,
+            },
+        )
+        .unwrap();
+
+        let spec = Spec::load(bundle_dir.join(OCI_CONFIG_FILENAME)).unwrap();
+        let linux = spec
+            .linux()
+            .as_ref()
+            .expect("linux section present");
+        let ns = linux
+            .namespaces()
+            .as_ref()
+            .expect("namespaces present");
+        let netns = ns
+            .iter()
+            .find(|n| n.typ() == LinuxNamespaceType::Network);
+        assert!(netns.is_none(), "network namespace should be removed");
     }
 }
