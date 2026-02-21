@@ -30,7 +30,7 @@ use vz::protocol::OciContainerState;
 
 use crate::config::{
     ExecConfig, ExecutionMode, MountAccess, MountSpec, MountType, OciRuntimeKind, PortMapping,
-    PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig,
+    PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig, StackVmConfig,
 };
 use crate::error::OciError;
 use crate::store::{ImageInfo, PruneResult};
@@ -51,6 +51,17 @@ pub struct Runtime {
     puller: ImagePuller,
     /// Active VM handles keyed by container ID, for OCI lifecycle operations.
     vm_handles: Arc<Mutex<HashMap<String, Arc<LinuxVm>>>>,
+    /// Shared VMs keyed by stack ID, for multi-container stacks.
+    ///
+    /// When a container belongs to a stack, its VM handle in [`vm_handles`]
+    /// points to the same [`LinuxVm`] instance stored here. Individual
+    /// container stop/remove should not tear down the shared VM.
+    stack_vms: Arc<Mutex<HashMap<String, Arc<LinuxVm>>>>,
+    /// Maps container IDs to the stack they belong to (if any).
+    ///
+    /// Used to determine whether a container's VM is shared and should
+    /// not be torn down when the container is stopped individually.
+    container_stack: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Runtime {
@@ -69,6 +80,8 @@ impl Runtime {
             container_store,
             puller,
             vm_handles: Arc::new(Mutex::new(HashMap::new())),
+            stack_vms: Arc::new(Mutex::new(HashMap::new())),
+            container_stack: Arc::new(Mutex::new(HashMap::new())),
         };
 
         runtime.reconcile_stale_containers();
@@ -164,10 +177,16 @@ impl Runtime {
 
         let exit_code = stop_via_oci_runtime(&*vm, id, force, STOP_GRACE_PERIOD).await?;
 
-        // Best-effort OCI delete + VM teardown.
+        // Best-effort OCI delete.
         let _ = vm.oci_delete(id.to_string(), true).await;
-        let _ = vm.stop().await;
+
+        // Only tear down the VM if the container does NOT belong to a shared stack VM.
+        let is_stack_container = self.container_stack.lock().await.contains_key(id);
+        if !is_stack_container {
+            let _ = vm.stop().await;
+        }
         self.vm_handles.lock().await.remove(id);
+        self.container_stack.lock().await.remove(id);
 
         if let Some(rootfs_path) = container.rootfs_path.take() {
             let _ = fs::remove_dir_all(rootfs_path);
@@ -372,6 +391,317 @@ impl Runtime {
             }
         }
     }
+
+    // ── Shared stack VM API ──────────────────────────────────────────
+
+    /// Boot a shared VM for a multi-service stack.
+    ///
+    /// The VM runs a single kernel with the guest agent, and multiple OCI
+    /// containers can be created inside it via
+    /// [`create_container_in_stack`](Self::create_container_in_stack).
+    ///
+    /// Each service's assembled rootfs is shared with the guest as a VirtioFS
+    /// mount tagged `rootfs-<index>`. The guest agent (or init) is responsible
+    /// for making these accessible at
+    /// `/run/vz-oci/rootfs/<container-id>/` so that OCI bundles can reference
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a shared VM is already running for `stack_id`, or
+    /// if the VM fails to boot.
+    pub async fn boot_shared_vm(
+        &self,
+        stack_id: &str,
+        config: StackVmConfig,
+    ) -> Result<(), OciError> {
+        // Guard against double-boot.
+        if self.stack_vms.lock().await.contains_key(stack_id) {
+            return Err(OciError::InvalidConfig(format!(
+                "shared VM already running for stack '{stack_id}'"
+            )));
+        }
+
+        let kernel = ensure_kernel_with_options(EnsureKernelOptions {
+            install_dir: self.config.linux_install_dir.clone(),
+            bundle_dir: self.config.linux_bundle_dir.clone(),
+            require_exact_agent_version: self.config.require_exact_agent_version,
+        })
+        .await?;
+
+        let runtime_binary = resolve_oci_runtime_binary_path(
+            self.config.guest_oci_runtime,
+            self.config.guest_oci_runtime_path.as_deref(),
+            &kernel,
+        )?;
+
+        let mount_shares = mount_specs_to_shared_dirs(&config.extra_mounts);
+        let mut vm_config = LinuxVmConfig::new(kernel.kernel, kernel.initramfs)
+            .with_rootfs_dir(config.rootfs_dir);
+        vm_config
+            .shared_dirs
+            .push(make_oci_runtime_share(&runtime_binary)?);
+        vm_config.shared_dirs.extend(mount_shares);
+        vm_config.cpus = config.cpus;
+        vm_config.memory_mb = config.memory_mb;
+        vm_config.serial_log_file = config.serial_log_file;
+
+        if !config.network_enabled {
+            vm_config.network = Some(NetworkConfig::None);
+        }
+
+        let vm = LinuxVm::create(vm_config).await?;
+        vm.start().await?;
+
+        if let Err(err) = vm.wait_for_agent(self.config.agent_ready_timeout).await {
+            let _ = vm.stop().await;
+            return Err(err.into());
+        }
+
+        let vm = Arc::new(vm);
+
+        // Set up port forwarding for all services' ports.
+        if let Err(err) = start_port_forwarding(vm.inner_shared(), &config.ports).await {
+            let _ = vm.stop().await;
+            return Err(err);
+        }
+
+        self.stack_vms
+            .lock()
+            .await
+            .insert(stack_id.to_string(), vm);
+
+        Ok(())
+    }
+
+    /// Create and start an OCI container inside a shared stack VM.
+    ///
+    /// The VM must have been booted via [`boot_shared_vm`](Self::boot_shared_vm).
+    /// This method pulls the image, assembles its rootfs, writes an OCI bundle,
+    /// and runs the OCI create/start lifecycle inside the shared VM.
+    ///
+    /// Returns the container identifier.
+    pub async fn create_container_in_stack(
+        &self,
+        stack_id: &str,
+        image: &str,
+        run: RunConfig,
+    ) -> Result<String, OciError> {
+        let vm = self
+            .stack_vms
+            .lock()
+            .await
+            .get(stack_id)
+            .cloned()
+            .ok_or_else(|| {
+                OciError::InvalidConfig(format!(
+                    "no shared VM running for stack '{stack_id}'; call boot_shared_vm first"
+                ))
+            })?;
+
+        let image_id = self.pull(image).await?;
+        let container_id = run.container_id.clone().unwrap_or_else(new_container_id);
+
+        let created_unix_secs = current_unix_secs();
+        let mut container = ContainerInfo {
+            id: container_id.clone(),
+            image: image.to_string(),
+            image_id: image_id.0.clone(),
+            status: ContainerStatus::Created,
+            created_unix_secs,
+            started_unix_secs: None,
+            stopped_unix_secs: None,
+            rootfs_path: None,
+            host_pid: Some(process::id()),
+        };
+
+        self.container_store
+            .upsert(container.clone())
+            .map_err(OciError::from)?;
+
+        let rootfs_dir = match self
+            .store
+            .assemble_rootfs_async(&image_id.0, &container_id)
+            .await
+        {
+            Ok(rootfs_dir) => rootfs_dir,
+            Err(err) => {
+                container.status = ContainerStatus::Stopped { exit_code: -1 };
+                container.stopped_unix_secs = Some(current_unix_secs());
+                container.host_pid = None;
+                self.container_store
+                    .upsert(container)
+                    .map_err(OciError::from)?;
+                return Err(err.into());
+            }
+        };
+
+        container.rootfs_path = Some(rootfs_dir.clone());
+        self.container_store
+            .upsert(container.clone())
+            .map_err(OciError::from)?;
+
+        let image_config = parse_image_config_summary_from_store(&self.store, &image_id.0)?;
+        let run = resolve_run_config(image_config, run, &container_id)?;
+
+        // Build OCI bundle referencing the assembled rootfs (shared via VirtioFS).
+        let oci_container_id = run
+            .container_id
+            .clone()
+            .unwrap_or_else(|| container_id.to_string());
+        let bundle_guest_root = oci_bundle_guest_root(self.config.guest_state_dir.as_deref())?;
+        let bundle_guest_path = oci_bundle_guest_path(&bundle_guest_root, &oci_container_id);
+        let bundle_host_dir = oci_bundle_host_dir(&rootfs_dir, &bundle_guest_path);
+
+        let bundle_cmd = run
+            .init_process
+            .clone()
+            .or_else(|| {
+                if run.cmd.is_empty() {
+                    None
+                } else {
+                    Some(run.cmd.clone())
+                }
+            })
+            .ok_or_else(|| {
+                OciError::InvalidConfig(
+                    "container requires a command (init_process or cmd)".to_string(),
+                )
+            })?;
+
+        let mut bundle_mounts = mount_specs_to_bundle_mounts(&run.mounts)?;
+
+        if !run.extra_hosts.is_empty() {
+            write_hosts_file(&bundle_host_dir, &run.extra_hosts)?;
+            bundle_mounts.push(BundleMount {
+                destination: PathBuf::from("/etc/hosts"),
+                source: PathBuf::from(format!("{bundle_guest_path}/hosts")),
+                typ: "bind".to_string(),
+                options: vec!["rbind".to_string(), "ro".to_string()],
+            });
+        }
+
+        write_oci_bundle(
+            &bundle_host_dir,
+            Path::new(OCI_GUEST_ROOT_PATH),
+            BundleSpec {
+                cmd: bundle_cmd,
+                env: run.env.clone(),
+                cwd: run.working_dir.clone(),
+                user: run.user.clone(),
+                mounts: bundle_mounts,
+                oci_annotations: run.oci_annotations.clone(),
+                network_namespace_path: run.network_namespace_path.clone(),
+            },
+        )?;
+
+        // OCI create + start inside the shared VM.
+        if let Err(err) = vm.oci_create(oci_container_id.clone(), bundle_guest_path).await {
+            container.status = ContainerStatus::Stopped { exit_code: -1 };
+            container.stopped_unix_secs = Some(current_unix_secs());
+            container.host_pid = None;
+            self.container_store
+                .upsert(container)
+                .map_err(OciError::from)?;
+            self.cleanup_rootfs_dir(rootfs_dir.as_ref());
+            return Err(OciError::from(err));
+        }
+
+        if let Err(err) = vm.oci_start(oci_container_id.clone()).await {
+            let _ = vm.oci_delete(oci_container_id, true).await;
+            container.status = ContainerStatus::Stopped { exit_code: -1 };
+            container.stopped_unix_secs = Some(current_unix_secs());
+            container.host_pid = None;
+            self.container_store
+                .upsert(container)
+                .map_err(OciError::from)?;
+            self.cleanup_rootfs_dir(rootfs_dir.as_ref());
+            return Err(OciError::from(err));
+        }
+
+        // Register VM handle for exec/stop and track stack membership.
+        self.vm_handles
+            .lock()
+            .await
+            .insert(container_id.to_string(), Arc::clone(&vm));
+        self.container_stack
+            .lock()
+            .await
+            .insert(container_id.to_string(), stack_id.to_string());
+
+        container.status = ContainerStatus::Running;
+        container.started_unix_secs = Some(current_unix_secs());
+        container.host_pid = Some(process::id());
+        self.container_store
+            .upsert(container)
+            .map_err(OciError::from)?;
+
+        Ok(container_id)
+    }
+
+    /// Stop all containers and shut down the shared VM for a stack.
+    ///
+    /// Each container is stopped via `oci_kill` + `oci_delete`, then the
+    /// shared VM is torn down. Container metadata is updated to `Stopped`.
+    pub async fn shutdown_shared_vm(&self, stack_id: &str) -> Result<(), OciError> {
+        let vm = self
+            .stack_vms
+            .lock()
+            .await
+            .remove(stack_id)
+            .ok_or_else(|| {
+                OciError::InvalidConfig(format!(
+                    "no shared VM running for stack '{stack_id}'"
+                ))
+            })?;
+
+        // Find all containers belonging to this stack.
+        let stack_containers: Vec<String> = {
+            let cs = self.container_stack.lock().await;
+            cs.iter()
+                .filter(|(_, sid)| *sid == stack_id)
+                .map(|(cid, _)| cid.clone())
+                .collect()
+        };
+
+        // Stop each container via OCI lifecycle.
+        for cid in &stack_containers {
+            let _ = stop_via_oci_runtime(&*vm, cid, false, STOP_GRACE_PERIOD).await;
+            let _ = vm.oci_delete(cid.to_string(), true).await;
+
+            // Update container metadata.
+            if let Ok(mut containers) = self.container_store.load_all() {
+                if let Some(container) = containers.iter_mut().find(|c| c.id == *cid) {
+                    container.status = ContainerStatus::Stopped { exit_code: 0 };
+                    container.stopped_unix_secs = Some(current_unix_secs());
+                    container.host_pid = None;
+                    let _ = self.container_store.upsert(container.clone());
+                }
+            }
+        }
+
+        // Clean up tracking maps.
+        {
+            let mut vm_handles = self.vm_handles.lock().await;
+            let mut cs = self.container_stack.lock().await;
+            for cid in &stack_containers {
+                vm_handles.remove(cid);
+                cs.remove(cid);
+            }
+        }
+
+        // Tear down the shared VM.
+        let _ = vm.stop().await;
+
+        Ok(())
+    }
+
+    /// Check whether a shared VM is running for the given stack.
+    pub async fn has_shared_vm(&self, stack_id: &str) -> bool {
+        self.stack_vms.lock().await.contains_key(stack_id)
+    }
+
+    // ── Single-container exec ──────────────────────────────────────
 
     /// Execute a command inside an already-running container.
     ///
@@ -584,6 +914,7 @@ impl Runtime {
             container_id,
             oci_annotations,
             extra_hosts,
+            network_namespace_path: _,
         } = run;
 
         let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
@@ -745,6 +1076,7 @@ impl Runtime {
             container_id: _,
             oci_annotations: _,
             extra_hosts: _,
+            network_namespace_path: _,
         } = run;
 
         let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
@@ -1409,6 +1741,7 @@ fn resolve_run_config(
         container_id: _,
         oci_annotations,
         extra_hosts,
+        network_namespace_path,
     } = run;
 
     let resolved_cmd = if !run_cmd.is_empty() {
@@ -1458,6 +1791,7 @@ fn resolve_run_config(
         init_process,
         oci_annotations,
         extra_hosts,
+        network_namespace_path,
     })
 }
 

@@ -13,7 +13,7 @@ mod store;
 
 pub use config::{
     Auth, ExecConfig, ExecutionMode, MountAccess, MountSpec, MountType, OciRuntimeKind,
-    PortMapping, PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig,
+    PortMapping, PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig, StackVmConfig,
 };
 pub use container_store::{ContainerInfo, ContainerStatus, ContainerStore};
 pub use error::OciError;

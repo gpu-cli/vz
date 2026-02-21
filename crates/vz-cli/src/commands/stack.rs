@@ -216,6 +216,48 @@ impl ContainerRuntime for OciContainerRuntime {
                 .map_err(|e| StackError::Network(format!("exec failed: {e}")))
         })
     }
+
+    fn boot_shared_vm(
+        &self,
+        stack_id: &str,
+        config: vz_oci::StackVmConfig,
+    ) -> Result<(), StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.runtime.boot_shared_vm(stack_id, config))
+                .map_err(|e| StackError::Network(format!("boot_shared_vm failed: {e}")))
+        })
+    }
+
+    fn create_in_stack(
+        &self,
+        stack_id: &str,
+        image: &str,
+        config: vz_oci::RunConfig,
+    ) -> Result<String, StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(
+                    self.runtime
+                        .create_container_in_stack(stack_id, image, config),
+                )
+                .map_err(|e| StackError::Network(format!("create_in_stack failed: {e}")))
+        })
+    }
+
+    fn shutdown_shared_vm(&self, stack_id: &str) -> Result<(), StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.runtime.shutdown_shared_vm(stack_id))
+                .map_err(|e| StackError::Network(format!("shutdown_shared_vm failed: {e}")))
+        })
+    }
+
+    fn has_shared_vm(&self, stack_id: &str) -> bool {
+        tokio::task::block_in_place(|| {
+            self.handle.block_on(self.runtime.has_shared_vm(stack_id))
+        })
+    }
 }
 
 // ── up ─────────────────────────────────────────────────────────────

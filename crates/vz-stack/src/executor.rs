@@ -53,6 +53,42 @@ pub trait ContainerRuntime {
     fn logs(&self, _container_id: &str) -> Result<ContainerLogs, StackError> {
         Ok(ContainerLogs::default())
     }
+
+    /// Boot a shared VM for a multi-service stack.
+    ///
+    /// After calling this, containers for the stack should be created via
+    /// [`create_in_stack`](Self::create_in_stack) instead of [`create`](Self::create).
+    fn boot_shared_vm(
+        &self,
+        _stack_id: &str,
+        _config: vz_oci::StackVmConfig,
+    ) -> Result<(), StackError> {
+        Ok(())
+    }
+
+    /// Create and start a container inside a shared stack VM.
+    ///
+    /// The VM must have been booted via [`boot_shared_vm`](Self::boot_shared_vm).
+    fn create_in_stack(
+        &self,
+        stack_id: &str,
+        image: &str,
+        config: vz_oci::RunConfig,
+    ) -> Result<String, StackError> {
+        let _ = stack_id;
+        // Default: fall back to individual VM per container.
+        self.create(image, config)
+    }
+
+    /// Shut down the shared VM for a stack, stopping all its containers.
+    fn shutdown_shared_vm(&self, _stack_id: &str) -> Result<(), StackError> {
+        Ok(())
+    }
+
+    /// Check whether a shared VM is running for the given stack.
+    fn has_shared_vm(&self, _stack_id: &str) -> bool {
+        false
+    }
 }
 
 /// Container log output.
