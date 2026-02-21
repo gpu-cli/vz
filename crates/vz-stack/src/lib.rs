@@ -39,8 +39,8 @@ pub use orchestrator::{OrchestrationConfig, OrchestrationResult, RoundReport, St
 pub use reconcile::{Action, ApplyResult, DeferredService, apply};
 pub use restart::{RestartTracker, compute_restarts};
 pub use spec::{
-    HealthCheckSpec, MountSpec, NetworkSpec, PortSpec, ResourcesSpec, RestartPolicy, ServiceSpec,
-    StackSpec, VolumeSpec,
+    HealthCheckSpec, MountSpec, NetworkSpec, PortSpec, ResourcesSpec, RestartPolicy, SecretDef,
+    ServiceSecretRef, ServiceSpec, StackSpec, VolumeSpec,
 };
 pub use state_store::{ServiceObservedState, ServicePhase, StateStore};
 pub use volume::{

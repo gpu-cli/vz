@@ -153,8 +153,9 @@ impl LinuxVm {
         &self,
         target_port: u16,
         protocol_name: &str,
+        target_host: Option<&str>,
     ) -> Result<vz::VsockStream, LinuxError> {
-        open_port_forward_stream(self.vm.as_ref(), target_port, protocol_name).await
+        open_port_forward_stream(self.vm.as_ref(), target_port, protocol_name, target_host).await
     }
 
     /// Create a container in the guest OCI runtime.

@@ -22,7 +22,7 @@ impl PortProtocol {
 }
 
 /// Host-to-container port mapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortMapping {
     /// Host port to listen on.
     pub host: u16,
@@ -30,6 +30,12 @@ pub struct PortMapping {
     pub container: u16,
     /// Forwarding protocol.
     pub protocol: PortProtocol,
+    /// Target host/IP inside the guest for port forwarding.
+    ///
+    /// In stack mode, this is set to the service IP (e.g., `172.20.0.2`)
+    /// so connections route through the bridge to the correct per-service
+    /// network namespace. When `None`, defaults to `127.0.0.1`.
+    pub target_host: Option<String>,
 }
 
 /// Runtime backend selection.
@@ -207,6 +213,12 @@ pub struct RunConfig {
     /// causing the container to join the existing netns rather than creating
     /// a new one.
     pub network_namespace_path: Option<String>,
+    /// CPU quota in microseconds per `cpu_period` for cgroup CPU throttling.
+    ///
+    /// For example, `cpus: 0.5` → quota=50000, period=100000.
+    pub cpu_quota: Option<i64>,
+    /// CPU CFS period in microseconds (default: 100000 = 100ms).
+    pub cpu_period: Option<u64>,
 }
 
 /// Options for executing a command in an already-running container.

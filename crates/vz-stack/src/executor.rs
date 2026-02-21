@@ -281,11 +281,16 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
         if has_creates && !self.runtime.has_shared_vm(&spec.name) && spec.services.len() > 1 {
             // Collect all ports from all services for the shared VM.
+            // Each port's target_host is set to the service IP so the guest
+            // agent forwards connections through the bridge to the correct
+            // per-service network namespace.
             let all_ports: Vec<vz_oci::PortMapping> = spec
                 .services
                 .iter()
-                .flat_map(|svc| {
-                    svc.ports.iter().map(|p| {
+                .enumerate()
+                .flat_map(|(i, svc)| {
+                    let service_ip = format!("172.20.0.{}", i + 2);
+                    svc.ports.iter().map(move |p| {
                         let protocol = match p.protocol.as_str() {
                             "udp" => vz_oci::PortProtocol::Udp,
                             _ => vz_oci::PortProtocol::Tcp,
@@ -294,6 +299,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                             host: p.host_port.unwrap_or(p.container_port),
                             container: p.container_port,
                             protocol,
+                            target_host: Some(service_ip.clone()),
                         }
                     })
                 })
@@ -427,9 +433,21 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         };
 
         // Convert ServiceSpec → RunConfig.
-        let mut run_config = service_to_run_config(svc_spec, &resolved_mounts)?;
+        let mut run_config = service_to_run_config(svc_spec, &resolved_mounts, &[])?;
 
         // Override ports with resolved allocations.
+        // In shared VM mode, set target_host to the service IP so port
+        // forwarding reaches the correct per-service network namespace.
+        let use_shared_vm = self.runtime.has_shared_vm(&spec.name);
+        let service_target_host = if use_shared_vm {
+            spec.services
+                .iter()
+                .enumerate()
+                .find(|(_, svc)| svc.name == service_name)
+                .map(|(i, _)| format!("172.20.0.{}", i + 2))
+        } else {
+            None
+        };
         run_config.ports = published
             .iter()
             .map(|p| {
@@ -441,12 +459,12 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     host: p.host_port,
                     container: p.container_port,
                     protocol,
+                    target_host: service_target_host.clone(),
                 }
             })
             .collect();
 
         // Auto-inject sibling service hostnames for inter-service resolution.
-        let use_shared_vm = self.runtime.has_shared_vm(&spec.name);
         if use_shared_vm {
             // Shared VM with per-service netns: use real IPs (172.20.0.x).
             for (i, svc) in spec.services.iter().enumerate() {
@@ -847,6 +865,7 @@ mod tests {
             restart_policy: None,
             resources: ResourcesSpec::default(),
             extra_hosts: vec![],
+            secrets: vec![],
         }
     }
 
@@ -856,6 +875,7 @@ mod tests {
             services,
             networks: vec![],
             volumes: vec![],
+            secrets: vec![],
         }
     }
 
@@ -1146,6 +1166,7 @@ mod tests {
                 driver: "local".to_string(),
                 driver_opts: None,
             }],
+            secrets: vec![],
         };
 
         let actions = vec![Action::ServiceCreate {

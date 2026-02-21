@@ -227,9 +227,10 @@ where
         id,
         target_port,
         protocol,
+        target_host,
     } = first_request
     {
-        handle_port_forward_connection(id, target_port, &protocol, &mut stream).await?;
+        handle_port_forward_connection(id, target_port, &protocol, target_host.as_deref(), &mut stream).await?;
         return Ok(());
     }
 
@@ -262,6 +263,7 @@ async fn handle_port_forward_connection<S>(
     id: u64,
     target_port: u16,
     protocol_name: &str,
+    target_host: Option<&str>,
     stream: &mut S,
 ) -> anyhow::Result<()>
 where
@@ -280,14 +282,15 @@ where
         return Ok(());
     }
 
-    let mut target = match connect_port_forward_target(target_port).await {
+    let host = target_host.unwrap_or("127.0.0.1");
+    let mut target = match connect_port_forward_target(host, target_port).await {
         Ok(stream) => stream,
         Err(e) => {
             protocol::write_frame(
                 stream,
                 &Response::Error {
                     id,
-                    error: format!("failed to connect to localhost:{target_port}: {e}"),
+                    error: format!("failed to connect to {host}:{target_port}: {e}"),
                 },
             )
             .await
@@ -320,11 +323,14 @@ where
     Ok(())
 }
 
-async fn connect_port_forward_target(target_port: u16) -> std::io::Result<tokio::net::TcpStream> {
+async fn connect_port_forward_target(
+    target_host: &str,
+    target_port: u16,
+) -> std::io::Result<tokio::net::TcpStream> {
     let started = Instant::now();
 
     loop {
-        match tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await {
+        match tokio::net::TcpStream::connect((target_host, target_port)).await {
             Ok(stream) => return Ok(stream),
             Err(error) => {
                 if started.elapsed() >= PORT_FORWARD_CONNECT_TIMEOUT {
@@ -1472,6 +1478,7 @@ mod tests {
                     id: 7,
                     target_port,
                     protocol: "tcp".to_string(),
+                    target_host: None,
                 },
             )
             .await
@@ -1541,6 +1548,7 @@ mod tests {
                     id: 8,
                     target_port,
                     protocol: "tcp".to_string(),
+                    target_host: None,
                 },
             )
             .await

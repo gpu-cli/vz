@@ -12,14 +12,14 @@ use serde_yml::Value;
 
 use crate::error::StackError;
 use crate::spec::{
-    HealthCheckSpec, MountSpec, PortSpec, ResourcesSpec, RestartPolicy, ServiceSpec, StackSpec,
-    VolumeSpec,
+    HealthCheckSpec, MountSpec, PortSpec, ResourcesSpec, RestartPolicy, SecretDef,
+    ServiceSecretRef, ServiceSpec, StackSpec, VolumeSpec,
 };
 
 // ── Accepted key sets ──────────────────────────────────────────────
 
 /// Top-level keys allowed in the Compose file.
-const ACCEPTED_TOP_LEVEL: &[&str] = &["version", "name", "services", "volumes"];
+const ACCEPTED_TOP_LEVEL: &[&str] = &["version", "name", "services", "volumes", "secrets"];
 
 /// Service-level keys allowed inside `services.<name>`.
 const ACCEPTED_SERVICE: &[&str] = &[
@@ -36,6 +36,8 @@ const ACCEPTED_SERVICE: &[&str] = &[
     "healthcheck",
     "restart",
     "extra_hosts",
+    "deploy",
+    "secrets",
 ];
 
 /// Volume-level keys allowed inside `volumes.<name>`.
@@ -53,10 +55,6 @@ const REJECTED_TOP_LEVEL: &[(&str, &str)] = &[
         "configs",
         "Compose configs are not supported; use environment variables or bind mounts instead",
     ),
-    (
-        "secrets",
-        "Compose secrets are not supported; use environment variables or bind mounts instead",
-    ),
 ];
 
 /// Service-level keys explicitly rejected with stable error codes.
@@ -64,10 +62,6 @@ const REJECTED_SERVICE: &[(&str, &str)] = &[
     (
         "build",
         "image building is not supported; use pre-built OCI images",
-    ),
-    (
-        "deploy",
-        "deployment directives are not supported in this runtime",
     ),
     (
         "profiles",
@@ -190,12 +184,16 @@ fn parse_compose_inner(
         })
         .unwrap_or_default();
 
+    // ── Parse top-level secrets ───────────────────────────────────
+    let secrets = parse_secrets_top_level(root_map)?;
+    let secret_names: Vec<&str> = secrets.iter().map(|s| s.name.as_str()).collect();
+
     let mut services = Vec::new();
     for (key, svc_value) in services_map {
         let svc_name = key
             .as_str()
             .ok_or_else(|| StackError::ComposeParse("service name must be a string".into()))?;
-        let svc = parse_service(svc_name, svc_value, &volume_names, compose_dir)?;
+        let svc = parse_service(svc_name, svc_value, &volume_names, &secret_names, compose_dir)?;
         services.push(svc);
     }
 
@@ -237,6 +235,7 @@ fn parse_compose_inner(
         services,
         networks: vec![],
         volumes,
+        secrets,
     })
 }
 
@@ -320,6 +319,7 @@ fn parse_service(
     name: &str,
     value: &Value,
     defined_volumes: &[String],
+    defined_secrets: &[&str],
     compose_dir: Option<&Path>,
 ) -> Result<ServiceSpec, StackError> {
     let svc_map = value.as_mapping().ok_or_else(|| {
@@ -358,6 +358,8 @@ fn parse_service(
     let healthcheck = parse_healthcheck(name, svc_map)?;
     let restart_policy = parse_restart(name, svc_map)?;
     let extra_hosts = parse_extra_hosts(name, svc_map)?;
+    let resources = parse_deploy(name, svc_map)?;
+    let secrets = parse_service_secrets(name, svc_map, defined_secrets)?;
 
     Ok(ServiceSpec {
         name: name.to_string(),
@@ -372,8 +374,9 @@ fn parse_service(
         depends_on,
         healthcheck,
         restart_policy,
-        resources: ResourcesSpec::default(),
+        resources,
         extra_hosts,
+        secrets,
     })
 }
 
@@ -1013,6 +1016,164 @@ fn parse_extra_hosts(
     Ok(hosts)
 }
 
+/// Parse `deploy.resources.limits` into [`ResourcesSpec`].
+///
+/// Only `deploy.resources.limits.cpus` and `deploy.resources.limits.memory`
+/// are accepted. Any other deploy sub-keys are rejected with an error.
+fn parse_deploy(
+    svc_name: &str,
+    map: &serde_yml::Mapping,
+) -> Result<ResourcesSpec, StackError> {
+    let Some(deploy_value) = map.get(val("deploy")) else {
+        return Ok(ResourcesSpec::default());
+    };
+
+    if deploy_value.is_null() {
+        return Ok(ResourcesSpec::default());
+    }
+
+    let deploy_map = deploy_value.as_mapping().ok_or_else(|| {
+        StackError::ComposeParse(format!(
+            "service `{svc_name}`: `deploy` must be a mapping"
+        ))
+    })?;
+
+    // Only `resources` is accepted under deploy.
+    for key in deploy_map.keys() {
+        let key_str = key.as_str().unwrap_or("");
+        if key_str != "resources" {
+            return Err(StackError::ComposeUnsupportedFeature {
+                feature: format!("services.{svc_name}.deploy.{key_str}"),
+                reason: "only `deploy.resources.limits` is supported".to_string(),
+            });
+        }
+    }
+
+    let Some(resources_value) = deploy_map.get(val("resources")) else {
+        return Ok(ResourcesSpec::default());
+    };
+
+    if resources_value.is_null() {
+        return Ok(ResourcesSpec::default());
+    }
+
+    let resources_map = resources_value.as_mapping().ok_or_else(|| {
+        StackError::ComposeParse(format!(
+            "service `{svc_name}`: `deploy.resources` must be a mapping"
+        ))
+    })?;
+
+    // Only `limits` is accepted under resources.
+    for key in resources_map.keys() {
+        let key_str = key.as_str().unwrap_or("");
+        if key_str != "limits" {
+            return Err(StackError::ComposeUnsupportedFeature {
+                feature: format!("services.{svc_name}.deploy.resources.{key_str}"),
+                reason: "only `deploy.resources.limits` is supported; reservations are not supported".to_string(),
+            });
+        }
+    }
+
+    let Some(limits_value) = resources_map.get(val("limits")) else {
+        return Ok(ResourcesSpec::default());
+    };
+
+    if limits_value.is_null() {
+        return Ok(ResourcesSpec::default());
+    }
+
+    let limits_map = limits_value.as_mapping().ok_or_else(|| {
+        StackError::ComposeParse(format!(
+            "service `{svc_name}`: `deploy.resources.limits` must be a mapping"
+        ))
+    })?;
+
+    // Only `cpus` and `memory` are accepted under limits.
+    for key in limits_map.keys() {
+        let key_str = key.as_str().unwrap_or("");
+        if key_str != "cpus" && key_str != "memory" {
+            return Err(StackError::ComposeUnsupportedFeature {
+                feature: format!("services.{svc_name}.deploy.resources.limits.{key_str}"),
+                reason: "only `cpus` and `memory` limits are supported".to_string(),
+            });
+        }
+    }
+
+    let cpus = limits_map
+        .get(val("cpus"))
+        .map(|v| {
+            // Compose accepts cpus as string ("0.5") or number (0.5).
+            if let Some(s) = v.as_str() {
+                s.parse::<f64>().map_err(|_| {
+                    StackError::ComposeParse(format!(
+                        "service `{svc_name}`: invalid `deploy.resources.limits.cpus` value `{s}`"
+                    ))
+                })
+            } else if let Some(f) = v.as_f64() {
+                Ok(f)
+            } else {
+                Err(StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `deploy.resources.limits.cpus` must be a number or string"
+                )))
+            }
+        })
+        .transpose()?;
+
+    let memory_bytes = limits_map
+        .get(val("memory"))
+        .map(|v| {
+            let s = v.as_str().ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `deploy.resources.limits.memory` must be a string (e.g., \"512m\", \"1g\")"
+                ))
+            })?;
+            parse_memory_string(svc_name, s)
+        })
+        .transpose()?;
+
+    Ok(ResourcesSpec {
+        cpus,
+        memory_bytes,
+    })
+}
+
+/// Parse a Docker Compose memory string into bytes.
+///
+/// Supports:
+/// - `"512m"` or `"512M"` → 512 * 1024 * 1024
+/// - `"1g"` or `"1G"` → 1 * 1024 * 1024 * 1024
+/// - `"256k"` or `"256K"` → 256 * 1024
+/// - `"1024b"` or `"1024B"` or `"1024"` → 1024
+fn parse_memory_string(svc_name: &str, s: &str) -> Result<u64, StackError> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(StackError::ComposeParse(format!(
+            "service `{svc_name}`: empty memory value"
+        )));
+    }
+
+    let lower = s.to_lowercase();
+    let (num_str, multiplier) = if let Some(n) = lower.strip_suffix('g') {
+        (n, 1024u64 * 1024 * 1024)
+    } else if let Some(n) = lower.strip_suffix('m') {
+        (n, 1024u64 * 1024)
+    } else if let Some(n) = lower.strip_suffix('k') {
+        (n, 1024u64)
+    } else if let Some(n) = lower.strip_suffix('b') {
+        (n, 1u64)
+    } else {
+        (lower.as_str(), 1u64)
+    };
+
+    let val: u64 = num_str.trim().parse().map_err(|_| {
+        StackError::ComposeParse(format!(
+            "service `{svc_name}`: invalid memory value `{s}`"
+        ))
+    })?;
+
+    Ok(val * multiplier)
+}
+
 // ── env_file and variable expansion ─────────────────────────────────
 
 /// Parse an `.env` file's content into key-value pairs.
@@ -1164,6 +1325,134 @@ fn load_env_file_entries(
     }
 
     Ok(env)
+}
+
+// ── Secrets parsing ────────────────────────────────────────────────
+
+/// Parse top-level `secrets` definitions.
+///
+/// Each secret must have a `file:` key pointing to a host file path.
+/// External secrets (`external: true`) are rejected.
+fn parse_secrets_top_level(root: &serde_yml::Mapping) -> Result<Vec<SecretDef>, StackError> {
+    let Some(value) = root.get(val("secrets")) else {
+        return Ok(vec![]);
+    };
+
+    let secrets_map = value
+        .as_mapping()
+        .ok_or_else(|| StackError::ComposeParse("top-level `secrets` must be a mapping".into()))?;
+
+    let mut secrets = Vec::new();
+    for (key, secret_value) in secrets_map {
+        let secret_name = key
+            .as_str()
+            .ok_or_else(|| StackError::ComposeParse("secret name must be a string".into()))?;
+
+        let secret_map = secret_value.as_mapping().ok_or_else(|| {
+            StackError::ComposeParse(format!(
+                "secret `{secret_name}` must be a mapping with a `file` key"
+            ))
+        })?;
+
+        // Reject external secrets.
+        if secret_map
+            .get(val("external"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return Err(StackError::ComposeUnsupportedFeature {
+                feature: format!("secrets.{secret_name}.external"),
+                reason: "external secrets are not supported; use file-based secrets".to_string(),
+            });
+        }
+
+        let file = secret_map
+            .get(val("file"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                StackError::ComposeValidation(format!(
+                    "secret `{secret_name}` is missing required `file` key"
+                ))
+            })?
+            .to_string();
+
+        secrets.push(SecretDef {
+            name: secret_name.to_string(),
+            file,
+        });
+    }
+
+    // Sort for determinism.
+    secrets.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(secrets)
+}
+
+/// Parse service-level `secrets` references.
+///
+/// Supports:
+/// - Short form: just a string name (source and target both set to the name)
+/// - Long form: mapping with `source` and optional `target` keys
+///
+/// Each referenced secret must be defined in the top-level `secrets` section.
+fn parse_service_secrets(
+    svc_name: &str,
+    map: &serde_yml::Mapping,
+    defined_secrets: &[&str],
+) -> Result<Vec<ServiceSecretRef>, StackError> {
+    let Some(value) = map.get(val("secrets")) else {
+        return Ok(vec![]);
+    };
+
+    let seq = value.as_sequence().ok_or_else(|| {
+        StackError::ComposeParse(format!("service `{svc_name}`: `secrets` must be a list"))
+    })?;
+
+    let mut refs = Vec::new();
+    for item in seq {
+        let secret_ref = if let Some(s) = item.as_str() {
+            // Short form: just the secret name.
+            if !defined_secrets.contains(&s) {
+                return Err(StackError::ComposeValidation(format!(
+                    "service `{svc_name}` references secret `{s}` which is not defined in top-level `secrets`"
+                )));
+            }
+            ServiceSecretRef {
+                source: s.to_string(),
+                target: s.to_string(),
+            }
+        } else if let Some(obj) = item.as_mapping() {
+            // Long form: { source: ..., target: ... }
+            let source = obj
+                .get(val("source"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    StackError::ComposeParse(format!(
+                        "service `{svc_name}`: secret long-form requires `source`"
+                    ))
+                })?
+                .to_string();
+
+            if !defined_secrets.contains(&source.as_str()) {
+                return Err(StackError::ComposeValidation(format!(
+                    "service `{svc_name}` references secret `{source}` which is not defined in top-level `secrets`"
+                )));
+            }
+
+            let target = obj
+                .get(val("target"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| source.clone());
+
+            ServiceSecretRef { source, target }
+        } else {
+            return Err(StackError::ComposeParse(format!(
+                "service `{svc_name}`: secret entry must be a string or mapping"
+            )));
+        };
+        refs.push(secret_ref);
+    }
+    Ok(refs)
 }
 
 // ── Volume parsing ─────────────────────────────────────────────────
@@ -1836,7 +2125,7 @@ networks:
     }
 
     #[test]
-    fn reject_deploy() {
+    fn reject_deploy_replicas() {
         let yaml = r#"
 services:
   web:
@@ -1845,7 +2134,22 @@ services:
       replicas: 3
 "#;
         let err = parse_compose(yaml, "myapp").unwrap_err();
-        assert!(err.to_string().contains("deploy"));
+        assert!(err.to_string().contains("replicas"));
+    }
+
+    #[test]
+    fn reject_deploy_resources_reservations() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    deploy:
+      resources:
+        reservations:
+          cpus: "0.25"
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("reservations"));
     }
 
     #[test]
@@ -1876,17 +2180,145 @@ configs:
     }
 
     #[test]
-    fn reject_secrets() {
+    fn secrets_file_based_accepted() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    secrets:
+      - mysecret
+secrets:
+  mysecret:
+    file: ./secret.txt
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.secrets.len(), 1);
+        assert_eq!(spec.secrets[0].name, "mysecret");
+        assert_eq!(spec.secrets[0].file, "./secret.txt");
+        assert_eq!(spec.services[0].secrets.len(), 1);
+        assert_eq!(spec.services[0].secrets[0].source, "mysecret");
+        assert_eq!(spec.services[0].secrets[0].target, "mysecret");
+    }
+
+    #[test]
+    fn secrets_long_form_with_target() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    secrets:
+      - source: db_password
+        target: password.txt
+secrets:
+  db_password:
+    file: ./db_pass.txt
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].secrets.len(), 1);
+        assert_eq!(spec.services[0].secrets[0].source, "db_password");
+        assert_eq!(spec.services[0].secrets[0].target, "password.txt");
+    }
+
+    #[test]
+    fn secrets_long_form_without_target() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    secrets:
+      - source: api_key
+secrets:
+  api_key:
+    file: ./api.key
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].secrets[0].source, "api_key");
+        assert_eq!(spec.services[0].secrets[0].target, "api_key");
+    }
+
+    #[test]
+    fn secrets_external_rejected() {
         let yaml = r#"
 services:
   web:
     image: nginx:latest
 secrets:
   mysecret:
+    external: true
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("external"), "error should mention external: {msg}");
+    }
+
+    #[test]
+    fn secrets_missing_file_rejected() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+secrets:
+  mysecret:
+    name: something
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("file"), "error should mention file: {msg}");
+    }
+
+    #[test]
+    fn secrets_undefined_ref_rejected() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    secrets:
+      - undefined_secret
+secrets:
+  mysecret:
     file: ./secret.txt
 "#;
         let err = parse_compose(yaml, "myapp").unwrap_err();
-        assert!(err.to_string().contains("secrets"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("undefined_secret"),
+            "error should mention the undefined secret: {msg}"
+        );
+    }
+
+    #[test]
+    fn secrets_multiple() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    secrets:
+      - db_pass
+      - api_key
+secrets:
+  db_pass:
+    file: ./db.txt
+  api_key:
+    file: ./api.key
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.secrets.len(), 2);
+        assert_eq!(spec.services[0].secrets.len(), 2);
+    }
+
+    #[test]
+    fn secrets_top_level_without_service_refs() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+secrets:
+  unused_secret:
+    file: ./unused.txt
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.secrets.len(), 1);
+        assert!(spec.services[0].secrets.is_empty());
     }
 
     #[test]
@@ -2382,5 +2814,174 @@ services:
         let spec = parse_compose_with_dir(yaml, "myapp", dir.path()).unwrap();
         assert_eq!(spec.services[0].image, "nginx:latest");
         assert_eq!(spec.services[0].environment.get("PORT").unwrap(), "8080");
+    }
+
+    // ── Deploy / resource limits parsing ─────────────────────────
+
+    #[test]
+    fn deploy_resource_limits_cpus_and_memory() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "512m"
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let res = &spec.services[0].resources;
+        assert!((res.cpus.unwrap() - 0.5).abs() < f64::EPSILON);
+        assert_eq!(res.memory_bytes.unwrap(), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn deploy_resource_limits_cpus_as_number() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    deploy:
+      resources:
+        limits:
+          cpus: 2.0
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert!((spec.services[0].resources.cpus.unwrap() - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn deploy_resource_limits_memory_gigabytes() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    deploy:
+      resources:
+        limits:
+          memory: "2g"
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(
+            spec.services[0].resources.memory_bytes.unwrap(),
+            2 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn deploy_resource_limits_memory_kilobytes() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    deploy:
+      resources:
+        limits:
+          memory: "256k"
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(
+            spec.services[0].resources.memory_bytes.unwrap(),
+            256 * 1024
+        );
+    }
+
+    #[test]
+    fn deploy_empty_is_accepted() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    deploy:
+      resources:
+        limits:
+"#;
+        // Empty limits mapping → no resources set.
+        // serde_yml parses `limits:` (no value) as null, not an empty mapping.
+        // We should handle this gracefully.
+        let result = parse_compose(yaml, "myapp");
+        // This might parse `limits` as null, which is fine — returns default.
+        assert!(result.is_ok());
+        let spec = result.unwrap();
+        assert_eq!(spec.services[0].resources, ResourcesSpec::default());
+    }
+
+    #[test]
+    fn deploy_no_resources_accepted() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    deploy:
+      resources:
+"#;
+        // resources with no value is null.
+        let result = parse_compose(yaml, "myapp");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn deploy_only_cpus() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert!((spec.services[0].resources.cpus.unwrap() - 1.5).abs() < f64::EPSILON);
+        assert!(spec.services[0].resources.memory_bytes.is_none());
+    }
+
+    #[test]
+    fn deploy_only_memory() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    deploy:
+      resources:
+        limits:
+          memory: "1g"
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert!(spec.services[0].resources.cpus.is_none());
+        assert_eq!(
+            spec.services[0].resources.memory_bytes.unwrap(),
+            1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn reject_deploy_unsupported_limit_key() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    deploy:
+      resources:
+        limits:
+          pids: 100
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("pids"));
+    }
+
+    #[test]
+    fn parse_memory_string_variants() {
+        assert_eq!(parse_memory_string("test", "512m").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_memory_string("test", "512M").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_memory_string("test", "1g").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_string("test", "1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_string("test", "256k").unwrap(), 256 * 1024);
+        assert_eq!(parse_memory_string("test", "256K").unwrap(), 256 * 1024);
+        assert_eq!(parse_memory_string("test", "1024").unwrap(), 1024);
+        assert_eq!(parse_memory_string("test", "1024b").unwrap(), 1024);
+        assert!(parse_memory_string("test", "abc").is_err());
+        assert!(parse_memory_string("test", "").is_err());
     }
 }

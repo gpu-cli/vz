@@ -22,6 +22,9 @@ pub struct StackSpec {
     /// Volume definitions.
     #[serde(default)]
     pub volumes: Vec<VolumeSpec>,
+    /// Secret definitions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<SecretDef>,
 }
 
 /// Specification for a single service within a stack.
@@ -67,6 +70,9 @@ pub struct ServiceSpec {
     /// Extra `/etc/hosts` entries as `(hostname, ip)` pairs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_hosts: Vec<(String, String)>,
+    /// Secret references for this service.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<ServiceSecretRef>,
 }
 
 /// Mount specification for container volumes.
@@ -164,12 +170,12 @@ pub enum RestartPolicy {
 /// Resource constraints for a service.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ResourcesSpec {
-    /// CPU limit (e.g., "2" for 2 cores).
+    /// CPU limit as fractional cores (e.g., 0.5 for half a core, 2.0 for two cores).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu: Option<String>,
-    /// Memory limit (e.g., "512m", "1g").
+    pub cpus: Option<f64>,
+    /// Memory limit in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory: Option<String>,
+    pub memory_bytes: Option<u64>,
 }
 
 /// Network definition for the stack.
@@ -201,6 +207,24 @@ pub struct VolumeSpec {
 
 fn default_volume_driver() -> String {
     "local".to_string()
+}
+
+/// A top-level secret definition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecretDef {
+    /// Secret name (referenced by services).
+    pub name: String,
+    /// Host file path containing the secret value.
+    pub file: String,
+}
+
+/// A service-level reference to a defined secret.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceSecretRef {
+    /// Name of the top-level secret to mount.
+    pub source: String,
+    /// Mount target filename inside `/run/secrets/`. Defaults to source name.
+    pub target: String,
 }
 
 #[cfg(test)]
@@ -247,10 +271,11 @@ mod tests {
                     max_retries: Some(5),
                 }),
                 resources: ResourcesSpec {
-                    cpu: Some("2".to_string()),
-                    memory: Some("512m".to_string()),
+                    cpus: Some(2.0),
+                    memory_bytes: Some(512 * 1024 * 1024),
                 },
                 extra_hosts: vec![],
+                secrets: vec![],
             }],
             networks: vec![NetworkSpec {
                 name: "frontend".to_string(),
@@ -261,6 +286,7 @@ mod tests {
                 driver: "local".to_string(),
                 driver_opts: None,
             }],
+            secrets: vec![],
         };
 
         let json = serde_json::to_string_pretty(&spec).unwrap();
@@ -275,6 +301,7 @@ mod tests {
             services: vec![],
             networks: vec![],
             volumes: vec![],
+            secrets: vec![],
         };
 
         let json = serde_json::to_string(&spec).unwrap();

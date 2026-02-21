@@ -658,6 +658,8 @@ impl Runtime {
                 mounts: bundle_mounts,
                 oci_annotations: run.oci_annotations.clone(),
                 network_namespace_path: run.network_namespace_path.clone(),
+                cpu_quota: run.cpu_quota,
+                cpu_period: run.cpu_period,
             },
         )
         .map_err(|e| { tracing::error!(error = %e, "step 3c FAILED: write_oci_bundle"); e })?;
@@ -975,6 +977,8 @@ impl Runtime {
                 mounts: bundle_mounts,
                 oci_annotations: run.oci_annotations.clone(),
                 network_namespace_path: None,
+                cpu_quota: run.cpu_quota,
+                cpu_period: run.cpu_period,
             },
         )?;
 
@@ -1072,6 +1076,8 @@ impl Runtime {
             oci_annotations,
             extra_hosts,
             network_namespace_path: _,
+            cpu_quota: _,
+            cpu_period: _,
         } = run;
 
         let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
@@ -1116,6 +1122,8 @@ impl Runtime {
                 mounts: bundle_mounts,
                 oci_annotations,
                 network_namespace_path: None,
+                cpu_quota: None,
+                cpu_period: None,
             },
         )?;
 
@@ -1234,6 +1242,8 @@ impl Runtime {
             oci_annotations: _,
             extra_hosts: _,
             network_namespace_path: _,
+            cpu_quota: _,
+            cpu_period: _,
         } = run;
 
         let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
@@ -1529,7 +1539,7 @@ async fn start_port_forwarding(
 
         let mut listener_shutdown_rx = shutdown_rx.clone();
         let listener_vm = Arc::clone(&vm);
-        let listener_mapping = *mapping;
+        let listener_mapping = mapping.clone();
 
         listener_tasks.push(tokio::spawn(async move {
             let mut connection_tasks = JoinSet::new();
@@ -1545,17 +1555,20 @@ async fn start_port_forwarding(
                         match accept_result {
                             Ok((host_stream, _peer)) => {
                                 let connection_vm = Arc::clone(&listener_vm);
+                                let connection_mapping = listener_mapping.clone();
                                 connection_tasks.spawn(async move {
+                                    let host_port = connection_mapping.host;
+                                    let container_port = connection_mapping.container;
                                     if let Err(error) = relay_port_forward_connection(
                                         connection_vm,
                                         host_stream,
-                                        listener_mapping,
+                                        connection_mapping,
                                     )
                                     .await
                                     {
                                         warn!(
-                                            host_port = listener_mapping.host,
-                                            container_port = listener_mapping.container,
+                                            host_port,
+                                            container_port,
                                             error = %error,
                                             "port forward connection failed"
                                         );
@@ -1614,6 +1627,7 @@ async fn relay_port_forward_connection(
         vm.as_ref(),
         mapping.container,
         mapping.protocol.as_str(),
+        mapping.target_host.as_deref(),
     )
     .await?;
 
@@ -1898,6 +1912,8 @@ fn resolve_run_config(
         oci_annotations,
         extra_hosts,
         network_namespace_path,
+        cpu_quota: _,
+        cpu_period: _,
     } = run;
 
     let resolved_cmd = if !run_cmd.is_empty() {
@@ -1948,6 +1964,8 @@ fn resolve_run_config(
         oci_annotations,
         extra_hosts,
         network_namespace_path,
+        cpu_quota: None,
+        cpu_period: None,
     })
 }
 
@@ -2636,6 +2654,7 @@ mod tests {
                 host: 8080,
                 container: 80,
                 protocol: PortProtocol::Tcp,
+                target_host: None,
             }],
             ..RunConfig::default()
         };
@@ -2647,6 +2666,7 @@ mod tests {
                 host: 8080,
                 container: 80,
                 protocol: PortProtocol::Tcp,
+                target_host: None,
             }],
         );
     }

@@ -147,10 +147,15 @@ pub async fn handshake_and_ping(vm: &Vm) -> Result<HandshakeAck, LinuxError> {
 ///
 /// On success, the returned stream is a raw byte pipe to the requested
 /// `target_port` inside the guest.
+///
+/// When `target_host` is `Some`, the guest agent connects to the specified
+/// host/IP instead of `127.0.0.1`. This is used in stack mode to route
+/// connections to per-service network namespaces via their bridge IPs.
 pub async fn open_port_forward_stream(
     vm: &Vm,
     target_port: u16,
     protocol_name: &str,
+    target_host: Option<&str>,
 ) -> Result<VsockStream, LinuxError> {
     let handshake = Handshake {
         protocol_version: protocol::PROTOCOL_VERSION,
@@ -177,6 +182,7 @@ pub async fn open_port_forward_stream(
             id: PORT_FORWARD_REQUEST_ID,
             target_port,
             protocol: protocol_name.to_string(),
+            target_host: target_host.map(String::from),
         },
     )
     .await?;

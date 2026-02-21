@@ -432,6 +432,8 @@ async fn create_container(runtime: &vz_oci::Runtime, args: CreateArgs) -> anyhow
         oci_annotations: Vec::new(),
         extra_hosts: Vec::new(),
         network_namespace_path: None,
+        cpu_quota: None,
+        cpu_period: None,
     };
 
     info!(image = %args.image, "creating long-lived container");
@@ -576,6 +578,8 @@ fn build_run_config(args: &RunArgs) -> anyhow::Result<RunConfig> {
         oci_annotations: Vec::new(),
         extra_hosts: Vec::new(),
         network_namespace_path: None,
+        cpu_quota: None,
+        cpu_period: None,
     })
 }
 
@@ -657,6 +661,7 @@ fn parse_port_mapping(spec: &str) -> anyhow::Result<PortMapping> {
         host,
         container,
         protocol,
+        target_host: None,
     })
 }
 

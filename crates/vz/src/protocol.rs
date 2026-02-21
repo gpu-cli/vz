@@ -277,6 +277,13 @@ pub enum Request {
         target_port: u16,
         /// Protocol string ("tcp" or "udp").
         protocol: String,
+        /// Target host/IP to connect to inside the guest.
+        ///
+        /// Defaults to `127.0.0.1` when absent. In stack mode, this is set
+        /// to the service IP (e.g., `172.20.0.2`) so the connection reaches
+        /// the correct per-service network namespace via the bridge.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_host: Option<String>,
     },
     /// Create a container in the OCI runtime from a prepared bundle.
     OciCreate {
@@ -545,6 +552,7 @@ mod tests {
             id: 7,
             target_port: 8080,
             protocol: "tcp".to_string(),
+            target_host: None,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         let deserialized: Request = serde_json::from_str(&json).expect("deserialize");

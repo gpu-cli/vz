@@ -4,8 +4,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use oci_spec::runtime::{
-    Capability, LinuxCapabilities, LinuxCapabilitiesBuilder, LinuxNamespaceType, Mount,
-    MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder, User, UserBuilder, VERSION,
+    Capability, LinuxCapabilities, LinuxCapabilitiesBuilder, LinuxCpuBuilder, LinuxNamespaceType,
+    LinuxResourcesBuilder, Mount, MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder,
+    User, UserBuilder, VERSION,
 };
 
 use crate::error::OciError;
@@ -48,6 +49,13 @@ pub(crate) struct BundleSpec {
     /// to this path (e.g., `/var/run/netns/svc-web`). The
     /// namespace must be created before the container starts.
     pub network_namespace_path: Option<String>,
+    /// CPU quota in microseconds per `cpu_period`.
+    ///
+    /// For example, `cpus: 0.5` → quota=50000, period=100000
+    /// means the container gets 50ms of CPU time per 100ms period.
+    pub cpu_quota: Option<i64>,
+    /// CPU CFS period in microseconds (default: 100000 = 100ms).
+    pub cpu_period: Option<u64>,
 }
 
 /// Write an OCI bundle directory (`config.json` + optional `rootfs` link).
@@ -92,6 +100,8 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
         mut mounts,
         oci_annotations,
         network_namespace_path,
+        cpu_quota,
+        cpu_period,
     } = spec;
 
     if cmd.is_empty() {
@@ -140,6 +150,10 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
         set_network_namespace_path(&mut spec, &netns_path);
     }
 
+    if cpu_quota.is_some() || cpu_period.is_some() {
+        set_cpu_limits(&mut spec, cpu_quota, cpu_period)?;
+    }
+
     Ok(spec)
 }
 
@@ -159,6 +173,29 @@ fn set_network_namespace_path(spec: &mut Spec, path: &str) {
     {
         netns.set_path(Some(path.into()));
     }
+}
+
+/// Set CPU cgroup limits (quota/period) in the spec's linux.resources.cpu section.
+fn set_cpu_limits(
+    spec: &mut Spec,
+    quota: Option<i64>,
+    period: Option<u64>,
+) -> Result<(), OciError> {
+    let mut cpu_builder = LinuxCpuBuilder::default();
+    if let Some(q) = quota {
+        cpu_builder = cpu_builder.quota(q);
+    }
+    if let Some(p) = period {
+        cpu_builder = cpu_builder.period(p);
+    }
+    let cpu = cpu_builder.build()?;
+
+    let resources = LinuxResourcesBuilder::default().cpu(cpu).build()?;
+
+    if let Some(linux) = spec.linux_mut() {
+        linux.set_resources(Some(resources));
+    }
+    Ok(())
 }
 
 fn sort_bundle_mounts(mounts: &mut [BundleMount]) {
@@ -352,6 +389,8 @@ mod tests {
                     ("com.example.revision".to_string(), "42".to_string()),
                 ],
                 network_namespace_path: None,
+                cpu_quota: None,
+                cpu_period: None,
             },
         )
         .unwrap();
@@ -433,6 +472,8 @@ mod tests {
                 mounts: Vec::new(),
                 oci_annotations: Vec::new(),
                 network_namespace_path: None,
+                cpu_quota: None,
+                cpu_period: None,
             },
         )
         .unwrap();
@@ -483,6 +524,8 @@ mod tests {
                 ],
                 oci_annotations: Vec::new(),
                 network_namespace_path: None,
+                cpu_quota: None,
+                cpu_period: None,
             },
         )
         .unwrap();
@@ -525,6 +568,8 @@ mod tests {
                 mounts: Vec::new(),
                 oci_annotations: Vec::new(),
                 network_namespace_path: Some("/var/run/netns/svc-web".to_string()),
+                cpu_quota: None,
+                cpu_period: None,
             },
         )
         .unwrap();
@@ -563,6 +608,8 @@ mod tests {
                 mounts: Vec::new(),
                 oci_annotations: Vec::new(),
                 network_namespace_path: None,
+                cpu_quota: None,
+                cpu_period: None,
             },
         )
         .unwrap();

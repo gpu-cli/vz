@@ -428,6 +428,7 @@ async fn cmd_down(args: DownArgs) -> anyhow::Result<()> {
         services: vec![],
         networks: vec![],
         volumes: vec![],
+        secrets: vec![],
     };
 
     info!(stack = %stack_name, "tearing down stack");

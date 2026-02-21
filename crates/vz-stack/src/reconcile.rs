@@ -411,6 +411,7 @@ mod tests {
             restart_policy: None,
             resources: Default::default(),
             extra_hosts: vec![],
+            secrets: vec![],
         }
     }
 
@@ -441,6 +442,7 @@ mod tests {
             services,
             networks: vec![],
             volumes: vec![],
+            secrets: vec![],
         }
     }
 

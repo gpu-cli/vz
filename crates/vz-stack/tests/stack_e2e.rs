@@ -325,6 +325,7 @@ services:
         services: vec![],
         networks: vec![],
         volumes: vec![],
+        secrets: vec![],
     };
     let down_result = orchestrator.run(&down_spec, None).unwrap();
     assert!(down_result.converged);

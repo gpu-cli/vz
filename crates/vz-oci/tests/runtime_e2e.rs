@@ -258,6 +258,7 @@ async fn port_forwarding_tcp() {
                     host: 18080,
                     container: 8080,
                     protocol: vz_oci::PortProtocol::Tcp,
+                    target_host: None,
                 }],
                 ..RunConfig::default()
             },

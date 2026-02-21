@@ -278,6 +278,7 @@ mod tests {
                     restart_policy: None,
                     resources: Default::default(),
                     extra_hosts: vec![],
+                    secrets: vec![],
                 },
                 ServiceSpec {
                     name: "db".to_string(),
@@ -297,10 +298,12 @@ mod tests {
                     restart_policy: None,
                     resources: Default::default(),
                     extra_hosts: vec![],
+                    secrets: vec![],
                 },
             ],
             networks: vec![],
             volumes: vec![],
+            secrets: vec![],
         }
     }
 
@@ -340,6 +343,7 @@ mod tests {
                 driver: "local".to_string(),
                 driver_opts: None,
             }],
+            secrets: vec![],
         };
 
         store.save_desired_state("myapp", &spec2).unwrap();
@@ -491,12 +495,14 @@ mod tests {
             services: vec![],
             networks: vec![],
             volumes: vec![],
+            secrets: vec![],
         };
         let spec2 = StackSpec {
             name: "app2".to_string(),
             services: vec![],
             networks: vec![],
             volumes: vec![],
+            secrets: vec![],
         };
 
         store.save_desired_state("app1", &spec1).unwrap();
