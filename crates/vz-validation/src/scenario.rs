@@ -63,6 +63,38 @@ pub struct Scenario {
     pub user: Option<String>,
     /// Expected outcome conditions.
     pub expectations: Vec<Expectation>,
+    /// For S6 ComposeFixture scenarios: the services to deploy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compose_services: Option<Vec<ComposeServiceSpec>>,
+    /// For S6 connectivity checks: exec commands to run after stack is up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connectivity_checks: Option<Vec<ConnectivityCheck>>,
+}
+
+/// A service definition within a compose scenario.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeServiceSpec {
+    /// Service name (used for DNS and network namespace).
+    pub name: String,
+    /// OCI image reference.
+    pub image: String,
+    /// Command override for the service container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+    /// Services this service depends on (must start first).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+}
+
+/// A connectivity check to execute against a running compose stack.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectivityCheck {
+    /// Service to run the check from.
+    pub from_service: String,
+    /// Command to execute inside the service container.
+    pub command: Vec<String>,
+    /// Expected exit code (0 = reachable).
+    pub expected_exit_code: i32,
 }
 
 /// A condition that must be met for a scenario to pass.
@@ -114,6 +146,8 @@ pub fn s1_entrypoint_scenarios() -> Vec<Scenario> {
             working_dir: None,
             user: None,
             expectations: vec![Expectation::ExitCode { code: 0 }],
+            compose_services: None,
+            connectivity_checks: None,
         },
         Scenario {
             id: "s1-cmd-override".to_string(),
@@ -130,6 +164,8 @@ pub fn s1_entrypoint_scenarios() -> Vec<Scenario> {
                     substring: "hello-from-override".to_string(),
                 },
             ],
+            compose_services: None,
+            connectivity_checks: None,
         },
         Scenario {
             id: "s1-entrypoint-override".to_string(),
@@ -146,6 +182,8 @@ pub fn s1_entrypoint_scenarios() -> Vec<Scenario> {
                     substring: "world".to_string(),
                 },
             ],
+            compose_services: None,
+            connectivity_checks: None,
         },
     ]
 }
@@ -163,6 +201,8 @@ pub fn s2_user_scenarios() -> Vec<Scenario> {
             working_dir: None,
             user: None,
             expectations: vec![Expectation::ExitCode { code: 0 }],
+            compose_services: None,
+            connectivity_checks: None,
         },
         Scenario {
             id: "s2-numeric-uid".to_string(),
@@ -179,6 +219,8 @@ pub fn s2_user_scenarios() -> Vec<Scenario> {
                     substring: "1000".to_string(),
                 },
             ],
+            compose_services: None,
+            connectivity_checks: None,
         },
     ]
 }
@@ -208,6 +250,8 @@ pub fn s1_env_cwd_scenarios() -> Vec<Scenario> {
                     substring: "hello-from-env".to_string(),
                 },
             ],
+            compose_services: None,
+            connectivity_checks: None,
         },
         Scenario {
             id: "s1-working-dir".to_string(),
@@ -224,6 +268,8 @@ pub fn s1_env_cwd_scenarios() -> Vec<Scenario> {
                     substring: "/tmp".to_string(),
                 },
             ],
+            compose_services: None,
+            connectivity_checks: None,
         },
     ]
 }
@@ -252,6 +298,8 @@ pub fn s5_service_scenarios() -> Vec<Scenario> {
                     ],
                 },
             ],
+            compose_services: None,
+            connectivity_checks: None,
         },
         Scenario {
             id: "s5-port-reachable".to_string(),
@@ -263,6 +311,8 @@ pub fn s5_service_scenarios() -> Vec<Scenario> {
             working_dir: None,
             user: None,
             expectations: vec![Expectation::ExitCode { code: 0 }],
+            compose_services: None,
+            connectivity_checks: None,
         },
     ]
 }
@@ -289,6 +339,8 @@ pub fn s3_mount_scenarios() -> Vec<Scenario> {
                     substring: "test".to_string(),
                 },
             ],
+            compose_services: None,
+            connectivity_checks: None,
         },
         Scenario {
             id: "s3-bind-mount-ro".to_string(),
@@ -309,6 +361,8 @@ pub fn s3_mount_scenarios() -> Vec<Scenario> {
                     substring: "readonly-ok".to_string(),
                 },
             ],
+            compose_services: None,
+            connectivity_checks: None,
         },
         Scenario {
             id: "s3-named-volume-persistence".to_string(),
@@ -324,6 +378,8 @@ pub fn s3_mount_scenarios() -> Vec<Scenario> {
             working_dir: None,
             user: None,
             expectations: vec![Expectation::ExitCode { code: 0 }],
+            compose_services: None,
+            connectivity_checks: None,
         },
     ]
 }
@@ -350,6 +406,21 @@ pub fn s6_compose_scenarios() -> Vec<Scenario> {
                     ],
                 },
             ],
+            compose_services: Some(vec![
+                ComposeServiceSpec {
+                    name: "web".to_string(),
+                    image: "alpine:3.20".to_string(),
+                    command: Some(vec!["sleep".to_string(), "300".to_string()]),
+                    depends_on: vec![],
+                },
+                ComposeServiceSpec {
+                    name: "db".to_string(),
+                    image: "alpine:3.20".to_string(),
+                    command: Some(vec!["sleep".to_string(), "300".to_string()]),
+                    depends_on: vec![],
+                },
+            ]),
+            connectivity_checks: None,
         },
         Scenario {
             id: "s6-service-connectivity".to_string(),
@@ -361,11 +432,53 @@ pub fn s6_compose_scenarios() -> Vec<Scenario> {
             working_dir: None,
             user: None,
             expectations: vec![Expectation::ExitCode { code: 0 }],
+            compose_services: Some(vec![
+                ComposeServiceSpec {
+                    name: "web".to_string(),
+                    image: "alpine:3.20".to_string(),
+                    command: Some(vec!["sleep".to_string(), "300".to_string()]),
+                    depends_on: vec![],
+                },
+                ComposeServiceSpec {
+                    name: "db".to_string(),
+                    image: "alpine:3.20".to_string(),
+                    command: Some(vec!["sleep".to_string(), "300".to_string()]),
+                    depends_on: vec![],
+                },
+            ]),
+            connectivity_checks: Some(vec![
+                ConnectivityCheck {
+                    from_service: "web".to_string(),
+                    command: vec![
+                        "ping".to_string(),
+                        "-c".to_string(),
+                        "1".to_string(),
+                        "-W".to_string(),
+                        "3".to_string(),
+                        "db".to_string(),
+                    ],
+                    expected_exit_code: 0,
+                },
+                ConnectivityCheck {
+                    from_service: "db".to_string(),
+                    command: vec![
+                        "ping".to_string(),
+                        "-c".to_string(),
+                        "1".to_string(),
+                        "-W".to_string(),
+                        "3".to_string(),
+                        "web".to_string(),
+                    ],
+                    expected_exit_code: 0,
+                },
+            ]),
         },
         Scenario {
             id: "s6-restart-recovery".to_string(),
             kind: ScenarioKind::ComposeFixture,
-            description: "Verify service restart recovery after failure".to_string(),
+            description:
+                "Verify service restart recovery after failure (stub — needs restart policy)"
+                    .to_string(),
             command: None,
             entrypoint: None,
             environment: HashMap::new(),
@@ -381,6 +494,8 @@ pub fn s6_compose_scenarios() -> Vec<Scenario> {
                     ],
                 },
             ],
+            compose_services: None,
+            connectivity_checks: None,
         },
     ]
 }
@@ -404,6 +519,8 @@ pub fn s4_signal_scenarios() -> Vec<Scenario> {
                 "delete".to_string(),
             ],
         }],
+        compose_services: None,
+        connectivity_checks: None,
     }]
 }
 

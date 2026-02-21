@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use crate::cohort::ImageRef;
 use crate::report::{ScenarioOutcome, TestResult};
-use crate::scenario::{Expectation, Scenario};
+use crate::scenario::{Expectation, Scenario, ScenarioKind};
 
 /// Output captured from a scenario execution.
 #[derive(Debug, Clone)]
@@ -28,7 +28,7 @@ pub struct ExecOutput {
 ///
 /// Implement this for real runtimes (vz-oci Runtime) or mocks.
 pub trait RuntimeAdapter {
-    /// Execute a scenario and return captured output.
+    /// Execute a single-container scenario and return captured output.
     ///
     /// The adapter is responsible for:
     /// 1. Pulling/preparing the image
@@ -36,6 +36,17 @@ pub trait RuntimeAdapter {
     /// 3. Capturing stdout/stderr
     /// 4. Returning the exit code and lifecycle events
     fn execute(&self, image: &ImageRef, scenario: &Scenario) -> Result<ExecOutput, String>;
+
+    /// Execute a multi-service compose scenario.
+    ///
+    /// Default implementation returns an error indicating compose is not
+    /// supported. Override this in adapters that support stack operations.
+    fn execute_compose(&self, scenario: &Scenario) -> Result<ExecOutput, String> {
+        Err(format!(
+            "compose scenarios not supported by this adapter: {}",
+            scenario.id
+        ))
+    }
 }
 
 /// Runs scenarios against a runtime adapter and collects results.
@@ -53,7 +64,24 @@ impl<R: RuntimeAdapter> ScenarioRunner<R> {
     pub fn run_one(&self, image: &ImageRef, scenario: &Scenario) -> TestResult {
         let start = Instant::now();
 
-        let (outcome, exit_code, stdout, stderr) = match self.adapter.execute(image, scenario) {
+        // Dispatch compose scenarios through execute_compose when they
+        // have concrete service definitions. Stubs (compose_services=None)
+        // fall through to execute_compose which returns an error by default.
+        let result = if scenario.kind == ScenarioKind::ComposeFixture
+            && scenario.compose_services.is_some()
+        {
+            self.adapter.execute_compose(scenario)
+        } else if scenario.kind == ScenarioKind::ComposeFixture {
+            // Stub scenario with no services — skip gracefully.
+            Err(format!(
+                "compose scenario {} has no service definitions (stub)",
+                scenario.id
+            ))
+        } else {
+            self.adapter.execute(image, scenario)
+        };
+
+        let (outcome, exit_code, stdout, stderr) = match result {
             Ok(output) => {
                 let failures = evaluate_expectations(&scenario.expectations, &output);
                 let outcome = if failures.is_empty() {

@@ -25,6 +25,60 @@ const OCI_ERROR_CODE_RUNTIME_FAILURE: i32 = 125;
 const OCI_ERROR_CODE_EXEC_START_FAILURE: i32 = 127;
 const AGENT_CAPABILITY_NETWORK_SETUP: &str = "network_setup";
 
+/// Timeout for a single vsock connect + handshake attempt.
+const VSOCK_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Maximum retries for vsock handshake.
+const VSOCK_MAX_CONNECT_ATTEMPTS: u32 = 10;
+/// Delay between retry attempts.
+const VSOCK_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+/// Connect to the guest agent and perform handshake with retry.
+///
+/// Virtualization.framework can transiently fail to deliver vsock connections
+/// to the guest, especially immediately after a previous connection closes.
+/// This function retries the connection + handshake with a timeout per attempt.
+async fn connect_and_handshake(
+    vm: &Vm,
+    handshake: &Handshake,
+) -> Result<(VsockStream, HandshakeAck), LinuxError> {
+    let mut last_error = String::new();
+    for attempt in 1..=VSOCK_MAX_CONNECT_ATTEMPTS {
+        let result = tokio::time::timeout(VSOCK_HANDSHAKE_TIMEOUT, async {
+            let mut stream = vm.vsock_connect(protocol::AGENT_PORT).await?;
+            protocol::write_frame(&mut stream, handshake).await?;
+            let ack: HandshakeAck = protocol::read_frame(&mut stream).await?;
+            ensure_handshake_protocol(&ack)?;
+            Ok::<_, LinuxError>((stream, ack))
+        })
+        .await;
+
+        match result {
+            Ok(Ok(pair)) => {
+                if attempt > 1 {
+                    tracing::info!(attempt, "vsock handshake succeeded after retry");
+                }
+                return Ok(pair);
+            }
+            Ok(Err(e)) => {
+                last_error = e.to_string();
+                tracing::debug!(attempt, error = %last_error, "vsock handshake failed");
+            }
+            Err(_) => {
+                last_error = format!("timed out after {VSOCK_HANDSHAKE_TIMEOUT:?}");
+                tracing::debug!(attempt, "{last_error}");
+            }
+        }
+
+        if attempt < VSOCK_MAX_CONNECT_ATTEMPTS {
+            tokio::time::sleep(VSOCK_RETRY_DELAY).await;
+        }
+    }
+
+    Err(LinuxError::Protocol(format!(
+        "vsock connect failed after {VSOCK_MAX_CONNECT_ATTEMPTS} attempts: {last_error}"
+    )))
+}
+
 /// Options for guest command execution.
 #[derive(Debug, Clone, Default)]
 pub struct ExecOptions {
@@ -98,8 +152,6 @@ pub async fn open_port_forward_stream(
     target_port: u16,
     protocol_name: &str,
 ) -> Result<VsockStream, LinuxError> {
-    let mut stream = vm.vsock_connect(protocol::AGENT_PORT).await?;
-
     let handshake = Handshake {
         protocol_version: protocol::PROTOCOL_VERSION,
         capabilities: vec![
@@ -107,14 +159,7 @@ pub async fn open_port_forward_stream(
             AGENT_CAPABILITY_PORT_FORWARD.to_string(),
         ],
     };
-    protocol::write_frame(&mut stream, &handshake).await?;
-
-    let ack: HandshakeAck = protocol::read_frame(&mut stream).await?;
-    if ack.protocol_version == 0 {
-        return Err(LinuxError::Protocol(
-            "guest agent negotiated protocol version 0".to_string(),
-        ));
-    }
+    let (mut stream, ack) = connect_and_handshake(vm, &handshake).await?;
 
     if !ack
         .capabilities
@@ -166,9 +211,6 @@ pub async fn exec_capture_with_options(
     request_timeout: Duration,
     options: ExecOptions,
 ) -> Result<ExecOutput, LinuxError> {
-    let stream = vm.vsock_connect(protocol::AGENT_PORT).await?;
-    let (mut reader, mut writer) = tokio::io::split(stream);
-
     let handshake = Handshake {
         protocol_version: protocol::PROTOCOL_VERSION,
         capabilities: vec![
@@ -176,13 +218,8 @@ pub async fn exec_capture_with_options(
             AGENT_CAPABILITY_PORT_FORWARD.to_string(),
         ],
     };
-    protocol::write_frame(&mut writer, &handshake).await?;
-    let ack: HandshakeAck = protocol::read_frame(&mut reader).await?;
-    if ack.protocol_version == 0 {
-        return Err(LinuxError::Protocol(
-            "guest agent negotiated protocol version 0".to_string(),
-        ));
-    }
+    let (stream, _ack) = connect_and_handshake(vm, &handshake).await?;
+    let (mut reader, mut writer) = tokio::io::split(stream);
 
     let exec_id = EXEC_REQUEST_ID;
     let request = Request::Exec {
@@ -335,6 +372,15 @@ fn oci_command_plan(request: Request) -> OciCommandPlan {
                 runtime_args.push("--cwd".to_string());
                 runtime_args.push(cwd);
             }
+            // Ensure a PATH is always set for exec commands so that
+            // executables in standard directories are found.
+            let has_path = env.iter().any(|(k, _)| k == "PATH");
+            if !has_path {
+                runtime_args.push("--env".to_string());
+                runtime_args.push(
+                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+                );
+            }
             for (key, value) in env {
                 runtime_args.push("--env".to_string());
                 runtime_args.push(format!("{key}={value}"));
@@ -483,14 +529,27 @@ fn map_youki_exec_output(plan: &OciCommandPlan, output: ExecOutput) -> Response 
     }
 }
 
+/// Dispatch an OCI request, including handshake. Used by `_with_stream` test variants.
+#[cfg(test)]
 async fn dispatch_oci_request<S>(mut stream: S, request: Request) -> Result<OciPayload, LinuxError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let plan = oci_command_plan(request);
     protocol::write_frame(&mut stream, &oci_handshake()).await?;
     let ack: HandshakeAck = protocol::read_frame(&mut stream).await?;
     ensure_handshake_protocol(&ack)?;
+    dispatch_oci_request_handshaked(stream, request).await
+}
+
+/// Dispatch an OCI request on a stream that has already completed handshake.
+async fn dispatch_oci_request_handshaked<S>(
+    mut stream: S,
+    request: Request,
+) -> Result<OciPayload, LinuxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let plan = oci_command_plan(request);
 
     protocol::write_frame(
         &mut stream,
@@ -582,6 +641,7 @@ fn expect_exec_payload(id: &str, payload: OciPayload) -> Result<OciExecResult, L
     }
 }
 
+#[cfg(test)]
 async fn oci_create_with_stream<S>(
     stream: S,
     id: String,
@@ -601,6 +661,7 @@ where
     expect_empty_payload("OCI create", &id, payload)
 }
 
+#[cfg(test)]
 async fn oci_start_with_stream<S>(stream: S, id: String) -> Result<(), LinuxError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -609,6 +670,7 @@ where
     expect_empty_payload("OCI start", &id, payload)
 }
 
+#[cfg(test)]
 async fn oci_state_with_stream<S>(stream: S, id: String) -> Result<OciContainerState, LinuxError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -617,6 +679,7 @@ where
     expect_state_payload(&id, payload)
 }
 
+#[cfg(test)]
 async fn oci_exec_with_stream<S>(
     stream: S,
     id: String,
@@ -642,6 +705,7 @@ where
     expect_exec_payload(&id, payload)
 }
 
+#[cfg(test)]
 async fn oci_kill_with_stream<S>(stream: S, id: String, signal: String) -> Result<(), LinuxError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -657,6 +721,7 @@ where
     expect_empty_payload("OCI kill", &id, payload)
 }
 
+#[cfg(test)]
 async fn oci_delete_with_stream<S>(stream: S, id: String, force: bool) -> Result<(), LinuxError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -674,20 +739,32 @@ where
 
 /// Dispatch `OciCreate` to the Linux guest agent.
 pub async fn oci_create(vm: &Vm, id: String, bundle_path: String) -> Result<(), LinuxError> {
-    let stream = vm.vsock_connect(protocol::AGENT_PORT).await?;
-    oci_create_with_stream(stream, id, bundle_path).await
+    let (stream, _ack) = connect_and_handshake(vm, &oci_handshake()).await?;
+    let payload = dispatch_oci_request_handshaked(
+        stream,
+        Request::OciCreate {
+            id: id.clone(),
+            bundle_path,
+        },
+    )
+    .await?;
+    expect_empty_payload("OCI create", &id, payload)
 }
 
 /// Dispatch `OciStart` to the Linux guest agent.
 pub async fn oci_start(vm: &Vm, id: String) -> Result<(), LinuxError> {
-    let stream = vm.vsock_connect(protocol::AGENT_PORT).await?;
-    oci_start_with_stream(stream, id).await
+    let (stream, _ack) = connect_and_handshake(vm, &oci_handshake()).await?;
+    let payload =
+        dispatch_oci_request_handshaked(stream, Request::OciStart { id: id.clone() }).await?;
+    expect_empty_payload("OCI start", &id, payload)
 }
 
 /// Dispatch `OciState` to the Linux guest agent.
 pub async fn oci_state(vm: &Vm, id: String) -> Result<OciContainerState, LinuxError> {
-    let stream = vm.vsock_connect(protocol::AGENT_PORT).await?;
-    oci_state_with_stream(stream, id).await
+    let (stream, _ack) = connect_and_handshake(vm, &oci_handshake()).await?;
+    let payload =
+        dispatch_oci_request_handshaked(stream, Request::OciState { id: id.clone() }).await?;
+    expect_state_payload(&id, payload)
 }
 
 /// Dispatch `OciExec` to the Linux guest agent.
@@ -698,20 +775,48 @@ pub async fn oci_exec(
     args: Vec<String>,
     options: OciExecOptions,
 ) -> Result<OciExecResult, LinuxError> {
-    let stream = vm.vsock_connect(protocol::AGENT_PORT).await?;
-    oci_exec_with_stream(stream, id, command, args, options).await
+    let (stream, _ack) = connect_and_handshake(vm, &oci_handshake()).await?;
+    let payload = dispatch_oci_request_handshaked(
+        stream,
+        Request::OciExec {
+            id: id.clone(),
+            command,
+            args,
+            env: options.env,
+            cwd: options.cwd,
+            user: options.user,
+        },
+    )
+    .await?;
+    expect_exec_payload(&id, payload)
 }
 
 /// Dispatch `OciKill` to the Linux guest agent.
 pub async fn oci_kill(vm: &Vm, id: String, signal: String) -> Result<(), LinuxError> {
-    let stream = vm.vsock_connect(protocol::AGENT_PORT).await?;
-    oci_kill_with_stream(stream, id, signal).await
+    let (stream, _ack) = connect_and_handshake(vm, &oci_handshake()).await?;
+    let payload = dispatch_oci_request_handshaked(
+        stream,
+        Request::OciKill {
+            id: id.clone(),
+            signal,
+        },
+    )
+    .await?;
+    expect_empty_payload("OCI kill", &id, payload)
 }
 
 /// Dispatch `OciDelete` to the Linux guest agent.
 pub async fn oci_delete(vm: &Vm, id: String, force: bool) -> Result<(), LinuxError> {
-    let stream = vm.vsock_connect(protocol::AGENT_PORT).await?;
-    oci_delete_with_stream(stream, id, force).await
+    let (stream, _ack) = connect_and_handshake(vm, &oci_handshake()).await?;
+    let payload = dispatch_oci_request_handshaked(
+        stream,
+        Request::OciDelete {
+            id: id.clone(),
+            force,
+        },
+    )
+    .await?;
+    expect_empty_payload("OCI delete", &id, payload)
 }
 
 // ── Network setup/teardown ─────────────────────────────────────────
@@ -737,11 +842,12 @@ pub async fn network_setup(
     stack_id: String,
     services: Vec<NetworkServiceConfig>,
 ) -> Result<(), LinuxError> {
-    let stream = vm.vsock_connect(protocol::AGENT_PORT).await?;
-    network_setup_with_stream(stream, stack_id, services).await
+    let (stream, _ack) = connect_and_handshake(vm, &network_handshake()).await?;
+    network_setup_send(stream, stack_id, services).await
 }
 
-async fn network_setup_with_stream<S>(
+/// Send the NetworkSetup request on an already-handshaked stream.
+async fn network_setup_send<S>(
     mut stream: S,
     stack_id: String,
     services: Vec<NetworkServiceConfig>,
@@ -749,10 +855,6 @@ async fn network_setup_with_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    protocol::write_frame(&mut stream, &network_handshake()).await?;
-    let ack: HandshakeAck = protocol::read_frame(&mut stream).await?;
-    ensure_handshake_protocol(&ack)?;
-
     protocol::write_frame(
         &mut stream,
         &Request::NetworkSetup {
@@ -766,9 +868,9 @@ where
     let response: Response = protocol::read_frame(&mut stream).await?;
     match response {
         Response::NetworkSetupOk { id } if id == NETWORK_SETUP_REQUEST_ID => Ok(()),
-        Response::NetworkSetupError { id, error } if id == NETWORK_SETUP_REQUEST_ID => {
-            Err(LinuxError::Protocol(format!("network setup failed: {error}")))
-        }
+        Response::NetworkSetupError { id, error } if id == NETWORK_SETUP_REQUEST_ID => Err(
+            LinuxError::Protocol(format!("network setup failed: {error}")),
+        ),
         other => Err(LinuxError::Protocol(format!(
             "unexpected network setup response: {other:?}"
         ))),
@@ -781,11 +883,12 @@ pub async fn network_teardown(
     stack_id: String,
     service_names: Vec<String>,
 ) -> Result<(), LinuxError> {
-    let stream = vm.vsock_connect(protocol::AGENT_PORT).await?;
-    network_teardown_with_stream(stream, stack_id, service_names).await
+    let (stream, _ack) = connect_and_handshake(vm, &network_handshake()).await?;
+    network_teardown_send(stream, stack_id, service_names).await
 }
 
-async fn network_teardown_with_stream<S>(
+/// Send the NetworkTeardown request on an already-handshaked stream.
+async fn network_teardown_send<S>(
     mut stream: S,
     stack_id: String,
     service_names: Vec<String>,
@@ -793,10 +896,6 @@ async fn network_teardown_with_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    protocol::write_frame(&mut stream, &network_handshake()).await?;
-    let ack: HandshakeAck = protocol::read_frame(&mut stream).await?;
-    ensure_handshake_protocol(&ack)?;
-
     protocol::write_frame(
         &mut stream,
         &Request::NetworkTeardown {
@@ -810,11 +909,9 @@ where
     let response: Response = protocol::read_frame(&mut stream).await?;
     match response {
         Response::NetworkTeardownOk { id } if id == NETWORK_TEARDOWN_REQUEST_ID => Ok(()),
-        Response::NetworkTeardownError { id, error } if id == NETWORK_TEARDOWN_REQUEST_ID => {
-            Err(LinuxError::Protocol(format!(
-                "network teardown failed: {error}"
-            )))
-        }
+        Response::NetworkTeardownError { id, error } if id == NETWORK_TEARDOWN_REQUEST_ID => Err(
+            LinuxError::Protocol(format!("network teardown failed: {error}")),
+        ),
         other => Err(LinuxError::Protocol(format!(
             "unexpected network teardown response: {other:?}"
         ))),
@@ -1006,6 +1103,8 @@ mod tests {
                 id.clone(),
                 "--cwd".to_string(),
                 "/workspace".to_string(),
+                "--env".to_string(),
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
                 "--env".to_string(),
                 "MODE=prod".to_string(),
                 "--env".to_string(),

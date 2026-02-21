@@ -194,7 +194,11 @@ where
         protocol_version: negotiated_version,
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         os: std::env::consts::OS.to_string(),
-        capabilities: vec!["user_exec".to_string(), "port_forward".to_string()],
+        capabilities: vec![
+            "user_exec".to_string(),
+            "port_forward".to_string(),
+            "network_setup".to_string(),
+        ],
     };
 
     protocol::write_frame(&mut stream, &ack)
@@ -539,11 +543,12 @@ async fn handle_exec<W>(
     let exit_writer = writer.clone();
     let exit_table = process_table.clone();
     tokio::spawn(async move {
-        // Wait for stdout/stderr to finish before reporting exit
-        let _ = stdout_handle.await;
-        let _ = stderr_handle.await;
-
-        // Wait for the child to exit
+        // Wait for the child to exit first, then drain remaining pipe output.
+        //
+        // We wait for child exit before pipe draining because forked grandchildren
+        // (e.g., OCI container init processes from `youki create`) may hold pipe
+        // FDs open indefinitely. By checking child exit first, we avoid blocking
+        // forever on pipe reads.
         let exit_code = {
             let mut table = exit_table.lock().await;
             if let Some(entry) = table.get_mut(exec_id) {
@@ -559,6 +564,14 @@ async fn handle_exec<W>(
                 -1
             }
         };
+
+        // Allow a brief window for any remaining stdout/stderr data to be
+        // flushed. If grandchildren still hold pipe FDs open, abort after timeout.
+        let _ = tokio::time::timeout(Duration::from_millis(500), async {
+            let _ = stdout_handle.await;
+            let _ = stderr_handle.await;
+        })
+        .await;
 
         info!(exec_id, exit_code, "process exited");
 
@@ -1138,6 +1151,8 @@ async fn handle_network_setup<W>(
 {
     #[cfg(target_os = "linux")]
     {
+        // Run directly on the tokio worker thread for now.
+        // Note: unshare(CLONE_NEWNET) in create_named_netns affects this OS thread.
         match network::setup_stack_network(stack_id, services) {
             Ok(()) => {
                 info!(stack_id = %stack_id, services = services.len(), "network setup complete");
@@ -1181,18 +1196,36 @@ async fn handle_network_teardown<W>(
 {
     #[cfg(target_os = "linux")]
     {
-        match network::teardown_stack_network(stack_id, service_names) {
-            Ok(()) => {
+        let stack_id_owned = stack_id.to_string();
+        let service_names_owned = service_names.to_vec();
+        let result = tokio::task::spawn_blocking(move || {
+            network::teardown_stack_network(&stack_id_owned, &service_names_owned)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {
                 info!(stack_id = %stack_id, "network teardown complete");
                 send_response(writer, &Response::NetworkTeardownOk { id }).await;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!(stack_id = %stack_id, error = %e, "network teardown failed");
                 send_response(
                     writer,
                     &Response::NetworkTeardownError {
                         id,
                         error: e.to_string(),
+                    },
+                )
+                .await;
+            }
+            Err(e) => {
+                error!(stack_id = %stack_id, error = %e, "network teardown task panicked");
+                send_response(
+                    writer,
+                    &Response::NetworkTeardownError {
+                        id,
+                        error: format!("task panicked: {e}"),
                     },
                 )
                 .await;

@@ -1964,8 +1964,14 @@ services:
         let spec = parse_compose(yaml, "myapp").unwrap();
         let web = &spec.services[0];
         assert_eq!(web.extra_hosts.len(), 2);
-        assert_eq!(web.extra_hosts[0], ("myhost".to_string(), "192.168.1.10".to_string()));
-        assert_eq!(web.extra_hosts[1], ("other".to_string(), "10.0.0.1".to_string()));
+        assert_eq!(
+            web.extra_hosts[0],
+            ("myhost".to_string(), "192.168.1.10".to_string())
+        );
+        assert_eq!(
+            web.extra_hosts[1],
+            ("other".to_string(), "10.0.0.1".to_string())
+        );
     }
 
     #[test]

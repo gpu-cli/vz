@@ -123,7 +123,7 @@ impl LinuxVmConfig {
             ordered.push(SharedDirConfig {
                 tag: "rootfs".to_string(),
                 source: rootfs_dir.clone(),
-                read_only: true,
+                read_only: false,
             });
             ordered.extend(shared_dirs);
             ordered
@@ -286,7 +286,7 @@ mod tests {
         assert_eq!(ordered.len(), 4);
         assert_eq!(ordered[0].tag, "rootfs");
         assert_eq!(ordered[0].source, PathBuf::from("/tmp/rootfs"));
-        assert!(ordered[0].read_only);
+        assert!(!ordered[0].read_only);
         assert_eq!(ordered[1].tag, "mount-a");
         assert_eq!(ordered[1].source, PathBuf::from("/tmp/a"));
         assert_eq!(ordered[2].tag, "mount-a");
@@ -327,15 +327,17 @@ mod tests {
     }
 
     #[test]
-    fn initramfs_overlay_path_uses_read_only_lower_and_writable_upper() {
+    fn initramfs_overlay_path_uses_writable_lower_and_upper() {
         let init_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join("linux/initramfs/init");
         let script = fs::read_to_string(&init_script).expect("read initramfs init script");
 
-        assert!(script.contains("mount -o remount,ro /mnt/rootfs"));
         assert!(script.contains("lowerdir=/mnt/rootfs"));
         assert!(script.contains("upperdir=/run/vz-oci/overlay/upper"));
         assert!(script.contains("workdir=/run/vz-oci/overlay/work"));
+        // VirtioFS rootfs share is kept rw so the bind mount at /vz-rootfs
+        // can be rw for the OCI runtime.
+        assert!(!script.contains("remount,ro /mnt/rootfs"));
     }
 }

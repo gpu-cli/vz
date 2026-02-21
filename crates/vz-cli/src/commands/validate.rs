@@ -13,8 +13,8 @@ use clap::{Args, Subcommand};
 use tracing::info;
 
 use vz_validation::{
-    CohortManifest, ExecOutput, MockAdapter, RuntimeAdapter, ScenarioRunner, StressConfig,
-    StressReport, TestReport, default_manifest, stress_scenario,
+    CohortManifest, ExecOutput, MockAdapter, OciRuntimeAdapter, RuntimeAdapter, ScenarioRunner,
+    StressConfig, StressReport, TestReport, default_manifest, stress_scenario,
 };
 
 /// Validate OCI image cohorts with tiered test suites.
@@ -139,14 +139,9 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         let runner = ScenarioRunner::new(adapter);
         run_cohort(&runner, &manifest, cohort, &mut report);
     } else {
-        let adapter = MockAdapter {
-            output: ExecOutput {
-                exit_code: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-                lifecycle_events: Vec::new(),
-            },
-        };
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let data_dir = std::path::PathBuf::from(home).join(".vz").join("oci");
+        let adapter = OciRuntimeAdapter::new(&data_dir);
         let runner = ScenarioRunner::new(adapter);
         run_cohort(&runner, &manifest, cohort, &mut report);
     }

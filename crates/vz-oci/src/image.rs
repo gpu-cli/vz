@@ -81,6 +81,15 @@ impl ImagePuller {
                 reference: reference.to_string(),
                 reason: error.to_string(),
             })?;
+
+        // Return cached image if reference is already resolved locally.
+        if let Ok(cached_digest) = self.store.read_reference(&parsed.whole()) {
+            if self.store.read_manifest_json(&cached_digest).is_ok() {
+                tracing::debug!(reference = %reference, digest = %cached_digest, "using cached image");
+                return Ok(ImageId(cached_digest));
+            }
+        }
+
         let registry_auth = resolve_registry_auth(&parsed, auth)?;
 
         let (manifest, digest, config_json) = self

@@ -424,8 +424,14 @@ mod tests {
         ];
         let config = service_to_run_config(&spec, &[]).unwrap();
         assert_eq!(config.extra_hosts.len(), 2);
-        assert_eq!(config.extra_hosts[0], ("db".to_string(), "127.0.0.1".to_string()));
-        assert_eq!(config.extra_hosts[1], ("cache".to_string(), "10.0.0.5".to_string()));
+        assert_eq!(
+            config.extra_hosts[0],
+            ("db".to_string(), "127.0.0.1".to_string())
+        );
+        assert_eq!(
+            config.extra_hosts[1],
+            ("cache".to_string(), "10.0.0.5".to_string())
+        );
     }
 
     #[test]

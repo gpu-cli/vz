@@ -32,6 +32,7 @@ fn test_runtime(data_dir: &std::path::Path) -> Runtime {
         require_exact_agent_version: false,
         agent_ready_timeout: Duration::from_secs(15),
         exec_timeout: Duration::from_secs(30),
+        default_memory_mb: 4096,
         ..RuntimeConfig::default()
     };
     Runtime::new(config)
@@ -323,4 +324,145 @@ async fn pull_nonexistent_image_fails() {
 
     let result = rt.pull("library/this-image-does-not-exist:v999").await;
     assert!(result.is_err(), "pulling nonexistent image should fail");
+}
+
+// ── Shared VM inter-service connectivity ────────────────────────
+
+/// Boot a shared VM with two containers in isolated network namespaces,
+/// then verify cross-service connectivity by IP and hostname.
+///
+/// This exercises the full stack VM pipeline:
+/// boot_shared_vm → network_setup → create_container_in_stack × 2 → exec ping → shutdown.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn shared_vm_inter_service_connectivity() {
+    init_tracing();
+    // Use persistent data dir for image cache to avoid Docker Hub rate limits.
+    let home = std::env::var("HOME").unwrap();
+    let data_dir = std::path::PathBuf::from(home).join(".vz/oci");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let rt = test_runtime(&data_dir);
+
+    // Pull alpine (skip if already cached to avoid Docker Hub rate limits).
+    if rt.pull("alpine:latest").await.is_err() {
+        eprintln!("WARN: pull failed (rate limit?), assuming image is cached");
+    }
+
+    let stack_id = "e2e-net";
+
+    // 1. Boot shared VM.
+    rt.boot_shared_vm(stack_id, vec![]).await.unwrap();
+
+    // 2. Set up per-service networking.
+    let services = vec![
+        vz_oci::NetworkServiceConfig {
+            name: "web".to_string(),
+            addr: "172.20.0.2/24".to_string(),
+        },
+        vz_oci::NetworkServiceConfig {
+            name: "db".to_string(),
+            addr: "172.20.0.3/24".to_string(),
+        },
+    ];
+    rt.network_setup(stack_id, services).await.unwrap();
+
+    // 3. Create containers with cross-service /etc/hosts.
+    let hosts = vec![
+        ("web".to_string(), "172.20.0.2".to_string()),
+        ("db".to_string(), "172.20.0.3".to_string()),
+    ];
+
+    let web_id = rt
+        .create_container_in_stack(
+            stack_id,
+            "alpine:latest",
+            RunConfig {
+                cmd: vec!["sleep".into(), "300".into()],
+                execution_mode: ExecutionMode::OciRuntime,
+                extra_hosts: hosts.clone(),
+                network_namespace_path: Some("/var/run/netns/web".to_string()),
+                ..RunConfig::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create web container failed: {e:?}"));
+
+    let db_id = rt
+        .create_container_in_stack(
+            stack_id,
+            "alpine:latest",
+            RunConfig {
+                cmd: vec!["sleep".into(), "300".into()],
+                execution_mode: ExecutionMode::OciRuntime,
+                extra_hosts: hosts.clone(),
+                network_namespace_path: Some("/var/run/netns/db".to_string()),
+                ..RunConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // 4. Exec ping by IP: web → db.
+    // Use /bin/busybox directly since busybox is the real binary, not a
+    // symlink. VirtioFS-backed overlays may not properly expose busybox
+    // applet symlinks to the guest.
+    // Timeout set to 30s to account for vsock handshake retries.
+    let ping_by_ip = rt
+        .exec_container(
+            &web_id,
+            ExecConfig {
+                cmd: vec![
+                    "/bin/busybox".into(),
+                    "ping".into(),
+                    "-c".into(),
+                    "1".into(),
+                    "-W".into(),
+                    "3".into(),
+                    "172.20.0.3".into(),
+                ],
+                timeout: Some(Duration::from_secs(30)),
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ping_by_ip.exit_code, 0,
+        "ping by IP should succeed (web→db): stderr={}",
+        ping_by_ip.stderr
+    );
+
+    // 5. Exec ping by hostname: db → web.
+    let ping_by_name = rt
+        .exec_container(
+            &db_id,
+            ExecConfig {
+                cmd: vec![
+                    "/bin/busybox".into(),
+                    "ping".into(),
+                    "-c".into(),
+                    "1".into(),
+                    "-W".into(),
+                    "3".into(),
+                    "web".into(),
+                ],
+                timeout: Some(Duration::from_secs(30)),
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ping_by_name.exit_code, 0,
+        "ping by hostname should succeed (db→web): stderr={}",
+        ping_by_name.stderr
+    );
+
+    // 6. Tear down.
+    let _ = rt
+        .network_teardown(stack_id, vec!["web".to_string(), "db".to_string()])
+        .await;
+    rt.shutdown_shared_vm(stack_id).await.unwrap();
 }

@@ -446,13 +446,18 @@ impl Runtime {
             &kernel,
         )?;
 
-        let mut vm_config = LinuxVmConfig::new(kernel.kernel, kernel.initramfs)
-            .with_rootfs_dir(rootfs_store);
+        let mut vm_config =
+            LinuxVmConfig::new(kernel.kernel, kernel.initramfs).with_rootfs_dir(rootfs_store);
         vm_config
             .shared_dirs
             .push(make_oci_runtime_share(&runtime_binary)?);
         vm_config.cpus = self.config.default_cpus;
         vm_config.memory_mb = self.config.default_memory_mb;
+
+        // Debug: capture serial log for shared VM diagnostics.
+        if let Ok(log_path) = std::env::var("VZ_STACK_SERIAL_LOG") {
+            vm_config.serial_log_file = Some(std::path::PathBuf::from(log_path));
+        }
 
         if !self.config.default_network_enabled {
             vm_config.network = Some(NetworkConfig::None);
@@ -474,10 +479,7 @@ impl Runtime {
             return Err(err);
         }
 
-        self.stack_vms
-            .lock()
-            .await
-            .insert(stack_id.to_string(), vm);
+        self.stack_vms.lock().await.insert(stack_id.to_string(), vm);
 
         Ok(())
     }
@@ -509,6 +511,7 @@ impl Runtime {
 
         let image_id = self.pull(image).await?;
         let container_id = run.container_id.clone().unwrap_or_else(new_container_id);
+        tracing::debug!(stack_id = %stack_id, container_id = %container_id, image_id = %image_id.0, "create_container_in_stack: starting");
 
         let created_unix_secs = current_unix_secs();
         let mut container = ContainerInfo {
@@ -527,6 +530,7 @@ impl Runtime {
             .upsert(container.clone())
             .map_err(OciError::from)?;
 
+        tracing::debug!("step 1: assemble_rootfs_async");
         let rootfs_dir = match self
             .store
             .assemble_rootfs_async(&image_id.0, &container_id)
@@ -534,6 +538,7 @@ impl Runtime {
         {
             Ok(rootfs_dir) => rootfs_dir,
             Err(err) => {
+                tracing::error!(error = %err, "step 1 FAILED: assemble_rootfs_async");
                 container.status = ContainerStatus::Stopped { exit_code: -1 };
                 container.stopped_unix_secs = Some(current_unix_secs());
                 container.host_pid = None;
@@ -543,13 +548,17 @@ impl Runtime {
                 return Err(err.into());
             }
         };
+        tracing::debug!(rootfs_dir = %rootfs_dir.display(), "step 1 OK");
 
         container.rootfs_path = Some(rootfs_dir.clone());
         self.container_store
             .upsert(container.clone())
             .map_err(OciError::from)?;
 
-        let image_config = parse_image_config_summary_from_store(&self.store, &image_id.0)?;
+        tracing::debug!("step 2: parse_image_config_summary_from_store");
+        let image_config = parse_image_config_summary_from_store(&self.store, &image_id.0)
+            .map_err(|e| { tracing::error!(error = %e, "step 2 FAILED"); e })?;
+        tracing::debug!("step 2 OK");
         let run = resolve_run_config(image_config, run, &container_id)?;
 
         // Build OCI bundle referencing the assembled rootfs (shared via VirtioFS).
@@ -566,8 +575,9 @@ impl Runtime {
         let bundle_relative_path = oci_bundle_guest_path(&bundle_guest_root, &oci_container_id);
         // Host: <data_dir>/rootfs/<container_id>/<bundle_path>
         let bundle_host_dir = oci_bundle_host_dir(&rootfs_dir, &bundle_relative_path);
-        // Guest: /<container_id>/<bundle_path>
-        let bundle_guest_path = format!("/{container_id}{bundle_relative_path}");
+        // Guest: /vz-rootfs/<container_id>/<bundle_path>
+        let bundle_guest_path = format!("/vz-rootfs/{container_id}{bundle_relative_path}");
+        tracing::debug!(bundle_host_dir = %bundle_host_dir.display(), bundle_guest_path = %bundle_guest_path, "step 3: write bundle");
 
         let bundle_cmd = run
             .init_process
@@ -585,20 +595,58 @@ impl Runtime {
                 )
             })?;
 
-        let mut bundle_mounts = mount_specs_to_bundle_mounts(&run.mounts)?;
+        let bundle_mounts = mount_specs_to_bundle_mounts(&run.mounts)?;
 
-        if !run.extra_hosts.is_empty() {
-            write_hosts_file(&bundle_host_dir, &run.extra_hosts)?;
-            bundle_mounts.push(BundleMount {
-                destination: PathBuf::from("/etc/hosts"),
-                source: PathBuf::from(format!("{bundle_guest_path}/hosts")),
-                typ: "bind".to_string(),
-                options: vec!["rbind".to_string(), "ro".to_string()],
-            });
+        // Per-container overlay: VirtioFS doesn't support mknod, which the OCI
+        // runtime needs for default devices (/dev/null etc). We create a local
+        // overlay in the guest with VirtioFS as lowerdir and tmpfs as upperdir
+        // so that mknod writes go to the tmpfs layer.
+        let vz_rootfs_path = format!("/vz-rootfs/{container_id}");
+        let container_overlay = format!("/run/vz-oci/containers/{container_id}");
+        let guest_rootfs_path = format!("{container_overlay}/merged");
+        tracing::debug!("step 3a: setup per-container overlay in guest");
+        let overlay_cmd = format!(
+            "mkdir -p {container_overlay} && \
+             mount -t tmpfs tmpfs {container_overlay} && \
+             mkdir -p {container_overlay}/upper {container_overlay}/work {container_overlay}/merged && \
+             mount -t overlay overlay \
+             -o lowerdir={vz_rootfs_path},upperdir={container_overlay}/upper,workdir={container_overlay}/work \
+             {container_overlay}/merged"
+        );
+        let overlay_result = vm
+            .exec_capture(
+                "sh".to_string(),
+                vec!["-c".to_string(), overlay_cmd],
+                Duration::from_secs(10),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "step 3a FAILED: per-container overlay setup");
+                OciError::from(e)
+            })?;
+        if overlay_result.exit_code != 0 {
+            let msg = format!(
+                "per-container overlay setup failed (exit {}): {}",
+                overlay_result.exit_code,
+                overlay_result.stderr.trim()
+            );
+            tracing::error!("{}", msg);
+            container.status = ContainerStatus::Stopped { exit_code: -1 };
+            container.stopped_unix_secs = Some(current_unix_secs());
+            container.host_pid = None;
+            self.container_store
+                .upsert(container)
+                .map_err(OciError::from)?;
+            return Err(OciError::Linux(LinuxError::Protocol(msg)));
         }
+        tracing::debug!("step 3a OK");
 
-        // Rootfs symlink: points to /<container_id>/ inside the guest.
-        let guest_rootfs_path = format!("/{container_id}");
+        // extra_hosts are written AFTER the container starts (step 5) via
+        // oci_exec inside the container's mount namespace. Writing before
+        // start (via guest exec or bind mount) fails due to VirtioFS caching
+        // and youki's pivot_root creating an isolated mount tree.
+
+        tracing::debug!("step 3c: write_oci_bundle");
         write_oci_bundle(
             &bundle_host_dir,
             Path::new(&guest_rootfs_path),
@@ -611,10 +659,16 @@ impl Runtime {
                 oci_annotations: run.oci_annotations.clone(),
                 network_namespace_path: run.network_namespace_path.clone(),
             },
-        )?;
+        )
+        .map_err(|e| { tracing::error!(error = %e, "step 3c FAILED: write_oci_bundle"); e })?;
+        tracing::debug!("step 3c OK");
 
         // OCI create + start inside the shared VM.
-        if let Err(err) = vm.oci_create(oci_container_id.clone(), bundle_guest_path.clone()).await {
+        tracing::debug!("step 4: oci_create + oci_start");
+        if let Err(err) = vm
+            .oci_create(oci_container_id.clone(), bundle_guest_path.clone())
+            .await
+        {
             container.status = ContainerStatus::Stopped { exit_code: -1 };
             container.stopped_unix_secs = Some(current_unix_secs());
             container.host_pid = None;
@@ -654,6 +708,48 @@ impl Runtime {
             .upsert(container)
             .map_err(OciError::from)?;
 
+        // Step 5: Write /etc/hosts inside the running container via oci_exec.
+        // This writes directly into the container's mount namespace after
+        // pivot_root, avoiding VirtioFS caching and overlay visibility issues.
+        if !run.extra_hosts.is_empty() {
+            tracing::debug!("step 5: write /etc/hosts via oci_exec");
+            let mut printf_content = String::from("127.0.0.1\\tlocalhost\\n::1\\tlocalhost\\n");
+            for (hostname, ip) in &run.extra_hosts {
+                printf_content.push_str(&format!("{ip}\\t{hostname}\\n"));
+            }
+            let hosts_result = tokio::time::timeout(
+                Duration::from_secs(30),
+                vm.oci_exec(
+                    oci_container_id.clone(),
+                    "/bin/sh".to_string(),
+                    vec![
+                        "-c".to_string(),
+                        format!("printf '{printf_content}' > /etc/hosts"),
+                    ],
+                    OciExecOptions::default(),
+                ),
+            )
+            .await;
+            match hosts_result {
+                Ok(Ok(r)) if r.exit_code == 0 => {
+                    tracing::debug!("step 5 OK: /etc/hosts written");
+                }
+                Ok(Ok(r)) => {
+                    tracing::warn!(
+                        exit_code = r.exit_code,
+                        stderr = %r.stderr.trim(),
+                        "step 5: /etc/hosts write returned non-zero"
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "step 5: /etc/hosts write failed");
+                }
+                Err(_) => {
+                    tracing::warn!("step 5: /etc/hosts write timed out");
+                }
+            }
+        }
+
         Ok(container_id)
     }
 
@@ -668,9 +764,7 @@ impl Runtime {
             .await
             .remove(stack_id)
             .ok_or_else(|| {
-                OciError::InvalidConfig(format!(
-                    "no shared VM running for stack '{stack_id}'"
-                ))
+                OciError::InvalidConfig(format!("no shared VM running for stack '{stack_id}'"))
             })?;
 
         // Find all containers belonging to this stack.
@@ -735,9 +829,7 @@ impl Runtime {
             .get(stack_id)
             .cloned()
             .ok_or_else(|| {
-                OciError::InvalidConfig(format!(
-                    "no shared VM running for stack '{stack_id}'"
-                ))
+                OciError::InvalidConfig(format!("no shared VM running for stack '{stack_id}'"))
             })?;
 
         vm.network_setup(stack_id.to_string(), services)
@@ -758,9 +850,7 @@ impl Runtime {
             .get(stack_id)
             .cloned()
             .ok_or_else(|| {
-                OciError::InvalidConfig(format!(
-                    "no shared VM running for stack '{stack_id}'"
-                ))
+                OciError::InvalidConfig(format!("no shared VM running for stack '{stack_id}'"))
             })?;
 
         vm.network_teardown(stack_id.to_string(), service_names)
@@ -1711,12 +1801,11 @@ fn make_oci_runtime_share(runtime_binary: &Path) -> Result<SharedDirConfig, OciE
 ///
 /// The generated file contains standard localhost entries plus one line
 /// per extra host mapping (hostname → IP).
-fn write_hosts_file(
-    bundle_dir: &Path,
-    extra_hosts: &[(String, String)],
-) -> Result<(), OciError> {
+fn write_hosts_file(rootfs_dir: &Path, extra_hosts: &[(String, String)]) -> Result<(), OciError> {
     use std::io::Write;
-    let hosts_path = bundle_dir.join("hosts");
+    let etc_dir = rootfs_dir.join("etc");
+    fs::create_dir_all(&etc_dir)?;
+    let hosts_path = etc_dir.join("hosts");
     let mut f = fs::File::create(&hosts_path)?;
     writeln!(f, "127.0.0.1\tlocalhost")?;
     writeln!(f, "::1\tlocalhost")?;
@@ -2472,7 +2561,7 @@ mod tests {
             ("cache".to_string(), "10.0.0.5".to_string()),
         ];
         write_hosts_file(&tmp, &hosts).unwrap();
-        let content = fs::read_to_string(tmp.join("hosts")).unwrap();
+        let content = fs::read_to_string(tmp.join("etc/hosts")).unwrap();
         assert!(content.contains("127.0.0.1\tlocalhost"));
         assert!(content.contains("::1\tlocalhost"));
         assert!(content.contains("127.0.0.1\tdb"));

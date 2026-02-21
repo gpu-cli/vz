@@ -236,19 +236,12 @@ impl ContainerRuntime for OciContainerRuntime {
     ) -> Result<(), StackError> {
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(
-                    self.runtime
-                        .network_setup(stack_id, services.to_vec()),
-                )
+                .block_on(self.runtime.network_setup(stack_id, services.to_vec()))
                 .map_err(|e| StackError::Network(format!("network_setup failed: {e}")))
         })
     }
 
-    fn network_teardown(
-        &self,
-        stack_id: &str,
-        service_names: &[String],
-    ) -> Result<(), StackError> {
+    fn network_teardown(&self, stack_id: &str, service_names: &[String]) -> Result<(), StackError> {
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(
@@ -284,9 +277,7 @@ impl ContainerRuntime for OciContainerRuntime {
     }
 
     fn has_shared_vm(&self, stack_id: &str) -> bool {
-        tokio::task::block_in_place(|| {
-            self.handle.block_on(self.runtime.has_shared_vm(stack_id))
-        })
+        tokio::task::block_in_place(|| self.handle.block_on(self.runtime.has_shared_vm(stack_id)))
     }
 }
 

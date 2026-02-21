@@ -141,9 +141,9 @@ impl VsockListener {
             return Err(io::Error::last_os_error());
         }
 
-        // Listen with backlog of 1 (single connection at a time)
+        // Listen with backlog of 8 (allow multiple pending connections)
         // SAFETY: listen() with a valid bound fd.
-        let ret = unsafe { libc::listen(fd, 1) };
+        let ret = unsafe { libc::listen(fd, 8) };
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }

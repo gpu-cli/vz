@@ -15,12 +15,12 @@ pub use config::{
     Auth, ExecConfig, ExecutionMode, MountAccess, MountSpec, MountType, OciRuntimeKind,
     PortMapping, PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig,
 };
-pub use vz_linux::NetworkServiceConfig;
 pub use container_store::{ContainerInfo, ContainerStatus, ContainerStore};
 pub use error::OciError;
 pub use image::{ImageConfigSummary, ImageId, ImagePuller};
 pub use runtime::Runtime;
 pub use store::{ImageInfo, ImageStore, LayerDescriptor, PruneResult};
+pub use vz_linux::NetworkServiceConfig;
 
 #[cfg(test)]
 mod tests {

@@ -4,8 +4,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use oci_spec::runtime::{
-    LinuxNamespaceType, Mount, MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder, User,
-    UserBuilder, VERSION,
+    Capability, LinuxCapabilities, LinuxCapabilitiesBuilder, LinuxNamespaceType, Mount,
+    MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder, User, UserBuilder, VERSION,
 };
 
 use crate::error::OciError;
@@ -50,7 +50,12 @@ pub(crate) struct BundleSpec {
     pub network_namespace_path: Option<String>,
 }
 
-/// Write an OCI bundle directory (`config.json` + `rootfs` link).
+/// Write an OCI bundle directory (`config.json` + optional `rootfs` link).
+///
+/// When `rootfs_dir` is absolute, `root.path` in `config.json` is set to the
+/// absolute path directly (no symlink created). This avoids VirtioFS caching
+/// issues where symlinks written on the host may not be visible in the guest.
+/// When `rootfs_dir` is relative, a symlink is created at `<bundle>/rootfs`.
 pub(crate) fn write_oci_bundle(
     bundle_dir: impl AsRef<Path>,
     rootfs_dir: impl AsRef<Path>,
@@ -61,17 +66,24 @@ pub(crate) fn write_oci_bundle(
 
     fs::create_dir_all(bundle_dir)?;
 
-    let rootfs_path = bundle_dir.join(OCI_ROOTFS_DIRNAME);
-    replace_rootfs_link(&rootfs_path, rootfs_dir)?;
+    let rootfs_path_in_spec = if rootfs_dir.is_absolute() {
+        // Absolute path: embed directly in config.json, no symlink needed.
+        rootfs_dir.to_string_lossy().into_owned()
+    } else {
+        // Relative path: create a symlink at <bundle>/rootfs.
+        let rootfs_path = bundle_dir.join(OCI_ROOTFS_DIRNAME);
+        replace_rootfs_link(&rootfs_path, rootfs_dir)?;
+        OCI_ROOTFS_DIRNAME.to_string()
+    };
 
-    let runtime_spec = build_runtime_spec(spec)?;
+    let runtime_spec = build_runtime_spec(spec, &rootfs_path_in_spec)?;
     let config_path = bundle_dir.join(OCI_CONFIG_FILENAME);
     runtime_spec.save(&config_path)?;
 
     Ok(())
 }
 
-fn build_runtime_spec(spec: BundleSpec) -> Result<Spec, OciError> {
+fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciError> {
     let BundleSpec {
         cmd,
         env,
@@ -97,6 +109,7 @@ fn build_runtime_spec(spec: BundleSpec) -> Result<Spec, OciError> {
         )
         .cwd(cwd.unwrap_or_else(|| "/".to_string()))
         .user(parse_process_user(user.as_deref())?)
+        .capabilities(docker_default_capabilities()?)
         .build()?;
 
     sort_bundle_mounts(&mut mounts);
@@ -107,7 +120,7 @@ fn build_runtime_spec(spec: BundleSpec) -> Result<Spec, OciError> {
     let annotations = to_runtime_annotations(oci_annotations);
 
     let root = RootBuilder::default()
-        .path(OCI_ROOTFS_DIRNAME)
+        .path(rootfs_path)
         .readonly(false)
         .build()?;
 
@@ -191,6 +204,37 @@ fn to_runtime_mount(mount: BundleMount) -> Result<Mount, OciError> {
     }
 
     builder.build().map_err(Into::into)
+}
+
+/// Docker-equivalent default capabilities for container processes.
+fn docker_default_capabilities() -> Result<LinuxCapabilities, OciError> {
+    use std::collections::HashSet;
+    let caps: HashSet<Capability> = [
+        Capability::AuditWrite,
+        Capability::Chown,
+        Capability::DacOverride,
+        Capability::Fowner,
+        Capability::Fsetid,
+        Capability::Kill,
+        Capability::Mknod,
+        Capability::NetBindService,
+        Capability::NetRaw,
+        Capability::Setfcap,
+        Capability::Setgid,
+        Capability::Setpcap,
+        Capability::Setuid,
+        Capability::SysChroot,
+    ]
+    .into_iter()
+    .collect();
+    LinuxCapabilitiesBuilder::default()
+        .bounding(caps.clone())
+        .effective(caps.clone())
+        .inheritable(caps.clone())
+        .permitted(caps.clone())
+        .ambient(caps)
+        .build()
+        .map_err(Into::into)
 }
 
 fn parse_process_user(user: Option<&str>) -> Result<User, OciError> {
@@ -313,11 +357,11 @@ mod tests {
         .unwrap();
 
         let config_path = bundle_dir.join(OCI_CONFIG_FILENAME);
-        let rootfs_path = bundle_dir.join(OCI_ROOTFS_DIRNAME);
         assert!(config_path.is_file());
-
-        let link_target = fs::read_link(&rootfs_path).unwrap();
-        assert_eq!(link_target, rootfs_source);
+        // With absolute rootfs_source, no symlink is created — root.path
+        // is set to the absolute path directly in config.json.
+        let rootfs_link = bundle_dir.join(OCI_ROOTFS_DIRNAME);
+        assert!(!rootfs_link.exists(), "no symlink when rootfs is absolute");
 
         let spec = Spec::load(&config_path).unwrap();
         let process = spec.process().as_ref().expect("process should exist");
@@ -367,7 +411,7 @@ mod tests {
         );
 
         let root = spec.root().as_ref().expect("root should be present");
-        assert_eq!(root.path(), &PathBuf::from(OCI_ROOTFS_DIRNAME));
+        assert_eq!(root.path(), &rootfs_source);
         assert_eq!(root.readonly(), Some(false));
     }
 
@@ -487,7 +531,10 @@ mod tests {
 
         let spec = Spec::load(bundle_dir.join(OCI_CONFIG_FILENAME)).unwrap();
         let linux = spec.linux().as_ref().expect("linux section should exist");
-        let namespaces = linux.namespaces().as_ref().expect("namespaces should exist");
+        let namespaces = linux
+            .namespaces()
+            .as_ref()
+            .expect("namespaces should exist");
         let netns = namespaces
             .iter()
             .find(|ns| ns.typ() == LinuxNamespaceType::Network)
@@ -523,8 +570,14 @@ mod tests {
         let spec = Spec::load(bundle_dir.join(OCI_CONFIG_FILENAME)).unwrap();
         // Without network_namespace_path, the default network namespace has no path
         // (i.e., the container creates a new netns rather than joining an existing one).
-        let linux = spec.linux().as_ref().expect("default spec includes linux section");
-        let ns = linux.namespaces().as_ref().expect("default namespaces present");
+        let linux = spec
+            .linux()
+            .as_ref()
+            .expect("default spec includes linux section");
+        let ns = linux
+            .namespaces()
+            .as_ref()
+            .expect("default namespaces present");
         let netns = ns
             .iter()
             .find(|n| n.typ() == LinuxNamespaceType::Network)

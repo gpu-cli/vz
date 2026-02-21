@@ -1,8 +1,7 @@
 //! Per-service network namespace isolation for stack VMs.
 //!
 //! Creates a bridge, per-service network namespaces, veth pairs, IP
-//! addresses, and default routes using raw netlink sockets and libc
-//! namespace syscalls. No external tools (`ip`, `brctl`) are required.
+//! addresses, and default routes using busybox commands.
 //!
 //! # Network topology
 //!
@@ -17,15 +16,24 @@
 //! │     └── ...                                                     │
 //! └──────────────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! # Implementation notes
+//!
+//! BusyBox `ip` does not support the `netns` subcommand. Instead, we:
+//! 1. Create named network namespaces via `unshare(2)` + bind mount
+//!    (simple syscalls — no netlink, no memory risk)
+//! 2. Use `nsenter --net=<path>` to run `ip` commands inside namespaces
+//! 3. Move veth endpoints via `ip link set <dev> netns <path>`
 
 use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::process::Command;
 
-use tracing::{debug, info};
+use tracing::info;
 use vz::protocol::NetworkServiceConfig;
 
 /// Directory where named network namespaces are stored.
@@ -35,13 +43,12 @@ const NETNS_RUN_DIR: &str = "/var/run/netns";
 ///
 /// 1. Creates bridge `br-<stack_id>` with gateway IP (first address in subnet)
 /// 2. For each service: creates netns, veth pair, assigns IP, sets up routes
-pub fn setup_stack_network(
-    stack_id: &str,
-    services: &[NetworkServiceConfig],
-) -> io::Result<()> {
+pub fn setup_stack_network(stack_id: &str, services: &[NetworkServiceConfig]) -> io::Result<()> {
     if services.is_empty() {
         return Ok(());
     }
+
+    info!(stack_id = %stack_id, services = services.len(), "setup_stack_network: starting");
 
     // Derive bridge address from first service's subnet (use .1).
     let first_addr = parse_cidr(&services[0].addr)?;
@@ -56,9 +63,16 @@ pub fn setup_stack_network(
     let bridge_name = format!("br-{}", truncate_name(stack_id, 12));
 
     // 1. Create bridge.
-    create_bridge(&bridge_name)?;
-    add_addr_to_iface(&bridge_name, bridge_ip, prefix_len)?;
-    set_iface_up(&bridge_name)?;
+    info!(bridge = %bridge_name, "creating bridge");
+    ip_run(&["link", "add", "name", &bridge_name, "type", "bridge"])?;
+    ip_run(&[
+        "addr",
+        "add",
+        &format!("{bridge_ip}/{prefix_len}"),
+        "dev",
+        &bridge_name,
+    ])?;
+    ip_run(&["link", "set", &bridge_name, "up"])?;
     info!(bridge = %bridge_name, addr = %bridge_ip, "bridge created");
 
     // 2. Set up each service.
@@ -67,42 +81,64 @@ pub fn setup_stack_network(
     for svc in services {
         let (svc_ip, svc_prefix) = parse_cidr(&svc.addr)?;
         let veth_host = format!("veth-{}", truncate_name(&svc.name, 10));
-        let veth_guest = "eth0".to_string();
-        let ns_name = svc.name.clone();
+        let ns_name = &svc.name;
+        let ns_path = format!("{NETNS_RUN_DIR}/{ns_name}");
 
-        // Create network namespace.
-        create_named_netns(&ns_name)?;
+        // Create network namespace via unshare(2) + bind mount.
+        info!(service = %svc.name, "creating netns");
+        create_named_netns(ns_name)?;
 
-        // Create veth pair.
-        create_veth_pair(&veth_host, &veth_guest)?;
+        // Create veth pair inside the namespace, then move host end out.
+        // This avoids needing `ip link set ... netns <path>` which BusyBox
+        // doesn't support (it only accepts PIDs).
+        //
+        // BusyBox ip ignores `peer name X` — it auto-names the peer as vethN.
+        // We create the pair, then rename the peer to eth0 after moving the
+        // host end out.
+        info!(service = %svc.name, host = %veth_host, "creating veth pair");
+        nsenter_ip(&ns_path, &[
+            "link", "add", &veth_host, "type", "veth", "peer", "name", "veth0",
+        ])?;
 
-        // Move guest end into the namespace.
-        move_iface_to_netns(&veth_guest, &ns_name)?;
+        // Move host end from netns to default namespace (PID 1's netns).
+        nsenter_ip(&ns_path, &["link", "set", &veth_host, "netns", "1"])?;
 
-        // Attach host end to bridge and bring up.
-        set_iface_master(&veth_host, &bridge_name)?;
-        set_iface_up(&veth_host)?;
+        // Attach host end to bridge and bring up (in default namespace).
+        ip_run(&["link", "set", &veth_host, "master", &bridge_name])?;
+        ip_run(&["link", "set", &veth_host, "up"])?;
 
         // Configure inside the namespace.
-        in_netns(&ns_name, || {
-            set_iface_up("lo")?;
-            add_addr_to_iface("eth0", svc_ip, svc_prefix)?;
-            set_iface_up("eth0")?;
-            add_default_route(bridge_ip)?;
-            Ok(())
-        })?;
+        info!(service = %svc.name, "configuring namespace networking");
+        nsenter_ip(&ns_path, &["link", "set", "lo", "up"])?;
 
-        debug!(service = %svc.name, addr = %svc_ip, ns = %ns_name, "service network configured");
+        // Rename peer end to eth0.
+        nsenter_ip(&ns_path, &["link", "set", "veth0", "name", "eth0"])?;
+
+        nsenter_ip(
+            &ns_path,
+            &[
+                "addr",
+                "add",
+                &format!("{svc_ip}/{svc_prefix}"),
+                "dev",
+                "eth0",
+            ],
+        )?;
+        nsenter_ip(&ns_path, &["link", "set", "eth0", "up"])?;
+        nsenter_ip(
+            &ns_path,
+            &["route", "add", "default", "via", &bridge_ip.to_string()],
+        )?;
+
+        info!(service = %svc.name, addr = %svc_ip, ns = %ns_name, "service network configured");
     }
 
+    info!(stack_id = %stack_id, "setup_stack_network: complete");
     Ok(())
 }
 
 /// Tear down network resources for a stack.
-pub fn teardown_stack_network(
-    stack_id: &str,
-    service_names: &[String],
-) -> io::Result<()> {
+pub fn teardown_stack_network(stack_id: &str, service_names: &[String]) -> io::Result<()> {
     // Remove network namespaces (deletes veth pairs automatically).
     for name in service_names {
         let ns_path = Path::new(NETNS_RUN_DIR).join(name);
@@ -119,7 +155,7 @@ pub fn teardown_stack_network(
 
     // Delete the bridge (also removes attached veth host ends).
     let bridge_name = format!("br-{}", truncate_name(stack_id, 12));
-    let _ = delete_iface(&bridge_name);
+    let _ = ip_run(&["link", "del", &bridge_name]);
 
     Ok(())
 }
@@ -136,7 +172,10 @@ fn truncate_name(name: &str, max_len: usize) -> &str {
 
 fn parse_cidr(addr: &str) -> io::Result<(Ipv4Addr, u8)> {
     let (ip_str, prefix_str) = addr.split_once('/').ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, format!("missing prefix in '{addr}'"))
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("missing prefix in '{addr}'"),
+        )
     })?;
     let ip: Ipv4Addr = ip_str
         .parse()
@@ -147,433 +186,169 @@ fn parse_cidr(addr: &str) -> io::Result<(Ipv4Addr, u8)> {
     Ok((ip, prefix))
 }
 
-// ── Netlink operations (raw libc) ──────────────────────────────────
+// ── Network namespace creation via syscalls ────────────────────────
 //
-// All netlink operations use AF_NETLINK / NETLINK_ROUTE sockets with
-// hand-crafted messages. This avoids external crate dependencies.
+// BusyBox `ip` doesn't support `ip netns`. Instead, we create named
+// network namespaces using unshare(2) + bind mount, matching the
+// iproute2 convention at /var/run/netns/<name>.
 
-/// Netlink message header + payload buffer.
-struct NlMsg {
-    buf: Vec<u8>,
-}
-
-// Netlink constants not in libc.
-const RTM_NEWLINK: u16 = 16;
-const RTM_DELLINK: u16 = 17;
-const RTM_NEWADDR: u16 = 20;
-const RTM_NEWROUTE: u16 = 24;
-const NLM_F_REQUEST: u16 = 1;
-const NLM_F_ACK: u16 = 4;
-const NLM_F_CREATE: u16 = 0x400;
-const NLM_F_EXCL: u16 = 0x200;
-const IFLA_IFNAME: u16 = 3;
-const IFLA_MASTER: u16 = 10;
-const IFLA_LINKINFO: u16 = 18;
-const IFLA_INFO_KIND: u16 = 1;
-const IFLA_INFO_DATA: u16 = 2;
-const VETH_INFO_PEER: u16 = 1;
-const IFA_LOCAL: u16 = 2;
-const IFA_ADDRESS: u16 = 1;
-const RTA_GATEWAY: u16 = 5;
-const RT_TABLE_MAIN: u8 = 254;
-const RTPROT_BOOT: u8 = 3;
-const RT_SCOPE_UNIVERSE: u8 = 0;
-const RTN_UNICAST: u8 = 1;
-
-impl NlMsg {
-    fn new() -> Self {
-        // Reserve space for nlmsghdr (16 bytes).
-        Self {
-            buf: vec![0u8; 16],
-        }
-    }
-
-    fn set_type_flags(&mut self, msg_type: u16, flags: u16) {
-        self.buf[4..6].copy_from_slice(&msg_type.to_ne_bytes());
-        self.buf[6..8].copy_from_slice(&flags.to_ne_bytes());
-    }
-
-    /// Append an ifinfomsg (16 bytes).
-    fn push_ifinfomsg(&mut self, family: u8, ifi_type: u16, ifi_index: i32, ifi_flags: u32, ifi_change: u32) {
-        self.buf.push(family);
-        self.buf.push(0); // padding
-        self.buf.extend_from_slice(&ifi_type.to_ne_bytes());
-        self.buf.extend_from_slice(&ifi_index.to_ne_bytes());
-        self.buf.extend_from_slice(&ifi_flags.to_ne_bytes());
-        self.buf.extend_from_slice(&ifi_change.to_ne_bytes());
-    }
-
-    /// Append an ifaddrmsg (8 bytes).
-    fn push_ifaddrmsg(&mut self, family: u8, prefix_len: u8, flags: u8, scope: u8, index: u32) {
-        self.buf.push(family);
-        self.buf.push(prefix_len);
-        self.buf.push(flags);
-        self.buf.push(scope);
-        self.buf.extend_from_slice(&index.to_ne_bytes());
-    }
-
-    /// Append an rtmsg (12 bytes).
-    fn push_rtmsg(
-        &mut self,
-        family: u8,
-        dst_len: u8,
-        src_len: u8,
-        tos: u8,
-        table: u8,
-        protocol: u8,
-        scope: u8,
-        rtype: u8,
-        flags: u32,
-    ) {
-        self.buf.push(family);
-        self.buf.push(dst_len);
-        self.buf.push(src_len);
-        self.buf.push(tos);
-        self.buf.push(table);
-        self.buf.push(protocol);
-        self.buf.push(scope);
-        self.buf.push(rtype);
-        self.buf.extend_from_slice(&flags.to_ne_bytes());
-    }
-
-    /// Start a nested attribute.
-    fn start_nested(&mut self, attr_type: u16) -> usize {
-        let offset = self.buf.len();
-        // Placeholder for nla_len (2 bytes) + nla_type (2 bytes).
-        self.buf.extend_from_slice(&[0, 0]);
-        self.buf.extend_from_slice(&attr_type.to_ne_bytes());
-        offset
-    }
-
-    /// End a nested attribute, writing back the length.
-    fn end_nested(&mut self, offset: usize) {
-        let len = (self.buf.len() - offset) as u16;
-        self.buf[offset..offset + 2].copy_from_slice(&len.to_ne_bytes());
-    }
-
-    /// Append a netlink attribute with string payload.
-    fn push_attr_str(&mut self, attr_type: u16, value: &str) {
-        let payload = value.as_bytes();
-        let nla_len = 4 + payload.len() + 1; // +1 for NUL
-        let padded = (nla_len + 3) & !3;
-        self.buf.extend_from_slice(&(nla_len as u16).to_ne_bytes());
-        self.buf.extend_from_slice(&attr_type.to_ne_bytes());
-        self.buf.extend_from_slice(payload);
-        self.buf.push(0); // NUL
-        // Pad to 4-byte alignment.
-        while self.buf.len() < self.buf.len() + (padded - nla_len) {
-            self.buf.push(0);
-        }
-        let total_now = self.buf.len();
-        let target = ((total_now + 3) / 4) * 4;
-        self.buf.resize(target, 0);
-    }
-
-    /// Append a netlink attribute with raw bytes payload.
-    fn push_attr_bytes(&mut self, attr_type: u16, value: &[u8]) {
-        let nla_len = 4 + value.len();
-        let padded = (nla_len + 3) & !3;
-        self.buf.extend_from_slice(&(nla_len as u16).to_ne_bytes());
-        self.buf.extend_from_slice(&attr_type.to_ne_bytes());
-        self.buf.extend_from_slice(value);
-        self.buf.resize(self.buf.len() + (padded - nla_len), 0);
-    }
-
-    /// Append a netlink attribute with a u32 payload.
-    fn push_attr_u32(&mut self, attr_type: u16, value: u32) {
-        self.push_attr_bytes(attr_type, &value.to_ne_bytes());
-    }
-
-    /// Finalize: write total length into nlmsghdr.
-    fn finalize(&mut self) {
-        let len = self.buf.len() as u32;
-        self.buf[0..4].copy_from_slice(&len.to_ne_bytes());
-    }
-}
-
-fn open_netlink_socket() -> io::Result<OwnedFd> {
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_NETLINK,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-            libc::NETLINK_ROUTE,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    addr.nl_family = libc::AF_NETLINK as u16;
-    let ret = unsafe {
-        libc::bind(
-            fd,
-            &addr as *const libc::sockaddr_nl as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_nl>() as u32,
-        )
-    };
-    if ret < 0 {
-        let err = io::Error::last_os_error();
-        unsafe { libc::close(fd) };
-        return Err(err);
-    }
-
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-fn nl_send_and_ack(fd: &OwnedFd, msg: &NlMsg) -> io::Result<()> {
-    let sent = unsafe {
-        libc::send(
-            fd.as_raw_fd(),
-            msg.buf.as_ptr() as *const libc::c_void,
-            msg.buf.len(),
-            0,
-        )
-    };
-    if sent < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // Read ack.
-    let mut buf = [0u8; 4096];
-    let n = unsafe {
-        libc::recv(fd.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
-    };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // Check for NLMSG_ERROR.
-    if n >= 16 {
-        let msg_type = u16::from_ne_bytes([buf[4], buf[5]]);
-        if msg_type == libc::NLMSG_ERROR as u16 && n >= 20 {
-            let errno = i32::from_ne_bytes([buf[16], buf[17], buf[18], buf[19]]);
-            if errno < 0 {
-                return Err(io::Error::from_raw_os_error(-errno));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn if_nametoindex(name: &str) -> io::Result<u32> {
-    let c_name = CString::new(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let idx = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
-    if idx == 0 {
-        Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("interface '{name}' not found"),
-        ))
-    } else {
-        Ok(idx)
-    }
-}
-
-fn create_bridge(name: &str) -> io::Result<()> {
-    let fd = open_netlink_socket()?;
-    let mut msg = NlMsg::new();
-    msg.set_type_flags(RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
-    msg.push_ifinfomsg(0, 0, 0, 0, 0);
-    msg.push_attr_str(IFLA_IFNAME, name);
-
-    let nested = msg.start_nested(IFLA_LINKINFO);
-    msg.push_attr_str(IFLA_INFO_KIND, "bridge");
-    msg.end_nested(nested);
-
-    msg.finalize();
-    nl_send_and_ack(&fd, &msg)
-}
-
-fn create_veth_pair(name1: &str, name2: &str) -> io::Result<()> {
-    let fd = open_netlink_socket()?;
-    let mut msg = NlMsg::new();
-    msg.set_type_flags(RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
-    msg.push_ifinfomsg(0, 0, 0, 0, 0);
-    msg.push_attr_str(IFLA_IFNAME, name1);
-
-    let linkinfo = msg.start_nested(IFLA_LINKINFO);
-    msg.push_attr_str(IFLA_INFO_KIND, "veth");
-
-    let infodata = msg.start_nested(IFLA_INFO_DATA);
-    let peer = msg.start_nested(VETH_INFO_PEER);
-    // Peer ifinfomsg (16 bytes of zeros for defaults).
-    msg.push_ifinfomsg(0, 0, 0, 0, 0);
-    msg.push_attr_str(IFLA_IFNAME, name2);
-    msg.end_nested(peer);
-    msg.end_nested(infodata);
-
-    msg.end_nested(linkinfo);
-    msg.finalize();
-    nl_send_and_ack(&fd, &msg)
-}
-
-fn set_iface_up(name: &str) -> io::Result<()> {
-    let idx = if_nametoindex(name)?;
-    let fd = open_netlink_socket()?;
-    let mut msg = NlMsg::new();
-    msg.set_type_flags(RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK);
-    msg.push_ifinfomsg(
-        0,
-        0,
-        idx as i32,
-        libc::IFF_UP as u32,
-        libc::IFF_UP as u32,
-    );
-    msg.finalize();
-    nl_send_and_ack(&fd, &msg)
-}
-
-fn set_iface_master(iface: &str, bridge: &str) -> io::Result<()> {
-    let iface_idx = if_nametoindex(iface)?;
-    let bridge_idx = if_nametoindex(bridge)?;
-    let fd = open_netlink_socket()?;
-    let mut msg = NlMsg::new();
-    msg.set_type_flags(RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK);
-    msg.push_ifinfomsg(0, 0, iface_idx as i32, 0, 0);
-    msg.push_attr_u32(IFLA_MASTER, bridge_idx);
-    msg.finalize();
-    nl_send_and_ack(&fd, &msg)
-}
-
-fn add_addr_to_iface(name: &str, addr: Ipv4Addr, prefix_len: u8) -> io::Result<()> {
-    let idx = if_nametoindex(name)?;
-    let fd = open_netlink_socket()?;
-    let mut msg = NlMsg::new();
-    msg.set_type_flags(RTM_NEWADDR, NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
-    msg.push_ifaddrmsg(libc::AF_INET as u8, prefix_len, 0, 0, idx);
-    msg.push_attr_bytes(IFA_LOCAL, &addr.octets());
-    msg.push_attr_bytes(IFA_ADDRESS, &addr.octets());
-    msg.finalize();
-    nl_send_and_ack(&fd, &msg)
-}
-
-fn add_default_route(gateway: Ipv4Addr) -> io::Result<()> {
-    let fd = open_netlink_socket()?;
-    let mut msg = NlMsg::new();
-    msg.set_type_flags(RTM_NEWROUTE, NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
-    msg.push_rtmsg(
-        libc::AF_INET as u8,
-        0,   // dst_len = 0 means default route
-        0,
-        0,
-        RT_TABLE_MAIN,
-        RTPROT_BOOT,
-        RT_SCOPE_UNIVERSE,
-        RTN_UNICAST,
-        0,
-    );
-    msg.push_attr_bytes(RTA_GATEWAY, &gateway.octets());
-    msg.finalize();
-    nl_send_and_ack(&fd, &msg)
-}
-
-fn delete_iface(name: &str) -> io::Result<()> {
-    let idx = match if_nametoindex(name) {
-        Ok(idx) => idx,
-        Err(_) => return Ok(()), // Already gone.
-    };
-    let fd = open_netlink_socket()?;
-    let mut msg = NlMsg::new();
-    msg.set_type_flags(RTM_DELLINK, NLM_F_REQUEST | NLM_F_ACK);
-    msg.push_ifinfomsg(0, 0, idx as i32, 0, 0);
-    msg.finalize();
-    nl_send_and_ack(&fd, &msg)
-}
-
-fn move_iface_to_netns(iface: &str, ns_name: &str) -> io::Result<()> {
-    let iface_idx = if_nametoindex(iface)?;
-    let ns_path = Path::new(NETNS_RUN_DIR).join(ns_name);
-    let ns_fd = fs::File::open(&ns_path)?;
-
-    let fd = open_netlink_socket()?;
-    let mut msg = NlMsg::new();
-    msg.set_type_flags(RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK);
-    msg.push_ifinfomsg(0, 0, iface_idx as i32, 0, 0);
-
-    // IFLA_NET_NS_FD = 28
-    const IFLA_NET_NS_FD: u16 = 28;
-    msg.push_attr_u32(IFLA_NET_NS_FD, ns_fd.as_raw_fd() as u32);
-
-    msg.finalize();
-    nl_send_and_ack(&fd, &msg)
-}
-
-// ── Namespace operations ───────────────────────────────────────────
-
+/// Create a named network namespace at `/var/run/netns/<name>`.
+///
+/// Uses fork + unshare(CLONE_NEWNET) + bind mount to create a persistent
+/// named netns without requiring `ip netns` support.
 fn create_named_netns(name: &str) -> io::Result<()> {
-    let ns_path = Path::new(NETNS_RUN_DIR).join(name);
+    let ns_path = format!("{NETNS_RUN_DIR}/{name}");
+    let ns_path_obj = Path::new(&ns_path);
 
-    // Create the mount point file.
-    fs::write(&ns_path, b"")?;
-
-    // Create a new network namespace using clone/unshare.
-    let ret = unsafe { libc::unshare(libc::CLONE_NEWNET) };
-    if ret < 0 {
-        let err = io::Error::last_os_error();
-        let _ = fs::remove_file(&ns_path);
-        return Err(err);
+    // Create the bind mount target file.
+    if !ns_path_obj.exists() {
+        fs::write(&ns_path, b"")?;
     }
 
-    // Bind-mount the current netns to the named path so it persists.
-    let source = CString::new("/proc/self/ns/net")
+    // Fork a child that will unshare into a new network namespace,
+    // then bind-mount its /proc/self/ns/net onto our target path.
+    let ns_path_c = CString::new(ns_path.as_bytes())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let target = CString::new(ns_path.to_string_lossy().as_bytes())
+    let proc_ns_net = CString::new("/proc/self/ns/net")
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let ret = unsafe {
-        libc::mount(
-            source.as_ptr(),
-            target.as_ptr(),
-            std::ptr::null(),
-            libc::MS_BIND,
-            std::ptr::null(),
-        )
-    };
-    if ret < 0 {
-        let err = io::Error::last_os_error();
-        let _ = fs::remove_file(&ns_path);
-        return Err(err);
-    }
 
-    // Switch back to the original (default) network namespace.
-    // We do this by opening /proc/1/ns/net (init's netns is always the default).
-    let init_ns = fs::File::open("/proc/1/ns/net")?;
-    let ret = unsafe { libc::setns(init_ns.as_raw_fd(), libc::CLONE_NEWNET) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
+    // Safety: unshare and mount are standard POSIX-like syscalls.
+    // We fork to isolate the new namespace from the agent process.
+    unsafe {
+        let pid = libc::fork();
+        if pid < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        if pid == 0 {
+            // Child process: create new netns and bind-mount it.
+            if libc::unshare(libc::CLONE_NEWNET) != 0 {
+                libc::_exit(1);
+            }
+            if libc::mount(
+                proc_ns_net.as_ptr(),
+                ns_path_c.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            ) != 0
+            {
+                libc::_exit(2);
+            }
+            libc::_exit(0);
+        }
+
+        // Parent: wait for child.
+        let mut status: libc::c_int = 0;
+        if libc::waitpid(pid, &mut status, 0) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+            let exit_code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                -1
+            };
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "create_named_netns({name}) failed: child exited with code {exit_code}"
+                ),
+            ));
+        }
     }
 
     Ok(())
 }
 
-/// Execute a closure inside a named network namespace, then return to the
-/// original namespace.
-fn in_netns<F>(name: &str, f: F) -> io::Result<()>
-where
-    F: FnOnce() -> io::Result<()>,
-{
-    let ns_path = Path::new(NETNS_RUN_DIR).join(name);
-    let target_ns = fs::File::open(&ns_path)?;
-    let orig_ns = fs::File::open("/proc/self/ns/net")?;
+// ── Command-based network operations ───────────────────────────────
+//
+// Uses busybox `ip` for link/addr/route operations. Namespace entry
+// is done via `nsenter` since BusyBox `ip` lacks `netns` support.
+//
+// This delegates netlink operations to child processes, avoiding a
+// kernel OOM deadlock that occurs when the guest agent triggers
+// a page fault that the OOM killer can't resolve by killing PID 1.
 
-    // Enter target namespace.
-    let ret = unsafe { libc::setns(target_ns.as_raw_fd(), libc::CLONE_NEWNET) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
+/// Absolute path to BusyBox `ip` inside the chroot.
+///
+/// We use an absolute path because Rust's `Command::new("ip")` resolves
+/// the binary using the *parent* process's PATH, not the child's `.env("PATH", ...)`.
+/// The init script creates `/bin/ip` as a symlink to `/bin/busybox`.
+const IP_BIN: &str = "/bin/ip";
+
+/// Run `ip <args>` and check for success.
+fn ip_run(args: &[&str]) -> io::Result<()> {
+    let output = Command::new(IP_BIN)
+        .args(args)
+        .output()
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("failed to exec `{IP_BIN} {}`: {}", args.join(" "), e),
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("{IP_BIN} {} failed: {}", args.join(" "), stderr.trim()),
+        ));
     }
-
-    let result = f();
-
-    // Return to original namespace.
-    let ret = unsafe { libc::setns(orig_ns.as_raw_fd(), libc::CLONE_NEWNET) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    result
+    Ok(())
 }
 
-use std::os::fd::FromRawFd;
+/// Run `ip <args>` inside a network namespace.
+///
+/// Uses `pre_exec` with `setns(2)` to enter the namespace before execing ip.
+/// BusyBox nsenter doesn't support `--net=<path>`, and BusyBox ip
+/// doesn't support `ip netns exec`, so we do it via pre_exec hook.
+fn nsenter_ip(ns_path: &str, args: &[&str]) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    // Open the namespace fd.
+    let ns_file = fs::File::open(ns_path)?;
+    let ns_fd = ns_file.as_raw_fd();
+
+    let output = unsafe {
+        Command::new(IP_BIN)
+            .args(args)
+            .pre_exec(move || {
+                if libc::setns(ns_fd, libc::CLONE_NEWNET) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            })
+            .output()
+    }
+    .map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "failed to exec `{IP_BIN} {}` in netns {}: {}",
+                args.join(" "),
+                ns_path,
+                e
+            ),
+        )
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "{IP_BIN} {} in netns {} failed: {}",
+                args.join(" "),
+                ns_path,
+                stderr.trim()
+            ),
+        ));
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -599,26 +374,5 @@ mod tests {
     #[test]
     fn truncate_name_long() {
         assert_eq!(truncate_name("very-long-stack-name", 12), "very-long-st");
-    }
-
-    #[test]
-    fn nlmsg_finalize_sets_length() {
-        let mut msg = NlMsg::new();
-        msg.set_type_flags(RTM_NEWLINK, NLM_F_REQUEST);
-        msg.push_ifinfomsg(0, 0, 0, 0, 0);
-        msg.finalize();
-        let len = u32::from_ne_bytes([msg.buf[0], msg.buf[1], msg.buf[2], msg.buf[3]]);
-        assert_eq!(len as usize, msg.buf.len());
-    }
-
-    #[test]
-    fn nlmsg_attr_str_alignment() {
-        let mut msg = NlMsg::new();
-        msg.set_type_flags(RTM_NEWLINK, NLM_F_REQUEST);
-        msg.push_ifinfomsg(0, 0, 0, 0, 0);
-        msg.push_attr_str(IFLA_IFNAME, "br0");
-        msg.finalize();
-        // Total length should be 4-byte aligned.
-        assert_eq!(msg.buf.len() % 4, 0);
     }
 }

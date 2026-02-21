@@ -459,8 +459,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             }
 
             // Join the per-service network namespace.
-            run_config.network_namespace_path =
-                Some(format!("/var/run/netns/{service_name}"));
+            run_config.network_namespace_path = Some(format!("/var/run/netns/{service_name}"));
         } else {
             // Single VM per container: all services share 127.0.0.1.
             for svc in &spec.services {
@@ -477,7 +476,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         // Create and start container.
         info!(service = %service_name, image = %svc_spec.image, "creating container");
         let container_id = if use_shared_vm {
-            match self.runtime.create_in_stack(&spec.name, &svc_spec.image, run_config) {
+            match self
+                .runtime
+                .create_in_stack(&spec.name, &svc_spec.image, run_config)
+            {
                 Ok(id) => id,
                 Err(e) => {
                     self.mark_failed(spec, service_name, &e.to_string())?;
@@ -745,9 +747,7 @@ pub(crate) mod tests_support {
                         .join(",")
                 ),
             ));
-            self.shared_vms
-                .borrow_mut()
-                .insert(stack_id.to_string());
+            self.shared_vms.borrow_mut().insert(stack_id.to_string());
             Ok(())
         }
 
@@ -792,10 +792,9 @@ pub(crate) mod tests_support {
             image: &str,
             config: vz_oci::RunConfig,
         ) -> Result<String, StackError> {
-            self.calls.borrow_mut().push((
-                "create_in_stack".to_string(),
-                format!("{stack_id}:{image}"),
-            ));
+            self.calls
+                .borrow_mut()
+                .push(("create_in_stack".to_string(), format!("{stack_id}:{image}")));
             if self.fail_create {
                 return Err(StackError::InvalidSpec("mock create failure".to_string()));
             }
@@ -809,10 +808,9 @@ pub(crate) mod tests_support {
         }
 
         fn shutdown_shared_vm(&self, stack_id: &str) -> Result<(), StackError> {
-            self.calls.borrow_mut().push((
-                "shutdown_shared_vm".to_string(),
-                stack_id.to_string(),
-            ));
+            self.calls
+                .borrow_mut()
+                .push(("shutdown_shared_vm".to_string(), stack_id.to_string()));
             self.shared_vms.borrow_mut().remove(stack_id);
             Ok(())
         }
@@ -1523,7 +1521,10 @@ mod tests {
         assert_eq!(ops[1], "network_setup");
         // Remaining: pull + create_in_stack for each service.
         assert!(ops.contains(&"create_in_stack"));
-        assert!(!ops.contains(&"create"), "should use create_in_stack, not create");
+        assert!(
+            !ops.contains(&"create"),
+            "should use create_in_stack, not create"
+        );
     }
 
     #[test]
@@ -1706,8 +1707,16 @@ mod tests {
         let web_config = configs.iter().find(|(id, _)| id == "ctr-web").unwrap();
         let web_hosts = &web_config.1.extra_hosts;
         assert_eq!(web_hosts.len(), 2); // api + db
-        assert!(web_hosts.iter().any(|(h, ip)| h == "api" && ip == "172.20.0.3"));
-        assert!(web_hosts.iter().any(|(h, ip)| h == "db" && ip == "172.20.0.4"));
+        assert!(
+            web_hosts
+                .iter()
+                .any(|(h, ip)| h == "api" && ip == "172.20.0.3")
+        );
+        assert!(
+            web_hosts
+                .iter()
+                .any(|(h, ip)| h == "db" && ip == "172.20.0.4")
+        );
     }
 
     #[test]

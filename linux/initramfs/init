@@ -30,6 +30,7 @@ install_youki_binary() {
 # Ensure loopback works for localhost services and port forwarding.
 /bin/ip link set dev lo up >/dev/console 2>&1 || true
 
+
 # Optional DHCP setup if a virtio-net device is present.
 # Run in background so missing network does not block guest-agent startup.
 if [ -d /sys/class/net/eth0 ] && [ -x /sbin/udhcpc ]; then
@@ -57,6 +58,10 @@ switch_root_into_overlay_rootfs() {
   mount -t devtmpfs devtmpfs "$ROOTFS/dev" || true
   mount -t tmpfs tmpfs "$ROOTFS/tmp" || return 1
 
+  # Mount cgroup2 for OCI container runtime (youki) support.
+  mkdir -p "$ROOTFS/sys/fs/cgroup"
+  mount -t cgroup2 none "$ROOTFS/sys/fs/cgroup" || true
+
   cp /usr/bin/vz-guest-agent "$ROOTFS/usr/local/bin/vz-guest-agent" || return 1
   /bin/busybox chmod +x "$ROOTFS/usr/local/bin/vz-guest-agent" || return 1
 
@@ -67,9 +72,29 @@ switch_root_into_overlay_rootfs() {
   /bin/busybox chmod +x "$ROOTFS/etc/udhcpc.script" || return 1
 
   install_youki_binary "$ROOTFS/usr/local/bin/youki" || return 1
+  install_youki_binary "$ROOTFS/run/vz-oci/bin/youki" || return 1
+
+  # Copy busybox into rootfs for network setup commands.
+  mkdir -p "$ROOTFS/bin" "$ROOTFS/sbin"
+  cp /bin/busybox "$ROOTFS/bin/busybox" || return 1
+  # Install applet symlinks using busybox's built-in mechanism.
+  # Manual `ln -sf` fails on some overlayfs configurations.
+  chroot "$ROOTFS" /bin/busybox --install -s /bin 2>/dev/null || \
+    /bin/busybox --install -s "$ROOTFS/bin" 2>/dev/null || true
+
+  # Bind-mount VirtioFS rootfs share directly into chroot so container
+  # rootfs directories written after overlay mount are visible.
+  # Overlay caches lowerdir entries, so new files added via VirtioFS
+  # won't appear through the overlay — but a direct bind mount works.
+  mkdir -p "$ROOTFS/vz-rootfs"
+  mount --bind /mnt/rootfs "$ROOTFS/vz-rootfs" || return 1
 
   echo "[vz-init] entering rootfs via chroot and starting guest agent on vsock 7424"
-  exec chroot "$ROOTFS" /usr/local/bin/vz-guest-agent --port 7424 --bind-timeout-secs 30
+
+  # Run guest agent as a child process (not PID 1) to avoid OOM killer deadlock.
+  # PID 1 is unkillable; if the agent triggers OOM as PID 1, the kernel panics.
+  chroot "$ROOTFS" /usr/local/bin/vz-guest-agent --port 7424 --bind-timeout-secs 30 &
+  wait
 
   return 1
 }
@@ -79,11 +104,10 @@ ROOTFS_READY=0
 # Optional VirtioFS rootfs mount (used by container runtime path).
 if mount -t virtiofs rootfs /mnt/rootfs 2>/dev/null; then
   echo "[vz-init] mounted virtiofs rootfs at /mnt/rootfs"
-  if mount -o remount,ro /mnt/rootfs >/dev/console 2>&1; then
-    echo "[vz-init] remounted rootfs share read-only for overlay lowerdir"
-  else
-    echo "[vz-init] rootfs remount read-only not supported, relying on host share flags"
-  fi
+  # Note: we do NOT remount /mnt/rootfs read-only here. Overlay works fine
+  # with an rw lowerdir (writes go to upperdir, lowerdir is never modified
+  # through the overlay). Keeping /mnt/rootfs rw allows the bind mount at
+  # /vz-rootfs to also be rw, which the OCI runtime needs for container setup.
   ROOTFS_READY=1
 else
   echo "[vz-init] no rootfs virtiofs mount available, continuing"
@@ -106,4 +130,5 @@ if [ "$ROOTFS_READY" -eq 1 ]; then
 fi
 
 echo "[vz-init] starting guest agent on vsock 7424"
-exec /usr/bin/vz-guest-agent --port 7424
+/usr/bin/vz-guest-agent --port 7424 &
+wait

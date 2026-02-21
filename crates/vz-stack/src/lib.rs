@@ -20,7 +20,9 @@ mod spec;
 mod state_store;
 mod volume;
 
-pub use compose::{expand_variables, parse_compose, parse_compose_with_dir, parse_env_file_content};
+pub use compose::{
+    expand_variables, parse_compose, parse_compose_with_dir, parse_env_file_content,
+};
 pub use convert::service_to_run_config;
 pub use error::StackError;
 pub use events::{EventRecord, StackEvent};
