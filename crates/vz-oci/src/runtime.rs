@@ -487,6 +487,7 @@ impl Runtime {
                 user: run.user.clone(),
                 mounts: bundle_mounts,
                 oci_annotations: run.oci_annotations.clone(),
+                network_namespace_path: None,
             },
         )?;
 
@@ -626,6 +627,7 @@ impl Runtime {
                 user: user.clone(),
                 mounts: bundle_mounts,
                 oci_annotations,
+                network_namespace_path: None,
             },
         )?;
 

@@ -4,7 +4,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use oci_spec::runtime::{
-    Mount, MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder, User, UserBuilder, VERSION,
+    LinuxNamespaceType, Mount, MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder, User,
+    UserBuilder, VERSION,
 };
 
 use crate::error::OciError;
@@ -40,6 +41,13 @@ pub(crate) struct BundleSpec {
     pub mounts: Vec<BundleMount>,
     /// Additional OCI runtime-spec annotations.
     pub oci_annotations: Vec<(String, String)>,
+    /// Path to an existing network namespace to join.
+    ///
+    /// When set, the generated config.json will include a
+    /// `linux.namespaces` entry with `type: "network"` pointing
+    /// to this path (e.g., `/var/run/netns/svc-web`). The
+    /// namespace must be created before the container starts.
+    pub network_namespace_path: Option<String>,
 }
 
 /// Write an OCI bundle directory (`config.json` + `rootfs` link).
@@ -71,6 +79,7 @@ fn build_runtime_spec(spec: BundleSpec) -> Result<Spec, OciError> {
         user,
         mut mounts,
         oci_annotations,
+        network_namespace_path,
     } = spec;
 
     if cmd.is_empty() {
@@ -112,7 +121,31 @@ fn build_runtime_spec(spec: BundleSpec) -> Result<Spec, OciError> {
         builder = builder.annotations(annotations);
     }
 
-    builder.build().map_err(Into::into)
+    let mut spec = builder.build()?;
+
+    if let Some(netns_path) = network_namespace_path {
+        set_network_namespace_path(&mut spec, &netns_path);
+    }
+
+    Ok(spec)
+}
+
+/// Update the network namespace entry in the spec's linux section to join
+/// an existing netns at `path` (e.g., `/var/run/netns/svc-web`).
+/// If no linux section or namespaces exist, this is a no-op.
+fn set_network_namespace_path(spec: &mut Spec, path: &str) {
+    let Some(linux) = spec.linux_mut() else {
+        return;
+    };
+    let Some(namespaces) = linux.namespaces_mut() else {
+        return;
+    };
+    if let Some(netns) = namespaces
+        .iter_mut()
+        .find(|ns| ns.typ() == LinuxNamespaceType::Network)
+    {
+        netns.set_path(Some(path.into()));
+    }
 }
 
 fn sort_bundle_mounts(mounts: &mut [BundleMount]) {
@@ -274,6 +307,7 @@ mod tests {
                     ("com.example.service".to_string(), "web".to_string()),
                     ("com.example.revision".to_string(), "42".to_string()),
                 ],
+                network_namespace_path: None,
             },
         )
         .unwrap();
@@ -354,6 +388,7 @@ mod tests {
                 user: Some("nobody".to_string()),
                 mounts: Vec::new(),
                 oci_annotations: Vec::new(),
+                network_namespace_path: None,
             },
         )
         .unwrap();
@@ -403,6 +438,7 @@ mod tests {
                     },
                 ],
                 oci_annotations: Vec::new(),
+                network_namespace_path: None,
             },
         )
         .unwrap();
@@ -425,5 +461,74 @@ mod tests {
             mounts[2].source().as_ref(),
             Some(&PathBuf::from("/host/config"))
         );
+    }
+
+    #[test]
+    fn write_oci_bundle_with_network_namespace() {
+        let temp = unique_temp_dir("netns");
+        let rootfs_source = temp.join("rootfs-source");
+        fs::create_dir_all(&rootfs_source).unwrap();
+
+        let bundle_dir = temp.join("bundle");
+        write_oci_bundle(
+            &bundle_dir,
+            &rootfs_source,
+            BundleSpec {
+                cmd: vec!["/bin/sh".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: Vec::new(),
+                oci_annotations: Vec::new(),
+                network_namespace_path: Some("/var/run/netns/svc-web".to_string()),
+            },
+        )
+        .unwrap();
+
+        let spec = Spec::load(bundle_dir.join(OCI_CONFIG_FILENAME)).unwrap();
+        let linux = spec.linux().as_ref().expect("linux section should exist");
+        let namespaces = linux.namespaces().as_ref().expect("namespaces should exist");
+        let netns = namespaces
+            .iter()
+            .find(|ns| ns.typ() == LinuxNamespaceType::Network)
+            .expect("network namespace should exist");
+        assert_eq!(
+            netns.path().as_deref(),
+            Some(Path::new("/var/run/netns/svc-web"))
+        );
+    }
+
+    #[test]
+    fn write_oci_bundle_without_network_namespace_has_no_linux_section() {
+        let temp = unique_temp_dir("no-netns");
+        let rootfs_source = temp.join("rootfs-source");
+        fs::create_dir_all(&rootfs_source).unwrap();
+
+        let bundle_dir = temp.join("bundle");
+        write_oci_bundle(
+            &bundle_dir,
+            &rootfs_source,
+            BundleSpec {
+                cmd: vec!["/bin/sh".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: Vec::new(),
+                oci_annotations: Vec::new(),
+                network_namespace_path: None,
+            },
+        )
+        .unwrap();
+
+        let spec = Spec::load(bundle_dir.join(OCI_CONFIG_FILENAME)).unwrap();
+        // Without network_namespace_path, the default network namespace has no path
+        // (i.e., the container creates a new netns rather than joining an existing one).
+        let linux = spec.linux().as_ref().expect("default spec includes linux section");
+        let ns = linux.namespaces().as_ref().expect("default namespaces present");
+        let netns = ns
+            .iter()
+            .find(|n| n.typ() == LinuxNamespaceType::Network)
+            .expect("default network namespace exists");
+        assert!(netns.path().is_none(), "expected no netns path by default");
     }
 }
