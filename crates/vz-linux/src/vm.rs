@@ -3,11 +3,13 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 use vz::Vm;
-use vz::protocol::{ExecOutput, HandshakeAck, OciContainerState, OciExecResult};
+use vz::protocol::{
+    ExecOutput, HandshakeAck, NetworkServiceConfig, OciContainerState, OciExecResult,
+};
 
 use crate::agent::{
-    exec_capture, exec_capture_with_options, handshake_and_ping, oci_create, oci_delete, oci_exec,
-    oci_kill, oci_start, oci_state, open_port_forward_stream,
+    exec_capture, exec_capture_with_options, handshake_and_ping, network_setup, network_teardown,
+    oci_create, oci_delete, oci_exec, oci_kill, oci_start, oci_state, open_port_forward_stream,
 };
 use crate::{ExecOptions, LinuxError, LinuxVmConfig, OciExecOptions};
 
@@ -189,6 +191,24 @@ impl LinuxVm {
     /// Delete container state from the guest OCI runtime.
     pub async fn oci_delete(&self, id: String, force: bool) -> Result<(), LinuxError> {
         oci_delete(self.vm.as_ref(), id, force).await
+    }
+
+    /// Set up per-service network isolation inside the VM.
+    pub async fn network_setup(
+        &self,
+        stack_id: String,
+        services: Vec<NetworkServiceConfig>,
+    ) -> Result<(), LinuxError> {
+        network_setup(self.vm.as_ref(), stack_id, services).await
+    }
+
+    /// Tear down the network resources for a stack.
+    pub async fn network_teardown(
+        &self,
+        stack_id: String,
+        service_names: Vec<String>,
+    ) -> Result<(), LinuxError> {
+        network_teardown(self.vm.as_ref(), stack_id, service_names).await
     }
 
     /// Borrow the underlying base VM.

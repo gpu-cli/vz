@@ -22,4 +22,4 @@ pub use kernel::{
     ensure_kernel_with_options,
 };
 pub use vm::LinuxVm;
-pub use vz::protocol::{OciContainerState, OciExecResult};
+pub use vz::protocol::{NetworkServiceConfig, OciContainerState, OciExecResult};

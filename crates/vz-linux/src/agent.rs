@@ -4,8 +4,8 @@ use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::{Instant, timeout};
 use vz::protocol::{
-    self, ExecOutput, Handshake, HandshakeAck, OciContainerState, OciExecResult, OciPayload,
-    Request, Response,
+    self, ExecOutput, Handshake, HandshakeAck, NetworkServiceConfig, OciContainerState,
+    OciExecResult, OciPayload, Request, Response,
 };
 use vz::{Vm, VsockStream};
 
@@ -19,8 +19,11 @@ const AGENT_CAPABILITY_PORT_FORWARD: &str = "port_forward";
 const AGENT_CAPABILITY_OCI_LIFECYCLE: &str = "oci_lifecycle";
 const OCI_RUNTIME_BINARY: &str = "/run/vz-oci/bin/youki";
 const OCI_EXEC_REQUEST_ID: u64 = 4;
+const NETWORK_SETUP_REQUEST_ID: u64 = 5;
+const NETWORK_TEARDOWN_REQUEST_ID: u64 = 6;
 const OCI_ERROR_CODE_RUNTIME_FAILURE: i32 = 125;
 const OCI_ERROR_CODE_EXEC_START_FAILURE: i32 = 127;
+const AGENT_CAPABILITY_NETWORK_SETUP: &str = "network_setup";
 
 /// Options for guest command execution.
 #[derive(Debug, Clone, Default)]
@@ -709,6 +712,113 @@ pub async fn oci_kill(vm: &Vm, id: String, signal: String) -> Result<(), LinuxEr
 pub async fn oci_delete(vm: &Vm, id: String, force: bool) -> Result<(), LinuxError> {
     let stream = vm.vsock_connect(protocol::AGENT_PORT).await?;
     oci_delete_with_stream(stream, id, force).await
+}
+
+// ── Network setup/teardown ─────────────────────────────────────────
+
+fn network_handshake() -> Handshake {
+    Handshake {
+        protocol_version: protocol::PROTOCOL_VERSION,
+        capabilities: vec![
+            AGENT_CAPABILITY_USER_EXEC.to_string(),
+            AGENT_CAPABILITY_PORT_FORWARD.to_string(),
+            AGENT_CAPABILITY_NETWORK_SETUP.to_string(),
+        ],
+    }
+}
+
+/// Set up per-service network isolation inside a shared stack VM.
+///
+/// Creates a bridge (`br-<stack_id>`), per-service network namespaces,
+/// veth pairs, and IP routes so that services can communicate via
+/// their assigned addresses.
+pub async fn network_setup(
+    vm: &Vm,
+    stack_id: String,
+    services: Vec<NetworkServiceConfig>,
+) -> Result<(), LinuxError> {
+    let stream = vm.vsock_connect(protocol::AGENT_PORT).await?;
+    network_setup_with_stream(stream, stack_id, services).await
+}
+
+async fn network_setup_with_stream<S>(
+    mut stream: S,
+    stack_id: String,
+    services: Vec<NetworkServiceConfig>,
+) -> Result<(), LinuxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    protocol::write_frame(&mut stream, &network_handshake()).await?;
+    let ack: HandshakeAck = protocol::read_frame(&mut stream).await?;
+    ensure_handshake_protocol(&ack)?;
+
+    protocol::write_frame(
+        &mut stream,
+        &Request::NetworkSetup {
+            id: NETWORK_SETUP_REQUEST_ID,
+            stack_id,
+            services,
+        },
+    )
+    .await?;
+
+    let response: Response = protocol::read_frame(&mut stream).await?;
+    match response {
+        Response::NetworkSetupOk { id } if id == NETWORK_SETUP_REQUEST_ID => Ok(()),
+        Response::NetworkSetupError { id, error } if id == NETWORK_SETUP_REQUEST_ID => {
+            Err(LinuxError::Protocol(format!("network setup failed: {error}")))
+        }
+        other => Err(LinuxError::Protocol(format!(
+            "unexpected network setup response: {other:?}"
+        ))),
+    }
+}
+
+/// Tear down the network resources created by [`network_setup`].
+pub async fn network_teardown(
+    vm: &Vm,
+    stack_id: String,
+    service_names: Vec<String>,
+) -> Result<(), LinuxError> {
+    let stream = vm.vsock_connect(protocol::AGENT_PORT).await?;
+    network_teardown_with_stream(stream, stack_id, service_names).await
+}
+
+async fn network_teardown_with_stream<S>(
+    mut stream: S,
+    stack_id: String,
+    service_names: Vec<String>,
+) -> Result<(), LinuxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    protocol::write_frame(&mut stream, &network_handshake()).await?;
+    let ack: HandshakeAck = protocol::read_frame(&mut stream).await?;
+    ensure_handshake_protocol(&ack)?;
+
+    protocol::write_frame(
+        &mut stream,
+        &Request::NetworkTeardown {
+            id: NETWORK_TEARDOWN_REQUEST_ID,
+            stack_id,
+            service_names,
+        },
+    )
+    .await?;
+
+    let response: Response = protocol::read_frame(&mut stream).await?;
+    match response {
+        Response::NetworkTeardownOk { id } if id == NETWORK_TEARDOWN_REQUEST_ID => Ok(()),
+        Response::NetworkTeardownError { id, error } if id == NETWORK_TEARDOWN_REQUEST_ID => {
+            Err(LinuxError::Protocol(format!(
+                "network teardown failed: {error}"
+            )))
+        }
+        other => Err(LinuxError::Protocol(format!(
+            "unexpected network teardown response: {other:?}"
+        ))),
+    }
 }
 
 #[cfg(test)]

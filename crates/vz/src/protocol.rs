@@ -162,6 +162,15 @@ pub struct ResourceStats {
     pub load_average: [f64; 3],
 }
 
+/// Per-service network configuration for stack VM network setup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkServiceConfig {
+    /// Service name, also used as the network namespace name.
+    pub name: String,
+    /// IP address with CIDR prefix (e.g., `"172.20.0.2/24"`).
+    pub addr: String,
+}
+
 /// OCI runtime state for a container.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OciContainerState {
@@ -315,6 +324,28 @@ pub enum Request {
         /// Force delete if true.
         force: bool,
     },
+    /// Set up per-service network isolation for a stack.
+    ///
+    /// Creates a bridge, per-service network namespaces, veth pairs,
+    /// and IP routes so that services can communicate via their
+    /// assigned addresses.
+    NetworkSetup {
+        /// Unique request ID.
+        id: u64,
+        /// Stack identifier, used to name the bridge (`br-<stack_id>`).
+        stack_id: String,
+        /// Per-service network configuration.
+        services: Vec<NetworkServiceConfig>,
+    },
+    /// Tear down the network resources created by [`NetworkSetup`].
+    NetworkTeardown {
+        /// Unique request ID.
+        id: u64,
+        /// Stack identifier whose network should be torn down.
+        stack_id: String,
+        /// Service names whose network namespaces should be removed.
+        service_names: Vec<String>,
+    },
 }
 
 /// Response sent from guest to host.
@@ -420,6 +451,30 @@ pub enum Response {
         code: i32,
         /// Human-readable error message.
         message: String,
+    },
+    /// Network setup completed successfully.
+    NetworkSetupOk {
+        /// ID of the originating [`NetworkSetup`](Request::NetworkSetup) request.
+        id: u64,
+    },
+    /// Network setup failed.
+    NetworkSetupError {
+        /// ID of the originating [`NetworkSetup`](Request::NetworkSetup) request.
+        id: u64,
+        /// Human-readable error description.
+        error: String,
+    },
+    /// Network teardown completed successfully.
+    NetworkTeardownOk {
+        /// ID of the originating [`NetworkTeardown`](Request::NetworkTeardown) request.
+        id: u64,
+    },
+    /// Network teardown failed.
+    NetworkTeardownError {
+        /// ID of the originating [`NetworkTeardown`](Request::NetworkTeardown) request.
+        id: u64,
+        /// Human-readable error description.
+        error: String,
     },
 }
 
@@ -642,6 +697,62 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).expect("serialize");
         assert!(json.contains(r#""type":"OciError""#));
+        let deserialized: Response = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(resp, deserialized);
+    }
+
+    #[test]
+    fn request_network_setup_round_trip() {
+        let req = Request::NetworkSetup {
+            id: 10,
+            stack_id: "my-stack".to_string(),
+            services: vec![
+                NetworkServiceConfig {
+                    name: "web".to_string(),
+                    addr: "172.20.0.2/24".to_string(),
+                },
+                NetworkServiceConfig {
+                    name: "db".to_string(),
+                    addr: "172.20.0.3/24".to_string(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains(r#""type":"NetworkSetup""#));
+        let deserialized: Request = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(req, deserialized);
+    }
+
+    #[test]
+    fn request_network_teardown_round_trip() {
+        let req = Request::NetworkTeardown {
+            id: 11,
+            stack_id: "my-stack".to_string(),
+            service_names: vec!["web".to_string(), "db".to_string()],
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains(r#""type":"NetworkTeardown""#));
+        let deserialized: Request = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(req, deserialized);
+    }
+
+    #[test]
+    fn response_network_setup_ok_round_trip() {
+        let resp = Response::NetworkSetupOk { id: 10 };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(json.contains(r#""type":"NetworkSetupOk""#));
+        let deserialized: Response = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(resp, deserialized);
+    }
+
+    #[test]
+    fn response_network_setup_error_round_trip() {
+        let resp = Response::NetworkSetupError {
+            id: 10,
+            error: "bridge creation failed".to_string(),
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(json.contains(r#""type":"NetworkSetupError""#));
         let deserialized: Response = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(resp, deserialized);
     }

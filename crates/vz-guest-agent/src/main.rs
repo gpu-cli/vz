@@ -8,6 +8,8 @@
 #![allow(unsafe_code)]
 
 mod listener;
+#[cfg(target_os = "linux")]
+mod network;
 mod process_table;
 
 use std::sync::Arc;
@@ -21,8 +23,8 @@ use tokio::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 use vz::protocol::{
-    self as protocol, AGENT_PORT, ChannelError, Handshake, HandshakeAck, PROTOCOL_VERSION, Request,
-    Response,
+    self as protocol, AGENT_PORT, ChannelError, Handshake, HandshakeAck, NetworkServiceConfig,
+    PROTOCOL_VERSION, Request, Response,
 };
 
 use crate::listener::VsockListener;
@@ -405,6 +407,20 @@ async fn dispatch_request<W>(
                 },
             )
             .await;
+        }
+        Request::NetworkSetup {
+            id,
+            stack_id,
+            services,
+        } => {
+            handle_network_setup(id, &stack_id, &services, &writer).await;
+        }
+        Request::NetworkTeardown {
+            id,
+            stack_id,
+            service_names,
+        } => {
+            handle_network_teardown(id, &stack_id, &service_names, &writer).await;
         }
     }
 }
@@ -1108,6 +1124,94 @@ async fn drain_processes(process_table: Arc<Mutex<ProcessTable>>) {
         }
     }
     table.clear();
+}
+
+// ── Network setup/teardown handlers ────────────────────────────────
+
+async fn handle_network_setup<W>(
+    id: u64,
+    stack_id: &str,
+    services: &[NetworkServiceConfig],
+    writer: &Arc<Mutex<W>>,
+) where
+    W: AsyncWrite + Unpin + Send,
+{
+    #[cfg(target_os = "linux")]
+    {
+        match network::setup_stack_network(stack_id, services) {
+            Ok(()) => {
+                info!(stack_id = %stack_id, services = services.len(), "network setup complete");
+                send_response(writer, &Response::NetworkSetupOk { id }).await;
+            }
+            Err(e) => {
+                error!(stack_id = %stack_id, error = %e, "network setup failed");
+                send_response(
+                    writer,
+                    &Response::NetworkSetupError {
+                        id,
+                        error: e.to_string(),
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (stack_id, services);
+        send_response(
+            writer,
+            &Response::NetworkSetupError {
+                id,
+                error: "network setup requires Linux".to_string(),
+            },
+        )
+        .await;
+    }
+}
+
+async fn handle_network_teardown<W>(
+    id: u64,
+    stack_id: &str,
+    service_names: &[String],
+    writer: &Arc<Mutex<W>>,
+) where
+    W: AsyncWrite + Unpin + Send,
+{
+    #[cfg(target_os = "linux")]
+    {
+        match network::teardown_stack_network(stack_id, service_names) {
+            Ok(()) => {
+                info!(stack_id = %stack_id, "network teardown complete");
+                send_response(writer, &Response::NetworkTeardownOk { id }).await;
+            }
+            Err(e) => {
+                error!(stack_id = %stack_id, error = %e, "network teardown failed");
+                send_response(
+                    writer,
+                    &Response::NetworkTeardownError {
+                        id,
+                        error: e.to_string(),
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (stack_id, service_names);
+        send_response(
+            writer,
+            &Response::NetworkTeardownError {
+                id,
+                error: "network teardown requires Linux".to_string(),
+            },
+        )
+        .await;
+    }
 }
 
 #[cfg(test)]
