@@ -450,6 +450,7 @@ impl Runtime {
         &self,
         stack_id: &str,
         ports: Vec<PortMapping>,
+        resources: vz_runtime_contract::StackResourceHint,
     ) -> Result<(), OciError> {
         // Guard against double-boot.
         if self.stack_vms.lock().await.contains_key(stack_id) {
@@ -479,8 +480,8 @@ impl Runtime {
         vm_config
             .shared_dirs
             .push(make_oci_runtime_share(&runtime_binary)?);
-        vm_config.cpus = self.config.default_cpus;
-        vm_config.memory_mb = self.config.default_memory_mb;
+        vm_config.cpus = resources.cpus.unwrap_or(self.config.default_cpus);
+        vm_config.memory_mb = resources.memory_mb.unwrap_or(self.config.default_memory_mb);
 
         // Debug: capture serial log for shared VM diagnostics.
         if let Ok(log_path) = std::env::var("VZ_STACK_SERIAL_LOG") {

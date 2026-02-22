@@ -8,11 +8,13 @@
 //! 5. Exit when all services are converged (running+ready or permanently failed).
 
 use std::collections::HashMap;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
 use crate::error::StackError;
+use crate::events::StackEvent;
 use crate::executor::{ContainerRuntime, ExecutionResult, StackExecutor};
 use crate::health::{HealthPollResult, HealthPoller};
 use crate::reconcile::{ApplyResult, apply};
@@ -118,6 +120,26 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
     /// Access the health poller.
     pub fn health_poller(&self) -> &HealthPoller {
         &self.health_poller
+    }
+
+    /// Subscribe to real-time stack events.
+    ///
+    /// Returns a [`mpsc::Receiver`] that receives a clone of every
+    /// [`StackEvent`] emitted by the orchestrator. Events originate
+    /// from both the executor (container lifecycle) and the reconciler
+    /// (apply/action planning); both are funnelled into the same channel.
+    ///
+    /// Events are also durably persisted to the SQLite store regardless
+    /// of whether a subscriber exists.
+    ///
+    /// Only one subscription is active at a time. Calling this again
+    /// replaces the previous subscription (the old receiver will see
+    /// no further events).
+    pub fn subscribe(&mut self) -> mpsc::Receiver<StackEvent> {
+        let (tx, rx) = mpsc::channel();
+        self.executor.store_mut().set_event_sender(tx.clone());
+        self.reconcile_store.set_event_sender(tx);
+        rx
     }
 
     /// Run the orchestration loop until convergence or max rounds.
@@ -476,5 +498,85 @@ mod tests {
         assert_eq!(result.rounds, 1);
         assert_eq!(result.services_ready, 0);
         assert_eq!(result.services_failed, 0);
+    }
+
+    // ── Real-time event streaming tests ──
+
+    #[test]
+    fn subscribe_receives_events() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
+        let (mut orch, _tmp) = make_orchestrator_shared(runtime);
+        let rx = orch.subscribe();
+
+        let spec = stack("app", vec![svc("web")]);
+        let result = orch.run(&spec, None).unwrap();
+        assert!(result.converged);
+
+        // Collect all events from the channel.
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        // Should have received lifecycle events.
+        assert!(!events.is_empty(), "subscriber should receive events");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::StackApplyStarted { .. })),
+            "should receive StackApplyStarted"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::ServiceCreating { .. })),
+            "should receive ServiceCreating"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::ServiceReady { .. })),
+            "should receive ServiceReady"
+        );
+    }
+
+    #[test]
+    fn subscribe_and_sqlite_both_receive_events() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
+        let (mut orch, _tmp) = make_orchestrator_shared(runtime);
+        let rx = orch.subscribe();
+
+        let spec = stack("app", vec![svc("web")]);
+        orch.run(&spec, None).unwrap();
+
+        // Channel events.
+        let mut channel_events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            channel_events.push(event);
+        }
+
+        // SQLite events.
+        let sqlite_events = orch.executor().store().load_events("app").unwrap();
+
+        // Both should have the same events.
+        assert_eq!(
+            channel_events.len(),
+            sqlite_events.len(),
+            "channel and SQLite should have same event count"
+        );
+    }
+
+    #[test]
+    fn no_subscriber_does_not_error() {
+        // Without calling subscribe(), events should still persist to SQLite.
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
+        let (mut orch, _tmp) = make_orchestrator_shared(runtime);
+        let spec = stack("app", vec![svc("web")]);
+
+        let result = orch.run(&spec, None).unwrap();
+        assert!(result.converged);
+
+        let events = orch.executor().store().load_events("app").unwrap();
+        assert!(!events.is_empty());
     }
 }

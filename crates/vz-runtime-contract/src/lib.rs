@@ -14,6 +14,7 @@ pub use selection::{HostBackend, ResolvedBackend};
 pub use types::{
     ContainerInfo, ContainerLogs, ContainerStatus, ExecConfig, ExecOutput, ImageInfo, MountAccess,
     MountSpec, MountType, NetworkServiceConfig, PortMapping, PortProtocol, PruneResult, RunConfig,
+    StackResourceHint,
 };
 
 /// Backend-neutral container runtime trait.
@@ -93,6 +94,7 @@ pub trait RuntimeBackend: Send + Sync {
         &self,
         _stack_id: &str,
         _ports: Vec<PortMapping>,
+        _resources: StackResourceHint,
     ) -> impl Future<Output = Result<(), RuntimeError>> {
         async { Ok(()) }
     }

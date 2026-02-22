@@ -359,11 +359,15 @@ impl ContainerRuntime for OciContainerRuntime {
         &self,
         stack_id: &str,
         ports: &[vz_runtime_contract::PortMapping],
+        resources: vz_runtime_contract::StackResourceHint,
     ) -> Result<(), StackError> {
         use vz_runtime_contract::RuntimeBackend;
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.backend.boot_shared_vm(stack_id, ports.to_vec()))
+                .block_on(
+                    self.backend
+                        .boot_shared_vm(stack_id, ports.to_vec(), resources),
+                )
                 .map_err(|e| StackError::Network(format!("boot_shared_vm failed: {e}")))
         })
     }

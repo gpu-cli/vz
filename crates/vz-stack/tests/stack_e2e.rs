@@ -119,10 +119,18 @@ impl ContainerRuntime for OciContainerRuntime {
         })
     }
 
-    fn boot_shared_vm(&self, stack_id: &str, ports: &[PortMapping]) -> Result<(), StackError> {
+    fn boot_shared_vm(
+        &self,
+        stack_id: &str,
+        ports: &[PortMapping],
+        resources: vz_runtime_contract::StackResourceHint,
+    ) -> Result<(), StackError> {
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.backend.boot_shared_vm(stack_id, ports.to_vec()))
+                .block_on(
+                    self.backend
+                        .boot_shared_vm(stack_id, ports.to_vec(), resources),
+                )
                 .map_err(|e| StackError::Network(format!("boot_shared_vm failed: {e}")))
         })
     }

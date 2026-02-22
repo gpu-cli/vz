@@ -440,7 +440,9 @@ async fn shared_vm_inter_service_connectivity() {
     let stack_id = "e2e-net";
 
     // 1. Boot shared VM.
-    rt.boot_shared_vm(stack_id, vec![]).await.unwrap();
+    rt.boot_shared_vm(stack_id, vec![], Default::default())
+        .await
+        .unwrap();
 
     // 2. Set up per-service networking.
     let services = vec![

@@ -419,6 +419,7 @@ impl RuntimeBackend for LinuxNativeBackend {
         &self,
         stack_id: &str,
         ports: Vec<contract::PortMapping>,
+        _resources: contract::StackResourceHint,
     ) -> Result<(), RuntimeError> {
         let mut stacks = self.stacks.lock().await;
         if stacks.contains_key(stack_id) {

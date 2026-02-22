@@ -157,7 +157,7 @@ impl RuntimeAdapter for OciRuntimeAdapter {
             // 2. Boot shared VM.
             info!("Booting shared VM for stack: {stack_id}");
             self.runtime
-                .boot_shared_vm(&stack_id, vec![])
+                .boot_shared_vm(&stack_id, vec![], Default::default())
                 .await
                 .map_err(|e| format!("boot_shared_vm failed: {e}"))?;
 

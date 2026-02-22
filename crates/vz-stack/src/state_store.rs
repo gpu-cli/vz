@@ -6,6 +6,7 @@
 //! - **Events**: structured lifecycle events for observability
 
 use std::path::Path;
+use std::sync::mpsc;
 
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -52,13 +53,18 @@ pub struct ServiceObservedState {
 /// Durable state store backed by a single SQLite database file.
 pub struct StateStore {
     conn: Connection,
+    /// Optional real-time event sender for streaming subscribers.
+    event_sender: Option<mpsc::Sender<StackEvent>>,
 }
 
 impl StateStore {
     /// Open or create a state store at the given path.
     pub fn open(path: &Path) -> Result<Self, StackError> {
         let conn = Connection::open(path)?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            event_sender: None,
+        };
         store.init_schema()?;
         Ok(store)
     }
@@ -66,9 +72,21 @@ impl StateStore {
     /// Create an in-memory state store (useful for testing).
     pub fn in_memory() -> Result<Self, StackError> {
         let conn = Connection::open_in_memory()?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            event_sender: None,
+        };
         store.init_schema()?;
         Ok(store)
+    }
+
+    /// Attach an event channel sender for real-time streaming.
+    ///
+    /// When set, [`emit_event`](Self::emit_event) will send a clone of each
+    /// event through this channel in addition to persisting it to SQLite.
+    /// Sending failures (receiver dropped) are silently ignored.
+    pub fn set_event_sender(&mut self, sender: mpsc::Sender<StackEvent>) {
+        self.event_sender = Some(sender);
     }
 
     fn init_schema(&self) -> Result<(), StackError> {
@@ -169,12 +187,21 @@ impl StateStore {
     }
 
     /// Append a structured event to the event log.
+    ///
+    /// The event is always persisted to SQLite. If a real-time event
+    /// sender has been attached via [`set_event_sender`](Self::set_event_sender),
+    /// a clone of the event is also pushed through the channel. Send
+    /// failures (receiver dropped) are silently ignored.
     pub fn emit_event(&self, stack_name: &str, event: &StackEvent) -> Result<(), StackError> {
         let json = serde_json::to_string(event)?;
         self.conn.execute(
             "INSERT INTO events (stack_name, event_json) VALUES (?1, ?2)",
             params![stack_name, json],
         )?;
+        // Push to real-time subscribers (ignore if receiver dropped).
+        if let Some(ref sender) = self.event_sender {
+            let _ = sender.send(event.clone());
+        }
         Ok(())
     }
 
@@ -718,5 +745,68 @@ mod tests {
 
         let loaded = store.load_events("myapp").unwrap();
         assert_eq!(loaded, events);
+    }
+
+    // ── Real-time event streaming tests ──
+
+    #[test]
+    fn emit_event_sends_to_channel() {
+        use std::sync::mpsc;
+
+        let mut store = StateStore::in_memory().unwrap();
+        let (tx, rx) = mpsc::channel();
+        store.set_event_sender(tx);
+
+        store
+            .emit_event(
+                "test",
+                &StackEvent::StackDestroyed {
+                    stack_name: "test".to_string(),
+                },
+            )
+            .unwrap();
+
+        let received = rx.try_recv().unwrap();
+        assert!(matches!(received, StackEvent::StackDestroyed { .. }));
+    }
+
+    #[test]
+    fn emit_event_without_sender_works() {
+        let store = StateStore::in_memory().unwrap();
+        // No sender set — should not error.
+        store
+            .emit_event(
+                "test",
+                &StackEvent::StackDestroyed {
+                    stack_name: "test".to_string(),
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn emit_event_ignores_dropped_receiver() {
+        use std::sync::mpsc;
+
+        let mut store = StateStore::in_memory().unwrap();
+        let (tx, rx) = mpsc::channel();
+        store.set_event_sender(tx);
+
+        // Drop the receiver so sends fail.
+        drop(rx);
+
+        // Should not error even though receiver is gone.
+        store
+            .emit_event(
+                "test",
+                &StackEvent::StackDestroyed {
+                    stack_name: "test".to_string(),
+                },
+            )
+            .unwrap();
+
+        // Event should still be persisted to SQLite.
+        let events = store.load_events("test").unwrap();
+        assert_eq!(events.len(), 1);
     }
 }

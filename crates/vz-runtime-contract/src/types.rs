@@ -231,6 +231,19 @@ pub struct NetworkServiceConfig {
     pub addr: String,
 }
 
+/// Aggregate resource hints for sizing a shared stack VM.
+///
+/// When multiple services define CPU/memory limits, the stack executor
+/// computes an aggregate and passes it to the runtime backend so the
+/// shared VM gets enough CPU cores and memory.
+#[derive(Debug, Clone, Default)]
+pub struct StackResourceHint {
+    /// Suggested CPU cores for the VM (max of all service limits, ceiling).
+    pub cpus: Option<u8>,
+    /// Suggested memory in MB for the VM (sum of all service limits).
+    pub memory_mb: Option<u64>,
+}
+
 /// Container log output.
 #[derive(Debug, Clone, Default)]
 pub struct ContainerLogs {

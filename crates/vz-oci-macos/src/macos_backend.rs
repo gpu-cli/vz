@@ -116,11 +116,12 @@ impl RuntimeBackend for MacosRuntimeBackend {
         &self,
         stack_id: &str,
         ports: Vec<contract::PortMapping>,
+        resources: contract::StackResourceHint,
     ) -> Result<(), RuntimeError> {
         let oci_ports: Vec<oci_config::PortMapping> =
             ports.into_iter().map(port_mapping_from_contract).collect();
         self.runtime
-            .boot_shared_vm(stack_id, oci_ports)
+            .boot_shared_vm(stack_id, oci_ports, resources)
             .await
             .map_err(oci_err)
     }

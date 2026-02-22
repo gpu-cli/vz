@@ -66,6 +66,7 @@ pub trait ContainerRuntime: Send + Sync {
         &self,
         _stack_id: &str,
         _ports: &[vz_runtime_contract::PortMapping],
+        _resources: vz_runtime_contract::StackResourceHint,
     ) -> Result<(), StackError> {
         Ok(())
     }
@@ -295,6 +296,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         &self.store
     }
 
+    /// Mutably access the underlying state store.
+    pub fn store_mut(&mut self) -> &mut StateStore {
+        &mut self.store
+    }
+
     /// Access the volume manager.
     pub fn volumes(&self) -> &VolumeManager {
         &self.volumes
@@ -378,8 +384,32 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 })
                 .collect();
 
+            // Compute aggregate resource hints for VM sizing.
+            let resources = {
+                let max_cpus = spec
+                    .services
+                    .iter()
+                    .filter_map(|s| s.resources.cpus)
+                    .map(|c| c.ceil() as u8)
+                    .max();
+                let total_memory_mb = {
+                    let sum: u64 = spec
+                        .services
+                        .iter()
+                        .filter_map(|s| s.resources.memory_bytes)
+                        .map(|b| b / (1024 * 1024))
+                        .sum();
+                    if sum > 0 { Some(sum) } else { None }
+                };
+                vz_runtime_contract::StackResourceHint {
+                    cpus: max_cpus,
+                    memory_mb: total_memory_mb,
+                }
+            };
+
             info!(stack = %spec.name, services = spec.services.len(), "booting shared VM");
-            self.runtime.boot_shared_vm(&spec.name, &all_ports)?;
+            self.runtime
+                .boot_shared_vm(&spec.name, &all_ports, resources)?;
 
             // Set up per-service network namespaces.
             let network_services: Vec<vz_runtime_contract::NetworkServiceConfig> = spec
@@ -971,6 +1001,7 @@ pub(crate) mod tests_support {
             &self,
             stack_id: &str,
             ports: &[vz_runtime_contract::PortMapping],
+            _resources: vz_runtime_contract::StackResourceHint,
         ) -> Result<(), StackError> {
             self.calls.lock().unwrap().push((
                 "boot_shared_vm".to_string(),
@@ -2229,5 +2260,46 @@ mod tests {
             db_idx < web_idx,
             "db must be created before web (dependency)"
         );
+    }
+
+    #[test]
+    fn resource_hints_passed_to_boot_shared_vm() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-db"]);
+        let mut executor = make_executor(runtime);
+
+        let spec = stack(
+            "resapp",
+            vec![
+                ServiceSpec {
+                    resources: ResourcesSpec {
+                        cpus: Some(2.0),
+                        memory_bytes: Some(512 * 1024 * 1024), // 512 MiB
+                    },
+                    ..svc("web", "nginx:latest")
+                },
+                ServiceSpec {
+                    resources: ResourcesSpec {
+                        cpus: Some(4.0),
+                        memory_bytes: Some(1024 * 1024 * 1024), // 1 GiB
+                    },
+                    ..svc("db", "postgres:16")
+                },
+            ],
+        );
+
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+        ];
+
+        let result = executor.execute(&spec, &actions).unwrap();
+        assert!(result.all_succeeded());
+        // Verify boot_shared_vm was called (indicating shared VM was used).
+        let calls = executor.runtime.call_log();
+        assert!(calls.iter().any(|(op, _)| op == "boot_shared_vm"));
     }
 }
