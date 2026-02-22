@@ -563,3 +563,160 @@ services:
         .runtime()
         .shutdown_shared_vm("real-svc");
 }
+
+/// End-to-end test for exec via Unix control socket.
+///
+/// Boots Redis, starts a control socket listener, connects a client
+/// through the socket, runs `redis-cli PING`, and validates the response.
+/// This tests the full `vz stack exec` pipe: socket → container lookup →
+/// exec_with_output → response serialization.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn exec_via_control_socket() {
+    use serde::{Deserialize, Serialize};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{UnixListener, UnixStream};
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,vz_oci=debug,vz_linux=debug,vz_stack=debug")
+        .with_test_writer()
+        .try_init();
+
+    let yaml = r#"
+services:
+  cache:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+"#;
+
+    // Use persistent data dir for image cache.
+    let home = std::env::var("HOME").unwrap();
+    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    std::fs::create_dir_all(&oci_data).unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("state.db");
+
+    let spec = parse_compose(yaml, "exec-sock").unwrap();
+    let bridge = OciContainerRuntime::new(&oci_data);
+    let exec_store = StateStore::open(&db_path).unwrap();
+    let reconcile_store = StateStore::open(&db_path).unwrap();
+    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+
+    let orch_config = OrchestrationConfig {
+        poll_interval: Some(2),
+        max_rounds: 20,
+    };
+    let mut orchestrator = StackOrchestrator::new(executor, reconcile_store, orch_config);
+    let result = orchestrator.run(&spec, None).unwrap();
+    assert!(result.converged, "Redis should converge");
+    assert_eq!(result.services_ready, 1);
+
+    // Set up control socket.
+    let sock_path = tmp.path().join("control.sock");
+    let listener = UnixListener::bind(&sock_path).unwrap();
+
+    // JSON protocol structs (mirrors vz-cli's ControlRequest/ControlResponse).
+    #[derive(Debug, Serialize, Deserialize)]
+    struct Req {
+        service: String,
+        cmd: Vec<String>,
+    }
+    #[derive(Debug, Serialize, Deserialize)]
+    struct Resp {
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+        error: Option<String>,
+    }
+
+    // Spawn a client task that sends the exec request through the socket.
+    let client_sock_path = sock_path.clone();
+    let client = tokio::spawn(async move {
+        // Small delay to let the server start accepting.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let stream = UnixStream::connect(&client_sock_path).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+
+        let req = Req {
+            service: "cache".into(),
+            cmd: vec!["redis-cli".into(), "PING".into()],
+        };
+        let mut json = serde_json::to_string(&req).unwrap();
+        json.push('\n');
+        writer.write_all(json.as_bytes()).await.unwrap();
+        writer.flush().await.unwrap();
+
+        let mut lines = BufReader::new(reader).lines();
+        let line = lines.next_line().await.unwrap().unwrap();
+        serde_json::from_str::<Resp>(&line).unwrap()
+    });
+
+    // Server: accept the connection on the main task (which owns the orchestrator).
+    let (stream, _) = listener.accept().await.unwrap();
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    let line = lines.next_line().await.unwrap().unwrap();
+    let req: Req = serde_json::from_str(&line).unwrap();
+
+    // Look up container ID from state.
+    let observed = orchestrator
+        .executor()
+        .store()
+        .load_observed_state("exec-sock")
+        .unwrap();
+    let svc = observed
+        .iter()
+        .find(|o| o.service_name == req.service)
+        .unwrap();
+    let container_id = svc.container_id.as_ref().unwrap();
+
+    // Execute via the ORIGINAL runtime (which owns the VM handles).
+    let (exit_code, stdout, stderr) = orchestrator
+        .executor()
+        .runtime()
+        .exec_with_output(container_id, req.cmd);
+
+    let resp = Resp {
+        exit_code,
+        stdout,
+        stderr,
+        error: None,
+    };
+    let mut json = serde_json::to_string(&resp).unwrap();
+    json.push('\n');
+    writer.write_all(json.as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+
+    // Wait for the client and validate the response it received.
+    let client_resp = client.await.unwrap();
+    assert_eq!(
+        client_resp.exit_code, 0,
+        "redis-cli PING via socket should succeed"
+    );
+    assert!(
+        client_resp.stdout.contains("PONG"),
+        "response stdout should contain 'PONG': {}",
+        client_resp.stdout
+    );
+    assert!(client_resp.error.is_none(), "no error expected");
+
+    // Teardown.
+    let down_spec = vz_stack::StackSpec {
+        name: "exec-sock".to_string(),
+        services: vec![],
+        networks: vec![],
+        volumes: vec![],
+        secrets: vec![],
+    };
+    let _ = orchestrator.run(&down_spec, None);
+    let _ = orchestrator
+        .executor()
+        .runtime()
+        .shutdown_shared_vm("exec-sock");
+}

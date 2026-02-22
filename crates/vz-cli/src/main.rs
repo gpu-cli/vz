@@ -364,6 +364,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_stack_exec() {
+        let cli = Cli::try_parse_from([
+            "vz", "stack", "exec", "myapp", "db", "--", "psql", "-U", "app",
+        ])
+        .expect("parse");
+        if let Commands::Stack(ref args) = cli.command {
+            if let commands::stack::StackCommand::Exec(ref exec) = args.action {
+                assert_eq!(exec.name, "myapp");
+                assert_eq!(exec.service, "db");
+                assert_eq!(exec.command, vec!["psql", "-U", "app"]);
+            } else {
+                panic!("expected Exec");
+            }
+        } else {
+            panic!("expected Stack");
+        }
+    }
+
+    #[test]
     fn parse_validate_run() {
         let cli = Cli::try_parse_from(["vz", "validate", "run", "--tier", "1"]).expect("parse");
         assert!(matches!(

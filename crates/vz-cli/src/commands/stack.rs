@@ -1,15 +1,23 @@
 //! `vz stack` — multi-service stack lifecycle commands.
 //!
-//! Provides `up`, `down`, `ps`, and `events` subcommands backed by
-//! the `vz-stack` control plane. The [`OciContainerRuntime`] bridges
-//! the async `vz_oci::Runtime` to the sync [`ContainerRuntime`] trait
-//! using `block_in_place` + `block_on`.
+//! Provides `up`, `down`, `ps`, `events`, `logs`, and `exec` subcommands
+//! backed by the `vz-stack` control plane. The [`OciContainerRuntime`]
+//! bridges the async `vz_oci::Runtime` to the sync [`ContainerRuntime`]
+//! trait using `block_in_place` + `block_on`.
+//!
+//! ## Exec Architecture
+//!
+//! `vz stack up` (foreground mode) keeps the VM alive after convergence
+//! and listens on a Unix socket at `~/.vz/stacks/<name>/control.sock`.
+//! `vz stack exec` connects to that socket to execute commands inside
+//! running service containers.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use vz_stack::{
@@ -41,6 +49,9 @@ pub enum StackCommand {
 
     /// Show service logs (event history and container output).
     Logs(LogsArgs),
+
+    /// Execute a command in a running service container.
+    Exec(ExecArgs),
 }
 
 #[derive(Args, Debug)]
@@ -135,6 +146,39 @@ pub struct LogsArgs {
     pub state_dir: Option<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+pub struct ExecArgs {
+    /// Stack name.
+    pub name: String,
+
+    /// Service to execute the command in.
+    pub service: String,
+
+    /// Command and arguments to execute.
+    #[arg(last = true, required = true)]
+    pub command: Vec<String>,
+
+    /// State directory for stack persistence.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+}
+
+/// JSON protocol for exec requests over the control socket.
+#[derive(Debug, Serialize, Deserialize)]
+struct ControlRequest {
+    service: String,
+    cmd: Vec<String>,
+}
+
+/// JSON protocol for exec responses over the control socket.
+#[derive(Debug, Serialize, Deserialize)]
+struct ControlResponse {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+    error: Option<String>,
+}
+
 pub async fn run(args: StackArgs) -> anyhow::Result<()> {
     match args.action {
         StackCommand::Up(args) => cmd_up(args).await,
@@ -142,6 +186,7 @@ pub async fn run(args: StackArgs) -> anyhow::Result<()> {
         StackCommand::Ps(args) => cmd_ps(args).await,
         StackCommand::Events(args) => cmd_events(args).await,
         StackCommand::Logs(args) => cmd_logs(args).await,
+        StackCommand::Exec(args) => cmd_exec(args).await,
     }
 }
 
@@ -166,6 +211,23 @@ impl OciContainerRuntime {
         let runtime = vz_oci::Runtime::new(config);
         let handle = tokio::runtime::Handle::current();
         Ok(Self { runtime, handle })
+    }
+
+    /// Execute a command in a running container and capture output.
+    fn exec_with_output(
+        &self,
+        container_id: &str,
+        cmd: Vec<String>,
+    ) -> Result<vz::protocol::ExecOutput, StackError> {
+        tokio::task::block_in_place(|| {
+            let exec_config = vz_oci::ExecConfig {
+                cmd,
+                ..Default::default()
+            };
+            self.handle
+                .block_on(self.runtime.exec_container(container_id, exec_config))
+                .map_err(|e| StackError::Network(format!("exec failed: {e}")))
+        })
     }
 }
 
@@ -363,7 +425,8 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
             result.services_ready, result.services_failed
         );
     } else {
-        // Foreground mode: full orchestration loop until convergence.
+        // Foreground mode: full orchestration loop until convergence,
+        // then keep the VM alive with a control socket for `vz stack exec`.
         let mut orchestrator =
             StackOrchestrator::new(executor, reconcile_store, OrchestrationConfig::default());
 
@@ -395,9 +458,256 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
         if !result.converged {
             bail!("stack did not converge");
         }
+
+        // Keep the VM alive and listen for exec requests until ctrl-C.
+        let sock_path = state_dir.join("control.sock");
+        serve_control_socket(&sock_path, &spec, &orchestrator).await?;
+
+        // Teardown on exit.
+        info!(stack = %spec.name, "shutting down stack");
+        let teardown_store = StateStore::open(&db_path)
+            .with_context(|| "failed to open teardown state store")?;
+        let empty_spec = StackSpec {
+            name: spec.name.clone(),
+            services: vec![],
+            networks: vec![],
+            volumes: vec![],
+            secrets: vec![],
+        };
+        let health_statuses = HashMap::new();
+        let teardown_actions = vz_stack::apply(&empty_spec, &teardown_store, &health_statuses)
+            .with_context(|| "teardown apply failed")?;
+        if !teardown_actions.actions.is_empty() {
+            let mut teardown_executor = StackExecutor::new(
+                OciContainerRuntime::new(&state_dir)
+                    .with_context(|| "failed to create teardown runtime")?,
+                StateStore::open(&db_path)
+                    .with_context(|| "failed to open teardown exec store")?,
+                &state_dir,
+            );
+            let _ = teardown_executor.execute(&empty_spec, &teardown_actions.actions);
+        }
+        println!("\nStack stopped.");
     }
 
     Ok(())
+}
+
+// ── control socket (for exec) ─────────────────────────────────────
+
+/// Listen on a Unix socket for exec requests until ctrl-C.
+///
+/// The socket accepts one connection at a time. Each connection sends
+/// a JSON [`ControlRequest`] (newline-terminated) and receives a JSON
+/// [`ControlResponse`] (newline-terminated) back.
+async fn serve_control_socket(
+    sock_path: &Path,
+    spec: &StackSpec,
+    orchestrator: &StackOrchestrator<OciContainerRuntime>,
+) -> anyhow::Result<()> {
+    use tokio::net::UnixListener;
+
+    // Clean up stale socket from a previous run.
+    let _ = std::fs::remove_file(sock_path);
+
+    let listener = UnixListener::bind(sock_path)
+        .with_context(|| format!("failed to bind control socket: {}", sock_path.display()))?;
+
+    println!("Listening for exec requests on {}", sock_path.display());
+    println!("Press Ctrl+C to stop.\n");
+
+    // Wait for ctrl-C in parallel with accepting connections.
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                info!("ctrl-C received, shutting down");
+                break;
+            }
+            accept = listener.accept() => {
+                match accept {
+                    Ok((stream, _)) => {
+                        handle_control_connection(stream, spec, orchestrator).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to accept connection");
+                    }
+                }
+            }
+        }
+    }
+
+    // Remove socket file on exit.
+    let _ = std::fs::remove_file(sock_path);
+    Ok(())
+}
+
+/// Handle a single exec request on a control socket connection.
+async fn handle_control_connection(
+    stream: tokio::net::UnixStream,
+    spec: &StackSpec,
+    orchestrator: &StackOrchestrator<OciContainerRuntime>,
+) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    let line = match lines.next_line().await {
+        Ok(Some(line)) => line,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read from control socket");
+            return;
+        }
+    };
+
+    let request: ControlRequest = match serde_json::from_str(&line) {
+        Ok(req) => req,
+        Err(e) => {
+            let resp = ControlResponse {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: Some(format!("invalid request: {e}")),
+            };
+            let _ = write_response(&mut writer, &resp).await;
+            return;
+        }
+    };
+
+    // Look up the container ID for this service from observed state.
+    let store = orchestrator.executor().store();
+    let observed = match store.load_observed_state(&spec.name) {
+        Ok(o) => o,
+        Err(e) => {
+            let resp = ControlResponse {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: Some(format!("failed to load state: {e}")),
+            };
+            let _ = write_response(&mut writer, &resp).await;
+            return;
+        }
+    };
+
+    let svc_state = observed
+        .iter()
+        .find(|o| o.service_name == request.service);
+
+    let container_id = match svc_state.and_then(|s| s.container_id.as_deref()) {
+        Some(id) => id,
+        None => {
+            let resp = ControlResponse {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: Some(format!("service '{}' is not running", request.service)),
+            };
+            let _ = write_response(&mut writer, &resp).await;
+            return;
+        }
+    };
+
+    info!(
+        service = %request.service,
+        container = %container_id,
+        cmd = ?request.cmd,
+        "exec request"
+    );
+
+    let runtime = orchestrator.executor().runtime();
+    let resp = match runtime.exec_with_output(container_id, request.cmd) {
+        Ok(output) => ControlResponse {
+            exit_code: output.exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+            error: None,
+        },
+        Err(e) => ControlResponse {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: Some(format!("{e}")),
+        },
+    };
+
+    let _ = write_response(&mut writer, &resp).await;
+}
+
+async fn write_response(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    resp: &ControlResponse,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut json = serde_json::to_string(resp)?;
+    json.push('\n');
+    writer.write_all(json.as_bytes()).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+// ── exec ──────────────────────────────────────────────────────────
+
+/// Connect to a running `vz stack up` session and execute a command.
+async fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let state_dir = resolve_state_dir(args.state_dir.as_deref(), &args.name)?;
+    let sock_path = state_dir.join("control.sock");
+
+    if !sock_path.exists() {
+        bail!(
+            "stack '{}' is not running in foreground mode.\n\
+             Start it with: vz stack up -f <compose.yaml>",
+            args.name
+        );
+    }
+
+    let stream = UnixStream::connect(&sock_path)
+        .await
+        .with_context(|| format!("failed to connect to control socket: {}", sock_path.display()))?;
+
+    let (reader, mut writer) = stream.into_split();
+
+    // Send the exec request.
+    let request = ControlRequest {
+        service: args.service,
+        cmd: args.command,
+    };
+    let mut json = serde_json::to_string(&request)?;
+    json.push('\n');
+    writer.write_all(json.as_bytes()).await?;
+    writer.flush().await?;
+
+    // Read the response.
+    let mut lines = BufReader::new(reader).lines();
+    let line = lines
+        .next_line()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("control socket closed without response"))?;
+
+    let resp: ControlResponse = serde_json::from_str(&line)
+        .with_context(|| "failed to parse control response")?;
+
+    if let Some(err) = resp.error {
+        bail!("{err}");
+    }
+
+    // Print captured output.
+    if !resp.stdout.is_empty() {
+        print!("{}", resp.stdout);
+    }
+    if !resp.stderr.is_empty() {
+        eprint!("{}", resp.stderr);
+    }
+
+    std::process::exit(resp.exit_code);
 }
 
 // ── down ───────────────────────────────────────────────────────────
@@ -1014,5 +1324,102 @@ mod tests {
             }],
         };
         print_apply_result(&result);
+    }
+
+    #[test]
+    fn control_request_serde_roundtrip() {
+        let req = ControlRequest {
+            service: "db".into(),
+            cmd: vec!["psql".into(), "-U".into(), "app".into()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: ControlRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.service, "db");
+        assert_eq!(parsed.cmd, vec!["psql", "-U", "app"]);
+    }
+
+    #[test]
+    fn control_response_serde_roundtrip() {
+        let resp = ControlResponse {
+            exit_code: 0,
+            stdout: "1 row\n".into(),
+            stderr: String::new(),
+            error: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: ControlResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.exit_code, 0);
+        assert_eq!(parsed.stdout, "1 row\n");
+        assert!(parsed.error.is_none());
+    }
+
+    #[test]
+    fn control_response_with_error() {
+        let resp = ControlResponse {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: Some("service 'web' is not running".into()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: ControlResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.error.unwrap(), "service 'web' is not running");
+    }
+
+    #[tokio::test]
+    async fn control_socket_roundtrip() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::{UnixListener, UnixStream};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("test.sock");
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        // Spawn a server that echoes back a fixed response.
+        let server_path = sock_path.clone();
+        let server = tokio::spawn(async move {
+            let _ = server_path; // keep the path alive
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let line = lines.next_line().await.unwrap().unwrap();
+            let req: ControlRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(req.service, "cache");
+            assert_eq!(req.cmd, vec!["redis-cli", "PING"]);
+
+            let resp = ControlResponse {
+                exit_code: 0,
+                stdout: "PONG\n".into(),
+                stderr: String::new(),
+                error: None,
+            };
+            let mut json = serde_json::to_string(&resp).unwrap();
+            json.push('\n');
+            writer.write_all(json.as_bytes()).await.unwrap();
+            writer.flush().await.unwrap();
+        });
+
+        // Client sends a request and reads the response.
+        let stream = UnixStream::connect(&sock_path).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+
+        let req = ControlRequest {
+            service: "cache".into(),
+            cmd: vec!["redis-cli".into(), "PING".into()],
+        };
+        let mut json = serde_json::to_string(&req).unwrap();
+        json.push('\n');
+        writer.write_all(json.as_bytes()).await.unwrap();
+        writer.flush().await.unwrap();
+
+        let mut lines = BufReader::new(reader).lines();
+        let line = lines.next_line().await.unwrap().unwrap();
+        let resp: ControlResponse = serde_json::from_str(&line).unwrap();
+        assert_eq!(resp.exit_code, 0);
+        assert_eq!(resp.stdout, "PONG\n");
+        assert!(resp.error.is_none());
+
+        server.await.unwrap();
     }
 }
