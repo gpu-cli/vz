@@ -34,22 +34,24 @@ pub struct ProcessOutput {
 
 /// Create a container from an OCI bundle.
 ///
-/// Runs: `<runtime> create <id> --bundle <bundle_path> [--root <state_dir>]`
+/// Runs: `<runtime> --root <state_dir> create <id> --bundle <bundle_path>`
 pub(crate) async fn oci_create(
     runtime_binary: &str,
     container_id: &str,
     bundle_path: &Path,
     state_dir: &Path,
 ) -> Result<(), LinuxNativeError> {
+    let state_dir_s = state_dir.to_string_lossy();
+    let bundle_path_s = bundle_path.to_string_lossy();
     let output = run_runtime_command(
         runtime_binary,
         &[
+            "--root",
+            &state_dir_s,
             "create",
             container_id,
             "--bundle",
-            &bundle_path.to_string_lossy(),
-            "--root",
-            &state_dir.to_string_lossy(),
+            &bundle_path_s,
         ],
         None,
     )
@@ -68,20 +70,16 @@ pub(crate) async fn oci_create(
 
 /// Start a created container.
 ///
-/// Runs: `<runtime> start <id> [--root <state_dir>]`
+/// Runs: `<runtime> --root <state_dir> start <id>`
 pub(crate) async fn oci_start(
     runtime_binary: &str,
     container_id: &str,
     state_dir: &Path,
 ) -> Result<(), LinuxNativeError> {
+    let state_dir_s = state_dir.to_string_lossy();
     let output = run_runtime_command(
         runtime_binary,
-        &[
-            "start",
-            container_id,
-            "--root",
-            &state_dir.to_string_lossy(),
-        ],
+        &["--root", &state_dir_s, "start", container_id],
         None,
     )
     .await?;
@@ -99,20 +97,16 @@ pub(crate) async fn oci_start(
 
 /// Get container state.
 ///
-/// Runs: `<runtime> state <id> [--root <state_dir>]`
+/// Runs: `<runtime> --root <state_dir> state <id>`
 pub(crate) async fn oci_state(
     runtime_binary: &str,
     container_id: &str,
     state_dir: &Path,
 ) -> Result<OciState, LinuxNativeError> {
+    let state_dir_s = state_dir.to_string_lossy();
     let output = run_runtime_command(
         runtime_binary,
-        &[
-            "state",
-            container_id,
-            "--root",
-            &state_dir.to_string_lossy(),
-        ],
+        &["--root", &state_dir_s, "state", container_id],
         None,
     )
     .await?;
@@ -153,10 +147,11 @@ pub(crate) async fn oci_exec(opts: ExecOptions<'_>) -> Result<ProcessOutput, Lin
         user,
         timeout,
     } = opts;
+    // --root is a global flag and must come before the subcommand.
     let mut args: Vec<String> = vec![
-        "exec".to_string(),
         "--root".to_string(),
         state_dir.to_string_lossy().into_owned(),
+        "exec".to_string(),
     ];
 
     if let Some(cwd) = cwd {
@@ -191,22 +186,17 @@ pub(crate) async fn oci_exec(opts: ExecOptions<'_>) -> Result<ProcessOutput, Lin
 
 /// Send a signal to a container.
 ///
-/// Runs: `<runtime> kill <id> <signal> [--root <state_dir>]`
+/// Runs: `<runtime> --root <state_dir> kill <id> <signal>`
 pub(crate) async fn oci_kill(
     runtime_binary: &str,
     container_id: &str,
     state_dir: &Path,
     signal: &str,
 ) -> Result<(), LinuxNativeError> {
+    let state_dir_s = state_dir.to_string_lossy();
     let output = run_runtime_command(
         runtime_binary,
-        &[
-            "kill",
-            "--root",
-            &state_dir.to_string_lossy(),
-            container_id,
-            signal,
-        ],
+        &["--root", &state_dir_s, "kill", container_id, signal],
         None,
     )
     .await?;
@@ -226,17 +216,15 @@ pub(crate) async fn oci_kill(
 
 /// Delete a container.
 ///
-/// Runs: `<runtime> delete [--force] <id> [--root <state_dir>]`
+/// Runs: `<runtime> --root <state_dir> delete [--force] <id>`
 pub(crate) async fn oci_delete(
     runtime_binary: &str,
     container_id: &str,
     state_dir: &Path,
     force: bool,
 ) -> Result<(), LinuxNativeError> {
-    let mut args = vec!["delete", "--root", &state_dir.to_string_lossy()];
-    // Need to own the string for the borrow checker
     let state_dir_str = state_dir.to_string_lossy().into_owned();
-    args = vec!["delete", "--root", &state_dir_str];
+    let mut args = vec!["--root", &*state_dir_str, "delete"];
 
     if force {
         args.push("--force");

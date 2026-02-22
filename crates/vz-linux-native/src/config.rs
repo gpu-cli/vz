@@ -68,10 +68,11 @@ pub struct LinuxNativeConfig {
 
 impl Default for LinuxNativeConfig {
     fn default() -> Self {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         Self {
             runtime: OciRuntime::default(),
             isolation: IsolationMode::default(),
-            data_dir: PathBuf::from("~/.vz/linux-native"),
+            data_dir: PathBuf::from(home).join(".vz/linux-native"),
             state_dir: None,
             bundle_dir: None,
         }
