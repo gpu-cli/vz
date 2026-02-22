@@ -282,10 +282,7 @@ fn compute_topo_levels<'a>(creates: &[&'a Action], spec: &StackSpec) -> Vec<Vec<
 /// Parse the base octets from a CIDR subnet string (e.g., `"172.20.1.0/24"` -> `[172, 20, 1, 0]`).
 fn parse_subnet_base(subnet: &str) -> [u8; 4] {
     let ip_part = subnet.split('/').next().unwrap_or("172.20.0.0");
-    let octets: Vec<u8> = ip_part
-        .split('.')
-        .filter_map(|o| o.parse().ok())
-        .collect();
+    let octets: Vec<u8> = ip_part.split('.').filter_map(|o| o.parse().ok()).collect();
     [
         octets.first().copied().unwrap_or(172),
         octets.get(1).copied().unwrap_or(20),
@@ -781,11 +778,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         // Auto-inject sibling service hostnames for inter-service resolution.
         // Issue 4: only inject hosts for services that share at least one network.
         if use_shared_vm {
-            let my_networks: HashSet<&str> = svc_spec
-                .networks
-                .iter()
-                .map(|n| n.as_str())
-                .collect();
+            let my_networks: HashSet<&str> = svc_spec.networks.iter().map(|n| n.as_str()).collect();
 
             for svc in &spec.services {
                 if svc.name == service_name {
@@ -2474,11 +2467,7 @@ mod tests {
         ];
 
         let result = executor.execute(&spec, &actions).unwrap();
-        assert!(
-            result.all_succeeded(),
-            "errors: {:?}",
-            result.errors
-        );
+        assert!(result.all_succeeded(), "errors: {:?}", result.errors);
 
         // Verify network configs: 4 entries (web@frontend, api@frontend, api@backend, db@backend).
         let captured = executor.runtime.captured_network_services.lock().unwrap();

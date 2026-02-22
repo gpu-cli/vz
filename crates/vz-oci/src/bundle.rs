@@ -5,9 +5,8 @@ use std::path::{Path, PathBuf};
 
 use oci_spec::runtime::{
     Capability, LinuxCapabilities, LinuxCapabilitiesBuilder, LinuxCpuBuilder, LinuxNamespaceType,
-    LinuxPidsBuilder, LinuxResourcesBuilder, Mount, MountBuilder, PosixRlimit,
-    PosixRlimitBuilder, PosixRlimitType, ProcessBuilder, RootBuilder, Spec, SpecBuilder, User,
-    UserBuilder, VERSION,
+    LinuxPidsBuilder, LinuxResourcesBuilder, Mount, MountBuilder, PosixRlimit, PosixRlimitBuilder,
+    PosixRlimitType, ProcessBuilder, RootBuilder, Spec, SpecBuilder, User, UserBuilder, VERSION,
 };
 
 use crate::error::OciError;
@@ -398,11 +397,7 @@ fn default_linux_mounts() -> Result<Vec<Mount>, OciError> {
             .destination("/proc")
             .typ("proc")
             .source("proc")
-            .options(vec![
-                "nosuid".into(),
-                "noexec".into(),
-                "nodev".into(),
-            ])
+            .options(vec!["nosuid".into(), "noexec".into(), "nodev".into()])
             .build()?,
         MountBuilder::default()
             .destination("/dev")
@@ -444,11 +439,7 @@ fn default_linux_mounts() -> Result<Vec<Mount>, OciError> {
             .destination("/dev/mqueue")
             .typ("mqueue")
             .source("mqueue")
-            .options(vec![
-                "nosuid".into(),
-                "noexec".into(),
-                "nodev".into(),
-            ])
+            .options(vec!["nosuid".into(), "noexec".into(), "nodev".into()])
             .build()?,
         MountBuilder::default()
             .destination("/sys")
@@ -665,9 +656,8 @@ fn convert_ulimits_to_rlimits(
     ulimits
         .iter()
         .map(|(name, soft, hard)| {
-            let rlimit_type = ulimit_name_to_rlimit_type(name).ok_or_else(|| {
-                OciError::InvalidConfig(format!("unknown ulimit name: {name}"))
-            })?;
+            let rlimit_type = ulimit_name_to_rlimit_type(name)
+                .ok_or_else(|| OciError::InvalidConfig(format!("unknown ulimit name: {name}")))?;
             PosixRlimitBuilder::default()
                 .typ(rlimit_type)
                 .soft(*soft)
@@ -1157,17 +1147,9 @@ mod tests {
         .unwrap();
 
         let spec = Spec::load(bundle_dir.join(OCI_CONFIG_FILENAME)).unwrap();
-        let linux = spec
-            .linux()
-            .as_ref()
-            .expect("linux section present");
-        let ns = linux
-            .namespaces()
-            .as_ref()
-            .expect("namespaces present");
-        let netns = ns
-            .iter()
-            .find(|n| n.typ() == LinuxNamespaceType::Network);
+        let linux = spec.linux().as_ref().expect("linux section present");
+        let ns = linux.namespaces().as_ref().expect("namespaces present");
+        let netns = ns.iter().find(|n| n.typ() == LinuxNamespaceType::Network);
         assert!(netns.is_none(), "network namespace should be removed");
     }
 
@@ -1184,10 +1166,7 @@ mod tests {
 
     #[test]
     fn wrap_cmd_with_log_redirect_quotes_args_with_spaces() {
-        let cmd = vec![
-            "echo".to_string(),
-            "hello world".to_string(),
-        ];
+        let cmd = vec!["echo".to_string(), "hello world".to_string()];
         let wrapped = wrap_cmd_with_log_redirect(&cmd);
         // shell_words::join should quote the argument with spaces.
         assert!(wrapped[2].contains("'hello world'"));
@@ -1204,7 +1183,11 @@ mod tests {
             &bundle_dir,
             &rootfs_source,
             BundleSpec {
-                cmd: vec!["redis-server".to_string(), "--appendonly".to_string(), "yes".to_string()],
+                cmd: vec![
+                    "redis-server".to_string(),
+                    "--appendonly".to_string(),
+                    "yes".to_string(),
+                ],
                 env: Vec::new(),
                 cwd: None,
                 user: None,
@@ -1235,5 +1218,395 @@ mod tests {
         assert_eq!(args[1], "-c");
         assert!(args[2].contains("exec redis-server --appendonly yes"));
         assert!(args[2].contains(CONTAINER_LOG_FILE));
+    }
+
+    // ── Security fields tests ────────────────────────────────────
+
+    #[test]
+    fn privileged_mode_grants_all_capabilities() {
+        let temp = unique_temp_dir("privileged");
+        let rootfs = temp.join("rootfs");
+        fs::create_dir_all(&rootfs).unwrap();
+
+        write_oci_bundle(
+            &temp.join("bundle"),
+            &rootfs,
+            BundleSpec {
+                cmd: vec!["/bin/sh".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: Vec::new(),
+                oci_annotations: Vec::new(),
+                network_namespace_path: None,
+                share_host_network: false,
+                cpu_quota: None,
+                cpu_period: None,
+                capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: true,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: None,
+                domainname: None,
+            },
+        )
+        .unwrap();
+
+        let spec = Spec::load(temp.join("bundle").join(OCI_CONFIG_FILENAME)).unwrap();
+        let process = spec.process().as_ref().unwrap();
+        let caps = process.capabilities().as_ref().unwrap();
+        let effective = caps.effective().as_ref().unwrap();
+        // Privileged mode should grant SysAdmin, NetAdmin, etc.
+        assert!(effective.contains(&Capability::SysAdmin));
+        assert!(effective.contains(&Capability::NetAdmin));
+    }
+
+    #[test]
+    fn cap_add_extends_defaults() {
+        let temp = unique_temp_dir("cap-add");
+        let rootfs = temp.join("rootfs");
+        fs::create_dir_all(&rootfs).unwrap();
+
+        write_oci_bundle(
+            &temp.join("bundle"),
+            &rootfs,
+            BundleSpec {
+                cmd: vec!["/bin/sh".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: Vec::new(),
+                oci_annotations: Vec::new(),
+                network_namespace_path: None,
+                share_host_network: false,
+                cpu_quota: None,
+                cpu_period: None,
+                capture_logs: false,
+                cap_add: vec!["SYS_ADMIN".to_string()],
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: None,
+                domainname: None,
+            },
+        )
+        .unwrap();
+
+        let spec = Spec::load(temp.join("bundle").join(OCI_CONFIG_FILENAME)).unwrap();
+        let caps = spec
+            .process()
+            .as_ref()
+            .unwrap()
+            .capabilities()
+            .as_ref()
+            .unwrap();
+        let effective = caps.effective().as_ref().unwrap();
+        assert!(effective.contains(&Capability::SysAdmin));
+        // Default caps still present
+        assert!(effective.contains(&Capability::Chown));
+    }
+
+    #[test]
+    fn cap_drop_removes_defaults() {
+        let temp = unique_temp_dir("cap-drop");
+        let rootfs = temp.join("rootfs");
+        fs::create_dir_all(&rootfs).unwrap();
+
+        write_oci_bundle(
+            &temp.join("bundle"),
+            &rootfs,
+            BundleSpec {
+                cmd: vec!["/bin/sh".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: Vec::new(),
+                oci_annotations: Vec::new(),
+                network_namespace_path: None,
+                share_host_network: false,
+                cpu_quota: None,
+                cpu_period: None,
+                capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: vec!["NET_RAW".to_string()],
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: None,
+                domainname: None,
+            },
+        )
+        .unwrap();
+
+        let spec = Spec::load(temp.join("bundle").join(OCI_CONFIG_FILENAME)).unwrap();
+        let caps = spec
+            .process()
+            .as_ref()
+            .unwrap()
+            .capabilities()
+            .as_ref()
+            .unwrap();
+        let effective = caps.effective().as_ref().unwrap();
+        assert!(!effective.contains(&Capability::NetRaw));
+        // Other defaults still present
+        assert!(effective.contains(&Capability::Chown));
+    }
+
+    #[test]
+    fn read_only_rootfs_sets_root_readonly() {
+        let temp = unique_temp_dir("read-only");
+        let rootfs = temp.join("rootfs");
+        fs::create_dir_all(&rootfs).unwrap();
+
+        write_oci_bundle(
+            &temp.join("bundle"),
+            &rootfs,
+            BundleSpec {
+                cmd: vec!["/bin/sh".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: Vec::new(),
+                oci_annotations: Vec::new(),
+                network_namespace_path: None,
+                share_host_network: false,
+                cpu_quota: None,
+                cpu_period: None,
+                capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: true,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: None,
+                domainname: None,
+            },
+        )
+        .unwrap();
+
+        let spec = Spec::load(temp.join("bundle").join(OCI_CONFIG_FILENAME)).unwrap();
+        let root = spec.root().as_ref().unwrap();
+        assert!(root.readonly().unwrap_or(false));
+    }
+
+    #[test]
+    fn sysctls_applied_to_linux_section() {
+        let temp = unique_temp_dir("sysctls");
+        let rootfs = temp.join("rootfs");
+        fs::create_dir_all(&rootfs).unwrap();
+
+        let mut params = HashMap::new();
+        params.insert("net.core.somaxconn".to_string(), "1024".to_string());
+
+        write_oci_bundle(
+            &temp.join("bundle"),
+            &rootfs,
+            BundleSpec {
+                cmd: vec!["/bin/sh".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: Vec::new(),
+                oci_annotations: Vec::new(),
+                network_namespace_path: None,
+                share_host_network: false,
+                cpu_quota: None,
+                cpu_period: None,
+                capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: params,
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: None,
+                domainname: None,
+            },
+        )
+        .unwrap();
+
+        let spec = Spec::load(temp.join("bundle").join(OCI_CONFIG_FILENAME)).unwrap();
+        let linux = spec.linux().as_ref().unwrap();
+        let sysctl = linux.sysctl().as_ref().unwrap();
+        assert_eq!(sysctl.get("net.core.somaxconn").unwrap(), "1024");
+    }
+
+    // ── Resource fields tests ────────────────────────────────────
+
+    #[test]
+    fn pids_limit_applied_to_linux_resources() {
+        let temp = unique_temp_dir("pids-limit");
+        let rootfs = temp.join("rootfs");
+        fs::create_dir_all(&rootfs).unwrap();
+
+        write_oci_bundle(
+            &temp.join("bundle"),
+            &rootfs,
+            BundleSpec {
+                cmd: vec!["/bin/sh".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: Vec::new(),
+                oci_annotations: Vec::new(),
+                network_namespace_path: None,
+                share_host_network: false,
+                cpu_quota: None,
+                cpu_period: None,
+                capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: Some(100),
+                hostname: None,
+                domainname: None,
+            },
+        )
+        .unwrap();
+
+        let spec = Spec::load(temp.join("bundle").join(OCI_CONFIG_FILENAME)).unwrap();
+        let linux = spec.linux().as_ref().unwrap();
+        let resources = linux.resources().as_ref().unwrap();
+        let pids = resources.pids().as_ref().unwrap();
+        assert_eq!(pids.limit(), 100);
+    }
+
+    #[test]
+    fn ulimits_applied_as_rlimits() {
+        let temp = unique_temp_dir("ulimits");
+        let rootfs = temp.join("rootfs");
+        fs::create_dir_all(&rootfs).unwrap();
+
+        write_oci_bundle(
+            &temp.join("bundle"),
+            &rootfs,
+            BundleSpec {
+                cmd: vec!["/bin/sh".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: Vec::new(),
+                oci_annotations: Vec::new(),
+                network_namespace_path: None,
+                share_host_network: false,
+                cpu_quota: None,
+                cpu_period: None,
+                capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: vec![("nofile".to_string(), 1024, 65536)],
+                pids_limit: None,
+                hostname: None,
+                domainname: None,
+            },
+        )
+        .unwrap();
+
+        let spec = Spec::load(temp.join("bundle").join(OCI_CONFIG_FILENAME)).unwrap();
+        let process = spec.process().as_ref().unwrap();
+        let rlimits = process.rlimits().as_ref().unwrap();
+        assert!(!rlimits.is_empty());
+        let nofile = rlimits
+            .iter()
+            .find(|r| r.typ() == PosixRlimitType::RlimitNofile)
+            .expect("should have RLIMIT_NOFILE");
+        assert_eq!(nofile.soft(), 1024);
+        assert_eq!(nofile.hard(), 65536);
+    }
+
+    // ── Container identity tests ─────────────────────────────────
+
+    #[test]
+    fn hostname_applied_to_spec() {
+        let temp = unique_temp_dir("hostname");
+        let rootfs = temp.join("rootfs");
+        fs::create_dir_all(&rootfs).unwrap();
+
+        write_oci_bundle(
+            &temp.join("bundle"),
+            &rootfs,
+            BundleSpec {
+                cmd: vec!["/bin/sh".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: Vec::new(),
+                oci_annotations: Vec::new(),
+                network_namespace_path: None,
+                share_host_network: false,
+                cpu_quota: None,
+                cpu_period: None,
+                capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: Some("my-host".to_string()),
+                domainname: None,
+            },
+        )
+        .unwrap();
+
+        let spec = Spec::load(temp.join("bundle").join(OCI_CONFIG_FILENAME)).unwrap();
+        assert_eq!(spec.hostname().as_deref(), Some("my-host"));
+    }
+
+    #[test]
+    fn domainname_applied_to_spec() {
+        let temp = unique_temp_dir("domainname");
+        let rootfs = temp.join("rootfs");
+        fs::create_dir_all(&rootfs).unwrap();
+
+        write_oci_bundle(
+            &temp.join("bundle"),
+            &rootfs,
+            BundleSpec {
+                cmd: vec!["/bin/sh".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: Vec::new(),
+                oci_annotations: Vec::new(),
+                network_namespace_path: None,
+                share_host_network: false,
+                cpu_quota: None,
+                cpu_period: None,
+                capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: None,
+                domainname: Some("example.com".to_string()),
+            },
+        )
+        .unwrap();
+
+        let spec = Spec::load(temp.join("bundle").join(OCI_CONFIG_FILENAME)).unwrap();
+        assert_eq!(spec.domainname().as_deref(), Some("example.com"));
     }
 }

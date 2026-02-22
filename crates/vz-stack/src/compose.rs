@@ -481,9 +481,9 @@ fn parse_service(
         .map(String::from);
     let labels = parse_labels(name, svc_map)?;
 
-    // Merge pids_limit into resources
+    // Merge pids_limit: service-level overrides deploy-level when present.
     let resources = ResourcesSpec {
-        pids_limit,
+        pids_limit: pids_limit.or(resources.pids_limit),
         ..resources
     };
 
@@ -1246,7 +1246,7 @@ fn parse_deploy(svc_name: &str, map: &serde_yml::Mapping) -> Result<ResourcesSpe
         }
     }
 
-    let (cpus, memory_bytes) = parse_resource_sub_section(svc_name, resources_map, "limits")?;
+    let (cpus, memory_bytes, pids_limit) = parse_limits_sub_section(svc_name, resources_map)?;
     let (reservation_cpus, reservation_memory_bytes) =
         parse_resource_sub_section(svc_name, resources_map, "reservations")?;
 
@@ -1255,8 +1255,88 @@ fn parse_deploy(svc_name: &str, map: &serde_yml::Mapping) -> Result<ResourcesSpe
         memory_bytes,
         reservation_cpus,
         reservation_memory_bytes,
-        pids_limit: None,
+        pids_limit,
     })
+}
+
+/// Parse the `limits` sub-section under `deploy.resources`, including `pids`.
+///
+/// Returns `(cpus, memory_bytes, pids_limit)`.
+#[allow(clippy::type_complexity)]
+fn parse_limits_sub_section(
+    svc_name: &str,
+    resources_map: &serde_yml::Mapping,
+) -> Result<(Option<f64>, Option<u64>, Option<i64>), StackError> {
+    let section = "limits";
+    let Some(section_value) = resources_map.get(val(section)) else {
+        return Ok((None, None, None));
+    };
+
+    if section_value.is_null() {
+        return Ok((None, None, None));
+    }
+
+    let section_map = section_value.as_mapping().ok_or_else(|| {
+        StackError::ComposeParse(format!(
+            "service `{svc_name}`: `deploy.resources.{section}` must be a mapping"
+        ))
+    })?;
+
+    for key in section_map.keys() {
+        let key_str = key.as_str().unwrap_or("");
+        if key_str != "cpus" && key_str != "memory" && key_str != "pids" {
+            return Err(StackError::ComposeUnsupportedFeature {
+                feature: format!("services.{svc_name}.deploy.resources.{section}.{key_str}"),
+                reason: format!(
+                    "only `cpus`, `memory`, and `pids` are supported under `{section}`"
+                ),
+            });
+        }
+    }
+
+    let cpus = section_map
+        .get(val("cpus"))
+        .map(|v| {
+            if let Some(s) = v.as_str() {
+                s.parse::<f64>().map_err(|_| {
+                    StackError::ComposeParse(format!(
+                        "service `{svc_name}`: invalid `deploy.resources.{section}.cpus` value `{s}`"
+                    ))
+                })
+            } else if let Some(f) = v.as_f64() {
+                Ok(f)
+            } else {
+                Err(StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `deploy.resources.{section}.cpus` must be a number or string"
+                )))
+            }
+        })
+        .transpose()?;
+
+    let memory_bytes = section_map
+        .get(val("memory"))
+        .map(|v| {
+            let s = v.as_str().ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `deploy.resources.{section}.memory` must be a string (e.g., \"512m\", \"1g\")"
+                ))
+            })?;
+            parse_memory_string(svc_name, s)
+        })
+        .transpose()?;
+
+    let pids_limit = section_map
+        .get(val("pids"))
+        .map(|v| {
+            v.as_i64().ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `deploy.resources.{section}.pids` must be an integer"
+                ))
+            })
+        })
+        .transpose()?;
+
+    Ok((cpus, memory_bytes, pids_limit))
 }
 
 /// Parse a `limits` or `reservations` sub-section under `deploy.resources`.
@@ -1746,9 +1826,7 @@ fn parse_networks(root: &serde_yml::Mapping) -> Result<Vec<NetworkSpec>, StackEr
         }
 
         let net_map = net_value.as_mapping().ok_or_else(|| {
-            StackError::ComposeParse(format!(
-                "network `{net_name}` must be a mapping or empty"
-            ))
+            StackError::ComposeParse(format!("network `{net_name}` must be a mapping or empty"))
         })?;
 
         let driver = net_map
@@ -1950,18 +2028,13 @@ fn parse_string_map(
 ///     soft: 1024
 ///     hard: 65535
 /// ```
-fn parse_ulimits(
-    svc_name: &str,
-    map: &serde_yml::Mapping,
-) -> Result<Vec<UlimitSpec>, StackError> {
+fn parse_ulimits(svc_name: &str, map: &serde_yml::Mapping) -> Result<Vec<UlimitSpec>, StackError> {
     let Some(value) = map.get(val("ulimits")) else {
         return Ok(vec![]);
     };
 
     let obj = value.as_mapping().ok_or_else(|| {
-        StackError::ComposeParse(format!(
-            "service `{svc_name}`: `ulimits` must be a mapping"
-        ))
+        StackError::ComposeParse(format!("service `{svc_name}`: `ulimits` must be a mapping"))
     })?;
 
     let mut ulimits = Vec::new();
@@ -3674,10 +3747,10 @@ services:
     deploy:
       resources:
         limits:
-          pids: 100
+          devices: []
 "#;
         let err = parse_compose(yaml, "myapp").unwrap_err();
-        assert!(err.to_string().contains("pids"));
+        assert!(err.to_string().contains("devices"));
     }
 
     #[test]
@@ -3784,10 +3857,7 @@ services:
         let spec = parse_compose(yaml, "myapp").unwrap();
         assert_eq!(spec.services[0].sysctls.len(), 2);
         assert_eq!(spec.services[0].sysctls["net.core.somaxconn"], "1024");
-        assert_eq!(
-            spec.services[0].sysctls["net.ipv4.tcp_syncookies"],
-            "0"
-        );
+        assert_eq!(spec.services[0].sysctls["net.ipv4.tcp_syncookies"], "0");
     }
 
     #[test]
@@ -3883,10 +3953,7 @@ services:
     hostname: my-web-host
 "#;
         let spec = parse_compose(yaml, "myapp").unwrap();
-        assert_eq!(
-            spec.services[0].hostname,
-            Some("my-web-host".to_string())
-        );
+        assert_eq!(spec.services[0].hostname, Some("my-web-host".to_string()));
     }
 
     #[test]
@@ -3898,10 +3965,7 @@ services:
     domainname: example.com
 "#;
         let spec = parse_compose(yaml, "myapp").unwrap();
-        assert_eq!(
-            spec.services[0].domainname,
-            Some("example.com".to_string())
-        );
+        assert_eq!(spec.services[0].domainname, Some("example.com".to_string()));
     }
 
     #[test]
@@ -3920,10 +3984,7 @@ services:
             spec.services[0].labels["com.example.description"],
             "Web frontend"
         );
-        assert_eq!(
-            spec.services[0].labels["com.example.tier"],
-            "frontend"
-        );
+        assert_eq!(spec.services[0].labels["com.example.tier"], "frontend");
     }
 
     #[test]
