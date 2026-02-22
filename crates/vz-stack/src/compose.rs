@@ -52,6 +52,7 @@ const ACCEPTED_SERVICE: &[&str] = &[
     "ulimits",
     "pids_limit",
     // Container identity
+    "container_name",
     "hostname",
     "domainname",
     "labels",
@@ -474,6 +475,10 @@ fn parse_service(
         .transpose()?;
 
     // Container identity
+    let container_name = svc_map
+        .get(val("container_name"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let hostname = svc_map
         .get(val("hostname"))
         .and_then(|v| v.as_str())
@@ -542,6 +547,7 @@ fn parse_service(
         read_only,
         sysctls,
         ulimits,
+        container_name,
         hostname,
         domainname,
         labels,
@@ -3306,10 +3312,10 @@ x-custom:
 services:
   web:
     image: nginx:latest
-    container_name: my-web
+    stdin_open: true
 "#;
         let err = parse_compose(yaml, "myapp").unwrap_err();
-        assert!(err.to_string().contains("container_name"));
+        assert!(err.to_string().contains("stdin_open"));
     }
 
     #[test]
@@ -4027,6 +4033,32 @@ services:
     }
 
     // ── Container identity ───────────────────────────────────────
+
+    #[test]
+    fn container_name_parsed() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    container_name: my-web-container
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(
+            spec.services[0].container_name,
+            Some("my-web-container".to_string())
+        );
+    }
+
+    #[test]
+    fn container_name_defaults_to_none() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].container_name, None);
+    }
 
     #[test]
     fn hostname_parsed() {

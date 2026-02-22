@@ -759,7 +759,13 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
         // Convert ServiceSpec → RunConfig.
         let mut run_config = service_to_run_config(svc_spec, &resolved_mounts, &secret_mounts)?;
-        run_config.container_id = Some(service_name.to_string());
+        run_config.container_id = Some(
+            svc_spec
+                .container_name
+                .as_deref()
+                .unwrap_or(service_name)
+                .to_string(),
+        );
 
         // Override ports with resolved allocations.
         let service_target_host = if use_shared_vm {
@@ -1242,6 +1248,7 @@ mod tests {
             read_only: false,
             sysctls: HashMap::new(),
             ulimits: vec![],
+            container_name: None,
             hostname: None,
             domainname: None,
             labels: HashMap::new(),

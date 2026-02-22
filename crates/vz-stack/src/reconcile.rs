@@ -449,6 +449,7 @@ mod tests {
             read_only: false,
             sysctls: HashMap::new(),
             ulimits: vec![],
+            container_name: None,
             hostname: None,
             domainname: None,
             labels: HashMap::new(),

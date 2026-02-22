@@ -146,6 +146,12 @@ pub struct ServiceSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ulimits: Vec<UlimitSpec>,
     // ── Container identity ───────────────────────────────────────
+    /// Explicit container name override.
+    ///
+    /// When set, the container runtime uses this as the container identifier
+    /// instead of the service name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
     /// Container hostname override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
@@ -400,6 +406,7 @@ mod tests {
                 read_only: false,
                 sysctls: HashMap::new(),
                 ulimits: vec![],
+                container_name: None,
                 hostname: None,
                 domainname: None,
                 labels: HashMap::new(),

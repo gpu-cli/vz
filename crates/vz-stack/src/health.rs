@@ -492,6 +492,7 @@ mod tests {
             read_only: false,
             sysctls: std::collections::HashMap::new(),
             ulimits: vec![],
+            container_name: None,
             hostname: None,
             domainname: None,
             labels: std::collections::HashMap::new(),
