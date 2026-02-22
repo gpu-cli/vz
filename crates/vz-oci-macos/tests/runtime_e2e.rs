@@ -232,6 +232,83 @@ async fn lifecycle_create_exec_stop_remove() {
     );
 }
 
+// ── Container logs ──────────────────────────────────────────────
+
+/// Create a container with capture_logs, run a command that writes output,
+/// then verify we can read the logs via exec.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn container_logs_capture_and_retrieve() {
+    init_tracing();
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = test_runtime(tmp.path());
+
+    // Create a container with capture_logs enabled.
+    // The init process writes output that gets captured to /var/log/vz-oci/output.log.
+    let container_id = rt
+        .create_container(
+            "alpine:latest",
+            RunConfig {
+                cmd: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "echo log-line-one && echo log-line-two && sleep 300".into(),
+                ],
+                execution_mode: ExecutionMode::OciRuntime,
+                capture_logs: true,
+                ..RunConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Give the init process a moment to produce output.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Read the log file via exec.
+    let log_output = rt
+        .exec_container(
+            &container_id,
+            ExecConfig {
+                cmd: vec![
+                    "tail".into(),
+                    "-n".into(),
+                    "100".into(),
+                    "/var/log/vz-oci/output.log".into(),
+                ],
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(log_output.exit_code, 0, "tail should succeed");
+    assert!(
+        log_output.stdout.contains("log-line-one"),
+        "logs should contain 'log-line-one', got: {}",
+        log_output.stdout
+    );
+    assert!(
+        log_output.stdout.contains("log-line-two"),
+        "logs should contain 'log-line-two', got: {}",
+        log_output.stdout
+    );
+
+    // Also test via the RuntimeBackend::logs() trait (through MacosRuntimeBackend).
+    use vz_runtime_contract::RuntimeBackend;
+    let backend = vz_oci_macos::MacosRuntimeBackend::new(rt);
+    let logs = backend.logs(&container_id).unwrap();
+    assert!(
+        logs.output.contains("log-line-one"),
+        "RuntimeBackend::logs() should contain 'log-line-one', got: {}",
+        logs.output
+    );
+
+    // Cleanup.
+    backend.inner().stop_container(&container_id, true).await.unwrap();
+    backend.inner().remove_container(&container_id).await.unwrap();
+}
+
 // ── Port forwarding ─────────────────────────────────────────────
 
 /// Start a container with port forwarding and verify TCP connectivity.

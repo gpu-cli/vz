@@ -182,6 +182,35 @@ impl RuntimeBackend for MacosRuntimeBackend {
                 .block_on(self.runtime.has_shared_vm(stack_id))
         })
     }
+
+    fn logs(&self, container_id: &str) -> Result<contract::ContainerLogs, RuntimeError> {
+        let exec_config = oci_config::ExecConfig {
+            cmd: vec![
+                "tail".into(),
+                "-n".into(),
+                "100".into(),
+                "/var/log/vz-oci/output.log".into(),
+            ],
+            working_dir: None,
+            env: vec![],
+            user: None,
+            timeout: Some(std::time::Duration::from_secs(5)),
+        };
+
+        let output = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(self.runtime.exec_container(container_id, exec_config))
+        })
+        .map_err(oci_err)?;
+
+        Ok(contract::ContainerLogs {
+            output: if output.exit_code == 0 {
+                output.stdout
+            } else {
+                String::new()
+            },
+        })
+    }
 }
 
 // ── Error mapping ─────────────────────────────────────────────────

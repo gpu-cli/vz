@@ -273,6 +273,23 @@ pub struct RmArgs {
     pub opts: ContainerOpts,
 }
 
+#[derive(Args, Debug)]
+pub struct LogsArgs {
+    /// Container identifier.
+    pub id: String,
+
+    /// Follow log output (poll for new lines).
+    #[arg(short, long)]
+    pub follow: bool,
+
+    /// Number of lines to show from the end of the logs.
+    #[arg(short = 'n', long, default_value_t = 100)]
+    pub tail: u32,
+
+    #[command(flatten)]
+    pub opts: ContainerOpts,
+}
+
 // ── Per-command entry points ─────────────────────────────────────
 
 /// Entry point for `vz pull`.
@@ -446,6 +463,25 @@ pub async fn run_rm(args: RmArgs) -> anyhow::Result<()> {
     }
 }
 
+/// Entry point for `vz logs`.
+pub async fn run_logs(args: LogsArgs) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let runtime = build_macos_runtime(&args.opts)?;
+        container_logs(&runtime, args).await
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let backend = build_linux_backend(&args.opts);
+        container_logs_linux(&backend, args).await
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = args;
+        anyhow::bail!("Container commands are not supported on this platform")
+    }
+}
+
 // ── macOS implementation (uses vz_oci_macos::Runtime directly) ──
 
 #[cfg(target_os = "macos")]
@@ -610,7 +646,7 @@ async fn create_container(runtime: &vz_oci_macos::Runtime, args: CreateArgs) -> 
         network_namespace_path: None,
         cpu_quota: None,
         cpu_period: None,
-        capture_logs: false,
+        capture_logs: true,
     };
 
     info!(image = %args.image, "creating long-lived container");
@@ -733,6 +769,80 @@ async fn remove_container(runtime: &vz_oci_macos::Runtime, args: RmArgs) -> anyh
     runtime.remove_container(&args.id).await?;
     println!("Removed container {id}", id = args.id);
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn container_logs(runtime: &vz_oci_macos::Runtime, args: LogsArgs) -> anyhow::Result<()> {
+    let log_file = "/var/log/vz-oci/output.log";
+
+    // Initial fetch: bounded tail -n <count>.
+    let tail_n = args.tail.to_string();
+    let exec_config = vz_oci_macos::ExecConfig {
+        cmd: vec![
+            "tail".into(),
+            "-n".into(),
+            tail_n,
+            log_file.into(),
+        ],
+        working_dir: None,
+        env: vec![],
+        user: None,
+        timeout: Some(Duration::from_secs(5)),
+    };
+
+    let output = runtime.exec_container(&args.id, exec_config).await?;
+    if output.exit_code == 0 && !output.stdout.is_empty() {
+        print!("{}", output.stdout);
+    }
+
+    if !args.follow {
+        return Ok(());
+    }
+
+    // Follow mode: track byte offset, poll with tail -c +<offset>.
+    let size_config = vz_oci_macos::ExecConfig {
+        cmd: vec![
+            "wc".into(),
+            "-c".into(),
+            log_file.into(),
+        ],
+        working_dir: None,
+        env: vec![],
+        user: None,
+        timeout: Some(Duration::from_secs(5)),
+    };
+
+    let size_output = runtime.exec_container(&args.id, size_config).await?;
+    let mut offset: u64 = size_output
+        .stdout
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    loop {
+        sleep(Duration::from_secs(1)).await;
+
+        let offset_arg = format!("+{}", offset + 1);
+        let poll_config = vz_oci_macos::ExecConfig {
+            cmd: vec![
+                "tail".into(),
+                "-c".into(),
+                offset_arg,
+                log_file.into(),
+            ],
+            working_dir: None,
+            env: vec![],
+            user: None,
+            timeout: Some(Duration::from_secs(5)),
+        };
+
+        let poll_output = runtime.exec_container(&args.id, poll_config).await?;
+        if poll_output.exit_code == 0 && !poll_output.stdout.is_empty() {
+            print!("{}", poll_output.stdout);
+            offset += poll_output.stdout.len() as u64;
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1057,6 +1167,80 @@ async fn remove_container_linux(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("Removed container {id}", id = args.id);
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn container_logs_linux(
+    backend: &vz_linux_native::LinuxNativeBackend,
+    args: LogsArgs,
+) -> anyhow::Result<()> {
+    use vz_runtime_contract::RuntimeBackend;
+
+    let log_file = "/var/log/vz-oci/output.log";
+
+    // Initial fetch: bounded tail -n <count>.
+    let tail_n = args.tail.to_string();
+    let exec_config = vz_runtime_contract::ExecConfig {
+        cmd: vec!["tail".into(), "-n".into(), tail_n, log_file.into()],
+        working_dir: None,
+        env: vec![],
+        user: None,
+        timeout: Some(Duration::from_secs(5)),
+    };
+
+    let output = backend
+        .exec_container(&args.id, exec_config)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if output.exit_code == 0 && !output.stdout.is_empty() {
+        print!("{}", output.stdout);
+    }
+
+    if !args.follow {
+        return Ok(());
+    }
+
+    // Follow mode: track byte offset, poll with tail -c +<offset>.
+    let size_config = vz_runtime_contract::ExecConfig {
+        cmd: vec!["wc".into(), "-c".into(), log_file.into()],
+        working_dir: None,
+        env: vec![],
+        user: None,
+        timeout: Some(Duration::from_secs(5)),
+    };
+
+    let size_output = backend
+        .exec_container(&args.id, size_config)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut offset: u64 = size_output
+        .stdout
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let offset_arg = format!("+{}", offset + 1);
+        let poll_config = vz_runtime_contract::ExecConfig {
+            cmd: vec!["tail".into(), "-c".into(), offset_arg, log_file.into()],
+            working_dir: None,
+            env: vec![],
+            user: None,
+            timeout: Some(Duration::from_secs(5)),
+        };
+
+        let poll_output = backend
+            .exec_container(&args.id, poll_config)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if poll_output.exit_code == 0 && !poll_output.stdout.is_empty() {
+            print!("{}", poll_output.stdout);
+            offset += poll_output.stdout.len() as u64;
+        }
+    }
 }
 
 // ── Cross-platform parsing helpers ────────────────────────────────

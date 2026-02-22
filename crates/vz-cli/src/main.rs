@@ -74,6 +74,9 @@ enum Commands {
     /// Remove container metadata and rootfs.
     Rm(commands::oci::RmArgs),
 
+    /// Show container logs.
+    Logs(commands::oci::LogsArgs),
+
     // ── Stack orchestration (cross-platform) ──
     /// Manage multi-service stacks from Compose files.
     Stack(commands::stack::StackArgs),
@@ -136,6 +139,7 @@ fn main() -> anyhow::Result<()> {
             Commands::Ps(args) => commands::oci::run_ps(args).await,
             Commands::Stop(args) => commands::oci::run_stop(args).await,
             Commands::Rm(args) => commands::oci::run_rm(args).await,
+            Commands::Logs(args) => commands::oci::run_logs(args).await,
 
             // Stack orchestration
             Commands::Stack(args) => commands::stack::run(args).await,
@@ -207,6 +211,27 @@ mod tests {
     fn parse_pull_subcommand() {
         let cli = Cli::try_parse_from(["vz", "pull", "alpine:latest"]).expect("parse");
         assert!(matches!(cli.command, Commands::Pull(_)));
+    }
+
+    #[test]
+    fn parse_logs_subcommand() {
+        let cli = Cli::try_parse_from(["vz", "logs", "ctr-123"]).expect("parse");
+        assert!(matches!(cli.command, Commands::Logs(_)));
+    }
+
+    #[test]
+    fn parse_logs_with_follow_and_tail() {
+        let cli =
+            Cli::try_parse_from(["vz", "logs", "ctr-123", "--follow", "--tail", "50"])
+                .expect("parse");
+        match cli.command {
+            Commands::Logs(args) => {
+                assert_eq!(args.id, "ctr-123");
+                assert!(args.follow);
+                assert_eq!(args.tail, 50);
+            }
+            other => panic!("unexpected command variant: {other:?}"),
+        }
     }
 
     #[test]
