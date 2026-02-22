@@ -161,7 +161,7 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         let stdout_tx = tx.clone();
         let stdout_handle = tokio::spawn(async move {
             if let Some(mut stdout) = stdout {
-                let mut buf = vec![0u8; 8192];
+                let mut buf = vec![0u8; 65536];
                 loop {
                     match stdout.read(&mut buf).await {
                         Ok(0) => break,
@@ -189,7 +189,7 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         let stderr_tx = tx.clone();
         let stderr_handle = tokio::spawn(async move {
             if let Some(mut stderr) = stderr {
-                let mut buf = vec![0u8; 8192];
+                let mut buf = vec![0u8; 65536];
                 loop {
                     match stderr.read(&mut buf).await {
                         Ok(0) => break,
@@ -381,7 +381,7 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         // Task: read from target TCP socket, send as gRPC data frames.
         let reader_tx = tx.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 8192];
+            let mut buf = vec![0u8; 65536];
             loop {
                 match target_reader.read(&mut buf).await {
                     Ok(0) => break,

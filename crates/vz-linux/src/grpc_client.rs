@@ -148,18 +148,17 @@ impl GrpcAgentClient {
         }
     }
 
-    /// Execute a command in the guest and return the streaming response.
+    /// Execute a command in the guest and return a streaming handle.
     ///
     /// Unlike [`exec`](Self::exec), this does not buffer the output.
-    /// The caller receives a [`tonic::Streaming`] of
-    /// [`ExecEvent`](vz_agent_proto::ExecEvent) messages and can
-    /// process them incrementally.
+    /// Returns a [`GrpcExecStream`] that yields [`vz::protocol::ExecEvent`]
+    /// values matching the legacy protocol API.
     pub async fn exec_stream(
         &mut self,
         command: String,
         args: Vec<String>,
         options: ExecOptions,
-    ) -> Result<tonic::Streaming<vz_agent_proto::ExecEvent>, LinuxError> {
+    ) -> Result<GrpcExecStream, LinuxError> {
         let env = options.env.into_iter().collect::<HashMap<String, String>>();
 
         let request = ProtoExecRequest {
@@ -171,7 +170,7 @@ impl GrpcAgentClient {
         };
 
         let response = self.agent.exec(request).await?;
-        Ok(response.into_inner())
+        Ok(GrpcExecStream::new(response.into_inner()))
     }
 
     /// Create an OCI container from a prepared bundle.
@@ -283,6 +282,83 @@ impl GrpcAgentClient {
             })
             .await?;
         Ok(())
+    }
+}
+
+/// A stream of exec events from a gRPC-based command execution.
+///
+/// Mirrors the API of [`vz::protocol::ExecStream`] but backed by a
+/// tonic gRPC server-streaming response. Yields
+/// [`vz::protocol::ExecEvent`] values (Stdout, Stderr, Exit).
+pub struct GrpcExecStream {
+    inner: tonic::Streaming<vz_agent_proto::ExecEvent>,
+    done: bool,
+}
+
+impl GrpcExecStream {
+    /// Wrap a tonic streaming response.
+    fn new(inner: tonic::Streaming<vz_agent_proto::ExecEvent>) -> Self {
+        Self { inner, done: false }
+    }
+
+    /// Read the next event from the stream.
+    ///
+    /// Returns `None` after the command has exited (after yielding
+    /// [`ExecEvent::Exit`](vz::protocol::ExecEvent::Exit)).
+    pub async fn next(&mut self) -> Option<vz::protocol::ExecEvent> {
+        if self.done {
+            return None;
+        }
+
+        loop {
+            match self.inner.message().await {
+                Ok(Some(proto_event)) => match proto_event.event {
+                    Some(exec_event::Event::Stdout(data)) => {
+                        return Some(vz::protocol::ExecEvent::Stdout(data));
+                    }
+                    Some(exec_event::Event::Stderr(data)) => {
+                        return Some(vz::protocol::ExecEvent::Stderr(data));
+                    }
+                    Some(exec_event::Event::ExitCode(code)) => {
+                        self.done = true;
+                        return Some(vz::protocol::ExecEvent::Exit(code));
+                    }
+                    Some(exec_event::Event::Error(_)) => {
+                        self.done = true;
+                        return Some(vz::protocol::ExecEvent::Exit(-1));
+                    }
+                    None => {
+                        // Empty event frame, skip.
+                        continue;
+                    }
+                },
+                Ok(None) | Err(_) => {
+                    self.done = true;
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Collect all remaining events into an [`ExecOutput`].
+    pub async fn collect(mut self) -> ExecOutput {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit_code = -1;
+
+        while let Some(event) = self.next().await {
+            match event {
+                vz::protocol::ExecEvent::Stdout(data) => stdout.extend_from_slice(&data),
+                vz::protocol::ExecEvent::Stderr(data) => stderr.extend_from_slice(&data),
+                vz::protocol::ExecEvent::Exit(code) => exit_code = code,
+            }
+        }
+
+        ExecOutput {
+            exit_code,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        }
     }
 }
 
