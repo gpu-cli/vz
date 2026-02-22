@@ -3,7 +3,6 @@
 #![cfg(target_os = "macos")]
 #![forbid(unsafe_code)]
 
-mod agent;
 mod benchmark;
 mod config;
 mod error;
@@ -11,13 +10,13 @@ pub mod grpc_client;
 mod kernel;
 mod vm;
 
-pub use agent::{ExecOptions, OciExecOptions, open_port_forward_stream};
 pub use benchmark::{
     BootBenchmarkConfig, BootBenchmarkEvent, BootBenchmarkResult, BootSample, run_boot_benchmark,
     run_boot_benchmark_with_progress,
 };
 pub use config::LinuxVmConfig;
 pub use error::LinuxError;
+pub use grpc_client::{ExecOptions, GrpcPortForwardStream, OciExecOptions};
 pub use kernel::{
     EnsureKernelOptions, KernelPaths, KernelVersion, default_linux_dir, ensure_kernel,
     ensure_kernel_with_options,

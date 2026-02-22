@@ -1740,13 +1740,15 @@ async fn relay_port_forward_connection(
     mut host_stream: TcpStream,
     mapping: PortMapping,
 ) -> Result<(), LinuxError> {
-    let mut guest_stream = vz_linux::open_port_forward_stream(
-        vm.as_ref(),
-        mapping.container,
-        mapping.protocol.as_str(),
-        mapping.target_host.as_deref(),
-    )
-    .await?;
+    let mut client =
+        vz_linux::grpc_client::GrpcAgentClient::connect(vm, vz::protocol::AGENT_PORT).await?;
+    let mut guest_stream = client
+        .port_forward(
+            mapping.container,
+            mapping.protocol.as_str(),
+            mapping.target_host.as_deref(),
+        )
+        .await?;
 
     tokio::io::copy_bidirectional(&mut host_stream, &mut guest_stream)
         .await

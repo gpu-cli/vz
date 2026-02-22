@@ -1,16 +1,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Mutex;
 use tokio::time::Instant;
 use vz::Vm;
-use vz::protocol::{
-    ExecOutput, HandshakeAck, NetworkServiceConfig, OciContainerState, OciExecResult,
-};
+use vz::protocol::{ExecOutput, NetworkServiceConfig, OciContainerState, OciExecResult};
 
-use crate::agent::{
-    exec_capture, exec_capture_with_options, handshake_and_ping, network_setup, network_teardown,
-    oci_create, oci_delete, oci_exec, oci_kill, oci_start, oci_state, open_port_forward_stream,
-};
+use crate::grpc_client::{GrpcAgentClient, GrpcPortForwardStream};
 use crate::{ExecOptions, LinuxError, LinuxVmConfig, OciExecOptions};
 
 const AGENT_POLL_INITIAL: Duration = Duration::from_millis(50);
@@ -18,10 +14,20 @@ const AGENT_POLL_MAX: Duration = Duration::from_secs(1);
 const AGENT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Linux VM wrapper with guest-agent readiness helpers.
-#[derive(Debug)]
+///
+/// Internally holds a [`GrpcAgentClient`] for all guest communication.
 pub struct LinuxVm {
     vm: Arc<Vm>,
     config: LinuxVmConfig,
+    grpc: Mutex<Option<GrpcAgentClient>>,
+}
+
+impl std::fmt::Debug for LinuxVm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinuxVm")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LinuxVm {
@@ -30,7 +36,11 @@ impl LinuxVm {
         config.validate()?;
         let vm_config = config.to_vm_config()?;
         let vm = Arc::new(Vm::create(vm_config).await?);
-        Ok(Self { vm, config })
+        Ok(Self {
+            vm,
+            config,
+            grpc: Mutex::new(None),
+        })
     }
 
     /// Start the VM (cold boot).
@@ -69,18 +79,20 @@ impl LinuxVm {
         Ok(started.elapsed())
     }
 
-    /// Wait for guest agent readiness (handshake + ping).
-    pub async fn wait_for_agent(&self, timeout: Duration) -> Result<HandshakeAck, LinuxError> {
+    /// Wait for guest agent readiness via gRPC ping.
+    pub async fn wait_for_agent(&self, timeout: Duration) -> Result<(), LinuxError> {
         self.wait_for_agent_with_progress(timeout, |_attempts, _last_error| {})
             .await
     }
 
     /// Wait for guest agent readiness and report retry progress.
+    ///
+    /// On success, stores the [`GrpcAgentClient`] for subsequent operations.
     pub async fn wait_for_agent_with_progress<F>(
         &self,
         timeout: Duration,
         mut on_retry: F,
-    ) -> Result<HandshakeAck, LinuxError>
+    ) -> Result<(), LinuxError>
     where
         F: FnMut(u32, &str),
     {
@@ -94,12 +106,27 @@ impl LinuxVm {
             let remaining = timeout.saturating_sub(elapsed);
             let attempt_timeout = std::cmp::min(AGENT_ATTEMPT_TIMEOUT, remaining);
 
-            match tokio::time::timeout(attempt_timeout, handshake_and_ping(&self.vm)).await {
-                Ok(Ok(ack)) => {
-                    if ack.os != "linux" {
-                        return Err(LinuxError::UnexpectedGuestOs(ack.os));
-                    }
-                    return Ok(ack);
+            let connect_result = tokio::time::timeout(attempt_timeout, async {
+                let mut client =
+                    GrpcAgentClient::connect(Arc::clone(&self.vm), vz::protocol::AGENT_PORT)
+                        .await?;
+                client.ping().await?;
+
+                // Verify guest OS via system_info.
+                let info = client.system_info().await?;
+                if !info.os_version.to_lowercase().contains("linux") {
+                    return Err(LinuxError::UnexpectedGuestOs(info.os_version));
+                }
+
+                Ok(client)
+            })
+            .await;
+
+            match connect_result {
+                Ok(Ok(client)) => {
+                    let mut grpc = self.grpc.lock().await;
+                    *grpc = Some(client);
+                    return Ok(());
                 }
                 Ok(Err(e)) => {
                     last_error = e.to_string();
@@ -107,7 +134,7 @@ impl LinuxVm {
                 }
                 Err(_) => {
                     last_error = format!(
-                        "handshake attempt timed out after {:.3}s",
+                        "agent connect timed out after {:.3}s",
                         attempt_timeout.as_secs_f64()
                     );
                     on_retry(attempts, &last_error);
@@ -133,6 +160,18 @@ impl LinuxVm {
         })
     }
 
+    /// Ensure a gRPC client is connected, reconnecting if needed.
+    async fn ensure_grpc(&self) -> Result<(), LinuxError> {
+        let mut grpc = self.grpc.lock().await;
+        if grpc.is_none() {
+            let mut client =
+                GrpcAgentClient::connect(Arc::clone(&self.vm), vz::protocol::AGENT_PORT).await?;
+            client.ping().await?;
+            *grpc = Some(client);
+        }
+        Ok(())
+    }
+
     /// Run a command on the guest and capture buffered output.
     pub async fn exec_capture(
         &self,
@@ -140,7 +179,8 @@ impl LinuxVm {
         args: Vec<String>,
         timeout: Duration,
     ) -> Result<ExecOutput, LinuxError> {
-        exec_capture(self.vm.as_ref(), command, args, timeout).await
+        self.exec_capture_with_options(command, args, timeout, ExecOptions::default())
+            .await
     }
 
     /// Run a command on the guest with explicit execution options.
@@ -151,7 +191,19 @@ impl LinuxVm {
         timeout: Duration,
         options: ExecOptions,
     ) -> Result<ExecOutput, LinuxError> {
-        exec_capture_with_options(self.vm.as_ref(), command, args, timeout, options).await
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc.as_mut().ok_or_else(|| {
+            LinuxError::Protocol("gRPC client not connected".to_string())
+        })?;
+        tokio::time::timeout(timeout, client.exec(command, args, options))
+            .await
+            .map_err(|_| {
+                LinuxError::Protocol(format!(
+                    "exec timed out after {:.3}s",
+                    timeout.as_secs_f64()
+                ))
+            })?
     }
 
     /// Open a dedicated port-forward stream to a guest-local target port.
@@ -160,23 +212,45 @@ impl LinuxVm {
         target_port: u16,
         protocol_name: &str,
         target_host: Option<&str>,
-    ) -> Result<vz::VsockStream, LinuxError> {
-        open_port_forward_stream(self.vm.as_ref(), target_port, protocol_name, target_host).await
+    ) -> Result<GrpcPortForwardStream, LinuxError> {
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc.as_mut().ok_or_else(|| {
+            LinuxError::Protocol("gRPC client not connected".to_string())
+        })?;
+        client
+            .port_forward(target_port, protocol_name, target_host)
+            .await
     }
 
     /// Create a container in the guest OCI runtime.
     pub async fn oci_create(&self, id: String, bundle_path: String) -> Result<(), LinuxError> {
-        oci_create(self.vm.as_ref(), id, bundle_path).await
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc.as_mut().ok_or_else(|| {
+            LinuxError::Protocol("gRPC client not connected".to_string())
+        })?;
+        client.oci_create(id, bundle_path).await
     }
 
     /// Start a created container in the guest OCI runtime.
     pub async fn oci_start(&self, id: String) -> Result<(), LinuxError> {
-        oci_start(self.vm.as_ref(), id).await
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc.as_mut().ok_or_else(|| {
+            LinuxError::Protocol("gRPC client not connected".to_string())
+        })?;
+        client.oci_start(id).await
     }
 
     /// Query container state from the guest OCI runtime.
     pub async fn oci_state(&self, id: String) -> Result<OciContainerState, LinuxError> {
-        oci_state(self.vm.as_ref(), id).await
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc.as_mut().ok_or_else(|| {
+            LinuxError::Protocol("gRPC client not connected".to_string())
+        })?;
+        client.oci_state(id).await
     }
 
     /// Execute a command in a running guest OCI container.
@@ -187,17 +261,32 @@ impl LinuxVm {
         args: Vec<String>,
         options: OciExecOptions,
     ) -> Result<OciExecResult, LinuxError> {
-        oci_exec(self.vm.as_ref(), id, command, args, options).await
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc.as_mut().ok_or_else(|| {
+            LinuxError::Protocol("gRPC client not connected".to_string())
+        })?;
+        client.oci_exec(id, command, args, options).await
     }
 
     /// Signal a running container in the guest OCI runtime.
     pub async fn oci_kill(&self, id: String, signal: String) -> Result<(), LinuxError> {
-        oci_kill(self.vm.as_ref(), id, signal).await
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc.as_mut().ok_or_else(|| {
+            LinuxError::Protocol("gRPC client not connected".to_string())
+        })?;
+        client.oci_kill(id, signal).await
     }
 
     /// Delete container state from the guest OCI runtime.
     pub async fn oci_delete(&self, id: String, force: bool) -> Result<(), LinuxError> {
-        oci_delete(self.vm.as_ref(), id, force).await
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc.as_mut().ok_or_else(|| {
+            LinuxError::Protocol("gRPC client not connected".to_string())
+        })?;
+        client.oci_delete(id, force).await
     }
 
     /// Set up per-service network isolation inside the VM.
@@ -206,7 +295,19 @@ impl LinuxVm {
         stack_id: String,
         services: Vec<NetworkServiceConfig>,
     ) -> Result<(), LinuxError> {
-        network_setup(self.vm.as_ref(), stack_id, services).await
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc.as_mut().ok_or_else(|| {
+            LinuxError::Protocol("gRPC client not connected".to_string())
+        })?;
+        let proto_services = services
+            .into_iter()
+            .map(|s| vz_agent_proto::NetworkServiceConfig {
+                name: s.name,
+                addr: s.addr,
+            })
+            .collect();
+        client.network_setup(stack_id, proto_services).await
     }
 
     /// Tear down the network resources for a stack.
@@ -215,7 +316,12 @@ impl LinuxVm {
         stack_id: String,
         service_names: Vec<String>,
     ) -> Result<(), LinuxError> {
-        network_teardown(self.vm.as_ref(), stack_id, service_names).await
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc.as_mut().ok_or_else(|| {
+            LinuxError::Protocol("gRPC client not connected".to_string())
+        })?;
+        client.network_teardown(stack_id, service_names).await
     }
 
     /// Borrow the underlying base VM.

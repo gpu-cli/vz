@@ -7,16 +7,17 @@
 //! # Execution Models
 //!
 //! - [`exec`](SandboxSession::exec) — Run a command, collect all output, return when done.
-//! - [`exec_streaming`](SandboxSession::exec_streaming) — Run a command, return an
-//!   [`ExecStream`] that yields [`ExecEvent`]s as they arrive.
+//! - [`exec_streaming`](SandboxSession::exec_streaming) — Run a command, return a
+//!   [`GrpcExecStream`] that yields events as they arrive.
 //! - [`exec_as_root`](SandboxSession::exec_as_root) — Like `exec`, but runs as root.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use tokio::sync::Mutex;
 use tracing::debug;
-use vz::protocol::{Channel, ExecOutput, ExecStream, Request, Response};
+use vz::protocol::ExecOutput;
+use vz_linux::grpc_client::{ExecOptions, GrpcAgentClient, GrpcExecStream};
 
 use crate::error::SandboxError;
 
@@ -31,7 +32,7 @@ use crate::error::SandboxError;
 /// to the pool with [`SandboxPool::release`](crate::pool::SandboxPool::release).
 ///
 /// Commands are parsed with `shell-words` for proper quoting support,
-/// then sent as structured [`Request::Exec`] messages to the guest agent.
+/// then sent as structured gRPC `Exec` requests to the guest agent.
 pub struct SandboxSession {
     /// Pool slot index this session occupies.
     slot_index: usize,
@@ -39,10 +40,8 @@ pub struct SandboxSession {
     guest_project_path: String,
     /// Default timeout for exec calls.
     default_exec_timeout: Option<Duration>,
-    /// Shared atomic counter for generating unique exec IDs.
-    next_exec_id: Arc<AtomicU64>,
-    /// Channel to the guest agent (None when no VM is connected, e.g. in tests).
-    channel: Option<Arc<Channel<Request, Response>>>,
+    /// gRPC agent client (None when no VM is connected, e.g. in tests).
+    grpc: Arc<Mutex<Option<GrpcAgentClient>>>,
 }
 
 impl std::fmt::Debug for SandboxSession {
@@ -51,7 +50,6 @@ impl std::fmt::Debug for SandboxSession {
             .field("slot_index", &self.slot_index)
             .field("guest_project_path", &self.guest_project_path)
             .field("default_exec_timeout", &self.default_exec_timeout)
-            .field("channel", &self.channel.as_ref().map(|_| "connected"))
             .finish()
     }
 }
@@ -62,15 +60,13 @@ impl SandboxSession {
         slot_index: usize,
         guest_project_path: String,
         default_exec_timeout: Option<Duration>,
-        next_exec_id: Arc<AtomicU64>,
-        channel: Option<Arc<Channel<Request, Response>>>,
+        grpc: Arc<Mutex<Option<GrpcAgentClient>>>,
     ) -> Self {
         Self {
             slot_index,
             guest_project_path,
             default_exec_timeout,
-            next_exec_id,
-            channel,
+            grpc,
         }
     }
 
@@ -129,37 +125,35 @@ impl SandboxSession {
 
     /// Execute a command and return a streaming event source.
     ///
-    /// Returns an [`ExecStream`] that yields [`ExecEvent`]s as stdout/stderr
+    /// Returns a [`GrpcExecStream`] that yields events as stdout/stderr
     /// data arrives. Use this for long-running commands where you want to
     /// process output incrementally.
-    ///
-    /// # Example (conceptual)
-    ///
-    /// ```rust,ignore
-    /// let mut stream = session.exec_streaming("cargo build 2>&1").await?;
-    /// while let Some(event) = stream.next().await {
-    ///     match event {
-    ///         ExecEvent::Stdout(data) => print!("{}", String::from_utf8_lossy(&data)),
-    ///         ExecEvent::Stderr(data) => eprint!("{}", String::from_utf8_lossy(&data)),
-    ///         ExecEvent::Exit(code) => println!("exited with {code}"),
-    ///     }
-    /// }
-    /// ```
-    pub async fn exec_streaming(&self, cmd: &str) -> Result<ExecStream, SandboxError> {
-        let (request, exec_id) = self.build_exec_request(cmd, None)?;
+    pub async fn exec_streaming(&self, cmd: &str) -> Result<GrpcExecStream, SandboxError> {
+        let (command, args) = self.parse_command(cmd)?;
 
         debug!(
-            exec_id = exec_id,
             cmd = cmd,
             slot = self.slot_index,
             "exec_streaming"
         );
 
-        if let Some(ref channel) = self.channel {
-            channel.send(&request).await?;
+        let mut grpc = self.grpc.lock().await;
+        if let Some(ref mut client) = *grpc {
+            let options = ExecOptions {
+                working_dir: Some(self.guest_project_path.clone()),
+                env: Vec::new(),
+                user: None,
+            };
+            let stream = client
+                .exec_stream(command, args, options)
+                .await
+                .map_err(|e| SandboxError::GrpcError(e.to_string()))?;
+            Ok(stream)
+        } else {
+            Err(SandboxError::GrpcError(
+                "no gRPC client connected".to_string(),
+            ))
         }
-
-        Ok(ExecStream::new(exec_id, self.channel.clone()))
     }
 
     // -----------------------------------------------------------------------
@@ -173,10 +167,9 @@ impl SandboxSession {
         user: Option<&str>,
         timeout: Option<Duration>,
     ) -> Result<ExecOutput, SandboxError> {
-        let (request, exec_id) = self.build_exec_request(cmd, user)?;
+        let (command, args) = self.parse_command(cmd)?;
 
         debug!(
-            exec_id = exec_id,
             cmd = cmd,
             user = user,
             timeout = ?timeout,
@@ -184,50 +177,29 @@ impl SandboxSession {
             "exec"
         );
 
-        if let Some(ref channel) = self.channel {
-            channel.send(&request).await?;
-
-            let collect_future = async {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                let exit_code = loop {
-                    let resp = channel.recv().await?;
-                    match resp {
-                        Response::Stdout { data, exec_id: eid } if eid == exec_id => {
-                            stdout.extend_from_slice(&data);
-                        }
-                        Response::Stderr { data, exec_id: eid } if eid == exec_id => {
-                            stderr.extend_from_slice(&data);
-                        }
-                        Response::ExitCode { code, exec_id: eid } if eid == exec_id => {
-                            break code;
-                        }
-                        Response::ExecError { error, .. } => {
-                            return Err(SandboxError::Channel(vz::protocol::ChannelError::Io(
-                                std::io::Error::other(error),
-                            )));
-                        }
-                        _ => {} // Ignore responses for other exec_ids
-                    }
-                };
-
-                Ok(ExecOutput {
-                    exit_code,
-                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                })
+        let mut grpc = self.grpc.lock().await;
+        if let Some(ref mut client) = *grpc {
+            let options = ExecOptions {
+                working_dir: Some(self.guest_project_path.clone()),
+                env: Vec::new(),
+                user: user.map(String::from),
             };
 
+            let exec_future = client.exec(command, args, options);
+
             if let Some(duration) = timeout {
-                tokio::time::timeout(duration, collect_future)
+                tokio::time::timeout(duration, exec_future)
                     .await
                     .map_err(|_| SandboxError::ExecTimeout(duration))?
+                    .map_err(|e| SandboxError::GrpcError(e.to_string()))
             } else {
-                collect_future.await
+                exec_future
+                    .await
+                    .map_err(|e| SandboxError::GrpcError(e.to_string()))
             }
         } else {
-            // No channel available (test mode or VM not connected)
-            debug!(exec_id, "no channel connected, returning empty output");
+            // No client available (test mode or VM not connected)
+            debug!("no gRPC client connected, returning empty output");
             Ok(ExecOutput {
                 exit_code: 0,
                 stdout: String::new(),
@@ -236,12 +208,8 @@ impl SandboxSession {
         }
     }
 
-    /// Parse a command string and build an Exec request.
-    fn build_exec_request(
-        &self,
-        cmd: &str,
-        user: Option<&str>,
-    ) -> Result<(Request, u64), SandboxError> {
+    /// Parse a command string into (command, args).
+    fn parse_command(&self, cmd: &str) -> Result<(String, Vec<String>), SandboxError> {
         let words =
             shell_words::split(cmd).map_err(|e| SandboxError::CommandParse(e.to_string()))?;
 
@@ -252,18 +220,7 @@ impl SandboxSession {
         let command = words[0].clone();
         let args: Vec<String> = words[1..].to_vec();
 
-        let exec_id = self.next_exec_id.fetch_add(1, Ordering::Relaxed);
-
-        let request = Request::Exec {
-            id: exec_id,
-            command,
-            args,
-            working_dir: Some(self.guest_project_path.clone()),
-            env: vec![],
-            user: user.map(String::from),
-        };
-
-        Ok((request, exec_id))
+        Ok((command, args))
     }
 }
 
@@ -274,16 +231,13 @@ impl SandboxSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vz::protocol::ExecEvent;
 
     fn make_session() -> SandboxSession {
-        let counter = Arc::new(AtomicU64::new(1));
         SandboxSession::new(
             0,
             "/mnt/workspace/my-project".to_string(),
             Some(Duration::from_secs(30)),
-            counter,
-            None,
+            Arc::new(Mutex::new(None)),
         )
     }
 
@@ -299,81 +253,33 @@ mod tests {
     }
 
     #[test]
-    fn build_exec_request_simple() {
+    fn parse_command_simple() {
         let session = make_session();
-        let (request, exec_id) = session.build_exec_request("cargo build", None).unwrap();
-        assert_eq!(exec_id, 1);
-        if let Request::Exec {
-            id,
-            command,
-            args,
-            working_dir,
-            user,
-            ..
-        } = request
-        {
-            assert_eq!(id, 1);
-            assert_eq!(command, "cargo");
-            assert_eq!(args, vec!["build"]);
-            assert_eq!(working_dir, Some("/mnt/workspace/my-project".to_string()));
-            assert!(user.is_none());
-        } else {
-            panic!("expected Exec request");
-        }
+        let (command, args) = session.parse_command("cargo build").unwrap();
+        assert_eq!(command, "cargo");
+        assert_eq!(args, vec!["build"]);
     }
 
     #[test]
-    fn build_exec_request_with_quotes() {
+    fn parse_command_with_quotes() {
         let session = make_session();
-        let (request, _) = session
-            .build_exec_request(r#"echo "hello world""#, None)
-            .unwrap();
-        if let Request::Exec { command, args, .. } = request {
-            assert_eq!(command, "echo");
-            assert_eq!(args, vec!["hello world"]);
-        } else {
-            panic!("expected Exec request");
-        }
+        let (command, args) = session.parse_command(r#"echo "hello world""#).unwrap();
+        assert_eq!(command, "echo");
+        assert_eq!(args, vec!["hello world"]);
     }
 
     #[test]
-    fn build_exec_request_with_user() {
+    fn parse_command_empty_fails() {
         let session = make_session();
-        let (request, _) = session
-            .build_exec_request("apt install git", Some("root"))
-            .unwrap();
-        if let Request::Exec { user, .. } = request {
-            assert_eq!(user, Some("root".to_string()));
-        } else {
-            panic!("expected Exec request");
-        }
-    }
-
-    #[test]
-    fn build_exec_request_empty_fails() {
-        let session = make_session();
-        let result = session.build_exec_request("", None);
+        let result = session.parse_command("");
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SandboxError::CommandParse(_)));
     }
 
     #[test]
-    fn build_exec_request_bad_quotes_fails() {
+    fn parse_command_bad_quotes_fails() {
         let session = make_session();
-        let result = session.build_exec_request("echo \"unterminated", None);
+        let result = session.parse_command("echo \"unterminated");
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SandboxError::CommandParse(_)));
-    }
-
-    #[test]
-    fn exec_ids_increment() {
-        let session = make_session();
-        let (_, id1) = session.build_exec_request("cmd1", None).unwrap();
-        let (_, id2) = session.build_exec_request("cmd2", None).unwrap();
-        let (_, id3) = session.build_exec_request("cmd3", None).unwrap();
-        assert_eq!(id1, 1);
-        assert_eq!(id2, 2);
-        assert_eq!(id3, 3);
     }
 
     #[tokio::test]
@@ -392,29 +298,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_streaming_returns_stream() {
-        let session = make_session();
-        let mut stream = session.exec_streaming("cargo build").await.unwrap();
-        assert!(stream.exec_id() > 0);
-
-        // Stub yields Exit(0) immediately
-        let event = stream.next().await;
-        assert_eq!(event, Some(ExecEvent::Exit(0)));
-
-        // After exit, next() returns None
-        let event = stream.next().await;
-        assert!(event.is_none());
-    }
-
-    #[tokio::test]
-    async fn exec_stream_collect() {
-        let session = make_session();
-        let stream = session.exec_streaming("ls").await.unwrap();
-        let output = stream.collect().await.unwrap();
-        assert_eq!(output.exit_code, 0);
-    }
-
-    #[tokio::test]
     async fn exec_with_timeout_works() {
         let session = make_session();
         let output = session
@@ -425,24 +308,23 @@ mod tests {
     }
 
     #[test]
-    fn build_exec_request_complex_command() {
+    fn parse_command_complex() {
         let session = make_session();
-        let (request, _) = session
-            .build_exec_request("bash -c 'echo $HOME && ls -la'", None)
+        let (command, args) = session
+            .parse_command("bash -c 'echo $HOME && ls -la'")
             .unwrap();
-        if let Request::Exec { command, args, .. } = request {
-            assert_eq!(command, "bash");
-            assert_eq!(args, vec!["-c", "echo $HOME && ls -la"]);
-        } else {
-            panic!("expected Exec request");
-        }
+        assert_eq!(command, "bash");
+        assert_eq!(args, vec!["-c", "echo $HOME && ls -la"]);
     }
 
     #[test]
     fn session_no_timeout() {
-        let counter = Arc::new(AtomicU64::new(1));
-        let session =
-            SandboxSession::new(1, "/mnt/workspace/other".to_string(), None, counter, None);
+        let session = SandboxSession::new(
+            1,
+            "/mnt/workspace/other".to_string(),
+            None,
+            Arc::new(Mutex::new(None)),
+        );
         assert!(session.default_exec_timeout().is_none());
     }
 }

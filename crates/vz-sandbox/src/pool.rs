@@ -2,13 +2,13 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use vz::Vm;
-use vz::protocol::{self, Channel, Request, Response};
+use vz::protocol::AGENT_PORT;
+use vz_linux::grpc_client::GrpcAgentClient;
 
 use crate::error::SandboxError;
 use crate::session::SandboxSession;
@@ -59,7 +59,7 @@ impl Default for SandboxConfig {
             memory_gb: 8,
             state_path: None,
             workspace_mount: PathBuf::new(),
-            agent_port: protocol::AGENT_PORT,
+            agent_port: AGENT_PORT,
             isolation: IsolationMode::RestoreOnAcquire,
             network: NetworkPolicy::None,
             default_exec_timeout: None,
@@ -118,7 +118,6 @@ struct PoolEntry {
 pub struct SandboxPool {
     config: SandboxConfig,
     entries: Mutex<Vec<PoolEntry>>,
-    next_exec_id: Arc<AtomicU64>,
 }
 
 impl SandboxPool {
@@ -173,7 +172,6 @@ impl SandboxPool {
         Ok(Self {
             config,
             entries: Mutex::new(entries),
-            next_exec_id: Arc::new(AtomicU64::new(1)),
         })
     }
 
@@ -237,8 +235,8 @@ impl SandboxPool {
             }
         }
 
-        // Connect to guest agent with retry (if VM is available)
-        let channel = {
+        // Connect to guest agent via gRPC (if VM is available)
+        let grpc = {
             let entries = self.entries.lock().await;
             let vm = entries
                 .iter()
@@ -247,15 +245,15 @@ impl SandboxPool {
             drop(entries);
 
             if let Some(vm) = vm {
-                match self.connect_agent_to_vm(&vm).await {
-                    Ok(ch) => Some(Arc::new(ch)),
+                match self.connect_agent_to_vm(vm).await {
+                    Ok(client) => Arc::new(Mutex::new(Some(client))),
                     Err(e) => {
                         warn!(slot = slot_index, error = %e, "failed to connect to guest agent");
-                        None
+                        Arc::new(Mutex::new(None))
                     }
                 }
             } else {
-                None
+                Arc::new(Mutex::new(None))
             }
         };
 
@@ -263,8 +261,7 @@ impl SandboxPool {
             slot_index,
             guest_project_path,
             self.config.default_exec_timeout,
-            Arc::clone(&self.next_exec_id),
-            channel,
+            grpc,
         ))
     }
 
@@ -274,7 +271,7 @@ impl SandboxPool {
     pub async fn release(&self, session: SandboxSession) -> Result<(), SandboxError> {
         let slot_index = session.slot_index();
 
-        // The session's channel (if any) is dropped when the session is dropped,
+        // The session's gRPC client (if any) is dropped when the session is dropped,
         // which closes the connection to the guest agent automatically.
         drop(session);
 
@@ -350,41 +347,36 @@ impl SandboxPool {
         Ok(vm)
     }
 
-    /// Connect to the guest agent over vsock with retry and exponential backoff.
+    /// Connect to the guest agent over gRPC with retry and exponential backoff.
     async fn connect_agent_to_vm(
         &self,
-        vm: &Vm,
-    ) -> Result<Channel<Request, Response>, SandboxError> {
+        vm: Arc<Vm>,
+    ) -> Result<GrpcAgentClient, SandboxError> {
         let mut attempts = 0u32;
         let mut delay = Duration::from_secs(1);
 
         loop {
             attempts += 1;
 
-            match vm.vsock_connect(self.config.agent_port).await {
-                Ok(stream) => {
-                    let channel: Channel<Request, Response> = Channel::new(stream);
-
-                    // Verify connectivity with ping/pong handshake
-                    channel
-                        .send(&Request::Ping { id: 0 })
-                        .await
-                        .map_err(|e| SandboxError::HandshakeFailed(e.to_string()))?;
-
-                    let resp = channel
-                        .recv()
-                        .await
-                        .map_err(|e| SandboxError::HandshakeFailed(e.to_string()))?;
-
-                    match resp {
-                        Response::Pong { .. } => {
-                            info!(attempts, "connected to guest agent");
-                            return Ok(channel);
+            match GrpcAgentClient::connect(Arc::clone(&vm), self.config.agent_port).await {
+                Ok(mut client) => {
+                    // Verify connectivity with ping
+                    match client.ping().await {
+                        Ok(()) => {
+                            info!(attempts, "connected to guest agent via gRPC");
+                            return Ok(client);
                         }
-                        _ => {
-                            return Err(SandboxError::HandshakeFailed(format!(
-                                "expected Pong, got: {resp:?}"
-                            )));
+                        Err(e) => {
+                            if attempts >= MAX_RECONNECT_ATTEMPTS {
+                                return Err(SandboxError::HandshakeFailed(format!(
+                                    "ping failed after connect: {e}"
+                                )));
+                            }
+                            warn!(
+                                attempt = attempts,
+                                error = %e,
+                                "ping failed after connect, retrying"
+                            );
                         }
                     }
                 }
@@ -542,7 +534,7 @@ mod tests {
         let config = SandboxConfig::default();
         assert_eq!(config.cpus, 4);
         assert_eq!(config.memory_gb, 8);
-        assert_eq!(config.agent_port, protocol::AGENT_PORT);
+        assert_eq!(config.agent_port, AGENT_PORT);
         assert_eq!(config.isolation, IsolationMode::RestoreOnAcquire);
         assert_eq!(config.network, NetworkPolicy::None);
         assert!(config.default_exec_timeout.is_none());

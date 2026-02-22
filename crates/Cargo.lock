@@ -2772,7 +2772,6 @@ name = "vz"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "block2",
  "dispatch2",
  "libc",
@@ -2820,6 +2819,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vz",
+ "vz-linux",
  "vz-linux-native",
  "vz-oci-macos",
  "vz-runtime-contract",
@@ -2875,6 +2875,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tower 0.5.3",
  "tracing",
@@ -2953,6 +2954,7 @@ dependencies = [
  "tokio",
  "tracing",
  "vz",
+ "vz-linux",
 ]
 
 [[package]]

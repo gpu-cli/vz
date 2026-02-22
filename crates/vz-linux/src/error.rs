@@ -65,10 +65,6 @@ pub enum LinuxError {
     #[error(transparent)]
     Vm(#[from] vz::VzError),
 
-    /// Wrapped framing/protocol channel error.
-    #[error(transparent)]
-    Channel(#[from] vz::protocol::ChannelError),
-
     /// Wrapped filesystem I/O error.
     #[error(transparent)]
     Io(#[from] std::io::Error),

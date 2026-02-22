@@ -37,9 +37,9 @@ pub enum SandboxError {
     #[error("VM error: {0}")]
     VmError(String),
 
-    /// A channel communication error.
-    #[error("channel error: {0}")]
-    Channel(#[from] vz::protocol::ChannelError),
+    /// A gRPC communication error.
+    #[error("grpc error: {0}")]
+    GrpcError(String),
 
     /// An underlying I/O error.
     #[error(transparent)]

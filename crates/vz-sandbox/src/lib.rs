@@ -29,20 +29,6 @@
 //! let output = session.exec("cargo build").await?;
 //! assert_eq!(output.exit_code, 0);
 //!
-//! // Stream output from long-running commands
-//! let mut stream = session.exec_streaming("cargo test").await?;
-//! while let Some(event) = stream.next().await {
-//!     match event {
-//!         vz_sandbox::ExecEvent::Stdout(data) => {
-//!             let _ = String::from_utf8_lossy(&data);
-//!         }
-//!         vz_sandbox::ExecEvent::Exit(code) => {
-//!             assert_eq!(code, 0);
-//!         }
-//!         _ => {}
-//!     }
-//! }
-//!
 //! // Release back to pool
 //! pool.release(session).await?;
 //! # Ok(())
@@ -59,7 +45,5 @@ pub mod session;
 pub use error::SandboxError;
 pub use pool::{IsolationMode, NetworkPolicy, SandboxConfig, SandboxPool};
 pub use session::SandboxSession;
-pub use vz::protocol::{
-    Channel, ChannelError, ExecEvent, ExecOutput, ExecStream, Handshake, HandshakeAck, Request,
-    ResourceStats, Response,
-};
+pub use vz::protocol::{ExecEvent, ExecOutput};
+pub use vz_linux::grpc_client::GrpcExecStream;

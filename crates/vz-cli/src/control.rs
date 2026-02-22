@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use crate::registry;
 
 // ---------------------------------------------------------------------------
-// Wire format: length-prefixed JSON (same as vz-sandbox channel framing)
+// Wire format: length-prefixed JSON
 // ---------------------------------------------------------------------------
 
 /// Maximum control frame size: 4 MiB.
@@ -213,7 +213,7 @@ async fn handle_control_connection(
             command,
             user,
             workdir,
-        } => handle_control_exec(&vm, command, user, workdir).await,
+        } => handle_control_exec(Arc::clone(&vm), command, user, workdir).await,
         ControlRequest::Save { path, stop_after } => {
             handle_control_save(&vm, &path, stop_after).await
         }
@@ -240,16 +240,21 @@ async fn handle_control_connection(
 }
 
 async fn handle_control_exec(
-    vm: &vz::Vm,
+    vm: Arc<vz::Vm>,
     command: Vec<String>,
     user: Option<String>,
     workdir: Option<String>,
 ) -> ControlResponse {
-    use vz::protocol::{self, Handshake, HandshakeAck, Request, Response};
+    use vz_linux::grpc_client::{ExecOptions, GrpcAgentClient};
 
-    // Connect to guest agent via vsock
-    let stream = match vm.vsock_connect(protocol::AGENT_PORT).await {
-        Ok(s) => s,
+    if command.is_empty() {
+        return ControlResponse::Error {
+            message: "empty command".to_string(),
+        };
+    }
+
+    let mut client = match GrpcAgentClient::connect(vm, vz::protocol::AGENT_PORT).await {
+        Ok(c) => c,
         Err(e) => {
             return ControlResponse::Error {
                 message: format!("failed to connect to guest agent: {e}"),
@@ -257,82 +262,24 @@ async fn handle_control_exec(
         }
     };
 
-    let (mut reader, mut writer) = tokio::io::split(stream);
-
-    // Handshake
-    let handshake = Handshake {
-        protocol_version: protocol::PROTOCOL_VERSION,
-        capabilities: vec![],
-    };
-    if let Err(e) = protocol::write_frame(&mut writer, &handshake).await {
-        return ControlResponse::Error {
-            message: format!("handshake write failed: {e}"),
-        };
-    }
-    let _ack: HandshakeAck = match protocol::read_frame(&mut reader).await {
-        Ok(ack) => ack,
-        Err(e) => {
-            return ControlResponse::Error {
-                message: format!("handshake read failed: {e}"),
-            };
-        }
-    };
-
-    // Build exec request
-    if command.is_empty() {
-        return ControlResponse::Error {
-            message: "empty command".to_string(),
-        };
-    }
     let cmd = command[0].clone();
     let args: Vec<String> = command[1..].to_vec();
 
-    let request = Request::Exec {
-        id: 1,
-        command: cmd,
-        args,
+    let options = ExecOptions {
         working_dir: workdir,
-        env: vec![],
+        env: Vec::new(),
         user,
     };
 
-    if let Err(e) = protocol::write_frame(&mut writer, &request).await {
-        return ControlResponse::Error {
-            message: format!("exec request failed: {e}"),
-        };
-    }
-
-    // Collect responses
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-
-    let exit_code = loop {
-        let resp: Response = match protocol::read_frame(&mut reader).await {
-            Ok(r) => r,
-            Err(e) => {
-                return ControlResponse::Error {
-                    message: format!("response read failed: {e}"),
-                };
-            }
-        };
-
-        match resp {
-            Response::Stdout { data, .. } => stdout.extend_from_slice(&data),
-            Response::Stderr { data, .. } => stderr.extend_from_slice(&data),
-            Response::ExitCode { code, .. } => {
-                break code;
-            }
-            Response::ExecError { error, .. } => {
-                return ControlResponse::Error { message: error };
-            }
-            _ => {} // Ignore other response types
-        }
-    };
-
-    ControlResponse::ExecResult {
-        exit_code,
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    match client.exec(cmd, args, options).await {
+        Ok(output) => ControlResponse::ExecResult {
+            exit_code: output.exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        },
+        Err(e) => ControlResponse::Error {
+            message: format!("exec failed: {e}"),
+        },
     }
 }
 
