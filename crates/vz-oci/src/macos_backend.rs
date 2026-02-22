@@ -1,0 +1,305 @@
+//! macOS Virtualization.framework backend adapter.
+//!
+//! Wraps the existing [`Runtime`] to implement the
+//! [`RuntimeBackend`](vz_runtime_contract::RuntimeBackend) trait,
+//! bridging between vz-oci internal types and the backend-neutral contract.
+
+use vz_runtime_contract::{self as contract, RuntimeBackend, RuntimeError};
+
+use crate::config as oci_config;
+use crate::container_store as oci_container;
+use crate::runtime::Runtime;
+use crate::store as oci_store;
+
+/// macOS backend wrapping the existing [`Runtime`].
+pub struct MacosRuntimeBackend {
+    runtime: Runtime,
+}
+
+impl MacosRuntimeBackend {
+    /// Create a new macOS backend from an existing runtime.
+    pub fn new(runtime: Runtime) -> Self {
+        Self { runtime }
+    }
+
+    /// Access the underlying runtime.
+    pub fn inner(&self) -> &Runtime {
+        &self.runtime
+    }
+}
+
+impl RuntimeBackend for MacosRuntimeBackend {
+    fn name(&self) -> &'static str {
+        "macos-vz"
+    }
+
+    async fn pull(&self, image: &str) -> Result<String, RuntimeError> {
+        let id = self.runtime.pull(image).await.map_err(oci_err)?;
+        Ok(id.0)
+    }
+
+    fn images(&self) -> Result<Vec<contract::ImageInfo>, RuntimeError> {
+        self.runtime
+            .images()
+            .map(|v| v.into_iter().map(image_info_to_contract).collect())
+            .map_err(oci_err)
+    }
+
+    fn prune_images(&self) -> Result<contract::PruneResult, RuntimeError> {
+        self.runtime
+            .prune_images()
+            .map(prune_result_to_contract)
+            .map_err(oci_err)
+    }
+
+    async fn run(
+        &self,
+        image: &str,
+        config: contract::RunConfig,
+    ) -> Result<contract::ExecOutput, RuntimeError> {
+        let oci_config = run_config_from_contract(config);
+        self.runtime
+            .run(image, oci_config)
+            .await
+            .map(exec_output_to_contract)
+            .map_err(oci_err)
+    }
+
+    async fn create_container(
+        &self,
+        image: &str,
+        config: contract::RunConfig,
+    ) -> Result<String, RuntimeError> {
+        let oci_config = run_config_from_contract(config);
+        self.runtime
+            .create_container(image, oci_config)
+            .await
+            .map_err(oci_err)
+    }
+
+    async fn exec_container(
+        &self,
+        id: &str,
+        config: contract::ExecConfig,
+    ) -> Result<contract::ExecOutput, RuntimeError> {
+        let oci_config = exec_config_from_contract(config);
+        self.runtime
+            .exec_container(id, oci_config)
+            .await
+            .map(exec_output_to_contract)
+            .map_err(oci_err)
+    }
+
+    async fn stop_container(
+        &self,
+        id: &str,
+        force: bool,
+    ) -> Result<contract::ContainerInfo, RuntimeError> {
+        self.runtime
+            .stop_container(id, force)
+            .await
+            .map(container_info_to_contract)
+            .map_err(oci_err)
+    }
+
+    async fn remove_container(&self, id: &str) -> Result<(), RuntimeError> {
+        self.runtime.remove_container(id).await.map_err(oci_err)
+    }
+
+    fn list_containers(&self) -> Result<Vec<contract::ContainerInfo>, RuntimeError> {
+        self.runtime
+            .list_containers()
+            .map(|v| v.into_iter().map(container_info_to_contract).collect())
+            .map_err(oci_err)
+    }
+
+    async fn boot_shared_vm(
+        &self,
+        stack_id: &str,
+        ports: Vec<contract::PortMapping>,
+    ) -> Result<(), RuntimeError> {
+        let oci_ports: Vec<oci_config::PortMapping> =
+            ports.into_iter().map(port_mapping_from_contract).collect();
+        self.runtime
+            .boot_shared_vm(stack_id, oci_ports)
+            .await
+            .map_err(oci_err)
+    }
+
+    async fn create_container_in_stack(
+        &self,
+        stack_id: &str,
+        image: &str,
+        config: contract::RunConfig,
+    ) -> Result<String, RuntimeError> {
+        let oci_config = run_config_from_contract(config);
+        self.runtime
+            .create_container_in_stack(stack_id, image, oci_config)
+            .await
+            .map_err(oci_err)
+    }
+
+    async fn network_setup(
+        &self,
+        stack_id: &str,
+        services: Vec<contract::NetworkServiceConfig>,
+    ) -> Result<(), RuntimeError> {
+        let oci_services: Vec<vz::protocol::NetworkServiceConfig> = services
+            .into_iter()
+            .map(|s| vz::protocol::NetworkServiceConfig {
+                name: s.name,
+                addr: s.addr,
+            })
+            .collect();
+        self.runtime
+            .network_setup(stack_id, oci_services)
+            .await
+            .map_err(oci_err)
+    }
+
+    async fn network_teardown(
+        &self,
+        stack_id: &str,
+        service_names: Vec<String>,
+    ) -> Result<(), RuntimeError> {
+        self.runtime
+            .network_teardown(stack_id, service_names)
+            .await
+            .map_err(oci_err)
+    }
+
+    async fn shutdown_shared_vm(&self, stack_id: &str) -> Result<(), RuntimeError> {
+        self.runtime
+            .shutdown_shared_vm(stack_id)
+            .await
+            .map_err(oci_err)
+    }
+
+    fn has_shared_vm(&self, stack_id: &str) -> bool {
+        // Runtime::has_shared_vm is async (uses Mutex::lock().await).
+        // Use block_in_place since this is called from sync context.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(self.runtime.has_shared_vm(stack_id))
+        })
+    }
+}
+
+// ── Error mapping ─────────────────────────────────────────────────
+
+fn oci_err(e: crate::error::OciError) -> RuntimeError {
+    RuntimeError::Backend {
+        message: e.to_string(),
+        source: Box::new(e),
+    }
+}
+
+// ── Type conversions: contract → vz-oci ───────────────────────────
+
+fn run_config_from_contract(c: contract::RunConfig) -> oci_config::RunConfig {
+    oci_config::RunConfig {
+        cmd: c.cmd,
+        working_dir: c.working_dir,
+        env: c.env,
+        user: c.user,
+        ports: c.ports.into_iter().map(port_mapping_from_contract).collect(),
+        mounts: c.mounts.into_iter().map(mount_spec_from_contract).collect(),
+        cpus: c.cpus,
+        memory_mb: c.memory_mb,
+        network_enabled: c.network_enabled,
+        serial_log_file: None,
+        timeout: c.timeout,
+        execution_mode: oci_config::ExecutionMode::OciRuntime,
+        container_id: c.container_id,
+        init_process: c.init_process,
+        oci_annotations: c.oci_annotations,
+        extra_hosts: c.extra_hosts,
+        network_namespace_path: c.network_namespace_path,
+        cpu_quota: c.cpu_quota,
+        cpu_period: c.cpu_period,
+        capture_logs: c.capture_logs,
+    }
+}
+
+fn exec_config_from_contract(c: contract::ExecConfig) -> oci_config::ExecConfig {
+    oci_config::ExecConfig {
+        cmd: c.cmd,
+        working_dir: c.working_dir,
+        env: c.env,
+        user: c.user,
+        timeout: c.timeout,
+    }
+}
+
+fn port_mapping_from_contract(p: contract::PortMapping) -> oci_config::PortMapping {
+    oci_config::PortMapping {
+        host: p.host,
+        container: p.container,
+        protocol: match p.protocol {
+            contract::PortProtocol::Tcp => oci_config::PortProtocol::Tcp,
+            contract::PortProtocol::Udp => oci_config::PortProtocol::Udp,
+        },
+        target_host: p.target_host,
+    }
+}
+
+fn mount_spec_from_contract(m: contract::MountSpec) -> oci_config::MountSpec {
+    oci_config::MountSpec {
+        source: m.source,
+        target: m.target,
+        mount_type: match m.mount_type {
+            contract::MountType::Bind => oci_config::MountType::Bind,
+            contract::MountType::Tmpfs => oci_config::MountType::Tmpfs,
+        },
+        access: match m.access {
+            contract::MountAccess::ReadWrite => oci_config::MountAccess::ReadWrite,
+            contract::MountAccess::ReadOnly => oci_config::MountAccess::ReadOnly,
+        },
+    }
+}
+
+// ── Type conversions: vz-oci → contract ───────────────────────────
+
+fn exec_output_to_contract(o: vz::protocol::ExecOutput) -> contract::ExecOutput {
+    contract::ExecOutput {
+        exit_code: o.exit_code,
+        stdout: o.stdout,
+        stderr: o.stderr,
+    }
+}
+
+fn container_info_to_contract(c: oci_container::ContainerInfo) -> contract::ContainerInfo {
+    contract::ContainerInfo {
+        id: c.id,
+        image: c.image,
+        image_id: c.image_id,
+        status: match c.status {
+            oci_container::ContainerStatus::Created => contract::ContainerStatus::Created,
+            oci_container::ContainerStatus::Running => contract::ContainerStatus::Running,
+            oci_container::ContainerStatus::Stopped { exit_code } => {
+                contract::ContainerStatus::Stopped { exit_code }
+            }
+        },
+        created_unix_secs: c.created_unix_secs,
+        started_unix_secs: c.started_unix_secs,
+        stopped_unix_secs: c.stopped_unix_secs,
+        rootfs_path: c.rootfs_path,
+        host_pid: c.host_pid,
+    }
+}
+
+fn image_info_to_contract(i: oci_store::ImageInfo) -> contract::ImageInfo {
+    contract::ImageInfo {
+        reference: i.reference,
+        image_id: i.image_id,
+    }
+}
+
+fn prune_result_to_contract(p: oci_store::PruneResult) -> contract::PruneResult {
+    contract::PruneResult {
+        removed_refs: p.removed_refs,
+        removed_manifests: p.removed_manifests,
+        removed_configs: p.removed_configs,
+        removed_layer_dirs: p.removed_layer_dirs,
+    }
+}

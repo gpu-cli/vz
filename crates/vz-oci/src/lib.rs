@@ -8,6 +8,7 @@ mod config;
 mod container_store;
 mod error;
 mod image;
+pub mod macos_backend;
 mod runtime;
 mod store;
 
@@ -19,9 +20,13 @@ pub use config::{
 pub use container_store::{ContainerInfo, ContainerStatus, ContainerStore};
 pub use error::OciError;
 pub use image::{ImageConfigSummary, ImageId, ImagePuller};
+pub use macos_backend::MacosRuntimeBackend;
 pub use runtime::Runtime;
 pub use store::{ImageInfo, ImageStore, LayerDescriptor, PruneResult};
 pub use vz_linux::NetworkServiceConfig;
+
+/// Re-export the runtime contract crate for downstream access.
+pub use vz_runtime_contract as contract;
 
 #[cfg(test)]
 mod tests {

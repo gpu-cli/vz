@@ -2457,7 +2457,16 @@ dependencies = [
  "tracing-subscriber",
  "vz",
  "vz-linux",
+ "vz-runtime-contract",
  "vz-sandbox",
+]
+
+[[package]]
+name = "vz-runtime-contract"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -106,6 +106,14 @@ impl Runtime {
         &self.config.data_dir
     }
 
+    /// Create a [`MacosRuntimeBackend`] adapter for this runtime.
+    ///
+    /// The returned adapter implements [`vz_runtime_contract::RuntimeBackend`]
+    /// and delegates all operations back to this runtime instance.
+    pub fn into_backend(self) -> crate::macos_backend::MacosRuntimeBackend {
+        crate::macos_backend::MacosRuntimeBackend::new(self)
+    }
+
     /// List cached images currently tracked by refs.
     pub fn images(&self) -> Result<Vec<ImageInfo>, OciError> {
         self.store.list_images().map_err(Into::into)
