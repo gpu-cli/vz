@@ -13,8 +13,9 @@ use crate::agent::{
 };
 use crate::{ExecOptions, LinuxError, LinuxVmConfig, OciExecOptions};
 
-const AGENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const AGENT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
+const AGENT_POLL_INITIAL: Duration = Duration::from_millis(50);
+const AGENT_POLL_MAX: Duration = Duration::from_secs(1);
+const AGENT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Linux VM wrapper with guest-agent readiness helpers.
 #[derive(Debug)]
@@ -118,7 +119,12 @@ impl LinuxVm {
                 break;
             }
             let remaining_after_attempt = timeout.saturating_sub(elapsed_after_attempt);
-            tokio::time::sleep(std::cmp::min(AGENT_POLL_INTERVAL, remaining_after_attempt)).await;
+            // Exponential backoff: 50ms, 100ms, 200ms, 400ms, 800ms, capped at 1s.
+            let backoff = std::cmp::min(
+                AGENT_POLL_MAX,
+                AGENT_POLL_INITIAL * 2u32.saturating_pow(attempts.saturating_sub(1)),
+            );
+            tokio::time::sleep(std::cmp::min(backoff, remaining_after_attempt)).await;
         }
 
         Err(LinuxError::AgentUnreachable {

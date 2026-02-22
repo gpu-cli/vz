@@ -110,6 +110,11 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
         &self.executor
     }
 
+    /// Mutably access the underlying executor.
+    pub fn executor_mut(&mut self) -> &mut StackExecutor<R> {
+        &mut self.executor
+    }
+
     /// Access the health poller.
     pub fn health_poller(&self) -> &HealthPoller {
         &self.health_poller

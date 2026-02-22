@@ -720,3 +720,110 @@ services:
         .runtime()
         .shutdown_shared_vm("exec-sock");
 }
+
+/// Boot a 2-service stack with port forwarding, then connect from the host
+/// and verify TCP data round-trip through the per-service network namespace.
+///
+/// Service "echo" runs `nc -l -p 8080` mapped to host:18090 with
+/// `target_host` pointing at its per-service netns IP. The host connects
+/// and reads the response, proving the full port-forwarding path works:
+/// host → vsock → guest agent → netns bridge → container.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn stack_port_forwarding() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,vz_oci=debug,vz_linux=debug,vz_stack=debug")
+        .with_test_writer()
+        .try_init();
+
+    let yaml = r#"
+services:
+  echo:
+    image: alpine:latest
+    command: ["sh", "-c", "echo pong | nc -l -p 8080"]
+    ports:
+      - "18090:8080"
+
+  sidecar:
+    image: alpine:latest
+    command: ["sleep", "300"]
+"#;
+
+    // Use persistent data dir for image cache.
+    let home = std::env::var("HOME").unwrap();
+    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    std::fs::create_dir_all(&oci_data).unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("state.db");
+
+    let spec = parse_compose(yaml, "port-fwd").unwrap();
+    assert_eq!(spec.services.len(), 2);
+
+    let bridge = OciContainerRuntime::new(&oci_data);
+    let exec_store = StateStore::open(&db_path).unwrap();
+    let reconcile_store = StateStore::open(&db_path).unwrap();
+    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+
+    let orch_config = OrchestrationConfig {
+        poll_interval: Some(2),
+        max_rounds: 20,
+    };
+    let mut orchestrator = StackOrchestrator::new(executor, reconcile_store, orch_config);
+
+    let result = orchestrator.run(&spec, None).unwrap();
+    assert!(
+        result.converged,
+        "stack should converge: ready={}, failed={}",
+        result.services_ready, result.services_failed
+    );
+    assert_eq!(result.services_ready, 2);
+
+    // Give the nc listener a moment to start inside the container.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Connect from the host — retry to allow port forwarding relay to start.
+    use tokio::io::AsyncReadExt;
+    let mut conn = None;
+    for attempt in 1..=5 {
+        match tokio::net::TcpStream::connect("127.0.0.1:18090").await {
+            Ok(stream) => {
+                conn = Some(stream);
+                break;
+            }
+            Err(e) if attempt < 5 => {
+                eprintln!("port forward attempt {attempt}/5 failed: {e}, retrying...");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(e) => panic!("port forwarding connection failed after 5 attempts: {e}"),
+        }
+    }
+    let mut conn = conn.unwrap();
+    let mut buf = vec![0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(10), conn.read(&mut buf))
+        .await
+        .expect("port forward read timed out")
+        .expect("port forward read failed");
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        response.contains("pong"),
+        "expected 'pong' from port-forwarded nc, got: {response}"
+    );
+
+    // Drop connection before cleanup.
+    drop(conn);
+
+    // Teardown.
+    let down_spec = vz_stack::StackSpec {
+        name: "port-fwd".to_string(),
+        services: vec![],
+        networks: vec![],
+        volumes: vec![],
+        secrets: vec![],
+    };
+    let _ = orchestrator.run(&down_spec, None);
+    let _ = orchestrator
+        .executor()
+        .runtime()
+        .shutdown_shared_vm("port-fwd");
+}

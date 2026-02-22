@@ -52,6 +52,15 @@ pub enum StackCommand {
 
     /// Execute a command in a running service container.
     Exec(ExecArgs),
+
+    /// Stop an individual service in a running stack.
+    Stop(ServiceArgs),
+
+    /// Start (recreate) an individual service in a running stack.
+    Start(ServiceArgs),
+
+    /// Restart an individual service in a running stack.
+    Restart(ServiceArgs),
 }
 
 #[derive(Args, Debug)]
@@ -163,11 +172,41 @@ pub struct ExecArgs {
     pub state_dir: Option<PathBuf>,
 }
 
-/// JSON protocol for exec requests over the control socket.
+#[derive(Args, Debug)]
+pub struct ServiceArgs {
+    /// Stack name.
+    pub name: String,
+
+    /// Service to act on.
+    pub service: String,
+
+    /// State directory for stack persistence.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+}
+
+/// Action types for control socket requests.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ControlAction {
+    Exec,
+    Stop,
+    Start,
+    Restart,
+}
+
+/// JSON protocol for control socket requests.
 #[derive(Debug, Serialize, Deserialize)]
 struct ControlRequest {
+    #[serde(default = "default_action")]
+    action: ControlAction,
     service: String,
+    #[serde(default)]
     cmd: Vec<String>,
+}
+
+fn default_action() -> ControlAction {
+    ControlAction::Exec
 }
 
 /// JSON protocol for exec responses over the control socket.
@@ -187,6 +226,9 @@ pub async fn run(args: StackArgs) -> anyhow::Result<()> {
         StackCommand::Events(args) => cmd_events(args).await,
         StackCommand::Logs(args) => cmd_logs(args).await,
         StackCommand::Exec(args) => cmd_exec(args).await,
+        StackCommand::Stop(args) => cmd_service_action(args, ControlAction::Stop).await,
+        StackCommand::Start(args) => cmd_service_action(args, ControlAction::Start).await,
+        StackCommand::Restart(args) => cmd_service_action(args, ControlAction::Restart).await,
     }
 }
 
@@ -480,7 +522,7 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
 
         // Keep the VM alive and listen for exec requests until ctrl-C.
         let sock_path = state_dir.join("control.sock");
-        serve_control_socket(&sock_path, &spec, &orchestrator).await?;
+        serve_control_socket(&sock_path, &spec, &mut orchestrator).await?;
 
         // Teardown on exit.
         info!(stack = %spec.name, "shutting down stack");
@@ -522,7 +564,7 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
 async fn serve_control_socket(
     sock_path: &Path,
     spec: &StackSpec,
-    orchestrator: &StackOrchestrator<OciContainerRuntime>,
+    orchestrator: &mut StackOrchestrator<OciContainerRuntime>,
 ) -> anyhow::Result<()> {
     use tokio::net::UnixListener;
 
@@ -563,11 +605,11 @@ async fn serve_control_socket(
     Ok(())
 }
 
-/// Handle a single exec request on a control socket connection.
+/// Handle a single control socket connection (exec, stop, start, restart).
 async fn handle_control_connection(
     stream: tokio::net::UnixStream,
     spec: &StackSpec,
-    orchestrator: &StackOrchestrator<OciContainerRuntime>,
+    orchestrator: &mut StackOrchestrator<OciContainerRuntime>,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -597,37 +639,55 @@ async fn handle_control_connection(
         }
     };
 
-    // Look up the container ID for this service from observed state.
+    let resp = match request.action {
+        ControlAction::Exec => handle_exec(spec, orchestrator, &request),
+        ControlAction::Stop => handle_service_stop(spec, orchestrator, &request.service),
+        ControlAction::Start => handle_service_start(spec, orchestrator, &request.service),
+        ControlAction::Restart => {
+            let stop_resp = handle_service_stop(spec, orchestrator, &request.service);
+            if stop_resp.error.is_some() {
+                stop_resp
+            } else {
+                handle_service_start(spec, orchestrator, &request.service)
+            }
+        }
+    };
+
+    let _ = write_response(&mut writer, &resp).await;
+}
+
+/// Handle an exec action: run a command inside a service container.
+fn handle_exec(
+    spec: &StackSpec,
+    orchestrator: &StackOrchestrator<OciContainerRuntime>,
+    request: &ControlRequest,
+) -> ControlResponse {
     let store = orchestrator.executor().store();
     let observed = match store.load_observed_state(&spec.name) {
         Ok(o) => o,
         Err(e) => {
-            let resp = ControlResponse {
+            return ControlResponse {
                 exit_code: 1,
                 stdout: String::new(),
                 stderr: String::new(),
                 error: Some(format!("failed to load state: {e}")),
             };
-            let _ = write_response(&mut writer, &resp).await;
-            return;
         }
     };
 
-    let svc_state = observed
+    let container_id = match observed
         .iter()
-        .find(|o| o.service_name == request.service);
-
-    let container_id = match svc_state.and_then(|s| s.container_id.as_deref()) {
+        .find(|o| o.service_name == request.service)
+        .and_then(|s| s.container_id.as_deref())
+    {
         Some(id) => id,
         None => {
-            let resp = ControlResponse {
+            return ControlResponse {
                 exit_code: 1,
                 stdout: String::new(),
                 stderr: String::new(),
                 error: Some(format!("service '{}' is not running", request.service)),
             };
-            let _ = write_response(&mut writer, &resp).await;
-            return;
         }
     };
 
@@ -639,7 +699,7 @@ async fn handle_control_connection(
     );
 
     let runtime = orchestrator.executor().runtime();
-    let resp = match runtime.exec_with_output(container_id, request.cmd) {
+    match runtime.exec_with_output(container_id, request.cmd.clone()) {
         Ok(output) => ControlResponse {
             exit_code: output.exit_code,
             stdout: output.stdout,
@@ -652,9 +712,105 @@ async fn handle_control_connection(
             stderr: String::new(),
             error: Some(format!("{e}")),
         },
-    };
+    }
+}
 
-    let _ = write_response(&mut writer, &resp).await;
+/// Handle a stop action: remove an individual service from the running stack.
+fn handle_service_stop(
+    spec: &StackSpec,
+    orchestrator: &mut StackOrchestrator<OciContainerRuntime>,
+    service_name: &str,
+) -> ControlResponse {
+    info!(service = %service_name, "stop request");
+
+    let actions = vec![vz_stack::Action::ServiceRemove {
+        service_name: service_name.to_string(),
+    }];
+
+    match orchestrator.executor_mut().execute(spec, &actions) {
+        Ok(result) if result.all_succeeded() => ControlResponse {
+            exit_code: 0,
+            stdout: format!("service '{service_name}' stopped\n"),
+            stderr: String::new(),
+            error: None,
+        },
+        Ok(result) => ControlResponse {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: Some(format!(
+                "failed to stop service '{}': {}",
+                service_name,
+                result
+                    .errors
+                    .iter()
+                    .map(|(_, e)| e.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        },
+        Err(e) => ControlResponse {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: Some(format!("stop failed: {e}")),
+        },
+    }
+}
+
+/// Handle a start action: (re)create an individual service from the spec.
+fn handle_service_start(
+    spec: &StackSpec,
+    orchestrator: &mut StackOrchestrator<OciContainerRuntime>,
+    service_name: &str,
+) -> ControlResponse {
+    // Verify the service exists in the spec.
+    if !spec.services.iter().any(|s| s.name == service_name) {
+        return ControlResponse {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: Some(format!(
+                "service '{service_name}' not found in stack spec"
+            )),
+        };
+    }
+
+    info!(service = %service_name, "start request");
+
+    let actions = vec![vz_stack::Action::ServiceCreate {
+        service_name: service_name.to_string(),
+    }];
+
+    match orchestrator.executor_mut().execute(spec, &actions) {
+        Ok(result) if result.all_succeeded() => ControlResponse {
+            exit_code: 0,
+            stdout: format!("service '{service_name}' started\n"),
+            stderr: String::new(),
+            error: None,
+        },
+        Ok(result) => ControlResponse {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: Some(format!(
+                "failed to start service '{}': {}",
+                service_name,
+                result
+                    .errors
+                    .iter()
+                    .map(|(_, e)| e.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        },
+        Err(e) => ControlResponse {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: Some(format!("start failed: {e}")),
+        },
+    }
 }
 
 async fn write_response(
@@ -696,6 +852,7 @@ async fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
 
     // Send the exec request.
     let request = ControlRequest {
+        action: ControlAction::Exec,
         service: args.service,
         cmd: args.command,
     };
@@ -727,6 +884,60 @@ async fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
     }
 
     std::process::exit(resp.exit_code);
+}
+
+// ── service start/stop/restart ─────────────────────────────────────
+
+/// Send a service-level action (stop/start/restart) through the control socket.
+async fn cmd_service_action(args: ServiceArgs, action: ControlAction) -> anyhow::Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let state_dir = resolve_state_dir(args.state_dir.as_deref(), &args.name)?;
+    let sock_path = state_dir.join("control.sock");
+
+    if !sock_path.exists() {
+        bail!(
+            "stack '{}' is not running in foreground mode.\n\
+             Start it with: vz stack up -f <compose.yaml>",
+            args.name
+        );
+    }
+
+    let stream = UnixStream::connect(&sock_path)
+        .await
+        .with_context(|| format!("failed to connect to control socket: {}", sock_path.display()))?;
+
+    let (reader, mut writer) = stream.into_split();
+
+    let request = ControlRequest {
+        action,
+        service: args.service,
+        cmd: vec![],
+    };
+    let mut json = serde_json::to_string(&request)?;
+    json.push('\n');
+    writer.write_all(json.as_bytes()).await?;
+    writer.flush().await?;
+
+    let mut lines = BufReader::new(reader).lines();
+    let line = lines
+        .next_line()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("control socket closed without response"))?;
+
+    let resp: ControlResponse = serde_json::from_str(&line)
+        .with_context(|| "failed to parse control response")?;
+
+    if let Some(err) = resp.error {
+        bail!("{err}");
+    }
+
+    if !resp.stdout.is_empty() {
+        print!("{}", resp.stdout);
+    }
+
+    Ok(())
 }
 
 // ── down ───────────────────────────────────────────────────────────
@@ -985,6 +1196,7 @@ async fn exec_via_socket(
     let (reader, mut writer) = stream.into_split();
 
     let request = ControlRequest {
+        action: ControlAction::Exec,
         service: service.to_string(),
         cmd: cmd.iter().map(|s| s.to_string()).collect(),
     };
@@ -1426,13 +1638,48 @@ mod tests {
     #[test]
     fn control_request_serde_roundtrip() {
         let req = ControlRequest {
+            action: ControlAction::Exec,
             service: "db".into(),
             cmd: vec!["psql".into(), "-U".into(), "app".into()],
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ControlRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.action, ControlAction::Exec);
         assert_eq!(parsed.service, "db");
         assert_eq!(parsed.cmd, vec!["psql", "-U", "app"]);
+    }
+
+    #[test]
+    fn control_request_defaults_to_exec() {
+        // Old-style request without action field should default to Exec.
+        let json = r#"{"service":"web","cmd":["echo","hi"]}"#;
+        let parsed: ControlRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.action, ControlAction::Exec);
+    }
+
+    #[test]
+    fn control_request_stop_action() {
+        let req = ControlRequest {
+            action: ControlAction::Stop,
+            service: "web".into(),
+            cmd: vec![],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: ControlRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.action, ControlAction::Stop);
+        assert_eq!(parsed.service, "web");
+    }
+
+    #[test]
+    fn control_request_restart_action() {
+        let req = ControlRequest {
+            action: ControlAction::Restart,
+            service: "cache".into(),
+            cmd: vec![],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: ControlRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.action, ControlAction::Restart);
     }
 
     #[test]
@@ -1502,6 +1749,7 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
 
         let req = ControlRequest {
+            action: ControlAction::Exec,
             service: "cache".into(),
             cmd: vec!["redis-cli".into(), "PING".into()],
         };

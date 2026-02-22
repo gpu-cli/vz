@@ -66,6 +66,11 @@ pub struct Runtime {
     /// Kept alive so the TCP listeners and relay tasks continue running.
     /// Dropped when the container is stopped or removed.
     port_forwards: Arc<Mutex<HashMap<String, PortForwarding>>>,
+    /// Active port-forwarding handles keyed by stack ID.
+    ///
+    /// Kept alive so TCP listeners for shared VM stacks continue running.
+    /// Cleaned up when the shared VM is shut down.
+    stack_port_forwards: Arc<Mutex<HashMap<String, PortForwarding>>>,
 }
 
 impl Runtime {
@@ -87,6 +92,7 @@ impl Runtime {
             stack_vms: Arc::new(Mutex::new(HashMap::new())),
             container_stack: Arc::new(Mutex::new(HashMap::new())),
             port_forwards: Arc::new(Mutex::new(HashMap::new())),
+            stack_port_forwards: Arc::new(Mutex::new(HashMap::new())),
         };
 
         runtime.reconcile_stale_containers();
@@ -489,9 +495,19 @@ impl Runtime {
         let vm = Arc::new(vm);
 
         // Set up port forwarding for all services' ports.
-        if let Err(err) = start_port_forwarding(vm.inner_shared(), &ports).await {
-            let _ = vm.stop().await;
-            return Err(err);
+        let port_forwarding = match start_port_forwarding(vm.inner_shared(), &ports).await {
+            Ok(pf) => pf,
+            Err(err) => {
+                let _ = vm.stop().await;
+                return Err(err);
+            }
+        };
+
+        if let Some(pf) = port_forwarding {
+            self.stack_port_forwards
+                .lock()
+                .await
+                .insert(stack_id.to_string(), pf);
         }
 
         self.stack_vms.lock().await.insert(stack_id.to_string(), vm);
@@ -800,6 +816,11 @@ impl Runtime {
                 vm_handles.remove(cid);
                 cs.remove(cid);
             }
+        }
+
+        // Shut down port forwarding relays for this stack.
+        if let Some(pf) = self.stack_port_forwards.lock().await.remove(stack_id) {
+            pf.shutdown().await;
         }
 
         // Tear down the shared VM.
