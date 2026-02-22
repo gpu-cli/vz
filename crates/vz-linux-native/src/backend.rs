@@ -12,7 +12,7 @@ use tracing::{debug, info};
 use vz_image::{ImagePuller, ImageStore, parse_image_config_summary_from_store};
 use vz_runtime_contract::{self as contract, RuntimeBackend, RuntimeError};
 
-use crate::bundle::{BundleMount, BundleSpec};
+use vz_oci::bundle::{BundleMount, BundleSpec};
 use crate::config::LinuxNativeConfig;
 use crate::network;
 use crate::ns;

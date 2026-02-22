@@ -8,10 +8,6 @@ use clap::{Args, Subcommand, ValueEnum};
 use std::fmt;
 use tracing::info;
 
-// Platform-specific type imports for cross-platform parsing helpers.
-#[cfg(target_os = "macos")]
-use vz_oci::{MountAccess, MountSpec, MountType, PortMapping, PortProtocol};
-#[cfg(not(target_os = "macos"))]
 use vz_runtime_contract::{MountAccess, MountSpec, MountType, PortMapping, PortProtocol};
 
 #[cfg(target_os = "macos")]
@@ -287,7 +283,7 @@ pub async fn run(args: OciArgs) -> anyhow::Result<()> {
     }
 }
 
-// ── macOS implementation (uses vz_oci::Runtime directly) ──────────
+// ── macOS implementation (uses vz_oci_macos::Runtime directly) ──────────
 
 #[cfg(target_os = "macos")]
 async fn run_macos(args: OciArgs) -> anyhow::Result<()> {
@@ -307,7 +303,7 @@ async fn run_macos(args: OciArgs) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn build_runtime(args: &OciArgs) -> anyhow::Result<vz_oci::Runtime> {
+fn build_runtime(args: &OciArgs) -> anyhow::Result<vz_oci_macos::Runtime> {
     if args.username.is_some() && args.password.is_none() {
         anyhow::bail!("--username requires --password");
     }
@@ -316,7 +312,7 @@ fn build_runtime(args: &OciArgs) -> anyhow::Result<vz_oci::Runtime> {
         anyhow::bail!("--password requires --username");
     }
 
-    let mut config = vz_oci::RuntimeConfig::default();
+    let mut config = vz_oci_macos::RuntimeConfig::default();
     if let Some(path) = &args.data_dir {
         config.data_dir = path.clone();
     }
@@ -328,19 +324,19 @@ fn build_runtime(args: &OciArgs) -> anyhow::Result<vz_oci::Runtime> {
     }
 
     config.auth = match (args.docker_config, &args.username, &args.password) {
-        (true, _, _) => vz_oci::Auth::DockerConfig,
-        (false, Some(username), Some(password)) => vz_oci::Auth::Basic {
+        (true, _, _) => vz_oci_macos::Auth::DockerConfig,
+        (false, Some(username), Some(password)) => vz_oci_macos::Auth::Basic {
             username: username.clone(),
             password: password.clone(),
         },
-        _ => vz_oci::Auth::Anonymous,
+        _ => vz_oci_macos::Auth::Anonymous,
     };
 
-    Ok(vz_oci::Runtime::new(config))
+    Ok(vz_oci_macos::Runtime::new(config))
 }
 
 #[cfg(target_os = "macos")]
-async fn pull_image(runtime: &vz_oci::Runtime, args: PullArgs) -> anyhow::Result<()> {
+async fn pull_image(runtime: &vz_oci_macos::Runtime, args: PullArgs) -> anyhow::Result<()> {
     info!(image = %args.image, "pulling OCI image");
     let image_id = runtime.pull(&args.image).await?;
     println!(
@@ -352,7 +348,7 @@ async fn pull_image(runtime: &vz_oci::Runtime, args: PullArgs) -> anyhow::Result
 }
 
 #[cfg(target_os = "macos")]
-async fn run_image(runtime: vz_oci::Runtime, args: RunArgs) -> anyhow::Result<()> {
+async fn run_image(runtime: vz_oci_macos::Runtime, args: RunArgs) -> anyhow::Result<()> {
     if args.detach && !args.internal_detached_child {
         return run_image_detached_parent(&runtime, &args).await;
     }
@@ -381,7 +377,7 @@ async fn run_image(runtime: vz_oci::Runtime, args: RunArgs) -> anyhow::Result<()
 
 #[cfg(target_os = "macos")]
 async fn run_image_detached_parent(
-    runtime: &vz_oci::Runtime,
+    runtime: &vz_oci_macos::Runtime,
     args: &RunArgs,
 ) -> anyhow::Result<()> {
     let container_id = args
@@ -414,16 +410,16 @@ async fn run_image_detached_parent(
             .find(|container| container.id == container_id)
         {
             match container.status {
-                vz_oci::ContainerStatus::Running => {
+                vz_oci_macos::ContainerStatus::Running => {
                     println!("container running in background: {container_id}");
                     return Ok(());
                 }
-                vz_oci::ContainerStatus::Stopped { exit_code } => {
+                vz_oci_macos::ContainerStatus::Stopped { exit_code } => {
                     anyhow::bail!(
                         "detached container {container_id} stopped during startup with exit code {exit_code}"
                     );
                 }
-                vz_oci::ContainerStatus::Created => {}
+                vz_oci_macos::ContainerStatus::Created => {}
             }
         }
 
@@ -438,13 +434,13 @@ async fn run_image_detached_parent(
 }
 
 #[cfg(target_os = "macos")]
-async fn create_container(runtime: &vz_oci::Runtime, args: CreateArgs) -> anyhow::Result<()> {
+async fn create_container(runtime: &vz_oci_macos::Runtime, args: CreateArgs) -> anyhow::Result<()> {
     let env = parse_env_vars(&args.env)?;
     let ports = parse_port_mappings(&args.publish)?;
     let mounts = parse_volume_mounts(&args.volume)?;
     let network_enabled = if args.no_network { Some(false) } else { None };
 
-    let run_config = vz_oci::RunConfig {
+    let run_config = vz_oci_macos::RunConfig {
         cmd: args.command.clone(),
         working_dir: args.workdir,
         env,
@@ -455,7 +451,7 @@ async fn create_container(runtime: &vz_oci::Runtime, args: CreateArgs) -> anyhow
         memory_mb: args.memory_mb,
         network_enabled,
         serial_log_file: args.serial_log_file,
-        execution_mode: vz_oci::ExecutionMode::OciRuntime,
+        execution_mode: vz_oci_macos::ExecutionMode::OciRuntime,
         timeout: None,
         container_id: args.name,
         init_process: if args.command.is_empty() {
@@ -478,11 +474,11 @@ async fn create_container(runtime: &vz_oci::Runtime, args: CreateArgs) -> anyhow
 }
 
 #[cfg(target_os = "macos")]
-async fn exec_container(runtime: &vz_oci::Runtime, args: ExecArgs) -> anyhow::Result<()> {
+async fn exec_container(runtime: &vz_oci_macos::Runtime, args: ExecArgs) -> anyhow::Result<()> {
     let env = parse_env_vars(&args.env)?;
     let timeout = args.timeout_secs.map(Duration::from_secs);
 
-    let exec_config = vz_oci::ExecConfig {
+    let exec_config = vz_oci_macos::ExecConfig {
         cmd: args.command,
         working_dir: args.workdir,
         env,
@@ -506,7 +502,7 @@ async fn exec_container(runtime: &vz_oci::Runtime, args: ExecArgs) -> anyhow::Re
 }
 
 #[cfg(target_os = "macos")]
-fn list_images(runtime: &vz_oci::Runtime) -> anyhow::Result<()> {
+fn list_images(runtime: &vz_oci_macos::Runtime) -> anyhow::Result<()> {
     let images = runtime.images()?;
 
     if images.is_empty() {
@@ -524,7 +520,7 @@ fn list_images(runtime: &vz_oci::Runtime) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn prune_images(runtime: &vz_oci::Runtime) -> anyhow::Result<()> {
+fn prune_images(runtime: &vz_oci_macos::Runtime) -> anyhow::Result<()> {
     let result = runtime.prune_images()?;
 
     println!(
@@ -539,7 +535,7 @@ fn prune_images(runtime: &vz_oci::Runtime) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn list_containers(runtime: &vz_oci::Runtime) -> anyhow::Result<()> {
+fn list_containers(runtime: &vz_oci_macos::Runtime) -> anyhow::Result<()> {
     let containers = runtime.list_containers()?;
 
     if containers.is_empty() {
@@ -552,9 +548,9 @@ fn list_containers(runtime: &vz_oci::Runtime) -> anyhow::Result<()> {
 
     for container in containers {
         let status = match container.status {
-            vz_oci::ContainerStatus::Created => "created".to_string(),
-            vz_oci::ContainerStatus::Running => "running".to_string(),
-            vz_oci::ContainerStatus::Stopped { exit_code } => {
+            vz_oci_macos::ContainerStatus::Created => "created".to_string(),
+            vz_oci_macos::ContainerStatus::Running => "running".to_string(),
+            vz_oci_macos::ContainerStatus::Stopped { exit_code } => {
                 format!("stopped (exit {exit_code})")
             }
         };
@@ -569,16 +565,16 @@ fn list_containers(runtime: &vz_oci::Runtime) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-async fn stop_container(runtime: &vz_oci::Runtime, args: StopArgs) -> anyhow::Result<()> {
+async fn stop_container(runtime: &vz_oci_macos::Runtime, args: StopArgs) -> anyhow::Result<()> {
     let container = runtime.stop_container(&args.id, args.force).await?;
     match container.status {
-        vz_oci::ContainerStatus::Running => {
+        vz_oci_macos::ContainerStatus::Running => {
             println!("Container {} remains running", args.id);
         }
-        vz_oci::ContainerStatus::Created => {
+        vz_oci_macos::ContainerStatus::Created => {
             println!("Container {} is created but not running", args.id);
         }
-        vz_oci::ContainerStatus::Stopped { exit_code } => {
+        vz_oci_macos::ContainerStatus::Stopped { exit_code } => {
             println!("Stopped container {} (exit {exit_code})", args.id);
         }
     }
@@ -587,14 +583,14 @@ async fn stop_container(runtime: &vz_oci::Runtime, args: StopArgs) -> anyhow::Re
 }
 
 #[cfg(target_os = "macos")]
-async fn remove_container(runtime: &vz_oci::Runtime, args: RmArgs) -> anyhow::Result<()> {
+async fn remove_container(runtime: &vz_oci_macos::Runtime, args: RmArgs) -> anyhow::Result<()> {
     runtime.remove_container(&args.id).await?;
     println!("Removed container {id}", id = args.id);
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn build_run_config(args: &RunArgs) -> anyhow::Result<vz_oci::RunConfig> {
+fn build_run_config(args: &RunArgs) -> anyhow::Result<vz_oci_macos::RunConfig> {
     let env = parse_env_vars(&args.env)?;
     let ports = parse_port_mappings(&args.publish)?;
     let mounts = parse_volume_mounts(&args.volume)?;
@@ -602,7 +598,7 @@ fn build_run_config(args: &RunArgs) -> anyhow::Result<vz_oci::RunConfig> {
     let network_enabled = if args.no_network { Some(false) } else { None };
     let timeout = args.timeout_secs.map(Duration::from_secs);
 
-    Ok(vz_oci::RunConfig {
+    Ok(vz_oci_macos::RunConfig {
         cmd: args.command.clone(),
         working_dir: args.workdir.clone(),
         env,
@@ -627,11 +623,11 @@ fn build_run_config(args: &RunArgs) -> anyhow::Result<vz_oci::RunConfig> {
 }
 
 #[cfg(target_os = "macos")]
-impl From<ExecutionModeArg> for vz_oci::ExecutionMode {
+impl From<ExecutionModeArg> for vz_oci_macos::ExecutionMode {
     fn from(value: ExecutionModeArg) -> Self {
         match value {
-            ExecutionModeArg::GuestExec => vz_oci::ExecutionMode::GuestExec,
-            ExecutionModeArg::OciRuntime => vz_oci::ExecutionMode::OciRuntime,
+            ExecutionModeArg::GuestExec => vz_oci_macos::ExecutionMode::GuestExec,
+            ExecutionModeArg::OciRuntime => vz_oci_macos::ExecutionMode::OciRuntime,
         }
     }
 }

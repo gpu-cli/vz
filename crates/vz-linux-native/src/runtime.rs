@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
-use crate::bundle::{self, BundleSpec};
+use vz_oci::bundle::{self, BundleSpec};
 use crate::config::LinuxNativeConfig;
 use crate::error::LinuxNativeError;
 use crate::process::{self, ExecOptions, OciState};

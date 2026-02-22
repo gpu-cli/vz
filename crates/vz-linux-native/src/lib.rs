@@ -8,7 +8,6 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
-pub mod bundle;
 pub mod cgroups;
 pub mod config;
 pub mod error;
@@ -19,7 +18,7 @@ pub mod process;
 pub mod runtime;
 
 pub use backend::LinuxNativeBackend;
-pub use bundle::{BundleMount, BundleSpec};
+pub use vz_oci::bundle::{BundleMount, BundleSpec};
 pub use config::{IsolationMode, LinuxNativeConfig, OciRuntime};
 pub use error::LinuxNativeError;
 pub use probe::{HostProbeReport, ProbeResult, probe_host};

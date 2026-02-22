@@ -28,7 +28,7 @@ ctrlc = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 vz-sandbox = { workspace = true }
 vz = { workspace = true }
-vz-oci = { workspace = true }
+vz-oci-macos = { workspace = true }
 vz-validation = { workspace = true, features = ["oci"] }
 objc2 = { workspace = true }
 objc2-foundation = { workspace = true }

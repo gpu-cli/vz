@@ -2403,7 +2403,7 @@ dependencies = [
  "tracing-subscriber",
  "vz",
  "vz-linux-native",
- "vz-oci",
+ "vz-oci-macos",
  "vz-runtime-contract",
  "vz-sandbox",
  "vz-stack",
@@ -2463,17 +2463,31 @@ dependencies = [
  "oci-spec",
  "serde",
  "serde_json",
- "shell-words",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "vz-image",
+ "vz-oci",
  "vz-runtime-contract",
 ]
 
 [[package]]
 name = "vz-oci"
+version = "0.1.0"
+dependencies = [
+ "oci-spec",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "tempfile",
+ "thiserror 2.0.18",
+ "vz-image",
+ "vz-runtime-contract",
+]
+
+[[package]]
+name = "vz-oci-macos"
 version = "0.1.0"
 dependencies = [
  "oci-spec",
@@ -2488,6 +2502,7 @@ dependencies = [
  "vz",
  "vz-image",
  "vz-linux",
+ "vz-oci",
  "vz-runtime-contract",
  "vz-sandbox",
 ]
@@ -2526,7 +2541,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "vz-oci",
+ "vz-oci-macos",
  "vz-runtime-contract",
 ]
 
@@ -2540,7 +2555,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "vz-oci",
+ "vz-oci-macos",
 ]
 
 [[package]]

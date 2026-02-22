@@ -1,4 +1,4 @@
-//! Real runtime adapter backed by `vz_oci::Runtime`.
+//! Real runtime adapter backed by `vz_oci_macos::Runtime`.
 //!
 //! Bridges the validation harness to real Linux VMs via
 //! Virtualization.framework. Supports single-container (S1-S5)
@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use tracing::{debug, info};
-use vz_oci::{ExecConfig, ExecutionMode, NetworkServiceConfig, RunConfig, Runtime, RuntimeConfig};
+use vz_oci_macos::{ExecConfig, ExecutionMode, NetworkServiceConfig, RunConfig, Runtime, RuntimeConfig};
 
 use crate::cohort::ImageRef;
 use crate::runner::{ExecOutput, RuntimeAdapter};

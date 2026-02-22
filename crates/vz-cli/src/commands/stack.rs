@@ -238,7 +238,7 @@ pub async fn run(args: StackArgs) -> anyhow::Result<()> {
 // ── Platform backend type alias ───────────────────────────────────
 
 #[cfg(target_os = "macos")]
-type PlatformBackend = vz_oci::MacosRuntimeBackend;
+type PlatformBackend = vz_oci_macos::MacosRuntimeBackend;
 
 #[cfg(target_os = "linux")]
 type PlatformBackend = vz_linux_native::LinuxNativeBackend;
@@ -259,12 +259,12 @@ struct OciContainerRuntime {
 impl OciContainerRuntime {
     #[cfg(target_os = "macos")]
     fn new(oci_data_dir: &Path) -> anyhow::Result<Self> {
-        let config = vz_oci::RuntimeConfig {
+        let config = vz_oci_macos::RuntimeConfig {
             data_dir: oci_data_dir.to_path_buf(),
             ..Default::default()
         };
-        let runtime = vz_oci::Runtime::new(config);
-        let backend = vz_oci::MacosRuntimeBackend::new(runtime);
+        let runtime = vz_oci_macos::Runtime::new(config);
+        let backend = vz_oci_macos::MacosRuntimeBackend::new(runtime);
         let handle = tokio::runtime::Handle::current();
         Ok(Self { backend, handle })
     }

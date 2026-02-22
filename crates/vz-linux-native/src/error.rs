@@ -41,4 +41,18 @@ pub enum LinuxNativeError {
     /// Image store or pull error.
     #[error(transparent)]
     Image(#[from] vz_image::ImageError),
+
+}
+
+/// Convert platform-agnostic `OciError` into `LinuxNativeError`.
+impl From<vz_oci::OciError> for LinuxNativeError {
+    fn from(e: vz_oci::OciError) -> Self {
+        match e {
+            vz_oci::OciError::InvalidConfig(msg) => Self::InvalidConfig(msg),
+            vz_oci::OciError::InvalidRootfs { path } => Self::InvalidRootfs { path },
+            vz_oci::OciError::RuntimeSpec(e) => Self::RuntimeSpec(e),
+            vz_oci::OciError::Image(e) => Self::Image(e),
+            vz_oci::OciError::Storage(e) => Self::Io(e),
+        }
+    }
 }

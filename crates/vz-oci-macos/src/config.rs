@@ -3,42 +3,8 @@ use std::time::Duration;
 
 pub use vz_image::Auth;
 
-/// Port mapping protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PortProtocol {
-    /// TCP stream forwarding.
-    #[default]
-    Tcp,
-    /// UDP datagram forwarding.
-    Udp,
-}
-
-impl PortProtocol {
-    /// Protocol name used by the guest wire protocol.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Tcp => "tcp",
-            Self::Udp => "udp",
-        }
-    }
-}
-
-/// Host-to-container port mapping.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PortMapping {
-    /// Host port to listen on.
-    pub host: u16,
-    /// Container guest port to forward to.
-    pub container: u16,
-    /// Forwarding protocol.
-    pub protocol: PortProtocol,
-    /// Target host/IP inside the guest for port forwarding.
-    ///
-    /// In stack mode, this is set to the service IP (e.g., `172.20.0.2`)
-    /// so connections route through the bridge to the correct per-service
-    /// network namespace. When `None`, defaults to `127.0.0.1`.
-    pub target_host: Option<String>,
-}
+// Re-export shared types from the runtime contract.
+pub use vz_runtime_contract::{MountAccess, MountSpec, MountType, PortMapping, PortProtocol};
 
 /// Runtime backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,39 +98,6 @@ impl Default for RuntimeConfig {
     }
 }
 
-/// Mount type for container volume bindings.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum MountType {
-    /// Bind mount from host to container.
-    #[default]
-    Bind,
-    /// Ephemeral tmpfs mount inside the container.
-    Tmpfs,
-}
-
-/// Access mode for container mounts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MountAccess {
-    /// Read-write access (default).
-    #[default]
-    ReadWrite,
-    /// Read-only access.
-    ReadOnly,
-}
-
-/// A volume/bind mount specification for a container run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MountSpec {
-    /// Host source path (required for bind mounts, ignored for tmpfs).
-    pub source: Option<PathBuf>,
-    /// Container destination path (absolute).
-    pub target: PathBuf,
-    /// Mount type.
-    pub mount_type: MountType,
-    /// Access mode.
-    pub access: MountAccess,
-}
-
 /// Per-run options for a Linux rootfs-backed container VM.
 #[derive(Debug, Clone, Default)]
 pub struct RunConfig {
@@ -242,4 +175,3 @@ pub struct ExecConfig {
     /// Optional exec timeout override.
     pub timeout: Option<Duration>,
 }
-

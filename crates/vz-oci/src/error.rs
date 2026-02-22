@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
-/// Errors produced by `vz-oci` runtime operations.
+/// Errors produced by platform-agnostic OCI operations (bundle generation, storage).
 use oci_spec::OciSpecError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OciError {
-    /// Invalid runtime or run configuration.
-    #[error("invalid runtime config: {0}")]
+    /// Invalid configuration.
+    #[error("invalid config: {0}")]
     InvalidConfig(String),
 
     /// Rootfs directory is missing or invalid.
@@ -14,17 +14,6 @@ pub enum OciError {
     InvalidRootfs {
         /// Rootfs path that failed validation.
         path: PathBuf,
-    },
-
-    /// Linux backend error.
-    #[error(transparent)]
-    Linux(#[from] vz_linux::LinuxError),
-
-    /// The selected execution strategy is not yet implemented.
-    #[error("execution mode '{mode}' is not yet supported")]
-    UnsupportedExecutionMode {
-        /// Requested execution strategy name.
-        mode: String,
     },
 
     /// Runtime-spec generation or serialization failed.

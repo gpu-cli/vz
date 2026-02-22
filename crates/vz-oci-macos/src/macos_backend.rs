@@ -7,7 +7,7 @@
 use vz_runtime_contract::{self as contract, RuntimeBackend, RuntimeError};
 
 use crate::config as oci_config;
-use crate::container_store as oci_container;
+use vz_oci::container_store as oci_container;
 use crate::runtime::Runtime;
 
 /// macOS backend wrapping the existing [`Runtime`].
@@ -186,7 +186,7 @@ impl RuntimeBackend for MacosRuntimeBackend {
 
 // ── Error mapping ─────────────────────────────────────────────────
 
-fn oci_err(e: crate::error::OciError) -> RuntimeError {
+fn oci_err(e: crate::error::MacosOciError) -> RuntimeError {
     RuntimeError::Backend {
         message: e.to_string(),
         source: Box::new(e),

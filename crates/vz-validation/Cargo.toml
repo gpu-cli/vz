@@ -9,14 +9,14 @@ repository.workspace = true
 
 [features]
 default = ["oci"]
-oci = ["dep:vz-oci", "dep:tokio"]
+oci = ["dep:vz-oci-macos", "dep:tokio"]
 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-vz-oci = { workspace = true, optional = true }
+vz-oci-macos = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 
 [dev-dependencies]

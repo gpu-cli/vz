@@ -12,11 +12,11 @@ use oci_spec::runtime::{
 use crate::error::OciError;
 
 const OCI_ROOTFS_DIRNAME: &str = "rootfs";
-pub(crate) const OCI_CONFIG_FILENAME: &str = "config.json";
+pub const OCI_CONFIG_FILENAME: &str = "config.json";
 
 /// Mount entry written into an OCI runtime-spec bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BundleMount {
+pub struct BundleMount {
     /// Mount destination path inside the container.
     pub destination: PathBuf,
     /// Source path on the host.
@@ -29,7 +29,7 @@ pub(crate) struct BundleMount {
 
 /// Process-oriented bundle settings consumed by runtime-spec generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BundleSpec {
+pub struct BundleSpec {
     /// Process command and argument vector.
     pub cmd: Vec<String>,
     /// Process environment key/value pairs.
@@ -75,7 +75,7 @@ pub(crate) struct BundleSpec {
 /// absolute path directly (no symlink created). This avoids VirtioFS caching
 /// issues where symlinks written on the host may not be visible in the guest.
 /// When `rootfs_dir` is relative, a symlink is created at `<bundle>/rootfs`.
-pub(crate) fn write_oci_bundle(
+pub fn write_oci_bundle(
     bundle_dir: impl AsRef<Path>,
     rootfs_dir: impl AsRef<Path>,
     spec: BundleSpec,
@@ -129,13 +129,22 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
         cmd
     };
 
+    // Ensure PATH is always set (Docker default behavior).
+    let has_path = env.iter().any(|(k, _)| k == "PATH");
+    let mut env_strings: Vec<String> = env
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    if !has_path {
+        env_strings.insert(
+            0,
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+        );
+    }
+
     let process = ProcessBuilder::default()
         .args(process_args)
-        .env(
-            env.into_iter()
-                .map(|(key, value)| format!("{key}={value}"))
-                .collect::<Vec<_>>(),
-        )
+        .env(env_strings)
         .cwd(cwd.unwrap_or_else(|| "/".to_string()))
         .user(parse_process_user(user.as_deref())?)
         .capabilities(docker_default_capabilities()?)

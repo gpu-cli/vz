@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use vz_oci::{MacosRuntimeBackend, RuntimeConfig};
+use vz_oci_macos::{MacosRuntimeBackend, RuntimeConfig};
 use vz_runtime_contract::{
     ExecConfig, NetworkServiceConfig, PortMapping, RunConfig, RuntimeBackend,
 };
@@ -30,7 +30,7 @@ use vz_stack::{
 /// Bridge the async [`MacosRuntimeBackend`] to the sync [`ContainerRuntime`] trait.
 ///
 /// Uses `MacosRuntimeBackend` (which implements `RuntimeBackend` with contract types)
-/// rather than `vz_oci::Runtime` directly, avoiding manual type conversions.
+/// rather than `vz_oci_macos::Runtime` directly, avoiding manual type conversions.
 struct OciContainerRuntime {
     backend: MacosRuntimeBackend,
     handle: tokio::runtime::Handle,
@@ -45,7 +45,7 @@ impl OciContainerRuntime {
             exec_timeout: Duration::from_secs(30),
             ..RuntimeConfig::default()
         };
-        let runtime = vz_oci::Runtime::new(config);
+        let runtime = vz_oci_macos::Runtime::new(config);
         Self {
             backend: MacosRuntimeBackend::new(runtime),
             handle: tokio::runtime::Handle::current(),
@@ -427,7 +427,7 @@ services:
 #[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn real_services_postgres_and_redis() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,vz_oci=debug,vz_linux=debug,vz_stack=debug")
+        .with_env_filter("info,vz_oci_macos=debug,vz_linux=debug,vz_stack=debug")
         .with_test_writer()
         .try_init();
 
@@ -571,7 +571,7 @@ async fn exec_via_control_socket() {
     use tokio::net::{UnixListener, UnixStream};
 
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,vz_oci=debug,vz_linux=debug,vz_stack=debug")
+        .with_env_filter("info,vz_oci_macos=debug,vz_linux=debug,vz_stack=debug")
         .with_test_writer()
         .try_init();
 
@@ -725,7 +725,7 @@ services:
 #[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn stack_port_forwarding() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,vz_oci=debug,vz_linux=debug,vz_stack=debug")
+        .with_env_filter("info,vz_oci_macos=debug,vz_linux=debug,vz_stack=debug")
         .with_test_writer()
         .try_init();
 

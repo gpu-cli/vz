@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, process};
 
-use crate::bundle::{BundleMount, BundleSpec, write_oci_bundle};
-use crate::container_store::{ContainerInfo, ContainerStatus, ContainerStore};
+use vz_oci::bundle::{BundleMount, BundleSpec, write_oci_bundle};
+use vz_oci::container_store::{ContainerInfo, ContainerStatus, ContainerStore};
 use vz_image::{
     ImageConfigSummary, ImageId, ImagePuller, ImageStore, parse_image_config_summary_from_store,
 };
@@ -31,7 +31,7 @@ use crate::config::{
     ExecConfig, ExecutionMode, MountAccess, MountSpec, MountType, OciRuntimeKind, PortMapping,
     PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig,
 };
-use crate::error::OciError;
+use crate::error::MacosOciError as OciError;
 use vz_image::{ImageInfo, PruneResult};
 
 const STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);

@@ -1,23 +1,30 @@
 [package]
-name = "vz-oci"
+name = "vz-oci-macos"
 version = "0.1.0"
-description = "Platform-agnostic OCI bundle generation and container metadata"
+description = "macOS Virtualization.framework backend for vz OCI runtime"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
+vz = { workspace = true }
 vz-image = { workspace = true }
+vz-linux = { workspace = true }
+vz-oci = { workspace = true }
 vz-runtime-contract = { workspace = true }
+vz-sandbox = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
 oci-spec = { workspace = true }
+tracing = { workspace = true }
 shell-words = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

@@ -22,7 +22,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-vz-oci = { workspace = true }
+vz-oci-macos = { workspace = true }
 
 [lints]
 workspace = true

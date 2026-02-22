@@ -9,13 +9,13 @@
 //! - Linux kernel artifacts installed (`~/.vz/linux/`)
 //! - Network access for image pulls (first run only; cached after)
 //!
-//! Run with: `cargo nextest run -p vz-oci --test runtime_e2e -- --ignored`
+//! Run with: `cargo nextest run -p vz-oci-macos --test runtime_e2e -- --ignored`
 
 #![allow(clippy::unwrap_used)]
 
 use std::time::Duration;
 
-use vz_oci::{ExecConfig, ExecutionMode, RunConfig, Runtime, RuntimeConfig};
+use vz_oci_macos::{ExecConfig, ExecutionMode, RunConfig, Runtime, RuntimeConfig};
 
 /// Set up tracing for test diagnostics.
 fn init_tracing() {
@@ -217,7 +217,7 @@ async fn lifecycle_create_exec_stop_remove() {
     // Stop the container.
     let stopped = rt.stop_container(&container_id, false).await.unwrap();
     assert!(
-        !matches!(stopped.status, vz_oci::ContainerStatus::Running),
+        !matches!(stopped.status, vz_oci_macos::ContainerStatus::Running),
         "container should not be running after stop"
     );
 
@@ -254,10 +254,10 @@ async fn port_forwarding_tcp() {
                     "echo 'pong' | nc -l -p 8080".into(),
                 ],
                 execution_mode: ExecutionMode::OciRuntime,
-                ports: vec![vz_oci::PortMapping {
+                ports: vec![vz_oci_macos::PortMapping {
                     host: 18080,
                     container: 8080,
-                    protocol: vz_oci::PortProtocol::Tcp,
+                    protocol: vz_oci_macos::PortProtocol::Tcp,
                     target_host: None,
                 }],
                 ..RunConfig::default()
@@ -367,11 +367,11 @@ async fn shared_vm_inter_service_connectivity() {
 
     // 2. Set up per-service networking.
     let services = vec![
-        vz_oci::NetworkServiceConfig {
+        vz_oci_macos::NetworkServiceConfig {
             name: "web".to_string(),
             addr: "172.20.0.2/24".to_string(),
         },
-        vz_oci::NetworkServiceConfig {
+        vz_oci_macos::NetworkServiceConfig {
             name: "db".to_string(),
             addr: "172.20.0.3/24".to_string(),
         },
