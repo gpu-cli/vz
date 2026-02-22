@@ -1332,7 +1332,7 @@ impl Runtime {
             env,
             user,
             ports,
-            mounts: _,
+            mounts,
             cpus,
             memory_mb,
             network_enabled,
@@ -1375,6 +1375,21 @@ impl Runtime {
         vm_config
             .shared_dirs
             .push(make_oci_runtime_share(&runtime_binary)?);
+
+        // Add VirtioFS shares for bind mounts and encode target paths in
+        // the kernel command line so the initramfs can mount them.
+        let mount_shares = mount_specs_to_shared_dirs(&mounts);
+        if !mount_shares.is_empty() {
+            vm_config.shared_dirs.extend(mount_shares);
+            for (idx, spec) in mounts.iter().enumerate() {
+                if matches!(spec.mount_type, MountType::Bind) {
+                    vm_config
+                        .cmdline
+                        .push_str(&format!(" vz.mount.{}={}", idx, spec.target.display()));
+                }
+            }
+        }
+
         vm_config.cpus = cpus.unwrap_or(self.config.default_cpus);
         vm_config.memory_mb = memory_mb.unwrap_or(self.config.default_memory_mb);
         vm_config.serial_log_file = serial_log_file;

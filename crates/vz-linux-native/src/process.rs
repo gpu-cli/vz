@@ -246,6 +246,12 @@ pub(crate) async fn oci_delete(
 }
 
 /// Run an OCI runtime command and capture output.
+///
+/// IMPORTANT: We wait for the child process to exit BEFORE draining
+/// stdout/stderr pipes. OCI runtimes like youki fork child processes
+/// (container init) that inherit pipe file descriptors. Using
+/// `wait_with_output()` would block forever because the forked
+/// init process (`sleep infinity`) keeps the pipes open.
 async fn run_runtime_command(
     runtime_binary: &str,
     args: &[&str],
@@ -263,7 +269,7 @@ async fn run_runtime_command(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let child = cmd.spawn().map_err(|e| {
+    let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             LinuxNativeError::RuntimeBinaryNotFound {
                 path: runtime_binary.to_string(),
@@ -273,10 +279,18 @@ async fn run_runtime_command(
         }
     })?;
 
-    let output = if let Some(timeout) = timeout {
-        match tokio::time::timeout(timeout, child.wait_with_output()).await {
+    // Take ownership of stdout/stderr before waiting, so we can drain
+    // them independently after the process exits.
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+
+    // Wait for the child process to exit first.
+    let status = if let Some(timeout) = timeout {
+        match tokio::time::timeout(timeout, child.wait()).await {
             Ok(result) => result?,
             Err(_) => {
+                // Kill the child on timeout.
+                let _ = child.kill().await;
                 return Ok(ProcessOutput {
                     exit_code: 124, // timeout exit code convention
                     stdout: String::new(),
@@ -285,12 +299,27 @@ async fn run_runtime_command(
             }
         }
     } else {
-        child.wait_with_output().await?
+        child.wait().await?
     };
 
-    let exit_code = output.status.code().unwrap_or(128);
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    // Now drain pipes. The main process has exited, so its pipe ends
+    // are closed. Forked children may still hold them open, so read
+    // with a short timeout to avoid blocking forever.
+    let drain_timeout = Duration::from_millis(500);
+
+    let stdout = if let Some(ref mut pipe) = stdout_pipe {
+        drain_pipe(pipe, drain_timeout).await
+    } else {
+        String::new()
+    };
+
+    let stderr = if let Some(ref mut pipe) = stderr_pipe {
+        drain_pipe(pipe, drain_timeout).await
+    } else {
+        String::new()
+    };
+
+    let exit_code = status.code().unwrap_or(128);
 
     debug!(
         exit_code,
@@ -304,4 +333,15 @@ async fn run_runtime_command(
         stdout,
         stderr,
     })
+}
+
+/// Drain a pipe with a timeout, returning whatever was read.
+async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(
+    pipe: &mut R,
+    timeout: Duration,
+) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(timeout, pipe.read_to_end(&mut buf)).await;
+    String::from_utf8_lossy(&buf).into_owned()
 }

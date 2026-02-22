@@ -89,6 +89,25 @@ switch_root_into_overlay_rootfs() {
   mkdir -p "$ROOTFS/vz-rootfs"
   mount --bind /mnt/rootfs "$ROOTFS/vz-rootfs" || return 1
 
+  # Bind-mount user volume shares into the chroot at their target paths.
+  # Target paths are encoded in kernel cmdline as vz.mount.N=/target/path.
+  for param in $(cat /proc/cmdline); do
+    case "$param" in
+      vz.mount.*=*)
+        idx="${param#vz.mount.}"
+        idx="${idx%%=*}"
+        target="${param#*=}"
+        src="/mnt/vz-mount-$idx"
+        if [ -d "$src" ]; then
+          mkdir -p "$ROOTFS$target"
+          mount --bind "$src" "$ROOTFS$target" || \
+            echo "[vz-init] warning: failed to bind-mount $src to $ROOTFS$target"
+          echo "[vz-init] volume $src -> $target"
+        fi
+        ;;
+    esac
+  done
+
   echo "[vz-init] entering rootfs via chroot and starting guest agent on vsock 7424"
 
   # Run guest agent as a child process (not PID 1) to avoid OOM killer deadlock.
@@ -118,6 +137,23 @@ if mount -t virtiofs oci-runtime-bin /mnt/oci-runtime-bin 2>/dev/null; then
 else
   echo "[vz-init] no oci-runtime-bin virtiofs mount available"
 fi
+
+# Mount user-provided VirtioFS volume shares (vz-mount-0, vz-mount-1, ...).
+# These are configured when --volume is passed to `vz oci run`.
+idx=0
+while true; do
+  tag="vz-mount-$idx"
+  mount_point="/mnt/$tag"
+  mkdir -p "$mount_point"
+  if mount -t virtiofs "$tag" "$mount_point" 2>/dev/null; then
+    echo "[vz-init] mounted virtiofs $tag at $mount_point"
+  else
+    # No more mount shares — stop probing.
+    rmdir "$mount_point" 2>/dev/null || true
+    break
+  fi
+  idx=$((idx + 1))
+done
 
 if ! install_youki_binary /usr/local/bin/youki; then
   echo "[vz-init] failed to stage youki in initramfs userland"
