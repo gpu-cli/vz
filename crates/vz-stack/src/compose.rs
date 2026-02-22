@@ -56,6 +56,8 @@ const ACCEPTED_SERVICE: &[&str] = &[
     "hostname",
     "domainname",
     "labels",
+    // Filesystem
+    "tmpfs",
     // Stop lifecycle
     "stop_signal",
     "stop_grace_period",
@@ -439,7 +441,9 @@ fn parse_service(
         .and_then(|v| v.as_str())
         .map(String::from);
     let ports = parse_ports(name, svc_map)?;
-    let mounts = parse_mounts(name, svc_map, defined_volumes)?;
+    let mut mounts = parse_mounts(name, svc_map, defined_volumes)?;
+    let tmpfs_mounts = parse_tmpfs(name, svc_map)?;
+    mounts.extend(tmpfs_mounts);
     let depends_on = parse_depends_on(name, svc_map)?;
     let healthcheck = parse_healthcheck(name, svc_map)?;
     let restart_policy = parse_restart(name, svc_map)?;
@@ -813,6 +817,54 @@ fn parse_mounts(
         }
     }
     Ok(mounts)
+}
+
+/// Parse the `tmpfs` service key into ephemeral mounts.
+///
+/// Docker Compose allows `tmpfs` as a single path string or a list of paths:
+/// ```yaml
+/// tmpfs: /run
+/// # or
+/// tmpfs:
+///   - /run
+///   - /tmp
+/// ```
+fn parse_tmpfs(svc_name: &str, map: &serde_yml::Mapping) -> Result<Vec<MountSpec>, StackError> {
+    let Some(value) = map.get(val("tmpfs")) else {
+        return Ok(vec![]);
+    };
+
+    let paths: Vec<&str> = if let Some(s) = value.as_str() {
+        vec![s]
+    } else if let Some(seq) = value.as_sequence() {
+        seq.iter()
+            .map(|v| {
+                v.as_str().ok_or_else(|| {
+                    StackError::ComposeParse(format!(
+                        "service `{svc_name}`: `tmpfs` entries must be strings"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        return Err(StackError::ComposeParse(format!(
+            "service `{svc_name}`: `tmpfs` must be a string or list of strings"
+        )));
+    };
+
+    paths
+        .into_iter()
+        .map(|path| {
+            if !path.starts_with('/') {
+                return Err(StackError::ComposeParse(format!(
+                    "service `{svc_name}`: tmpfs path `{path}` must be an absolute path"
+                )));
+            }
+            Ok(MountSpec::Ephemeral {
+                target: path.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Parse short-form mount syntax: `"source:target[:ro]"` or `"/target"`.

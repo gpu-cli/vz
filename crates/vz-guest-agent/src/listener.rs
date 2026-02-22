@@ -226,12 +226,18 @@ impl Connected for VsockStream {
 /// Wraps a shared [`VsockListener`] and yields `Result<VsockStream, io::Error>`.
 pub struct VsockIncoming {
     listener: Arc<VsockListener>,
+    /// The in-progress accept future, stored across `poll_next` calls so that
+    /// a `spawn_blocking` accept result is not lost between polls.
+    pending: Option<Pin<Box<dyn std::future::Future<Output = io::Result<VsockStream>> + Send>>>,
 }
 
 impl VsockIncoming {
     /// Create a new incoming stream from the given listener.
     pub fn new(listener: Arc<VsockListener>) -> Self {
-        Self { listener }
+        Self {
+            listener,
+            pending: None,
+        }
     }
 }
 
@@ -239,16 +245,20 @@ impl tokio_stream::Stream for VsockIncoming {
     type Item = Result<VsockStream, io::Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let listener = self.listener.clone();
-        // We need to poll the accept future. Since VsockListener::accept uses
-        // spawn_blocking internally, we create a future each time and poll it.
-        // To avoid creating a new future on every poll, we use a simple approach:
-        // pin a new future each time. This works because spawn_blocking handles
-        // the actual blocking, and each poll_next call represents a new accept attempt.
-        let fut = async move { listener.accept().await };
-        let mut fut = Box::pin(fut);
+        let this = self.get_mut();
+
+        // Reuse the pending future if one exists, otherwise create a new one.
+        let fut = this.pending.get_or_insert_with(|| {
+            let listener = this.listener.clone();
+            Box::pin(async move { listener.accept().await })
+        });
+
         match fut.as_mut().poll(cx) {
-            Poll::Ready(result) => Poll::Ready(Some(result)),
+            Poll::Ready(result) => {
+                // Future completed — clear it so the next poll creates a fresh one.
+                this.pending = None;
+                Poll::Ready(Some(result))
+            }
             Poll::Pending => Poll::Pending,
         }
     }

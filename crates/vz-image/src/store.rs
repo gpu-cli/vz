@@ -236,25 +236,41 @@ impl ImageStore {
 
             for entry in fs::read_dir(layers_dir)? {
                 let entry = entry?;
-                if !entry.file_type()?.is_dir() {
-                    continue;
-                }
+                let path = entry.path();
+                let is_dir = entry.file_type()?.is_dir();
 
-                let name_os = entry.file_name();
-                let Some(name) = name_os.to_str() else {
+                // Handle both unpacked layer dirs and their `.done` markers.
+                let digest = if is_dir {
+                    let name_os = entry.file_name();
+                    let Some(name) = name_os.to_str() else {
+                        continue;
+                    };
+                    if !is_image_id(name) {
+                        continue;
+                    }
+                    name.to_string()
+                } else if path.extension().is_some_and(|ext| ext == "done") {
+                    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    if !is_image_id(stem) {
+                        continue;
+                    }
+                    stem.to_string()
+                } else {
                     continue;
                 };
 
-                if !is_image_id(name) {
+                if referenced_layer_digests.contains(digest.as_str()) {
                     continue;
                 }
 
-                if referenced_layer_digests.contains(name) {
-                    continue;
+                if is_dir {
+                    fs::remove_dir_all(&path)?;
+                    result.removed_layer_dirs += 1;
+                } else {
+                    fs::remove_file(&path)?;
                 }
-
-                fs::remove_dir_all(entry.path())?;
-                result.removed_layer_dirs += 1;
             }
         }
 
@@ -297,49 +313,114 @@ impl ImageStore {
     }
 
     /// Internal helper for unpacking a layer.
+    ///
+    /// Uses a `.done` marker file to coordinate concurrent extractors. If the
+    /// directory exists but `.done` is absent, another thread is still
+    /// extracting — we poll until it finishes.
     fn unpack_layer_inner(&self, digest: &str, media_type: &str) -> io::Result<PathBuf> {
         let src = self.resolve_layer_blob_path(digest)?;
         let destination = self.unpacked_layer_dir(digest);
+        let done_marker = destination.with_extension("done");
 
-        if destination.exists() {
+        // Fast path: extraction already completed by a previous or concurrent call.
+        if done_marker.exists() {
             return Ok(destination);
         }
 
-        let media = LayerMediaType::from_media_type(media_type);
+        // Directory exists but no `.done` marker. Either:
+        // (a) Another thread is extracting right now (`.tmp` sibling exists) — wait.
+        // (b) Legacy extraction from before the marker was introduced — stamp it.
+        if destination.exists() {
+            let tmp_dir = destination.with_extension("tmp");
+            if tmp_dir.exists() {
+                Self::wait_for_done(&done_marker)?;
+            } else {
+                // Legacy extraction or marker was lost — treat as complete.
+                File::create(&done_marker)?;
+            }
+            return Ok(destination);
+        }
 
-        fs::create_dir_all(&destination)?;
+        // Race-safe creation: use a temp directory and rename. If rename fails
+        // with AlreadyExists, another thread won the race — wait for their marker.
+        let tmp_dir = destination.with_extension("tmp");
+        if tmp_dir.exists() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+        }
+        fs::create_dir_all(&tmp_dir)?;
+
+        let media = LayerMediaType::from_media_type(media_type);
 
         let status = match media {
             LayerMediaType::Gzip => Command::new("tar")
                 .arg("-xpf")
                 .arg(&src)
                 .arg("-C")
-                .arg(&destination)
+                .arg(&tmp_dir)
                 .arg("-z")
                 .status()?,
             LayerMediaType::Zstd => Command::new("tar")
                 .arg("-xpf")
                 .arg(&src)
                 .arg("-C")
-                .arg(&destination)
+                .arg(&tmp_dir)
                 .arg("--zstd")
                 .status()?,
             LayerMediaType::Tar => Command::new("tar")
                 .arg("-xpf")
                 .arg(&src)
                 .arg("-C")
-                .arg(&destination)
+                .arg(&tmp_dir)
                 .status()?,
         };
 
         if !status.success() {
-            fs::remove_dir_all(&destination)?;
+            let _ = fs::remove_dir_all(&tmp_dir);
             return Err(io::Error::other(format!(
                 "unable to unpack layer {digest} using media type {media_type}",
             )));
         }
 
+        // Atomically move to final destination.
+        match fs::rename(&tmp_dir, &destination) {
+            Ok(()) => {
+                // We won the race — write the completion marker.
+                File::create(&done_marker)?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // Another thread beat us. Clean up our temp dir and wait for theirs.
+                let _ = fs::remove_dir_all(&tmp_dir);
+                Self::wait_for_done(&done_marker)?;
+            }
+            Err(e) => {
+                let _ = fs::remove_dir_all(&tmp_dir);
+                return Err(e);
+            }
+        }
+
         Ok(destination)
+    }
+
+    /// Wait for a `.done` marker file to appear, polling with backoff.
+    fn wait_for_done(done_marker: &Path) -> io::Result<()> {
+        let mut elapsed = std::time::Duration::ZERO;
+        let timeout = std::time::Duration::from_secs(120);
+        let poll_interval = std::time::Duration::from_millis(100);
+
+        while !done_marker.exists() {
+            if elapsed >= timeout {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "timed out waiting for layer extraction to complete: {}",
+                        done_marker.display()
+                    ),
+                ));
+            }
+            std::thread::sleep(poll_interval);
+            elapsed += poll_interval;
+        }
+        Ok(())
     }
 
     /// Assemble and apply all image layers into `rootfs/<container_id>/`.

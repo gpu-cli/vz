@@ -240,6 +240,13 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
         set_network_namespace_path(&mut spec, &netns_path);
     }
 
+    // Strip namespaces and resources unsupported by the minimal VM kernel.
+    // The kernel has CONFIG_NAMESPACES=y and CONFIG_NET_NS=y, but lacks
+    // CONFIG_PID_NS, CONFIG_IPC_NS, CONFIG_UTS_NS, and cgroup controllers.
+    // Keep only mount (always available) and network namespaces.
+    strip_unsupported_namespaces(&mut spec);
+    clear_default_linux_resources(&mut spec);
+
     if cpu_quota.is_some() || cpu_period.is_some() || pids_limit.is_some() {
         set_linux_resources(&mut spec, cpu_quota, cpu_period, pids_limit)?;
     }
@@ -262,6 +269,40 @@ fn remove_network_namespace(spec: &mut Spec) {
         return;
     };
     namespaces.retain(|ns| ns.typ() != LinuxNamespaceType::Network);
+}
+
+/// Keep only namespaces supported by the minimal VM kernel.
+///
+/// The kernel has `CONFIG_NAMESPACES=y` (mount ns) and `CONFIG_NET_NS=y`,
+/// but lacks `CONFIG_PID_NS`, `CONFIG_IPC_NS`, `CONFIG_UTS_NS`, and
+/// cgroup controller support. Unsupported namespace types cause youki to
+/// hang on `unshare()`.
+fn strip_unsupported_namespaces(spec: &mut Spec) {
+    let Some(linux) = spec.linux_mut() else {
+        return;
+    };
+    let Some(namespaces) = linux.namespaces_mut() else {
+        return;
+    };
+    namespaces.retain(|ns| {
+        matches!(
+            ns.typ(),
+            LinuxNamespaceType::Mount | LinuxNamespaceType::Network
+        )
+    });
+}
+
+/// Clear default linux resources (CPU, memory, pids, devices) from the spec.
+///
+/// `Linux::default()` populates these with empty values, but their presence
+/// causes youki to attempt cgroup controller setup. The minimal VM kernel
+/// lacks the necessary controllers, so we strip them entirely.
+fn clear_default_linux_resources(spec: &mut Spec) {
+    let Some(linux) = spec.linux_mut() else {
+        return;
+    };
+    linux.set_resources(None);
+    linux.set_cgroups_path(None);
 }
 
 /// Update the network namespace entry in the spec's linux section to join
@@ -454,8 +495,8 @@ fn default_linux_mounts() -> Result<Vec<Mount>, OciError> {
             .build()?,
         MountBuilder::default()
             .destination("/sys/fs/cgroup")
-            .typ("cgroup")
-            .source("cgroup")
+            .typ("cgroup2")
+            .source("cgroup2")
             .options(vec![
                 "nosuid".into(),
                 "noexec".into(),

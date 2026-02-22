@@ -28,5 +28,8 @@ prost = { workspace = true }
 # Reuse protocol types from vz (kept for legacy JSON protocol)
 vz = { workspace = true }
 
+# JSON parsing for youki state output
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

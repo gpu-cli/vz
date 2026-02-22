@@ -80,7 +80,11 @@ impl ContainerStore {
     }
 
     /// Insert or replace a container metadata record by ID.
+    ///
+    /// Acquires an advisory file lock to serialize concurrent access.
     pub fn upsert(&self, container: ContainerInfo) -> io::Result<()> {
+        let _lock = self.lock()?;
+
         let mut containers = self.load_all()?;
 
         match containers.iter().position(|item| item.id == container.id) {
@@ -104,6 +108,8 @@ impl ContainerStore {
     /// exists are transitioned to `Stopped { exit_code: -1 }` with their
     /// rootfs cleaned up. Returns the IDs of reconciled containers.
     pub fn reconcile_stale(&self) -> io::Result<Vec<String>> {
+        let _lock = self.lock()?;
+
         let mut containers = self.load_all()?;
         let mut reconciled = Vec::new();
 
@@ -144,6 +150,8 @@ impl ContainerStore {
 
     /// Remove a container metadata record by ID.
     pub fn remove(&self, id: &str) -> io::Result<()> {
+        let _lock = self.lock()?;
+
         let mut containers = self.load_all()?;
         let len = containers.len();
         containers.retain(|container| container.id != id);
@@ -162,11 +170,77 @@ impl ContainerStore {
         self.base_dir.join("containers.json")
     }
 
+    fn lock_path(&self) -> PathBuf {
+        self.base_dir.join("containers.lock")
+    }
+
+    /// Acquire an exclusive advisory lock on the container store.
+    ///
+    /// The lock is released when the returned guard is dropped.
+    fn lock(&self) -> io::Result<FileLock> {
+        fs::create_dir_all(&self.base_dir)?;
+        FileLock::acquire(&self.lock_path())
+    }
+
     fn write_all(&self, containers: &[ContainerInfo]) -> io::Result<()> {
         let path = self.containers_json_path();
         let bytes = serde_json::to_vec_pretty(containers)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
         write_atomic(&path, &bytes)
+    }
+}
+
+/// RAII guard for an exclusive file lock.
+///
+/// Uses `File::create_new` (O_EXCL) to atomically create a lock file. The
+/// lock is released by deleting the file when the guard is dropped.
+struct FileLock {
+    path: PathBuf,
+}
+
+impl FileLock {
+    /// Acquire an exclusive lock, spinning with backoff until available.
+    fn acquire(path: &Path) -> io::Result<Self> {
+        let mut elapsed = std::time::Duration::ZERO;
+        let timeout = std::time::Duration::from_secs(30);
+        let poll = std::time::Duration::from_millis(10);
+
+        loop {
+            match File::create_new(path) {
+                Ok(_file) => {
+                    return Ok(Self {
+                        path: path.to_path_buf(),
+                    });
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    if elapsed >= timeout {
+                        // Stale lock — force remove and retry once.
+                        let _ = fs::remove_file(path);
+                        if File::create_new(path).is_ok() {
+                            return Ok(Self {
+                                path: path.to_path_buf(),
+                            });
+                        }
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "timed out acquiring container store lock: {}",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(poll);
+                    elapsed += poll;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 

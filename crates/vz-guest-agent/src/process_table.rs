@@ -27,6 +27,7 @@ pub struct ProcessTable {
     entries: HashMap<u64, ProcessEntry>,
 }
 
+#[allow(dead_code)]
 impl ProcessTable {
     /// Create an empty process table.
     pub fn new() -> Self {

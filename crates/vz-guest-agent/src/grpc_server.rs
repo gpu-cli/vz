@@ -424,63 +424,417 @@ impl agent_service_server::AgentService for AgentServiceImpl {
 
 // ── OciService ──────────────────────────────────────────────────────
 
+/// Path to the youki OCI runtime binary (delivered via VirtioFS).
+#[cfg(target_os = "linux")]
+const YOUKI_BIN: &str = "/run/vz-oci/bin/youki";
+
+/// Root directory for youki container state.
+#[cfg(target_os = "linux")]
+const YOUKI_ROOT: &str = "/run/vz-oci/state";
+
 /// gRPC implementation of the `OciService` trait.
 ///
-/// OCI lifecycle requests are unsupported in this guest agent binary.
-/// All methods return `UNIMPLEMENTED` status.
+/// On Linux guests, delegates to the youki OCI runtime for container
+/// lifecycle management. On other platforms, returns `UNIMPLEMENTED`.
 pub struct OciServiceImpl;
 
+#[cfg(target_os = "linux")]
+#[tonic::async_trait]
+impl oci_service_server::OciService for OciServiceImpl {
+    async fn create(
+        &self,
+        request: Request<OciCreateRequest>,
+    ) -> Result<Response<OciCreateResponse>, Status> {
+        let req = request.into_inner();
+        info!(container_id = %req.container_id, bundle_path = %req.bundle_path, "oci: create");
+
+        // Patch the OCI config to work in the minimal guest VM kernel.
+        let config_path = format!("{}/config.json", &req.bundle_path);
+        match patch_oci_config(&config_path).await {
+            Ok(()) => info!(container_id = %req.container_id, "oci: config patched for guest VM"),
+            Err(e) => error!(container_id = %req.container_id, error = %e, "oci: failed to patch config"),
+        }
+
+        // Log bundle config for diagnostics.
+        match tokio::fs::read_to_string(&config_path).await {
+            Ok(config) => info!(container_id = %req.container_id, config = %config, "oci: bundle config"),
+            Err(e) => error!(container_id = %req.container_id, error = %e, "oci: failed to read bundle config"),
+        }
+
+        run_youki(&["create", "--bundle", &req.bundle_path, &req.container_id]).await?;
+        Ok(Response::new(OciCreateResponse {}))
+    }
+
+    async fn start(
+        &self,
+        request: Request<OciStartRequest>,
+    ) -> Result<Response<OciStartResponse>, Status> {
+        let req = request.into_inner();
+        info!(container_id = %req.container_id, "oci: start");
+
+        run_youki(&["start", &req.container_id]).await?;
+        Ok(Response::new(OciStartResponse {}))
+    }
+
+    async fn state(
+        &self,
+        request: Request<OciStateRequest>,
+    ) -> Result<Response<OciStateResponse>, Status> {
+        let req = request.into_inner();
+
+        let output = run_youki_output(&["state", &req.container_id], YOUKI_LIFECYCLE_TIMEOUT).await?;
+        let state: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|e| Status::internal(format!("failed to parse youki state: {e}")))?;
+
+        Ok(Response::new(OciStateResponse {
+            container_id: state["id"].as_str().unwrap_or("").to_string(),
+            status: state["status"].as_str().unwrap_or("unknown").to_string(),
+            pid: state["pid"].as_u64().unwrap_or(0) as u32,
+            bundle_path: state["bundle"].as_str().unwrap_or("").to_string(),
+        }))
+    }
+
+    async fn exec(
+        &self,
+        request: Request<OciExecRequest>,
+    ) -> Result<Response<OciExecResponse>, Status> {
+        let req = request.into_inner();
+        info!(container_id = %req.container_id, command = %req.command, "oci: exec");
+
+        // Youki 0.5.7 exec doesn't properly enter the container's mount
+        // namespace, causing commands to see the initramfs instead of the
+        // container rootfs. Work around this by using nsenter: get the init
+        // PID from `youki state`, then nsenter into its namespaces.
+        let state_output = run_youki_output(
+            &["state", &req.container_id],
+            YOUKI_LIFECYCLE_TIMEOUT,
+        )
+        .await?;
+        let state: serde_json::Value = serde_json::from_slice(&state_output.stdout)
+            .map_err(|e| Status::internal(format!("failed to parse youki state: {e}")))?;
+        let pid = state["pid"]
+            .as_u64()
+            .ok_or_else(|| Status::internal("youki state missing pid field"))?;
+
+        let mut nsenter_args: Vec<String> = vec![
+            "nsenter".into(),
+            "--mount".into(),
+            "--net".into(),
+            format!("--root=/proc/{pid}/root"),
+            format!("--target={pid}"),
+            "--".into(),
+        ];
+
+        // Build env prefix if environment variables are specified.
+        if !req.env.is_empty() || !req.working_dir.is_empty() || !req.user.is_empty() {
+            nsenter_args.push("env".into());
+            for (key, value) in &req.env {
+                nsenter_args.push(format!("{key}={value}"));
+            }
+        }
+
+        nsenter_args.push(req.command);
+        nsenter_args.extend(req.args);
+
+        info!(pid = pid, args = ?nsenter_args, "oci: exec via nsenter");
+
+        let mut cmd = tokio::process::Command::new(&nsenter_args[0]);
+        for arg in &nsenter_args[1..] {
+            cmd.arg(arg);
+        }
+        if !req.working_dir.is_empty() {
+            cmd.current_dir(&req.working_dir);
+        }
+        cmd.kill_on_drop(true);
+
+        let output = match tokio::time::timeout(YOUKI_EXEC_TIMEOUT, cmd.output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => {
+                return Err(Status::internal(format!("failed to execute nsenter: {e}")));
+            }
+            Err(_) => {
+                return Err(Status::internal(format!(
+                    "oci exec timed out after {}s",
+                    YOUKI_EXEC_TIMEOUT.as_secs()
+                )));
+            }
+        };
+
+        Ok(Response::new(OciExecResponse {
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        }))
+    }
+
+    async fn kill(
+        &self,
+        request: Request<OciKillRequest>,
+    ) -> Result<Response<OciKillResponse>, Status> {
+        let req = request.into_inner();
+        info!(container_id = %req.container_id, signal = %req.signal, "oci: kill");
+
+        run_youki(&["kill", &req.container_id, &req.signal]).await?;
+        Ok(Response::new(OciKillResponse {}))
+    }
+
+    async fn delete(
+        &self,
+        request: Request<OciDeleteRequest>,
+    ) -> Result<Response<OciDeleteResponse>, Status> {
+        let req = request.into_inner();
+        info!(container_id = %req.container_id, force = req.force, "oci: delete");
+
+        if req.force {
+            run_youki(&["delete", "--force", &req.container_id]).await?;
+        } else {
+            run_youki(&["delete", &req.container_id]).await?;
+        }
+        Ok(Response::new(OciDeleteResponse {}))
+    }
+}
+
+/// Timeout for youki lifecycle commands (create, start, kill, delete).
+#[cfg(target_os = "linux")]
+const YOUKI_LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Timeout for youki exec commands.
+#[cfg(target_os = "linux")]
+const YOUKI_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Ensure the youki state directory exists.
+#[cfg(target_os = "linux")]
+fn ensure_youki_state_dir() {
+    let _ = std::fs::create_dir_all(YOUKI_ROOT);
+}
+
+/// Run a youki lifecycle command (create, start, kill, delete) and check for
+/// success. Uses null stdio to avoid blocking on long-lived child processes
+/// that inherit pipe FDs.
+#[cfg(target_os = "linux")]
+async fn run_youki(args: &[&str]) -> Result<(), Status> {
+    ensure_youki_state_dir();
+    let _ = std::fs::create_dir_all(YOUKI_LOG_DIR);
+
+    let subcmd = args.first().unwrap_or(&"unknown");
+    let container_id = args.last().unwrap_or(&"unknown");
+    let log_file = format!("{YOUKI_LOG_DIR}/{container_id}-{subcmd}.log");
+
+    let mut cmd = tokio::process::Command::new(YOUKI_BIN);
+    cmd.arg("--root").arg(YOUKI_ROOT);
+    cmd.arg("--log").arg(&log_file);
+    cmd.kill_on_drop(true);
+    // Lifecycle commands (create, start) fork child processes that inherit
+    // pipe FDs. Using null stdio ensures wait() returns as soon as the
+    // youki parent exits, without blocking on the init process.
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    for arg in args {
+        cmd.arg(arg);
+    }
+
+    let cmd_desc = format!("youki {}", args.join(" "));
+    info!(cmd = %cmd_desc, log_file = %log_file, "executing youki command");
+
+    let mut child = cmd.spawn().map_err(|e| {
+        error!(cmd = %cmd_desc, error = %e, "failed to spawn youki");
+        Status::internal(format!("failed to execute youki: {e}"))
+    })?;
+
+    let status = match tokio::time::timeout(YOUKI_LIFECYCLE_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => {
+            error!(cmd = %cmd_desc, error = %e, "failed to wait for youki");
+            dump_youki_log(&log_file).await;
+            return Err(Status::internal(format!("youki {subcmd} failed: {e}")));
+        }
+        Err(_) => {
+            error!(cmd = %cmd_desc, timeout_secs = YOUKI_LIFECYCLE_TIMEOUT.as_secs(), "youki command timed out");
+            dump_youki_log(&log_file).await;
+            return Err(Status::internal(format!(
+                "{cmd_desc} timed out after {}s",
+                YOUKI_LIFECYCLE_TIMEOUT.as_secs()
+            )));
+        }
+    };
+
+    if !status.success() {
+        let youki_log = tokio::fs::read_to_string(&log_file).await.unwrap_or_default();
+        error!(command = %subcmd, log = %youki_log, "youki command failed");
+        return Err(Status::internal(format!(
+            "youki {subcmd} failed (exit {}): see youki log",
+            status.code().unwrap_or(-1)
+        )));
+    }
+
+    Ok(())
+}
+
+/// Directory for youki log files.
+#[cfg(target_os = "linux")]
+const YOUKI_LOG_DIR: &str = "/run/vz-oci/logs";
+
+/// Run a youki command and return the raw output (success or failure).
+#[cfg(target_os = "linux")]
+async fn run_youki_output(
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, Status> {
+    ensure_youki_state_dir();
+    let _ = std::fs::create_dir_all(YOUKI_LOG_DIR);
+
+    // Generate a unique log file for this invocation.
+    let subcmd = args.first().unwrap_or(&"unknown");
+    let container_id = args.last().unwrap_or(&"unknown");
+    let log_file = format!("{YOUKI_LOG_DIR}/{container_id}-{subcmd}.log");
+
+    let mut cmd = tokio::process::Command::new(YOUKI_BIN);
+    cmd.arg("--root").arg(YOUKI_ROOT);
+    cmd.arg("--log").arg(&log_file);
+    cmd.kill_on_drop(true);
+    for arg in args {
+        cmd.arg(arg);
+    }
+
+    let cmd_desc = format!("youki {}", args.join(" "));
+    info!(cmd = %cmd_desc, log_file = %log_file, "executing youki command");
+
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => {
+            error!(cmd = %cmd_desc, error = %e, "failed to execute youki");
+            dump_youki_log(&log_file).await;
+            Err(Status::internal(format!("failed to execute youki: {e}")))
+        }
+        Err(_) => {
+            error!(cmd = %cmd_desc, timeout_secs = timeout.as_secs(), "youki command timed out");
+            dump_youki_log(&log_file).await;
+            Err(Status::internal(format!("{cmd_desc} timed out after {}s", timeout.as_secs())))
+        }
+    }
+}
+
+/// Patch OCI config.json to be compatible with the minimal guest VM kernel.
+///
+/// The guest VM runs a stripped kernel that may lack certain filesystem types
+/// (e.g. mqueue, cgroup v1). This function removes or adjusts mounts that
+/// would cause youki to fail or hang.
+#[cfg(target_os = "linux")]
+async fn patch_oci_config(config_path: &str) -> Result<(), Status> {
+    let content = tokio::fs::read_to_string(config_path)
+        .await
+        .map_err(|e| Status::internal(format!("read config.json: {e}")))?;
+
+    let mut config: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| Status::internal(format!("parse config.json: {e}")))?;
+
+    // Remove mounts with filesystem types not available in the minimal kernel.
+    // Only keep types known to work: proc, tmpfs, bind, overlay.
+    // Types that hang or fail: mqueue (CONFIG_POSIX_MQUEUE), devpts, sysfs,
+    // cgroup/cgroup2 — these can cause youki to hang during container init.
+    if let Some(mounts) = config.pointer_mut("/mounts").and_then(|v| v.as_array_mut()) {
+        let supported_types = ["proc", "tmpfs", "bind"];
+        mounts.retain(|m| {
+            let typ = m.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if !supported_types.contains(&typ) {
+                tracing::info!(mount_type = typ, "stripping unsupported mount type from OCI config");
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    // Strip maskedPaths, readonlyPaths, and namespaces — the minimal VM
+    // kernel doesn't support the namespace types youki tries to unshare,
+    // and masked/readonly paths reference /proc and /sys paths that may
+    // not exist, causing youki to hang.
+    if let Some(linux) = config.pointer_mut("/linux") {
+        if let Some(obj) = linux.as_object_mut() {
+            if obj.remove("maskedPaths").is_some() {
+                tracing::info!("stripped maskedPaths from OCI config");
+            }
+            if obj.remove("readonlyPaths").is_some() {
+                tracing::info!("stripped readonlyPaths from OCI config");
+            }
+            // Strip all namespaces — the container runs directly in the
+            // guest VM's namespace. The VM itself provides isolation.
+            if obj.remove("namespaces").is_some() {
+                tracing::info!("stripped namespaces from OCI config");
+            }
+        }
+    }
+
+    let patched = serde_json::to_string_pretty(&config)
+        .map_err(|e| Status::internal(format!("serialize config.json: {e}")))?;
+
+    tokio::fs::write(config_path, patched)
+        .await
+        .map_err(|e| Status::internal(format!("write config.json: {e}")))?;
+
+    Ok(())
+}
+
+/// Read and log the contents of a youki log file for diagnostics.
+#[cfg(target_os = "linux")]
+async fn dump_youki_log(path: &str) {
+    match tokio::fs::read_to_string(path).await {
+        Ok(contents) if !contents.is_empty() => {
+            error!(log_file = %path, contents = %contents, "youki log file contents");
+        }
+        Ok(_) => {
+            warn!(log_file = %path, "youki log file is empty");
+        }
+        Err(e) => {
+            warn!(log_file = %path, error = %e, "could not read youki log file");
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 #[tonic::async_trait]
 impl oci_service_server::OciService for OciServiceImpl {
     async fn create(
         &self,
         _request: Request<OciCreateRequest>,
     ) -> Result<Response<OciCreateResponse>, Status> {
-        Err(Status::unimplemented(oci_unsupported_message()))
+        Err(Status::unimplemented("OCI lifecycle requires Linux guest"))
     }
 
     async fn start(
         &self,
         _request: Request<OciStartRequest>,
     ) -> Result<Response<OciStartResponse>, Status> {
-        Err(Status::unimplemented(oci_unsupported_message()))
+        Err(Status::unimplemented("OCI lifecycle requires Linux guest"))
     }
 
     async fn state(
         &self,
         _request: Request<OciStateRequest>,
     ) -> Result<Response<OciStateResponse>, Status> {
-        Err(Status::unimplemented(oci_unsupported_message()))
+        Err(Status::unimplemented("OCI lifecycle requires Linux guest"))
     }
 
     async fn exec(
         &self,
         _request: Request<OciExecRequest>,
     ) -> Result<Response<OciExecResponse>, Status> {
-        Err(Status::unimplemented(oci_unsupported_message()))
+        Err(Status::unimplemented("OCI lifecycle requires Linux guest"))
     }
 
     async fn kill(
         &self,
         _request: Request<OciKillRequest>,
     ) -> Result<Response<OciKillResponse>, Status> {
-        Err(Status::unimplemented(oci_unsupported_message()))
+        Err(Status::unimplemented("OCI lifecycle requires Linux guest"))
     }
 
     async fn delete(
         &self,
         _request: Request<OciDeleteRequest>,
     ) -> Result<Response<OciDeleteResponse>, Status> {
-        Err(Status::unimplemented(oci_unsupported_message()))
+        Err(Status::unimplemented("OCI lifecycle requires Linux guest"))
     }
-}
-
-/// Generate the unsupported OCI message for this platform.
-fn oci_unsupported_message() -> String {
-    format!(
-        "OCI lifecycle requests are unsupported by vz-guest-agent on {} guests",
-        std::env::consts::OS
-    )
 }
 
 // ── NetworkService ──────────────────────────────────────────────────
@@ -513,9 +867,9 @@ fn do_network_setup(
     services: &[vz_agent_proto::NetworkServiceConfig],
 ) -> Result<Response<NetworkSetupResponse>, Status> {
     // Convert proto NetworkServiceConfig to vz protocol NetworkServiceConfig.
-    let vz_services: Vec<vz::protocol::NetworkServiceConfig> = services
+    let vz_services: Vec<::vz::protocol::NetworkServiceConfig> = services
         .iter()
-        .map(|s| vz::protocol::NetworkServiceConfig {
+        .map(|s| ::vz::protocol::NetworkServiceConfig {
             name: s.name.clone(),
             addr: s.addr.clone(),
             network_name: s.network_name.clone(),

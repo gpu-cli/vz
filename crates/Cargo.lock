@@ -3059,6 +3059,7 @@ dependencies = [
  "clap",
  "libc",
  "prost",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tonic",

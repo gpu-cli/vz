@@ -132,6 +132,15 @@ fn run_config_to_bundle_spec(config: &contract::RunConfig) -> BundleSpec {
         cpu_quota: config.cpu_quota,
         cpu_period: config.cpu_period,
         capture_logs: config.capture_logs,
+        cap_add: config.cap_add.clone(),
+        cap_drop: config.cap_drop.clone(),
+        privileged: config.privileged,
+        read_only_rootfs: config.read_only_rootfs,
+        sysctls: config.sysctls.iter().cloned().collect(),
+        ulimits: config.ulimits.clone(),
+        pids_limit: config.pids_limit,
+        hostname: config.hostname.clone(),
+        domainname: config.domainname.clone(),
     }
 }
 
@@ -377,6 +386,8 @@ impl RuntimeBackend for LinuxNativeBackend {
         &self,
         id: &str,
         force: bool,
+        _signal: Option<&str>,
+        _grace_period: Option<std::time::Duration>,
     ) -> Result<contract::ContainerInfo, RuntimeError> {
         self.runtime.stop(id, force).await.map_err(native_err)?;
 

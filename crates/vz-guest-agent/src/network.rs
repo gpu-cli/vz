@@ -107,10 +107,12 @@ pub fn setup_stack_network(stack_id: &str, services: &[NetworkServiceConfig]) ->
         );
         let prefix_len = first_addr.1;
 
+        // Linux IFNAMSIZ is 16 (15 usable chars). Format: "br-{stack}-{net}"
+        // overhead = 4 chars ("br-" + "-"), leaving 11 for stack + net.
         let bridge_name = format!(
             "br-{}-{}",
-            truncate_name(stack_id, 8),
-            truncate_name(net_name, 8)
+            truncate_name(stack_id, 5),
+            truncate_name(net_name, 5)
         );
 
         // Create bridge.
@@ -133,10 +135,14 @@ pub fn setup_stack_network(stack_id: &str, services: &[NetworkServiceConfig]) ->
             let eth_name = format!("eth{iface_idx}");
 
             // Unique veth host-end name: veth-<svc>-<idx>.
-            let veth_host = format!("veth-{}-{}", truncate_name(&svc.name, 8), iface_idx);
+            // Linux IFNAMSIZ is 16 (15 usable chars). Format: "ve-{svc}-{idx}"
+            // overhead = 4 chars ("ve-" + "-"), leaving 11 for svc + idx digit(s).
+            let veth_host = format!("ve-{}-{}", truncate_name(&svc.name, 9), iface_idx);
             let ns_path = format!("{NETNS_RUN_DIR}/{}", svc.name);
 
-            // Create veth pair inside the namespace, then move host end out.
+            // Create veth pair in root namespace, then move the peer end
+            // into the service namespace. BusyBox `ip` ignores `peer name`,
+            // so we find the auto-generated peer by parsing `ip link show`.
             info!(
                 service = %svc.name,
                 network = %net_name,
@@ -144,15 +150,14 @@ pub fn setup_stack_network(stack_id: &str, services: &[NetworkServiceConfig]) ->
                 iface = %eth_name,
                 "creating veth pair"
             );
-            nsenter_ip(
-                &ns_path,
-                &[
-                    "link", "add", &veth_host, "type", "veth", "peer", "name", "veth_tmp",
-                ],
-            )?;
+            ip_run(&["link", "add", &veth_host, "type", "veth"])?;
 
-            // Move host end from netns to default namespace (PID 1's netns).
-            nsenter_ip(&ns_path, &["link", "set", &veth_host, "netns", "1"])?;
+            // Find the auto-generated peer name (shown as "peerN@veth_host").
+            let veth_guest = find_veth_peer(&veth_host)?;
+            info!(peer = %veth_guest, "found veth peer");
+
+            // Move peer end into the service namespace.
+            move_link_to_netns(&veth_guest, &ns_path)?;
 
             // Attach host end to bridge and bring up (in default namespace).
             ip_run(&["link", "set", &veth_host, "master", &bridge_name])?;
@@ -163,8 +168,8 @@ pub fn setup_stack_network(stack_id: &str, services: &[NetworkServiceConfig]) ->
                 nsenter_ip(&ns_path, &["link", "set", "lo", "up"])?;
             }
 
-            // Rename peer end to ethN.
-            nsenter_ip(&ns_path, &["link", "set", "veth_tmp", "name", &eth_name])?;
+            // Rename guest end to ethN inside the namespace.
+            nsenter_ip(&ns_path, &["link", "set", &veth_guest, "name", &eth_name])?;
 
             nsenter_ip(
                 &ns_path,
@@ -225,7 +230,7 @@ pub fn teardown_stack_network(stack_id: &str, service_names: &[String]) -> io::R
     // We enumerate by listing interfaces; alternatively, just try the
     // well-known prefix. Since bridge names are truncated, list all
     // interfaces and delete those matching our prefix.
-    let prefix = format!("br-{}-", truncate_name(stack_id, 8));
+    let prefix = format!("br-{}-", truncate_name(stack_id, 5));
     if let Ok(output) = Command::new(IP_BIN)
         .args(["link", "show", "type", "bridge"])
         .output()
@@ -347,6 +352,79 @@ fn create_named_netns(name: &str) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Find the peer end of a veth pair by parsing `ip link show`.
+///
+/// BusyBox displays veth pairs as `N: peername@hostname: ...`.
+/// We look for any interface whose `@suffix` matches the given host name.
+fn find_veth_peer(host_name: &str) -> io::Result<String> {
+    let output = Command::new(IP_BIN)
+        .args(["link", "show"])
+        .output()
+        .map_err(|e| {
+            io::Error::new(e.kind(), format!("failed to exec `{IP_BIN} link show`: {e}"))
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let suffix = format!("@{host_name}");
+
+    for line in stdout.lines() {
+        // Lines: "5: veth0@ve-postgres-0: <BROADCAST,..."
+        if let Some(name_part) = line.split(':').nth(1) {
+            let name = name_part.trim();
+            if let Some(peer) = name.strip_suffix(&suffix) {
+                return Ok(peer.to_string());
+            }
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("no veth peer found for '{host_name}'"),
+    ))
+}
+
+/// Move a network interface into a named network namespace.
+///
+/// Uses `ip link set <dev> netns <pid>` by forking a child process
+/// that enters the target namespace and sleeps briefly while the
+/// parent moves the interface using the child's PID.
+fn move_link_to_netns(dev: &str, ns_path: &str) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let ns_file = fs::File::open(ns_path)?;
+    let ns_fd = ns_file.as_raw_fd();
+
+    // Fork a child that enters the target namespace and sleeps.
+    // The parent uses the child's PID with `ip link set ... netns <pid>`.
+    unsafe {
+        let pid = libc::fork();
+        if pid < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        if pid == 0 {
+            // Child: enter target namespace and sleep.
+            if libc::setns(ns_fd, libc::CLONE_NEWNET) != 0 {
+                libc::_exit(1);
+            }
+            // Sleep long enough for parent to move the interface.
+            libc::sleep(5);
+            libc::_exit(0);
+        }
+
+        // Parent: use child's PID to move the interface.
+        let pid_str = pid.to_string();
+        let result = ip_run(&["link", "set", dev, "netns", &pid_str]);
+
+        // Kill the sleeping child and reap it.
+        libc::kill(pid, libc::SIGKILL);
+        let mut status: libc::c_int = 0;
+        libc::waitpid(pid, &mut status, 0);
+
+        result
+    }
 }
 
 // ── Command-based network operations ───────────────────────────────
