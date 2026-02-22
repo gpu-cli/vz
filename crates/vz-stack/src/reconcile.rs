@@ -268,10 +268,8 @@ fn compute_actions(
             (s.name.as_str(), names)
         })
         .collect();
-    let dep_map: HashMap<&str, &[String]> = dep_names
-        .iter()
-        .map(|(k, v)| (*k, v.as_slice()))
-        .collect();
+    let dep_map: HashMap<&str, &[String]> =
+        dep_names.iter().map(|(k, v)| (*k, v.as_slice())).collect();
 
     (topo_sort(&actions, &dep_map), deferred)
 }

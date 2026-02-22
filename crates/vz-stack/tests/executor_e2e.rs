@@ -6,8 +6,9 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 use vz_stack::{
     Action, ContainerRuntime, HealthPoller, RestartTracker, ServiceObservedState, ServicePhase,
@@ -18,70 +19,81 @@ use vz_stack::{
 
 struct MockRuntime {
     container_ids: Vec<String>,
-    exec_exit_code: Cell<i32>,
-    calls: RefCell<Vec<(String, String)>>,
-    create_counter: Cell<usize>,
+    exec_exit_code: AtomicI32,
+    calls: Mutex<Vec<(String, String)>>,
+    create_counter: AtomicUsize,
 }
 
 impl MockRuntime {
     fn new(ids: Vec<&str>) -> Self {
         Self {
             container_ids: ids.into_iter().map(String::from).collect(),
-            exec_exit_code: Cell::new(0),
-            calls: RefCell::new(Vec::new()),
-            create_counter: Cell::new(0),
+            exec_exit_code: AtomicI32::new(0),
+            calls: Mutex::new(Vec::new()),
+            create_counter: AtomicUsize::new(0),
         }
     }
 
     fn call_log(&self) -> Vec<(String, String)> {
-        self.calls.borrow().clone()
+        self.calls.lock().unwrap().clone()
     }
 
     fn set_exec_exit_code(&self, code: i32) {
-        self.exec_exit_code.set(code);
+        self.exec_exit_code.store(code, Ordering::SeqCst);
     }
 }
 
 impl ContainerRuntime for MockRuntime {
     fn pull(&self, image: &str) -> Result<String, StackError> {
-        self.calls.borrow_mut().push(("pull".into(), image.into()));
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("pull".into(), image.into()));
         Ok(format!("sha256:{image}"))
     }
 
     fn create(
         &self,
         image: &str,
-        _config: vz_runtime_contract::RunConfig,
+        config: vz_runtime_contract::RunConfig,
     ) -> Result<String, StackError> {
         self.calls
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push(("create".into(), image.into()));
-        let idx = self.create_counter.get();
-        let id = self.container_ids[idx % self.container_ids.len()].clone();
-        self.create_counter.set(idx + 1);
+        let id = config
+            .container_id
+            .as_ref()
+            .map(|name| format!("ctr-{name}"))
+            .unwrap_or_else(|| {
+                let idx = self.create_counter.fetch_add(1, Ordering::SeqCst);
+                self.container_ids[idx % self.container_ids.len()].clone()
+            });
         Ok(id)
     }
 
     fn stop(&self, container_id: &str) -> Result<(), StackError> {
         self.calls
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push(("stop".into(), container_id.into()));
         Ok(())
     }
 
     fn remove(&self, container_id: &str) -> Result<(), StackError> {
         self.calls
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push(("remove".into(), container_id.into()));
         Ok(())
     }
 
     fn exec(&self, container_id: &str, command: &[String]) -> Result<i32, StackError> {
-        self.calls.borrow_mut().push((
+        self.calls.lock().unwrap().push((
             "exec".into(),
             format!("{container_id}:{}", command.join(" ")),
         ));
-        Ok(self.exec_exit_code.get())
+        Ok(self.exec_exit_code.load(Ordering::SeqCst))
     }
 }
 

@@ -787,13 +787,11 @@ fn parse_depends_on(
         // Simple list: depends_on: [db, cache]
         seq.iter()
             .map(|v| {
-                v.as_str()
-                    .map(ServiceDependency::started)
-                    .ok_or_else(|| {
-                        StackError::ComposeParse(format!(
-                            "service `{svc_name}`: `depends_on` items must be strings"
-                        ))
-                    })
+                v.as_str().map(ServiceDependency::started).ok_or_else(|| {
+                    StackError::ComposeParse(format!(
+                        "service `{svc_name}`: `depends_on` items must be strings"
+                    ))
+                })
             })
             .collect()
     } else if let Some(obj) = value.as_mapping() {

@@ -351,12 +351,14 @@ fn web_pg_redis_parse_produces_valid_spec() {
     assert!(redis.healthcheck.is_some());
 
     assert_eq!(web.depends_on.len(), 2);
-    assert!(web
-        .depends_on
-        .contains(&ServiceDependency::healthy("postgres")));
-    assert!(web
-        .depends_on
-        .contains(&ServiceDependency::healthy("redis")));
+    assert!(
+        web.depends_on
+            .contains(&ServiceDependency::healthy("postgres"))
+    );
+    assert!(
+        web.depends_on
+            .contains(&ServiceDependency::healthy("redis"))
+    );
 
     // Volumes sorted by name.
     let vol_names: Vec<&str> = spec.volumes.iter().map(|v| v.name.as_str()).collect();

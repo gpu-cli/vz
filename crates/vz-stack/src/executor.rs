@@ -27,7 +27,7 @@ use crate::volume::VolumeManager;
 /// The real implementation wraps `vz_runtime_contract::Runtime` (which is async);
 /// tests use a synchronous mock. The CLI layer bridges async by
 /// calling `block_on` around the real runtime methods.
-pub trait ContainerRuntime {
+pub trait ContainerRuntime: Send + Sync {
     /// Pull an image if not already present. Returns the image ID.
     fn pull(&self, image: &str) -> Result<String, StackError>;
 
@@ -209,6 +209,72 @@ impl ExecutionResult {
     }
 }
 
+/// Pre-computed data for a service create, ready for parallel execution.
+///
+/// Port allocation and mount resolution happen serially (they need
+/// `&mut self`), then image pull + container create run in parallel.
+struct PreparedCreate {
+    service_name: String,
+    image: String,
+    run_config: vz_runtime_contract::RunConfig,
+    use_shared_vm: bool,
+}
+
+/// Group create/recreate actions into topological levels for parallel execution.
+///
+/// Services at the same level have no dependency edges between them
+/// (within the current action set) and can safely run in parallel.
+/// Level 0 contains services with no in-batch deps, level 1 depends
+/// only on level 0, etc.
+fn compute_topo_levels<'a>(creates: &[&'a Action], spec: &StackSpec) -> Vec<Vec<&'a Action>> {
+    if creates.is_empty() {
+        return vec![];
+    }
+
+    // Build dependency map from the spec.
+    let dep_map: HashMap<&str, Vec<&str>> = spec
+        .services
+        .iter()
+        .map(|s| {
+            let deps: Vec<&str> = s.depends_on.iter().map(|d| d.service.as_str()).collect();
+            (s.name.as_str(), deps)
+        })
+        .collect();
+
+    // Only consider deps that are also in our action set.
+    let action_names: HashSet<&str> = creates.iter().map(|a| a.service_name()).collect();
+
+    // Assign each action a level. Since creates are already topo-sorted,
+    // we can process in order and look up deps that have already been assigned.
+    let mut levels: HashMap<&str, usize> = HashMap::new();
+    for action in creates {
+        let name = action.service_name();
+        let deps = dep_map.get(name).map(|d| d.as_slice()).unwrap_or(&[]);
+        let max_dep_level = deps
+            .iter()
+            .filter(|d| action_names.contains(**d))
+            .filter_map(|d| levels.get(d))
+            .copied()
+            .max();
+
+        let my_level = match max_dep_level {
+            Some(l) => l + 1,
+            None => 0,
+        };
+        levels.insert(name, my_level);
+    }
+
+    // Group by level.
+    let max_level = levels.values().copied().max().unwrap_or(0);
+    let mut result: Vec<Vec<&Action>> = (0..=max_level).map(|_| Vec::new()).collect();
+    for action in creates {
+        let level = levels[action.service_name()];
+        result[level].push(action);
+    }
+
+    result
+}
+
 impl<R: ContainerRuntime> StackExecutor<R> {
     /// Create a new executor with the given runtime, state store, and data directory.
     ///
@@ -246,9 +312,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
     /// Execute a batch of reconciler actions for the given stack spec.
     ///
-    /// Each action is processed in order. Failures on one service do not
-    /// prevent other services from being processed; errors are collected
-    /// and returned in [`ExecutionResult`].
+    /// Services at the same topological level (no dependency edges
+    /// between them) are created in parallel using [`std::thread::scope`],
+    /// while services at different levels execute sequentially to respect
+    /// `depends_on` ordering. This gives up to N× speedup for stacks
+    /// with N independent services.
     ///
     /// Port allocation is tracked across services: explicit host ports
     /// are validated for conflicts, and `None` host ports get ephemeral
@@ -334,35 +402,131 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
         let mut result = ExecutionResult::default();
 
-        for action in actions {
-            match action {
-                Action::ServiceCreate { service_name } => {
-                    match self.execute_create(spec, &service_map, service_name) {
-                        Ok(()) => result.succeeded += 1,
-                        Err(e) => {
-                            result.failed += 1;
-                            result.errors.push((service_name.clone(), e.to_string()));
-                        }
-                    }
-                }
-                Action::ServiceRecreate { service_name } => {
-                    // Stop and remove old container first.
+        // Partition into creates/recreates and removes.
+        let creates: Vec<&Action> = actions
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    Action::ServiceCreate { .. } | Action::ServiceRecreate { .. }
+                )
+            })
+            .collect();
+        let removes: Vec<&Action> = actions
+            .iter()
+            .filter(|a| matches!(a, Action::ServiceRemove { .. }))
+            .collect();
+
+        // Group creates by topo level for parallel execution.
+        let levels = compute_topo_levels(&creates, spec);
+        let use_shared_vm = self.runtime.has_shared_vm(&spec.name);
+
+        for level in &levels {
+            // Handle recreates: remove old containers first (serial).
+            for action in level {
+                if let Action::ServiceRecreate { service_name } = action {
                     if let Err(e) = self.execute_remove(spec, service_name) {
                         error!(service = %service_name, error = %e, "failed to remove old container during recreate");
-                        // Continue with create anyway.
                     }
-                    match self.execute_create(spec, &service_map, service_name) {
-                        Ok(()) => result.succeeded += 1,
+                }
+            }
+
+            // Serial prep: allocate ports, resolve mounts, build configs.
+            let mut prepared: Vec<PreparedCreate> = Vec::new();
+            for action in level {
+                let service_name = action.service_name();
+                match self.prepare_create(spec, &service_map, service_name, use_shared_vm) {
+                    Ok(prep) => prepared.push(prep),
+                    Err(e) => {
+                        result.failed += 1;
+                        result
+                            .errors
+                            .push((service_name.to_string(), e.to_string()));
+                    }
+                }
+            }
+
+            if prepared.len() <= 1 {
+                // Single service — execute inline, no thread overhead.
+                for prep in prepared {
+                    let service_name = prep.service_name.clone();
+                    info!(service = %service_name, image = %prep.image, "creating container");
+                    if let Err(e) = self.runtime.pull(&prep.image) {
+                        self.mark_failed(spec, &service_name, &e.to_string())?;
+                        result.failed += 1;
+                        result.errors.push((service_name, e.to_string()));
+                        continue;
+                    }
+                    let create_result = if prep.use_shared_vm {
+                        self.runtime
+                            .create_in_stack(&spec.name, &prep.image, prep.run_config)
+                    } else {
+                        self.runtime.create(&prep.image, prep.run_config)
+                    };
+                    match create_result {
+                        Ok(container_id) => {
+                            self.finalize_create(spec, &service_name, &container_id)?;
+                            result.succeeded += 1;
+                        }
                         Err(e) => {
+                            self.mark_failed(spec, &service_name, &e.to_string())?;
                             result.failed += 1;
-                            result.errors.push((service_name.clone(), e.to_string()));
+                            result.errors.push((service_name, e.to_string()));
                         }
                     }
                 }
-                Action::ServiceRemove { service_name } => {
-                    match self.execute_remove(spec, service_name) {
-                        Ok(()) => result.succeeded += 1,
+            } else {
+                // Parallel pull + create for multiple services at the same level.
+                let service_names: Vec<String> =
+                    prepared.iter().map(|p| p.service_name.clone()).collect();
+                info!(
+                    services = ?service_names,
+                    "creating {} containers in parallel",
+                    service_names.len()
+                );
+
+                let runtime = &self.runtime;
+                let stack_name = &spec.name;
+                let outcomes: Vec<Result<String, StackError>> = std::thread::scope(|s| {
+                    let handles: Vec<_> = prepared
+                        .into_iter()
+                        .map(|prep| {
+                            s.spawn(move || -> Result<String, StackError> {
+                                info!(service = %prep.service_name, image = %prep.image, "pulling image");
+                                runtime.pull(&prep.image)?;
+                                info!(service = %prep.service_name, image = %prep.image, "creating container");
+                                if prep.use_shared_vm {
+                                    runtime.create_in_stack(
+                                        stack_name,
+                                        &prep.image,
+                                        prep.run_config,
+                                    )
+                                } else {
+                                    runtime.create(&prep.image, prep.run_config)
+                                }
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| match h.join() {
+                            Ok(result) => result,
+                            Err(_) => Err(StackError::Network(
+                                "container create thread panicked".to_string(),
+                            )),
+                        })
+                        .collect()
+                });
+
+                // Serial post: update state for each outcome.
+                for (service_name, outcome) in service_names.iter().zip(outcomes) {
+                    match outcome {
+                        Ok(container_id) => {
+                            self.finalize_create(spec, service_name, &container_id)?;
+                            result.succeeded += 1;
+                        }
                         Err(e) => {
+                            self.mark_failed(spec, service_name, &e.to_string())?;
                             result.failed += 1;
                             result.errors.push((service_name.clone(), e.to_string()));
                         }
@@ -371,16 +535,33 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             }
         }
 
+        // Execute removes sequentially.
+        for action in &removes {
+            match self.execute_remove(spec, action.service_name()) {
+                Ok(()) => result.succeeded += 1,
+                Err(e) => {
+                    result.failed += 1;
+                    result
+                        .errors
+                        .push((action.service_name().to_string(), e.to_string()));
+                }
+            }
+        }
+
         Ok(result)
     }
 
-    /// Execute a service create: pull image, convert spec, allocate ports, create container.
-    fn execute_create(
+    /// Prepare a service create: resolve mounts, allocate ports, build config.
+    ///
+    /// This runs serially (needs `&mut self` for port allocation) and produces
+    /// a [`PreparedCreate`] that can be executed in parallel.
+    fn prepare_create(
         &mut self,
         spec: &StackSpec,
         service_map: &HashMap<&str, &ServiceSpec>,
         service_name: &str,
-    ) -> Result<(), StackError> {
+        use_shared_vm: bool,
+    ) -> Result<PreparedCreate, StackError> {
         let svc_spec = service_map.get(service_name).ok_or_else(|| {
             StackError::InvalidSpec(format!("service '{service_name}' not found in stack spec"))
         })?;
@@ -405,13 +586,6 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             },
         )?;
 
-        // Pull image.
-        info!(service = %service_name, image = %svc_spec.image, "pulling image");
-        if let Err(e) = self.runtime.pull(&svc_spec.image) {
-            self.mark_failed(spec, service_name, &e.to_string())?;
-            return Err(e);
-        }
-
         // Resolve mounts using volume manager.
         let resolved_mounts = self
             .volumes
@@ -421,7 +595,6 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         let published = match self.ports.allocate(service_name, &svc_spec.ports) {
             Ok(p) => p,
             Err(e) => {
-                // Emit PortConflict event if allocation fails.
                 if let Some(first_port) = svc_spec.ports.first() {
                     self.store.emit_event(
                         &spec.name,
@@ -467,11 +640,9 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
         // Convert ServiceSpec → RunConfig.
         let mut run_config = service_to_run_config(svc_spec, &resolved_mounts, &secret_mounts)?;
+        run_config.container_id = Some(service_name.to_string());
 
         // Override ports with resolved allocations.
-        // In shared VM mode, set target_host to the service IP so port
-        // forwarding reaches the correct per-service network namespace.
-        let use_shared_vm = self.runtime.has_shared_vm(&spec.name);
         let service_target_host = if use_shared_vm {
             spec.services
                 .iter()
@@ -499,7 +670,6 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
         // Auto-inject sibling service hostnames for inter-service resolution.
         if use_shared_vm {
-            // Shared VM with per-service netns: use real IPs (172.20.0.x).
             for (i, svc) in spec.services.iter().enumerate() {
                 if svc.name != service_name
                     && !run_config.extra_hosts.iter().any(|(h, _)| h == &svc.name)
@@ -508,11 +678,8 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     run_config.extra_hosts.push((svc.name.clone(), ip));
                 }
             }
-
-            // Join the per-service network namespace.
             run_config.network_namespace_path = Some(format!("/var/run/netns/{service_name}"));
         } else {
-            // Single VM per container: all services share 127.0.0.1.
             for svc in &spec.services {
                 if svc.name != service_name
                     && !run_config.extra_hosts.iter().any(|(h, _)| h == &svc.name)
@@ -524,36 +691,27 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             }
         }
 
-        // Create and start container.
-        info!(service = %service_name, image = %svc_spec.image, "creating container");
-        let container_id = if use_shared_vm {
-            match self
-                .runtime
-                .create_in_stack(&spec.name, &svc_spec.image, run_config)
-            {
-                Ok(id) => id,
-                Err(e) => {
-                    self.mark_failed(spec, service_name, &e.to_string())?;
-                    return Err(e);
-                }
-            }
-        } else {
-            match self.runtime.create(&svc_spec.image, run_config) {
-                Ok(id) => id,
-                Err(e) => {
-                    self.mark_failed(spec, service_name, &e.to_string())?;
-                    return Err(e);
-                }
-            }
-        };
+        Ok(PreparedCreate {
+            service_name: service_name.to_string(),
+            image: svc_spec.image.clone(),
+            run_config,
+            use_shared_vm,
+        })
+    }
 
-        // Update state to Running.
+    /// Finalize a successful container create: update state to Running.
+    fn finalize_create(
+        &self,
+        spec: &StackSpec,
+        service_name: &str,
+        container_id: &str,
+    ) -> Result<(), StackError> {
         self.store.save_observed_state(
             &spec.name,
             &ServiceObservedState {
                 service_name: service_name.to_string(),
                 phase: ServicePhase::Running,
-                container_id: Some(container_id.clone()),
+                container_id: Some(container_id.to_string()),
                 last_error: None,
                 ready: false, // Health checks set this to true later.
             },
@@ -564,7 +722,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             &StackEvent::ServiceReady {
                 stack_name: spec.name.clone(),
                 service_name: service_name.to_string(),
-                runtime_id: container_id,
+                runtime_id: container_id.to_string(),
             },
         )?;
 
@@ -665,14 +823,19 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 /// Test support: mock container runtime shared across test modules.
 #[cfg(test)]
 pub(crate) mod tests_support {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     /// Mock container runtime for testing.
     ///
     /// Records all operations and can be configured to fail specific calls.
     /// Supports shared VM tracking for multi-service stack testing.
+    /// Uses `Mutex`/`AtomicUsize` instead of `RefCell`/`Cell` so it is
+    /// `Send + Sync` and can be used with parallel container creation.
     pub struct MockContainerRuntime {
-        /// Container IDs to return on create calls (cycled).
+        /// Container IDs to return on create calls (fallback when config has no container_id).
         pub container_ids: Vec<String>,
         /// Whether pull should fail.
         pub fail_pull: bool,
@@ -685,16 +848,16 @@ pub(crate) mod tests_support {
         /// Whether exec should fail with an error (not just non-zero exit).
         pub fail_exec: bool,
         /// Tracks calls: (operation, arg).
-        pub calls: std::cell::RefCell<Vec<(String, String)>>,
-        /// Counter for create calls (to cycle through container_ids).
-        create_counter: std::cell::Cell<usize>,
+        pub calls: Mutex<Vec<(String, String)>>,
+        /// Counter for create calls (fallback ID generation).
+        create_counter: AtomicUsize,
         /// Tracks which stacks have a shared VM running.
-        shared_vms: std::cell::RefCell<HashSet<String>>,
-        /// Captured RunConfigs from create_in_stack calls, keyed by container_id.
-        pub captured_configs: std::cell::RefCell<Vec<(String, vz_runtime_contract::RunConfig)>>,
+        shared_vms: Mutex<HashSet<String>>,
+        /// Captured RunConfigs from create/create_in_stack calls, keyed by container_id.
+        pub captured_configs: Mutex<Vec<(String, vz_runtime_contract::RunConfig)>>,
         /// Captured NetworkServiceConfigs from network_setup calls.
         pub captured_network_services:
-            std::cell::RefCell<Vec<(String, Vec<vz_runtime_contract::NetworkServiceConfig>)>>,
+            Mutex<Vec<(String, Vec<vz_runtime_contract::NetworkServiceConfig>)>>,
     }
 
     impl MockContainerRuntime {
@@ -706,11 +869,11 @@ pub(crate) mod tests_support {
                 fail_stop: false,
                 exec_exit_code: 0,
                 fail_exec: false,
-                calls: std::cell::RefCell::new(Vec::new()),
-                create_counter: std::cell::Cell::new(0),
-                shared_vms: std::cell::RefCell::new(HashSet::new()),
-                captured_configs: std::cell::RefCell::new(Vec::new()),
-                captured_network_services: std::cell::RefCell::new(Vec::new()),
+                calls: Mutex::new(Vec::new()),
+                create_counter: AtomicUsize::new(0),
+                shared_vms: Mutex::new(HashSet::new()),
+                captured_configs: Mutex::new(Vec::new()),
+                captured_network_services: Mutex::new(Vec::new()),
             }
         }
 
@@ -722,14 +885,31 @@ pub(crate) mod tests_support {
         }
 
         pub fn call_log(&self) -> Vec<(String, String)> {
-            self.calls.borrow().clone()
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// Generate a deterministic container ID from the RunConfig.
+        ///
+        /// Uses `config.container_id` (set to service name by the executor)
+        /// so that IDs are deterministic regardless of parallel execution order.
+        /// Falls back to cycling through `container_ids` if not set.
+        fn next_id(&self, config: &vz_runtime_contract::RunConfig) -> String {
+            config
+                .container_id
+                .as_ref()
+                .map(|name| format!("ctr-{name}"))
+                .unwrap_or_else(|| {
+                    let idx = self.create_counter.fetch_add(1, Ordering::SeqCst);
+                    self.container_ids[idx % self.container_ids.len()].clone()
+                })
         }
     }
 
     impl ContainerRuntime for MockContainerRuntime {
         fn pull(&self, image: &str) -> Result<String, StackError> {
             self.calls
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .push(("pull".to_string(), image.to_string()));
             if self.fail_pull {
                 return Err(StackError::InvalidSpec("mock pull failure".to_string()));
@@ -743,23 +923,24 @@ pub(crate) mod tests_support {
             config: vz_runtime_contract::RunConfig,
         ) -> Result<String, StackError> {
             self.calls
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .push(("create".to_string(), image.to_string()));
             if self.fail_create {
                 return Err(StackError::InvalidSpec("mock create failure".to_string()));
             }
-            let idx = self.create_counter.get();
-            let id = self.container_ids[idx % self.container_ids.len()].clone();
-            self.create_counter.set(idx + 1);
+            let id = self.next_id(&config);
             self.captured_configs
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .push((id.clone(), config));
             Ok(id)
         }
 
         fn stop(&self, container_id: &str) -> Result<(), StackError> {
             self.calls
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .push(("stop".to_string(), container_id.to_string()));
             if self.fail_stop {
                 return Err(StackError::InvalidSpec("mock stop failure".to_string()));
@@ -769,13 +950,14 @@ pub(crate) mod tests_support {
 
         fn remove(&self, container_id: &str) -> Result<(), StackError> {
             self.calls
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .push(("remove".to_string(), container_id.to_string()));
             Ok(())
         }
 
         fn exec(&self, container_id: &str, command: &[String]) -> Result<i32, StackError> {
-            self.calls.borrow_mut().push((
+            self.calls.lock().unwrap().push((
                 "exec".to_string(),
                 format!("{container_id}:{}", command.join(" ")),
             ));
@@ -790,7 +972,7 @@ pub(crate) mod tests_support {
             stack_id: &str,
             ports: &[vz_runtime_contract::PortMapping],
         ) -> Result<(), StackError> {
-            self.calls.borrow_mut().push((
+            self.calls.lock().unwrap().push((
                 "boot_shared_vm".to_string(),
                 format!(
                     "{}:{}",
@@ -802,7 +984,7 @@ pub(crate) mod tests_support {
                         .join(",")
                 ),
             ));
-            self.shared_vms.borrow_mut().insert(stack_id.to_string());
+            self.shared_vms.lock().unwrap().insert(stack_id.to_string());
             Ok(())
         }
 
@@ -811,7 +993,7 @@ pub(crate) mod tests_support {
             stack_id: &str,
             services: &[vz_runtime_contract::NetworkServiceConfig],
         ) -> Result<(), StackError> {
-            self.calls.borrow_mut().push((
+            self.calls.lock().unwrap().push((
                 "network_setup".to_string(),
                 format!(
                     "{}:{}",
@@ -824,7 +1006,8 @@ pub(crate) mod tests_support {
                 ),
             ));
             self.captured_network_services
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .push((stack_id.to_string(), services.to_vec()));
             Ok(())
         }
@@ -834,7 +1017,7 @@ pub(crate) mod tests_support {
             stack_id: &str,
             service_names: &[String],
         ) -> Result<(), StackError> {
-            self.calls.borrow_mut().push((
+            self.calls.lock().unwrap().push((
                 "network_teardown".to_string(),
                 format!("{}:{}", stack_id, service_names.join(",")),
             ));
@@ -848,30 +1031,31 @@ pub(crate) mod tests_support {
             config: vz_runtime_contract::RunConfig,
         ) -> Result<String, StackError> {
             self.calls
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .push(("create_in_stack".to_string(), format!("{stack_id}:{image}")));
             if self.fail_create {
                 return Err(StackError::InvalidSpec("mock create failure".to_string()));
             }
-            let idx = self.create_counter.get();
-            let id = self.container_ids[idx % self.container_ids.len()].clone();
-            self.create_counter.set(idx + 1);
+            let id = self.next_id(&config);
             self.captured_configs
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .push((id.clone(), config));
             Ok(id)
         }
 
         fn shutdown_shared_vm(&self, stack_id: &str) -> Result<(), StackError> {
             self.calls
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .push(("shutdown_shared_vm".to_string(), stack_id.to_string()));
-            self.shared_vms.borrow_mut().remove(stack_id);
+            self.shared_vms.lock().unwrap().remove(stack_id);
             Ok(())
         }
 
         fn has_shared_vm(&self, stack_id: &str) -> bool {
-            self.shared_vms.borrow().contains(stack_id)
+            self.shared_vms.lock().unwrap().contains(stack_id)
         }
     }
 }
@@ -949,7 +1133,7 @@ mod tests {
         let observed = executor.store().load_observed_state("myapp").unwrap();
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0].phase, ServicePhase::Running);
-        assert_eq!(observed[0].container_id, Some("ctr-001".to_string()));
+        assert_eq!(observed[0].container_id, Some("ctr-web".to_string()));
 
         // Verify events.
         let events = executor.store().load_events("myapp").unwrap();
@@ -1068,7 +1252,7 @@ mod tests {
         let observed = executor.store().load_observed_state("myapp").unwrap();
         let web = observed.iter().find(|o| o.service_name == "web").unwrap();
         assert_eq!(web.phase, ServicePhase::Running);
-        assert_eq!(web.container_id, Some("ctr-new".to_string()));
+        assert_eq!(web.container_id, Some("ctr-web".to_string()));
     }
 
     #[test]
@@ -1603,7 +1787,7 @@ mod tests {
         executor.execute(&spec, &actions).unwrap();
 
         // Verify network_setup was called with correct service configs.
-        let captured = executor.runtime.captured_network_services.borrow();
+        let captured = executor.runtime.captured_network_services.lock().unwrap();
         assert_eq!(captured.len(), 1);
         let (stack_id, services) = &captured[0];
         assert_eq!(stack_id, "netapp");
@@ -1634,7 +1818,7 @@ mod tests {
         executor.execute(&spec, &actions).unwrap();
 
         // Verify extra_hosts use real IPs, not 127.0.0.1.
-        let configs = executor.runtime.captured_configs.borrow();
+        let configs = executor.runtime.captured_configs.lock().unwrap();
 
         // Find web's config.
         let web_config = configs.iter().find(|(id, _)| id == "ctr-web");
@@ -1672,7 +1856,7 @@ mod tests {
 
         executor.execute(&spec, &actions).unwrap();
 
-        let configs = executor.runtime.captured_configs.borrow();
+        let configs = executor.runtime.captured_configs.lock().unwrap();
 
         // web should join /var/run/netns/web.
         let web_config = configs.iter().find(|(id, _)| id == "ctr-web").unwrap();
@@ -1752,7 +1936,7 @@ mod tests {
 
         executor.execute(&spec, &actions).unwrap();
 
-        let captured = executor.runtime.captured_network_services.borrow();
+        let captured = executor.runtime.captured_network_services.lock().unwrap();
         let (_, services) = &captured[0];
         assert_eq!(services.len(), 3);
         // 172.20.0.1 = bridge, services get .2, .3, .4.
@@ -1761,7 +1945,7 @@ mod tests {
         assert_eq!(services[2].addr, "172.20.0.4/24");
 
         // Verify cross-service host resolution for web.
-        let configs = executor.runtime.captured_configs.borrow();
+        let configs = executor.runtime.captured_configs.lock().unwrap();
         let web_config = configs.iter().find(|(id, _)| id == "ctr-web").unwrap();
         let web_hosts = &web_config.1.extra_hosts;
         assert_eq!(web_hosts.len(), 2); // api + db
@@ -1813,7 +1997,7 @@ mod tests {
         executor.execute(&spec, &actions).unwrap();
 
         // No extra_hosts since there's only one service.
-        let configs = executor.runtime.captured_configs.borrow();
+        let configs = executor.runtime.captured_configs.lock().unwrap();
         let web_config = configs.iter().find(|(id, _)| id == "ctr-web").unwrap();
         assert!(web_config.1.extra_hosts.is_empty());
         assert!(web_config.1.network_namespace_path.is_none());
@@ -1850,5 +2034,200 @@ mod tests {
             .filter(|(op, _)| op == "boot_shared_vm")
             .count();
         assert_eq!(boot_count, 1, "shared VM should not be rebooted");
+    }
+
+    // ── Parallel execution tests ──
+
+    #[test]
+    fn topo_levels_independent_services_same_level() {
+        // Three services with no deps → all at level 0.
+        let spec = three_service_stack();
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "api".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+        ];
+        let refs: Vec<&Action> = actions.iter().collect();
+        let levels = compute_topo_levels(&refs, &spec);
+        assert_eq!(levels.len(), 1, "all independent services at one level");
+        assert_eq!(levels[0].len(), 3);
+    }
+
+    #[test]
+    fn topo_levels_chain_dependency() {
+        // app → api → db: three levels.
+        let spec = stack(
+            "chain",
+            vec![
+                svc("db", "postgres:16"),
+                ServiceSpec {
+                    depends_on: vec![crate::spec::ServiceDependency::started("db")],
+                    ..svc("api", "node:20")
+                },
+                ServiceSpec {
+                    depends_on: vec![crate::spec::ServiceDependency::started("api")],
+                    ..svc("app", "myapp:latest")
+                },
+            ],
+        );
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "api".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "app".to_string(),
+            },
+        ];
+        let refs: Vec<&Action> = actions.iter().collect();
+        let levels = compute_topo_levels(&refs, &spec);
+        assert_eq!(levels.len(), 3);
+        assert_eq!(levels[0][0].service_name(), "db");
+        assert_eq!(levels[1][0].service_name(), "api");
+        assert_eq!(levels[2][0].service_name(), "app");
+    }
+
+    #[test]
+    fn topo_levels_diamond_dependency() {
+        // web and api depend on db → db at level 0, web+api at level 1.
+        let spec = stack(
+            "diamond",
+            vec![
+                svc("db", "postgres:16"),
+                ServiceSpec {
+                    depends_on: vec![crate::spec::ServiceDependency::started("db")],
+                    ..svc("web", "nginx:latest")
+                },
+                ServiceSpec {
+                    depends_on: vec![crate::spec::ServiceDependency::started("db")],
+                    ..svc("api", "node:20")
+                },
+            ],
+        );
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "api".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+        ];
+        let refs: Vec<&Action> = actions.iter().collect();
+        let levels = compute_topo_levels(&refs, &spec);
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[0].len(), 1);
+        assert_eq!(levels[0][0].service_name(), "db");
+        assert_eq!(levels[1].len(), 2);
+        let level1_names: HashSet<&str> = levels[1].iter().map(|a| a.service_name()).collect();
+        assert!(level1_names.contains("web"));
+        assert!(level1_names.contains("api"));
+    }
+
+    #[test]
+    fn parallel_creates_all_succeed() {
+        // Three independent services should all be created (via parallel path).
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-api", "ctr-db"]);
+        let mut executor = make_executor(runtime);
+        let spec = three_service_stack();
+
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "api".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+        ];
+
+        let result = executor.execute(&spec, &actions).unwrap();
+        assert!(result.all_succeeded());
+        assert_eq!(result.succeeded, 3);
+
+        // All three should be Running with deterministic IDs from container_id.
+        let observed = executor.store().load_observed_state("triapp").unwrap();
+        assert_eq!(observed.len(), 3);
+        for obs in &observed {
+            assert_eq!(obs.phase, ServicePhase::Running);
+            assert_eq!(obs.container_id, Some(format!("ctr-{}", obs.service_name)));
+        }
+    }
+
+    #[test]
+    fn parallel_creates_with_dependency_ordering() {
+        // web depends on db: db at level 0 (serial), web at level 1 (serial).
+        // api has no deps: at level 0 alongside db (parallel with db).
+        let spec = stack(
+            "depapp",
+            vec![
+                svc("db", "postgres:16"),
+                svc("api", "node:20"),
+                ServiceSpec {
+                    depends_on: vec![crate::spec::ServiceDependency::started("db")],
+                    ..svc("web", "nginx:latest")
+                },
+            ],
+        );
+
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-db", "ctr-api", "ctr-web"]);
+        let mut executor = make_executor(runtime);
+
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "api".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+        ];
+
+        let result = executor.execute(&spec, &actions).unwrap();
+        assert!(
+            result.all_succeeded(),
+            "execution had errors: {:?}",
+            result.errors
+        );
+        assert_eq!(result.succeeded, 3);
+
+        // web depends on db, so web's create must come after db's.
+        // api is independent, so it can be in any order relative to db.
+        // With 3 services the executor boots a shared VM, so creates go
+        // through create_in_stack (arg = "stack_name:image").
+        let calls = executor.runtime.call_log();
+        let create_calls: Vec<&str> = calls
+            .iter()
+            .filter(|(op, _)| op == "create" || op == "create_in_stack")
+            .map(|(_, arg)| arg.as_str())
+            .collect();
+        // db and api images are both at level 0.
+        // web image is at level 1 and must appear after both db and api.
+        let web_idx = create_calls
+            .iter()
+            .position(|img| img.contains("nginx:latest"))
+            .unwrap();
+        let db_idx = create_calls
+            .iter()
+            .position(|img| img.contains("postgres:16"))
+            .unwrap();
+        assert!(
+            db_idx < web_idx,
+            "db must be created before web (dependency)"
+        );
     }
 }
