@@ -740,7 +740,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         base.push(format!(
-            "vz-oci-store-test-{}-{}-{}",
+            "vz-image-store-test-{}-{}-{}",
             name,
             std::process::id(),
             nanos.as_nanos(),

@@ -9,7 +9,6 @@ use vz_runtime_contract::{self as contract, RuntimeBackend, RuntimeError};
 use crate::config as oci_config;
 use crate::container_store as oci_container;
 use crate::runtime::Runtime;
-use crate::store as oci_store;
 
 /// macOS backend wrapping the existing [`Runtime`].
 pub struct MacosRuntimeBackend {
@@ -288,14 +287,14 @@ fn container_info_to_contract(c: oci_container::ContainerInfo) -> contract::Cont
     }
 }
 
-fn image_info_to_contract(i: oci_store::ImageInfo) -> contract::ImageInfo {
+fn image_info_to_contract(i: vz_image::ImageInfo) -> contract::ImageInfo {
     contract::ImageInfo {
         reference: i.reference,
         image_id: i.image_id,
     }
 }
 
-fn prune_result_to_contract(p: oci_store::PruneResult) -> contract::PruneResult {
+fn prune_result_to_contract(p: vz_image::PruneResult) -> contract::PruneResult {
     contract::PruneResult {
         removed_refs: p.removed_refs,
         removed_manifests: p.removed_manifests,

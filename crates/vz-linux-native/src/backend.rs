@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
 use tracing::{debug, info};
+use vz_image::{ImagePuller, ImageStore, parse_image_config_summary_from_store};
 use vz_runtime_contract::{self as contract, RuntimeBackend, RuntimeError};
 
 use crate::bundle::{BundleMount, BundleSpec};
@@ -27,8 +28,10 @@ struct TrackedContainer {
 /// Runs OCI containers directly on the Linux host using an OCI runtime
 /// binary (youki, runc) without a VM layer.
 pub struct LinuxNativeBackend {
-    _config: LinuxNativeConfig,
+    config: LinuxNativeConfig,
     runtime: ContainerRuntime,
+    image_store: ImageStore,
+    image_puller: ImagePuller,
     containers: Arc<Mutex<HashMap<String, TrackedContainer>>>,
     /// Stack-level bridge state: stack_id → bridge_name.
     stacks: Arc<Mutex<HashMap<String, StackState>>>,
@@ -57,9 +60,13 @@ impl LinuxNativeBackend {
     /// Create a new Linux-native backend.
     pub fn new(config: LinuxNativeConfig) -> Self {
         let runtime = ContainerRuntime::new(config.clone());
+        let image_store = ImageStore::new(config.data_dir.join("oci"));
+        let image_puller = ImagePuller::new(image_store.clone());
         Self {
-            _config: config,
+            config,
             runtime,
+            image_store,
+            image_puller,
             containers: Arc::new(Mutex::new(HashMap::new())),
             stacks: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -128,35 +135,92 @@ fn run_config_to_bundle_spec(config: &contract::RunConfig) -> BundleSpec {
     }
 }
 
+/// Pull image and assemble rootfs, returning the rootfs path and image id.
+async fn pull_and_assemble(
+    puller: &ImagePuller,
+    store: &ImageStore,
+    image: &str,
+    auth: &vz_image::Auth,
+    container_id: &str,
+) -> Result<(std::path::PathBuf, String), crate::error::LinuxNativeError> {
+    let image_id = puller.pull(image, auth).await?;
+    let rootfs_dir = store.assemble_rootfs_async(&image_id.0, container_id).await?;
+    Ok((rootfs_dir, image_id.0))
+}
+
+/// Resolve image config into a RunConfig, applying image defaults.
+fn apply_image_config(
+    store: &ImageStore,
+    image_id: &str,
+    config: &mut contract::RunConfig,
+    container_id: &str,
+) -> Result<(), crate::error::LinuxNativeError> {
+    let image_config = parse_image_config_summary_from_store(store, image_id)?;
+
+    if config.cmd.is_empty() {
+        config.cmd = image_config
+            .resolve_cmd(&config.cmd)
+            .unwrap_or_default();
+    }
+    config.env = image_config.resolve_env(&config.env, container_id);
+    if config.working_dir.is_none() {
+        config.working_dir = image_config.resolve_working_dir(None);
+    }
+    if config.user.is_none() {
+        config.user = image_config.resolve_user(None);
+    }
+    Ok(())
+}
+
 impl RuntimeBackend for LinuxNativeBackend {
     fn name(&self) -> &'static str {
         "linux-native"
     }
 
     // ── Image operations ──────────────────────────────────────────
-    // Linux-native reuses the image store from vz-oci. Image pull/list/prune
-    // are not implemented here — they are handled by the orchestrator or
-    // delegated to the image store directly. These stubs return appropriate
-    // errors until image store integration is wired.
 
     async fn pull(&self, image: &str) -> Result<String, RuntimeError> {
-        // Image pull is handled externally. Return the reference as-is.
-        info!(image, "linux-native pull (delegated to image store)");
-        Ok(image.to_string())
+        let image_id = self
+            .image_puller
+            .pull(image, &self.config.auth)
+            .await
+            .map_err(|e| RuntimeError::PullFailed {
+                reference: image.to_string(),
+                reason: e.to_string(),
+            })?;
+        Ok(image_id.0)
     }
 
     fn images(&self) -> Result<Vec<contract::ImageInfo>, RuntimeError> {
-        // Image listing delegated to image store.
-        Ok(Vec::new())
+        self.image_store
+            .list_images()
+            .map(|v| {
+                v.into_iter()
+                    .map(|i| contract::ImageInfo {
+                        reference: i.reference,
+                        image_id: i.image_id,
+                    })
+                    .collect()
+            })
+            .map_err(|e| RuntimeError::Backend {
+                message: e.to_string(),
+                source: Box::new(e),
+            })
     }
 
     fn prune_images(&self) -> Result<contract::PruneResult, RuntimeError> {
-        Ok(contract::PruneResult {
-            removed_refs: 0,
-            removed_manifests: 0,
-            removed_configs: 0,
-            removed_layer_dirs: 0,
-        })
+        self.image_store
+            .prune_images()
+            .map(|p| contract::PruneResult {
+                removed_refs: p.removed_refs,
+                removed_manifests: p.removed_manifests,
+                removed_configs: p.removed_configs,
+                removed_layer_dirs: p.removed_layer_dirs,
+            })
+            .map_err(|e| RuntimeError::Backend {
+                message: e.to_string(),
+                source: Box::new(e),
+            })
     }
 
     // ── Container lifecycle ───────────────────────────────────────
@@ -164,12 +228,27 @@ impl RuntimeBackend for LinuxNativeBackend {
     async fn run(
         &self,
         image: &str,
-        config: contract::RunConfig,
+        mut config: contract::RunConfig,
     ) -> Result<contract::ExecOutput, RuntimeError> {
         let container_id = config
             .container_id
             .clone()
             .unwrap_or_else(|| format!("vz-{}", &uuid_short()));
+
+        // Pull image and assemble rootfs.
+        let (rootfs_dir, image_id) = pull_and_assemble(
+            &self.image_puller,
+            &self.image_store,
+            image,
+            &self.config.auth,
+            &container_id,
+        )
+        .await
+        .map_err(native_err)?;
+
+        // Apply image config defaults.
+        apply_image_config(&self.image_store, &image_id, &mut config, &container_id)
+            .map_err(native_err)?;
 
         // For one-shot run: create container with init process, start, exec cmd, cleanup.
         let init = config
@@ -179,10 +258,6 @@ impl RuntimeBackend for LinuxNativeBackend {
 
         let mut spec = run_config_to_bundle_spec(&config);
         spec.cmd = init;
-
-        // TODO: rootfs_dir should come from image pull/unpack.
-        // For now, assume the image reference IS a local rootfs path.
-        let rootfs_dir = std::path::PathBuf::from(image);
 
         self.runtime
             .create_and_start(&container_id, &rootfs_dir, spec)
@@ -217,12 +292,27 @@ impl RuntimeBackend for LinuxNativeBackend {
     async fn create_container(
         &self,
         image: &str,
-        config: contract::RunConfig,
+        mut config: contract::RunConfig,
     ) -> Result<String, RuntimeError> {
         let container_id = config
             .container_id
             .clone()
             .unwrap_or_else(|| format!("vz-{}", &uuid_short()));
+
+        // Pull image and assemble rootfs.
+        let (rootfs_dir, image_id) = pull_and_assemble(
+            &self.image_puller,
+            &self.image_store,
+            image,
+            &self.config.auth,
+            &container_id,
+        )
+        .await
+        .map_err(native_err)?;
+
+        // Apply image config defaults.
+        apply_image_config(&self.image_store, &image_id, &mut config, &container_id)
+            .map_err(native_err)?;
 
         let init = config
             .init_process
@@ -231,8 +321,6 @@ impl RuntimeBackend for LinuxNativeBackend {
 
         let mut spec = run_config_to_bundle_spec(&config);
         spec.cmd = init;
-
-        let rootfs_dir = std::path::PathBuf::from(image);
 
         self.runtime
             .create_and_start(&container_id, &rootfs_dir, spec)
@@ -243,7 +331,7 @@ impl RuntimeBackend for LinuxNativeBackend {
         let info = contract::ContainerInfo {
             id: container_id.clone(),
             image: image.to_string(),
-            image_id: String::new(),
+            image_id,
             status: contract::ContainerStatus::Running,
             created_unix_secs: now_unix_secs(),
             started_unix_secs: Some(now_unix_secs()),

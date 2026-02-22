@@ -9,10 +9,9 @@ use std::{fs, process};
 
 use crate::bundle::{BundleMount, BundleSpec, write_oci_bundle};
 use crate::container_store::{ContainerInfo, ContainerStatus, ContainerStore};
-use crate::image::{
-    ImageConfigSummary, ImageId, ImagePuller, parse_image_config_summary_from_store,
+use vz_image::{
+    ImageConfigSummary, ImageId, ImagePuller, ImageStore, parse_image_config_summary_from_store,
 };
-use crate::store::ImageStore;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -33,7 +32,7 @@ use crate::config::{
     PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig,
 };
 use crate::error::OciError;
-use crate::store::{ImageInfo, PruneResult};
+use vz_image::{ImageInfo, PruneResult};
 
 const STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -238,7 +237,7 @@ impl Runtime {
 
     /// Pull an image reference into local storage.
     pub async fn pull(&self, image: &str) -> Result<ImageId, OciError> {
-        self.puller.pull(image, &self.config.auth).await
+        Ok(self.puller.pull(image, &self.config.auth).await?)
     }
 
     /// Pick backend from image reference and optional override.
@@ -2079,30 +2078,14 @@ fn resolve_run_config(
         capture_logs,
     } = run;
 
-    let resolved_cmd = if !run_cmd.is_empty() {
-        run_cmd
-    } else {
-        let mut image_cmd = Vec::new();
-        if let Some(entrypoint) = image_config.entrypoint {
-            image_cmd.extend(entrypoint);
-        }
+    let resolved_cmd = image_config.resolve_cmd(&run_cmd).ok_or_else(|| {
+        OciError::InvalidConfig("run command must not be empty".to_string())
+    })?;
 
-        if let Some(cmd) = image_config.cmd {
-            image_cmd.extend(cmd);
-        }
+    let resolved_env = image_config.resolve_env(&run_env, container_id);
+    let working_dir = image_config.resolve_working_dir(run_working_dir.as_deref());
+    let user = image_config.resolve_user(run_user.as_deref());
 
-        if image_cmd.is_empty() {
-            return Err(OciError::InvalidConfig(
-                "run command must not be empty".to_string(),
-            ));
-        }
-
-        image_cmd
-    };
-
-    let resolved_env = merge_run_env(image_config.env, run_env, container_id);
-    let working_dir = run_working_dir.or(image_config.working_dir);
-    let user = run_user.or(image_config.user);
     if init_process.as_ref().is_some_and(Vec::is_empty) {
         return Err(OciError::InvalidConfig(
             "init process must not be empty".to_string(),
@@ -2131,42 +2114,6 @@ fn resolve_run_config(
         cpu_period: None,
         capture_logs,
     })
-}
-
-fn merge_run_env(
-    image_env: Option<Vec<String>>,
-    run_env: Vec<(String, String)>,
-    container_id: &str,
-) -> Vec<(String, String)> {
-    let mut merged: Vec<(String, String)> = image_env
-        .unwrap_or_default()
-        .into_iter()
-        .map(|entry| {
-            entry
-                .split_once('=')
-                .map(|(key, value)| (key.to_string(), value.to_string()))
-                .unwrap_or_else(|| (entry, String::new()))
-        })
-        .collect();
-
-    for (run_key, run_value) in run_env {
-        let mut was_updated = false;
-        for (existing_key, existing_value) in merged.iter_mut() {
-            if *existing_key == run_key {
-                *existing_value = run_value.clone();
-                was_updated = true;
-            }
-        }
-
-        if !was_updated && !merged.iter().any(|(key, _)| *key == run_key) {
-            merged.push((run_key, run_value));
-        }
-    }
-
-    merged.retain(|(key, _)| key != "VZ_CONTAINER_ID");
-    merged.push(("VZ_CONTAINER_ID".to_string(), container_id.to_string()));
-
-    merged
 }
 
 fn new_container_id() -> String {

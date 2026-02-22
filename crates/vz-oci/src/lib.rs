@@ -7,23 +7,25 @@ mod bundle;
 mod config;
 mod container_store;
 mod error;
-mod image;
 pub mod macos_backend;
 mod runtime;
-mod store;
 
 pub use bundle::CONTAINER_LOG_FILE;
 pub use config::{
-    Auth, ExecConfig, ExecutionMode, MountAccess, MountSpec, MountType, OciRuntimeKind,
-    PortMapping, PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig,
+    ExecConfig, ExecutionMode, MountAccess, MountSpec, MountType, OciRuntimeKind, PortMapping,
+    PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig,
 };
 pub use container_store::{ContainerInfo, ContainerStatus, ContainerStore};
 pub use error::OciError;
-pub use image::{ImageConfigSummary, ImageId, ImagePuller};
 pub use macos_backend::MacosRuntimeBackend;
 pub use runtime::Runtime;
-pub use store::{ImageInfo, ImageStore, LayerDescriptor, PruneResult};
 pub use vz_linux::NetworkServiceConfig;
+
+// Re-export image types from the shared vz-image crate.
+pub use vz_image::{
+    Auth, ImageConfigSummary, ImageError, ImageId, ImageInfo, ImagePuller, ImageStore,
+    LayerDescriptor, PruneResult, parse_image_config_summary_from_store,
+};
 
 /// Re-export the runtime contract crate for downstream access.
 pub use vz_runtime_contract as contract;

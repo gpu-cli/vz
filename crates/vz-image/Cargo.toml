@@ -1,22 +1,22 @@
 [package]
-name = "vz-linux-native"
+name = "vz-image"
 version = "0.1.0"
+description = "Platform-independent OCI image store and puller for vz"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Linux-native container backend for vz"
 
 [dependencies]
-vz-image = { workspace = true }
-vz-runtime-contract = { workspace = true }
+oci-distribution = { workspace = true }
+docker_credential = { workspace = true }
+sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 tokio = { workspace = true }
-oci-spec = { workspace = true }
-shell-words = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

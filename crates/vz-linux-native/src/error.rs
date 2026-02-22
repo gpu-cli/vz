@@ -37,4 +37,8 @@ pub enum LinuxNativeError {
     /// JSON serialization/deserialization error.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// Image store or pull error.
+    #[error(transparent)]
+    Image(#[from] vz_image::ImageError),
 }

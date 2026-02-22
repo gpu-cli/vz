@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub use vz_image::Auth;
+
 /// Port mapping protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PortProtocol {
@@ -241,19 +243,3 @@ pub struct ExecConfig {
     pub timeout: Option<Duration>,
 }
 
-/// Registry authentication used when pulling OCI images.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum Auth {
-    /// Access the registry anonymously.
-    #[default]
-    Anonymous,
-    /// Authenticate to the registry with username and password.
-    Basic {
-        /// Registry username.
-        username: String,
-        /// Registry password.
-        password: String,
-    },
-    /// Load credentials from the local Docker credential configuration.
-    DockerConfig,
-}

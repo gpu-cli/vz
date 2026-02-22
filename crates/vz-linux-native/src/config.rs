@@ -42,7 +42,7 @@ pub enum IsolationMode {
 }
 
 /// Linux-native backend configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct LinuxNativeConfig {
     /// OCI runtime to use (youki, runc, or custom).
     pub runtime: OciRuntime,
@@ -64,6 +64,9 @@ pub struct LinuxNativeConfig {
     ///
     /// Defaults to `<data_dir>/bundles`.
     pub bundle_dir: Option<PathBuf>,
+
+    /// Registry authentication strategy for image pulls.
+    pub auth: vz_image::Auth,
 }
 
 impl Default for LinuxNativeConfig {
@@ -75,6 +78,7 @@ impl Default for LinuxNativeConfig {
             data_dir: PathBuf::from(home).join(".vz/linux-native"),
             state_dir: None,
             bundle_dir: None,
+            auth: vz_image::Auth::DockerConfig,
         }
     }
 }

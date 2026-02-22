@@ -5,6 +5,7 @@ members = [
     "vz-sandbox",
     "vz-cli",
     "vz-guest-agent",
+    "vz-image",
     "vz-linux",
     "vz-oci",
     "vz-linux-native",
@@ -146,6 +147,7 @@ tempfile = "3"
 
 # Internal crates
 vz = { path = "vz" }
+vz-image = { path = "vz-image" }
 vz-sandbox = { path = "vz-sandbox" }
 vz-linux = { path = "vz-linux" }
 vz-linux-native = { path = "vz-linux-native" }
