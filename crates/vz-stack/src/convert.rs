@@ -207,7 +207,9 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use crate::spec::{HealthCheckSpec, MountSpec as StackMountSpec, RestartPolicy};
+    use crate::spec::{
+        HealthCheckSpec, MountSpec as StackMountSpec, RestartPolicy, ServiceDependency,
+    };
     use crate::volume::{ResolvedMount, ResolvedMountKind};
     use std::collections::HashMap;
 
@@ -513,7 +515,7 @@ mod tests {
                     host_port: None,
                 },
             ],
-            depends_on: vec!["db".to_string()],
+            depends_on: vec![ServiceDependency::started("db")],
             healthcheck: Some(HealthCheckSpec {
                 test: vec![
                     "CMD".to_string(),

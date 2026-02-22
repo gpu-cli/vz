@@ -261,9 +261,16 @@ fn compute_actions(
     }
 
     // Build dependency graph for ordering.
-    let dep_map: HashMap<&str, &[String]> = desired_services
+    let dep_names: HashMap<&str, Vec<String>> = desired_services
         .iter()
-        .map(|s| (s.name.as_str(), s.depends_on.as_slice()))
+        .map(|s| {
+            let names: Vec<String> = s.depends_on.iter().map(|d| d.service.clone()).collect();
+            (s.name.as_str(), names)
+        })
+        .collect();
+    let dep_map: HashMap<&str, &[String]> = dep_names
+        .iter()
+        .map(|(k, v)| (*k, v.as_slice()))
         .collect();
 
     (topo_sort(&actions, &dep_map), deferred)
@@ -393,7 +400,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use crate::spec::StackSpec;
+    use crate::spec::{ServiceDependency, StackSpec};
 
     fn svc(name: &str, image: &str) -> ServiceSpec {
         ServiceSpec {
@@ -417,7 +424,14 @@ mod tests {
 
     fn svc_with_deps(name: &str, image: &str, deps: Vec<&str>) -> ServiceSpec {
         ServiceSpec {
-            depends_on: deps.into_iter().map(String::from).collect(),
+            depends_on: deps.into_iter().map(ServiceDependency::started).collect(),
+            ..svc(name, image)
+        }
+    }
+
+    fn svc_with_healthy_deps(name: &str, image: &str, deps: Vec<&str>) -> ServiceSpec {
+        ServiceSpec {
+            depends_on: deps.into_iter().map(ServiceDependency::healthy).collect(),
             ..svc(name, image)
         }
     }
@@ -678,11 +692,31 @@ mod tests {
     }
 
     #[test]
-    fn dep_gating_healthcheck_blocks_until_healthy() {
+    fn dep_gating_service_started_ignores_healthcheck() {
         // db has a health check and is Running but not yet healthy.
+        // With service_started condition (default), web should NOT be blocked.
         let desired = vec![
             svc_with_healthcheck("db", "postgres:16"),
             svc_with_deps("web", "nginx:latest", vec!["db"]),
+        ];
+        let observed = vec![obs_running("db")];
+
+        // No health status — but condition is service_started, so web is unblocked.
+        // db is Running (no action), web is not yet created → ServiceCreate.
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health());
+
+        assert!(deferred.is_empty());
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].service_name(), "web");
+    }
+
+    #[test]
+    fn dep_gating_service_healthy_blocks_until_healthy() {
+        // db has a health check and is Running but not yet healthy.
+        // With service_healthy condition, web should be blocked.
+        let desired = vec![
+            svc_with_healthcheck("db", "postgres:16"),
+            svc_with_healthy_deps("web", "nginx:latest", vec!["db"]),
         ];
         let observed = vec![obs_running("db")];
 
@@ -695,11 +729,12 @@ mod tests {
     }
 
     #[test]
-    fn dep_gating_healthcheck_unblocks_when_healthy() {
+    fn dep_gating_service_healthy_unblocks_when_healthy() {
         // db has a health check and is Running + healthy.
+        // With service_healthy condition, web should be unblocked.
         let desired = vec![
             svc_with_healthcheck("db", "postgres:16"),
-            svc_with_deps("web", "nginx:latest", vec!["db"]),
+            svc_with_healthy_deps("web", "nginx:latest", vec!["db"]),
         ];
         let observed = vec![obs_running("db")];
 
@@ -841,14 +876,14 @@ mod tests {
     }
 
     #[test]
-    fn apply_with_healthcheck_gating() {
+    fn apply_with_healthcheck_gating_service_healthy() {
         let store = StateStore::in_memory().unwrap();
-        // db has a health check; web depends on db.
+        // db has a health check; web depends on db with service_healthy condition.
         let s = spec(
             "myapp",
             vec![
                 svc_with_healthcheck("db", "postgres:16"),
-                svc_with_deps("web", "nginx:latest", vec!["db"]),
+                svc_with_healthy_deps("web", "nginx:latest", vec!["db"]),
             ],
         );
 
@@ -875,7 +910,7 @@ mod tests {
             .save_observed_state("myapp", &obs("web", ServicePhase::Stopped))
             .unwrap();
 
-        // Apply with no health status: web is deferred (db has healthcheck, not passed).
+        // Apply with no health status: web is deferred (service_healthy condition, not passed).
         let r3 = apply(&s, &store, &no_health()).unwrap();
         assert!(r3.actions.is_empty()); // No create for web.
         assert_eq!(r3.deferred.len(), 1);
@@ -891,6 +926,34 @@ mod tests {
         assert_eq!(r4.actions.len(), 1);
         assert_eq!(r4.actions[0].service_name(), "web");
         assert!(r4.deferred.is_empty());
+    }
+
+    #[test]
+    fn apply_with_healthcheck_service_started_ignores_health() {
+        let store = StateStore::in_memory().unwrap();
+        // db has a health check; web depends on db with default (service_started) condition.
+        let s = spec(
+            "myapp",
+            vec![
+                svc_with_healthcheck("db", "postgres:16"),
+                svc_with_deps("web", "nginx:latest", vec!["db"]),
+            ],
+        );
+
+        // Simulate db Running but health check NOT yet passing.
+        store
+            .save_observed_state("myapp", &obs_running("db"))
+            .unwrap();
+        store
+            .save_observed_state("myapp", &obs("web", ServicePhase::Stopped))
+            .unwrap();
+
+        // Apply with no health status: web should NOT be deferred because
+        // service_started doesn't care about health checks.
+        let r = apply(&s, &store, &no_health()).unwrap();
+        assert_eq!(r.actions.len(), 1);
+        assert_eq!(r.actions[0].service_name(), "web");
+        assert!(r.deferred.is_empty());
     }
 
     #[test]

@@ -12,8 +12,8 @@ use serde_yml::Value;
 
 use crate::error::StackError;
 use crate::spec::{
-    HealthCheckSpec, MountSpec, PortSpec, ResourcesSpec, RestartPolicy, SecretDef,
-    ServiceSecretRef, ServiceSpec, StackSpec, VolumeSpec,
+    DependencyCondition, HealthCheckSpec, MountSpec, PortSpec, ResourcesSpec, RestartPolicy,
+    SecretDef, ServiceDependency, ServiceSecretRef, ServiceSpec, StackSpec, VolumeSpec,
 };
 
 // ── Accepted key sets ──────────────────────────────────────────────
@@ -213,10 +213,10 @@ fn parse_compose_inner(
     let service_names: Vec<&str> = services.iter().map(|s| s.name.as_str()).collect();
     for svc in &services {
         for dep in &svc.depends_on {
-            if !service_names.contains(&dep.as_str()) {
+            if !service_names.contains(&dep.service.as_str()) {
                 return Err(StackError::ComposeValidation(format!(
                     "service `{}` depends on `{}` which is not defined",
-                    svc.name, dep,
+                    svc.name, dep.service,
                 )));
             }
         }
@@ -775,7 +775,10 @@ fn parse_mount_long(svc_name: &str, obj: &serde_yml::Mapping) -> Result<MountSpe
 }
 
 /// Parse `depends_on` which can be a list of strings or a mapping with conditions.
-fn parse_depends_on(svc_name: &str, map: &serde_yml::Mapping) -> Result<Vec<String>, StackError> {
+fn parse_depends_on(
+    svc_name: &str,
+    map: &serde_yml::Mapping,
+) -> Result<Vec<ServiceDependency>, StackError> {
     let Some(value) = map.get(val("depends_on")) else {
         return Ok(vec![]);
     };
@@ -784,22 +787,28 @@ fn parse_depends_on(svc_name: &str, map: &serde_yml::Mapping) -> Result<Vec<Stri
         // Simple list: depends_on: [db, cache]
         seq.iter()
             .map(|v| {
-                v.as_str().map(String::from).ok_or_else(|| {
-                    StackError::ComposeParse(format!(
-                        "service `{svc_name}`: `depends_on` items must be strings"
-                    ))
-                })
+                v.as_str()
+                    .map(ServiceDependency::started)
+                    .ok_or_else(|| {
+                        StackError::ComposeParse(format!(
+                            "service `{svc_name}`: `depends_on` items must be strings"
+                        ))
+                    })
             })
             .collect()
     } else if let Some(obj) = value.as_mapping() {
         // Conditional form: depends_on: { db: { condition: service_healthy } }
-        // We accept both forms but treat all conditions as service_started.
-        obj.keys()
-            .map(|k| {
-                k.as_str().map(String::from).ok_or_else(|| {
+        obj.iter()
+            .map(|(k, v)| {
+                let dep_name = k.as_str().ok_or_else(|| {
                     StackError::ComposeParse(format!(
                         "service `{svc_name}`: `depends_on` keys must be strings"
                     ))
+                })?;
+                let condition = parse_dependency_condition(svc_name, dep_name, v)?;
+                Ok(ServiceDependency {
+                    service: dep_name.to_string(),
+                    condition,
                 })
             })
             .collect()
@@ -807,6 +816,40 @@ fn parse_depends_on(svc_name: &str, map: &serde_yml::Mapping) -> Result<Vec<Stri
         Err(StackError::ComposeParse(format!(
             "service `{svc_name}`: `depends_on` must be a list or mapping"
         )))
+    }
+}
+
+/// Extract the condition from a depends_on mapping value.
+///
+/// The value can be a mapping like `{ condition: service_healthy }` or
+/// omitted/empty (defaults to `service_started`).
+fn parse_dependency_condition(
+    svc_name: &str,
+    dep_name: &str,
+    value: &serde_yml::Value,
+) -> Result<DependencyCondition, StackError> {
+    let Some(obj) = value.as_mapping() else {
+        // No condition specified → default.
+        return Ok(DependencyCondition::ServiceStarted);
+    };
+
+    let Some(cond_val) = obj.get(val("condition")) else {
+        return Ok(DependencyCondition::ServiceStarted);
+    };
+
+    let cond_str = cond_val.as_str().ok_or_else(|| {
+        StackError::ComposeParse(format!(
+            "service `{svc_name}`: depends_on `{dep_name}` condition must be a string"
+        ))
+    })?;
+
+    match cond_str {
+        "service_started" => Ok(DependencyCondition::ServiceStarted),
+        "service_healthy" => Ok(DependencyCondition::ServiceHealthy),
+        "service_completed_successfully" => Ok(DependencyCondition::ServiceCompletedSuccessfully),
+        other => Err(StackError::ComposeParse(format!(
+            "service `{svc_name}`: depends_on `{dep_name}` unknown condition `{other}`"
+        ))),
     }
 }
 
@@ -1925,11 +1968,11 @@ services:
 "#;
         let spec = parse_compose(yaml, "myapp").unwrap();
         let web = spec.services.iter().find(|s| s.name == "web").unwrap();
-        assert_eq!(web.depends_on, vec!["db".to_string()]);
+        assert_eq!(web.depends_on, vec![ServiceDependency::started("db")]);
     }
 
     #[test]
-    fn depends_on_mapping_form() {
+    fn depends_on_mapping_form_service_healthy() {
         let yaml = r#"
 services:
   db:
@@ -1942,7 +1985,40 @@ services:
 "#;
         let spec = parse_compose(yaml, "myapp").unwrap();
         let web = spec.services.iter().find(|s| s.name == "web").unwrap();
-        assert_eq!(web.depends_on, vec!["db".to_string()]);
+        assert_eq!(web.depends_on, vec![ServiceDependency::healthy("db")]);
+    }
+
+    #[test]
+    fn depends_on_mapping_form_service_started() {
+        let yaml = r#"
+services:
+  db:
+    image: postgres:15
+  web:
+    image: nginx:latest
+    depends_on:
+      db:
+        condition: service_started
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let web = spec.services.iter().find(|s| s.name == "web").unwrap();
+        assert_eq!(web.depends_on, vec![ServiceDependency::started("db")]);
+    }
+
+    #[test]
+    fn depends_on_mapping_form_no_condition() {
+        let yaml = r#"
+services:
+  db:
+    image: postgres:15
+  web:
+    image: nginx:latest
+    depends_on:
+      db: {}
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let web = spec.services.iter().find(|s| s.name == "web").unwrap();
+        assert_eq!(web.depends_on, vec![ServiceDependency::started("db")]);
     }
 
     // ── Healthcheck parsing ───────────────────────────────────────
@@ -2555,7 +2631,7 @@ volumes:
 
         // Web service.
         let web = &spec.services[1];
-        assert_eq!(web.depends_on, vec!["redis".to_string()]);
+        assert_eq!(web.depends_on, vec![ServiceDependency::started("redis")]);
         assert_eq!(
             web.environment.get("REDIS_URL").unwrap(),
             "redis://redis:6379"

@@ -8,6 +8,53 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+/// Condition for a service dependency.
+///
+/// Determines when a dependency is considered satisfied, following
+/// Docker Compose v3 semantics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyCondition {
+    /// Dependency is satisfied as soon as the service is running,
+    /// regardless of health check status. This is the default.
+    #[default]
+    ServiceStarted,
+    /// Dependency is satisfied only when the service is running AND
+    /// its health check has passed at least once.
+    ServiceHealthy,
+    /// Dependency is satisfied when the service has completed (exited
+    /// with code 0). Useful for init containers.
+    ServiceCompletedSuccessfully,
+}
+
+/// A dependency on another service with an optional condition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceDependency {
+    /// Name of the service this depends on.
+    pub service: String,
+    /// Condition that must be met before the dependency is satisfied.
+    #[serde(default)]
+    pub condition: DependencyCondition,
+}
+
+impl ServiceDependency {
+    /// Create a dependency with the default condition (`service_started`).
+    pub fn started(service: impl Into<String>) -> Self {
+        Self {
+            service: service.into(),
+            condition: DependencyCondition::ServiceStarted,
+        }
+    }
+
+    /// Create a dependency requiring the service to be healthy.
+    pub fn healthy(service: impl Into<String>) -> Self {
+        Self {
+            service: service.into(),
+            condition: DependencyCondition::ServiceHealthy,
+        }
+    }
+}
+
 /// Root specification for a multi-service stack.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StackSpec {
@@ -55,9 +102,9 @@ pub struct ServiceSpec {
     /// Port mappings from host to container.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<PortSpec>,
-    /// Service names this service depends on for startup ordering.
+    /// Service dependencies with optional conditions for startup ordering.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub depends_on: Vec<String>,
+    pub depends_on: Vec<ServiceDependency>,
     /// Health check configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<HealthCheckSpec>,
@@ -255,7 +302,7 @@ mod tests {
                     container_port: 80,
                     host_port: Some(8080),
                 }],
-                depends_on: vec!["db".to_string()],
+                depends_on: vec![ServiceDependency::started("db")],
                 healthcheck: Some(HealthCheckSpec {
                     test: vec![
                         "CMD".to_string(),

@@ -10,7 +10,8 @@
 use std::collections::HashMap;
 
 use vz_stack::{
-    Action, HealthStatus, ServiceObservedState, ServicePhase, StackSpec, StateStore, parse_compose,
+    Action, HealthStatus, ServiceDependency, ServiceObservedState, ServicePhase, StackSpec,
+    StateStore, parse_compose,
 };
 
 // ── Fixture: web + redis ──────────────────────────────────────────
@@ -22,7 +23,8 @@ services:
     ports:
       - "8080:80"
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     environment:
       REDIS_URL: redis://redis:6379
     restart: on-failure:3
@@ -62,7 +64,7 @@ fn web_redis_parse_produces_valid_spec() {
 
     assert_eq!(web.name, "web");
     assert_eq!(web.image, "myapp:latest");
-    assert_eq!(web.depends_on, vec!["redis"]);
+    assert_eq!(web.depends_on, vec![ServiceDependency::healthy("redis")]);
     assert_eq!(
         web.environment.get("REDIS_URL").unwrap(),
         "redis://redis:6379"
@@ -284,8 +286,10 @@ services:
     ports:
       - "8080:80"
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://postgres:5432/app
       REDIS_URL: redis://redis:6379
@@ -347,8 +351,12 @@ fn web_pg_redis_parse_produces_valid_spec() {
     assert!(redis.healthcheck.is_some());
 
     assert_eq!(web.depends_on.len(), 2);
-    assert!(web.depends_on.contains(&"postgres".to_string()));
-    assert!(web.depends_on.contains(&"redis".to_string()));
+    assert!(web
+        .depends_on
+        .contains(&ServiceDependency::healthy("postgres")));
+    assert!(web
+        .depends_on
+        .contains(&ServiceDependency::healthy("redis")));
 
     // Volumes sorted by name.
     let vol_names: Vec<&str> = spec.volumes.iter().map(|v| v.name.as_str()).collect();

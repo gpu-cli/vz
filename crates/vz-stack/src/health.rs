@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 use crate::error::StackError;
 use crate::events::StackEvent;
 use crate::executor::ContainerRuntime;
-use crate::spec::{HealthCheckSpec, ServiceSpec, StackSpec};
+use crate::spec::{DependencyCondition, HealthCheckSpec, ServiceSpec, StackSpec};
 use crate::state_store::{ServiceObservedState, ServicePhase, StateStore};
 
 /// Result of checking whether a service's dependencies are satisfied.
@@ -103,11 +103,14 @@ pub fn is_service_ready(
 /// only blocks when:
 ///
 /// - It is in a terminal state (`Failed` / `Stopped`).
-/// - It is `Running` with a health check that has not yet passed.
+/// - The condition is `service_healthy` and the health check has
+///   not yet passed.
+/// - The condition is `service_completed_successfully` and the
+///   service has not exited with code 0.
 ///
-/// This means a fresh deployment creates all services in one
-/// topo-sorted pass, while health-checked dependencies gate their
-/// dependents across apply cycles.
+/// With the default `service_started` condition, a running service
+/// is considered ready regardless of health check status — matching
+/// Docker Compose semantics.
 pub fn check_dependencies(
     service: &ServiceSpec,
     observed: &[ServiceObservedState],
@@ -128,10 +131,10 @@ pub fn check_dependencies(
 
     let mut waiting_on = Vec::new();
 
-    for dep_name in &service.depends_on {
-        let dep_obs = observed_map.get(dep_name.as_str());
-        let dep_spec = spec_map.get(dep_name.as_str());
-        let dep_health = health_statuses.get(dep_name);
+    for dep in &service.depends_on {
+        let dep_obs = observed_map.get(dep.service.as_str());
+        let dep_spec = spec_map.get(dep.service.as_str());
+        let dep_health = health_statuses.get(&dep.service);
 
         let blocked = match dep_obs {
             None => {
@@ -141,21 +144,32 @@ pub fn check_dependencies(
             Some(obs) => match obs.phase {
                 // Terminal states block dependent creation.
                 ServicePhase::Failed | ServicePhase::Stopped => true,
-                // Running: block only if there's a health check that hasn't passed.
-                ServicePhase::Running => {
-                    let healthcheck = dep_spec.and_then(|s| s.healthcheck.as_ref());
-                    match healthcheck {
-                        None => false, // Running + no health check = ready.
-                        Some(hc) => !is_service_ready(obs, Some(hc), dep_health),
+                // Running: behaviour depends on the condition.
+                ServicePhase::Running => match dep.condition {
+                    DependencyCondition::ServiceStarted => {
+                        // Running is sufficient — don't check health.
+                        false
                     }
-                }
+                    DependencyCondition::ServiceHealthy => {
+                        // Must have a passing health check.
+                        let healthcheck = dep_spec.and_then(|s| s.healthcheck.as_ref());
+                        match healthcheck {
+                            None => false, // No health check defined = ready.
+                            Some(hc) => !is_service_ready(obs, Some(hc), dep_health),
+                        }
+                    }
+                    DependencyCondition::ServiceCompletedSuccessfully => {
+                        // Running means not completed yet → blocked.
+                        true
+                    }
+                },
                 // Pending/Creating/Stopping — in progress, don't block.
                 _ => false,
             },
         };
 
         if blocked {
-            waiting_on.push(dep_name.clone());
+            waiting_on.push(dep.service.clone());
         }
     }
 
@@ -433,6 +447,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use crate::spec::ServiceDependency;
     use std::collections::HashMap;
 
     fn svc(name: &str) -> ServiceSpec {
@@ -457,7 +472,14 @@ mod tests {
 
     fn svc_with_deps(name: &str, deps: Vec<&str>) -> ServiceSpec {
         ServiceSpec {
-            depends_on: deps.into_iter().map(String::from).collect(),
+            depends_on: deps.into_iter().map(ServiceDependency::started).collect(),
+            ..svc(name)
+        }
+    }
+
+    fn svc_with_healthy_deps(name: &str, deps: Vec<&str>) -> ServiceSpec {
+        ServiceSpec {
+            depends_on: deps.into_iter().map(ServiceDependency::healthy).collect(),
             ..svc(name)
         }
     }
@@ -644,12 +666,25 @@ mod tests {
     }
 
     #[test]
-    fn dep_running_with_healthcheck_failing_is_blocked() {
+    fn dep_running_with_healthcheck_service_started_is_ready() {
+        // service_started condition: running is sufficient, healthcheck irrelevant.
         let service = svc_with_deps("web", vec!["db"]);
         let all_services = vec![svc_with_healthcheck("db"), service.clone()];
         let observed = vec![obs("db", ServicePhase::Running)];
 
-        // No health status means health check hasn't passed yet.
+        // No health status — but condition is service_started, so not blocked.
+        let result = check_dependencies(&service, &observed, &all_services, &HashMap::new());
+        assert_eq!(result, DependencyCheck::Ready);
+    }
+
+    #[test]
+    fn dep_running_with_healthcheck_service_healthy_blocks() {
+        // service_healthy condition: must wait for health check to pass.
+        let service = svc_with_healthy_deps("web", vec!["db"]);
+        let all_services = vec![svc_with_healthcheck("db"), service.clone()];
+        let observed = vec![obs("db", ServicePhase::Running)];
+
+        // No health status means health check hasn't passed yet → blocked.
         let result = check_dependencies(&service, &observed, &all_services, &HashMap::new());
         assert_eq!(
             result,
@@ -660,8 +695,9 @@ mod tests {
     }
 
     #[test]
-    fn dep_running_with_healthcheck_passing_is_ready() {
-        let service = svc_with_deps("web", vec!["db"]);
+    fn dep_running_with_healthcheck_passing_service_healthy_is_ready() {
+        // service_healthy condition + health check passed → ready.
+        let service = svc_with_healthy_deps("web", vec!["db"]);
         let all_services = vec![svc_with_healthcheck("db"), service.clone()];
         let observed = vec![obs("db", ServicePhase::Running)];
 

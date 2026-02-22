@@ -280,7 +280,7 @@ mod tests {
 
     use super::*;
     use crate::executor::tests_support::MockContainerRuntime;
-    use crate::spec::{HealthCheckSpec, ServiceSpec, StackSpec};
+    use crate::spec::{HealthCheckSpec, ServiceDependency, ServiceSpec, StackSpec};
 
     fn svc(name: &str) -> ServiceSpec {
         ServiceSpec {
@@ -304,7 +304,7 @@ mod tests {
 
     fn svc_with_deps(name: &str, deps: Vec<&str>) -> ServiceSpec {
         ServiceSpec {
-            depends_on: deps.into_iter().map(String::from).collect(),
+            depends_on: deps.into_iter().map(ServiceDependency::started).collect(),
             ..svc(name)
         }
     }
