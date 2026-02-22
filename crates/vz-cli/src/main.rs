@@ -46,60 +46,42 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum Commands {
-    /// OCI container runtime operations.
-    Oci(Box<commands::oci::OciArgs>),
+    // ── Container commands (cross-platform, top-level) ──
+    /// Pull and cache an OCI image locally.
+    Pull(commands::oci::PullArgs),
 
+    /// Run a container from an OCI image.
+    Run(Box<commands::oci::RunArgs>),
+
+    /// Create and start a long-lived container.
+    Create(Box<commands::oci::CreateArgs>),
+
+    /// Execute a command in a running container.
+    Exec(commands::oci::ExecArgs),
+
+    /// List cached OCI images.
+    Images(commands::oci::ImagesArgs),
+
+    /// Remove stale image and layer artifacts.
+    Prune(commands::oci::PruneArgs),
+
+    /// List containers.
+    Ps(commands::oci::PsArgs),
+
+    /// Stop a running container.
+    Stop(commands::oci::StopArgs),
+
+    /// Remove container metadata and rootfs.
+    Rm(commands::oci::RmArgs),
+
+    // ── Stack orchestration (cross-platform) ──
     /// Manage multi-service stacks from Compose files.
     Stack(commands::stack::StackArgs),
 
-    // ── macOS-only VM commands ────────────────────────────────────
-    /// Create a golden macOS VM image from an IPSW.
+    // ── VM management (macOS only) ──
+    /// Manage virtual machines.
     #[cfg(target_os = "macos")]
-    Init(commands::init::InitArgs),
-
-    /// Start a VM with optional mounts.
-    #[cfg(target_os = "macos")]
-    Run(commands::run::RunArgs),
-
-    /// Execute a command inside a running VM.
-    #[cfg(target_os = "macos")]
-    Exec(commands::exec::ExecArgs),
-
-    /// Save VM state for fast restore.
-    #[cfg(target_os = "macos")]
-    Save(commands::save::SaveArgs),
-
-    /// Restore VM from saved state.
-    #[cfg(target_os = "macos")]
-    Restore(commands::restore::RestoreArgs),
-
-    /// List running VMs.
-    #[cfg(target_os = "macos")]
-    List(commands::list::ListArgs),
-
-    /// Stop a running VM.
-    #[cfg(target_os = "macos")]
-    Stop(commands::stop::StopArgs),
-
-    /// Manage cached files (IPSWs, downloads).
-    #[cfg(target_os = "macos")]
-    Cache(commands::cache::CacheArgs),
-
-    /// Provision a disk image (user account, guest agent, auto-login).
-    #[cfg(target_os = "macos")]
-    Provision(commands::provision::ProvisionArgs),
-
-    /// Detect and clean up orphaned VMs.
-    #[cfg(target_os = "macos")]
-    Cleanup(commands::cleanup::CleanupArgs),
-
-    /// Ad-hoc sign the vz binary with required entitlements.
-    #[cfg(target_os = "macos")]
-    SelfSign(commands::self_sign::SelfSignArgs),
-
-    /// Run validation suites against image cohorts.
-    #[cfg(target_os = "macos")]
-    Validate(commands::validate::ValidateArgs),
+    Vm(commands::vm::VmArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -124,14 +106,19 @@ fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    // GUI mode: `vz run` without --headless needs AppKit on the main thread.
+    // GUI mode: `vz vm run` without --headless needs AppKit on the main thread.
     #[cfg(target_os = "macos")]
-    if let Commands::Run(ref args) = cli.command {
-        if !args.headless {
-            let Commands::Run(args) = cli.command else {
-                unreachable!()
-            };
-            return gui::run_with_gui(args);
+    if let Commands::Vm(ref vm_args) = cli.command {
+        if let commands::vm::VmCommand::Run(ref args) = vm_args.action {
+            if !args.headless {
+                let Commands::Vm(vm_args) = cli.command else {
+                    unreachable!()
+                };
+                let commands::vm::VmCommand::Run(args) = vm_args.action else {
+                    unreachable!()
+                };
+                return gui::run_with_gui(args);
+            }
         }
     }
 
@@ -139,35 +126,23 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         let result = match cli.command {
-            // Cross-platform commands
-            Commands::Oci(args) => commands::oci::run(*args).await,
+            // Container commands
+            Commands::Pull(args) => commands::oci::run_pull(args).await,
+            Commands::Run(args) => commands::oci::run_container(*args).await,
+            Commands::Create(args) => commands::oci::run_create(*args).await,
+            Commands::Exec(args) => commands::oci::run_exec(args).await,
+            Commands::Images(args) => commands::oci::run_images(args).await,
+            Commands::Prune(args) => commands::oci::run_prune(args).await,
+            Commands::Ps(args) => commands::oci::run_ps(args).await,
+            Commands::Stop(args) => commands::oci::run_stop(args).await,
+            Commands::Rm(args) => commands::oci::run_rm(args).await,
+
+            // Stack orchestration
             Commands::Stack(args) => commands::stack::run(args).await,
 
-            // macOS-only VM commands
+            // VM management (macOS only)
             #[cfg(target_os = "macos")]
-            Commands::Init(args) => commands::init::run(args).await,
-            #[cfg(target_os = "macos")]
-            Commands::Run(args) => commands::run::run(args).await,
-            #[cfg(target_os = "macos")]
-            Commands::Exec(args) => commands::exec::run(args).await,
-            #[cfg(target_os = "macos")]
-            Commands::Save(args) => commands::save::run(args).await,
-            #[cfg(target_os = "macos")]
-            Commands::Restore(args) => commands::restore::run(args).await,
-            #[cfg(target_os = "macos")]
-            Commands::List(args) => commands::list::run(args).await,
-            #[cfg(target_os = "macos")]
-            Commands::Stop(args) => commands::stop::run(args).await,
-            #[cfg(target_os = "macos")]
-            Commands::Cache(args) => commands::cache::run(args).await,
-            #[cfg(target_os = "macos")]
-            Commands::Provision(args) => commands::provision::run(args).await,
-            #[cfg(target_os = "macos")]
-            Commands::Cleanup(args) => commands::cleanup::run(args).await,
-            #[cfg(target_os = "macos")]
-            Commands::SelfSign(args) => commands::self_sign::run(args).await,
-            #[cfg(target_os = "macos")]
-            Commands::Validate(args) => commands::validate::run(args).await,
+            Commands::Vm(args) => commands::vm::run(args).await,
         };
 
         if let Err(ref e) = result {
@@ -190,100 +165,111 @@ mod tests {
 
     #[test]
     fn parse_verbose_flag() {
-        let cli = Cli::try_parse_from(["vz", "-v", "oci", "images"]).expect("parse");
+        let cli = Cli::try_parse_from(["vz", "-v", "images"]).expect("parse");
         assert_eq!(cli.verbose, 1);
     }
 
     #[test]
     fn parse_quiet_flag() {
-        let cli = Cli::try_parse_from(["vz", "--quiet", "oci", "images"]).expect("parse");
+        let cli = Cli::try_parse_from(["vz", "--quiet", "images"]).expect("parse");
         assert!(cli.quiet);
     }
 
     #[test]
     fn parse_json_flag() {
-        let cli = Cli::try_parse_from(["vz", "--json", "oci", "images"]).expect("parse");
+        let cli = Cli::try_parse_from(["vz", "--json", "images"]).expect("parse");
         assert!(cli.json);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn parse_init_subcommand() {
-        let cli = Cli::try_parse_from(["vz", "init", "--disk-size", "64G"]).expect("parse");
-        assert!(matches!(cli.command, Commands::Init(_)));
+    fn parse_vm_init_subcommand() {
+        let cli =
+            Cli::try_parse_from(["vz", "vm", "init", "--disk-size", "64G"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::Init(_))
+        ));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn parse_run_subcommand() {
+    fn parse_vm_run_subcommand() {
+        let cli = Cli::try_parse_from(["vz", "vm", "run", "--image", "base.img", "--headless"])
+            .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::Run(_))
+        ));
+    }
+
+    #[test]
+    fn parse_pull_subcommand() {
+        let cli = Cli::try_parse_from(["vz", "pull", "alpine:latest"]).expect("parse");
+        assert!(matches!(cli.command, Commands::Pull(_)));
+    }
+
+    #[test]
+    fn parse_container_run_subcommand() {
         let cli =
-            Cli::try_parse_from(["vz", "run", "--image", "base.img", "--headless"]).expect("parse");
+            Cli::try_parse_from(["vz", "run", "alpine:latest", "--", "echo", "hello"])
+                .expect("parse");
         assert!(matches!(cli.command, Commands::Run(_)));
     }
 
     #[test]
-    fn parse_oci_pull_subcommand() {
-        let cli = Cli::try_parse_from(["vz", "oci", "pull", "alpine:latest"]).expect("parse");
-        assert!(matches!(
-            cli.command,
-            Commands::Oci(ref args) if matches!(args.action, commands::oci::OciCommand::Pull(_))
-        ));
-    }
-
-    #[test]
-    fn parse_oci_run_subcommand() {
-        let cli = Cli::try_parse_from(["vz", "oci", "run", "alpine:latest", "--", "echo", "hello"])
-            .expect("parse");
-        assert!(matches!(
-            cli.command,
-            Commands::Oci(ref args) if matches!(args.action, commands::oci::OciCommand::Run(_))
-        ));
-    }
-
-    #[test]
-    fn parse_oci_run_with_publish_flag() {
-        let cli = Cli::try_parse_from(["vz", "oci", "run", "nginx:alpine", "--publish", "8080:80"])
-            .expect("parse");
+    fn parse_run_with_publish_flag() {
+        let cli =
+            Cli::try_parse_from(["vz", "run", "nginx:alpine", "--publish", "8080:80"])
+                .expect("parse");
 
         match cli.command {
-            Commands::Oci(args) => match args.action {
-                commands::oci::OciCommand::Run(run) => {
-                    assert_eq!(run.publish, vec!["8080:80".to_string()]);
-                }
-                other => panic!("unexpected OCI action variant: {other:?}"),
-            },
+            Commands::Run(args) => {
+                assert_eq!(args.publish, vec!["8080:80".to_string()]);
+            }
             other => panic!("unexpected command variant: {other:?}"),
         }
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn parse_exec_subcommand() {
+    fn parse_vm_exec_subcommand() {
+        let cli = Cli::try_parse_from(["vz", "vm", "exec", "my-vm", "--", "cargo", "build"])
+            .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::Exec(_))
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_stop_subcommand() {
         let cli =
-            Cli::try_parse_from(["vz", "exec", "my-vm", "--", "cargo", "build"]).expect("parse");
-        assert!(matches!(cli.command, Commands::Exec(_)));
+            Cli::try_parse_from(["vz", "vm", "stop", "my-vm", "--force"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::Stop(_))
+        ));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn parse_stop_subcommand() {
-        let cli = Cli::try_parse_from(["vz", "stop", "my-vm", "--force"]).expect("parse");
-        assert!(matches!(cli.command, Commands::Stop(_)));
+    fn parse_vm_save_subcommand() {
+        let cli = Cli::try_parse_from(["vz", "vm", "save", "my-vm", "--output", "state.bin"])
+            .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::Save(_))
+        ));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn parse_save_subcommand() {
-        let cli =
-            Cli::try_parse_from(["vz", "save", "my-vm", "--output", "state.bin"]).expect("parse");
-        assert!(matches!(cli.command, Commands::Save(_)));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn parse_restore_subcommand() {
+    fn parse_vm_restore_subcommand() {
         let cli = Cli::try_parse_from([
             "vz",
+            "vm",
             "restore",
             "--state",
             "state.bin",
@@ -291,35 +277,51 @@ mod tests {
             "base.img",
         ])
         .expect("parse");
-        assert!(matches!(cli.command, Commands::Restore(_)));
+        assert!(matches!(
+            cli.command,
+            Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::Restore(_))
+        ));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn parse_cache_list() {
-        let cli = Cli::try_parse_from(["vz", "cache", "list"]).expect("parse");
-        assert!(matches!(cli.command, Commands::Cache(_)));
+    fn parse_vm_cache_list() {
+        let cli = Cli::try_parse_from(["vz", "vm", "cache", "list"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::Cache(_))
+        ));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn parse_cache_clean() {
-        let cli = Cli::try_parse_from(["vz", "cache", "clean", "--all"]).expect("parse");
-        assert!(matches!(cli.command, Commands::Cache(_)));
+    fn parse_vm_cache_clean() {
+        let cli =
+            Cli::try_parse_from(["vz", "vm", "cache", "clean", "--all"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::Cache(_))
+        ));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn parse_cleanup() {
-        let cli = Cli::try_parse_from(["vz", "cleanup"]).expect("parse");
-        assert!(matches!(cli.command, Commands::Cleanup(_)));
+    fn parse_vm_cleanup() {
+        let cli = Cli::try_parse_from(["vz", "vm", "cleanup"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::Cleanup(_))
+        ));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn parse_self_sign() {
-        let cli = Cli::try_parse_from(["vz", "self-sign"]).expect("parse");
-        assert!(matches!(cli.command, Commands::SelfSign(_)));
+    fn parse_vm_self_sign() {
+        let cli = Cli::try_parse_from(["vz", "vm", "self-sign"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::SelfSign(_))
+        ));
     }
 
     #[test]
@@ -427,20 +429,26 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn parse_validate_run() {
-        let cli = Cli::try_parse_from(["vz", "validate", "run", "--tier", "1"]).expect("parse");
-        assert!(matches!(
-            cli.command,
-            Commands::Validate(ref args)
-                if matches!(args.action, commands::validate::ValidateCommand::Run(_))
-        ));
+    fn parse_vm_validate_run() {
+        let cli =
+            Cli::try_parse_from(["vz", "vm", "validate", "run", "--tier", "1"]).expect("parse");
+        if let Commands::Vm(ref vm_args) = cli.command {
+            assert!(matches!(
+                vm_args.action,
+                commands::vm::VmCommand::Validate(ref args)
+                    if matches!(args.action, commands::validate::ValidateCommand::Run(_))
+            ));
+        } else {
+            panic!("expected Vm");
+        }
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn parse_validate_run_with_output() {
+    fn parse_vm_validate_run_with_output() {
         let cli = Cli::try_parse_from([
             "vz",
+            "vm",
             "validate",
             "run",
             "--tier",
@@ -449,36 +457,51 @@ mod tests {
             "report.json",
         ])
         .expect("parse");
-        assert!(matches!(cli.command, Commands::Validate(_)));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn parse_validate_manifest() {
-        let cli = Cli::try_parse_from(["vz", "validate", "manifest"]).expect("parse");
         assert!(matches!(
             cli.command,
-            Commands::Validate(ref args)
-                if matches!(args.action, commands::validate::ValidateCommand::Manifest(_))
+            Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::Validate(_))
         ));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn parse_validate_list() {
-        let cli = Cli::try_parse_from(["vz", "validate", "list"]).expect("parse");
-        assert!(matches!(
-            cli.command,
-            Commands::Validate(ref args)
-                if matches!(args.action, commands::validate::ValidateCommand::List(_))
-        ));
+    fn parse_vm_validate_manifest() {
+        let cli =
+            Cli::try_parse_from(["vz", "vm", "validate", "manifest"]).expect("parse");
+        if let Commands::Vm(ref vm_args) = cli.command {
+            assert!(matches!(
+                vm_args.action,
+                commands::vm::VmCommand::Validate(ref args)
+                    if matches!(args.action, commands::validate::ValidateCommand::Manifest(_))
+            ));
+        } else {
+            panic!("expected Vm");
+        }
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn parse_validate_list_with_tier() {
-        let cli = Cli::try_parse_from(["vz", "validate", "list", "--tier", "2", "--json"])
+    fn parse_vm_validate_list() {
+        let cli = Cli::try_parse_from(["vz", "vm", "validate", "list"]).expect("parse");
+        if let Commands::Vm(ref vm_args) = cli.command {
+            assert!(matches!(
+                vm_args.action,
+                commands::vm::VmCommand::Validate(ref args)
+                    if matches!(args.action, commands::validate::ValidateCommand::List(_))
+            ));
+        } else {
+            panic!("expected Vm");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_validate_list_with_tier() {
+        let cli = Cli::try_parse_from(["vz", "vm", "validate", "list", "--tier", "2", "--json"])
             .expect("parse");
-        assert!(matches!(cli.command, Commands::Validate(_)));
+        assert!(matches!(
+            cli.command,
+            Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::Validate(_))
+        ));
     }
 }
