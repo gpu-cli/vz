@@ -2835,10 +2835,14 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "prost",
  "tokio",
+ "tokio-stream",
+ "tonic",
  "tracing",
  "tracing-subscriber",
  "vz",
+ "vz-agent-proto",
 ]
 
 [[package]]
@@ -2862,6 +2866,8 @@ name = "vz-linux"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "hyper-util",
+ "prost",
  "serde",
  "serde_json",
  "sha2",
@@ -2869,9 +2875,12 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tonic",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
  "vz",
+ "vz-agent-proto",
 ]
 
 [[package]]

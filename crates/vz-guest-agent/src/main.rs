@@ -7,9 +7,10 @@
 // The guest agent legitimately uses unsafe for libc syscalls (vsock, sysctl, etc.)
 #![allow(unsafe_code)]
 
+mod grpc_server;
 mod listener;
 #[cfg(target_os = "linux")]
-mod network;
+pub(crate) mod network;
 mod process_table;
 
 use std::sync::Arc;
@@ -41,14 +42,14 @@ struct ExecParams {
 }
 
 /// Resource usage statistics collected from the guest OS.
-struct ResourceStats {
-    cpu_usage_percent: f64,
-    memory_used_bytes: u64,
-    memory_total_bytes: u64,
-    disk_used_bytes: u64,
-    disk_total_bytes: u64,
-    process_count: u32,
-    load_average: [f64; 3],
+pub(crate) struct ResourceStats {
+    pub(crate) cpu_usage_percent: f64,
+    pub(crate) memory_used_bytes: u64,
+    pub(crate) memory_total_bytes: u64,
+    pub(crate) disk_used_bytes: u64,
+    pub(crate) disk_total_bytes: u64,
+    pub(crate) process_count: u32,
+    pub(crate) load_average: [f64; 3],
 }
 
 const PORT_FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -65,6 +66,10 @@ struct Args {
     /// Seconds to keep retrying vsock bind during early boot.
     #[arg(long, default_value_t = 30)]
     bind_timeout_secs: u64,
+
+    /// Use gRPC (tonic) protocol instead of legacy JSON framing.
+    #[arg(long)]
+    grpc: bool,
 }
 
 #[tokio::main]
@@ -80,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
     info!(
         port = args.port,
         bind_timeout_secs = args.bind_timeout_secs,
+        grpc = args.grpc,
         "starting vz-guest-agent"
     );
 
@@ -88,7 +94,11 @@ async fn main() -> anyhow::Result<()> {
 
     info!(port = args.port, "listening on vsock");
 
-    accept_loop(listener).await
+    if args.grpc {
+        grpc_accept_loop(listener).await
+    } else {
+        accept_loop(listener).await
+    }
 }
 
 async fn bind_vsock_listener(port: u32, timeout: Duration) -> anyhow::Result<VsockListener> {
@@ -162,6 +172,43 @@ async fn accept_loop(listener: VsockListener) -> anyhow::Result<()> {
     }
 }
 
+/// Start the gRPC (tonic) server over vsock.
+///
+/// Registers all three gRPC services (Agent, OCI, Network) and serves them
+/// using tonic's `serve_with_incoming` with a custom [`VsockIncoming`] stream.
+async fn grpc_accept_loop(listener: VsockListener) -> anyhow::Result<()> {
+    use std::sync::Arc as StdArc;
+    use vz_agent_proto::{
+        agent_service_server::AgentServiceServer, network_service_server::NetworkServiceServer,
+        oci_service_server::OciServiceServer,
+    };
+
+    use crate::grpc_server::{AgentServiceImpl, NetworkServiceImpl, OciServiceImpl, SharedState};
+    use crate::listener::VsockIncoming;
+
+    let shared_state = SharedState {
+        process_table: Arc::new(Mutex::new(ProcessTable::new())),
+    };
+
+    let agent_svc = AgentServiceServer::new(AgentServiceImpl::new(shared_state));
+    let oci_svc = OciServiceServer::new(OciServiceImpl);
+    let network_svc = NetworkServiceServer::new(NetworkServiceImpl);
+
+    let incoming = VsockIncoming::new(StdArc::new(listener));
+
+    info!("gRPC server starting");
+
+    tonic::transport::Server::builder()
+        .add_service(agent_svc)
+        .add_service(oci_svc)
+        .add_service(network_svc)
+        .serve_with_incoming(incoming)
+        .await
+        .context("gRPC server failed")?;
+
+    Ok(())
+}
+
 /// Handle a single vsock connection: handshake, then request dispatch loop.
 async fn handle_connection<S>(
     stream: S,
@@ -230,7 +277,14 @@ where
         target_host,
     } = first_request
     {
-        handle_port_forward_connection(id, target_port, &protocol, target_host.as_deref(), &mut stream).await?;
+        handle_port_forward_connection(
+            id,
+            target_port,
+            &protocol,
+            target_host.as_deref(),
+            &mut stream,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -323,7 +377,7 @@ where
     Ok(())
 }
 
-async fn connect_port_forward_target(
+pub(crate) async fn connect_port_forward_target(
     target_host: &str,
     target_port: u16,
 ) -> std::io::Result<tokio::net::TcpStream> {
@@ -599,7 +653,7 @@ async fn handle_exec<W>(
 }
 
 /// Spawn a process directly (as root / agent's user).
-fn spawn_direct(
+pub(crate) fn spawn_direct(
     command: &str,
     args: &[String],
     working_dir: Option<&str>,
@@ -626,7 +680,7 @@ fn spawn_direct(
 }
 
 /// Spawn a process as a specific user by dropping privileges via setuid/setgid.
-fn spawn_as_user(
+pub(crate) fn spawn_as_user(
     username: &str,
     command: &str,
     args: &[String],
@@ -817,7 +871,7 @@ where
 }
 
 /// Collect system information using sysctl and statfs.
-fn collect_system_info() -> anyhow::Result<(u32, u64, u64, String)> {
+pub(crate) fn collect_system_info() -> anyhow::Result<(u32, u64, u64, String)> {
     let cpu_count = get_sysctl_u32("hw.ncpu")?;
     let memory_bytes = get_sysctl_u64("hw.memsize")?;
     let disk_free_bytes = get_statfs_free("/")?;
@@ -862,7 +916,7 @@ where
 }
 
 /// Collect resource usage statistics.
-fn collect_resource_stats() -> anyhow::Result<ResourceStats> {
+pub(crate) fn collect_resource_stats() -> anyhow::Result<ResourceStats> {
     let memory_total = get_sysctl_u64("hw.memsize")?;
 
     // Get load averages

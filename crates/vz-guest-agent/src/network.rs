@@ -96,9 +96,12 @@ pub fn setup_stack_network(stack_id: &str, services: &[NetworkServiceConfig]) ->
         // We create the pair, then rename the peer to eth0 after moving the
         // host end out.
         info!(service = %svc.name, host = %veth_host, "creating veth pair");
-        nsenter_ip(&ns_path, &[
-            "link", "add", &veth_host, "type", "veth", "peer", "name", "veth0",
-        ])?;
+        nsenter_ip(
+            &ns_path,
+            &[
+                "link", "add", &veth_host, "type", "veth", "peer", "name", "veth0",
+            ],
+        )?;
 
         // Move host end from netns to default namespace (PID 1's netns).
         nsenter_ip(&ns_path, &["link", "set", &veth_host, "netns", "1"])?;
@@ -252,9 +255,7 @@ fn create_named_netns(name: &str) -> io::Result<()> {
             };
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!(
-                    "create_named_netns({name}) failed: child exited with code {exit_code}"
-                ),
+                format!("create_named_netns({name}) failed: child exited with code {exit_code}"),
             ));
         }
     }
@@ -280,15 +281,12 @@ const IP_BIN: &str = "/bin/ip";
 
 /// Run `ip <args>` and check for success.
 fn ip_run(args: &[&str]) -> io::Result<()> {
-    let output = Command::new(IP_BIN)
-        .args(args)
-        .output()
-        .map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("failed to exec `{IP_BIN} {}`: {}", args.join(" "), e),
-            )
-        })?;
+    let output = Command::new(IP_BIN).args(args).output().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("failed to exec `{IP_BIN} {}`: {}", args.join(" "), e),
+        )
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

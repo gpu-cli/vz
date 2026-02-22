@@ -13,13 +13,19 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 libc = { workspace = true }
 clap = { workspace = true }
 
-# Reuse protocol types from vz
+# gRPC
+vz-agent-proto = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+
+# Reuse protocol types from vz (kept for legacy JSON protocol)
 vz = { workspace = true }
 
 [lints]

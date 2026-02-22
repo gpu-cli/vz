@@ -2,14 +2,19 @@
 //!
 //! Provides a [`VsockListener`] that binds to a vsock port and accepts
 //! incoming connections from the host, wrapping them as tokio async streams.
+//! Also provides [`VsockIncoming`] for use with tonic's `serve_with_incoming`.
 
 // Vsock listener requires unsafe for libc socket/bind/listen/accept syscalls.
 #![allow(unsafe_code)]
 
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite};
+use tonic::transport::server::Connected;
 
 /// AF_VSOCK listener that accepts connections from the host.
 pub struct VsockListener {
@@ -194,5 +199,57 @@ impl VsockListener {
         Ok(VsockStream {
             inner: tokio_stream,
         })
+    }
+}
+
+// ── tonic Connected trait ──────────────────────────────────────────
+
+/// Connection info for vsock streams.
+///
+/// Minimal struct satisfying tonic's `Connected` trait requirements.
+#[derive(Clone, Debug)]
+pub struct VsockConnectInfo;
+
+impl Connected for VsockStream {
+    type ConnectInfo = VsockConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        VsockConnectInfo
+    }
+}
+
+// ── VsockIncoming stream adapter ───────────────────────────────────
+
+/// A `Stream` of accepted [`VsockStream`] connections, suitable for
+/// `tonic::transport::Server::serve_with_incoming`.
+///
+/// Wraps a shared [`VsockListener`] and yields `Result<VsockStream, io::Error>`.
+pub struct VsockIncoming {
+    listener: Arc<VsockListener>,
+}
+
+impl VsockIncoming {
+    /// Create a new incoming stream from the given listener.
+    pub fn new(listener: Arc<VsockListener>) -> Self {
+        Self { listener }
+    }
+}
+
+impl tokio_stream::Stream for VsockIncoming {
+    type Item = Result<VsockStream, io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let listener = self.listener.clone();
+        // We need to poll the accept future. Since VsockListener::accept uses
+        // spawn_blocking internally, we create a future each time and poll it.
+        // To avoid creating a new future on every poll, we use a simple approach:
+        // pin a new future each time. This works because spawn_blocking handles
+        // the actual blocking, and each poll_next call represents a new accept attempt.
+        let fut = async move { listener.accept().await };
+        let mut fut = Box::pin(fut);
+        match fut.as_mut().poll(cx) {
+            Poll::Ready(result) => Poll::Ready(Some(result)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }

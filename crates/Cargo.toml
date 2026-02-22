@@ -163,6 +163,8 @@ vz-validation = { path = "vz-validation" }
 # gRPC / Protobuf
 tonic = { version = "0.12", features = ["transport"] }
 prost = "0.13"
+tower = "0.5"
+hyper-util = "0.1"
 
 [workspace.lints.rust]
 unsafe_code = "warn"

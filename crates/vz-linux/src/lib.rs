@@ -7,6 +7,7 @@ mod agent;
 mod benchmark;
 mod config;
 mod error;
+pub mod grpc_client;
 mod kernel;
 mod vm;
 

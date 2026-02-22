@@ -9,7 +9,12 @@ repository.workspace = true
 
 [dependencies]
 vz = { workspace = true }
+vz-agent-proto = { workspace = true }
 tokio = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+tower = { workspace = true }
+hyper-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

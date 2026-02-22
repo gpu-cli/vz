@@ -76,4 +76,24 @@ pub enum LinuxError {
     /// Wrapped JSON parsing/serialization error.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+
+    /// gRPC transport or status error from the guest agent.
+    #[error("grpc error: {0}")]
+    Grpc(Box<tonic::Status>),
+
+    /// gRPC transport-level connection error.
+    #[error("grpc transport error: {0}")]
+    GrpcTransport(Box<tonic::transport::Error>),
+}
+
+impl From<tonic::Status> for LinuxError {
+    fn from(status: tonic::Status) -> Self {
+        Self::Grpc(Box::new(status))
+    }
+}
+
+impl From<tonic::transport::Error> for LinuxError {
+    fn from(err: tonic::transport::Error) -> Self {
+        Self::GrpcTransport(Box::new(err))
+    }
 }
