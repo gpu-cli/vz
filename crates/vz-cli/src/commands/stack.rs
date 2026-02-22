@@ -73,13 +73,19 @@ pub enum StackCommand {
 
     /// Restart an individual service in a running stack.
     Restart(ServiceArgs),
+
+    /// Open TUI dashboard for a running stack.
+    Dashboard(DashboardArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct UpArgs {
     /// Path to compose YAML file.
-    #[arg(short, long, default_value = "compose.yaml")]
-    pub file: PathBuf,
+    ///
+    /// When omitted, auto-discovers the first existing file from:
+    /// `compose.yaml`, `compose.yml`, `docker-compose.yml`, `docker-compose.yaml`.
+    #[arg(short, long)]
+    pub file: Option<PathBuf>,
 
     /// Stack name (defaults to parent directory name).
     #[arg(short = 'n', long)]
@@ -97,6 +103,10 @@ pub struct UpArgs {
     /// health checks to converge.
     #[arg(short, long)]
     pub detach: bool,
+
+    /// Disable TUI dashboard (use plain text output).
+    #[arg(long)]
+    pub no_tui: bool,
 }
 
 #[derive(Args, Debug)]
@@ -214,9 +224,9 @@ pub struct LsArgs {
 
 #[derive(Args, Debug)]
 pub struct ConfigArgs {
-    /// Path to compose YAML file.
-    #[arg(short, long, default_value = "compose.yaml")]
-    pub file: PathBuf,
+    /// Path to compose YAML file (auto-discovers if omitted).
+    #[arg(short, long)]
+    pub file: Option<PathBuf>,
 
     /// Stack name (defaults to parent directory name).
     #[arg(short = 'n', long)]
@@ -239,9 +249,9 @@ pub struct RunArgs {
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
 
-    /// Path to compose YAML file (for service resolution).
-    #[arg(short, long, default_value = "compose.yaml")]
-    pub file: PathBuf,
+    /// Path to compose YAML file (auto-discovers if omitted).
+    #[arg(short, long)]
+    pub file: Option<PathBuf>,
 
     /// State directory for stack persistence.
     #[arg(long)]
@@ -250,6 +260,21 @@ pub struct RunArgs {
     /// Remove the container after the command exits.
     #[arg(long, default_value = "true")]
     pub rm: bool,
+}
+
+/// Arguments for the `vz stack dashboard` subcommand.
+#[derive(Args, Debug)]
+pub struct DashboardArgs {
+    /// Stack name.
+    pub name: String,
+
+    /// Path to compose file (for service metadata).
+    #[arg(short, long)]
+    pub file: Option<PathBuf>,
+
+    /// State directory.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
 }
 
 /// Action types for control socket requests.
@@ -299,6 +324,7 @@ pub async fn run(args: StackArgs) -> anyhow::Result<()> {
         StackCommand::Stop(args) => cmd_service_action(args, ControlAction::Stop).await,
         StackCommand::Start(args) => cmd_service_action(args, ControlAction::Start).await,
         StackCommand::Restart(args) => cmd_service_action(args, ControlAction::Restart).await,
+        StackCommand::Dashboard(args) => cmd_dashboard(args).await,
     }
 }
 
@@ -526,17 +552,17 @@ impl ContainerRuntime for OciContainerRuntime {
 // ── up ─────────────────────────────────────────────────────────────
 
 async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
-    let yaml = std::fs::read_to_string(&args.file)
-        .with_context(|| format!("failed to read compose file: {}", args.file.display()))?;
+    let file = resolve_compose_file(args.file)?;
+    let yaml = std::fs::read_to_string(&file)
+        .with_context(|| format!("failed to read compose file: {}", file.display()))?;
 
-    let compose_dir = args
-        .file
+    let compose_dir = file
         .canonicalize()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let stack_name = resolve_stack_name(args.name.as_deref(), &args.file)?;
+    let stack_name = resolve_stack_name(args.name.as_deref(), &file)?;
     let spec = parse_compose_with_dir(&yaml, &stack_name, &compose_dir)
         .with_context(|| "failed to parse compose file")?;
 
@@ -641,7 +667,35 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
 
         // Keep the VM alive and listen for exec requests until ctrl-C.
         let sock_path = state_dir.join("control.sock");
-        serve_control_socket(&sock_path, &spec, &mut orchestrator).await?;
+
+        // Launch TUI dashboard in foreground mode if TTY and not disabled.
+        if !args.no_tui && crate::tui::is_tty() {
+            // Start control socket in background so `vz stack exec` still works.
+            let bg_sock_path = sock_path.clone();
+            let bg_spec = spec.clone();
+
+            // The TUI runs on the main thread; control socket runs in a
+            // background tokio task. We need to move the orchestrator into
+            // an Arc<Mutex> so the background task can use it.
+            let orchestrator = std::sync::Arc::new(std::sync::Mutex::new(orchestrator));
+            let bg_orchestrator = orchestrator.clone();
+
+            let _control_handle = tokio::spawn(async move {
+                if let Err(e) =
+                    serve_control_socket_bg(&bg_sock_path, &bg_spec, bg_orchestrator).await
+                {
+                    tracing::error!(error = %e, "control socket error");
+                }
+            });
+
+            // Run the TUI (blocks until user quits).
+            let tui_spec = spec.clone();
+            let tui_name = spec.name.clone();
+            let tui_db = db_path.clone();
+            crate::tui::run_tui(tui_name, tui_spec, tui_db)?;
+        } else {
+            serve_control_socket(&sock_path, &spec, &mut orchestrator).await?;
+        }
 
         // Teardown on exit.
         info!(stack = %spec.name, "shutting down stack");
@@ -721,6 +775,113 @@ async fn serve_control_socket(
     // Remove socket file on exit.
     let _ = std::fs::remove_file(sock_path);
     Ok(())
+}
+
+/// Listen on a Unix socket for exec requests (background-compatible version).
+///
+/// Same as [`serve_control_socket`] but takes an `Arc<Mutex<StackOrchestrator>>`
+/// so it can run in a background tokio task alongside the TUI.
+async fn serve_control_socket_bg(
+    sock_path: &Path,
+    spec: &StackSpec,
+    orchestrator: std::sync::Arc<std::sync::Mutex<StackOrchestrator<OciContainerRuntime>>>,
+) -> anyhow::Result<()> {
+    use tokio::net::UnixListener;
+
+    let _ = std::fs::remove_file(sock_path);
+
+    let listener = UnixListener::bind(sock_path)
+        .with_context(|| format!("failed to bind control socket: {}", sock_path.display()))?;
+
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                info!("ctrl-C received, shutting down control socket");
+                break;
+            }
+            accept = listener.accept() => {
+                match accept {
+                    Ok((stream, _)) => {
+                        handle_control_connection_bg(stream, spec, &orchestrator).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to accept connection");
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = std::fs::remove_file(sock_path);
+    Ok(())
+}
+
+/// Handle a control socket connection using a shared orchestrator.
+///
+/// This variant acquires the lock only for the synchronous exec/stop/start
+/// operations, releasing it before any `.await` so the `MutexGuard` is
+/// never held across an await point.
+async fn handle_control_connection_bg(
+    stream: tokio::net::UnixStream,
+    spec: &StackSpec,
+    orchestrator: &std::sync::Arc<std::sync::Mutex<StackOrchestrator<OciContainerRuntime>>>,
+) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    let line = match lines.next_line().await {
+        Ok(Some(line)) => line,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read from control socket");
+            return;
+        }
+    };
+
+    let request: ControlRequest = match serde_json::from_str(&line) {
+        Ok(req) => req,
+        Err(e) => {
+            let resp = ControlResponse {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: Some(format!("invalid request: {e}")),
+            };
+            let _ = write_response(&mut writer, &resp).await;
+            return;
+        }
+    };
+
+    // Acquire lock, perform synchronous work, release lock before writing response.
+    // The lock must not be held across any .await point.
+    let resp = match orchestrator.lock() {
+        Ok(mut orch) => match request.action {
+            ControlAction::Exec => handle_exec(spec, &orch, &request),
+            ControlAction::Stop => handle_service_stop(spec, &mut orch, &request.service),
+            ControlAction::Start => handle_service_start(spec, &mut orch, &request.service),
+            ControlAction::Restart => {
+                let stop_resp = handle_service_stop(spec, &mut orch, &request.service);
+                if stop_resp.error.is_some() {
+                    stop_resp
+                } else {
+                    handle_service_start(spec, &mut orch, &request.service)
+                }
+            }
+        },
+        Err(e) => ControlResponse {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: Some(format!("orchestrator lock poisoned: {e}")),
+        },
+    };
+
+    let _ = write_response(&mut writer, &resp).await;
 }
 
 /// Handle a single control socket connection (exec, stop, start, restart).
@@ -1466,17 +1627,17 @@ async fn cmd_ls(args: LsArgs) -> anyhow::Result<()> {
 // ── config ─────────────────────────────────────────────────────────
 
 async fn cmd_config(args: ConfigArgs) -> anyhow::Result<()> {
-    let yaml = std::fs::read_to_string(&args.file)
-        .with_context(|| format!("failed to read compose file: {}", args.file.display()))?;
+    let file = resolve_compose_file(args.file)?;
+    let yaml = std::fs::read_to_string(&file)
+        .with_context(|| format!("failed to read compose file: {}", file.display()))?;
 
-    let compose_dir = args
-        .file
+    let compose_dir = file
         .canonicalize()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let stack_name = resolve_stack_name(args.name.as_deref(), &args.file)?;
+    let stack_name = resolve_stack_name(args.name.as_deref(), &file)?;
     let spec = parse_compose_with_dir(&yaml, &stack_name, &compose_dir)
         .with_context(|| "failed to parse compose file")?;
 
@@ -1509,11 +1670,11 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     // Verify the service exists in the compose file.
-    let yaml = std::fs::read_to_string(&args.file)
-        .with_context(|| format!("failed to read compose file: {}", args.file.display()))?;
+    let file = resolve_compose_file(args.file)?;
+    let yaml = std::fs::read_to_string(&file)
+        .with_context(|| format!("failed to read compose file: {}", file.display()))?;
 
-    let compose_dir = args
-        .file
+    let compose_dir = file
         .canonicalize()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -1577,7 +1738,77 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     std::process::exit(resp.exit_code);
 }
 
+// ── dashboard ─────────────────────────────────────────────────────
+
+/// Open the TUI dashboard for an existing (running or stopped) stack.
+async fn cmd_dashboard(args: DashboardArgs) -> anyhow::Result<()> {
+    let state_dir = resolve_state_dir(args.state_dir.as_deref(), &args.name)?;
+    let db_path = state_dir.join("state.db");
+
+    if !db_path.exists() {
+        bail!("no state found for stack `{}`", args.name);
+    }
+
+    // Load the spec: prefer compose file if given, otherwise load from state DB.
+    let spec = if let Some(file) = args.file {
+        let yaml = std::fs::read_to_string(&file)
+            .with_context(|| format!("failed to read compose file: {}", file.display()))?;
+        let compose_dir = file
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
+        parse_compose_with_dir(&yaml, &args.name, &compose_dir)
+            .with_context(|| "failed to parse compose file")?
+    } else {
+        let store = StateStore::open(&db_path).with_context(|| "failed to open state store")?;
+        store
+            .load_desired_state(&args.name)
+            .with_context(|| "failed to load desired state")?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no desired state found for stack `{}`; use -f to specify a compose file",
+                    args.name
+                )
+            })?
+    };
+
+    crate::tui::run_tui(args.name, spec, db_path)
+}
+
 // ── Helpers ────────────────────────────────────────────────────────
+
+/// Standard compose file names in Docker Compose discovery order.
+const COMPOSE_FILE_CANDIDATES: &[&str] = &[
+    "compose.yaml",
+    "compose.yml",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+];
+
+/// Resolve the compose file path from an explicit `-f` flag or auto-discovery.
+///
+/// When no explicit path is given, searches the current directory for the first
+/// existing file from [`COMPOSE_FILE_CANDIDATES`] (matching Docker Compose's
+/// discovery behaviour).
+fn resolve_compose_file(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+
+    for candidate in COMPOSE_FILE_CANDIDATES {
+        let p = PathBuf::from(candidate);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+
+    bail!(
+        "no compose file found. Searched for: {}.\n\
+         Use -f to specify one explicitly.",
+        COMPOSE_FILE_CANDIDATES.join(", ")
+    );
+}
 
 /// Resolve the stack name from explicit flag or parent directory of compose file.
 fn resolve_stack_name(
@@ -1797,6 +2028,55 @@ mod tests {
     fn resolve_stack_name_explicit() {
         let name = resolve_stack_name(Some("myapp"), &PathBuf::from("compose.yaml")).unwrap();
         assert_eq!(name, "myapp");
+    }
+
+    #[test]
+    fn resolve_compose_file_explicit_path() {
+        let p = resolve_compose_file(Some(PathBuf::from("/tmp/my-compose.yml"))).unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/my-compose.yml"));
+    }
+
+    #[test]
+    fn resolve_compose_file_discovery_in_tempdir() {
+        let dir = std::env::temp_dir().join("vz-test-compose-discovery");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write a docker-compose.yml (not compose.yaml).
+        let target = dir.join("docker-compose.yml");
+        std::fs::write(&target, "services: {}").unwrap();
+
+        // Discovery should find it even though compose.yaml doesn't exist.
+        let saved = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let found = resolve_compose_file(None);
+        std::env::set_current_dir(&saved).unwrap();
+
+        assert_eq!(found.unwrap(), PathBuf::from("docker-compose.yml"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_compose_file_no_file_errors() {
+        let dir = std::env::temp_dir().join("vz-test-compose-empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let saved = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let result = resolve_compose_file(None);
+        std::env::set_current_dir(&saved).unwrap();
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no compose file found")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

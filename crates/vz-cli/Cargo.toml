@@ -24,6 +24,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 libc = { workspace = true }
 ctrlc = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 vz-sandbox = { workspace = true }

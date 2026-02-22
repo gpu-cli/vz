@@ -17,6 +17,7 @@ mod ipsw;
 #[cfg(target_os = "macos")]
 mod provision;
 mod registry;
+pub mod tui;
 
 use clap::Parser;
 use tracing::error;
@@ -440,6 +441,50 @@ mod tests {
                 assert_eq!(exec.command, vec!["psql", "-U", "app"]);
             } else {
                 panic!("expected Exec");
+            }
+        } else {
+            panic!("expected Stack");
+        }
+    }
+
+    #[test]
+    fn parse_stack_dashboard() {
+        let cli = Cli::try_parse_from(["vz", "stack", "dashboard", "myapp"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Stack(ref args)
+                if matches!(args.action, commands::stack::StackCommand::Dashboard(_))
+        ));
+    }
+
+    #[test]
+    fn parse_stack_dashboard_with_file() {
+        let cli = Cli::try_parse_from(["vz", "stack", "dashboard", "myapp", "-f", "compose.yaml"])
+            .expect("parse");
+        if let Commands::Stack(ref args) = cli.command {
+            if let commands::stack::StackCommand::Dashboard(ref d) = args.action {
+                assert_eq!(d.name, "myapp");
+                assert_eq!(
+                    d.file.as_deref(),
+                    Some(std::path::Path::new("compose.yaml"))
+                );
+            } else {
+                panic!("expected Dashboard");
+            }
+        } else {
+            panic!("expected Stack");
+        }
+    }
+
+    #[test]
+    fn parse_stack_up_no_tui() {
+        let cli = Cli::try_parse_from(["vz", "stack", "up", "--file", "compose.yaml", "--no-tui"])
+            .expect("parse");
+        if let Commands::Stack(ref args) = cli.command {
+            if let commands::stack::StackCommand::Up(ref up) = args.action {
+                assert!(up.no_tui);
+            } else {
+                panic!("expected Up");
             }
         } else {
             panic!("expected Stack");
