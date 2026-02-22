@@ -123,6 +123,27 @@ pub struct RunConfig {
     pub cpu_period: Option<u64>,
     /// Redirect container stdout/stderr to log files for later retrieval.
     pub capture_logs: bool,
+    // ── Security fields ──────────────────────────────────────────
+    /// Additional Linux capabilities to add to the container.
+    pub cap_add: Vec<String>,
+    /// Linux capabilities to drop from the container defaults.
+    pub cap_drop: Vec<String>,
+    /// Run the container in privileged mode (all capabilities).
+    pub privileged: bool,
+    /// Mount the container root filesystem as read-only.
+    pub read_only_rootfs: bool,
+    /// Kernel parameters to set inside the container (sysctl).
+    pub sysctls: Vec<(String, String)>,
+    // ── Resource extensions ──────────────────────────────────────
+    /// Per-process resource limits (name, soft, hard).
+    pub ulimits: Vec<(String, u64, u64)>,
+    /// Maximum number of PIDs in the container.
+    pub pids_limit: Option<i64>,
+    // ── Container identity ───────────────────────────────────────
+    /// Container hostname override.
+    pub hostname: Option<String>,
+    /// Container domain name.
+    pub domainname: Option<String>,
 }
 
 // ── Exec configuration ────────────────────────────────────────────
@@ -223,12 +244,19 @@ pub struct PruneResult {
 // ── Network types ─────────────────────────────────────────────────
 
 /// Per-service network configuration for stack networking.
+///
+/// Each entry represents one service on one network. A service that belongs
+/// to multiple custom networks will have multiple `NetworkServiceConfig`
+/// entries (one per network), each with a different `network_name` and
+/// subnet-specific `addr`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkServiceConfig {
     /// Service name.
     pub name: String,
-    /// IP address assigned to this service.
+    /// IP address assigned to this service (CIDR, e.g., `"172.20.0.2/24"`).
     pub addr: String,
+    /// Logical network this entry belongs to (e.g., `"default"`, `"frontend"`).
+    pub network_name: String,
 }
 
 /// Aggregate resource hints for sizing a shared stack VM.

@@ -305,6 +305,7 @@ impl LinuxVm {
             .map(|s| vz_agent_proto::NetworkServiceConfig {
                 name: s.name,
                 addr: s.addr,
+                network_name: s.network_name,
             })
             .collect();
         client.network_setup(stack_id, proto_services).await

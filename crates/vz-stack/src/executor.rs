@@ -190,6 +190,9 @@ pub struct StackExecutor<R: ContainerRuntime> {
     data_dir: PathBuf,
     volumes: VolumeManager,
     ports: PortTracker,
+    /// Per-service primary IP (first network IP, used for port forwarding and /etc/hosts).
+    /// Populated during shared VM boot / network setup.
+    service_ips: HashMap<String, String>,
 }
 
 /// Result of executing a batch of actions.
@@ -276,6 +279,30 @@ fn compute_topo_levels<'a>(creates: &[&'a Action], spec: &StackSpec) -> Vec<Vec<
     result
 }
 
+/// Parse the base octets from a CIDR subnet string (e.g., `"172.20.1.0/24"` -> `[172, 20, 1, 0]`).
+fn parse_subnet_base(subnet: &str) -> [u8; 4] {
+    let ip_part = subnet.split('/').next().unwrap_or("172.20.0.0");
+    let octets: Vec<u8> = ip_part
+        .split('.')
+        .filter_map(|o| o.parse().ok())
+        .collect();
+    [
+        octets.first().copied().unwrap_or(172),
+        octets.get(1).copied().unwrap_or(20),
+        octets.get(2).copied().unwrap_or(0),
+        octets.get(3).copied().unwrap_or(0),
+    ]
+}
+
+/// Parse the prefix length from a CIDR subnet string (e.g., `"172.20.1.0/24"` -> `24`).
+fn parse_subnet_prefix(subnet: &str) -> u8 {
+    subnet
+        .split('/')
+        .nth(1)
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(24)
+}
+
 impl<R: ContainerRuntime> StackExecutor<R> {
     /// Create a new executor with the given runtime, state store, and data directory.
     ///
@@ -288,6 +315,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             data_dir: data_dir.to_path_buf(),
             volumes: VolumeManager::new(data_dir),
             ports: PortTracker::new(),
+            service_ips: HashMap::new(),
         }
     }
 
@@ -359,16 +387,81 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         });
 
         if has_creates && !self.runtime.has_shared_vm(&spec.name) && spec.services.len() > 1 {
-            // Collect all ports from all services for the shared VM.
-            // Each port's target_host is set to the service IP so the guest
-            // agent forwards connections through the bridge to the correct
-            // per-service network namespace.
+            // ── Compute per-network subnets ─────────────────────────────
+            //
+            // Each distinct network gets its own subnet. Explicit subnets
+            // from `NetworkSpec` are honoured; others are auto-assigned
+            // from the 172.20.N.0/24 pool.
+            let network_subnets: HashMap<String, String> = {
+                let mut subnets = HashMap::new();
+                let mut next_subnet_idx: u8 = 0;
+                for net in &spec.networks {
+                    let subnet = if let Some(ref explicit) = net.subnet {
+                        explicit.clone()
+                    } else {
+                        let s = format!("172.20.{}.0/24", next_subnet_idx);
+                        next_subnet_idx = next_subnet_idx.saturating_add(1);
+                        s
+                    };
+                    subnets.insert(net.name.clone(), subnet);
+                }
+                subnets
+            };
+
+            // ── Per-service IP allocation ───────────────────────────────
+            //
+            // For each (network, service) pair, assign an IP within that
+            // network's subnet. Gateway is .1, services start at .2.
+            // `service_primary_ip` maps service_name -> first assigned IP
+            // (used for port forwarding target_host).
+            let mut service_primary_ip: HashMap<String, String> = HashMap::new();
+            let mut network_services: Vec<vz_runtime_contract::NetworkServiceConfig> = Vec::new();
+
+            for net in &spec.networks {
+                let subnet = &network_subnets[&net.name];
+                let base_octets = parse_subnet_base(subnet);
+                let prefix = parse_subnet_prefix(subnet);
+                let mut host_offset: u8 = 2; // .1 = bridge gateway
+
+                for svc in &spec.services {
+                    // A service belongs to this network if its `networks` list
+                    // contains this network name (Issue 1 ensures default membership).
+                    if !svc.networks.contains(&net.name) {
+                        continue;
+                    }
+                    let ip = format!(
+                        "{}.{}.{}.{}/{}",
+                        base_octets[0], base_octets[1], base_octets[2], host_offset, prefix
+                    );
+                    let ip_no_prefix = format!(
+                        "{}.{}.{}.{}",
+                        base_octets[0], base_octets[1], base_octets[2], host_offset
+                    );
+
+                    // First IP assigned becomes the primary (for port forwarding).
+                    service_primary_ip
+                        .entry(svc.name.clone())
+                        .or_insert(ip_no_prefix);
+
+                    network_services.push(vz_runtime_contract::NetworkServiceConfig {
+                        name: svc.name.clone(),
+                        addr: ip,
+                        network_name: net.name.clone(),
+                    });
+
+                    host_offset = host_offset.saturating_add(1);
+                }
+            }
+
+            // ── Collect all ports using primary IPs for target_host ──────
             let all_ports: Vec<vz_runtime_contract::PortMapping> = spec
                 .services
                 .iter()
-                .enumerate()
-                .flat_map(|(i, svc)| {
-                    let service_ip = format!("172.20.0.{}", i + 2);
+                .flat_map(|svc| {
+                    let service_ip = service_primary_ip
+                        .get(&svc.name)
+                        .cloned()
+                        .unwrap_or_else(|| "127.0.0.1".to_string());
                     svc.ports.iter().map(move |p| {
                         let protocol = match p.protocol.as_str() {
                             "udp" => vz_runtime_contract::PortProtocol::Udp,
@@ -411,20 +504,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             self.runtime
                 .boot_shared_vm(&spec.name, &all_ports, resources)?;
 
-            // Set up per-service network namespaces.
-            let network_services: Vec<vz_runtime_contract::NetworkServiceConfig> = spec
-                .services
-                .iter()
-                .enumerate()
-                .map(|(i, svc)| vz_runtime_contract::NetworkServiceConfig {
-                    name: svc.name.clone(),
-                    // 172.20.0.1 = bridge, services start at .2
-                    addr: format!("172.20.0.{}/24", i + 2),
-                })
-                .collect();
-
             info!(stack = %spec.name, "setting up per-service network namespaces");
             self.runtime.network_setup(&spec.name, &network_services)?;
+
+            // Store primary IPs for use in prepare_create.
+            self.service_ips = service_primary_ip;
         }
 
         let service_map: HashMap<&str, &ServiceSpec> =
@@ -674,11 +758,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
         // Override ports with resolved allocations.
         let service_target_host = if use_shared_vm {
-            spec.services
-                .iter()
-                .enumerate()
-                .find(|(_, svc)| svc.name == service_name)
-                .map(|(i, _)| format!("172.20.0.{}", i + 2))
+            self.service_ips.get(service_name).cloned()
         } else {
             None
         };
@@ -699,13 +779,30 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             .collect();
 
         // Auto-inject sibling service hostnames for inter-service resolution.
+        // Issue 4: only inject hosts for services that share at least one network.
         if use_shared_vm {
-            for (i, svc) in spec.services.iter().enumerate() {
-                if svc.name != service_name
-                    && !run_config.extra_hosts.iter().any(|(h, _)| h == &svc.name)
-                {
-                    let ip = format!("172.20.0.{}", i + 2);
-                    run_config.extra_hosts.push((svc.name.clone(), ip));
+            let my_networks: HashSet<&str> = svc_spec
+                .networks
+                .iter()
+                .map(|n| n.as_str())
+                .collect();
+
+            for svc in &spec.services {
+                if svc.name == service_name {
+                    continue;
+                }
+                if run_config.extra_hosts.iter().any(|(h, _)| h == &svc.name) {
+                    continue;
+                }
+                // Only add if the sibling shares at least one network.
+                let shares_network = svc
+                    .networks
+                    .iter()
+                    .any(|n| my_networks.contains(n.as_str()));
+                if shares_network {
+                    if let Some(ip) = self.service_ips.get(&svc.name) {
+                        run_config.extra_hosts.push((svc.name.clone(), ip.clone()));
+                    }
                 }
             }
             run_config.network_namespace_path = Some(format!("/var/run/netns/{service_name}"));
@@ -1031,7 +1128,7 @@ pub(crate) mod tests_support {
                     stack_id,
                     services
                         .iter()
-                        .map(|s| format!("{}={}", s.name, s.addr))
+                        .map(|s| format!("{}={}@{}", s.name, s.addr, s.network_name))
                         .collect::<Vec<_>>()
                         .join(",")
                 ),
@@ -1118,6 +1215,24 @@ mod tests {
             resources: ResourcesSpec::default(),
             extra_hosts: vec![],
             secrets: vec![],
+            networks: vec!["default".to_string()],
+            cap_add: vec![],
+            cap_drop: vec![],
+            privileged: false,
+            read_only: false,
+            sysctls: HashMap::new(),
+            ulimits: vec![],
+            hostname: None,
+            domainname: None,
+            labels: HashMap::new(),
+        }
+    }
+
+    fn default_network() -> crate::spec::NetworkSpec {
+        crate::spec::NetworkSpec {
+            name: "default".to_string(),
+            driver: "bridge".to_string(),
+            subnet: None,
         }
     }
 
@@ -1125,7 +1240,7 @@ mod tests {
         StackSpec {
             name: name.to_string(),
             services,
-            networks: vec![],
+            networks: vec![default_network()],
             volumes: vec![],
             secrets: vec![],
         }
@@ -1412,7 +1527,7 @@ mod tests {
                 }],
                 ..svc("db", "postgres:16")
             }],
-            networks: vec![],
+            networks: vec![default_network()],
             volumes: vec![VolumeSpec {
                 name: "dbdata".to_string(),
                 driver: "local".to_string(),
@@ -1824,11 +1939,13 @@ mod tests {
         assert_eq!(stack_id, "netapp");
         assert_eq!(services.len(), 2);
 
-        // web gets 172.20.0.2/24, db gets 172.20.0.3/24.
+        // web gets 172.20.0.2/24, db gets 172.20.0.3/24, both on "default" network.
         assert_eq!(services[0].name, "web");
         assert_eq!(services[0].addr, "172.20.0.2/24");
+        assert_eq!(services[0].network_name, "default");
         assert_eq!(services[1].name, "db");
         assert_eq!(services[1].addr, "172.20.0.3/24");
+        assert_eq!(services[1].network_name, "default");
     }
 
     #[test]
@@ -2274,6 +2391,7 @@ mod tests {
                     resources: ResourcesSpec {
                         cpus: Some(2.0),
                         memory_bytes: Some(512 * 1024 * 1024), // 512 MiB
+                        ..Default::default()
                     },
                     ..svc("web", "nginx:latest")
                 },
@@ -2281,6 +2399,7 @@ mod tests {
                     resources: ResourcesSpec {
                         cpus: Some(4.0),
                         memory_bytes: Some(1024 * 1024 * 1024), // 1 GiB
+                        ..Default::default()
                     },
                     ..svc("db", "postgres:16")
                 },
@@ -2301,5 +2420,249 @@ mod tests {
         // Verify boot_shared_vm was called (indicating shared VM was used).
         let calls = executor.runtime.call_log();
         assert!(calls.iter().any(|(op, _)| op == "boot_shared_vm"));
+    }
+
+    // ── Custom network tests ──
+
+    /// Helper: create a NetworkSpec.
+    fn net(name: &str, subnet: Option<&str>) -> crate::spec::NetworkSpec {
+        crate::spec::NetworkSpec {
+            name: name.to_string(),
+            driver: "bridge".to_string(),
+            subnet: subnet.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn custom_networks_multi_subnet_allocation() {
+        // Two networks: frontend (auto) and backend (auto).
+        // web on frontend only, api on both, db on backend only.
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-api", "ctr-db"]);
+        let mut executor = make_executor(runtime);
+
+        let spec = StackSpec {
+            name: "multinet".to_string(),
+            services: vec![
+                ServiceSpec {
+                    networks: vec!["frontend".to_string()],
+                    ..svc("web", "nginx:latest")
+                },
+                ServiceSpec {
+                    networks: vec!["frontend".to_string(), "backend".to_string()],
+                    ..svc("api", "node:20")
+                },
+                ServiceSpec {
+                    networks: vec!["backend".to_string()],
+                    ..svc("db", "postgres:16")
+                },
+            ],
+            networks: vec![net("frontend", None), net("backend", None)],
+            volumes: vec![],
+            secrets: vec![],
+        };
+
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "api".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+        ];
+
+        let result = executor.execute(&spec, &actions).unwrap();
+        assert!(
+            result.all_succeeded(),
+            "errors: {:?}",
+            result.errors
+        );
+
+        // Verify network configs: 4 entries (web@frontend, api@frontend, api@backend, db@backend).
+        let captured = executor.runtime.captured_network_services.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        let (_, services) = &captured[0];
+        assert_eq!(services.len(), 4);
+
+        // frontend network: 172.20.0.0/24
+        assert_eq!(services[0].name, "web");
+        assert_eq!(services[0].addr, "172.20.0.2/24");
+        assert_eq!(services[0].network_name, "frontend");
+
+        assert_eq!(services[1].name, "api");
+        assert_eq!(services[1].addr, "172.20.0.3/24");
+        assert_eq!(services[1].network_name, "frontend");
+
+        // backend network: 172.20.1.0/24
+        assert_eq!(services[2].name, "api");
+        assert_eq!(services[2].addr, "172.20.1.2/24");
+        assert_eq!(services[2].network_name, "backend");
+
+        assert_eq!(services[3].name, "db");
+        assert_eq!(services[3].addr, "172.20.1.3/24");
+        assert_eq!(services[3].network_name, "backend");
+    }
+
+    #[test]
+    fn custom_networks_explicit_subnet() {
+        // Frontend has explicit subnet 10.0.1.0/24.
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-api"]);
+        let mut executor = make_executor(runtime);
+
+        let spec = StackSpec {
+            name: "explicit".to_string(),
+            services: vec![
+                ServiceSpec {
+                    networks: vec!["frontend".to_string()],
+                    ..svc("web", "nginx:latest")
+                },
+                ServiceSpec {
+                    networks: vec!["frontend".to_string()],
+                    ..svc("api", "node:20")
+                },
+            ],
+            networks: vec![net("frontend", Some("10.0.1.0/24"))],
+            volumes: vec![],
+            secrets: vec![],
+        };
+
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "api".to_string(),
+            },
+        ];
+
+        let result = executor.execute(&spec, &actions).unwrap();
+        assert!(result.all_succeeded(), "errors: {:?}", result.errors);
+
+        let captured = executor.runtime.captured_network_services.lock().unwrap();
+        let (_, services) = &captured[0];
+        assert_eq!(services[0].addr, "10.0.1.2/24");
+        assert_eq!(services[1].addr, "10.0.1.3/24");
+    }
+
+    #[test]
+    fn scoped_hosts_only_shared_networks() {
+        // web on frontend only, db on backend only, api on both.
+        // web should see api (shared frontend) but NOT db.
+        // db should see api (shared backend) but NOT web.
+        // api should see both web and db.
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-api", "ctr-db"]);
+        let mut executor = make_executor(runtime);
+
+        let spec = StackSpec {
+            name: "scoped".to_string(),
+            services: vec![
+                ServiceSpec {
+                    networks: vec!["frontend".to_string()],
+                    ..svc("web", "nginx:latest")
+                },
+                ServiceSpec {
+                    networks: vec!["frontend".to_string(), "backend".to_string()],
+                    ..svc("api", "node:20")
+                },
+                ServiceSpec {
+                    networks: vec!["backend".to_string()],
+                    ..svc("db", "postgres:16")
+                },
+            ],
+            networks: vec![net("frontend", None), net("backend", None)],
+            volumes: vec![],
+            secrets: vec![],
+        };
+
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "api".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+        ];
+
+        let result = executor.execute(&spec, &actions).unwrap();
+        assert!(result.all_succeeded(), "errors: {:?}", result.errors);
+
+        let configs = executor.runtime.captured_configs.lock().unwrap();
+
+        // web should only see api (shared frontend), NOT db.
+        let web_config = configs.iter().find(|(id, _)| id == "ctr-web").unwrap();
+        let web_hosts: Vec<&str> = web_config
+            .1
+            .extra_hosts
+            .iter()
+            .map(|(h, _)| h.as_str())
+            .collect();
+        assert!(web_hosts.contains(&"api"), "web should see api");
+        assert!(!web_hosts.contains(&"db"), "web should NOT see db");
+
+        // db should only see api (shared backend), NOT web.
+        let db_config = configs.iter().find(|(id, _)| id == "ctr-db").unwrap();
+        let db_hosts: Vec<&str> = db_config
+            .1
+            .extra_hosts
+            .iter()
+            .map(|(h, _)| h.as_str())
+            .collect();
+        assert!(db_hosts.contains(&"api"), "db should see api");
+        assert!(!db_hosts.contains(&"web"), "db should NOT see web");
+
+        // api should see both web and db.
+        let api_config = configs.iter().find(|(id, _)| id == "ctr-api").unwrap();
+        let api_hosts: Vec<&str> = api_config
+            .1
+            .extra_hosts
+            .iter()
+            .map(|(h, _)| h.as_str())
+            .collect();
+        assert!(api_hosts.contains(&"web"), "api should see web");
+        assert!(api_hosts.contains(&"db"), "api should see db");
+    }
+
+    #[test]
+    fn default_network_backward_compat() {
+        // When all services are on "default" network, behaviour is identical
+        // to the old single-bridge approach.
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-db"]);
+        let mut executor = make_executor(runtime);
+        let spec = network_stack();
+
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+        ];
+
+        let result = executor.execute(&spec, &actions).unwrap();
+        assert!(result.all_succeeded());
+
+        // All services on same network, so all see each other.
+        let configs = executor.runtime.captured_configs.lock().unwrap();
+        let web_config = configs.iter().find(|(id, _)| id == "ctr-web").unwrap();
+        assert_eq!(web_config.1.extra_hosts.len(), 1);
+        assert_eq!(web_config.1.extra_hosts[0].0, "db");
+
+        let db_config = configs.iter().find(|(id, _)| id == "ctr-db").unwrap();
+        assert_eq!(db_config.1.extra_hosts.len(), 1);
+        assert_eq!(db_config.1.extra_hosts[0].0, "web");
+    }
+
+    #[test]
+    fn parse_subnet_helpers() {
+        assert_eq!(parse_subnet_base("172.20.1.0/24"), [172, 20, 1, 0]);
+        assert_eq!(parse_subnet_base("10.0.0.0/16"), [10, 0, 0, 0]);
+        assert_eq!(parse_subnet_prefix("172.20.1.0/24"), 24);
+        assert_eq!(parse_subnet_prefix("10.0.0.0/16"), 16);
     }
 }

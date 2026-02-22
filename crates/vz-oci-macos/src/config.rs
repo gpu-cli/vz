@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -159,6 +160,27 @@ pub struct RunConfig {
     /// When `true`, the OCI process args are wrapped with shell redirection
     /// to capture stdout/stderr to `/var/log/vz-oci/{stdout,stderr}.log`.
     pub capture_logs: bool,
+    // ── Security fields ──────────────────────────────────────────
+    /// Additional Linux capabilities to add to the container.
+    pub cap_add: Vec<String>,
+    /// Linux capabilities to drop from the container defaults.
+    pub cap_drop: Vec<String>,
+    /// Run the container in privileged mode (all capabilities).
+    pub privileged: bool,
+    /// Mount the container root filesystem as read-only.
+    pub read_only_rootfs: bool,
+    /// Kernel parameters to set inside the container (sysctl).
+    pub sysctls: HashMap<String, String>,
+    // ── Resource extensions ──────────────────────────────────────
+    /// Per-process resource limits (name, soft, hard).
+    pub ulimits: Vec<(String, u64, u64)>,
+    /// Maximum number of PIDs in the container.
+    pub pids_limit: Option<i64>,
+    // ── Container identity ───────────────────────────────────────
+    /// Container hostname override.
+    pub hostname: Option<String>,
+    /// Container domain name.
+    pub domainname: Option<String>,
 }
 
 /// Options for executing a command in an already-running container.

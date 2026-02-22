@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 
 use oci_spec::runtime::{
     Capability, LinuxCapabilities, LinuxCapabilitiesBuilder, LinuxCpuBuilder, LinuxNamespaceType,
-    LinuxResourcesBuilder, Mount, MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder,
-    User, UserBuilder, VERSION,
+    LinuxPidsBuilder, LinuxResourcesBuilder, Mount, MountBuilder, PosixRlimit,
+    PosixRlimitBuilder, PosixRlimitType, ProcessBuilder, RootBuilder, Spec, SpecBuilder, User,
+    UserBuilder, VERSION,
 };
 
 use crate::error::OciError;
@@ -67,6 +68,29 @@ pub struct BundleSpec {
     /// that sends both stdout and stderr to `/var/log/vz-oci/output.log`
     /// (interleaved, like Docker). The file can be read via `exec`.
     pub capture_logs: bool,
+    // ── Security fields ──────────────────────────────────────────
+    /// Additional Linux capabilities to add beyond the Docker defaults.
+    pub cap_add: Vec<String>,
+    /// Linux capabilities to drop from the Docker defaults.
+    pub cap_drop: Vec<String>,
+    /// Run the container in privileged mode (grant all capabilities).
+    pub privileged: bool,
+    /// Mount the container root filesystem as read-only.
+    pub read_only_rootfs: bool,
+    /// Kernel parameters to set via `linux.sysctl` in the OCI spec.
+    pub sysctls: HashMap<String, String>,
+    // ── Resource extensions ──────────────────────────────────────
+    /// Per-process resource limits as `(name, soft, hard)` tuples.
+    ///
+    /// Name maps to OCI `RLIMIT_` prefix: `nofile` -> `RLIMIT_NOFILE`.
+    pub ulimits: Vec<(String, u64, u64)>,
+    /// Maximum number of PIDs in the container.
+    pub pids_limit: Option<i64>,
+    // ── Container identity ───────────────────────────────────────
+    /// Container hostname override.
+    pub hostname: Option<String>,
+    /// Container domain name.
+    pub domainname: Option<String>,
 }
 
 /// Write an OCI bundle directory (`config.json` + optional `rootfs` link).
@@ -115,6 +139,15 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
         cpu_quota,
         cpu_period,
         capture_logs,
+        cap_add,
+        cap_drop,
+        privileged,
+        read_only_rootfs,
+        sysctls,
+        ulimits,
+        pids_limit,
+        hostname,
+        domainname,
     } = spec;
 
     if cmd.is_empty() {
@@ -142,13 +175,27 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
         );
     }
 
-    let process = ProcessBuilder::default()
+    // Build capabilities based on privileged/cap_add/cap_drop.
+    let capabilities = if privileged {
+        all_capabilities()?
+    } else {
+        modified_capabilities(&cap_add, &cap_drop)?
+    };
+
+    let mut process_builder = ProcessBuilder::default()
         .args(process_args)
         .env(env_strings)
         .cwd(cwd.unwrap_or_else(|| "/".to_string()))
         .user(parse_process_user(user.as_deref())?)
-        .capabilities(docker_default_capabilities()?)
-        .build()?;
+        .capabilities(capabilities);
+
+    // Add rlimits if specified.
+    if !ulimits.is_empty() {
+        let rlimits = convert_ulimits_to_rlimits(&ulimits)?;
+        process_builder = process_builder.rlimits(rlimits);
+    }
+
+    let process = process_builder.build()?;
 
     sort_bundle_mounts(&mut mounts);
     let user_mounts = mounts
@@ -165,7 +212,7 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
 
     let root = RootBuilder::default()
         .path(rootfs_path)
-        .readonly(false)
+        .readonly(read_only_rootfs)
         .build()?;
 
     let mut builder = SpecBuilder::default()
@@ -178,6 +225,14 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
         builder = builder.annotations(annotations);
     }
 
+    if let Some(ref hn) = hostname {
+        builder = builder.hostname(hn);
+    }
+
+    if let Some(ref dn) = domainname {
+        builder = builder.domainname(dn);
+    }
+
     let mut spec = builder.build()?;
 
     if share_host_network {
@@ -186,8 +241,13 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
         set_network_namespace_path(&mut spec, &netns_path);
     }
 
-    if cpu_quota.is_some() || cpu_period.is_some() {
-        set_cpu_limits(&mut spec, cpu_quota, cpu_period)?;
+    if cpu_quota.is_some() || cpu_period.is_some() || pids_limit.is_some() {
+        set_linux_resources(&mut spec, cpu_quota, cpu_period, pids_limit)?;
+    }
+
+    // Set sysctl parameters if any.
+    if !sysctls.is_empty() {
+        set_sysctls(&mut spec, sysctls);
     }
 
     Ok(spec)
@@ -223,22 +283,32 @@ fn set_network_namespace_path(spec: &mut Spec, path: &str) {
     }
 }
 
-/// Set CPU cgroup limits (quota/period) in the spec's linux.resources.cpu section.
-fn set_cpu_limits(
+/// Set linux.resources (CPU limits and pids limit) in the OCI spec.
+fn set_linux_resources(
     spec: &mut Spec,
     quota: Option<i64>,
     period: Option<u64>,
+    pids_limit: Option<i64>,
 ) -> Result<(), OciError> {
-    let mut cpu_builder = LinuxCpuBuilder::default();
-    if let Some(q) = quota {
-        cpu_builder = cpu_builder.quota(q);
-    }
-    if let Some(p) = period {
-        cpu_builder = cpu_builder.period(p);
-    }
-    let cpu = cpu_builder.build()?;
+    let mut resources_builder = LinuxResourcesBuilder::default();
 
-    let resources = LinuxResourcesBuilder::default().cpu(cpu).build()?;
+    if quota.is_some() || period.is_some() {
+        let mut cpu_builder = LinuxCpuBuilder::default();
+        if let Some(q) = quota {
+            cpu_builder = cpu_builder.quota(q);
+        }
+        if let Some(p) = period {
+            cpu_builder = cpu_builder.period(p);
+        }
+        resources_builder = resources_builder.cpu(cpu_builder.build()?);
+    }
+
+    if let Some(limit) = pids_limit {
+        let pids = LinuxPidsBuilder::default().limit(limit).build()?;
+        resources_builder = resources_builder.pids(pids);
+    }
+
+    let resources = resources_builder.build()?;
 
     if let Some(linux) = spec.linux_mut() {
         linux.set_resources(Some(resources));
@@ -406,10 +476,61 @@ fn default_linux_mounts() -> Result<Vec<Mount>, OciError> {
     ])
 }
 
-/// Docker-equivalent default capabilities for container processes.
-fn docker_default_capabilities() -> Result<LinuxCapabilities, OciError> {
+/// Build capabilities with additional caps added and dropped from the Docker defaults.
+fn modified_capabilities(
+    cap_add: &[String],
+    cap_drop: &[String],
+) -> Result<LinuxCapabilities, OciError> {
     use std::collections::HashSet;
-    let caps: HashSet<Capability> = [
+
+    let mut caps: HashSet<Capability> = docker_default_cap_set();
+
+    for name in cap_add {
+        if name == "ALL" {
+            caps = all_known_capabilities();
+        } else if let Some(cap) = parse_capability_name(name) {
+            caps.insert(cap);
+        }
+    }
+
+    for name in cap_drop {
+        if name == "ALL" {
+            caps.clear();
+            break;
+        }
+        if let Some(cap) = parse_capability_name(name) {
+            caps.remove(&cap);
+        }
+    }
+
+    LinuxCapabilitiesBuilder::default()
+        .bounding(caps.clone())
+        .effective(caps.clone())
+        .inheritable(caps.clone())
+        .permitted(caps.clone())
+        .ambient(caps)
+        .build()
+        .map_err(Into::into)
+}
+
+/// Grant all known Linux capabilities (privileged mode).
+fn all_capabilities() -> Result<LinuxCapabilities, OciError> {
+    use std::collections::HashSet;
+
+    let caps: HashSet<Capability> = all_known_capabilities();
+    LinuxCapabilitiesBuilder::default()
+        .bounding(caps.clone())
+        .effective(caps.clone())
+        .inheritable(caps.clone())
+        .permitted(caps.clone())
+        .ambient(caps)
+        .build()
+        .map_err(Into::into)
+}
+
+/// The default Docker capability set as a HashSet.
+fn docker_default_cap_set() -> std::collections::HashSet<Capability> {
+    [
         Capability::AuditWrite,
         Capability::Chown,
         Capability::DacOverride,
@@ -426,15 +547,158 @@ fn docker_default_capabilities() -> Result<LinuxCapabilities, OciError> {
         Capability::SysChroot,
     ]
     .into_iter()
-    .collect();
-    LinuxCapabilitiesBuilder::default()
-        .bounding(caps.clone())
-        .effective(caps.clone())
-        .inheritable(caps.clone())
-        .permitted(caps.clone())
-        .ambient(caps)
-        .build()
-        .map_err(Into::into)
+    .collect()
+}
+
+/// All known Linux capabilities for privileged mode.
+fn all_known_capabilities() -> std::collections::HashSet<Capability> {
+    [
+        Capability::AuditControl,
+        Capability::AuditRead,
+        Capability::AuditWrite,
+        Capability::BlockSuspend,
+        Capability::Bpf,
+        Capability::CheckpointRestore,
+        Capability::Chown,
+        Capability::DacOverride,
+        Capability::DacReadSearch,
+        Capability::Fowner,
+        Capability::Fsetid,
+        Capability::IpcLock,
+        Capability::IpcOwner,
+        Capability::Kill,
+        Capability::Lease,
+        Capability::LinuxImmutable,
+        Capability::MacAdmin,
+        Capability::MacOverride,
+        Capability::Mknod,
+        Capability::NetAdmin,
+        Capability::NetBindService,
+        Capability::NetBroadcast,
+        Capability::NetRaw,
+        Capability::Perfmon,
+        Capability::Setfcap,
+        Capability::Setgid,
+        Capability::Setpcap,
+        Capability::Setuid,
+        Capability::SysAdmin,
+        Capability::SysBoot,
+        Capability::SysChroot,
+        Capability::SysModule,
+        Capability::SysNice,
+        Capability::SysPacct,
+        Capability::SysPtrace,
+        Capability::SysRawio,
+        Capability::SysResource,
+        Capability::SysTime,
+        Capability::SysTtyConfig,
+        Capability::Syslog,
+        Capability::WakeAlarm,
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// Parse a capability name string (e.g., "NET_ADMIN", "SYS_PTRACE") into a Capability enum.
+///
+/// Accepts both with and without the `CAP_` prefix.
+fn parse_capability_name(name: &str) -> Option<Capability> {
+    let name = name.strip_prefix("CAP_").unwrap_or(name).to_uppercase();
+
+    match name.as_str() {
+        "AUDIT_CONTROL" => Some(Capability::AuditControl),
+        "AUDIT_READ" => Some(Capability::AuditRead),
+        "AUDIT_WRITE" => Some(Capability::AuditWrite),
+        "BLOCK_SUSPEND" => Some(Capability::BlockSuspend),
+        "BPF" => Some(Capability::Bpf),
+        "CHECKPOINT_RESTORE" => Some(Capability::CheckpointRestore),
+        "CHOWN" => Some(Capability::Chown),
+        "DAC_OVERRIDE" => Some(Capability::DacOverride),
+        "DAC_READ_SEARCH" => Some(Capability::DacReadSearch),
+        "FOWNER" => Some(Capability::Fowner),
+        "FSETID" => Some(Capability::Fsetid),
+        "IPC_LOCK" => Some(Capability::IpcLock),
+        "IPC_OWNER" => Some(Capability::IpcOwner),
+        "KILL" => Some(Capability::Kill),
+        "LEASE" => Some(Capability::Lease),
+        "LINUX_IMMUTABLE" => Some(Capability::LinuxImmutable),
+        "MAC_ADMIN" => Some(Capability::MacAdmin),
+        "MAC_OVERRIDE" => Some(Capability::MacOverride),
+        "MKNOD" => Some(Capability::Mknod),
+        "NET_ADMIN" => Some(Capability::NetAdmin),
+        "NET_BIND_SERVICE" => Some(Capability::NetBindService),
+        "NET_BROADCAST" => Some(Capability::NetBroadcast),
+        "NET_RAW" => Some(Capability::NetRaw),
+        "PERFMON" => Some(Capability::Perfmon),
+        "SETFCAP" => Some(Capability::Setfcap),
+        "SETGID" => Some(Capability::Setgid),
+        "SETPCAP" => Some(Capability::Setpcap),
+        "SETUID" => Some(Capability::Setuid),
+        "SYS_ADMIN" => Some(Capability::SysAdmin),
+        "SYS_BOOT" => Some(Capability::SysBoot),
+        "SYS_CHROOT" => Some(Capability::SysChroot),
+        "SYS_MODULE" => Some(Capability::SysModule),
+        "SYS_NICE" => Some(Capability::SysNice),
+        "SYS_PACCT" => Some(Capability::SysPacct),
+        "SYS_PTRACE" => Some(Capability::SysPtrace),
+        "SYS_RAWIO" => Some(Capability::SysRawio),
+        "SYS_RESOURCE" => Some(Capability::SysResource),
+        "SYS_TIME" => Some(Capability::SysTime),
+        "SYS_TTY_CONFIG" => Some(Capability::SysTtyConfig),
+        "SYSLOG" => Some(Capability::Syslog),
+        "WAKE_ALARM" => Some(Capability::WakeAlarm),
+        _ => None,
+    }
+}
+
+/// Set sysctl parameters on the OCI spec's linux section.
+fn set_sysctls(spec: &mut Spec, sysctls: HashMap<String, String>) {
+    if let Some(linux) = spec.linux_mut() {
+        linux.set_sysctl(Some(sysctls));
+    }
+}
+
+/// Convert ulimit tuples to OCI PosixRlimit entries.
+fn convert_ulimits_to_rlimits(
+    ulimits: &[(String, u64, u64)],
+) -> Result<Vec<PosixRlimit>, OciError> {
+    ulimits
+        .iter()
+        .map(|(name, soft, hard)| {
+            let rlimit_type = ulimit_name_to_rlimit_type(name).ok_or_else(|| {
+                OciError::InvalidConfig(format!("unknown ulimit name: {name}"))
+            })?;
+            PosixRlimitBuilder::default()
+                .typ(rlimit_type)
+                .soft(*soft)
+                .hard(*hard)
+                .build()
+                .map_err(Into::into)
+        })
+        .collect()
+}
+
+/// Map Docker-style ulimit names to OCI PosixRlimitType.
+fn ulimit_name_to_rlimit_type(name: &str) -> Option<PosixRlimitType> {
+    match name.to_lowercase().as_str() {
+        "as" => Some(PosixRlimitType::RlimitAs),
+        "core" => Some(PosixRlimitType::RlimitCore),
+        "cpu" => Some(PosixRlimitType::RlimitCpu),
+        "data" => Some(PosixRlimitType::RlimitData),
+        "fsize" => Some(PosixRlimitType::RlimitFsize),
+        "locks" => Some(PosixRlimitType::RlimitLocks),
+        "memlock" => Some(PosixRlimitType::RlimitMemlock),
+        "msgqueue" => Some(PosixRlimitType::RlimitMsgqueue),
+        "nice" => Some(PosixRlimitType::RlimitNice),
+        "nofile" => Some(PosixRlimitType::RlimitNofile),
+        "nproc" => Some(PosixRlimitType::RlimitNproc),
+        "rss" => Some(PosixRlimitType::RlimitRss),
+        "rtprio" => Some(PosixRlimitType::RlimitRtprio),
+        "rttime" => Some(PosixRlimitType::RlimitRttime),
+        "sigpending" => Some(PosixRlimitType::RlimitSigpending),
+        "stack" => Some(PosixRlimitType::RlimitStack),
+        _ => None,
+    }
 }
 
 fn parse_process_user(user: Option<&str>) -> Result<User, OciError> {
@@ -556,6 +820,15 @@ mod tests {
                 cpu_quota: None,
                 cpu_period: None,
                 capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: None,
+                domainname: None,
             },
         )
         .unwrap();
@@ -646,6 +919,15 @@ mod tests {
                 cpu_quota: None,
                 cpu_period: None,
                 capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: None,
+                domainname: None,
             },
         )
         .unwrap();
@@ -700,6 +982,15 @@ mod tests {
                 cpu_quota: None,
                 cpu_period: None,
                 capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: None,
+                domainname: None,
             },
         )
         .unwrap();
@@ -748,6 +1039,15 @@ mod tests {
                 cpu_quota: None,
                 cpu_period: None,
                 capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: None,
+                domainname: None,
             },
         )
         .unwrap();
@@ -790,6 +1090,15 @@ mod tests {
                 cpu_quota: None,
                 cpu_period: None,
                 capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: None,
+                domainname: None,
             },
         )
         .unwrap();
@@ -834,6 +1143,15 @@ mod tests {
                 cpu_quota: None,
                 cpu_period: None,
                 capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: None,
+                domainname: None,
             },
         )
         .unwrap();
@@ -897,6 +1215,15 @@ mod tests {
                 cpu_quota: None,
                 cpu_period: None,
                 capture_logs: true,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: None,
+                domainname: None,
             },
         )
         .unwrap();

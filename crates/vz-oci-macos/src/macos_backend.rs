@@ -7,8 +7,8 @@
 use vz_runtime_contract::{self as contract, RuntimeBackend, RuntimeError};
 
 use crate::config as oci_config;
-use vz_oci::container_store as oci_container;
 use crate::runtime::Runtime;
+use vz_oci::container_store as oci_container;
 
 /// macOS backend wrapping the existing [`Runtime`].
 pub struct MacosRuntimeBackend {
@@ -149,6 +149,7 @@ impl RuntimeBackend for MacosRuntimeBackend {
             .map(|s| vz::protocol::NetworkServiceConfig {
                 name: s.name,
                 addr: s.addr,
+                network_name: s.network_name,
             })
             .collect();
         self.runtime
@@ -179,8 +180,7 @@ impl RuntimeBackend for MacosRuntimeBackend {
         // Runtime::has_shared_vm is async (uses Mutex::lock().await).
         // Use block_in_place since this is called from sync context.
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(self.runtime.has_shared_vm(stack_id))
+            tokio::runtime::Handle::current().block_on(self.runtime.has_shared_vm(stack_id))
         })
     }
 
@@ -231,7 +231,11 @@ fn run_config_from_contract(c: contract::RunConfig) -> oci_config::RunConfig {
         working_dir: c.working_dir,
         env: c.env,
         user: c.user,
-        ports: c.ports.into_iter().map(port_mapping_from_contract).collect(),
+        ports: c
+            .ports
+            .into_iter()
+            .map(port_mapping_from_contract)
+            .collect(),
         mounts: c.mounts.into_iter().map(mount_spec_from_contract).collect(),
         cpus: c.cpus,
         memory_mb: c.memory_mb,
@@ -247,6 +251,15 @@ fn run_config_from_contract(c: contract::RunConfig) -> oci_config::RunConfig {
         cpu_quota: c.cpu_quota,
         cpu_period: c.cpu_period,
         capture_logs: c.capture_logs,
+        cap_add: c.cap_add,
+        cap_drop: c.cap_drop,
+        privileged: c.privileged,
+        read_only_rootfs: c.read_only_rootfs,
+        sysctls: c.sysctls.into_iter().collect(),
+        ulimits: c.ulimits,
+        pids_limit: c.pids_limit,
+        hostname: c.hostname,
+        domainname: c.domainname,
     }
 }
 

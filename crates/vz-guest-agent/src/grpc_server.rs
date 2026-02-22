@@ -518,6 +518,7 @@ fn do_network_setup(
         .map(|s| vz::protocol::NetworkServiceConfig {
             name: s.name.clone(),
             addr: s.addr.clone(),
+            network_name: s.network_name.clone(),
         })
         .collect();
 

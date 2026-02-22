@@ -120,6 +120,41 @@ pub struct ServiceSpec {
     /// Secret references for this service.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<ServiceSecretRef>,
+    /// Network names this service belongs to.
+    ///
+    /// When empty, the service joins the implicit `"default"` network.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub networks: Vec<String>,
+    // ── Security fields ──────────────────────────────────────────
+    /// Additional Linux capabilities to add to the container.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_add: Vec<String>,
+    /// Linux capabilities to drop from the container defaults.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_drop: Vec<String>,
+    /// Run the container in privileged mode (all capabilities).
+    #[serde(default)]
+    pub privileged: bool,
+    /// Mount the container root filesystem as read-only.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Kernel parameters to set inside the container.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub sysctls: HashMap<String, String>,
+    // ── Resource extensions ──────────────────────────────────────
+    /// Per-process resource limits (ulimits).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ulimits: Vec<UlimitSpec>,
+    // ── Container identity ───────────────────────────────────────
+    /// Container hostname override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// Container domain name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domainname: Option<String>,
+    /// Container labels (key-value metadata).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub labels: HashMap<String, String>,
 }
 
 /// Mount specification for container volumes.
@@ -223,6 +258,26 @@ pub struct ResourcesSpec {
     /// Memory limit in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_bytes: Option<u64>,
+    /// CPU reservation as fractional cores (informational, for scheduler).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation_cpus: Option<f64>,
+    /// Memory reservation in bytes (informational, for scheduler).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation_memory_bytes: Option<u64>,
+    /// Maximum number of PIDs in the container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids_limit: Option<i64>,
+}
+
+/// Per-process resource limit (ulimit) specification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UlimitSpec {
+    /// Limit name (e.g., `nofile`, `nproc`, `memlock`).
+    pub name: String,
+    /// Soft limit value.
+    pub soft: u64,
+    /// Hard limit value.
+    pub hard: u64,
 }
 
 /// Network definition for the stack.
@@ -233,6 +288,11 @@ pub struct NetworkSpec {
     /// Network driver.
     #[serde(default = "default_network_driver")]
     pub driver: String,
+    /// Optional explicit subnet in CIDR notation (e.g., `"172.20.1.0/24"`).
+    ///
+    /// When `None`, the executor auto-assigns a subnet from the pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subnet: Option<String>,
 }
 
 fn default_network_driver() -> String {
@@ -320,13 +380,27 @@ mod tests {
                 resources: ResourcesSpec {
                     cpus: Some(2.0),
                     memory_bytes: Some(512 * 1024 * 1024),
+                    reservation_cpus: None,
+                    reservation_memory_bytes: None,
+                    pids_limit: None,
                 },
                 extra_hosts: vec![],
                 secrets: vec![],
+                networks: vec![],
+                cap_add: vec![],
+                cap_drop: vec![],
+                privileged: false,
+                read_only: false,
+                sysctls: HashMap::new(),
+                ulimits: vec![],
+                hostname: None,
+                domainname: None,
+                labels: HashMap::new(),
             }],
             networks: vec![NetworkSpec {
                 name: "frontend".to_string(),
                 driver: "bridge".to_string(),
+                subnet: None,
             }],
             volumes: vec![VolumeSpec {
                 name: "dbdata".to_string(),

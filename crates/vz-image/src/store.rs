@@ -380,6 +380,37 @@ impl ImageStore {
             .map_err(|err| io::Error::other(err.to_string()))?
     }
 
+    /// Spawn rootfs assembly as a background task and return the handle.
+    ///
+    /// Unlike [`assemble_rootfs_async`](Self::assemble_rootfs_async), this
+    /// method returns immediately with a [`tokio::task::JoinHandle`] that
+    /// the caller can `.await` later. This allows other work (image config
+    /// parsing, OCI spec preparation, network setup) to proceed concurrently
+    /// with the heavy filesystem I/O of layer extraction and overlay assembly.
+    ///
+    /// The returned path is deterministic (`rootfs/<container_id>/`) so callers
+    /// can compute dependent paths before the task completes.
+    pub fn spawn_assemble_rootfs(
+        &self,
+        image_id: &str,
+        container_id: &str,
+    ) -> tokio::task::JoinHandle<io::Result<PathBuf>> {
+        let store = self.clone();
+        let image_id = image_id.to_string();
+        let container_id = container_id.to_string();
+
+        tokio::task::spawn_blocking(move || store.assemble_rootfs(&image_id, &container_id))
+    }
+
+    /// Return the deterministic rootfs path for a container without assembling it.
+    ///
+    /// This is useful when the caller needs to know the rootfs directory path
+    /// before the assembly task completes (e.g. to set up VirtioFS shares or
+    /// compute guest paths).
+    pub fn rootfs_path_for(&self, container_id: &str) -> PathBuf {
+        self.rootfs_path(container_id)
+    }
+
     fn manifest_path(&self, image_id: &str) -> PathBuf {
         self.manifests_dir().join(format!("{image_id}.json"))
     }

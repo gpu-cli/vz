@@ -12,14 +12,17 @@ use serde_yml::Value;
 
 use crate::error::StackError;
 use crate::spec::{
-    DependencyCondition, HealthCheckSpec, MountSpec, PortSpec, ResourcesSpec, RestartPolicy,
-    SecretDef, ServiceDependency, ServiceSecretRef, ServiceSpec, StackSpec, VolumeSpec,
+    DependencyCondition, HealthCheckSpec, MountSpec, NetworkSpec, PortSpec, ResourcesSpec,
+    RestartPolicy, SecretDef, ServiceDependency, ServiceSecretRef, ServiceSpec, StackSpec,
+    UlimitSpec, VolumeSpec,
 };
 
 // ── Accepted key sets ──────────────────────────────────────────────
 
 /// Top-level keys allowed in the Compose file.
-const ACCEPTED_TOP_LEVEL: &[&str] = &["version", "name", "services", "volumes", "secrets"];
+const ACCEPTED_TOP_LEVEL: &[&str] = &[
+    "version", "name", "services", "volumes", "secrets", "networks",
+];
 
 /// Service-level keys allowed inside `services.<name>`.
 const ACCEPTED_SERVICE: &[&str] = &[
@@ -38,6 +41,20 @@ const ACCEPTED_SERVICE: &[&str] = &[
     "extra_hosts",
     "deploy",
     "secrets",
+    "networks",
+    // Security fields
+    "cap_add",
+    "cap_drop",
+    "privileged",
+    "read_only",
+    "sysctls",
+    // Resource extensions
+    "ulimits",
+    "pids_limit",
+    // Container identity
+    "hostname",
+    "domainname",
+    "labels",
 ];
 
 /// Volume-level keys allowed inside `volumes.<name>`.
@@ -46,16 +63,10 @@ const ACCEPTED_VOLUME: &[&str] = &["driver", "driver_opts"];
 // ── Rejected keys with stable error messages ───────────────────────
 
 /// Top-level keys explicitly rejected with stable error codes.
-const REJECTED_TOP_LEVEL: &[(&str, &str)] = &[
-    (
-        "networks",
-        "custom network definitions are not supported; all services share a default stack network",
-    ),
-    (
-        "configs",
-        "Compose configs are not supported; use environment variables or bind mounts instead",
-    ),
-];
+const REJECTED_TOP_LEVEL: &[(&str, &str)] = &[(
+    "configs",
+    "Compose configs are not supported; use environment variables or bind mounts instead",
+)];
 
 /// Service-level keys explicitly rejected with stable error codes.
 const REJECTED_SERVICE: &[(&str, &str)] = &[
@@ -209,6 +220,58 @@ fn parse_compose_inner(
     // ── Parse volumes ──────────────────────────────────────────────
     let volumes = parse_volumes(root_map)?;
 
+    // ── Parse networks ──────────────────────────────────────────────
+    let parsed_networks = parse_networks(root_map)?;
+
+    // ── Apply default network membership ────────────────────────────
+    let (networks, mut services) = if parsed_networks.is_empty() {
+        // No custom networks: create implicit default, all services join it.
+        let default_net = NetworkSpec {
+            name: "default".to_string(),
+            driver: "bridge".to_string(),
+            subnet: None,
+        };
+        let services = services
+            .into_iter()
+            .map(|mut s| {
+                if s.networks.is_empty() {
+                    s.networks = vec!["default".to_string()];
+                }
+                s
+            })
+            .collect();
+        (vec![default_net], services)
+    } else {
+        // Custom networks: services with no explicit networks join "default".
+        let mut nets = parsed_networks;
+        let has_default = nets.iter().any(|n| n.name == "default");
+        let mut need_default = false;
+
+        let services: Vec<ServiceSpec> = services
+            .into_iter()
+            .map(|mut s| {
+                if s.networks.is_empty() {
+                    s.networks = vec!["default".to_string()];
+                    need_default = true;
+                }
+                s
+            })
+            .collect();
+
+        if need_default && !has_default {
+            nets.push(NetworkSpec {
+                name: "default".to_string(),
+                driver: "bridge".to_string(),
+                subnet: None,
+            });
+        }
+
+        (nets, services)
+    };
+
+    // Re-sort after network assignment for deterministic output.
+    services.sort_by(|a, b| a.name.cmp(&b.name));
+
     // ── Validate dependency references ─────────────────────────────
     let service_names: Vec<&str> = services.iter().map(|s| s.name.as_str()).collect();
     for svc in &services {
@@ -236,10 +299,23 @@ fn parse_compose_inner(
         }
     }
 
+    // ── Validate network references ────────────────────────────────
+    let final_network_names: Vec<&str> = networks.iter().map(|n| n.name.as_str()).collect();
+    for svc in &services {
+        for net_name in &svc.networks {
+            if !final_network_names.contains(&net_name.as_str()) {
+                return Err(StackError::ComposeValidation(format!(
+                    "service `{}` references network `{}` which is not defined",
+                    svc.name, net_name,
+                )));
+            }
+        }
+    }
+
     Ok(StackSpec {
         name,
         services,
-        networks: vec![],
+        networks,
         volumes,
         secrets,
     })
@@ -366,6 +442,50 @@ fn parse_service(
     let extra_hosts = parse_extra_hosts(name, svc_map)?;
     let resources = parse_deploy(name, svc_map)?;
     let secrets = parse_service_secrets(name, svc_map, defined_secrets)?;
+    let networks = parse_service_networks(name, svc_map)?;
+
+    // Security fields
+    let cap_add = parse_string_list(name, svc_map, "cap_add")?;
+    let cap_drop = parse_string_list(name, svc_map, "cap_drop")?;
+    let privileged = svc_map
+        .get(val("privileged"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let read_only = svc_map
+        .get(val("read_only"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let sysctls = parse_string_map(name, svc_map, "sysctls")?;
+
+    // Resource extensions
+    let ulimits = parse_ulimits(name, svc_map)?;
+    let pids_limit = svc_map
+        .get(val("pids_limit"))
+        .map(|v| {
+            v.as_i64().ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{name}`: `pids_limit` must be an integer"
+                ))
+            })
+        })
+        .transpose()?;
+
+    // Container identity
+    let hostname = svc_map
+        .get(val("hostname"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let domainname = svc_map
+        .get(val("domainname"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let labels = parse_labels(name, svc_map)?;
+
+    // Merge pids_limit into resources
+    let resources = ResourcesSpec {
+        pids_limit,
+        ..resources
+    };
 
     Ok(ServiceSpec {
         name: name.to_string(),
@@ -383,6 +503,16 @@ fn parse_service(
         resources,
         extra_hosts,
         secrets,
+        networks,
+        cap_add,
+        cap_drop,
+        privileged,
+        read_only,
+        sysctls,
+        ulimits,
+        hostname,
+        domainname,
+        labels,
     })
 }
 
@@ -1063,10 +1193,10 @@ fn parse_extra_hosts(
     Ok(hosts)
 }
 
-/// Parse `deploy.resources.limits` into [`ResourcesSpec`].
+/// Parse `deploy.resources` into [`ResourcesSpec`].
 ///
-/// Only `deploy.resources.limits.cpus` and `deploy.resources.limits.memory`
-/// are accepted. Any other deploy sub-keys are rejected with an error.
+/// Accepts both `deploy.resources.limits` and `deploy.resources.reservations`
+/// sub-keys. Each may contain `cpus` and `memory`.
 fn parse_deploy(svc_name: &str, map: &serde_yml::Mapping) -> Result<ResourcesSpec, StackError> {
     let Some(deploy_value) = map.get(val("deploy")) else {
         return Ok(ResourcesSpec::default());
@@ -1086,7 +1216,7 @@ fn parse_deploy(svc_name: &str, map: &serde_yml::Mapping) -> Result<ResourcesSpe
         if key_str != "resources" {
             return Err(StackError::ComposeUnsupportedFeature {
                 feature: format!("services.{svc_name}.deploy.{key_str}"),
-                reason: "only `deploy.resources.limits` is supported".to_string(),
+                reason: "only `deploy.resources` is supported".to_string(),
             });
         }
     }
@@ -1105,77 +1235,92 @@ fn parse_deploy(svc_name: &str, map: &serde_yml::Mapping) -> Result<ResourcesSpe
         ))
     })?;
 
-    // Only `limits` is accepted under resources.
+    // `limits` and `reservations` are accepted under resources.
     for key in resources_map.keys() {
         let key_str = key.as_str().unwrap_or("");
-        if key_str != "limits" {
+        if key_str != "limits" && key_str != "reservations" {
             return Err(StackError::ComposeUnsupportedFeature {
                 feature: format!("services.{svc_name}.deploy.resources.{key_str}"),
-                reason:
-                    "only `deploy.resources.limits` is supported; reservations are not supported"
-                        .to_string(),
+                reason: "only `deploy.resources.limits` and `deploy.resources.reservations` are supported".to_string(),
             });
         }
     }
 
-    let Some(limits_value) = resources_map.get(val("limits")) else {
-        return Ok(ResourcesSpec::default());
+    let (cpus, memory_bytes) = parse_resource_sub_section(svc_name, resources_map, "limits")?;
+    let (reservation_cpus, reservation_memory_bytes) =
+        parse_resource_sub_section(svc_name, resources_map, "reservations")?;
+
+    Ok(ResourcesSpec {
+        cpus,
+        memory_bytes,
+        reservation_cpus,
+        reservation_memory_bytes,
+        pids_limit: None,
+    })
+}
+
+/// Parse a `limits` or `reservations` sub-section under `deploy.resources`.
+fn parse_resource_sub_section(
+    svc_name: &str,
+    resources_map: &serde_yml::Mapping,
+    section: &str,
+) -> Result<(Option<f64>, Option<u64>), StackError> {
+    let Some(section_value) = resources_map.get(val(section)) else {
+        return Ok((None, None));
     };
 
-    if limits_value.is_null() {
-        return Ok(ResourcesSpec::default());
+    if section_value.is_null() {
+        return Ok((None, None));
     }
 
-    let limits_map = limits_value.as_mapping().ok_or_else(|| {
+    let section_map = section_value.as_mapping().ok_or_else(|| {
         StackError::ComposeParse(format!(
-            "service `{svc_name}`: `deploy.resources.limits` must be a mapping"
+            "service `{svc_name}`: `deploy.resources.{section}` must be a mapping"
         ))
     })?;
 
-    // Only `cpus` and `memory` are accepted under limits.
-    for key in limits_map.keys() {
+    for key in section_map.keys() {
         let key_str = key.as_str().unwrap_or("");
         if key_str != "cpus" && key_str != "memory" {
             return Err(StackError::ComposeUnsupportedFeature {
-                feature: format!("services.{svc_name}.deploy.resources.limits.{key_str}"),
-                reason: "only `cpus` and `memory` limits are supported".to_string(),
+                feature: format!("services.{svc_name}.deploy.resources.{section}.{key_str}"),
+                reason: format!("only `cpus` and `memory` are supported under `{section}`"),
             });
         }
     }
 
-    let cpus = limits_map
+    let cpus = section_map
         .get(val("cpus"))
         .map(|v| {
-            // Compose accepts cpus as string ("0.5") or number (0.5).
             if let Some(s) = v.as_str() {
                 s.parse::<f64>().map_err(|_| {
                     StackError::ComposeParse(format!(
-                        "service `{svc_name}`: invalid `deploy.resources.limits.cpus` value `{s}`"
+                        "service `{svc_name}`: invalid `deploy.resources.{section}.cpus` value `{s}`"
                     ))
                 })
             } else if let Some(f) = v.as_f64() {
                 Ok(f)
             } else {
                 Err(StackError::ComposeParse(format!(
-                    "service `{svc_name}`: `deploy.resources.limits.cpus` must be a number or string"
+                    "service `{svc_name}`: `deploy.resources.{section}.cpus` must be a number or string"
                 )))
             }
         })
         .transpose()?;
 
-    let memory_bytes = limits_map
+    let memory_bytes = section_map
         .get(val("memory"))
         .map(|v| {
             let s = v.as_str().ok_or_else(|| {
                 StackError::ComposeParse(format!(
-                    "service `{svc_name}`: `deploy.resources.limits.memory` must be a string (e.g., \"512m\", \"1g\")"
+                    "service `{svc_name}`: `deploy.resources.{section}.memory` must be a string (e.g., \"512m\", \"1g\")"
                 ))
             })?;
             parse_memory_string(svc_name, s)
         })
         .transpose()?;
 
-    Ok(ResourcesSpec { cpus, memory_bytes })
+    Ok((cpus, memory_bytes))
 }
 
 /// Parse a Docker Compose memory string into bytes.
@@ -1559,6 +1704,330 @@ fn parse_volumes(root: &serde_yml::Mapping) -> Result<Vec<VolumeSpec>, StackErro
     // Sort for determinism.
     volumes.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(volumes)
+}
+
+// ── Network parsing ────────────────────────────────────────────────
+
+/// Parse the top-level `networks:` section into [`NetworkSpec`] entries.
+///
+/// Supports the following forms:
+/// ```yaml
+/// networks:
+///   frontend:             # minimal: name only, defaults
+///   backend:
+///     driver: bridge
+///     ipam:
+///       config:
+///         - subnet: 172.20.1.0/24
+/// ```
+fn parse_networks(root: &serde_yml::Mapping) -> Result<Vec<NetworkSpec>, StackError> {
+    let Some(value) = root.get(val("networks")) else {
+        return Ok(vec![]);
+    };
+
+    let networks_map = value
+        .as_mapping()
+        .ok_or_else(|| StackError::ComposeParse("top-level `networks` must be a mapping".into()))?;
+
+    let mut networks = Vec::new();
+    for (key, net_value) in networks_map {
+        let net_name = key
+            .as_str()
+            .ok_or_else(|| StackError::ComposeParse("network name must be a string".into()))?;
+
+        // Empty value (just the name) is valid -- uses defaults.
+        if net_value.is_null() {
+            networks.push(NetworkSpec {
+                name: net_name.to_string(),
+                driver: "bridge".to_string(),
+                subnet: None,
+            });
+            continue;
+        }
+
+        let net_map = net_value.as_mapping().ok_or_else(|| {
+            StackError::ComposeParse(format!(
+                "network `{net_name}` must be a mapping or empty"
+            ))
+        })?;
+
+        let driver = net_map
+            .get(val("driver"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("bridge")
+            .to_string();
+
+        if driver != "bridge" {
+            return Err(StackError::ComposeUnsupportedFeature {
+                feature: format!("networks.{net_name}.driver"),
+                reason: format!("only `bridge` driver is supported; got `{driver}`"),
+            });
+        }
+
+        // Parse optional IPAM config for subnet.
+        let subnet = net_map
+            .get(val("ipam"))
+            .and_then(|v| v.as_mapping())
+            .and_then(|ipam| ipam.get(val("config")))
+            .and_then(|v| v.as_sequence())
+            .and_then(|seq| seq.first())
+            .and_then(|item| item.as_mapping())
+            .and_then(|cfg| cfg.get(val("subnet")))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        networks.push(NetworkSpec {
+            name: net_name.to_string(),
+            driver,
+            subnet,
+        });
+    }
+
+    // Sort for determinism.
+    networks.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(networks)
+}
+
+/// Parse the service-level `networks:` key.
+///
+/// Supports both list and mapping forms:
+/// ```yaml
+/// # List form:
+/// networks:
+///   - frontend
+///   - backend
+///
+/// # Mapping form:
+/// networks:
+///   frontend: {}
+///   backend:
+/// ```
+fn parse_service_networks(
+    svc_name: &str,
+    map: &serde_yml::Mapping,
+) -> Result<Vec<String>, StackError> {
+    let Some(value) = map.get(val("networks")) else {
+        return Ok(vec![]);
+    };
+
+    // List form: ["frontend", "backend"]
+    if let Some(seq) = value.as_sequence() {
+        let mut names = Vec::new();
+        for item in seq {
+            let name = item.as_str().ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `networks` list entries must be strings"
+                ))
+            })?;
+            names.push(name.to_string());
+        }
+        return Ok(names);
+    }
+
+    // Mapping form: { frontend: {}, backend: null }
+    if let Some(net_map) = value.as_mapping() {
+        let mut names = Vec::new();
+        for key in net_map.keys() {
+            let name = key.as_str().ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `networks` mapping keys must be strings"
+                ))
+            })?;
+            names.push(name.to_string());
+        }
+        return Ok(names);
+    }
+
+    Err(StackError::ComposeParse(format!(
+        "service `{svc_name}`: `networks` must be a list or mapping"
+    )))
+}
+
+// ── Security & identity field parsers ──────────────────────────────
+
+/// Parse a simple list of strings (e.g., `cap_add`, `cap_drop`).
+fn parse_string_list(
+    svc_name: &str,
+    map: &serde_yml::Mapping,
+    key: &str,
+) -> Result<Vec<String>, StackError> {
+    let Some(value) = map.get(val(key)) else {
+        return Ok(vec![]);
+    };
+
+    let seq = value.as_sequence().ok_or_else(|| {
+        StackError::ComposeParse(format!("service `{svc_name}`: `{key}` must be a list"))
+    })?;
+
+    seq.iter()
+        .map(|v| {
+            v.as_str().map(String::from).ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `{key}` items must be strings"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Parse a string-to-string map (e.g., `sysctls`).
+///
+/// Supports both object and list forms:
+/// ```yaml
+/// sysctls:
+///   net.core.somaxconn: "1024"
+/// ```
+/// or:
+/// ```yaml
+/// sysctls:
+///   - net.core.somaxconn=1024
+/// ```
+fn parse_string_map(
+    svc_name: &str,
+    map: &serde_yml::Mapping,
+    key: &str,
+) -> Result<HashMap<String, String>, StackError> {
+    let Some(value) = map.get(val(key)) else {
+        return Ok(HashMap::new());
+    };
+
+    if let Some(obj) = value.as_mapping() {
+        let mut result = HashMap::new();
+        for (k, v) in obj {
+            let k_str = k.as_str().ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `{key}` keys must be strings"
+                ))
+            })?;
+            let v_str = match v {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                _ => {
+                    return Err(StackError::ComposeParse(format!(
+                        "service `{svc_name}`: `{key}` values must be scalars"
+                    )));
+                }
+            };
+            result.insert(k_str.to_string(), v_str);
+        }
+        Ok(result)
+    } else if let Some(seq) = value.as_sequence() {
+        let mut result = HashMap::new();
+        for item in seq {
+            let s = item.as_str().ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `{key}` list items must be strings"
+                ))
+            })?;
+            if let Some((k, v)) = s.split_once('=') {
+                result.insert(k.to_string(), v.to_string());
+            } else {
+                return Err(StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `{key}` list items must be \"key=value\", got \"{s}\""
+                )));
+            }
+        }
+        Ok(result)
+    } else {
+        Err(StackError::ComposeParse(format!(
+            "service `{svc_name}`: `{key}` must be a mapping or list"
+        )))
+    }
+}
+
+/// Parse `ulimits` configuration.
+///
+/// Supports both single-value and soft/hard forms:
+/// ```yaml
+/// ulimits:
+///   nofile: 65535
+/// ```
+/// or:
+/// ```yaml
+/// ulimits:
+///   nofile:
+///     soft: 1024
+///     hard: 65535
+/// ```
+fn parse_ulimits(
+    svc_name: &str,
+    map: &serde_yml::Mapping,
+) -> Result<Vec<UlimitSpec>, StackError> {
+    let Some(value) = map.get(val("ulimits")) else {
+        return Ok(vec![]);
+    };
+
+    let obj = value.as_mapping().ok_or_else(|| {
+        StackError::ComposeParse(format!(
+            "service `{svc_name}`: `ulimits` must be a mapping"
+        ))
+    })?;
+
+    let mut ulimits = Vec::new();
+    for (k, v) in obj {
+        let name = k.as_str().ok_or_else(|| {
+            StackError::ComposeParse(format!(
+                "service `{svc_name}`: ulimit name must be a string"
+            ))
+        })?;
+
+        if let Some(n) = v.as_u64() {
+            // Single value: soft = hard = value.
+            ulimits.push(UlimitSpec {
+                name: name.to_string(),
+                soft: n,
+                hard: n,
+            });
+        } else if let Some(n) = v.as_i64() {
+            // Handle negative values (e.g., -1 for unlimited).
+            let val = n as u64;
+            ulimits.push(UlimitSpec {
+                name: name.to_string(),
+                soft: val,
+                hard: val,
+            });
+        } else if let Some(inner) = v.as_mapping() {
+            // Object form with soft/hard.
+            let soft = inner
+                .get(val("soft"))
+                .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i as u64)))
+                .ok_or_else(|| {
+                    StackError::ComposeParse(format!(
+                        "service `{svc_name}`: ulimit `{name}` requires `soft` value"
+                    ))
+                })?;
+            let hard = inner
+                .get(val("hard"))
+                .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i as u64)))
+                .ok_or_else(|| {
+                    StackError::ComposeParse(format!(
+                        "service `{svc_name}`: ulimit `{name}` requires `hard` value"
+                    ))
+                })?;
+            ulimits.push(UlimitSpec {
+                name: name.to_string(),
+                soft,
+                hard,
+            });
+        } else {
+            return Err(StackError::ComposeParse(format!(
+                "service `{svc_name}`: ulimit `{name}` must be a number or mapping with soft/hard"
+            )));
+        }
+    }
+
+    // Sort for deterministic output.
+    ulimits.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(ulimits)
+}
+
+/// Parse `labels` which can be a mapping or a list of `key=value` strings.
+fn parse_labels(
+    svc_name: &str,
+    map: &serde_yml::Mapping,
+) -> Result<HashMap<String, String>, StackError> {
+    parse_string_map(svc_name, map, "labels")
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -2179,20 +2648,183 @@ services:
         );
     }
 
+    // ── Network parsing ──────────────────────────────────────────
+
     #[test]
-    fn reject_networks_top_level() {
+    fn parse_top_level_networks_minimal() {
         let yaml = r#"
 services:
   web:
     image: nginx:latest
+    networks:
+      - frontend
+networks:
+  frontend:
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        // "default" is not created since no service lacks explicit networks.
+        // "frontend" is the only defined network.
+        assert!(spec.networks.iter().any(|n| n.name == "frontend"));
+        let frontend = spec.networks.iter().find(|n| n.name == "frontend").unwrap();
+        assert_eq!(frontend.driver, "bridge");
+        assert_eq!(frontend.subnet, None);
+        assert_eq!(spec.services[0].networks, vec!["frontend"]);
+    }
+
+    #[test]
+    fn parse_networks_with_ipam_subnet() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    networks:
+      - frontend
+  db:
+    image: postgres:16
+    networks:
+      - backend
+networks:
+  frontend:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.1.0/24
+  backend:
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.networks.len(), 2);
+
+        let frontend = spec.networks.iter().find(|n| n.name == "frontend").unwrap();
+        assert_eq!(frontend.subnet.as_deref(), Some("172.20.1.0/24"));
+
+        let backend = spec.networks.iter().find(|n| n.name == "backend").unwrap();
+        assert_eq!(backend.subnet, None);
+
+        // Check service network assignments.
+        let web = spec.services.iter().find(|s| s.name == "web").unwrap();
+        assert_eq!(web.networks, vec!["frontend"]);
+
+        let db = spec.services.iter().find(|s| s.name == "db").unwrap();
+        assert_eq!(db.networks, vec!["backend"]);
+    }
+
+    #[test]
+    fn parse_service_networks_list_form() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    networks:
+      - frontend
+      - backend
+networks:
+  frontend:
+  backend:
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let web = spec.services.iter().find(|s| s.name == "web").unwrap();
+        assert!(web.networks.contains(&"frontend".to_string()));
+        assert!(web.networks.contains(&"backend".to_string()));
+    }
+
+    #[test]
+    fn parse_service_networks_mapping_form() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    networks:
+      frontend: {}
+      backend:
+networks:
+  frontend:
+  backend:
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let web = spec.services.iter().find(|s| s.name == "web").unwrap();
+        assert!(web.networks.contains(&"frontend".to_string()));
+        assert!(web.networks.contains(&"backend".to_string()));
+    }
+
+    #[test]
+    fn no_networks_section_creates_implicit_default() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+  db:
+    image: postgres:16
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.networks.len(), 1);
+        assert_eq!(spec.networks[0].name, "default");
+        assert_eq!(spec.networks[0].driver, "bridge");
+
+        // All services join the default network.
+        for svc in &spec.services {
+            assert_eq!(svc.networks, vec!["default"]);
+        }
+    }
+
+    #[test]
+    fn custom_networks_services_without_explicit_get_default() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    networks:
+      - frontend
+  db:
+    image: postgres:16
+networks:
+  frontend:
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        // "default" network is auto-created for db.
+        assert!(spec.networks.iter().any(|n| n.name == "default"));
+        assert!(spec.networks.iter().any(|n| n.name == "frontend"));
+
+        let web = spec.services.iter().find(|s| s.name == "web").unwrap();
+        assert_eq!(web.networks, vec!["frontend"]);
+
+        let db = spec.services.iter().find(|s| s.name == "db").unwrap();
+        assert_eq!(db.networks, vec!["default"]);
+    }
+
+    #[test]
+    fn reject_undefined_network_reference() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    networks:
+      - nonexistent
 networks:
   frontend:
 "#;
         let err = parse_compose(yaml, "myapp").unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("networks"),
-            "error should mention `networks`: {msg}"
+            msg.contains("nonexistent"),
+            "error should mention the undefined network: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_non_bridge_driver() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+networks:
+  mynet:
+    driver: overlay
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("overlay"),
+            "error should mention the unsupported driver: {msg}"
         );
     }
 
@@ -2210,7 +2842,7 @@ services:
     }
 
     #[test]
-    fn reject_deploy_resources_reservations() {
+    fn deploy_resources_reservations_accepted() {
         let yaml = r#"
 services:
   web:
@@ -2219,9 +2851,14 @@ services:
       resources:
         reservations:
           cpus: "0.25"
+          memory: "256m"
 "#;
-        let err = parse_compose(yaml, "myapp").unwrap_err();
-        assert!(err.to_string().contains("reservations"));
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let res = &spec.services[0].resources;
+        assert_eq!(res.reservation_cpus, Some(0.25));
+        assert_eq!(res.reservation_memory_bytes, Some(256 * 1024 * 1024));
+        assert_eq!(res.cpus, None);
+        assert_eq!(res.memory_bytes, None);
     }
 
     #[test]
@@ -3067,5 +3704,243 @@ services:
         assert_eq!(parse_memory_string("test", "1024b").unwrap(), 1024);
         assert!(parse_memory_string("test", "abc").is_err());
         assert!(parse_memory_string("test", "").is_err());
+    }
+
+    // ── Security fields ──────────────────────────────────────────
+
+    #[test]
+    fn cap_add_parses_string_list() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    cap_add:
+      - NET_ADMIN
+      - SYS_PTRACE
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].cap_add, vec!["NET_ADMIN", "SYS_PTRACE"]);
+    }
+
+    #[test]
+    fn cap_drop_parses_string_list() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    cap_drop:
+      - MKNOD
+      - AUDIT_WRITE
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].cap_drop, vec!["MKNOD", "AUDIT_WRITE"]);
+    }
+
+    #[test]
+    fn privileged_true() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    privileged: true
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert!(spec.services[0].privileged);
+    }
+
+    #[test]
+    fn privileged_defaults_to_false() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert!(!spec.services[0].privileged);
+    }
+
+    #[test]
+    fn read_only_true() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    read_only: true
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert!(spec.services[0].read_only);
+    }
+
+    #[test]
+    fn sysctls_mapping_form() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    sysctls:
+      net.core.somaxconn: "1024"
+      net.ipv4.tcp_syncookies: "0"
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].sysctls.len(), 2);
+        assert_eq!(spec.services[0].sysctls["net.core.somaxconn"], "1024");
+        assert_eq!(
+            spec.services[0].sysctls["net.ipv4.tcp_syncookies"],
+            "0"
+        );
+    }
+
+    #[test]
+    fn sysctls_list_form() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    sysctls:
+      - net.core.somaxconn=1024
+      - net.ipv4.tcp_syncookies=0
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].sysctls.len(), 2);
+        assert_eq!(spec.services[0].sysctls["net.core.somaxconn"], "1024");
+    }
+
+    // ── Ulimits ──────────────────────────────────────────────────
+
+    #[test]
+    fn ulimits_single_value() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    ulimits:
+      nofile: 65536
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].ulimits.len(), 1);
+        assert_eq!(spec.services[0].ulimits[0].name, "nofile");
+        assert_eq!(spec.services[0].ulimits[0].soft, 65536);
+        assert_eq!(spec.services[0].ulimits[0].hard, 65536);
+    }
+
+    #[test]
+    fn ulimits_soft_hard_form() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 65536
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].ulimits.len(), 1);
+        assert_eq!(spec.services[0].ulimits[0].name, "nofile");
+        assert_eq!(spec.services[0].ulimits[0].soft, 1024);
+        assert_eq!(spec.services[0].ulimits[0].hard, 65536);
+    }
+
+    #[test]
+    fn ulimits_multiple() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 65536
+      nproc: 2048
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].ulimits.len(), 2);
+    }
+
+    #[test]
+    fn pids_limit_in_deploy() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    deploy:
+      resources:
+        limits:
+          pids: 100
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].resources.pids_limit, Some(100));
+    }
+
+    // ── Container identity ───────────────────────────────────────
+
+    #[test]
+    fn hostname_parsed() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    hostname: my-web-host
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(
+            spec.services[0].hostname,
+            Some("my-web-host".to_string())
+        );
+    }
+
+    #[test]
+    fn domainname_parsed() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    domainname: example.com
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(
+            spec.services[0].domainname,
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn labels_mapping_form() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    labels:
+      com.example.description: "Web frontend"
+      com.example.tier: frontend
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].labels.len(), 2);
+        assert_eq!(
+            spec.services[0].labels["com.example.description"],
+            "Web frontend"
+        );
+        assert_eq!(
+            spec.services[0].labels["com.example.tier"],
+            "frontend"
+        );
+    }
+
+    #[test]
+    fn labels_list_form() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    labels:
+      - com.example.description=Web frontend
+      - com.example.tier=frontend
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].labels.len(), 2);
+        assert_eq!(
+            spec.services[0].labels["com.example.description"],
+            "Web frontend"
+        );
     }
 }

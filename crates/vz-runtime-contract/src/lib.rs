@@ -200,6 +200,7 @@ mod tests {
         let _net = NetworkServiceConfig {
             name: "web".to_string(),
             addr: "172.20.0.2".to_string(),
+            network_name: "default".to_string(),
         };
         let _logs = ContainerLogs::default();
     }

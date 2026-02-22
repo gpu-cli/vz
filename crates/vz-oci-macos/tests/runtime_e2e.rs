@@ -305,8 +305,16 @@ async fn container_logs_capture_and_retrieve() {
     );
 
     // Cleanup.
-    backend.inner().stop_container(&container_id, true).await.unwrap();
-    backend.inner().remove_container(&container_id).await.unwrap();
+    backend
+        .inner()
+        .stop_container(&container_id, true)
+        .await
+        .unwrap();
+    backend
+        .inner()
+        .remove_container(&container_id)
+        .await
+        .unwrap();
 }
 
 // ── Port forwarding ─────────────────────────────────────────────
@@ -415,6 +423,65 @@ async fn pull_nonexistent_image_fails() {
     assert!(result.is_err(), "pulling nonexistent image should fail");
 }
 
+// ── Cgroup resource limits ───────────────────────────────────────
+
+/// Verify that cgroup cpu.max is correctly enforced inside the container.
+///
+/// Creates a container with `cpu_quota=50000` and `cpu_period=100000`
+/// (equivalent to `cpus=0.5`), then reads `/sys/fs/cgroup/cpu.max` inside
+/// the running container and asserts the kernel exposes the expected
+/// `"50000 100000"` throttle values.
+#[tokio::test]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn cgroup_cpu_max_enforcement() {
+    init_tracing();
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = test_runtime(tmp.path());
+
+    // Create a long-lived container with cpu_quota=50000 / cpu_period=100000 (0.5 CPU).
+    let container_id = rt
+        .create_container(
+            "alpine:latest",
+            RunConfig {
+                cmd: vec!["sleep".into(), "300".into()],
+                execution_mode: ExecutionMode::OciRuntime,
+                cpu_quota: Some(50_000),
+                cpu_period: Some(100_000),
+                ..RunConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Read the cgroup cpu.max file inside the container.
+    let exec_out = rt
+        .exec_container(
+            &container_id,
+            ExecConfig {
+                cmd: vec!["cat".into(), "/sys/fs/cgroup/cpu.max".into()],
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        exec_out.exit_code, 0,
+        "cat cpu.max should succeed: stderr={}",
+        exec_out.stderr
+    );
+    assert_eq!(
+        exec_out.stdout.trim(),
+        "50000 100000",
+        "cpu.max should reflect quota=50000 period=100000 (0.5 CPU), got: {}",
+        exec_out.stdout.trim()
+    );
+
+    // Cleanup.
+    let _ = rt.stop_container(&container_id, true).await;
+    let _ = rt.remove_container(&container_id).await;
+}
+
 // ── Shared VM inter-service connectivity ────────────────────────
 
 /// Boot a shared VM with two containers in isolated network namespaces,
@@ -449,10 +516,12 @@ async fn shared_vm_inter_service_connectivity() {
         vz_oci_macos::NetworkServiceConfig {
             name: "web".to_string(),
             addr: "172.20.0.2/24".to_string(),
+            network_name: "default".to_string(),
         },
         vz_oci_macos::NetworkServiceConfig {
             name: "db".to_string(),
             addr: "172.20.0.3/24".to_string(),
+            network_name: "default".to_string(),
         },
     ];
     rt.network_setup(stack_id, services).await.unwrap();

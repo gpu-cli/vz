@@ -31,6 +31,27 @@ pub fn service_to_run_config(
     mounts.extend_from_slice(secret_mounts);
     let resources = convert_resources(&spec.resources);
 
+    // Convert labels to OCI annotations.
+    let oci_annotations: Vec<(String, String)> = spec
+        .labels
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    // Convert sysctls from HashMap to Vec.
+    let sysctls: Vec<(String, String)> = spec
+        .sysctls
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    // Convert ulimits from UlimitSpec to tuple form.
+    let ulimits: Vec<(String, u64, u64)> = spec
+        .ulimits
+        .iter()
+        .map(|u| (u.name.clone(), u.soft, u.hard))
+        .collect();
+
     Ok(vz_runtime_contract::RunConfig {
         cmd,
         working_dir: spec.working_dir.clone(),
@@ -47,6 +68,19 @@ pub fn service_to_run_config(
         extra_hosts: spec.extra_hosts.clone(),
         // Capture container stdout/stderr to log files for `vz stack logs`.
         capture_logs: true,
+        // Security fields
+        cap_add: spec.cap_add.clone(),
+        cap_drop: spec.cap_drop.clone(),
+        privileged: spec.privileged,
+        read_only_rootfs: spec.read_only,
+        sysctls,
+        // Resource extensions
+        ulimits,
+        pids_limit: spec.resources.pids_limit,
+        // Container identity
+        hostname: spec.hostname.clone(),
+        domainname: spec.domainname.clone(),
+        oci_annotations,
         // Remaining fields use defaults; future beads may populate them.
         ..Default::default()
     })
@@ -230,6 +264,16 @@ mod tests {
             resources: ResourcesSpec::default(),
             extra_hosts: vec![],
             secrets: vec![],
+            networks: vec![],
+            cap_add: vec![],
+            cap_drop: vec![],
+            privileged: false,
+            read_only: false,
+            sysctls: HashMap::new(),
+            ulimits: vec![],
+            hostname: None,
+            domainname: None,
+            labels: HashMap::new(),
         }
     }
 
@@ -423,6 +467,7 @@ mod tests {
         spec.resources = ResourcesSpec {
             cpus: Some(4.0),
             memory_bytes: Some(1024 * 1024 * 1024), // 1 GiB
+            ..Default::default()
         };
         let config = service_to_run_config(&spec, &[], &[]).unwrap();
         assert_eq!(config.cpus, Some(4));
@@ -437,6 +482,7 @@ mod tests {
         spec.resources = ResourcesSpec {
             cpus: None,
             memory_bytes: Some(512 * 1024 * 1024), // 512 MiB
+            ..Default::default()
         };
         let config = service_to_run_config(&spec, &[], &[]).unwrap();
         assert_eq!(config.memory_mb, Some(512));
@@ -448,6 +494,7 @@ mod tests {
         spec.resources = ResourcesSpec {
             cpus: Some(0.5),
             memory_bytes: None,
+            ..Default::default()
         };
         let config = service_to_run_config(&spec, &[], &[]).unwrap();
         assert_eq!(config.cpus, Some(1)); // ceil(0.5) = 1
@@ -480,6 +527,7 @@ mod tests {
         spec.resources = ResourcesSpec {
             cpus: None,
             memory_bytes: Some(0),
+            ..Default::default()
         };
         let config = service_to_run_config(&spec, &[], &[]).unwrap();
         assert_eq!(config.memory_mb, Some(0));
@@ -531,9 +579,22 @@ mod tests {
             resources: ResourcesSpec {
                 cpus: Some(2.0),
                 memory_bytes: Some(1024 * 1024 * 1024),
+                reservation_cpus: None,
+                reservation_memory_bytes: None,
+                pids_limit: None,
             },
             extra_hosts: vec![],
             secrets: vec![],
+            networks: vec![],
+            cap_add: vec![],
+            cap_drop: vec![],
+            privileged: false,
+            read_only: false,
+            sysctls: HashMap::new(),
+            ulimits: vec![],
+            hostname: None,
+            domainname: None,
+            labels: HashMap::new(),
         };
 
         let resolved_mounts = vec![ResolvedMount {

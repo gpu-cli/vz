@@ -433,7 +433,10 @@ mod tests {
     fn verify_blob_digest_rejects_unsupported_algorithms() {
         let error = verify_blob_digest("sha512:abc", b"hello")
             .expect_err("sha512 should be rejected for now");
-        assert!(matches!(error, ImageError::UnsupportedDigestAlgorithm { .. }));
+        assert!(matches!(
+            error,
+            ImageError::UnsupportedDigestAlgorithm { .. }
+        ));
     }
 
     // ── resolve_cmd tests ────────────────────────────────────────
@@ -446,10 +449,7 @@ mod tests {
             ..Default::default()
         };
         let result = config.resolve_cmd(&["custom".to_string(), "cmd".to_string()]);
-        assert_eq!(
-            result,
-            Some(vec!["custom".to_string(), "cmd".to_string()])
-        );
+        assert_eq!(result, Some(vec!["custom".to_string(), "cmd".to_string()]));
     }
 
     #[test]
@@ -477,10 +477,7 @@ mod tests {
     #[test]
     fn resolve_env_merges_with_user_precedence() {
         let config = ImageConfigSummary {
-            env: Some(vec![
-                "BASE=1".to_string(),
-                "OVERRIDE=old".to_string(),
-            ]),
+            env: Some(vec!["BASE=1".to_string(), "OVERRIDE=old".to_string()]),
             ..Default::default()
         };
         let user_env = vec![
@@ -529,10 +526,7 @@ mod tests {
             working_dir: Some("/image".to_string()),
             ..Default::default()
         };
-        assert_eq!(
-            config.resolve_working_dir(None),
-            Some("/image".to_string())
-        );
+        assert_eq!(config.resolve_working_dir(None), Some("/image".to_string()));
     }
 
     // ── resolve_user tests ───────────────────────────────────────
@@ -543,10 +537,7 @@ mod tests {
             user: Some("1000".to_string()),
             ..Default::default()
         };
-        assert_eq!(
-            config.resolve_user(Some("root")),
-            Some("root".to_string())
-        );
+        assert_eq!(config.resolve_user(Some("root")), Some("root".to_string()));
     }
 
     #[test]

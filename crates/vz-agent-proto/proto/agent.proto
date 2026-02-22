@@ -206,6 +206,7 @@ message OciDeleteResponse {}
 message NetworkServiceConfig {
   string name = 1;            // service name = netns name
   string addr = 2;            // CIDR, e.g. "172.20.0.2/24"
+  string network_name = 3;    // logical network, e.g. "default", "frontend"
 }
 
 message NetworkSetupRequest {

@@ -31,12 +31,17 @@ pub enum ExecEvent {
 }
 
 /// Per-service network configuration for stack VM network setup.
+///
+/// Each entry represents one service on one network. Services on multiple
+/// networks have multiple entries with different `network_name` values.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkServiceConfig {
     /// Service name, also used as the network namespace name.
     pub name: String,
     /// IP address with CIDR prefix (e.g., `"172.20.0.2/24"`).
     pub addr: String,
+    /// Logical network name (e.g., `"default"`, `"frontend"`).
+    pub network_name: String,
 }
 
 /// OCI runtime state for a container.

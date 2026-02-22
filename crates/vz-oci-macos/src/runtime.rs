@@ -7,11 +7,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, process};
 
-use vz_oci::bundle::{BundleMount, BundleSpec, write_oci_bundle};
-use vz_oci::container_store::{ContainerInfo, ContainerStatus, ContainerStore};
-use vz_image::{
-    ImageConfigSummary, ImageId, ImagePuller, ImageStore, parse_image_config_summary_from_store,
-};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -19,10 +14,15 @@ use tracing::warn;
 use vz::Vm;
 use vz::protocol::ExecOutput;
 use vz::{NetworkConfig, SharedDirConfig};
+use vz_image::{
+    ImageConfigSummary, ImageId, ImagePuller, ImageStore, parse_image_config_summary_from_store,
+};
 use vz_linux::{
     EnsureKernelOptions, ExecOptions, KernelPaths, LinuxError, LinuxVm, LinuxVmConfig,
     OciExecOptions, ensure_kernel_with_options,
 };
+use vz_oci::bundle::{BundleMount, BundleSpec, write_oci_bundle};
+use vz_oci::container_store::{ContainerInfo, ContainerStatus, ContainerStore};
 
 use tokio::sync::Mutex;
 use vz::protocol::OciContainerState;
@@ -277,13 +277,19 @@ impl Runtime {
             .upsert(container.clone())
             .map_err(OciError::from)?;
 
-        let rootfs_dir = match self
-            .store
-            .assemble_rootfs_async(&image_id.0, &container_id)
-            .await
-        {
-            Ok(rootfs_dir) => rootfs_dir,
-            Err(err) => {
+        // Spawn rootfs assembly in background so image config parsing runs
+        // concurrently with the heavy layer extraction I/O.
+        let rootfs_handle = self.store.spawn_assemble_rootfs(&image_id.0, &container_id);
+
+        // Parse image config concurrently with rootfs assembly (reads from
+        // local store, no dependency on assembled rootfs).
+        let image_config = parse_image_config_summary_from_store(&self.store, &image_id.0)?;
+        let run = resolve_run_config(image_config, run, &container_id)?;
+
+        // Await rootfs assembly before proceeding to VM boot.
+        let rootfs_dir = match rootfs_handle.await {
+            Ok(Ok(rootfs_dir)) => rootfs_dir,
+            Ok(Err(err)) => {
                 container.status = ContainerStatus::Stopped { exit_code: -1 };
                 container.stopped_unix_secs = Some(current_unix_secs());
                 container.host_pid = None;
@@ -291,6 +297,17 @@ impl Runtime {
                     .upsert(container)
                     .map_err(OciError::from)?;
                 return Err(err.into());
+            }
+            Err(join_err) => {
+                container.status = ContainerStatus::Stopped { exit_code: -1 };
+                container.stopped_unix_secs = Some(current_unix_secs());
+                container.host_pid = None;
+                self.container_store
+                    .upsert(container)
+                    .map_err(OciError::from)?;
+                return Err(OciError::Storage(std::io::Error::other(
+                    join_err.to_string(),
+                )));
             }
         };
 
@@ -301,9 +318,6 @@ impl Runtime {
         self.container_store
             .upsert(container.clone())
             .map_err(OciError::from)?;
-
-        let image_config = parse_image_config_summary_from_store(&self.store, &image_id.0)?;
-        let run = resolve_run_config(image_config, run, &container_id)?;
 
         let output = match run.execution_mode {
             ExecutionMode::GuestExec => self.run_rootfs(&rootfs_dir, run).await,
@@ -369,13 +383,18 @@ impl Runtime {
             .upsert(container.clone())
             .map_err(OciError::from)?;
 
-        let rootfs_dir = match self
-            .store
-            .assemble_rootfs_async(&image_id.0, &container_id)
-            .await
-        {
-            Ok(rootfs_dir) => rootfs_dir,
-            Err(err) => {
+        // Spawn rootfs assembly in background so image config parsing runs
+        // concurrently with the heavy layer extraction I/O.
+        let rootfs_handle = self.store.spawn_assemble_rootfs(&image_id.0, &container_id);
+
+        // Parse image config concurrently with rootfs assembly.
+        let image_config = parse_image_config_summary_from_store(&self.store, &image_id.0)?;
+        let run = resolve_run_config(image_config, run, &container_id)?;
+
+        // Await rootfs assembly before booting the VM.
+        let rootfs_dir = match rootfs_handle.await {
+            Ok(Ok(rootfs_dir)) => rootfs_dir,
+            Ok(Err(err)) => {
                 container.status = ContainerStatus::Stopped { exit_code: -1 };
                 container.stopped_unix_secs = Some(current_unix_secs());
                 container.host_pid = None;
@@ -384,15 +403,23 @@ impl Runtime {
                     .map_err(OciError::from)?;
                 return Err(err.into());
             }
+            Err(join_err) => {
+                container.status = ContainerStatus::Stopped { exit_code: -1 };
+                container.stopped_unix_secs = Some(current_unix_secs());
+                container.host_pid = None;
+                self.container_store
+                    .upsert(container)
+                    .map_err(OciError::from)?;
+                return Err(OciError::Storage(std::io::Error::other(
+                    join_err.to_string(),
+                )));
+            }
         };
 
         container.rootfs_path = Some(rootfs_dir.clone());
         self.container_store
             .upsert(container.clone())
             .map_err(OciError::from)?;
-
-        let image_config = parse_image_config_summary_from_store(&self.store, &image_id.0)?;
-        let run = resolve_run_config(image_config, run, &container_id)?;
 
         match self
             .boot_and_start_container(&rootfs_dir, &run, &container_id)
@@ -569,34 +596,18 @@ impl Runtime {
             .upsert(container.clone())
             .map_err(OciError::from)?;
 
-        tracing::debug!("step 1: assemble_rootfs_async");
-        let rootfs_dir = match self
-            .store
-            .assemble_rootfs_async(&image_id.0, &container_id)
-            .await
-        {
-            Ok(rootfs_dir) => rootfs_dir,
-            Err(err) => {
-                tracing::error!(error = %err, "step 1 FAILED: assemble_rootfs_async");
-                container.status = ContainerStatus::Stopped { exit_code: -1 };
-                container.stopped_unix_secs = Some(current_unix_secs());
-                container.host_pid = None;
-                self.container_store
-                    .upsert(container)
-                    .map_err(OciError::from)?;
-                return Err(err.into());
-            }
-        };
-        tracing::debug!(rootfs_dir = %rootfs_dir.display(), "step 1 OK");
+        // Spawn rootfs assembly as a background task so we can do image config
+        // parsing and run config resolution concurrently with the heavy I/O.
+        tracing::debug!("step 1: spawn_assemble_rootfs (background)");
+        let rootfs_handle = self.store.spawn_assemble_rootfs(&image_id.0, &container_id);
 
-        container.rootfs_path = Some(rootfs_dir.clone());
-        self.container_store
-            .upsert(container.clone())
-            .map_err(OciError::from)?;
-
-        tracing::debug!("step 2: parse_image_config_summary_from_store");
+        // Step 2 runs concurrently with rootfs assembly (no disk I/O dependency).
+        tracing::debug!("step 2: parse_image_config_summary_from_store (concurrent with step 1)");
         let image_config = parse_image_config_summary_from_store(&self.store, &image_id.0)
-            .map_err(|e| { tracing::error!(error = %e, "step 2 FAILED"); e })?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "step 2 FAILED");
+                e
+            })?;
         tracing::debug!("step 2 OK");
         let run = resolve_run_config(image_config, run, &container_id)?;
 
@@ -612,6 +623,40 @@ impl Runtime {
             .unwrap_or_else(|| container_id.to_string());
         let bundle_guest_root = oci_bundle_guest_root(self.config.guest_state_dir.as_deref())?;
         let bundle_relative_path = oci_bundle_guest_path(&bundle_guest_root, &oci_container_id);
+
+        // Await rootfs assembly before writing the OCI bundle to disk.
+        let rootfs_dir = match rootfs_handle.await {
+            Ok(Ok(rootfs_dir)) => rootfs_dir,
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "step 1 FAILED: assemble_rootfs");
+                container.status = ContainerStatus::Stopped { exit_code: -1 };
+                container.stopped_unix_secs = Some(current_unix_secs());
+                container.host_pid = None;
+                self.container_store
+                    .upsert(container)
+                    .map_err(OciError::from)?;
+                return Err(err.into());
+            }
+            Err(join_err) => {
+                tracing::error!(error = %join_err, "step 1 FAILED: rootfs task panicked");
+                container.status = ContainerStatus::Stopped { exit_code: -1 };
+                container.stopped_unix_secs = Some(current_unix_secs());
+                container.host_pid = None;
+                self.container_store
+                    .upsert(container)
+                    .map_err(OciError::from)?;
+                return Err(OciError::Storage(std::io::Error::other(
+                    join_err.to_string(),
+                )));
+            }
+        };
+        tracing::debug!(rootfs_dir = %rootfs_dir.display(), "step 1 OK");
+
+        container.rootfs_path = Some(rootfs_dir.clone());
+        self.container_store
+            .upsert(container.clone())
+            .map_err(OciError::from)?;
+
         // Host: <data_dir>/rootfs/<container_id>/<bundle_path>
         let bundle_host_dir = oci_bundle_host_dir(&rootfs_dir, &bundle_relative_path);
         // Guest: /vz-rootfs/<container_id>/<bundle_path>
@@ -682,9 +727,21 @@ impl Runtime {
                 cpu_quota: run.cpu_quota,
                 cpu_period: run.cpu_period,
                 capture_logs: run.capture_logs,
+                cap_add: run.cap_add.clone(),
+                cap_drop: run.cap_drop.clone(),
+                privileged: run.privileged,
+                read_only_rootfs: run.read_only_rootfs,
+                sysctls: run.sysctls.clone(),
+                ulimits: run.ulimits.clone(),
+                pids_limit: run.pids_limit,
+                hostname: run.hostname.clone(),
+                domainname: run.domainname.clone(),
             },
         )
-        .map_err(|e| { tracing::error!(error = %e, "step 3c FAILED: write_oci_bundle"); e })?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "step 3c FAILED: write_oci_bundle");
+            e
+        })?;
         tracing::debug!("step 3c OK");
 
         // OCI create + start inside the shared VM.
@@ -1044,6 +1101,15 @@ impl Runtime {
                 cpu_quota: run.cpu_quota,
                 cpu_period: run.cpu_period,
                 capture_logs: run.capture_logs,
+                cap_add: run.cap_add.clone(),
+                cap_drop: run.cap_drop.clone(),
+                privileged: run.privileged,
+                read_only_rootfs: run.read_only_rootfs,
+                sysctls: run.sysctls.clone(),
+                ulimits: run.ulimits.clone(),
+                pids_limit: run.pids_limit,
+                hostname: run.hostname.clone(),
+                domainname: run.domainname.clone(),
             },
         )?;
 
@@ -1086,8 +1152,7 @@ impl Runtime {
         }
 
         // Set up per-container overlay so youki can mknod on tmpfs.
-        if let Err(err) =
-            setup_guest_container_overlay(&vm, "/vz-rootfs", &oci_container_id).await
+        if let Err(err) = setup_guest_container_overlay(&vm, "/vz-rootfs", &oci_container_id).await
         {
             let _ = vm.stop().await;
             return Err(err);
@@ -1163,6 +1228,15 @@ impl Runtime {
             cpu_quota: _,
             cpu_period: _,
             capture_logs: _,
+            cap_add,
+            cap_drop,
+            privileged,
+            read_only_rootfs,
+            sysctls,
+            ulimits,
+            pids_limit,
+            hostname,
+            domainname,
         } = run;
 
         let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
@@ -1217,6 +1291,15 @@ impl Runtime {
                 cpu_quota: None,
                 cpu_period: None,
                 capture_logs: false,
+                cap_add,
+                cap_drop,
+                privileged,
+                read_only_rootfs,
+                sysctls: sysctls.into_iter().collect(),
+                ulimits,
+                pids_limit,
+                hostname,
+                domainname,
             },
         )?;
 
@@ -1257,9 +1340,7 @@ impl Runtime {
         }
 
         // Set up per-container overlay so youki can mknod on tmpfs.
-        if let Err(err) =
-            setup_guest_container_overlay(&vm, "/vz-rootfs", &container_id).await
-        {
+        if let Err(err) = setup_guest_container_overlay(&vm, "/vz-rootfs", &container_id).await {
             let _ = vm.stop().await;
             return Err(err);
         }
@@ -1346,6 +1427,15 @@ impl Runtime {
             cpu_quota: _,
             cpu_period: _,
             capture_logs: _,
+            cap_add: _,
+            cap_drop: _,
+            privileged: _,
+            read_only_rootfs: _,
+            sysctls: _,
+            ulimits: _,
+            pids_limit: _,
+            hostname: _,
+            domainname: _,
         } = run;
 
         let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
@@ -1383,9 +1473,11 @@ impl Runtime {
             vm_config.shared_dirs.extend(mount_shares);
             for (idx, spec) in mounts.iter().enumerate() {
                 if matches!(spec.mount_type, MountType::Bind) {
-                    vm_config
-                        .cmdline
-                        .push_str(&format!(" vz.mount.{}={}", idx, spec.target.display()));
+                    vm_config.cmdline.push_str(&format!(
+                        " vz.mount.{}={}",
+                        idx,
+                        spec.target.display()
+                    ));
                 }
             }
         }
@@ -2079,11 +2171,20 @@ fn resolve_run_config(
         cpu_quota: _,
         cpu_period: _,
         capture_logs,
+        cap_add,
+        cap_drop,
+        privileged,
+        read_only_rootfs,
+        sysctls,
+        ulimits,
+        pids_limit,
+        hostname,
+        domainname,
     } = run;
 
-    let resolved_cmd = image_config.resolve_cmd(&run_cmd).ok_or_else(|| {
-        OciError::InvalidConfig("run command must not be empty".to_string())
-    })?;
+    let resolved_cmd = image_config
+        .resolve_cmd(&run_cmd)
+        .ok_or_else(|| OciError::InvalidConfig("run command must not be empty".to_string()))?;
 
     let resolved_env = image_config.resolve_env(&run_env, container_id);
     let working_dir = image_config.resolve_working_dir(run_working_dir.as_deref());
@@ -2116,6 +2217,15 @@ fn resolve_run_config(
         cpu_quota: None,
         cpu_period: None,
         capture_logs,
+        cap_add,
+        cap_drop,
+        privileged,
+        read_only_rootfs,
+        sysctls,
+        ulimits,
+        pids_limit,
+        hostname,
+        domainname,
     })
 }
 

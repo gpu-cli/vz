@@ -1,21 +1,26 @@
 //! Per-service network namespace isolation for stack VMs.
 //!
-//! Creates a bridge, per-service network namespaces, veth pairs, IP
-//! addresses, and default routes using busybox commands.
+//! Creates one bridge per logical network, per-service network namespaces,
+//! veth pairs, IP addresses, and default routes using busybox commands.
 //!
-//! # Network topology
+//! # Network topology (multi-network)
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────────────────────┐
 //! │ VM (shared for stack)                                           │
 //! │                                                                 │
-//! │  br-<stack> (172.20.0.1/24)                                    │
-//! │     │                                                           │
-//! │     ├── veth-web ←──→ [netns: web] eth0 (172.20.0.2/24)       │
-//! │     ├── veth-db  ←──→ [netns: db]  eth0 (172.20.0.3/24)       │
-//! │     └── ...                                                     │
+//! │  br-<stack>-frontend (172.20.0.1/24)                           │
+//! │     ├── veth-web-0 ←──→ [netns: web] eth0 (172.20.0.2/24)    │
+//! │     └── veth-api-0 ←──→ [netns: api] eth0 (172.20.0.3/24)    │
+//! │                                                                 │
+//! │  br-<stack>-backend  (172.20.1.1/24)                           │
+//! │     ├── veth-api-1 ←──→ [netns: api] eth1 (172.20.1.2/24)    │
+//! │     └── veth-db-0  ←──→ [netns: db]  eth0 (172.20.1.3/24)    │
 //! └──────────────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! Services belonging to multiple networks get multiple interfaces
+//! (eth0, eth1, ...). The default route goes through the first bridge.
 //!
 //! # Implementation notes
 //!
@@ -25,6 +30,7 @@
 //! 2. Use `nsenter --net=<path>` to run `ip` commands inside namespaces
 //! 3. Move veth endpoints via `ip link set <dev> netns <path>`
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::io;
@@ -41,8 +47,10 @@ const NETNS_RUN_DIR: &str = "/var/run/netns";
 
 /// Set up per-service network isolation for a stack.
 ///
-/// 1. Creates bridge `br-<stack_id>` with gateway IP (first address in subnet)
-/// 2. For each service: creates netns, veth pair, assigns IP, sets up routes
+/// 1. Groups services by `network_name`
+/// 2. Creates one bridge per network: `br-<stack_id>-<network_name>`
+/// 3. Creates netns per unique service (once, even for multi-network services)
+/// 4. For each (network, service) pair: creates veth, assigns IP, sets up route
 pub fn setup_stack_network(stack_id: &str, services: &[NetworkServiceConfig]) -> io::Result<()> {
     if services.is_empty() {
         return Ok(());
@@ -50,90 +58,151 @@ pub fn setup_stack_network(stack_id: &str, services: &[NetworkServiceConfig]) ->
 
     info!(stack_id = %stack_id, services = services.len(), "setup_stack_network: starting");
 
-    // Derive bridge address from first service's subnet (use .1).
-    let first_addr = parse_cidr(&services[0].addr)?;
-    let bridge_ip = Ipv4Addr::new(
-        first_addr.0.octets()[0],
-        first_addr.0.octets()[1],
-        first_addr.0.octets()[2],
-        1,
-    );
-    let prefix_len = first_addr.1;
+    // ── Group services by network ───────────────────────────────────
+    // Preserve insertion order by collecting distinct network names in order.
+    let mut network_order: Vec<String> = Vec::new();
+    let mut networks: HashMap<String, Vec<&NetworkServiceConfig>> = HashMap::new();
+    for svc in services {
+        if !networks.contains_key(&svc.network_name) {
+            network_order.push(svc.network_name.clone());
+        }
+        networks
+            .entry(svc.network_name.clone())
+            .or_default()
+            .push(svc);
+    }
 
-    let bridge_name = format!("br-{}", truncate_name(stack_id, 12));
-
-    // 1. Create bridge.
-    info!(bridge = %bridge_name, "creating bridge");
-    ip_run(&["link", "add", "name", &bridge_name, "type", "bridge"])?;
-    ip_run(&[
-        "addr",
-        "add",
-        &format!("{bridge_ip}/{prefix_len}"),
-        "dev",
-        &bridge_name,
-    ])?;
-    ip_run(&["link", "set", &bridge_name, "up"])?;
-    info!(bridge = %bridge_name, addr = %bridge_ip, "bridge created");
-
-    // 2. Set up each service.
     fs::create_dir_all(NETNS_RUN_DIR)?;
 
+    // ── Create network namespaces (one per unique service) ──────────
+    let mut created_ns: HashSet<String> = HashSet::new();
     for svc in services {
-        let (svc_ip, svc_prefix) = parse_cidr(&svc.addr)?;
-        let veth_host = format!("veth-{}", truncate_name(&svc.name, 10));
-        let ns_name = &svc.name;
-        let ns_path = format!("{NETNS_RUN_DIR}/{ns_name}");
+        if created_ns.insert(svc.name.clone()) {
+            info!(service = %svc.name, "creating netns");
+            create_named_netns(&svc.name)?;
+        }
+    }
 
-        // Create network namespace via unshare(2) + bind mount.
-        info!(service = %svc.name, "creating netns");
-        create_named_netns(ns_name)?;
+    // Track how many interfaces each service has already been given.
+    // This determines the ethN index inside each netns.
+    let mut service_iface_count: HashMap<String, u32> = HashMap::new();
 
-        // Create veth pair inside the namespace, then move host end out.
-        // This avoids needing `ip link set ... netns <path>` which BusyBox
-        // doesn't support (it only accepts PIDs).
-        //
-        // BusyBox ip ignores `peer name X` — it auto-names the peer as vethN.
-        // We create the pair, then rename the peer to eth0 after moving the
-        // host end out.
-        info!(service = %svc.name, host = %veth_host, "creating veth pair");
-        nsenter_ip(
-            &ns_path,
-            &[
-                "link", "add", &veth_host, "type", "veth", "peer", "name", "veth0",
-            ],
-        )?;
+    // Track whether each service has a default route yet.
+    let mut has_default_route: HashSet<String> = HashSet::new();
 
-        // Move host end from netns to default namespace (PID 1's netns).
-        nsenter_ip(&ns_path, &["link", "set", &veth_host, "netns", "1"])?;
+    // ── Per-network: create bridge + attach services ────────────────
+    for net_name in &network_order {
+        let net_services = &networks[net_name];
+        if net_services.is_empty() {
+            continue;
+        }
 
-        // Attach host end to bridge and bring up (in default namespace).
-        ip_run(&["link", "set", &veth_host, "master", &bridge_name])?;
-        ip_run(&["link", "set", &veth_host, "up"])?;
+        // Derive bridge address from first service's subnet (use .1).
+        let first_addr = parse_cidr(&net_services[0].addr)?;
+        let bridge_ip = Ipv4Addr::new(
+            first_addr.0.octets()[0],
+            first_addr.0.octets()[1],
+            first_addr.0.octets()[2],
+            1,
+        );
+        let prefix_len = first_addr.1;
 
-        // Configure inside the namespace.
-        info!(service = %svc.name, "configuring namespace networking");
-        nsenter_ip(&ns_path, &["link", "set", "lo", "up"])?;
+        let bridge_name = format!(
+            "br-{}-{}",
+            truncate_name(stack_id, 8),
+            truncate_name(net_name, 8)
+        );
 
-        // Rename peer end to eth0.
-        nsenter_ip(&ns_path, &["link", "set", "veth0", "name", "eth0"])?;
+        // Create bridge.
+        info!(bridge = %bridge_name, network = %net_name, "creating bridge");
+        ip_run(&["link", "add", "name", &bridge_name, "type", "bridge"])?;
+        ip_run(&[
+            "addr",
+            "add",
+            &format!("{bridge_ip}/{prefix_len}"),
+            "dev",
+            &bridge_name,
+        ])?;
+        ip_run(&["link", "set", &bridge_name, "up"])?;
+        info!(bridge = %bridge_name, addr = %bridge_ip, "bridge created");
 
-        nsenter_ip(
-            &ns_path,
-            &[
-                "addr",
-                "add",
-                &format!("{svc_ip}/{svc_prefix}"),
-                "dev",
-                "eth0",
-            ],
-        )?;
-        nsenter_ip(&ns_path, &["link", "set", "eth0", "up"])?;
-        nsenter_ip(
-            &ns_path,
-            &["route", "add", "default", "via", &bridge_ip.to_string()],
-        )?;
+        // Attach each service to this bridge.
+        for svc in net_services {
+            let (svc_ip, svc_prefix) = parse_cidr(&svc.addr)?;
+            let iface_idx = service_iface_count.entry(svc.name.clone()).or_insert(0);
+            let eth_name = format!("eth{iface_idx}");
 
-        info!(service = %svc.name, addr = %svc_ip, ns = %ns_name, "service network configured");
+            // Unique veth host-end name: veth-<svc>-<idx>.
+            let veth_host = format!(
+                "veth-{}-{}",
+                truncate_name(&svc.name, 8),
+                iface_idx
+            );
+            let ns_path = format!("{NETNS_RUN_DIR}/{}", svc.name);
+
+            // Create veth pair inside the namespace, then move host end out.
+            info!(
+                service = %svc.name,
+                network = %net_name,
+                host = %veth_host,
+                iface = %eth_name,
+                "creating veth pair"
+            );
+            nsenter_ip(
+                &ns_path,
+                &[
+                    "link", "add", &veth_host, "type", "veth", "peer", "name", "veth_tmp",
+                ],
+            )?;
+
+            // Move host end from netns to default namespace (PID 1's netns).
+            nsenter_ip(&ns_path, &["link", "set", &veth_host, "netns", "1"])?;
+
+            // Attach host end to bridge and bring up (in default namespace).
+            ip_run(&["link", "set", &veth_host, "master", &bridge_name])?;
+            ip_run(&["link", "set", &veth_host, "up"])?;
+
+            // Configure inside the namespace.
+            if *iface_idx == 0 {
+                nsenter_ip(&ns_path, &["link", "set", "lo", "up"])?;
+            }
+
+            // Rename peer end to ethN.
+            nsenter_ip(
+                &ns_path,
+                &["link", "set", "veth_tmp", "name", &eth_name],
+            )?;
+
+            nsenter_ip(
+                &ns_path,
+                &[
+                    "addr",
+                    "add",
+                    &format!("{svc_ip}/{svc_prefix}"),
+                    "dev",
+                    &eth_name,
+                ],
+            )?;
+            nsenter_ip(&ns_path, &["link", "set", &eth_name, "up"])?;
+
+            // Only add default route once (first network wins).
+            if has_default_route.insert(svc.name.clone()) {
+                nsenter_ip(
+                    &ns_path,
+                    &["route", "add", "default", "via", &bridge_ip.to_string()],
+                )?;
+            }
+
+            *iface_idx += 1;
+
+            info!(
+                service = %svc.name,
+                network = %net_name,
+                addr = %svc_ip,
+                iface = %eth_name,
+                "service network configured"
+            );
+        }
     }
 
     info!(stack_id = %stack_id, "setup_stack_network: complete");
@@ -141,6 +210,9 @@ pub fn setup_stack_network(stack_id: &str, services: &[NetworkServiceConfig]) ->
 }
 
 /// Tear down network resources for a stack.
+///
+/// Removes per-service network namespaces and all bridges created for the
+/// stack (one per network, named `br-<stack_id>-<network_name>`).
 pub fn teardown_stack_network(stack_id: &str, service_names: &[String]) -> io::Result<()> {
     // Remove network namespaces (deletes veth pairs automatically).
     for name in service_names {
@@ -156,9 +228,30 @@ pub fn teardown_stack_network(stack_id: &str, service_names: &[String]) -> io::R
         }
     }
 
-    // Delete the bridge (also removes attached veth host ends).
-    let bridge_name = format!("br-{}", truncate_name(stack_id, 12));
-    let _ = ip_run(&["link", "del", &bridge_name]);
+    // Delete all bridges matching the br-<stack_id>-* pattern.
+    // We enumerate by listing interfaces; alternatively, just try the
+    // well-known prefix. Since bridge names are truncated, list all
+    // interfaces and delete those matching our prefix.
+    let prefix = format!("br-{}-", truncate_name(stack_id, 8));
+    if let Ok(output) = Command::new(IP_BIN)
+        .args(["link", "show", "type", "bridge"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            // Lines look like: "5: br-mystack-default: <BROADCAST,..."
+            if let Some(name_part) = line.split(':').nth(1) {
+                let bridge = name_part.trim();
+                if bridge.starts_with(&prefix) {
+                    let _ = ip_run(&["link", "del", bridge]);
+                }
+            }
+        }
+    }
+
+    // Fallback: also try the legacy single-bridge name for backwards compat.
+    let legacy_bridge = format!("br-{}", truncate_name(stack_id, 12));
+    let _ = ip_run(&["link", "del", &legacy_bridge]);
 
     Ok(())
 }

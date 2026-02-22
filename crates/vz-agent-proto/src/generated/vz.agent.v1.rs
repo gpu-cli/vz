@@ -214,6 +214,9 @@ pub struct NetworkServiceConfig {
     /// CIDR, e.g. "172.20.0.2/24"
     #[prost(string, tag = "2")]
     pub addr: ::prost::alloc::string::String,
+    /// logical network, e.g. "default", "frontend"
+    #[prost(string, tag = "3")]
+    pub network_name: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NetworkSetupRequest {

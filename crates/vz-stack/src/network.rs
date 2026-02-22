@@ -398,6 +398,16 @@ mod tests {
             resources: Default::default(),
             extra_hosts: vec![],
             secrets: vec![],
+            networks: vec![],
+            cap_add: vec![],
+            cap_drop: vec![],
+            privileged: false,
+            read_only: false,
+            sysctls: HashMap::new(),
+            ulimits: vec![],
+            hostname: None,
+            domainname: None,
+            labels: HashMap::new(),
         }
     }
 

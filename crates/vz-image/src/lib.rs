@@ -11,5 +11,7 @@ pub mod puller;
 pub mod store;
 
 pub use error::ImageError;
-pub use puller::{Auth, ImageConfigSummary, ImageId, ImagePuller, parse_image_config_summary_from_store};
+pub use puller::{
+    Auth, ImageConfigSummary, ImageId, ImagePuller, parse_image_config_summary_from_store,
+};
 pub use store::{ImageInfo, ImageStore, LayerDescriptor, PruneResult};

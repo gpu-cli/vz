@@ -467,6 +467,16 @@ mod tests {
             resources: Default::default(),
             extra_hosts: vec![],
             secrets: vec![],
+            networks: vec![],
+            cap_add: vec![],
+            cap_drop: vec![],
+            privileged: false,
+            read_only: false,
+            sysctls: std::collections::HashMap::new(),
+            ulimits: vec![],
+            hostname: None,
+            domainname: None,
+            labels: std::collections::HashMap::new(),
         }
     }
 
