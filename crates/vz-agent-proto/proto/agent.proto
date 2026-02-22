@@ -1,0 +1,221 @@
+// Guest agent gRPC protocol for vz host↔guest communication.
+//
+// Three services covering the full agent API:
+//   - AgentService: general VM ops (exec, ping, system info, port forward)
+//   - OciService:   container lifecycle (create, start, state, exec, kill, delete)
+//   - NetworkService: per-service network namespace management
+//
+// Replaces the JSON+base64 framed protocol in protocol.rs.
+
+syntax = "proto3";
+
+package vz.agent.v1;
+
+// ─── Agent Service ───────────────────────────────────────────────
+
+service AgentService {
+  // Health check.
+  rpc Ping(PingRequest) returns (PingResponse);
+
+  // Query guest system information.
+  rpc SystemInfo(SystemInfoRequest) returns (SystemInfoResponse);
+
+  // Query guest resource usage stats.
+  rpc ResourceStats(ResourceStatsRequest) returns (ResourceStatsResponse);
+
+  // Execute a command in the guest. Returns a stream of stdout/stderr
+  // chunks followed by an exit code.
+  rpc Exec(ExecRequest) returns (stream ExecEvent);
+
+  // Write data to a running exec's stdin.
+  rpc StdinWrite(StdinWriteRequest) returns (StdinWriteResponse);
+
+  // Close a running exec's stdin.
+  rpc StdinClose(StdinCloseRequest) returns (StdinCloseResponse);
+
+  // Send a signal to a running exec.
+  rpc Signal(SignalRequest) returns (SignalResponse);
+
+  // Bidirectional TCP relay through the guest.
+  // Client sends PortForwardOpen as the first frame, then raw data
+  // flows in both directions.
+  rpc PortForward(stream PortForwardFrame) returns (stream PortForwardFrame);
+}
+
+// ─── OCI Container Service ──────────────────────────────────────
+
+service OciService {
+  // Create a container from a prepared OCI bundle.
+  rpc Create(OciCreateRequest) returns (OciCreateResponse);
+
+  // Start a created container.
+  rpc Start(OciStartRequest) returns (OciStartResponse);
+
+  // Query runtime state for a container.
+  rpc State(OciStateRequest) returns (OciStateResponse);
+
+  // Execute a command inside a running container.
+  rpc Exec(OciExecRequest) returns (OciExecResponse);
+
+  // Send a signal to a running container.
+  rpc Kill(OciKillRequest) returns (OciKillResponse);
+
+  // Delete a container from runtime state.
+  rpc Delete(OciDeleteRequest) returns (OciDeleteResponse);
+}
+
+// ─── Network Service ────────────────────────────────────────────
+
+service NetworkService {
+  // Set up per-service network namespaces with bridge and veth pairs.
+  rpc Setup(NetworkSetupRequest) returns (NetworkSetupResponse);
+
+  // Tear down per-service network resources.
+  rpc Teardown(NetworkTeardownRequest) returns (NetworkTeardownResponse);
+}
+
+// ─── Agent Messages ─────────────────────────────────────────────
+
+message PingRequest {}
+message PingResponse {}
+
+message SystemInfoRequest {}
+message SystemInfoResponse {
+  uint32 cpu_count = 1;
+  uint64 memory_bytes = 2;
+  uint64 disk_free_bytes = 3;
+  string os_version = 4;
+}
+
+message ResourceStatsRequest {}
+message ResourceStatsResponse {
+  double cpu_usage_percent = 1;
+  uint64 memory_used_bytes = 2;
+  uint64 memory_total_bytes = 3;
+  uint64 disk_used_bytes = 4;
+  uint64 disk_total_bytes = 5;
+  uint32 process_count = 6;
+  // 1-min, 5-min, 15-min load averages.
+  repeated double load_average = 7;
+}
+
+// ─── Exec ───────────────────────────────────────────────────────
+
+message ExecRequest {
+  string command = 1;
+  repeated string args = 2;
+  string working_dir = 3;     // empty = agent's cwd
+  map<string, string> env = 4;
+  string user = 5;            // empty = agent's user (root)
+}
+
+// Server-streamed event for a running exec. The last event is always
+// exit_code (or error if the command failed to start).
+message ExecEvent {
+  oneof event {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    int32 exit_code = 3;
+    string error = 4;
+  }
+}
+
+message StdinWriteRequest {
+  uint64 exec_id = 1;
+  bytes data = 2;
+}
+message StdinWriteResponse {}
+
+message StdinCloseRequest {
+  uint64 exec_id = 1;
+}
+message StdinCloseResponse {}
+
+message SignalRequest {
+  uint64 exec_id = 1;
+  int32 signal = 2;
+}
+message SignalResponse {}
+
+// ─── Port Forward ───────────────────────────────────────────────
+
+message PortForwardFrame {
+  oneof frame {
+    PortForwardOpen open = 1;
+    bytes data = 2;
+  }
+}
+
+message PortForwardOpen {
+  uint32 target_port = 1;
+  string protocol = 2;       // "tcp" or "udp"
+  string target_host = 3;    // empty = "127.0.0.1"
+}
+
+// ─── OCI Messages ───────────────────────────────────────────────
+
+message OciCreateRequest {
+  string container_id = 1;
+  string bundle_path = 2;
+}
+message OciCreateResponse {}
+
+message OciStartRequest {
+  string container_id = 1;
+}
+message OciStartResponse {}
+
+message OciStateRequest {
+  string container_id = 1;
+}
+message OciStateResponse {
+  string container_id = 1;
+  string status = 2;          // "created", "running", "stopped"
+  uint32 pid = 3;             // 0 if not available
+  string bundle_path = 4;
+}
+
+message OciExecRequest {
+  string container_id = 1;
+  string command = 2;
+  repeated string args = 3;
+  map<string, string> env = 4;
+  string working_dir = 5;
+  string user = 6;
+}
+message OciExecResponse {
+  int32 exit_code = 1;
+  string stdout = 2;
+  string stderr = 3;
+}
+
+message OciKillRequest {
+  string container_id = 1;
+  string signal = 2;          // e.g. "SIGTERM"
+}
+message OciKillResponse {}
+
+message OciDeleteRequest {
+  string container_id = 1;
+  bool force = 2;
+}
+message OciDeleteResponse {}
+
+// ─── Network Messages ───────────────────────────────────────────
+
+message NetworkServiceConfig {
+  string name = 1;            // service name = netns name
+  string addr = 2;            // CIDR, e.g. "172.20.0.2/24"
+}
+
+message NetworkSetupRequest {
+  string stack_id = 1;
+  repeated NetworkServiceConfig services = 2;
+}
+message NetworkSetupResponse {}
+
+message NetworkTeardownRequest {
+  string stack_id = 1;
+  repeated string service_names = 2;
+}
+message NetworkTeardownResponse {}

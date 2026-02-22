@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "vz",
+    "vz-agent-proto",
     "vz-sandbox",
     "vz-cli",
     "vz-guest-agent",
@@ -156,7 +157,12 @@ vz-oci = { path = "vz-oci" }
 vz-oci-macos = { path = "vz-oci-macos" }
 vz-runtime-contract = { path = "vz-runtime-contract" }
 vz-stack = { path = "vz-stack" }
+vz-agent-proto = { path = "vz-agent-proto" }
 vz-validation = { path = "vz-validation" }
+
+# gRPC / Protobuf
+tonic = { version = "0.12", features = ["transport"] }
+prost = "0.13"
 
 [workspace.lints.rust]
 unsafe_code = "warn"
