@@ -193,7 +193,13 @@ fn parse_compose_inner(
         let svc_name = key
             .as_str()
             .ok_or_else(|| StackError::ComposeParse("service name must be a string".into()))?;
-        let svc = parse_service(svc_name, svc_value, &volume_names, &secret_names, compose_dir)?;
+        let svc = parse_service(
+            svc_name,
+            svc_value,
+            &volume_names,
+            &secret_names,
+            compose_dir,
+        )?;
         services.push(svc);
     }
 
@@ -1020,10 +1026,7 @@ fn parse_extra_hosts(
 ///
 /// Only `deploy.resources.limits.cpus` and `deploy.resources.limits.memory`
 /// are accepted. Any other deploy sub-keys are rejected with an error.
-fn parse_deploy(
-    svc_name: &str,
-    map: &serde_yml::Mapping,
-) -> Result<ResourcesSpec, StackError> {
+fn parse_deploy(svc_name: &str, map: &serde_yml::Mapping) -> Result<ResourcesSpec, StackError> {
     let Some(deploy_value) = map.get(val("deploy")) else {
         return Ok(ResourcesSpec::default());
     };
@@ -1033,9 +1036,7 @@ fn parse_deploy(
     }
 
     let deploy_map = deploy_value.as_mapping().ok_or_else(|| {
-        StackError::ComposeParse(format!(
-            "service `{svc_name}`: `deploy` must be a mapping"
-        ))
+        StackError::ComposeParse(format!("service `{svc_name}`: `deploy` must be a mapping"))
     })?;
 
     // Only `resources` is accepted under deploy.
@@ -1069,7 +1070,9 @@ fn parse_deploy(
         if key_str != "limits" {
             return Err(StackError::ComposeUnsupportedFeature {
                 feature: format!("services.{svc_name}.deploy.resources.{key_str}"),
-                reason: "only `deploy.resources.limits` is supported; reservations are not supported".to_string(),
+                reason:
+                    "only `deploy.resources.limits` is supported; reservations are not supported"
+                        .to_string(),
             });
         }
     }
@@ -1131,10 +1134,7 @@ fn parse_deploy(
         })
         .transpose()?;
 
-    Ok(ResourcesSpec {
-        cpus,
-        memory_bytes,
-    })
+    Ok(ResourcesSpec { cpus, memory_bytes })
 }
 
 /// Parse a Docker Compose memory string into bytes.
@@ -1166,9 +1166,7 @@ fn parse_memory_string(svc_name: &str, s: &str) -> Result<u64, StackError> {
     };
 
     let val: u64 = num_str.trim().parse().map_err(|_| {
-        StackError::ComposeParse(format!(
-            "service `{svc_name}`: invalid memory value `{s}`"
-        ))
+        StackError::ComposeParse(format!("service `{svc_name}`: invalid memory value `{s}`"))
     })?;
 
     Ok(val * multiplier)
@@ -2248,7 +2246,10 @@ secrets:
 "#;
         let err = parse_compose(yaml, "myapp").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("external"), "error should mention external: {msg}");
+        assert!(
+            msg.contains("external"),
+            "error should mention external: {msg}"
+        );
     }
 
     #[test]
@@ -2881,10 +2882,7 @@ services:
           memory: "256k"
 "#;
         let spec = parse_compose(yaml, "myapp").unwrap();
-        assert_eq!(
-            spec.services[0].resources.memory_bytes.unwrap(),
-            256 * 1024
-        );
+        assert_eq!(spec.services[0].resources.memory_bytes.unwrap(), 256 * 1024);
     }
 
     #[test]
@@ -2973,10 +2971,22 @@ services:
 
     #[test]
     fn parse_memory_string_variants() {
-        assert_eq!(parse_memory_string("test", "512m").unwrap(), 512 * 1024 * 1024);
-        assert_eq!(parse_memory_string("test", "512M").unwrap(), 512 * 1024 * 1024);
-        assert_eq!(parse_memory_string("test", "1g").unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(parse_memory_string("test", "1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(
+            parse_memory_string("test", "512m").unwrap(),
+            512 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_memory_string("test", "512M").unwrap(),
+            512 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_memory_string("test", "1g").unwrap(),
+            1024 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_memory_string("test", "1G").unwrap(),
+            1024 * 1024 * 1024
+        );
         assert_eq!(parse_memory_string("test", "256k").unwrap(), 256 * 1024);
         assert_eq!(parse_memory_string("test", "256K").unwrap(), 256 * 1024);
         assert_eq!(parse_memory_string("test", "1024").unwrap(), 1024);

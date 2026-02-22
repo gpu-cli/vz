@@ -22,8 +22,8 @@ use crate::volume::ResolvedMount;
 pub fn service_to_run_config(
     spec: &ServiceSpec,
     resolved_mounts: &[ResolvedMount],
-    secret_mounts: &[vz_oci::MountSpec],
-) -> Result<vz_oci::RunConfig, StackError> {
+    secret_mounts: &[vz_runtime_contract::MountSpec],
+) -> Result<vz_runtime_contract::RunConfig, StackError> {
     let cmd = build_cmd(spec);
     let env = convert_env(&spec.environment);
     let ports = convert_ports(&spec.ports)?;
@@ -31,7 +31,7 @@ pub fn service_to_run_config(
     mounts.extend_from_slice(secret_mounts);
     let resources = convert_resources(&spec.resources);
 
-    Ok(vz_oci::RunConfig {
+    Ok(vz_runtime_contract::RunConfig {
         cmd,
         working_dir: spec.working_dir.clone(),
         env,
@@ -44,8 +44,6 @@ pub fn service_to_run_config(
         cpu_period: resources.cpu_period,
         // Stack containers should have networking for inter-service communication.
         network_enabled: Some(true),
-        // Use OCI runtime for full lifecycle (create → start → stop).
-        execution_mode: vz_oci::ExecutionMode::OciRuntime,
         extra_hosts: spec.extra_hosts.clone(),
         // Capture container stdout/stderr to log files for `vz stack logs`.
         capture_logs: true,
@@ -64,14 +62,14 @@ pub fn service_to_run_config(
 pub fn secrets_to_mounts(
     secrets: &[ServiceSecretRef],
     staged_dir: &std::path::Path,
-) -> Vec<vz_oci::MountSpec> {
+) -> Vec<vz_runtime_contract::MountSpec> {
     secrets
         .iter()
-        .map(|s| vz_oci::MountSpec {
+        .map(|s| vz_runtime_contract::MountSpec {
             source: Some(staged_dir.join(&s.source)),
             target: PathBuf::from(format!("/run/secrets/{}", s.target)),
-            mount_type: vz_oci::MountType::Bind,
-            access: vz_oci::MountAccess::ReadOnly,
+            mount_type: vz_runtime_contract::MountType::Bind,
+            access: vz_runtime_contract::MountAccess::ReadOnly,
         })
         .collect()
 }
@@ -109,19 +107,19 @@ fn convert_env(env: &std::collections::HashMap<String, String>) -> Vec<(String, 
 ///
 /// When `host_port` is `None`, the container port is used as the host
 /// port (a simple default; real dynamic allocation is a later bead).
-fn convert_ports(ports: &[PortSpec]) -> Result<Vec<vz_oci::PortMapping>, StackError> {
+fn convert_ports(ports: &[PortSpec]) -> Result<Vec<vz_runtime_contract::PortMapping>, StackError> {
     let mut mappings = Vec::with_capacity(ports.len());
     for port in ports {
         let protocol = match port.protocol.as_str() {
-            "tcp" => vz_oci::PortProtocol::Tcp,
-            "udp" => vz_oci::PortProtocol::Udp,
+            "tcp" => vz_runtime_contract::PortProtocol::Tcp,
+            "udp" => vz_runtime_contract::PortProtocol::Udp,
             other => {
                 return Err(StackError::InvalidSpec(format!(
                     "unsupported port protocol '{other}'"
                 )));
             }
         };
-        mappings.push(vz_oci::PortMapping {
+        mappings.push(vz_runtime_contract::PortMapping {
             host: port.host_port.unwrap_or(port.container_port),
             container: port.container_port,
             protocol,
@@ -132,27 +130,29 @@ fn convert_ports(ports: &[PortSpec]) -> Result<Vec<vz_oci::PortMapping>, StackEr
 }
 
 /// Convert pre-resolved mounts into vz-oci [`MountSpec`] entries.
-fn convert_mounts(resolved: &[ResolvedMount]) -> Vec<vz_oci::MountSpec> {
+fn convert_mounts(resolved: &[ResolvedMount]) -> Vec<vz_runtime_contract::MountSpec> {
     resolved
         .iter()
         .map(|rm| {
             let (mount_type, source) = match &rm.kind {
                 crate::volume::ResolvedMountKind::Bind => {
-                    (vz_oci::MountType::Bind, rm.host_path.clone())
+                    (vz_runtime_contract::MountType::Bind, rm.host_path.clone())
                 }
                 crate::volume::ResolvedMountKind::Named { .. } => {
-                    (vz_oci::MountType::Bind, rm.host_path.clone())
+                    (vz_runtime_contract::MountType::Bind, rm.host_path.clone())
                 }
-                crate::volume::ResolvedMountKind::Ephemeral => (vz_oci::MountType::Tmpfs, None),
+                crate::volume::ResolvedMountKind::Ephemeral => {
+                    (vz_runtime_contract::MountType::Tmpfs, None)
+                }
             };
 
             let access = if rm.read_only {
-                vz_oci::MountAccess::ReadOnly
+                vz_runtime_contract::MountAccess::ReadOnly
             } else {
-                vz_oci::MountAccess::ReadWrite
+                vz_runtime_contract::MountAccess::ReadWrite
             };
 
-            vz_oci::MountSpec {
+            vz_runtime_contract::MountSpec {
                 source,
                 target: PathBuf::from(&rm.target),
                 mount_type,
@@ -244,7 +244,6 @@ mod tests {
         assert_eq!(config.cpus, None);
         assert_eq!(config.memory_mb, None);
         assert_eq!(config.network_enabled, Some(true));
-        assert_eq!(config.execution_mode, vz_oci::ExecutionMode::OciRuntime);
         assert!(config.capture_logs, "stack containers must capture logs");
     }
 
@@ -309,7 +308,10 @@ mod tests {
         assert_eq!(config.ports.len(), 1);
         assert_eq!(config.ports[0].host, 8080);
         assert_eq!(config.ports[0].container, 80);
-        assert_eq!(config.ports[0].protocol, vz_oci::PortProtocol::Tcp);
+        assert_eq!(
+            config.ports[0].protocol,
+            vz_runtime_contract::PortProtocol::Tcp
+        );
     }
 
     #[test]
@@ -321,7 +323,10 @@ mod tests {
             host_port: Some(5353),
         }];
         let config = service_to_run_config(&spec, &[], &[]).unwrap();
-        assert_eq!(config.ports[0].protocol, vz_oci::PortProtocol::Udp);
+        assert_eq!(
+            config.ports[0].protocol,
+            vz_runtime_contract::PortProtocol::Udp
+        );
     }
 
     #[test]
@@ -361,8 +366,14 @@ mod tests {
         assert_eq!(config.mounts.len(), 1);
         assert_eq!(config.mounts[0].source, Some(PathBuf::from("/host/data")));
         assert_eq!(config.mounts[0].target, PathBuf::from("/container/data"));
-        assert_eq!(config.mounts[0].mount_type, vz_oci::MountType::Bind);
-        assert_eq!(config.mounts[0].access, vz_oci::MountAccess::ReadOnly);
+        assert_eq!(
+            config.mounts[0].mount_type,
+            vz_runtime_contract::MountType::Bind
+        );
+        assert_eq!(
+            config.mounts[0].access,
+            vz_runtime_contract::MountAccess::ReadOnly
+        );
     }
 
     #[test]
@@ -377,8 +388,14 @@ mod tests {
         }];
         let spec = minimal_service();
         let config = service_to_run_config(&spec, &resolved, &[]).unwrap();
-        assert_eq!(config.mounts[0].mount_type, vz_oci::MountType::Bind);
-        assert_eq!(config.mounts[0].access, vz_oci::MountAccess::ReadWrite);
+        assert_eq!(
+            config.mounts[0].mount_type,
+            vz_runtime_contract::MountType::Bind
+        );
+        assert_eq!(
+            config.mounts[0].access,
+            vz_runtime_contract::MountAccess::ReadWrite
+        );
     }
 
     #[test]
@@ -391,7 +408,10 @@ mod tests {
         }];
         let spec = minimal_service();
         let config = service_to_run_config(&spec, &resolved, &[]).unwrap();
-        assert_eq!(config.mounts[0].mount_type, vz_oci::MountType::Tmpfs);
+        assert_eq!(
+            config.mounts[0].mount_type,
+            vz_runtime_contract::MountType::Tmpfs
+        );
         assert!(config.mounts[0].source.is_none());
     }
 

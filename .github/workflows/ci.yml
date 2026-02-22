@@ -11,10 +11,15 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Layer 1: Unit tests on Linux (no macOS needed)
+  # Layer 1: Cross-platform crate tests on Linux.
+  # Linux-compatible crates: vz-cli, vz-stack, vz-runtime-contract, vz-linux-native.
+  # macOS-only crates (vz, vz-sandbox, vz-oci, vz-guest-agent) are skipped.
   test-linux:
     name: Test (Linux)
     runs-on: ubuntu-latest
+    env:
+      # Crates that compile on Linux. Update when adding new cross-platform crates.
+      LINUX_CRATES: "-p vz-cli -p vz-stack -p vz-runtime-contract -p vz-linux-native"
     steps:
       - uses: actions/checkout@v4
 
@@ -30,12 +35,20 @@ jobs:
         working-directory: crates
         run: cargo fmt --check --all
 
-      # Note: vz and vz-sandbox are macOS-only (#[cfg(target_os = "macos")]).
-      # On Linux we only check crates that compile cross-platform.
-      # The guest agent depends on vz-sandbox which is macOS-only, so skip it too.
       - name: Check (Linux-compatible crates)
         working-directory: crates
-        run: cargo check -p vz-cli 2>&1 || true
+        run: cargo check $LINUX_CRATES
+
+      - name: Clippy (Linux-compatible crates)
+        working-directory: crates
+        run: cargo clippy $LINUX_CRATES -- -D warnings
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Test (Linux-compatible crates)
+        working-directory: crates
+        run: cargo nextest run $LINUX_CRATES
 
   # Layers 1-2: Full test suite on macOS ARM64
   test-macos:

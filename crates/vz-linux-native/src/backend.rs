@@ -37,12 +37,20 @@ pub struct LinuxNativeBackend {
 struct StackState {
     bridge_name: String,
     services: HashMap<String, ServiceNetState>,
+    port_forwards: Vec<PortForwardRule>,
 }
 
 struct ServiceNetState {
     netns_name: String,
     veth_host: String,
     _addr: String,
+}
+
+struct PortForwardRule {
+    host_port: u16,
+    dest_ip: String,
+    container_port: u16,
+    protocol: String,
 }
 
 impl LinuxNativeBackend {
@@ -322,7 +330,7 @@ impl RuntimeBackend for LinuxNativeBackend {
     async fn boot_shared_vm(
         &self,
         stack_id: &str,
-        _ports: Vec<contract::PortMapping>,
+        ports: Vec<contract::PortMapping>,
     ) -> Result<(), RuntimeError> {
         let mut stacks = self.stacks.lock().await;
         if stacks.contains_key(stack_id) {
@@ -336,24 +344,64 @@ impl RuntimeBackend for LinuxNativeBackend {
             .await
             .map_err(native_err)?;
 
+        // Enable NAT masquerade so containers can reach the internet.
+        network::setup_nat_masquerade(&bridge_name, network::DEFAULT_BRIDGE_SUBNET)
+            .await
+            .map_err(native_err)?;
+
+        // Set up port forwarding (DNAT) for each published port.
+        let mut port_forwards = Vec::new();
+        for pm in &ports {
+            if let Some(ref dest_ip) = pm.target_host {
+                let proto = match pm.protocol {
+                    contract::PortProtocol::Udp => "udp",
+                    contract::PortProtocol::Tcp => "tcp",
+                };
+                network::setup_port_forward(pm.host, dest_ip, pm.container, proto)
+                    .await
+                    .map_err(native_err)?;
+                port_forwards.push(PortForwardRule {
+                    host_port: pm.host,
+                    dest_ip: dest_ip.clone(),
+                    container_port: pm.container,
+                    protocol: proto.to_string(),
+                });
+            }
+        }
+
         stacks.insert(
             stack_id.to_string(),
             StackState {
                 bridge_name,
                 services: HashMap::new(),
+                port_forwards,
             },
         );
 
-        info!(stack_id, "stack network initialized");
+        info!(stack_id, ports = ports.len(), "stack network initialized");
         Ok(())
     }
 
     async fn create_container_in_stack(
         &self,
-        _stack_id: &str,
+        stack_id: &str,
         image: &str,
-        config: contract::RunConfig,
+        mut config: contract::RunConfig,
     ) -> Result<String, RuntimeError> {
+        // The executor sets network_namespace_path to /var/run/netns/{service_name},
+        // but our netns names are vz-{stack_id}-{service_name}. Look up the correct
+        // name from the stacks map and override the path.
+        if let Some(ref ns_path) = config.network_namespace_path {
+            if let Some(service_name) = ns_path.rsplit('/').next() {
+                let stacks = self.stacks.lock().await;
+                if let Some(stack) = stacks.get(stack_id) {
+                    if let Some(svc) = stack.services.get(service_name) {
+                        config.network_namespace_path =
+                            Some(format!("/var/run/netns/{}", svc.netns_name));
+                    }
+                }
+            }
+        }
         self.create_container(image, config).await
     }
 
@@ -430,6 +478,22 @@ impl RuntimeBackend for LinuxNativeBackend {
         let Some(stack) = stacks.remove(stack_id) else {
             return Ok(());
         };
+
+        // Tear down port forwards.
+        for pf in &stack.port_forwards {
+            let _ = network::teardown_port_forward(
+                pf.host_port,
+                &pf.dest_ip,
+                pf.container_port,
+                &pf.protocol,
+            )
+            .await;
+        }
+
+        // Tear down NAT masquerade.
+        let _ =
+            network::teardown_nat_masquerade(&stack.bridge_name, network::DEFAULT_BRIDGE_SUBNET)
+                .await;
 
         // Tear down all services.
         for (name, svc) in &stack.services {

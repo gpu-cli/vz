@@ -2,16 +2,26 @@
 
 use std::path::PathBuf;
 use std::process;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use clap::{Args, Subcommand, ValueEnum};
 use std::fmt;
-use tokio::time::sleep;
 use tracing::info;
 
-use vz_oci::{ExecConfig, MountAccess, MountSpec, MountType, PortMapping, PortProtocol, RunConfig};
+// Platform-specific type imports for cross-platform parsing helpers.
+#[cfg(target_os = "macos")]
+use vz_oci::{MountAccess, MountSpec, MountType, PortMapping, PortProtocol};
+#[cfg(not(target_os = "macos"))]
+use vz_runtime_contract::{MountAccess, MountSpec, MountType, PortMapping, PortProtocol};
 
+#[cfg(target_os = "macos")]
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "macos")]
+use tokio::time::sleep;
+
+#[cfg(target_os = "macos")]
 const DETACH_START_TIMEOUT: Duration = Duration::from_secs(12);
+#[cfg(target_os = "macos")]
 const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// OCI runtime top-level command and shared options.
@@ -262,6 +272,25 @@ pub struct RmArgs {
 
 /// Entry point for `vz oci`.
 pub async fn run(args: OciArgs) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        run_macos(args).await
+    }
+    #[cfg(target_os = "linux")]
+    {
+        run_linux(args).await
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = args;
+        anyhow::bail!("OCI commands are not supported on this platform")
+    }
+}
+
+// ── macOS implementation (uses vz_oci::Runtime directly) ──────────
+
+#[cfg(target_os = "macos")]
+async fn run_macos(args: OciArgs) -> anyhow::Result<()> {
     let runtime = build_runtime(&args)?;
 
     match args.action {
@@ -277,6 +306,7 @@ pub async fn run(args: OciArgs) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn build_runtime(args: &OciArgs) -> anyhow::Result<vz_oci::Runtime> {
     if args.username.is_some() && args.password.is_none() {
         anyhow::bail!("--username requires --password");
@@ -309,6 +339,7 @@ fn build_runtime(args: &OciArgs) -> anyhow::Result<vz_oci::Runtime> {
     Ok(vz_oci::Runtime::new(config))
 }
 
+#[cfg(target_os = "macos")]
 async fn pull_image(runtime: &vz_oci::Runtime, args: PullArgs) -> anyhow::Result<()> {
     info!(image = %args.image, "pulling OCI image");
     let image_id = runtime.pull(&args.image).await?;
@@ -320,6 +351,7 @@ async fn pull_image(runtime: &vz_oci::Runtime, args: PullArgs) -> anyhow::Result
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 async fn run_image(runtime: vz_oci::Runtime, args: RunArgs) -> anyhow::Result<()> {
     if args.detach && !args.internal_detached_child {
         return run_image_detached_parent(&runtime, &args).await;
@@ -347,6 +379,7 @@ async fn run_image(runtime: vz_oci::Runtime, args: RunArgs) -> anyhow::Result<()
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 async fn run_image_detached_parent(
     runtime: &vz_oci::Runtime,
     args: &RunArgs,
@@ -404,13 +437,14 @@ async fn run_image_detached_parent(
     }
 }
 
+#[cfg(target_os = "macos")]
 async fn create_container(runtime: &vz_oci::Runtime, args: CreateArgs) -> anyhow::Result<()> {
     let env = parse_env_vars(&args.env)?;
     let ports = parse_port_mappings(&args.publish)?;
     let mounts = parse_volume_mounts(&args.volume)?;
     let network_enabled = if args.no_network { Some(false) } else { None };
 
-    let run_config = RunConfig {
+    let run_config = vz_oci::RunConfig {
         cmd: args.command.clone(),
         working_dir: args.workdir,
         env,
@@ -443,11 +477,12 @@ async fn create_container(runtime: &vz_oci::Runtime, args: CreateArgs) -> anyhow
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 async fn exec_container(runtime: &vz_oci::Runtime, args: ExecArgs) -> anyhow::Result<()> {
     let env = parse_env_vars(&args.env)?;
     let timeout = args.timeout_secs.map(Duration::from_secs);
 
-    let exec_config = ExecConfig {
+    let exec_config = vz_oci::ExecConfig {
         cmd: args.command,
         working_dir: args.workdir,
         env,
@@ -470,6 +505,7 @@ async fn exec_container(runtime: &vz_oci::Runtime, args: ExecArgs) -> anyhow::Re
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn list_images(runtime: &vz_oci::Runtime) -> anyhow::Result<()> {
     let images = runtime.images()?;
 
@@ -487,6 +523,7 @@ fn list_images(runtime: &vz_oci::Runtime) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn prune_images(runtime: &vz_oci::Runtime) -> anyhow::Result<()> {
     let result = runtime.prune_images()?;
 
@@ -501,6 +538,7 @@ fn prune_images(runtime: &vz_oci::Runtime) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn list_containers(runtime: &vz_oci::Runtime) -> anyhow::Result<()> {
     let containers = runtime.list_containers()?;
 
@@ -530,6 +568,7 @@ fn list_containers(runtime: &vz_oci::Runtime) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 async fn stop_container(runtime: &vz_oci::Runtime, args: StopArgs) -> anyhow::Result<()> {
     let container = runtime.stop_container(&args.id, args.force).await?;
     match container.status {
@@ -547,13 +586,15 @@ async fn stop_container(runtime: &vz_oci::Runtime, args: StopArgs) -> anyhow::Re
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 async fn remove_container(runtime: &vz_oci::Runtime, args: RmArgs) -> anyhow::Result<()> {
     runtime.remove_container(&args.id).await?;
     println!("Removed container {id}", id = args.id);
     Ok(())
 }
 
-fn build_run_config(args: &RunArgs) -> anyhow::Result<RunConfig> {
+#[cfg(target_os = "macos")]
+fn build_run_config(args: &RunArgs) -> anyhow::Result<vz_oci::RunConfig> {
     let env = parse_env_vars(&args.env)?;
     let ports = parse_port_mappings(&args.publish)?;
     let mounts = parse_volume_mounts(&args.volume)?;
@@ -561,7 +602,7 @@ fn build_run_config(args: &RunArgs) -> anyhow::Result<RunConfig> {
     let network_enabled = if args.no_network { Some(false) } else { None };
     let timeout = args.timeout_secs.map(Duration::from_secs);
 
-    Ok(RunConfig {
+    Ok(vz_oci::RunConfig {
         cmd: args.command.clone(),
         working_dir: args.workdir.clone(),
         env,
@@ -585,6 +626,7 @@ fn build_run_config(args: &RunArgs) -> anyhow::Result<RunConfig> {
     })
 }
 
+#[cfg(target_os = "macos")]
 impl From<ExecutionModeArg> for vz_oci::ExecutionMode {
     fn from(value: ExecutionModeArg) -> Self {
         match value {
@@ -594,6 +636,7 @@ impl From<ExecutionModeArg> for vz_oci::ExecutionMode {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn generate_detached_container_id() -> String {
     let millis = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_millis(),
@@ -602,6 +645,229 @@ fn generate_detached_container_id() -> String {
 
     format!("ctr-{millis}-{}", process::id())
 }
+
+// ── Linux implementation (uses LinuxNativeBackend) ────────────────
+
+#[cfg(target_os = "linux")]
+async fn run_linux(args: OciArgs) -> anyhow::Result<()> {
+    use vz_linux_native::{LinuxNativeBackend, LinuxNativeConfig};
+    use vz_runtime_contract::RuntimeBackend;
+
+    let mut config = LinuxNativeConfig::default();
+    if let Some(ref path) = args.data_dir {
+        config.data_dir = path.clone();
+    }
+    let backend = LinuxNativeBackend::new(config);
+
+    match args.action {
+        OciCommand::Pull(pull_args) => {
+            info!(image = %pull_args.image, "pulling OCI image");
+            let image_id = backend
+                .pull(&pull_args.image)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!(
+                "Pulled {image} as {id}",
+                image = pull_args.image,
+                id = image_id
+            );
+            Ok(())
+        }
+        OciCommand::Run(run_args) => {
+            let env = parse_env_vars(&run_args.env)?;
+            let ports = parse_port_mappings(&run_args.publish)?;
+            let mounts = parse_volume_mounts(&run_args.volume)?;
+            let network_enabled = if run_args.no_network {
+                Some(false)
+            } else {
+                None
+            };
+            let timeout = run_args.timeout_secs.map(Duration::from_secs);
+
+            let config = vz_runtime_contract::RunConfig {
+                cmd: run_args.command.clone(),
+                working_dir: run_args.workdir.clone(),
+                env,
+                user: run_args.user.clone(),
+                ports,
+                mounts,
+                cpus: run_args.cpus,
+                memory_mb: run_args.memory_mb,
+                network_enabled,
+                timeout,
+                container_id: run_args.internal_container_id.clone(),
+                ..Default::default()
+            };
+
+            info!(image = %run_args.image, command = ?run_args.command, "running OCI container");
+            let output = backend
+                .run(&run_args.image, config)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            if !output.stdout.is_empty() {
+                print!("{}", output.stdout);
+            }
+            if !output.stderr.is_empty() {
+                eprint!("{}", output.stderr);
+            }
+            if output.exit_code != 0 {
+                println!("container exited with code {}", output.exit_code);
+                process::exit(output.exit_code.rem_euclid(256));
+            }
+            println!("container completed successfully");
+            Ok(())
+        }
+        OciCommand::Create(create_args) => {
+            let env = parse_env_vars(&create_args.env)?;
+            let ports = parse_port_mappings(&create_args.publish)?;
+            let mounts = parse_volume_mounts(&create_args.volume)?;
+            let network_enabled = if create_args.no_network {
+                Some(false)
+            } else {
+                None
+            };
+
+            let config = vz_runtime_contract::RunConfig {
+                cmd: create_args.command.clone(),
+                working_dir: create_args.workdir,
+                env,
+                user: create_args.user,
+                ports,
+                mounts,
+                cpus: create_args.cpus,
+                memory_mb: create_args.memory_mb,
+                network_enabled,
+                container_id: create_args.name,
+                init_process: if create_args.command.is_empty() {
+                    None
+                } else {
+                    Some(create_args.command)
+                },
+                ..Default::default()
+            };
+
+            info!(image = %create_args.image, "creating long-lived container");
+            let container_id = backend
+                .create_container(&create_args.image, config)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("{container_id}");
+            Ok(())
+        }
+        OciCommand::Exec(exec_args) => {
+            let env = parse_env_vars(&exec_args.env)?;
+            let timeout = exec_args.timeout_secs.map(Duration::from_secs);
+
+            let config = vz_runtime_contract::ExecConfig {
+                cmd: exec_args.command,
+                working_dir: exec_args.workdir,
+                env,
+                user: exec_args.user,
+                timeout,
+            };
+
+            let output = backend
+                .exec_container(&exec_args.id, config)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            if !output.stdout.is_empty() {
+                print!("{}", output.stdout);
+            }
+            if !output.stderr.is_empty() {
+                eprint!("{}", output.stderr);
+            }
+            if output.exit_code != 0 {
+                process::exit(output.exit_code.rem_euclid(256));
+            }
+            Ok(())
+        }
+        OciCommand::Images => {
+            let images = backend.images().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            if images.is_empty() {
+                println!("No cached images");
+                return Ok(());
+            }
+
+            println!("{:<35} IMAGE ID", "REFERENCE");
+            println!("{}", "-".repeat(70));
+            for image in images {
+                println!("{:<35} {}", image.reference, image.image_id);
+            }
+            Ok(())
+        }
+        OciCommand::Prune => {
+            let result = backend.prune_images().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            println!(
+                "Prune complete: {} refs, {} manifests, {} configs, {} layer dirs",
+                result.removed_refs,
+                result.removed_manifests,
+                result.removed_configs,
+                result.removed_layer_dirs,
+            );
+            Ok(())
+        }
+        OciCommand::Ps => {
+            let containers = backend
+                .list_containers()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            if containers.is_empty() {
+                println!("No containers tracked");
+                return Ok(());
+            }
+
+            println!("{:<20} {:<35} {:<10} CREATED", "ID", "IMAGE", "STATUS");
+            println!("{}", "-".repeat(90));
+
+            for container in containers {
+                let status = match container.status {
+                    vz_runtime_contract::ContainerStatus::Created => "created".to_string(),
+                    vz_runtime_contract::ContainerStatus::Running => "running".to_string(),
+                    vz_runtime_contract::ContainerStatus::Stopped { exit_code } => {
+                        format!("stopped (exit {exit_code})")
+                    }
+                };
+                println!(
+                    "{:<20} {:<35} {:<10} {}",
+                    container.id, container.image, status, container.created_unix_secs
+                );
+            }
+            Ok(())
+        }
+        OciCommand::Stop(stop_args) => {
+            let container = backend
+                .stop_container(&stop_args.id, stop_args.force)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            match container.status {
+                vz_runtime_contract::ContainerStatus::Running => {
+                    println!("Container {} remains running", stop_args.id);
+                }
+                vz_runtime_contract::ContainerStatus::Created => {
+                    println!("Container {} is created but not running", stop_args.id);
+                }
+                vz_runtime_contract::ContainerStatus::Stopped { exit_code } => {
+                    println!("Stopped container {} (exit {exit_code})", stop_args.id);
+                }
+            }
+            Ok(())
+        }
+        OciCommand::Rm(rm_args) => {
+            backend
+                .remove_container(&rm_args.id)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Removed container {id}", id = rm_args.id);
+            Ok(())
+        }
+    }
+}
+
+// ── Cross-platform parsing helpers ────────────────────────────────
 
 fn parse_env_vars(vars: &[String]) -> anyhow::Result<Vec<(String, String)>> {
     let mut env = Vec::with_capacity(vars.len());
@@ -746,6 +1012,7 @@ mod tests {
         assert!(mapping.is_err());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn build_run_config_sets_internal_container_id() {
         let args = RunArgs {

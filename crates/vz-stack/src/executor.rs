@@ -24,7 +24,7 @@ use crate::volume::VolumeManager;
 
 /// Trait abstracting container lifecycle operations.
 ///
-/// The real implementation wraps `vz_oci::Runtime` (which is async);
+/// The real implementation wraps `vz_runtime_contract::Runtime` (which is async);
 /// tests use a synchronous mock. The CLI layer bridges async by
 /// calling `block_on` around the real runtime methods.
 pub trait ContainerRuntime {
@@ -33,7 +33,11 @@ pub trait ContainerRuntime {
 
     /// Create and start a container from the given image with the given config.
     /// Returns the container ID.
-    fn create(&self, image: &str, config: vz_oci::RunConfig) -> Result<String, StackError>;
+    fn create(
+        &self,
+        image: &str,
+        config: vz_runtime_contract::RunConfig,
+    ) -> Result<String, StackError>;
 
     /// Stop a running container. No-op if already stopped.
     fn stop(&self, container_id: &str) -> Result<(), StackError>;
@@ -61,7 +65,7 @@ pub trait ContainerRuntime {
     fn boot_shared_vm(
         &self,
         _stack_id: &str,
-        _ports: &[vz_oci::PortMapping],
+        _ports: &[vz_runtime_contract::PortMapping],
     ) -> Result<(), StackError> {
         Ok(())
     }
@@ -74,7 +78,7 @@ pub trait ContainerRuntime {
     fn network_setup(
         &self,
         _stack_id: &str,
-        _services: &[vz_oci::NetworkServiceConfig],
+        _services: &[vz_runtime_contract::NetworkServiceConfig],
     ) -> Result<(), StackError> {
         Ok(())
     }
@@ -95,7 +99,7 @@ pub trait ContainerRuntime {
         &self,
         stack_id: &str,
         image: &str,
-        config: vz_oci::RunConfig,
+        config: vz_runtime_contract::RunConfig,
     ) -> Result<String, StackError> {
         let _ = stack_id;
         // Default: fall back to individual VM per container.
@@ -285,7 +289,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             // Each port's target_host is set to the service IP so the guest
             // agent forwards connections through the bridge to the correct
             // per-service network namespace.
-            let all_ports: Vec<vz_oci::PortMapping> = spec
+            let all_ports: Vec<vz_runtime_contract::PortMapping> = spec
                 .services
                 .iter()
                 .enumerate()
@@ -293,10 +297,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     let service_ip = format!("172.20.0.{}", i + 2);
                     svc.ports.iter().map(move |p| {
                         let protocol = match p.protocol.as_str() {
-                            "udp" => vz_oci::PortProtocol::Udp,
-                            _ => vz_oci::PortProtocol::Tcp,
+                            "udp" => vz_runtime_contract::PortProtocol::Udp,
+                            _ => vz_runtime_contract::PortProtocol::Tcp,
                         };
-                        vz_oci::PortMapping {
+                        vz_runtime_contract::PortMapping {
                             host: p.host_port.unwrap_or(p.container_port),
                             container: p.container_port,
                             protocol,
@@ -310,11 +314,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             self.runtime.boot_shared_vm(&spec.name, &all_ports)?;
 
             // Set up per-service network namespaces.
-            let network_services: Vec<vz_oci::NetworkServiceConfig> = spec
+            let network_services: Vec<vz_runtime_contract::NetworkServiceConfig> = spec
                 .services
                 .iter()
                 .enumerate()
-                .map(|(i, svc)| vz_oci::NetworkServiceConfig {
+                .map(|(i, svc)| vz_runtime_contract::NetworkServiceConfig {
                     name: svc.name.clone(),
                     // 172.20.0.1 = bridge, services start at .2
                     addr: format!("172.20.0.{}/24", i + 2),
@@ -462,8 +466,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         };
 
         // Convert ServiceSpec → RunConfig.
-        let mut run_config =
-            service_to_run_config(svc_spec, &resolved_mounts, &secret_mounts)?;
+        let mut run_config = service_to_run_config(svc_spec, &resolved_mounts, &secret_mounts)?;
 
         // Override ports with resolved allocations.
         // In shared VM mode, set target_host to the service IP so port
@@ -482,10 +485,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             .iter()
             .map(|p| {
                 let protocol = match p.protocol.as_str() {
-                    "udp" => vz_oci::PortProtocol::Udp,
-                    _ => vz_oci::PortProtocol::Tcp,
+                    "udp" => vz_runtime_contract::PortProtocol::Udp,
+                    _ => vz_runtime_contract::PortProtocol::Tcp,
                 };
-                vz_oci::PortMapping {
+                vz_runtime_contract::PortMapping {
                     host: p.host_port,
                     container: p.container_port,
                     protocol,
@@ -688,10 +691,10 @@ pub(crate) mod tests_support {
         /// Tracks which stacks have a shared VM running.
         shared_vms: std::cell::RefCell<HashSet<String>>,
         /// Captured RunConfigs from create_in_stack calls, keyed by container_id.
-        pub captured_configs: std::cell::RefCell<Vec<(String, vz_oci::RunConfig)>>,
+        pub captured_configs: std::cell::RefCell<Vec<(String, vz_runtime_contract::RunConfig)>>,
         /// Captured NetworkServiceConfigs from network_setup calls.
         pub captured_network_services:
-            std::cell::RefCell<Vec<(String, Vec<vz_oci::NetworkServiceConfig>)>>,
+            std::cell::RefCell<Vec<(String, Vec<vz_runtime_contract::NetworkServiceConfig>)>>,
     }
 
     impl MockContainerRuntime {
@@ -734,7 +737,11 @@ pub(crate) mod tests_support {
             Ok(format!("sha256:{image}"))
         }
 
-        fn create(&self, image: &str, config: vz_oci::RunConfig) -> Result<String, StackError> {
+        fn create(
+            &self,
+            image: &str,
+            config: vz_runtime_contract::RunConfig,
+        ) -> Result<String, StackError> {
             self.calls
                 .borrow_mut()
                 .push(("create".to_string(), image.to_string()));
@@ -781,7 +788,7 @@ pub(crate) mod tests_support {
         fn boot_shared_vm(
             &self,
             stack_id: &str,
-            ports: &[vz_oci::PortMapping],
+            ports: &[vz_runtime_contract::PortMapping],
         ) -> Result<(), StackError> {
             self.calls.borrow_mut().push((
                 "boot_shared_vm".to_string(),
@@ -802,7 +809,7 @@ pub(crate) mod tests_support {
         fn network_setup(
             &self,
             stack_id: &str,
-            services: &[vz_oci::NetworkServiceConfig],
+            services: &[vz_runtime_contract::NetworkServiceConfig],
         ) -> Result<(), StackError> {
             self.calls.borrow_mut().push((
                 "network_setup".to_string(),
@@ -838,7 +845,7 @@ pub(crate) mod tests_support {
             &self,
             stack_id: &str,
             image: &str,
-            config: vz_oci::RunConfig,
+            config: vz_runtime_contract::RunConfig,
         ) -> Result<String, StackError> {
             self.calls
                 .borrow_mut()

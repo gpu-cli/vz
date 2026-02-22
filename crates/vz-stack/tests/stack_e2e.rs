@@ -11,21 +11,28 @@
 //!
 //! Run with: `cargo nextest run -p vz-stack --test stack_e2e -- --ignored`
 
+#![cfg(target_os = "macos")]
 #![allow(clippy::unwrap_used)]
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use vz_oci::{ExecConfig, RuntimeConfig};
+use vz_oci::{MacosRuntimeBackend, RuntimeConfig};
+use vz_runtime_contract::{
+    ExecConfig, NetworkServiceConfig, PortMapping, RunConfig, RuntimeBackend,
+};
 use vz_stack::{
     Action, ContainerRuntime, OrchestrationConfig, StackError, StackEvent, StackExecutor,
     StackOrchestrator, StateStore, apply, parse_compose,
 };
 
-/// Bridge the async `vz_oci::Runtime` to the sync `ContainerRuntime` trait.
+/// Bridge the async [`MacosRuntimeBackend`] to the sync [`ContainerRuntime`] trait.
+///
+/// Uses `MacosRuntimeBackend` (which implements `RuntimeBackend` with contract types)
+/// rather than `vz_oci::Runtime` directly, avoiding manual type conversions.
 struct OciContainerRuntime {
-    runtime: vz_oci::Runtime,
+    backend: MacosRuntimeBackend,
     handle: tokio::runtime::Handle,
 }
 
@@ -38,8 +45,9 @@ impl OciContainerRuntime {
             exec_timeout: Duration::from_secs(30),
             ..RuntimeConfig::default()
         };
+        let runtime = vz_oci::Runtime::new(config);
         Self {
-            runtime: vz_oci::Runtime::new(config),
+            backend: MacosRuntimeBackend::new(runtime),
             handle: tokio::runtime::Handle::current(),
         }
     }
@@ -50,7 +58,7 @@ impl OciContainerRuntime {
         tokio::task::block_in_place(|| {
             let out = self
                 .handle
-                .block_on(self.runtime.exec_container(
+                .block_on(self.backend.exec_container(
                     container_id,
                     ExecConfig {
                         cmd,
@@ -62,23 +70,21 @@ impl OciContainerRuntime {
             (out.exit_code, out.stdout, out.stderr)
         })
     }
-
 }
 
 impl ContainerRuntime for OciContainerRuntime {
     fn pull(&self, image: &str) -> Result<String, StackError> {
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.runtime.pull(image))
-                .map(|id| id.0)
+                .block_on(self.backend.pull(image))
                 .map_err(|e| StackError::Network(format!("pull failed: {e}")))
         })
     }
 
-    fn create(&self, image: &str, config: vz_oci::RunConfig) -> Result<String, StackError> {
+    fn create(&self, image: &str, config: RunConfig) -> Result<String, StackError> {
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.runtime.create_container(image, config))
+                .block_on(self.backend.create_container(image, config))
                 .map_err(|e| StackError::Network(format!("create failed: {e}")))
         })
     }
@@ -86,7 +92,7 @@ impl ContainerRuntime for OciContainerRuntime {
     fn stop(&self, container_id: &str) -> Result<(), StackError> {
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.runtime.stop_container(container_id, false))
+                .block_on(self.backend.stop_container(container_id, false))
                 .map(|_| ())
                 .map_err(|e| StackError::Network(format!("stop failed: {e}")))
         })
@@ -95,7 +101,7 @@ impl ContainerRuntime for OciContainerRuntime {
     fn remove(&self, container_id: &str) -> Result<(), StackError> {
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.runtime.remove_container(container_id))
+                .block_on(self.backend.remove_container(container_id))
                 .map_err(|e| StackError::Network(format!("remove failed: {e}")))
         })
     }
@@ -107,20 +113,16 @@ impl ContainerRuntime for OciContainerRuntime {
                 ..ExecConfig::default()
             };
             self.handle
-                .block_on(self.runtime.exec_container(container_id, exec_config))
+                .block_on(self.backend.exec_container(container_id, exec_config))
                 .map(|output| output.exit_code)
                 .map_err(|e| StackError::Network(format!("exec failed: {e}")))
         })
     }
 
-    fn boot_shared_vm(
-        &self,
-        stack_id: &str,
-        ports: &[vz_oci::PortMapping],
-    ) -> Result<(), StackError> {
+    fn boot_shared_vm(&self, stack_id: &str, ports: &[PortMapping]) -> Result<(), StackError> {
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.runtime.boot_shared_vm(stack_id, ports.to_vec()))
+                .block_on(self.backend.boot_shared_vm(stack_id, ports.to_vec()))
                 .map_err(|e| StackError::Network(format!("boot_shared_vm failed: {e}")))
         })
     }
@@ -128,24 +130,20 @@ impl ContainerRuntime for OciContainerRuntime {
     fn network_setup(
         &self,
         stack_id: &str,
-        services: &[vz_oci::NetworkServiceConfig],
+        services: &[NetworkServiceConfig],
     ) -> Result<(), StackError> {
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.runtime.network_setup(stack_id, services.to_vec()))
+                .block_on(self.backend.network_setup(stack_id, services.to_vec()))
                 .map_err(|e| StackError::Network(format!("network_setup failed: {e}")))
         })
     }
 
-    fn network_teardown(
-        &self,
-        stack_id: &str,
-        service_names: &[String],
-    ) -> Result<(), StackError> {
+    fn network_teardown(&self, stack_id: &str, service_names: &[String]) -> Result<(), StackError> {
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(
-                    self.runtime
+                    self.backend
                         .network_teardown(stack_id, service_names.to_vec()),
                 )
                 .map_err(|e| StackError::Network(format!("network_teardown failed: {e}")))
@@ -156,12 +154,12 @@ impl ContainerRuntime for OciContainerRuntime {
         &self,
         stack_id: &str,
         image: &str,
-        config: vz_oci::RunConfig,
+        config: RunConfig,
     ) -> Result<String, StackError> {
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(
-                    self.runtime
+                    self.backend
                         .create_container_in_stack(stack_id, image, config),
                 )
                 .map_err(|e| StackError::Network(format!("create_in_stack failed: {e}")))
@@ -171,16 +169,13 @@ impl ContainerRuntime for OciContainerRuntime {
     fn shutdown_shared_vm(&self, stack_id: &str) -> Result<(), StackError> {
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.runtime.shutdown_shared_vm(stack_id))
+                .block_on(self.backend.shutdown_shared_vm(stack_id))
                 .map_err(|e| StackError::Network(format!("shutdown_shared_vm failed: {e}")))
         })
     }
 
     fn has_shared_vm(&self, stack_id: &str) -> bool {
-        tokio::task::block_in_place(|| {
-            self.handle
-                .block_on(self.runtime.has_shared_vm(stack_id))
-        })
+        self.backend.has_shared_vm(stack_id)
     }
 }
 
@@ -536,10 +531,8 @@ services:
     );
 
     // Verify Redis: run PING via redis-cli.
-    let (exit_code, stdout, _) = rt.exec_with_output(
-        cache_container_id,
-        vec!["redis-cli".into(), "PING".into()],
-    );
+    let (exit_code, stdout, _) =
+        rt.exec_with_output(cache_container_id, vec!["redis-cli".into(), "PING".into()]);
     assert_eq!(exit_code, 0, "redis-cli PING should succeed");
     assert!(
         stdout.contains("PONG"),

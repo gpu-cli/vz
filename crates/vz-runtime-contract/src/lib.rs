@@ -35,10 +35,7 @@ pub trait RuntimeBackend: Send + Sync {
     // ── Image operations ──────────────────────────────────────────
 
     /// Pull an image from a registry and return its image ID (digest).
-    fn pull(
-        &self,
-        image: &str,
-    ) -> impl Future<Output = Result<String, RuntimeError>>;
+    fn pull(&self, image: &str) -> impl Future<Output = Result<String, RuntimeError>>;
 
     /// List locally cached images.
     fn images(&self) -> Result<Vec<ImageInfo>, RuntimeError>;
@@ -81,10 +78,7 @@ pub trait RuntimeBackend: Send + Sync {
     ) -> impl Future<Output = Result<ContainerInfo, RuntimeError>>;
 
     /// Remove a stopped container and clean up its resources.
-    fn remove_container(
-        &self,
-        id: &str,
-    ) -> impl Future<Output = Result<(), RuntimeError>>;
+    fn remove_container(&self, id: &str) -> impl Future<Output = Result<(), RuntimeError>>;
 
     /// List all tracked containers.
     fn list_containers(&self) -> Result<Vec<ContainerInfo>, RuntimeError>;
@@ -147,10 +141,7 @@ pub trait RuntimeBackend: Send + Sync {
     }
 
     /// Retrieve captured logs from a container.
-    fn logs(
-        &self,
-        _container_id: &str,
-    ) -> Result<ContainerLogs, RuntimeError> {
+    fn logs(&self, _container_id: &str) -> Result<ContainerLogs, RuntimeError> {
         Ok(ContainerLogs::default())
     }
 }

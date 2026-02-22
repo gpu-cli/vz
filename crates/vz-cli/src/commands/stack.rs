@@ -2,8 +2,8 @@
 //!
 //! Provides `up`, `down`, `ps`, `events`, `logs`, and `exec` subcommands
 //! backed by the `vz-stack` control plane. The [`OciContainerRuntime`]
-//! bridges the async `vz_oci::Runtime` to the sync [`ContainerRuntime`]
-//! trait using `block_in_place` + `block_on`.
+//! bridges the async [`RuntimeBackend`](vz_runtime_contract::RuntimeBackend)
+//! to the sync [`ContainerRuntime`] trait using `block_in_place` + `block_on`.
 //!
 //! ## Exec Architecture
 //!
@@ -25,6 +25,9 @@ use vz_stack::{
     OrchestrationConfig, RoundReport, ServiceObservedState, ServicePhase, StackError, StackEvent,
     StackExecutor, StackOrchestrator, StackSpec, StateStore, parse_compose_with_dir,
 };
+
+/// Log file path inside the container.
+const CONTAINER_LOG_FILE: &str = "/var/log/vz-oci/output.log";
 
 /// Manage multi-service stacks from Compose files.
 #[derive(Args, Debug)]
@@ -232,27 +235,49 @@ pub async fn run(args: StackArgs) -> anyhow::Result<()> {
     }
 }
 
+// ── Platform backend type alias ───────────────────────────────────
+
+#[cfg(target_os = "macos")]
+type PlatformBackend = vz_oci::MacosRuntimeBackend;
+
+#[cfg(target_os = "linux")]
+type PlatformBackend = vz_linux_native::LinuxNativeBackend;
+
 // ── OCI container runtime bridge ──────────────────────────────────
 
-/// Bridges the async `vz_oci::Runtime` to the sync [`ContainerRuntime`] trait.
+/// Bridges the async [`RuntimeBackend`](vz_runtime_contract::RuntimeBackend)
+/// to the sync [`ContainerRuntime`] trait.
 ///
 /// Each method uses `tokio::task::block_in_place` + `Handle::block_on`
-/// to call async OCI runtime methods from within the synchronous
+/// to call async runtime backend methods from within the synchronous
 /// executor context.
 struct OciContainerRuntime {
-    runtime: vz_oci::Runtime,
+    backend: PlatformBackend,
     handle: tokio::runtime::Handle,
 }
 
 impl OciContainerRuntime {
+    #[cfg(target_os = "macos")]
     fn new(oci_data_dir: &Path) -> anyhow::Result<Self> {
         let config = vz_oci::RuntimeConfig {
             data_dir: oci_data_dir.to_path_buf(),
             ..Default::default()
         };
         let runtime = vz_oci::Runtime::new(config);
+        let backend = vz_oci::MacosRuntimeBackend::new(runtime);
         let handle = tokio::runtime::Handle::current();
-        Ok(Self { runtime, handle })
+        Ok(Self { backend, handle })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn new(oci_data_dir: &Path) -> anyhow::Result<Self> {
+        let config = vz_linux_native::LinuxNativeConfig {
+            data_dir: oci_data_dir.to_path_buf(),
+            ..Default::default()
+        };
+        let backend = vz_linux_native::LinuxNativeBackend::new(config);
+        let handle = tokio::runtime::Handle::current();
+        Ok(Self { backend, handle })
     }
 
     /// Execute a command in a running container and capture output.
@@ -260,14 +285,15 @@ impl OciContainerRuntime {
         &self,
         container_id: &str,
         cmd: Vec<String>,
-    ) -> Result<vz::protocol::ExecOutput, StackError> {
+    ) -> Result<vz_runtime_contract::ExecOutput, StackError> {
+        use vz_runtime_contract::RuntimeBackend;
         tokio::task::block_in_place(|| {
-            let exec_config = vz_oci::ExecConfig {
+            let exec_config = vz_runtime_contract::ExecConfig {
                 cmd,
                 ..Default::default()
             };
             self.handle
-                .block_on(self.runtime.exec_container(container_id, exec_config))
+                .block_on(self.backend.exec_container(container_id, exec_config))
                 .map_err(|e| StackError::Network(format!("exec failed: {e}")))
         })
     }
@@ -275,47 +301,55 @@ impl OciContainerRuntime {
 
 impl ContainerRuntime for OciContainerRuntime {
     fn pull(&self, image: &str) -> Result<String, StackError> {
+        use vz_runtime_contract::RuntimeBackend;
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.runtime.pull(image))
-                .map(|id| id.0)
+                .block_on(self.backend.pull(image))
                 .map_err(|e| StackError::Network(format!("pull failed: {e}")))
         })
     }
 
-    fn create(&self, image: &str, config: vz_oci::RunConfig) -> Result<String, StackError> {
+    fn create(
+        &self,
+        image: &str,
+        config: vz_runtime_contract::RunConfig,
+    ) -> Result<String, StackError> {
+        use vz_runtime_contract::RuntimeBackend;
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.runtime.create_container(image, config))
+                .block_on(self.backend.create_container(image, config))
                 .map_err(|e| StackError::Network(format!("create failed: {e}")))
         })
     }
 
     fn stop(&self, container_id: &str) -> Result<(), StackError> {
+        use vz_runtime_contract::RuntimeBackend;
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.runtime.stop_container(container_id, false))
+                .block_on(self.backend.stop_container(container_id, false))
                 .map(|_| ())
                 .map_err(|e| StackError::Network(format!("stop failed: {e}")))
         })
     }
 
     fn remove(&self, container_id: &str) -> Result<(), StackError> {
+        use vz_runtime_contract::RuntimeBackend;
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.runtime.remove_container(container_id))
+                .block_on(self.backend.remove_container(container_id))
                 .map_err(|e| StackError::Network(format!("remove failed: {e}")))
         })
     }
 
     fn exec(&self, container_id: &str, command: &[String]) -> Result<i32, StackError> {
+        use vz_runtime_contract::RuntimeBackend;
         tokio::task::block_in_place(|| {
-            let exec_config = vz_oci::ExecConfig {
+            let exec_config = vz_runtime_contract::ExecConfig {
                 cmd: command.to_vec(),
                 ..Default::default()
             };
             self.handle
-                .block_on(self.runtime.exec_container(container_id, exec_config))
+                .block_on(self.backend.exec_container(container_id, exec_config))
                 .map(|output| output.exit_code)
                 .map_err(|e| StackError::Network(format!("exec failed: {e}")))
         })
@@ -324,11 +358,12 @@ impl ContainerRuntime for OciContainerRuntime {
     fn boot_shared_vm(
         &self,
         stack_id: &str,
-        ports: &[vz_oci::PortMapping],
+        ports: &[vz_runtime_contract::PortMapping],
     ) -> Result<(), StackError> {
+        use vz_runtime_contract::RuntimeBackend;
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.runtime.boot_shared_vm(stack_id, ports.to_vec()))
+                .block_on(self.backend.boot_shared_vm(stack_id, ports.to_vec()))
                 .map_err(|e| StackError::Network(format!("boot_shared_vm failed: {e}")))
         })
     }
@@ -336,20 +371,22 @@ impl ContainerRuntime for OciContainerRuntime {
     fn network_setup(
         &self,
         stack_id: &str,
-        services: &[vz_oci::NetworkServiceConfig],
+        services: &[vz_runtime_contract::NetworkServiceConfig],
     ) -> Result<(), StackError> {
+        use vz_runtime_contract::RuntimeBackend;
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.runtime.network_setup(stack_id, services.to_vec()))
+                .block_on(self.backend.network_setup(stack_id, services.to_vec()))
                 .map_err(|e| StackError::Network(format!("network_setup failed: {e}")))
         })
     }
 
     fn network_teardown(&self, stack_id: &str, service_names: &[String]) -> Result<(), StackError> {
+        use vz_runtime_contract::RuntimeBackend;
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(
-                    self.runtime
+                    self.backend
                         .network_teardown(stack_id, service_names.to_vec()),
                 )
                 .map_err(|e| StackError::Network(format!("network_teardown failed: {e}")))
@@ -360,12 +397,13 @@ impl ContainerRuntime for OciContainerRuntime {
         &self,
         stack_id: &str,
         image: &str,
-        config: vz_oci::RunConfig,
+        config: vz_runtime_contract::RunConfig,
     ) -> Result<String, StackError> {
+        use vz_runtime_contract::RuntimeBackend;
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(
-                    self.runtime
+                    self.backend
                         .create_container_in_stack(stack_id, image, config),
                 )
                 .map_err(|e| StackError::Network(format!("create_in_stack failed: {e}")))
@@ -373,15 +411,17 @@ impl ContainerRuntime for OciContainerRuntime {
     }
 
     fn shutdown_shared_vm(&self, stack_id: &str) -> Result<(), StackError> {
+        use vz_runtime_contract::RuntimeBackend;
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.runtime.shutdown_shared_vm(stack_id))
+                .block_on(self.backend.shutdown_shared_vm(stack_id))
                 .map_err(|e| StackError::Network(format!("shutdown_shared_vm failed: {e}")))
         })
     }
 
     fn has_shared_vm(&self, stack_id: &str) -> bool {
-        tokio::task::block_in_place(|| self.handle.block_on(self.runtime.has_shared_vm(stack_id)))
+        use vz_runtime_contract::RuntimeBackend;
+        self.backend.has_shared_vm(stack_id)
     }
 
     fn logs(&self, container_id: &str) -> Result<ContainerLogs, StackError> {
@@ -391,7 +431,7 @@ impl ContainerRuntime for OciContainerRuntime {
                 "tail".into(),
                 "-n".into(),
                 "100".into(),
-                vz_oci::CONTAINER_LOG_FILE.into(),
+                CONTAINER_LOG_FILE.into(),
             ],
         )?;
         Ok(ContainerLogs {
@@ -526,8 +566,8 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
 
         // Teardown on exit.
         info!(stack = %spec.name, "shutting down stack");
-        let teardown_store = StateStore::open(&db_path)
-            .with_context(|| "failed to open teardown state store")?;
+        let teardown_store =
+            StateStore::open(&db_path).with_context(|| "failed to open teardown state store")?;
         let empty_spec = StackSpec {
             name: spec.name.clone(),
             services: vec![],
@@ -542,8 +582,7 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
             let mut teardown_executor = StackExecutor::new(
                 OciContainerRuntime::new(&state_dir)
                     .with_context(|| "failed to create teardown runtime")?,
-                StateStore::open(&db_path)
-                    .with_context(|| "failed to open teardown exec store")?,
+                StateStore::open(&db_path).with_context(|| "failed to open teardown exec store")?,
                 &state_dir,
             );
             let _ = teardown_executor.execute(&empty_spec, &teardown_actions.actions);
@@ -770,9 +809,7 @@ fn handle_service_start(
             exit_code: 1,
             stdout: String::new(),
             stderr: String::new(),
-            error: Some(format!(
-                "service '{service_name}' not found in stack spec"
-            )),
+            error: Some(format!("service '{service_name}' not found in stack spec")),
         };
     }
 
@@ -844,9 +881,12 @@ async fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
         );
     }
 
-    let stream = UnixStream::connect(&sock_path)
-        .await
-        .with_context(|| format!("failed to connect to control socket: {}", sock_path.display()))?;
+    let stream = UnixStream::connect(&sock_path).await.with_context(|| {
+        format!(
+            "failed to connect to control socket: {}",
+            sock_path.display()
+        )
+    })?;
 
     let (reader, mut writer) = stream.into_split();
 
@@ -868,8 +908,8 @@ async fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
         .await?
         .ok_or_else(|| anyhow::anyhow!("control socket closed without response"))?;
 
-    let resp: ControlResponse = serde_json::from_str(&line)
-        .with_context(|| "failed to parse control response")?;
+    let resp: ControlResponse =
+        serde_json::from_str(&line).with_context(|| "failed to parse control response")?;
 
     if let Some(err) = resp.error {
         bail!("{err}");
@@ -904,9 +944,12 @@ async fn cmd_service_action(args: ServiceArgs, action: ControlAction) -> anyhow:
         );
     }
 
-    let stream = UnixStream::connect(&sock_path)
-        .await
-        .with_context(|| format!("failed to connect to control socket: {}", sock_path.display()))?;
+    let stream = UnixStream::connect(&sock_path).await.with_context(|| {
+        format!(
+            "failed to connect to control socket: {}",
+            sock_path.display()
+        )
+    })?;
 
     let (reader, mut writer) = stream.into_split();
 
@@ -926,8 +969,8 @@ async fn cmd_service_action(args: ServiceArgs, action: ControlAction) -> anyhow:
         .await?
         .ok_or_else(|| anyhow::anyhow!("control socket closed without response"))?;
 
-    let resp: ControlResponse = serde_json::from_str(&line)
-        .with_context(|| "failed to parse control response")?;
+    let resp: ControlResponse =
+        serde_json::from_str(&line).with_context(|| "failed to parse control response")?;
 
     if let Some(err) = resp.error {
         bail!("{err}");
@@ -1086,8 +1129,7 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
         Some(svc) => vec![svc.clone()],
         None => {
             let db_path = state_dir.join("state.db");
-            let store =
-                StateStore::open(&db_path).with_context(|| "failed to open state store")?;
+            let store = StateStore::open(&db_path).with_context(|| "failed to open state store")?;
             let observed = store
                 .load_observed_state(&args.name)
                 .with_context(|| "failed to load observed state")?;
@@ -1103,18 +1145,14 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
         bail!("no running services in stack `{}`", args.name);
     }
 
-    let log_file = vz_oci::CONTAINER_LOG_FILE;
+    let log_file = CONTAINER_LOG_FILE;
     let multi = services.len() > 1;
 
     // Initial fetch: bounded tail -n <count>.
     for service in &services {
         let tail_n = args.tail.to_string();
-        let output = exec_via_socket(
-            &sock_path,
-            service,
-            &["tail", "-n", &tail_n, log_file],
-        )
-        .await?;
+        let output =
+            exec_via_socket(&sock_path, service, &["tail", "-n", &tail_n, log_file]).await?;
         print_log_output(&output, service, multi);
     }
 
@@ -1135,12 +1173,9 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
 
         for (i, service) in services.iter().enumerate() {
             let offset_arg = format!("+{}", offsets[i] + 1);
-            let output = exec_via_socket(
-                &sock_path,
-                service,
-                &["tail", "-c", &offset_arg, log_file],
-            )
-            .await?;
+            let output =
+                exec_via_socket(&sock_path, service, &["tail", "-c", &offset_arg, log_file])
+                    .await?;
 
             if !output.is_empty() {
                 print_log_output(&output, service, multi);
@@ -1165,11 +1200,7 @@ fn print_log_output(output: &str, service: &str, multi: bool) {
 }
 
 /// Get file size inside a container via `wc -c`.
-async fn get_file_size(
-    sock_path: &Path,
-    service: &str,
-    path: &str,
-) -> anyhow::Result<u64> {
+async fn get_file_size(sock_path: &Path, service: &str, path: &str) -> anyhow::Result<u64> {
     let output = exec_via_socket(sock_path, service, &["wc", "-c", path]).await?;
     // wc -c output: "  12345 /path/to/file\n"
     let size: u64 = output
@@ -1181,17 +1212,16 @@ async fn get_file_size(
 }
 
 /// Execute a command in a service container via the control socket.
-async fn exec_via_socket(
-    sock_path: &Path,
-    service: &str,
-    cmd: &[&str],
-) -> anyhow::Result<String> {
+async fn exec_via_socket(sock_path: &Path, service: &str, cmd: &[&str]) -> anyhow::Result<String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
-    let stream = UnixStream::connect(sock_path)
-        .await
-        .with_context(|| format!("failed to connect to control socket: {}", sock_path.display()))?;
+    let stream = UnixStream::connect(sock_path).await.with_context(|| {
+        format!(
+            "failed to connect to control socket: {}",
+            sock_path.display()
+        )
+    })?;
 
     let (reader, mut writer) = stream.into_split();
 

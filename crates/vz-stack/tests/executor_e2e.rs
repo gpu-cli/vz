@@ -48,7 +48,11 @@ impl ContainerRuntime for MockRuntime {
         Ok(format!("sha256:{image}"))
     }
 
-    fn create(&self, image: &str, _config: vz_oci::RunConfig) -> Result<String, StackError> {
+    fn create(
+        &self,
+        image: &str,
+        _config: vz_runtime_contract::RunConfig,
+    ) -> Result<String, StackError> {
         self.calls
             .borrow_mut()
             .push(("create".into(), image.into()));

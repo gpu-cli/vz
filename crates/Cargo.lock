@@ -2402,7 +2402,9 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vz",
+ "vz-linux-native",
  "vz-oci",
+ "vz-runtime-contract",
  "vz-sandbox",
  "vz-stack",
  "vz-validation",
@@ -2511,6 +2513,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vz-oci",
+ "vz-runtime-contract",
 ]
 
 [[package]]
