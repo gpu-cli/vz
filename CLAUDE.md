@@ -4,11 +4,14 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## What is vz
 
-Rust-native interface to Apple's Virtualization.framework for sandboxing coding agents in macOS VMs. Three crates:
+Container runtime with dual backends: macOS (Virtualization.framework VMs) and Linux-native (direct OCI runtime execution).
 
-1. **vz** — Safe, ergonomic async Rust API wrapping `objc2-virtualization` (auto-generated bindings). All unsafe is internal; public API is 100% safe Rust.
+**Core crates:**
+1. **vz** — Safe async Rust API wrapping `objc2-virtualization` (auto-generated bindings). All unsafe is internal; public API is 100% safe Rust.
 2. **vz-sandbox** — High-level sandbox abstraction (pool, sessions, channels, guest agent)
-3. **vz-cli** — Standalone CLI for managing macOS VMs without writing Rust
+3. **vz-cli** — Standalone CLI for managing VMs and containers
+4. **vz-runtime-contract** — Backend-neutral `RuntimeBackend` trait and shared types
+5. **vz-linux-native** — Linux host container backend (OCI runtime, namespaces, cgroups, networking)
 
 There is no `vz-sys` crate. The `objc2-virtualization` crate (v0.3.2) provides auto-generated bindings to all Virtualization.framework classes, eliminating the need for hand-written FFI.
 
@@ -39,22 +42,26 @@ cd crates && cargo fmt --workspace
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                     vz-cli                          │
-│  `vz run --image base --mount project:./workspace`  │
-├─────────────────────────────────────────────────────┤
-│                   vz-sandbox                        │
-│  Pool, Session, Channel, Guest Agent binary         │
-├─────────────────────────────────────────────────────┤
-│                      vz                             │
-│  Safe Rust: Vm, Config, VirtioFs, Vsock, SaveState  │
-├─────────────────────────────────────────────────────┤
-│              objc2-virtualization v0.3.2             │
-│  Auto-generated bindings to ALL Vz.framework classes│
-├─────────────────────────────────────────────────────┤
-│           Apple Virtualization.framework            │
-│              (macOS 14+ / Apple Silicon)            │
-└─────────────────────────────────────────────────────┘
+                      vz-cli / vz-stack
+                           │
+                    vz-runtime-contract
+                     (RuntimeBackend trait)
+                    ┌──────┴──────┐
+              macOS │             │ Linux
+         ┌─────────┴──────┐  ┌───┴──────────────┐
+         │  vz-oci         │  │ vz-linux-native   │
+         │  MacosRuntime   │  │ LinuxNativeBackend│
+         │  Backend        │  │ OCI runtime, ns,  │
+         │  (VM-based)     │  │ cgroups, network  │
+         ├─────────────────┤  └──────────────────┘
+         │  vz / vz-linux  │
+         │  vz-sandbox     │
+         ├─────────────────┤
+         │ objc2-virt v0.3 │
+         ├─────────────────┤
+         │ Virt.framework  │
+         │ (macOS/Apple Si)│
+         └─────────────────┘
 ```
 
 ### Workspace Crates
@@ -64,6 +71,11 @@ cd crates && cargo fmt --workspace
 | `vz` | Safe async Rust API — Vm, VmConfig, VirtioFs, Vsock, SaveState. Wraps `objc2-virtualization` directly. |
 | `vz-sandbox` | High-level sandbox — SandboxPool, SandboxSession, typed Channel, guest agent binary |
 | `vz-cli` | CLI binary — `vz init`, `vz run`, `vz exec`, `vz save/restore` |
+| `vz-runtime-contract` | Backend-neutral `RuntimeBackend` trait + shared types (RunConfig, ExecConfig, etc.) |
+| `vz-linux-native` | Linux-native container backend — OCI bundle gen, container lifecycle, ns/cgroup/network |
+| `vz-linux` | Linux VM guest-side runtime (OCI dispatch, protocol, guest agent interface) |
+| `vz-oci` | OCI image pull/store + macOS backend adapter (`MacosRuntimeBackend`) |
+| `vz-stack` | Docker Compose-compatible multi-container orchestration |
 
 ### Key Design Decisions
 
@@ -73,6 +85,8 @@ cd crates && cargo fmt --workspace
 - **Async-first (tokio)** — all VM ops bridge ObjC completion handlers to tokio futures
 - **Long-lived VM model** — single VM stays running, project dirs swapped via VirtioFS mounts
 - **vsock for communication** — host↔guest channel without network config
+- **Dual backend** — `RuntimeBackend` trait in `vz-runtime-contract` with macOS (VM) and Linux-native implementations
+- **Linux-native uses OCI runtime** — shells out to youki/runc for container lifecycle, uses `ip` commands for networking
 
 ### Platform Constraints
 
@@ -142,3 +156,23 @@ Design documents live in `planning/`:
 - Integration tests in `crates/*/tests/` — require macOS + Apple Silicon to run
 - CI: build check on all platforms, tests only on macOS Apple Silicon runners
 - Use `cargo nextest` (not `cargo test`) for better output and parallelism
+- E2E tests need `codesign --force --sign - --entitlements entitlements/vz-cli.entitlements.plist` for Virtualization.framework entitlement
+
+### Testing Linux-Native Code via VMs (Dogfooding)
+
+The `vz-linux-native` crate targets Linux but we develop on macOS. We test it by running inside our own Linux VMs via Virtualization.framework:
+
+```bash
+# 1. Unit tests (bundle generation, config) run on macOS natively:
+cd crates && cargo nextest run -p vz-linux-native
+
+# 2. Cross-compile for Linux (integration tests that need Linux syscalls):
+cross build --target aarch64-unknown-linux-musl -p vz-linux-native
+
+# 3. Run inside a vz Linux VM for integration testing:
+cd crates && cargo test -p vz-oci --test runtime_e2e --no-run && \
+  codesign --force --sign - --entitlements ../entitlements/vz-cli.entitlements.plist target/debug/deps/runtime_e2e-* && \
+  target/debug/deps/runtime_e2e-* --ignored --nocapture --test-threads=1
+```
+
+The VM guest kernel has: cgroups v2, namespaces (user, net, pid, mnt, uts, ipc), overlayfs, bridge, veth, iptables — everything needed for Linux-native container execution. Youki is available at `/run/vz-oci/bin/youki` inside the VM.

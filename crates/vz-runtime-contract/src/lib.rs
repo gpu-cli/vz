@@ -6,9 +6,11 @@
 //! selection transparent.
 
 pub mod error;
+pub mod selection;
 pub mod types;
 
 pub use error::RuntimeError;
+pub use selection::{HostBackend, ResolvedBackend};
 pub use types::{
     ContainerInfo, ContainerLogs, ContainerStatus, ExecConfig, ExecOutput, ImageInfo, MountAccess,
     MountSpec, MountType, NetworkServiceConfig, PortMapping, PortProtocol, PruneResult, RunConfig,

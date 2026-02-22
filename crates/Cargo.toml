@@ -7,6 +7,7 @@ members = [
     "vz-guest-agent",
     "vz-linux",
     "vz-oci",
+    "vz-linux-native",
     "vz-runtime-contract",
     "vz-stack",
     "vz-validation",
@@ -147,6 +148,7 @@ tempfile = "3"
 vz = { path = "vz" }
 vz-sandbox = { path = "vz-sandbox" }
 vz-linux = { path = "vz-linux" }
+vz-linux-native = { path = "vz-linux-native" }
 vz-oci = { path = "vz-oci" }
 vz-runtime-contract = { path = "vz-runtime-contract" }
 vz-stack = { path = "vz-stack" }
