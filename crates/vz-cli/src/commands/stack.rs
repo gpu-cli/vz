@@ -21,9 +21,9 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use vz_stack::{
-    ApplyResult, ContainerRuntime, EventRecord, ExecutionResult, OrchestrationConfig, RoundReport,
-    ServiceObservedState, ServicePhase, StackError, StackEvent, StackExecutor, StackOrchestrator,
-    StackSpec, StateStore, parse_compose_with_dir,
+    ApplyResult, ContainerLogs, ContainerRuntime, EventRecord, ExecutionResult,
+    OrchestrationConfig, RoundReport, ServiceObservedState, ServicePhase, StackError, StackEvent,
+    StackExecutor, StackOrchestrator, StackSpec, StateStore, parse_compose_with_dir,
 };
 
 /// Manage multi-service stacks from Compose files.
@@ -340,6 +340,25 @@ impl ContainerRuntime for OciContainerRuntime {
 
     fn has_shared_vm(&self, stack_id: &str) -> bool {
         tokio::task::block_in_place(|| self.handle.block_on(self.runtime.has_shared_vm(stack_id)))
+    }
+
+    fn logs(&self, container_id: &str) -> Result<ContainerLogs, StackError> {
+        let output = self.exec_with_output(
+            container_id,
+            vec![
+                "tail".into(),
+                "-n".into(),
+                "100".into(),
+                vz_oci::CONTAINER_LOG_FILE.into(),
+            ],
+        )?;
+        Ok(ContainerLogs {
+            output: if output.exit_code == 0 {
+                output.stdout
+            } else {
+                String::new()
+            },
+        })
     }
 }
 
@@ -841,78 +860,156 @@ async fn cmd_events(args: EventsArgs) -> anyhow::Result<()> {
 
 async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
     let state_dir = resolve_state_dir(args.state_dir.as_deref(), &args.name)?;
-    let db_path = state_dir.join("state.db");
+    let sock_path = state_dir.join("control.sock");
 
-    if !db_path.exists() {
-        bail!("no state found for stack `{}`", args.name);
+    if !sock_path.exists() {
+        bail!(
+            "stack `{}` is not running (no control socket at {})",
+            args.name,
+            sock_path.display()
+        );
     }
 
-    let store = StateStore::open(&db_path).with_context(|| "failed to open state store")?;
-
-    // Load initial events.
-    let records = store
-        .load_event_records(&args.name)
-        .with_context(|| "failed to load events")?;
-
-    // Filter by service if specified.
-    let filtered: Vec<&EventRecord> = records
-        .iter()
-        .filter(|r| match &args.service {
-            Some(svc) => event_service_name(&r.event).is_some_and(|n| n == svc),
-            None => true,
-        })
-        .collect();
-
-    // Apply tail: show only the last N events (0 = all).
-    let display = if args.tail > 0 && filtered.len() > args.tail {
-        &filtered[filtered.len() - args.tail..]
-    } else {
-        &filtered
+    // Determine which services to fetch logs for.
+    let services = match &args.service {
+        Some(svc) => vec![svc.clone()],
+        None => {
+            let db_path = state_dir.join("state.db");
+            let store =
+                StateStore::open(&db_path).with_context(|| "failed to open state store")?;
+            let observed = store
+                .load_observed_state(&args.name)
+                .with_context(|| "failed to load observed state")?;
+            observed
+                .into_iter()
+                .filter(|o| o.phase == ServicePhase::Running)
+                .map(|o| o.service_name)
+                .collect()
+        }
     };
 
-    for record in display {
-        print_log_line(record);
+    if services.is_empty() {
+        bail!("no running services in stack `{}`", args.name);
+    }
+
+    let log_file = vz_oci::CONTAINER_LOG_FILE;
+    let multi = services.len() > 1;
+
+    // Initial fetch: bounded tail -n <count>.
+    for service in &services {
+        let tail_n = args.tail.to_string();
+        let output = exec_via_socket(
+            &sock_path,
+            service,
+            &["tail", "-n", &tail_n, log_file],
+        )
+        .await?;
+        print_log_output(&output, service, multi);
     }
 
     if !args.follow {
         return Ok(());
     }
 
-    // Follow mode: poll for new events using the cursor.
-    let mut cursor = records.last().map_or(0, |r| r.id);
+    // Follow mode: track byte offsets per service, poll with tail -c +<offset>.
+    // Get initial file sizes.
+    let mut offsets: Vec<u64> = Vec::with_capacity(services.len());
+    for service in &services {
+        let size = get_file_size(&sock_path, service, log_file).await?;
+        offsets.push(size);
+    }
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let new_records = store
-            .load_events_since(&args.name, cursor)
-            .with_context(|| "failed to poll events")?;
+        for (i, service) in services.iter().enumerate() {
+            let offset_arg = format!("+{}", offsets[i] + 1);
+            let output = exec_via_socket(
+                &sock_path,
+                service,
+                &["tail", "-c", &offset_arg, log_file],
+            )
+            .await?;
 
-        if new_records.is_empty() {
-            continue;
-        }
-
-        for record in &new_records {
-            if let Some(svc) = &args.service {
-                if event_service_name(&record.event).is_none_or(|n| n != svc) {
-                    continue;
-                }
+            if !output.is_empty() {
+                print_log_output(&output, service, multi);
+                offsets[i] += output.len() as u64;
             }
-            print_log_line(record);
         }
-
-        cursor = new_records.last().map_or(cursor, |r| r.id);
     }
 }
 
-/// Print a single log line with timestamp, service, and event summary.
-fn print_log_line(record: &EventRecord) {
-    let service = event_service_name(&record.event).unwrap_or("-");
-    let summary = format_event_summary(&record.event);
-    println!("{} [{}] {}", record.created_at, service, summary);
+/// Print log output, prefixing each line with service name for multi-service stacks.
+fn print_log_output(output: &str, service: &str, multi: bool) {
+    if output.is_empty() {
+        return;
+    }
+    if multi {
+        for line in output.lines() {
+            println!("{service} | {line}");
+        }
+    } else {
+        print!("{output}");
+    }
+}
+
+/// Get file size inside a container via `wc -c`.
+async fn get_file_size(
+    sock_path: &Path,
+    service: &str,
+    path: &str,
+) -> anyhow::Result<u64> {
+    let output = exec_via_socket(sock_path, service, &["wc", "-c", path]).await?;
+    // wc -c output: "  12345 /path/to/file\n"
+    let size: u64 = output
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    Ok(size)
+}
+
+/// Execute a command in a service container via the control socket.
+async fn exec_via_socket(
+    sock_path: &Path,
+    service: &str,
+    cmd: &[&str],
+) -> anyhow::Result<String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let stream = UnixStream::connect(sock_path)
+        .await
+        .with_context(|| format!("failed to connect to control socket: {}", sock_path.display()))?;
+
+    let (reader, mut writer) = stream.into_split();
+
+    let request = ControlRequest {
+        service: service.to_string(),
+        cmd: cmd.iter().map(|s| s.to_string()).collect(),
+    };
+    let mut json = serde_json::to_string(&request)?;
+    json.push('\n');
+    writer.write_all(json.as_bytes()).await?;
+
+    let mut lines = BufReader::new(reader).lines();
+    let line = lines
+        .next_line()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("control socket closed without response"))?;
+
+    let resp: ControlResponse =
+        serde_json::from_str(&line).with_context(|| "failed to parse control response")?;
+
+    if let Some(err) = resp.error {
+        bail!("exec error for service '{service}': {err}");
+    }
+
+    Ok(resp.stdout)
 }
 
 /// Extract the service name from a stack event, if applicable.
+#[cfg(test)]
 fn event_service_name(event: &StackEvent) -> Option<&str> {
     match event {
         StackEvent::ServiceCreating { service_name, .. }

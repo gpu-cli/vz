@@ -434,6 +434,7 @@ async fn create_container(runtime: &vz_oci::Runtime, args: CreateArgs) -> anyhow
         network_namespace_path: None,
         cpu_quota: None,
         cpu_period: None,
+        capture_logs: false,
     };
 
     info!(image = %args.image, "creating long-lived container");
@@ -580,6 +581,7 @@ fn build_run_config(args: &RunArgs) -> anyhow::Result<RunConfig> {
         network_namespace_path: None,
         cpu_quota: None,
         cpu_period: None,
+        capture_logs: false,
     })
 }
 

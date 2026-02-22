@@ -11,6 +11,7 @@ mod image;
 mod runtime;
 mod store;
 
+pub use bundle::CONTAINER_LOG_FILE;
 pub use config::{
     Auth, ExecConfig, ExecutionMode, MountAccess, MountSpec, MountType, OciRuntimeKind,
     PortMapping, PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig,

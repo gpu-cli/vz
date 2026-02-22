@@ -61,6 +61,12 @@ pub(crate) struct BundleSpec {
     pub cpu_quota: Option<i64>,
     /// CPU CFS period in microseconds (default: 100000 = 100ms).
     pub cpu_period: Option<u64>,
+    /// Redirect container stdout/stderr to a log file for later retrieval.
+    ///
+    /// When `true`, the process args are wrapped in a shell redirector
+    /// that sends both stdout and stderr to `/var/log/vz-oci/output.log`
+    /// (interleaved, like Docker). The file can be read via `exec`.
+    pub capture_logs: bool,
 }
 
 /// Write an OCI bundle directory (`config.json` + optional `rootfs` link).
@@ -108,6 +114,7 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
         share_host_network,
         cpu_quota,
         cpu_period,
+        capture_logs,
     } = spec;
 
     if cmd.is_empty() {
@@ -116,8 +123,14 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
         ));
     }
 
+    let process_args = if capture_logs {
+        wrap_cmd_with_log_redirect(&cmd)
+    } else {
+        cmd
+    };
+
     let process = ProcessBuilder::default()
-        .args(cmd)
+        .args(process_args)
         .env(
             env.into_iter()
                 .map(|(key, value)| format!("{key}={value}"))
@@ -232,6 +245,32 @@ fn sort_bundle_mounts(mounts: &mut [BundleMount]) {
             .then_with(|| left.typ.cmp(&right.typ))
             .then_with(|| left.options.cmp(&right.options))
     });
+}
+
+/// Log directory inside the container where stdout/stderr are redirected.
+const CONTAINER_LOG_DIR: &str = "/var/log/vz-oci";
+
+/// Log file path inside the container (stdout + stderr interleaved).
+pub const CONTAINER_LOG_FILE: &str = "/var/log/vz-oci/output.log";
+
+/// Wrap a command vector with shell-based log redirection.
+///
+/// Transforms `["redis-server", "--appendonly", "yes"]` into:
+/// ```text
+/// ["/bin/sh", "-c", "mkdir -p /var/log/vz-oci && exec redis-server --appendonly yes \
+///  >>/var/log/vz-oci/output.log 2>&1"]
+/// ```
+///
+/// stdout and stderr are interleaved in a single file for Docker-like
+/// `logs` behavior. The `exec` ensures the shell is replaced by the
+/// actual command, preserving PID 1 semantics and signal handling.
+fn wrap_cmd_with_log_redirect(cmd: &[String]) -> Vec<String> {
+    let joined = shell_words::join(cmd);
+    let script = format!(
+        "mkdir -p {CONTAINER_LOG_DIR} && exec {joined} \
+         >>{CONTAINER_LOG_FILE} 2>&1"
+    );
+    vec!["/bin/sh".into(), "-c".into(), script]
 }
 
 fn to_runtime_annotations(annotations: Vec<(String, String)>) -> HashMap<String, String> {
@@ -507,6 +546,7 @@ mod tests {
                 share_host_network: false,
                 cpu_quota: None,
                 cpu_period: None,
+                capture_logs: false,
             },
         )
         .unwrap();
@@ -596,6 +636,7 @@ mod tests {
                 share_host_network: false,
                 cpu_quota: None,
                 cpu_period: None,
+                capture_logs: false,
             },
         )
         .unwrap();
@@ -649,6 +690,7 @@ mod tests {
                 share_host_network: false,
                 cpu_quota: None,
                 cpu_period: None,
+                capture_logs: false,
             },
         )
         .unwrap();
@@ -696,6 +738,7 @@ mod tests {
                 share_host_network: false,
                 cpu_quota: None,
                 cpu_period: None,
+                capture_logs: false,
             },
         )
         .unwrap();
@@ -737,6 +780,7 @@ mod tests {
                 share_host_network: false,
                 cpu_quota: None,
                 cpu_period: None,
+                capture_logs: false,
             },
         )
         .unwrap();
@@ -780,6 +824,7 @@ mod tests {
                 share_host_network: true,
                 cpu_quota: None,
                 cpu_period: None,
+                capture_logs: false,
             },
         )
         .unwrap();
@@ -797,5 +842,62 @@ mod tests {
             .iter()
             .find(|n| n.typ() == LinuxNamespaceType::Network);
         assert!(netns.is_none(), "network namespace should be removed");
+    }
+
+    #[test]
+    fn wrap_cmd_with_log_redirect_wraps_simple_command() {
+        let cmd = vec!["redis-server".to_string()];
+        let wrapped = wrap_cmd_with_log_redirect(&cmd);
+        assert_eq!(wrapped[0], "/bin/sh");
+        assert_eq!(wrapped[1], "-c");
+        assert!(wrapped[2].contains("exec redis-server"));
+        assert!(wrapped[2].contains(CONTAINER_LOG_FILE));
+        assert!(wrapped[2].contains("2>&1"));
+    }
+
+    #[test]
+    fn wrap_cmd_with_log_redirect_quotes_args_with_spaces() {
+        let cmd = vec![
+            "echo".to_string(),
+            "hello world".to_string(),
+        ];
+        let wrapped = wrap_cmd_with_log_redirect(&cmd);
+        // shell_words::join should quote the argument with spaces.
+        assert!(wrapped[2].contains("'hello world'"));
+    }
+
+    #[test]
+    fn capture_logs_wraps_process_args() {
+        let temp = unique_temp_dir("capture-logs");
+        let rootfs_source = temp.join("rootfs-source");
+        fs::create_dir_all(&rootfs_source).unwrap();
+
+        let bundle_dir = temp.join("bundle");
+        write_oci_bundle(
+            &bundle_dir,
+            &rootfs_source,
+            BundleSpec {
+                cmd: vec!["redis-server".to_string(), "--appendonly".to_string(), "yes".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: Vec::new(),
+                oci_annotations: Vec::new(),
+                network_namespace_path: None,
+                share_host_network: false,
+                cpu_quota: None,
+                cpu_period: None,
+                capture_logs: true,
+            },
+        )
+        .unwrap();
+
+        let spec = Spec::load(bundle_dir.join(OCI_CONFIG_FILENAME)).unwrap();
+        let process = spec.process().as_ref().expect("process should exist");
+        let args = process.args().as_ref().expect("args should be present");
+        assert_eq!(args[0], "/bin/sh");
+        assert_eq!(args[1], "-c");
+        assert!(args[2].contains("exec redis-server --appendonly yes"));
+        assert!(args[2].contains(CONTAINER_LOG_FILE));
     }
 }

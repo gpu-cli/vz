@@ -113,13 +113,11 @@ pub trait ContainerRuntime {
     }
 }
 
-/// Container log output.
+/// Container log output (stdout + stderr interleaved).
 #[derive(Debug, Clone, Default)]
 pub struct ContainerLogs {
-    /// Captured stdout.
-    pub stdout: String,
-    /// Captured stderr.
-    pub stderr: String,
+    /// Combined stdout/stderr output.
+    pub output: String,
 }
 
 /// Tracks host port allocations across services within a stack.

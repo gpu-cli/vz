@@ -219,6 +219,11 @@ pub struct RunConfig {
     pub cpu_quota: Option<i64>,
     /// CPU CFS period in microseconds (default: 100000 = 100ms).
     pub cpu_period: Option<u64>,
+    /// Redirect container stdout/stderr to log files for later retrieval.
+    ///
+    /// When `true`, the OCI process args are wrapped with shell redirection
+    /// to capture stdout/stderr to `/var/log/vz-oci/{stdout,stderr}.log`.
+    pub capture_logs: bool,
 }
 
 /// Options for executing a command in an already-running container.

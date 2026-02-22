@@ -657,6 +657,7 @@ impl Runtime {
                 share_host_network: false,
                 cpu_quota: run.cpu_quota,
                 cpu_period: run.cpu_period,
+                capture_logs: run.capture_logs,
             },
         )
         .map_err(|e| { tracing::error!(error = %e, "step 3c FAILED: write_oci_bundle"); e })?;
@@ -1013,6 +1014,7 @@ impl Runtime {
                 share_host_network: true,
                 cpu_quota: run.cpu_quota,
                 cpu_period: run.cpu_period,
+                capture_logs: run.capture_logs,
             },
         )?;
 
@@ -1131,6 +1133,7 @@ impl Runtime {
             network_namespace_path: _,
             cpu_quota: _,
             cpu_period: _,
+            capture_logs: _,
         } = run;
 
         let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
@@ -1184,6 +1187,7 @@ impl Runtime {
                 share_host_network: true,
                 cpu_quota: None,
                 cpu_period: None,
+                capture_logs: false,
             },
         )?;
 
@@ -1312,6 +1316,7 @@ impl Runtime {
             network_namespace_path: _,
             cpu_quota: _,
             cpu_period: _,
+            capture_logs: _,
         } = run;
 
         let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
@@ -2027,6 +2032,7 @@ fn resolve_run_config(
         network_namespace_path,
         cpu_quota: _,
         cpu_period: _,
+        capture_logs,
     } = run;
 
     let resolved_cmd = if !run_cmd.is_empty() {
@@ -2079,6 +2085,7 @@ fn resolve_run_config(
         network_namespace_path,
         cpu_quota: None,
         cpu_period: None,
+        capture_logs,
     })
 }
 

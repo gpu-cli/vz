@@ -21,6 +21,7 @@ oci-distribution = { workspace = true }
 oci-spec = { workspace = true }
 docker_credential = { workspace = true }
 tracing = { workspace = true }
+shell-words = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

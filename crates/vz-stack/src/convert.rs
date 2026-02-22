@@ -47,6 +47,8 @@ pub fn service_to_run_config(
         // Use OCI runtime for full lifecycle (create → start → stop).
         execution_mode: vz_oci::ExecutionMode::OciRuntime,
         extra_hosts: spec.extra_hosts.clone(),
+        // Capture container stdout/stderr to log files for `vz stack logs`.
+        capture_logs: true,
         // Remaining fields use defaults; future beads may populate them.
         ..Default::default()
     })
@@ -243,6 +245,7 @@ mod tests {
         assert_eq!(config.memory_mb, None);
         assert_eq!(config.network_enabled, Some(true));
         assert_eq!(config.execution_mode, vz_oci::ExecutionMode::OciRuntime);
+        assert!(config.capture_logs, "stack containers must capture logs");
     }
 
     #[test]
