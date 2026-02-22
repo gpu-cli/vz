@@ -246,10 +246,12 @@ mod tests {
                 NetworkServiceConfig {
                     name: "web".to_string(),
                     addr: "172.20.0.2/24".to_string(),
+                    network_name: "default".to_string(),
                 },
                 NetworkServiceConfig {
                     name: "db".to_string(),
                     addr: "172.20.0.3/24".to_string(),
+                    network_name: "default".to_string(),
                 },
             ],
         };

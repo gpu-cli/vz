@@ -149,6 +149,14 @@ pub struct RunConfig {
     pub stop_signal: Option<String>,
     /// Seconds to wait after stop signal before SIGKILL. Default: 10.
     pub stop_grace_period_secs: Option<u64>,
+    // ── Shared VM mount support ──────────────────────────────────
+    /// Offset added to VirtioFS mount tag indices in shared VM mode.
+    ///
+    /// In a shared VM, multiple containers share one set of VirtioFS
+    /// shares. Each container's bind mounts are assigned a global index
+    /// starting at this offset so tags don't collide between services
+    /// (e.g., service A gets `vz-mount-0`, service B gets `vz-mount-2`).
+    pub mount_tag_offset: usize,
 }
 
 // ── Exec configuration ────────────────────────────────────────────
@@ -275,6 +283,25 @@ pub struct StackResourceHint {
     pub cpus: Option<u8>,
     /// Suggested memory in MB for the VM (sum of all service limits).
     pub memory_mb: Option<u64>,
+    /// Host directories to share as VirtioFS mounts inside the VM.
+    ///
+    /// Each entry is `(tag, host_path, read_only)`. The tag is used as the
+    /// VirtioFS mount tag and the init script mounts it at `/mnt/{tag}`.
+    /// Named volumes and bind mounts from all services are collected here
+    /// so the shared VM can set them up at boot time (VirtioFS shares are
+    /// static and must be configured before the VM starts).
+    pub volume_mounts: Vec<StackVolumeMount>,
+}
+
+/// A host directory to expose inside the shared VM via VirtioFS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackVolumeMount {
+    /// VirtioFS mount tag (e.g., `"vz-mount-0"`).
+    pub tag: String,
+    /// Absolute path on the host.
+    pub host_path: std::path::PathBuf,
+    /// Whether the mount is read-only.
+    pub read_only: bool,
 }
 
 /// Container log output.

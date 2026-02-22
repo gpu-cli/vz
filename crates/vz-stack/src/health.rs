@@ -40,6 +40,8 @@ pub struct HealthStatus {
     pub consecutive_passes: u32,
     /// Number of consecutive failed health checks.
     pub consecutive_failures: u32,
+    /// When the last health check was executed.
+    pub last_check: Option<Instant>,
 }
 
 impl HealthStatus {
@@ -49,6 +51,7 @@ impl HealthStatus {
             service_name: service_name.to_string(),
             consecutive_passes: 0,
             consecutive_failures: 0,
+            last_check: None,
         }
     }
 
@@ -314,6 +317,21 @@ impl HealthPoller {
                 continue;
             }
 
+            // Respect the health check interval — skip if we checked
+            // this service too recently.
+            let interval = Duration::from_secs(hc.interval_secs.unwrap_or(DEFAULT_INTERVAL_SECS));
+            {
+                let status = self
+                    .statuses
+                    .entry(svc.name.clone())
+                    .or_insert_with(|| HealthStatus::new(&svc.name));
+                if let Some(last) = status.last_check {
+                    if now.duration_since(last) < interval {
+                        continue;
+                    }
+                }
+            }
+
             // Execute health check command with timeout enforcement.
             // Docker convention: ["CMD", "arg1", ...] → exec directly,
             // ["CMD-SHELL", "cmd"] → exec through /bin/sh -c.
@@ -353,6 +371,7 @@ impl HealthPoller {
                 .statuses
                 .entry(svc.name.clone())
                 .or_insert_with(|| HealthStatus::new(&svc.name));
+            status.last_check = Some(now);
 
             result.checks_run += 1;
 
@@ -387,47 +406,46 @@ impl HealthPoller {
 
                 let retries = hc.retries.unwrap_or(DEFAULT_RETRIES);
 
+                // Emit event for every failure.
+                store.emit_event(
+                    &spec.name,
+                    &StackEvent::HealthCheckFailed {
+                        stack_name: spec.name.clone(),
+                        service_name: svc.name.clone(),
+                        attempt: status.consecutive_failures,
+                        error: format!("exit code {exit_code}"),
+                    },
+                )?;
+
                 if status.consecutive_failures >= retries {
-                    // Exceeded retries — mark failed.
+                    // Retries exhausted — mark unhealthy but keep running.
+                    // Docker Compose semantics: container stays running, health
+                    // checks continue indefinitely, and a future pass can
+                    // promote the service back to healthy/ready.
+
+                    // Read container output from VM-level log directory.
+                    let log_output = match runtime.logs(container_id) {
+                        Ok(logs) if !logs.output.is_empty() => {
+                            let lines: Vec<&str> =
+                                logs.output.lines().rev().take(30).collect();
+                            let lines: Vec<&str> = lines.into_iter().rev().collect();
+                            lines.join("\n")
+                        }
+                        Ok(_) => "(no output captured)".to_string(),
+                        Err(e) => format!("(logs error: {e})"),
+                    };
                     warn!(
                         service = %svc.name,
                         failures = status.consecutive_failures,
                         retries,
-                        "health check retries exhausted, marking failed"
+                        exit_code,
+                        container_output = %log_output,
+                        "health check retries exhausted, service unhealthy (will keep checking)"
                     );
-                    store.save_observed_state(
-                        &spec.name,
-                        &ServiceObservedState {
-                            service_name: svc.name.clone(),
-                            phase: ServicePhase::Failed,
-                            container_id: Some(container_id.clone()),
-                            last_error: Some(format!(
-                                "health check failed {} consecutive times",
-                                status.consecutive_failures
-                            )),
-                            ready: false,
-                        },
-                    )?;
-                    store.emit_event(
-                        &spec.name,
-                        &StackEvent::HealthCheckFailed {
-                            stack_name: spec.name.clone(),
-                            service_name: svc.name.clone(),
-                            attempt: status.consecutive_failures,
-                            error: format!("exit code {exit_code}"),
-                        },
-                    )?;
                     result.newly_failed.push(svc.name.clone());
+                    // Reset counter so we keep polling on subsequent cycles.
+                    status.consecutive_failures = 0;
                 } else {
-                    store.emit_event(
-                        &spec.name,
-                        &StackEvent::HealthCheckFailed {
-                            stack_name: spec.name.clone(),
-                            service_name: svc.name.clone(),
-                            attempt: status.consecutive_failures,
-                            error: format!("exit code {exit_code}"),
-                        },
-                    )?;
                     debug!(
                         service = %svc.name,
                         failures = status.consecutive_failures,
@@ -864,7 +882,8 @@ mod tests {
                 "curl".to_string(),
                 "localhost".to_string(),
             ],
-            interval_secs: Some(5),
+            // Use 0 interval so tests can call poll_all repeatedly without delay.
+            interval_secs: Some(0),
             timeout_secs: Some(3),
             retries,
             start_period_secs: None,
@@ -968,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn poller_retries_exhausted_marks_failed() {
+    fn poller_retries_exhausted_marks_unhealthy_but_keeps_running() {
         let mut runtime = MockContainerRuntime::new();
         runtime.exec_exit_code = 1;
         let store = StateStore::in_memory().unwrap();
@@ -990,15 +1009,22 @@ mod tests {
         let r1 = poller.poll_all(&runtime, &store, &spec).unwrap();
         assert!(r1.newly_failed.is_empty());
 
-        // Second failure — hits retries=2 threshold.
+        // Second failure — hits retries=2 threshold → newly_failed reported.
         let r2 = poller.poll_all(&runtime, &store, &spec).unwrap();
         assert_eq!(r2.newly_failed, vec!["web".to_string()]);
 
-        // Service now Failed.
+        // Service stays Running (Docker semantics: unhealthy != killed).
         let observed = store.load_observed_state("app").unwrap();
         let web = observed.iter().find(|o| o.service_name == "web").unwrap();
-        assert_eq!(web.phase, ServicePhase::Failed);
-        assert!(web.last_error.as_ref().unwrap().contains("2 consecutive"));
+        assert_eq!(web.phase, ServicePhase::Running);
+
+        // Counter is reset so health checks continue.
+        assert_eq!(poller.statuses()["web"].consecutive_failures, 0);
+
+        // A subsequent pass can still mark the service healthy.
+        runtime.exec_exit_code = 0;
+        let r3 = poller.poll_all(&runtime, &store, &spec).unwrap();
+        assert_eq!(r3.newly_ready, vec!["web".to_string()]);
     }
 
     #[test]

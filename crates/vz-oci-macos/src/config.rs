@@ -186,6 +186,9 @@ pub struct RunConfig {
     pub stop_signal: Option<String>,
     /// Seconds to wait after stop signal before SIGKILL. Default: 10.
     pub stop_grace_period_secs: Option<u64>,
+    // ── Shared VM mount support ──────────────────────────────────
+    /// Offset added to VirtioFS mount tag indices in shared VM mode.
+    pub mount_tag_offset: usize,
 }
 
 /// Options for executing a command in an already-running container.

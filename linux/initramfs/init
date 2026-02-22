@@ -89,6 +89,26 @@ switch_root_into_overlay_rootfs() {
   mkdir -p "$ROOTFS/vz-rootfs"
   mount --bind /mnt/rootfs "$ROOTFS/vz-rootfs" || return 1
 
+  # Bind-mount VirtioFS volume shares (vz-mount-*) into the chroot.
+  # Container OCI bundles reference /mnt/vz-mount-N as bind mount sources.
+  # Without these bind mounts, youki can't find the VirtioFS shares
+  # from inside the chroot.
+  vidx=0
+  while true; do
+    vtag="vz-mount-$vidx"
+    vsrc="/mnt/$vtag"
+    vdst="$ROOTFS/mnt/$vtag"
+    if [ -d "$vsrc" ]; then
+      mkdir -p "$vdst"
+      mount --bind "$vsrc" "$vdst" || \
+        echo "[vz-init] warning: failed to bind-mount $vsrc to $vdst"
+      echo "[vz-init] chroot bind-mount $vsrc -> /mnt/$vtag"
+      vidx=$((vidx + 1))
+    else
+      break
+    fi
+  done
+
   # Bind-mount user volume shares into the chroot at their target paths.
   # Target paths are encoded in kernel cmdline as vz.mount.N=/target/path.
   for param in $(cat /proc/cmdline); do

@@ -176,7 +176,11 @@ fn convert_mounts(resolved: &[ResolvedMount]) -> Vec<vz_runtime_contract::MountS
                     (vz_runtime_contract::MountType::Bind, rm.host_path.clone())
                 }
                 crate::volume::ResolvedMountKind::Named { .. } => {
-                    (vz_runtime_contract::MountType::Bind, rm.host_path.clone())
+                    // Named volumes use tmpfs inside the VM (not VirtioFS from the
+                    // host). VirtioFS doesn't support chown/chmod which breaks
+                    // containers that change ownership of their data directories
+                    // (e.g., postgres). Data persists for the VM's lifetime.
+                    (vz_runtime_contract::MountType::Tmpfs, None)
                 }
                 crate::volume::ResolvedMountKind::Ephemeral => {
                     (vz_runtime_contract::MountType::Tmpfs, None)
@@ -429,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn named_volume_mount_converts_as_bind() {
+    fn named_volume_mount_converts_as_tmpfs() {
         let resolved = vec![ResolvedMount {
             host_path: Some(PathBuf::from("/volumes/dbdata")),
             target: "/var/lib/db".to_string(),
@@ -440,14 +444,13 @@ mod tests {
         }];
         let spec = minimal_service();
         let config = service_to_run_config(&spec, &resolved, &[]).unwrap();
+        // Named volumes use tmpfs inside the VM (not VirtioFS from host)
+        // because VirtioFS doesn't support chown/chmod.
         assert_eq!(
             config.mounts[0].mount_type,
-            vz_runtime_contract::MountType::Bind
+            vz_runtime_contract::MountType::Tmpfs
         );
-        assert_eq!(
-            config.mounts[0].access,
-            vz_runtime_contract::MountAccess::ReadWrite
-        );
+        assert!(config.mounts[0].source.is_none());
     }
 
     #[test]

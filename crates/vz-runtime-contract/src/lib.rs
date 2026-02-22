@@ -14,7 +14,7 @@ pub use selection::{HostBackend, ResolvedBackend};
 pub use types::{
     ContainerInfo, ContainerLogs, ContainerStatus, ExecConfig, ExecOutput, ImageInfo, MountAccess,
     MountSpec, MountType, NetworkServiceConfig, PortMapping, PortProtocol, PruneResult, RunConfig,
-    StackResourceHint,
+    StackResourceHint, StackVolumeMount,
 };
 
 /// Backend-neutral container runtime trait.

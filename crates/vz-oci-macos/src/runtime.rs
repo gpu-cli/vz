@@ -517,6 +517,17 @@ impl Runtime {
         vm_config
             .shared_dirs
             .push(make_oci_runtime_share(&runtime_binary)?);
+
+        // Add VirtioFS shares for per-service volume mounts. These must be
+        // configured at VM creation time because VirtioFS shares are static.
+        for vol in &resources.volume_mounts {
+            vm_config.shared_dirs.push(SharedDirConfig {
+                tag: vol.tag.clone(),
+                source: vol.host_path.clone(),
+                read_only: vol.read_only,
+            });
+        }
+
         vm_config.cpus = resources.cpus.unwrap_or(self.config.default_cpus);
         vm_config.memory_mb = resources.memory_mb.unwrap_or(self.config.default_memory_mb);
 
@@ -689,7 +700,7 @@ impl Runtime {
                 )
             })?;
 
-        let bundle_mounts = mount_specs_to_bundle_mounts(&run.mounts)?;
+        let mut bundle_mounts = mount_specs_to_bundle_mounts(&run.mounts, run.mount_tag_offset)?;
 
         // Per-container overlay: VirtioFS doesn't support mknod, so we create a
         // guest-side overlay with tmpfs as upperdir for device nodes.
@@ -715,6 +726,17 @@ impl Runtime {
             }
         };
         tracing::debug!("step 3a OK");
+
+        // Bind-mount the VM-level log directory into the container so captured
+        // stdout/stderr survives even if the container's init process exits.
+        if run.capture_logs {
+            bundle_mounts.push(BundleMount {
+                destination: PathBuf::from("/var/log/vz-oci"),
+                source: PathBuf::from(container_log_dir(&container_id)),
+                typ: "bind".to_string(),
+                options: vec!["rbind".to_string(), "rw".to_string()],
+            });
+        }
 
         // extra_hosts are written AFTER the container starts (step 5) via
         // oci_exec inside the container's mount namespace. Writing before
@@ -1039,6 +1061,54 @@ impl Runtime {
         })
     }
 
+    /// Execute a command at the VM level (not inside a container namespace).
+    ///
+    /// Uses the guest agent's direct exec path (no nsenter). This works even
+    /// when the container's init process has exited, making it suitable for
+    /// reading logs from the VM-level log directory.
+    pub async fn exec_host(
+        &self,
+        container_id: &str,
+        exec: ExecConfig,
+    ) -> Result<ExecOutput, OciError> {
+        let vm = self
+            .vm_handles
+            .lock()
+            .await
+            .get(container_id)
+            .cloned()
+            .ok_or_else(|| {
+                OciError::InvalidConfig(format!(
+                    "no active VM handle for container '{container_id}'"
+                ))
+            })?;
+
+        let (command, args) = exec
+            .cmd
+            .split_first()
+            .ok_or_else(|| OciError::InvalidConfig("exec command must not be empty".to_string()))?;
+
+        let timeout = exec.timeout.unwrap_or(self.config.exec_timeout);
+
+        let result = tokio::time::timeout(
+            timeout,
+            vm.exec_capture(command.clone(), args.to_vec(), timeout),
+        )
+        .await
+        .map_err(|_| {
+            OciError::InvalidConfig(format!(
+                "host exec timed out after {:.3}s",
+                timeout.as_secs_f64()
+            ))
+        })??;
+
+        Ok(ExecOutput {
+            exit_code: result.exit_code,
+            stdout: result.stdout,
+            stderr: result.stderr,
+        })
+    }
+
     /// Boot a VM, wait for agent, register VM handle, set up port forwarding,
     /// and run OCI create+start (but NOT exec).
     async fn boot_and_start_container(
@@ -1083,7 +1153,7 @@ impl Runtime {
         let container_overlay = format!("/run/vz-oci/containers/{oci_container_id}");
         let guest_rootfs_path = format!("{container_overlay}/merged");
 
-        let mut bundle_mounts = mount_specs_to_bundle_mounts(&run.mounts)?;
+        let mut bundle_mounts = mount_specs_to_bundle_mounts(&run.mounts, 0)?;
 
         // Generate /etc/hosts file for inter-service hostname resolution.
         if !run.extra_hosts.is_empty() {
@@ -1093,6 +1163,17 @@ impl Runtime {
                 source: PathBuf::from(format!("{bundle_guest_path}/etc/hosts")),
                 typ: "bind".to_string(),
                 options: vec!["rbind".to_string(), "ro".to_string()],
+            });
+        }
+
+        // Bind-mount the VM-level log directory into the container so captured
+        // stdout/stderr survives even if the container's init process exits.
+        if run.capture_logs {
+            bundle_mounts.push(BundleMount {
+                destination: PathBuf::from("/var/log/vz-oci"),
+                source: PathBuf::from(container_log_dir(&oci_container_id)),
+                typ: "bind".to_string(),
+                options: vec!["rbind".to_string(), "rw".to_string()],
             });
         }
 
@@ -1135,7 +1216,7 @@ impl Runtime {
             &kernel,
         )?;
 
-        let mount_shares = mount_specs_to_shared_dirs(&run.mounts);
+        let mount_shares = mount_specs_to_shared_dirs(&run.mounts, 0);
         let mut vm_config = LinuxVmConfig::new(kernel.kernel, kernel.initramfs)
             .with_rootfs_dir(rootfs_dir.to_path_buf());
         vm_config
@@ -1249,6 +1330,7 @@ impl Runtime {
             domainname,
             stop_signal: _,
             stop_grace_period_secs: _,
+            mount_tag_offset: _,
         } = run;
 
         let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
@@ -1276,7 +1358,7 @@ impl Runtime {
         let container_overlay = format!("/run/vz-oci/containers/{container_id}");
         let guest_rootfs_path = format!("{container_overlay}/merged");
 
-        let mut bundle_mounts = mount_specs_to_bundle_mounts(&mounts)?;
+        let mut bundle_mounts = mount_specs_to_bundle_mounts(&mounts, 0)?;
 
         if !extra_hosts.is_empty() {
             write_hosts_file(&bundle_host_dir, &extra_hosts)?;
@@ -1327,7 +1409,7 @@ impl Runtime {
             &kernel,
         )?;
 
-        let mount_shares = mount_specs_to_shared_dirs(&mounts);
+        let mount_shares = mount_specs_to_shared_dirs(&mounts, 0);
         let mut vm_config =
             LinuxVmConfig::new(kernel.kernel, kernel.initramfs).with_rootfs_dir(rootfs_dir);
         vm_config
@@ -1450,6 +1532,7 @@ impl Runtime {
             domainname: _,
             stop_signal: _,
             stop_grace_period_secs: _,
+            mount_tag_offset: _,
         } = run;
 
         let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
@@ -1482,7 +1565,7 @@ impl Runtime {
 
         // Add VirtioFS shares for bind mounts and encode target paths in
         // the kernel command line so the initramfs can mount them.
-        let mount_shares = mount_specs_to_shared_dirs(&mounts);
+        let mount_shares = mount_specs_to_shared_dirs(&mounts, 0);
         if !mount_shares.is_empty() {
             vm_config.shared_dirs.extend(mount_shares);
             for (idx, spec) in mounts.iter().enumerate() {
@@ -1959,7 +2042,14 @@ fn validate_oci_runtime_binary_path(
 
 /// Convert public `MountSpec` entries to internal `BundleMount` entries for
 /// OCI runtime-spec generation.
-fn mount_specs_to_bundle_mounts(mounts: &[MountSpec]) -> Result<Vec<BundleMount>, OciError> {
+///
+/// `tag_offset` shifts the VirtioFS mount tag indices (e.g., `vz-mount-{N}`)
+/// so that multiple containers in a shared VM can have non-overlapping tags.
+/// Pass 0 for single-VM mode.
+fn mount_specs_to_bundle_mounts(
+    mounts: &[MountSpec],
+    tag_offset: usize,
+) -> Result<Vec<BundleMount>, OciError> {
     let mut bundle_mounts = Vec::with_capacity(mounts.len());
     for (idx, spec) in mounts.iter().enumerate() {
         if !spec.target.is_absolute() {
@@ -1992,7 +2082,10 @@ fn mount_specs_to_bundle_mounts(mounts: &[MountSpec]) -> Result<Vec<BundleMount>
 
         // Use the virtio mount tag as the in-guest source path for bind mounts.
         let guest_source = match &spec.mount_type {
-            MountType::Bind => PathBuf::from(format!("/mnt/vz-mount-{idx}")),
+            MountType::Bind => {
+                let global_idx = tag_offset + idx;
+                PathBuf::from(format!("/mnt/vz-mount-{global_idx}"))
+            }
             MountType::Tmpfs => source,
         };
 
@@ -2007,7 +2100,9 @@ fn mount_specs_to_bundle_mounts(mounts: &[MountSpec]) -> Result<Vec<BundleMount>
 }
 
 /// Generate VirtioFS shared directory entries for bind mount sources.
-fn mount_specs_to_shared_dirs(mounts: &[MountSpec]) -> Vec<SharedDirConfig> {
+///
+/// `tag_offset` shifts the mount tag indices to avoid collisions in shared VM mode.
+fn mount_specs_to_shared_dirs(mounts: &[MountSpec], tag_offset: usize) -> Vec<SharedDirConfig> {
     mounts
         .iter()
         .enumerate()
@@ -2016,8 +2111,9 @@ fn mount_specs_to_shared_dirs(mounts: &[MountSpec]) -> Vec<SharedDirConfig> {
                 return None;
             }
             let source = spec.source.as_ref()?;
+            let global_idx = tag_offset + idx;
             Some(SharedDirConfig {
-                tag: format!("vz-mount-{idx}"),
+                tag: format!("vz-mount-{global_idx}"),
                 source: source.clone(),
                 read_only: matches!(spec.access, MountAccess::ReadOnly),
             })
@@ -2099,6 +2195,14 @@ fn oci_bundle_guest_root(guest_state_dir: Option<&Path>) -> Result<String, OciEr
 /// tmpfs layer.
 ///
 /// Returns the guest-side merged rootfs path for use in the OCI bundle spec.
+/// VM-level log directory for a container's captured stdout/stderr.
+///
+/// The init process writes to `/var/log/vz-oci/output.log` inside the container,
+/// which is bind-mounted to this directory so logs survive container death.
+pub fn container_log_dir(container_id: &str) -> String {
+    format!("/run/vz-oci/logs/{container_id}")
+}
+
 async fn setup_guest_container_overlay(
     vm: &LinuxVm,
     vz_rootfs_path: &str,
@@ -2106,6 +2210,7 @@ async fn setup_guest_container_overlay(
 ) -> Result<String, OciError> {
     let container_overlay = format!("/run/vz-oci/containers/{container_id}");
     let guest_rootfs_path = format!("{container_overlay}/merged");
+    let log_dir = container_log_dir(container_id);
 
     let overlay_cmd = format!(
         "mkdir -p {container_overlay} && \
@@ -2113,7 +2218,8 @@ async fn setup_guest_container_overlay(
          mkdir -p {container_overlay}/upper {container_overlay}/work {container_overlay}/merged && \
          mount -t overlay overlay \
          -o lowerdir={vz_rootfs_path},upperdir={container_overlay}/upper,workdir={container_overlay}/work \
-         {container_overlay}/merged"
+         {container_overlay}/merged && \
+         mkdir -p {log_dir}"
     );
 
     let result = vm
@@ -2200,6 +2306,7 @@ fn resolve_run_config(
         domainname,
         stop_signal: _,
         stop_grace_period_secs: _,
+        mount_tag_offset: _,
     } = run;
 
     let resolved_cmd = image_config
@@ -2248,6 +2355,7 @@ fn resolve_run_config(
         domainname,
         stop_signal: None,
         stop_grace_period_secs: None,
+        mount_tag_offset: 0,
     })
 }
 
@@ -3087,7 +3195,7 @@ mod tests {
             access: MountAccess::ReadWrite,
         }];
 
-        let bundle_mounts = mount_specs_to_bundle_mounts(&mounts).unwrap();
+        let bundle_mounts = mount_specs_to_bundle_mounts(&mounts, 0).unwrap();
         assert_eq!(bundle_mounts.len(), 1);
         assert_eq!(
             bundle_mounts[0].destination,
@@ -3109,7 +3217,7 @@ mod tests {
             access: MountAccess::ReadOnly,
         }];
 
-        let bundle_mounts = mount_specs_to_bundle_mounts(&mounts).unwrap();
+        let bundle_mounts = mount_specs_to_bundle_mounts(&mounts, 0).unwrap();
         assert_eq!(bundle_mounts.len(), 1);
         assert!(bundle_mounts[0].options.contains(&"ro".to_string()));
     }
@@ -3123,7 +3231,7 @@ mod tests {
             access: MountAccess::ReadWrite,
         }];
 
-        let bundle_mounts = mount_specs_to_bundle_mounts(&mounts).unwrap();
+        let bundle_mounts = mount_specs_to_bundle_mounts(&mounts, 0).unwrap();
         assert_eq!(bundle_mounts.len(), 1);
         assert_eq!(bundle_mounts[0].destination, PathBuf::from("/tmp"));
         assert_eq!(bundle_mounts[0].source, PathBuf::from("tmpfs"));
@@ -3139,7 +3247,7 @@ mod tests {
             access: MountAccess::ReadWrite,
         }];
 
-        let err = mount_specs_to_bundle_mounts(&mounts).unwrap_err();
+        let err = mount_specs_to_bundle_mounts(&mounts, 0).unwrap_err();
         assert!(matches!(err, OciError::InvalidConfig(_)));
     }
 
@@ -3152,7 +3260,7 @@ mod tests {
             access: MountAccess::ReadWrite,
         }];
 
-        let err = mount_specs_to_bundle_mounts(&mounts).unwrap_err();
+        let err = mount_specs_to_bundle_mounts(&mounts, 0).unwrap_err();
         assert!(matches!(err, OciError::InvalidConfig(_)));
     }
 
@@ -3179,7 +3287,7 @@ mod tests {
             },
         ];
 
-        let shares = mount_specs_to_shared_dirs(&mounts);
+        let shares = mount_specs_to_shared_dirs(&mounts, 0);
         // Tmpfs is skipped, so only 2 entries.
         assert_eq!(shares.len(), 2);
         assert_eq!(shares[0].tag, "vz-mount-0");

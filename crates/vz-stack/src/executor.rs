@@ -57,6 +57,19 @@ pub trait ContainerRuntime: Send + Sync {
     /// Returns the exit code (0 = success).
     fn exec(&self, container_id: &str, command: &[String]) -> Result<i32, StackError>;
 
+    /// Execute a command and capture stdout/stderr.
+    ///
+    /// Default implementation delegates to [`exec`] and returns empty
+    /// strings. Runtimes that support output capture should override.
+    fn exec_with_output(
+        &self,
+        container_id: &str,
+        command: &[String],
+    ) -> Result<(i32, String, String), StackError> {
+        let code = self.exec(container_id, command)?;
+        Ok((code, String::new(), String::new()))
+    }
+
     /// Retrieve logs (stdout/stderr) from a container.
     ///
     /// Returns a [`ContainerLogs`] with captured stdout and stderr.
@@ -162,11 +175,18 @@ impl PortTracker {
     ///
     /// Explicit host_ports are verified against currently allocated ports.
     /// `None` host_ports get an ephemeral port assigned.
+    ///
+    /// If the service already has ports allocated (e.g. from a failed create
+    /// being retried), the old allocation is released first so it doesn't
+    /// conflict with itself.
     pub fn allocate(
         &mut self,
         service_name: &str,
         ports: &[crate::spec::PortSpec],
     ) -> Result<Vec<PublishedPort>, StackError> {
+        // Release any previous allocation for this service so retries don't
+        // conflict with their own prior allocation.
+        self.allocated.remove(service_name);
         let in_use = self.in_use();
         let resolved = resolve_ports(ports, &in_use)?;
         self.allocated
@@ -201,6 +221,12 @@ pub struct StackExecutor<R: ContainerRuntime> {
     /// Per-service primary IP (first network IP, used for port forwarding and /etc/hosts).
     /// Populated during shared VM boot / network setup.
     service_ips: HashMap<String, String>,
+    /// Per-service VirtioFS mount tag offset for shared VM mode.
+    ///
+    /// In a shared VM, all services' bind mounts are configured as VirtioFS
+    /// shares with globally-unique sequential tags. Each service's mounts
+    /// start at an offset so tags don't collide between services.
+    mount_tag_offsets: HashMap<String, usize>,
 }
 
 /// Result of executing a batch of actions.
@@ -321,6 +347,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             volumes: VolumeManager::new(data_dir),
             ports: PortTracker::new(),
             service_ips: HashMap::new(),
+            mount_tag_offsets: HashMap::new(),
         }
     }
 
@@ -482,6 +509,35 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 })
                 .collect();
 
+            // Collect all bind/named volume mounts across services so VirtioFS
+            // shares can be configured at VM creation time.  Each service gets
+            // a global tag offset so mount tags don't collide.
+            let mut all_volume_mounts: Vec<vz_runtime_contract::StackVolumeMount> = Vec::new();
+            let mut mount_tag_offsets: HashMap<String, usize> = HashMap::new();
+            for svc in &spec.services {
+                let resolved = self
+                    .volumes
+                    .resolve_mounts(&svc.mounts, &spec.volumes)?;
+                // This service's bind mounts start at the current global index.
+                mount_tag_offsets.insert(svc.name.clone(), all_volume_mounts.len());
+                for rm in &resolved {
+                    if let Some(host_path) = &rm.host_path {
+                        // Only host-backed bind mounts need VirtioFS shares.
+                        // Named volumes use tmpfs inside the VM, ephemeral mounts
+                        // are also tmpfs — neither needs a host share.
+                        if matches!(rm.kind, crate::volume::ResolvedMountKind::Bind) {
+                            let idx = all_volume_mounts.len();
+                            all_volume_mounts.push(vz_runtime_contract::StackVolumeMount {
+                                tag: format!("vz-mount-{idx}"),
+                                host_path: host_path.clone(),
+                                read_only: rm.read_only,
+                            });
+                        }
+                    }
+                }
+            }
+            self.mount_tag_offsets = mount_tag_offsets;
+
             // Compute aggregate resource hints for VM sizing.
             let resources = {
                 let max_cpus = spec
@@ -502,6 +558,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 vz_runtime_contract::StackResourceHint {
                     cpus: max_cpus,
                     memory_mb: total_memory_mb,
+                    volume_mounts: all_volume_mounts,
                 }
             };
 
@@ -541,11 +598,24 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         let use_shared_vm = self.runtime.has_shared_vm(&spec.name);
 
         for level in &levels {
-            // Handle recreates: remove old containers first (serial).
+            // Clean up old containers before creating new ones.
+            // Recreates always remove the old container. For creates from a
+            // Failed state, the old container may still exist in the runtime
+            // — clean it up to avoid "container already exists" errors.
             for action in level {
-                if let Action::ServiceRecreate { service_name } = action {
-                    if let Err(e) = self.execute_remove(spec, service_name) {
-                        error!(service = %service_name, error = %e, "failed to remove old container during recreate");
+                let should_remove = match action {
+                    Action::ServiceRecreate { .. } => true,
+                    Action::ServiceCreate { service_name } => {
+                        let observed = self.store.load_observed_state(&spec.name).unwrap_or_default();
+                        observed
+                            .iter()
+                            .any(|o| o.service_name == *service_name && o.container_id.is_some())
+                    }
+                    _ => false,
+                };
+                if should_remove {
+                    if let Err(e) = self.execute_remove(spec, action.service_name()) {
+                        error!(service = %action.service_name(), error = %e, "failed to remove old container");
                     }
                 }
             }
@@ -766,6 +836,13 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 .unwrap_or(service_name)
                 .to_string(),
         );
+
+        // Set the VirtioFS mount tag offset for this service in shared VM mode.
+        if use_shared_vm {
+            if let Some(&offset) = self.mount_tag_offsets.get(service_name) {
+                run_config.mount_tag_offset = offset;
+            }
+        }
 
         // Override ports with resolved allocations.
         let service_target_host = if use_shared_vm {
@@ -1754,6 +1831,77 @@ mod tests {
         }];
         let published = tracker.allocate("api", &ports2).unwrap();
         assert_eq!(published[0].host_port, 9090);
+    }
+
+    #[test]
+    fn port_tracker_reallocate_same_service_succeeds() {
+        let mut tracker = PortTracker::new();
+        let ports = vec![PortSpec {
+            protocol: "tcp".to_string(),
+            container_port: 5432,
+            host_port: Some(5432),
+        }];
+        // First allocation succeeds.
+        tracker.allocate("postgres", &ports).unwrap();
+
+        // Re-allocating the same service (e.g. retry after create failure)
+        // should succeed — the old allocation is released automatically.
+        let published = tracker.allocate("postgres", &ports).unwrap();
+        assert_eq!(published[0].host_port, 5432);
+    }
+
+    #[test]
+    fn port_tracker_reallocate_does_not_conflict_with_other_services() {
+        let mut tracker = PortTracker::new();
+
+        // Service A takes port 5433.
+        tracker
+            .allocate(
+                "postgres-test",
+                &[PortSpec {
+                    protocol: "tcp".to_string(),
+                    container_port: 5432,
+                    host_port: Some(5433),
+                }],
+            )
+            .unwrap();
+
+        // Service B takes port 5432.
+        tracker
+            .allocate(
+                "postgres",
+                &[PortSpec {
+                    protocol: "tcp".to_string(),
+                    container_port: 5432,
+                    host_port: Some(5432),
+                }],
+            )
+            .unwrap();
+
+        // Re-allocating service B should still succeed (its own port isn't
+        // treated as a conflict), but service A's port is still reserved.
+        let published = tracker
+            .allocate(
+                "postgres",
+                &[PortSpec {
+                    protocol: "tcp".to_string(),
+                    container_port: 5432,
+                    host_port: Some(5432),
+                }],
+            )
+            .unwrap();
+        assert_eq!(published[0].host_port, 5432);
+
+        // But trying to take service A's port should still fail.
+        let result = tracker.allocate(
+            "postgres",
+            &[PortSpec {
+                protocol: "tcp".to_string(),
+                container_port: 5432,
+                host_port: Some(5433),
+            }],
+        );
+        assert!(result.is_err());
     }
 
     #[test]

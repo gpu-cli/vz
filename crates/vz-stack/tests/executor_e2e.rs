@@ -233,7 +233,7 @@ services:
     image: postgres:16
     healthcheck:
       test: ["CMD", "pg_isready"]
-      interval: 5s
+      interval: 0s
       retries: 2
 
   app:
@@ -297,12 +297,17 @@ fn health_check_failure_marks_service_failed() {
         .poll_all(executor.runtime(), executor.store(), &spec)
         .unwrap();
 
+    // Retries exhausted → reported as newly_failed.
     assert_eq!(poll2.newly_failed, vec!["db".to_string()]);
 
-    // db should be marked Failed.
+    // Docker semantics: container stays Running (unhealthy), not killed.
     let observed = executor.store().load_observed_state("hc-fail").unwrap();
     let db = observed.iter().find(|o| o.service_name == "db").unwrap();
-    assert_eq!(db.phase, ServicePhase::Failed);
+    assert_eq!(db.phase, ServicePhase::Running);
+
+    // Counter is reset so health checks continue — a subsequent pass
+    // can still promote the service to ready.
+    assert_eq!(poller.statuses()["db"].consecutive_failures, 0);
 }
 
 // ── Restart policy integration ──────────────────────────────────

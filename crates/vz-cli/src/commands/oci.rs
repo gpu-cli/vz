@@ -659,6 +659,7 @@ async fn create_container(runtime: &vz_oci_macos::Runtime, args: CreateArgs) -> 
         domainname: None,
         stop_signal: None,
         stop_grace_period_secs: None,
+        mount_tag_offset: 0,
     };
 
     info!(image = %args.image, "creating long-lived container");
@@ -886,6 +887,7 @@ fn build_run_config(args: &RunArgs) -> anyhow::Result<vz_oci_macos::RunConfig> {
         domainname: None,
         stop_signal: None,
         stop_grace_period_secs: None,
+        mount_tag_offset: 0,
     })
 }
 

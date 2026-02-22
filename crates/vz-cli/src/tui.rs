@@ -1104,6 +1104,7 @@ mod tests {
                     labels: std::collections::HashMap::new(),
                     stop_signal: None,
                     stop_grace_period_secs: None,
+                    container_name: None,
                 },
                 vz_stack::ServiceSpec {
                     name: "db".into(),
@@ -1137,6 +1138,7 @@ mod tests {
                     labels: std::collections::HashMap::new(),
                     stop_signal: None,
                     stop_grace_period_secs: None,
+                    container_name: None,
                 },
             ],
             networks: vec![],

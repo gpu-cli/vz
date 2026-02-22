@@ -187,13 +187,13 @@ impl RuntimeBackend for MacosRuntimeBackend {
     }
 
     fn logs(&self, container_id: &str) -> Result<contract::ContainerLogs, RuntimeError> {
+        use crate::runtime::container_log_dir;
+
+        // Read from the VM-level log directory (not inside the container).
+        // This works even when the container's init process has exited.
+        let log_path = format!("{}/output.log", container_log_dir(container_id));
         let exec_config = oci_config::ExecConfig {
-            cmd: vec![
-                "tail".into(),
-                "-n".into(),
-                "100".into(),
-                "/var/log/vz-oci/output.log".into(),
-            ],
+            cmd: vec!["tail".into(), "-n".into(), "100".into(), log_path],
             working_dir: None,
             env: vec![],
             user: None,
@@ -202,7 +202,7 @@ impl RuntimeBackend for MacosRuntimeBackend {
 
         let output = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(self.runtime.exec_container(container_id, exec_config))
+                .block_on(self.runtime.exec_host(container_id, exec_config))
         })
         .map_err(oci_err)?;
 
@@ -264,6 +264,7 @@ fn run_config_from_contract(c: contract::RunConfig) -> oci_config::RunConfig {
         domainname: c.domainname,
         stop_signal: c.stop_signal,
         stop_grace_period_secs: c.stop_grace_period_secs,
+        mount_tag_offset: c.mount_tag_offset,
     }
 }
 

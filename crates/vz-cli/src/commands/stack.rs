@@ -373,23 +373,6 @@ impl OciContainerRuntime {
         Ok(Self { backend, handle })
     }
 
-    /// Execute a command in a running container and capture output.
-    fn exec_with_output(
-        &self,
-        container_id: &str,
-        cmd: Vec<String>,
-    ) -> Result<vz_runtime_contract::ExecOutput, StackError> {
-        use vz_runtime_contract::RuntimeBackend;
-        tokio::task::block_in_place(|| {
-            let exec_config = vz_runtime_contract::ExecConfig {
-                cmd,
-                ..Default::default()
-            };
-            self.handle
-                .block_on(self.backend.exec_container(container_id, exec_config))
-                .map_err(|e| StackError::Network(format!("exec failed: {e}")))
-        })
-    }
 }
 
 impl ContainerRuntime for OciContainerRuntime {
@@ -443,6 +426,15 @@ impl ContainerRuntime for OciContainerRuntime {
     }
 
     fn exec(&self, container_id: &str, command: &[String]) -> Result<i32, StackError> {
+        let (code, _, _) = ContainerRuntime::exec_with_output(self, container_id, command)?;
+        Ok(code)
+    }
+
+    fn exec_with_output(
+        &self,
+        container_id: &str,
+        command: &[String],
+    ) -> Result<(i32, String, String), StackError> {
         use vz_runtime_contract::RuntimeBackend;
         tokio::task::block_in_place(|| {
             let exec_config = vz_runtime_contract::ExecConfig {
@@ -451,7 +443,7 @@ impl ContainerRuntime for OciContainerRuntime {
             };
             self.handle
                 .block_on(self.backend.exec_container(container_id, exec_config))
-                .map(|output| output.exit_code)
+                .map(|output| (output.exit_code, output.stdout, output.stderr))
                 .map_err(|e| StackError::Network(format!("exec failed: {e}")))
         })
     }
@@ -530,21 +522,12 @@ impl ContainerRuntime for OciContainerRuntime {
     }
 
     fn logs(&self, container_id: &str) -> Result<ContainerLogs, StackError> {
-        let output = self.exec_with_output(
-            container_id,
-            vec![
-                "tail".into(),
-                "-n".into(),
-                "100".into(),
-                CONTAINER_LOG_FILE.into(),
-            ],
-        )?;
+        use vz_runtime_contract::RuntimeBackend;
+        let logs = self.backend.logs(container_id).map_err(|e| {
+            StackError::Network(format!("logs failed: {e}"))
+        })?;
         Ok(ContainerLogs {
-            output: if output.exit_code == 0 {
-                output.stdout
-            } else {
-                String::new()
-            },
+            output: logs.output,
         })
     }
 }
@@ -978,11 +961,11 @@ fn handle_exec(
     );
 
     let runtime = orchestrator.executor().runtime();
-    match runtime.exec_with_output(container_id, request.cmd.clone()) {
-        Ok(output) => ControlResponse {
-            exit_code: output.exit_code,
-            stdout: output.stdout,
-            stderr: output.stderr,
+    match runtime.exec_with_output(container_id, &request.cmd) {
+        Ok((exit_code, stdout, stderr)) => ControlResponse {
+            exit_code,
+            stdout,
+            stderr,
             error: None,
         },
         Err(e) => ControlResponse {

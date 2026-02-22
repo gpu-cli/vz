@@ -523,14 +523,19 @@ impl oci_service_server::OciService for OciServiceImpl {
             format!("--root=/proc/{pid}/root"),
             format!("--target={pid}"),
             "--".into(),
+            "env".into(),
         ];
 
-        // Build env prefix if environment variables are specified.
-        if !req.env.is_empty() || !req.working_dir.is_empty() || !req.user.is_empty() {
-            nsenter_args.push("env".into());
-            for (key, value) in &req.env {
-                nsenter_args.push(format!("{key}={value}"));
-            }
+        // Always set a standard PATH so commands like pg_isready are found.
+        let has_path = req.env.keys().any(|k| k == "PATH");
+        if !has_path {
+            nsenter_args.push(
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
+            );
+        }
+
+        for (key, value) in &req.env {
+            nsenter_args.push(format!("{key}={value}"));
         }
 
         nsenter_args.push(req.command);
@@ -661,10 +666,23 @@ async fn run_youki(args: &[&str]) -> Result<(), Status> {
     if !status.success() {
         let youki_log = tokio::fs::read_to_string(&log_file).await.unwrap_or_default();
         error!(command = %subcmd, log = %youki_log, "youki command failed");
-        return Err(Status::internal(format!(
-            "youki {subcmd} failed (exit {}): see youki log",
-            status.code().unwrap_or(-1)
-        )));
+        // Include the last few lines of the youki log in the error response
+        // so the host can surface them without needing VM access.
+        let log_tail: String = youki_log
+            .lines()
+            .rev()
+            .take(10)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let exit_code = status.code().unwrap_or(-1);
+        return Err(Status::internal(if log_tail.is_empty() {
+            format!("youki {subcmd} failed (exit {exit_code}): no log output")
+        } else {
+            format!("youki {subcmd} failed (exit {exit_code}): {log_tail}")
+        }));
     }
 
     Ok(())
@@ -745,10 +763,10 @@ async fn patch_oci_config(config_path: &str) -> Result<(), Status> {
         });
     }
 
-    // Strip maskedPaths, readonlyPaths, and namespaces — the minimal VM
-    // kernel doesn't support the namespace types youki tries to unshare,
-    // and masked/readonly paths reference /proc and /sys paths that may
-    // not exist, causing youki to hang.
+    // Strip maskedPaths, readonlyPaths, and unsupported namespaces — the
+    // minimal VM kernel doesn't support all namespace types youki tries to
+    // unshare, and masked/readonly paths reference /proc and /sys paths that
+    // may not exist, causing youki to hang.
     if let Some(linux) = config.pointer_mut("/linux") {
         if let Some(obj) = linux.as_object_mut() {
             if obj.remove("maskedPaths").is_some() {
@@ -757,10 +775,22 @@ async fn patch_oci_config(config_path: &str) -> Result<(), Status> {
             if obj.remove("readonlyPaths").is_some() {
                 tracing::info!("stripped readonlyPaths from OCI config");
             }
-            // Strip all namespaces — the container runs directly in the
-            // guest VM's namespace. The VM itself provides isolation.
-            if obj.remove("namespaces").is_some() {
-                tracing::info!("stripped namespaces from OCI config");
+            // Strip unsupported namespaces but preserve mount and network.
+            // The host-side bundle already strips PID/IPC/UTS/cgroup, but
+            // older bundles or third-party configs may still include them.
+            // Network namespaces MUST be preserved — multi-service stacks
+            // use per-service netns (e.g. /var/run/netns/svc-web) for
+            // container network isolation and service discovery.
+            if let Some(namespaces) = obj.get_mut("namespaces").and_then(|v| v.as_array_mut()) {
+                let before = namespaces.len();
+                namespaces.retain(|ns| {
+                    let typ = ns.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    matches!(typ, "mount" | "network")
+                });
+                let stripped = before - namespaces.len();
+                if stripped > 0 {
+                    tracing::info!(stripped, "stripped unsupported namespaces from OCI config");
+                }
             }
         }
     }
