@@ -198,6 +198,7 @@ Phase 1 must complete before Phase 2 or Phase 3 can begin. Phase 2 and Phase 3 c
 | `07-golden-image.md` | IPSW to bootable macOS VM pipeline, dev tool provisioning, image versioning, **automated first-boot provisioning (skip Setup Assistant, pre-create user), fully unattended vz init flow** |
 | `08-testing.md` | Testing strategy for a virtualization library: unit tests (mock ObjC), integration tests (real VMs), CI on Apple Silicon |
 | `09-signing.md` | **Entitlements (com.apple.security.virtualization), code signing with Developer ID, notarization, CI signing workflow, distribution (Homebrew, GitHub Releases, cargo install, install script)** |
+| `on-demand-elevation/README.md` | One-command UX with stage-gated elevation: request admin privileges only when offline provisioning requires it; includes security, UX, and rollout plan |
 | `oci-runtime/README.md` | Linux OCI runtime track (current): Linux VM bootstrap, image pulling, container lifecycle, unified API prerequisites |
 | `oci-youki-compose/README.md` | OCI runtime-spec compliance via `youki` + Compose-class stack runtime/reconciler track |
 
