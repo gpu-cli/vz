@@ -133,11 +133,7 @@ pub fn setup_stack_network(stack_id: &str, services: &[NetworkServiceConfig]) ->
             let eth_name = format!("eth{iface_idx}");
 
             // Unique veth host-end name: veth-<svc>-<idx>.
-            let veth_host = format!(
-                "veth-{}-{}",
-                truncate_name(&svc.name, 8),
-                iface_idx
-            );
+            let veth_host = format!("veth-{}-{}", truncate_name(&svc.name, 8), iface_idx);
             let ns_path = format!("{NETNS_RUN_DIR}/{}", svc.name);
 
             // Create veth pair inside the namespace, then move host end out.
@@ -168,10 +164,7 @@ pub fn setup_stack_network(stack_id: &str, services: &[NetworkServiceConfig]) ->
             }
 
             // Rename peer end to ethN.
-            nsenter_ip(
-                &ns_path,
-                &["link", "set", "veth_tmp", "name", &eth_name],
-            )?;
+            nsenter_ip(&ns_path, &["link", "set", "veth_tmp", "name", &eth_name])?;
 
             nsenter_ip(
                 &ns_path,

@@ -336,10 +336,7 @@ async fn run_runtime_command(
 }
 
 /// Drain a pipe with a timeout, returning whatever was read.
-async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(
-    pipe: &mut R,
-    timeout: Duration,
-) -> String {
+async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(pipe: &mut R, timeout: Duration) -> String {
     use tokio::io::AsyncReadExt;
     let mut buf = Vec::new();
     let _ = tokio::time::timeout(timeout, pipe.read_to_end(&mut buf)).await;

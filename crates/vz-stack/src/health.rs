@@ -9,7 +9,7 @@
 //! running services, updating observed state and emitting events.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
@@ -200,6 +200,8 @@ fn resolve_healthcheck_command(test: &[String]) -> Vec<String> {
 
 /// Default health check interval when not specified (30s).
 const DEFAULT_INTERVAL_SECS: u64 = 30;
+/// Default health check timeout when not specified (30s).
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Default health check retries threshold when not specified.
 const DEFAULT_RETRIES: u32 = 3;
 
@@ -312,23 +314,39 @@ impl HealthPoller {
                 continue;
             }
 
-            // Execute health check command.
+            // Execute health check command with timeout enforcement.
             // Docker convention: ["CMD", "arg1", ...] → exec directly,
             // ["CMD-SHELL", "cmd"] → exec through /bin/sh -c.
             let cmd = resolve_healthcheck_command(&hc.test);
-            debug!(service = %svc.name, cmd = ?cmd, "running health check");
-            let exit_code = match runtime.exec(container_id, &cmd) {
-                Ok(code) => {
-                    if code != 0 {
-                        debug!(service = %svc.name, exit_code = code, cmd = ?cmd, "health check returned non-zero");
+            let timeout = Duration::from_secs(hc.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+            debug!(service = %svc.name, cmd = ?cmd, timeout_secs = timeout.as_secs(), "running health check");
+
+            let exit_code = {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let cid = container_id.clone();
+                let cmd_clone = cmd.clone();
+                std::thread::scope(|s| {
+                    s.spawn(|| {
+                        let result = runtime.exec(&cid, &cmd_clone);
+                        let _ = tx.send(result);
+                    });
+                    match rx.recv_timeout(timeout) {
+                        Ok(Ok(code)) => {
+                            if code != 0 {
+                                debug!(service = %svc.name, exit_code = code, cmd = ?cmd, "health check returned non-zero");
+                            }
+                            code
+                        }
+                        Ok(Err(e)) => {
+                            warn!(service = %svc.name, error = %e, "health check exec failed");
+                            1
+                        }
+                        Err(_) => {
+                            warn!(service = %svc.name, timeout_secs = timeout.as_secs(), "health check timed out");
+                            1
+                        }
                     }
-                    code
-                }
-                Err(e) => {
-                    warn!(service = %svc.name, error = %e, "health check exec failed");
-                    // Treat exec errors as a failed check.
-                    1
-                }
+                })
             };
 
             let status = self
@@ -477,6 +495,8 @@ mod tests {
             hostname: None,
             domainname: None,
             labels: std::collections::HashMap::new(),
+            stop_signal: None,
+            stop_grace_period_secs: None,
         }
     }
 
@@ -1133,5 +1153,49 @@ mod tests {
         assert_eq!(result.checks_run, 1);
         assert!(result.newly_ready.is_empty());
         assert_eq!(poller.statuses()["web"].consecutive_failures, 1);
+    }
+
+    #[test]
+    fn poller_timeout_treated_as_failure() {
+        use std::time::Duration;
+
+        let mut runtime = MockContainerRuntime::new();
+        // Exec sleeps for 2s, but health check timeout is 1s.
+        runtime.exec_delay = Some(Duration::from_secs(2));
+        let store = StateStore::in_memory().unwrap();
+
+        let hc = HealthCheckSpec {
+            test: vec!["CMD".to_string(), "slow-cmd".to_string()],
+            interval_secs: Some(5),
+            timeout_secs: Some(1),
+            retries: Some(3),
+            start_period_secs: None,
+        };
+        let spec = stack_with_hc(
+            "app",
+            vec![ServiceSpec {
+                healthcheck: Some(hc),
+                ..svc("web")
+            }],
+        );
+
+        store
+            .save_observed_state("app", &running_obs("web", "ctr-1"))
+            .unwrap();
+
+        let mut poller = HealthPoller::new();
+        let result = poller.poll_all(&runtime, &store, &spec).unwrap();
+
+        assert_eq!(result.checks_run, 1);
+        assert!(result.newly_ready.is_empty());
+        assert_eq!(poller.statuses()["web"].consecutive_failures, 1);
+
+        // Event should be emitted for the failure.
+        let events = store.load_events("app").unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::HealthCheckFailed { .. }))
+        );
     }
 }

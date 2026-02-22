@@ -181,6 +181,11 @@ pub struct RunConfig {
     pub hostname: Option<String>,
     /// Container domain name.
     pub domainname: Option<String>,
+    // ── Stop lifecycle ──────────────────────────────────────────────
+    /// Signal to send for graceful stop (e.g., "SIGQUIT"). Default: SIGTERM.
+    pub stop_signal: Option<String>,
+    /// Seconds to wait after stop signal before SIGKILL. Default: 10.
+    pub stop_grace_period_secs: Option<u64>,
 }
 
 /// Options for executing a command in an already-running container.

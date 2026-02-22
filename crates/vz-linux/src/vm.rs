@@ -193,9 +193,9 @@ impl LinuxVm {
     ) -> Result<ExecOutput, LinuxError> {
         self.ensure_grpc().await?;
         let mut grpc = self.grpc.lock().await;
-        let client = grpc.as_mut().ok_or_else(|| {
-            LinuxError::Protocol("gRPC client not connected".to_string())
-        })?;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
         tokio::time::timeout(timeout, client.exec(command, args, options))
             .await
             .map_err(|_| {
@@ -215,9 +215,9 @@ impl LinuxVm {
     ) -> Result<GrpcPortForwardStream, LinuxError> {
         self.ensure_grpc().await?;
         let mut grpc = self.grpc.lock().await;
-        let client = grpc.as_mut().ok_or_else(|| {
-            LinuxError::Protocol("gRPC client not connected".to_string())
-        })?;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
         client
             .port_forward(target_port, protocol_name, target_host)
             .await
@@ -227,9 +227,9 @@ impl LinuxVm {
     pub async fn oci_create(&self, id: String, bundle_path: String) -> Result<(), LinuxError> {
         self.ensure_grpc().await?;
         let mut grpc = self.grpc.lock().await;
-        let client = grpc.as_mut().ok_or_else(|| {
-            LinuxError::Protocol("gRPC client not connected".to_string())
-        })?;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
         client.oci_create(id, bundle_path).await
     }
 
@@ -237,9 +237,9 @@ impl LinuxVm {
     pub async fn oci_start(&self, id: String) -> Result<(), LinuxError> {
         self.ensure_grpc().await?;
         let mut grpc = self.grpc.lock().await;
-        let client = grpc.as_mut().ok_or_else(|| {
-            LinuxError::Protocol("gRPC client not connected".to_string())
-        })?;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
         client.oci_start(id).await
     }
 
@@ -247,9 +247,9 @@ impl LinuxVm {
     pub async fn oci_state(&self, id: String) -> Result<OciContainerState, LinuxError> {
         self.ensure_grpc().await?;
         let mut grpc = self.grpc.lock().await;
-        let client = grpc.as_mut().ok_or_else(|| {
-            LinuxError::Protocol("gRPC client not connected".to_string())
-        })?;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
         client.oci_state(id).await
     }
 
@@ -263,9 +263,9 @@ impl LinuxVm {
     ) -> Result<OciExecResult, LinuxError> {
         self.ensure_grpc().await?;
         let mut grpc = self.grpc.lock().await;
-        let client = grpc.as_mut().ok_or_else(|| {
-            LinuxError::Protocol("gRPC client not connected".to_string())
-        })?;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
         client.oci_exec(id, command, args, options).await
     }
 
@@ -273,9 +273,9 @@ impl LinuxVm {
     pub async fn oci_kill(&self, id: String, signal: String) -> Result<(), LinuxError> {
         self.ensure_grpc().await?;
         let mut grpc = self.grpc.lock().await;
-        let client = grpc.as_mut().ok_or_else(|| {
-            LinuxError::Protocol("gRPC client not connected".to_string())
-        })?;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
         client.oci_kill(id, signal).await
     }
 
@@ -283,9 +283,9 @@ impl LinuxVm {
     pub async fn oci_delete(&self, id: String, force: bool) -> Result<(), LinuxError> {
         self.ensure_grpc().await?;
         let mut grpc = self.grpc.lock().await;
-        let client = grpc.as_mut().ok_or_else(|| {
-            LinuxError::Protocol("gRPC client not connected".to_string())
-        })?;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
         client.oci_delete(id, force).await
     }
 
@@ -297,9 +297,9 @@ impl LinuxVm {
     ) -> Result<(), LinuxError> {
         self.ensure_grpc().await?;
         let mut grpc = self.grpc.lock().await;
-        let client = grpc.as_mut().ok_or_else(|| {
-            LinuxError::Protocol("gRPC client not connected".to_string())
-        })?;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
         let proto_services = services
             .into_iter()
             .map(|s| vz_agent_proto::NetworkServiceConfig {
@@ -319,9 +319,9 @@ impl LinuxVm {
     ) -> Result<(), LinuxError> {
         self.ensure_grpc().await?;
         let mut grpc = self.grpc.lock().await;
-        let client = grpc.as_mut().ok_or_else(|| {
-            LinuxError::Protocol("gRPC client not connected".to_string())
-        })?;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
         client.network_teardown(stack_id, service_names).await
     }
 

@@ -186,7 +186,10 @@ mod tests {
             command: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), "echo ready".to_string()],
             env: [
-                ("PATH".to_string(), "/usr/local/bin:/usr/bin:/bin".to_string()),
+                (
+                    "PATH".to_string(),
+                    "/usr/local/bin:/usr/bin:/bin".to_string(),
+                ),
                 ("MODE".to_string(), "prod".to_string()),
             ]
             .into_iter()
@@ -272,9 +275,15 @@ mod tests {
     fn service_modules_exist() {
         // Verify the generated service modules are accessible.
         // Client and server stubs are generated for all three services.
-        let _ = std::any::type_name::<agent_service_client::AgentServiceClient<tonic::transport::Channel>>();
-        let _ = std::any::type_name::<oci_service_client::OciServiceClient<tonic::transport::Channel>>();
-        let _ = std::any::type_name::<network_service_client::NetworkServiceClient<tonic::transport::Channel>>();
+        let _ = std::any::type_name::<
+            agent_service_client::AgentServiceClient<tonic::transport::Channel>,
+        >();
+        let _ = std::any::type_name::<
+            oci_service_client::OciServiceClient<tonic::transport::Channel>,
+        >();
+        let _ = std::any::type_name::<
+            network_service_client::NetworkServiceClient<tonic::transport::Channel>,
+        >();
     }
 
     // ── Coverage: all proto message types instantiate ────────────

@@ -131,11 +131,7 @@ impl SandboxSession {
     pub async fn exec_streaming(&self, cmd: &str) -> Result<GrpcExecStream, SandboxError> {
         let (command, args) = self.parse_command(cmd)?;
 
-        debug!(
-            cmd = cmd,
-            slot = self.slot_index,
-            "exec_streaming"
-        );
+        debug!(cmd = cmd, slot = self.slot_index, "exec_streaming");
 
         let mut grpc = self.grpc.lock().await;
         if let Some(ref mut client) = *grpc {

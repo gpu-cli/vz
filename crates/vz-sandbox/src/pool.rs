@@ -348,10 +348,7 @@ impl SandboxPool {
     }
 
     /// Connect to the guest agent over gRPC with retry and exponential backoff.
-    async fn connect_agent_to_vm(
-        &self,
-        vm: Arc<Vm>,
-    ) -> Result<GrpcAgentClient, SandboxError> {
+    async fn connect_agent_to_vm(&self, vm: Arc<Vm>) -> Result<GrpcAgentClient, SandboxError> {
         let mut attempts = 0u32;
         let mut delay = Duration::from_secs(1);
 

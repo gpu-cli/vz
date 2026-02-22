@@ -155,6 +155,13 @@ pub struct ServiceSpec {
     /// Container labels (key-value metadata).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels: HashMap<String, String>,
+    // ── Stop lifecycle ──────────────────────────────────────────────
+    /// Signal to send for graceful stop (e.g., "SIGQUIT"). Default: SIGTERM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_signal: Option<String>,
+    /// Seconds to wait after stop signal before SIGKILL. Default: 10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_grace_period_secs: Option<u64>,
 }
 
 /// Mount specification for container volumes.
@@ -396,6 +403,8 @@ mod tests {
                 hostname: None,
                 domainname: None,
                 labels: HashMap::new(),
+                stop_signal: None,
+                stop_grace_period_secs: None,
             }],
             networks: vec![NetworkSpec {
                 name: "frontend".to_string(),

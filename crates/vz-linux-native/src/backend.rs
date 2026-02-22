@@ -12,11 +12,11 @@ use tracing::{debug, info};
 use vz_image::{ImagePuller, ImageStore, parse_image_config_summary_from_store};
 use vz_runtime_contract::{self as contract, RuntimeBackend, RuntimeError};
 
-use vz_oci::bundle::{BundleMount, BundleSpec};
 use crate::config::LinuxNativeConfig;
 use crate::network;
 use crate::ns;
 use crate::runtime::ContainerRuntime;
+use vz_oci::bundle::{BundleMount, BundleSpec};
 
 /// Tracked state for a container.
 struct TrackedContainer {
@@ -144,7 +144,9 @@ async fn pull_and_assemble(
     container_id: &str,
 ) -> Result<(std::path::PathBuf, String), crate::error::LinuxNativeError> {
     let image_id = puller.pull(image, auth).await?;
-    let rootfs_dir = store.assemble_rootfs_async(&image_id.0, container_id).await?;
+    let rootfs_dir = store
+        .assemble_rootfs_async(&image_id.0, container_id)
+        .await?;
     Ok((rootfs_dir, image_id.0))
 }
 
@@ -158,9 +160,7 @@ fn apply_image_config(
     let image_config = parse_image_config_summary_from_store(store, image_id)?;
 
     if config.cmd.is_empty() {
-        config.cmd = image_config
-            .resolve_cmd(&config.cmd)
-            .unwrap_or_default();
+        config.cmd = image_config.resolve_cmd(&config.cmd).unwrap_or_default();
     }
     config.env = image_config.resolve_env(&config.env, container_id);
     if config.working_dir.is_none() {

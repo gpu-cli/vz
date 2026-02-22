@@ -55,6 +55,9 @@ const ACCEPTED_SERVICE: &[&str] = &[
     "hostname",
     "domainname",
     "labels",
+    // Stop lifecycle
+    "stop_signal",
+    "stop_grace_period",
 ];
 
 /// Volume-level keys allowed inside `volumes.<name>`.
@@ -481,6 +484,35 @@ fn parse_service(
         .map(String::from);
     let labels = parse_labels(name, svc_map)?;
 
+    // Stop lifecycle
+    let stop_signal = svc_map
+        .get(val("stop_signal"))
+        .map(|v| {
+            v.as_str().ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{name}`: `stop_signal` must be a string"
+                ))
+            })
+        })
+        .transpose()?
+        .map(String::from);
+
+    let stop_grace_period_secs = svc_map
+        .get(val("stop_grace_period"))
+        .map(|v| {
+            let s = v.as_str().ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{name}`: `stop_grace_period` must be a duration string"
+                ))
+            })?;
+            parse_duration_string(s).ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{name}`: invalid duration `{s}` for `stop_grace_period`"
+                ))
+            })
+        })
+        .transpose()?;
+
     // Merge pids_limit: service-level overrides deploy-level when present.
     let resources = ResourcesSpec {
         pids_limit: pids_limit.or(resources.pids_limit),
@@ -513,6 +545,8 @@ fn parse_service(
         hostname,
         domainname,
         labels,
+        stop_signal,
+        stop_grace_period_secs,
     })
 }
 
@@ -2700,6 +2734,56 @@ volumes:
         assert_eq!(parse_duration_string("1m30s"), Some(90));
         assert_eq!(parse_duration_string("1h30m15s"), Some(5415));
         assert_eq!(parse_duration_string("0s"), Some(0));
+    }
+
+    // ── Stop lifecycle parsing ───────────────────────────────────
+
+    #[test]
+    fn stop_signal_parsed() {
+        let yaml = r#"
+services:
+  db:
+    image: postgres:16
+    stop_signal: SIGQUIT
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].stop_signal.as_deref(), Some("SIGQUIT"));
+    }
+
+    #[test]
+    fn stop_grace_period_parsed() {
+        let yaml = r#"
+services:
+  db:
+    image: postgres:16
+    stop_grace_period: 30s
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].stop_grace_period_secs, Some(30));
+    }
+
+    #[test]
+    fn stop_signal_defaults_to_none() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].stop_signal, None);
+        assert_eq!(spec.services[0].stop_grace_period_secs, None);
+    }
+
+    #[test]
+    fn stop_grace_period_compound_duration() {
+        let yaml = r#"
+services:
+  db:
+    image: postgres:16
+    stop_grace_period: 1m30s
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].stop_grace_period_secs, Some(90));
     }
 
     // ── Rejection tests ───────────────────────────────────────────

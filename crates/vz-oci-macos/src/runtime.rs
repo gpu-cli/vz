@@ -168,7 +168,16 @@ impl Runtime {
     ///
     /// Sends `oci_kill` (SIGTERM for graceful, SIGKILL for forced) and polls
     /// `oci_state` until the container exits or the grace period expires.
-    pub async fn stop_container(&self, id: &str, force: bool) -> Result<ContainerInfo, OciError> {
+    ///
+    /// `signal` overrides the default stop signal (SIGTERM).
+    /// `grace_period` overrides the default grace period before SIGKILL escalation.
+    pub async fn stop_container(
+        &self,
+        id: &str,
+        force: bool,
+        signal: Option<&str>,
+        grace_period: Option<Duration>,
+    ) -> Result<ContainerInfo, OciError> {
         let mut container = self
             .container_store
             .load_all()
@@ -198,7 +207,8 @@ impl Runtime {
                 ))
             })?;
 
-        let exit_code = stop_via_oci_runtime(&*vm, id, force, STOP_GRACE_PERIOD).await?;
+        let effective_grace = grace_period.unwrap_or(STOP_GRACE_PERIOD);
+        let exit_code = stop_via_oci_runtime(&*vm, id, force, effective_grace, signal).await?;
 
         // Best-effort OCI delete.
         let _ = vm.oci_delete(id.to_string(), true).await;
@@ -859,7 +869,7 @@ impl Runtime {
 
         // Stop each container via OCI lifecycle.
         for cid in &stack_containers {
-            let _ = stop_via_oci_runtime(&*vm, cid, false, STOP_GRACE_PERIOD).await;
+            let _ = stop_via_oci_runtime(&*vm, cid, false, STOP_GRACE_PERIOD, None).await;
             let _ = vm.oci_delete(cid.to_string(), true).await;
 
             // Update container metadata.
@@ -1237,6 +1247,8 @@ impl Runtime {
             pids_limit,
             hostname,
             domainname,
+            stop_signal: _,
+            stop_grace_period_secs: _,
         } = run;
 
         let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
@@ -1436,6 +1448,8 @@ impl Runtime {
             pids_limit: _,
             hostname: _,
             domainname: _,
+            stop_signal: _,
+            stop_grace_period_secs: _,
         } = run;
 
         let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
@@ -1851,9 +1865,11 @@ async fn relay_port_forward_connection(
 
 /// Stop a container through OCI runtime lifecycle: kill → poll state → escalate.
 ///
-/// Graceful (force=false): sends SIGTERM, polls state until stopped or grace
-/// period expires, then escalates to SIGKILL.
+/// Graceful (force=false): sends the configured stop signal (default SIGTERM),
+/// polls state until stopped or grace period expires, then escalates to SIGKILL.
 /// Forced (force=true): sends SIGKILL immediately.
+///
+/// `signal` overrides the default stop signal. When `None`, SIGTERM is used.
 ///
 /// Returns the conventional exit code: 128+signal (143 for SIGTERM, 137 for SIGKILL).
 async fn stop_via_oci_runtime(
@@ -1861,22 +1877,24 @@ async fn stop_via_oci_runtime(
     container_id: &str,
     force: bool,
     grace_period: Duration,
+    signal: Option<&str>,
 ) -> Result<i32, OciError> {
     let id = container_id.to_string();
+    let stop_signal = signal.unwrap_or("SIGTERM");
 
     if force {
         let _ = vm.oci_kill(id.clone(), "SIGKILL".to_string()).await;
         return Ok(137); // 128 + 9
     }
 
-    // Graceful: SIGTERM first.
-    vm.oci_kill(id.clone(), "SIGTERM".to_string()).await?;
+    // Graceful: send configured stop signal first.
+    vm.oci_kill(id.clone(), stop_signal.to_string()).await?;
 
     // Poll state until stopped or grace period expires.
     let deadline = tokio::time::Instant::now() + grace_period;
     loop {
         if is_container_stopped(vm, &id).await {
-            return Ok(143); // 128 + 15 (SIGTERM)
+            return Ok(143); // graceful stop succeeded (conventional SIGTERM exit code)
         }
 
         if tokio::time::Instant::now() >= deadline {
@@ -2180,6 +2198,8 @@ fn resolve_run_config(
         pids_limit,
         hostname,
         domainname,
+        stop_signal: _,
+        stop_grace_period_secs: _,
     } = run;
 
     let resolved_cmd = image_config
@@ -2226,6 +2246,8 @@ fn resolve_run_config(
         pids_limit,
         hostname,
         domainname,
+        stop_signal: None,
+        stop_grace_period_secs: None,
     })
 }
 
@@ -2387,7 +2409,7 @@ mod tests {
             stderr: String::new(),
         });
 
-        let exit_code = stop_via_oci_runtime(&mock, "svc-web", false, Duration::from_secs(5))
+        let exit_code = stop_via_oci_runtime(&mock, "svc-web", false, Duration::from_secs(5), None)
             .await
             .unwrap();
 
@@ -2405,7 +2427,7 @@ mod tests {
             stderr: String::new(),
         });
 
-        let exit_code = stop_via_oci_runtime(&mock, "svc-web", true, Duration::from_secs(5))
+        let exit_code = stop_via_oci_runtime(&mock, "svc-web", true, Duration::from_secs(5), None)
             .await
             .unwrap();
 
@@ -2477,6 +2499,7 @@ mod tests {
             "svc-stuck",
             false,
             Duration::from_millis(200),
+            None,
         )
         .await
         .unwrap();
@@ -3720,7 +3743,10 @@ mod tests {
             .unwrap();
 
         // Stopping a non-running container returns it unchanged.
-        let result = runtime.stop_container("stopped-ctr", false).await.unwrap();
+        let result = runtime
+            .stop_container("stopped-ctr", false, None, None)
+            .await
+            .unwrap();
         assert!(matches!(
             result.status,
             ContainerStatus::Stopped { exit_code: 0 }
@@ -3751,7 +3777,10 @@ mod tests {
             })
             .unwrap();
 
-        let result = runtime.stop_container("created-ctr", false).await.unwrap();
+        let result = runtime
+            .stop_container("created-ctr", false, None, None)
+            .await
+            .unwrap();
         assert!(matches!(result.status, ContainerStatus::Created));
     }
 
@@ -3764,7 +3793,7 @@ mod tests {
         });
 
         let err = runtime
-            .stop_container("nonexistent", false)
+            .stop_container("nonexistent", false, None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, OciError::Storage(_)));
@@ -4080,9 +4109,10 @@ mod tests {
             stderr: String::new(),
         });
 
-        let exit_code = stop_via_oci_runtime(&mock, "kill-test", false, Duration::from_secs(5))
-            .await
-            .unwrap();
+        let exit_code =
+            stop_via_oci_runtime(&mock, "kill-test", false, Duration::from_secs(5), None)
+                .await
+                .unwrap();
 
         // SIGTERM exit convention: 128 + 15 = 143.
         assert_eq!(exit_code, 143);
@@ -4100,9 +4130,10 @@ mod tests {
             stderr: String::new(),
         });
 
-        let exit_code = stop_via_oci_runtime(&mock, "force-kill", true, Duration::from_secs(5))
-            .await
-            .unwrap();
+        let exit_code =
+            stop_via_oci_runtime(&mock, "force-kill", true, Duration::from_secs(5), None)
+                .await
+                .unwrap();
 
         // SIGKILL exit convention: 128 + 9 = 137.
         assert_eq!(exit_code, 137);

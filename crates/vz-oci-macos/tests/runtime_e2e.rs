@@ -215,7 +215,10 @@ async fn lifecycle_create_exec_stop_remove() {
     assert_eq!(exec_out2.stdout.trim(), "still-alive");
 
     // Stop the container.
-    let stopped = rt.stop_container(&container_id, false).await.unwrap();
+    let stopped = rt
+        .stop_container(&container_id, false, None, None)
+        .await
+        .unwrap();
     assert!(
         !matches!(stopped.status, vz_oci_macos::ContainerStatus::Running),
         "container should not be running after stop"
@@ -307,7 +310,7 @@ async fn container_logs_capture_and_retrieve() {
     // Cleanup.
     backend
         .inner()
-        .stop_container(&container_id, true)
+        .stop_container(&container_id, true, None, None)
         .await
         .unwrap();
     backend
@@ -386,7 +389,7 @@ async fn port_forwarding_tcp() {
     drop(conn);
 
     // Cleanup.
-    let _ = rt.stop_container(&container_id, true).await;
+    let _ = rt.stop_container(&container_id, true, None, None).await;
     let _ = rt.remove_container(&container_id).await;
 }
 
@@ -478,7 +481,7 @@ async fn cgroup_cpu_max_enforcement() {
     );
 
     // Cleanup.
-    let _ = rt.stop_container(&container_id, true).await;
+    let _ = rt.stop_container(&container_id, true, None, None).await;
     let _ = rt.remove_container(&container_id).await;
 }
 

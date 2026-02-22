@@ -188,8 +188,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn parse_vm_init_subcommand() {
-        let cli =
-            Cli::try_parse_from(["vz", "vm", "init", "--disk-size", "64G"]).expect("parse");
+        let cli = Cli::try_parse_from(["vz", "vm", "init", "--disk-size", "64G"]).expect("parse");
         assert!(matches!(
             cli.command,
             Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::Init(_))
@@ -221,9 +220,8 @@ mod tests {
 
     #[test]
     fn parse_logs_with_follow_and_tail() {
-        let cli =
-            Cli::try_parse_from(["vz", "logs", "ctr-123", "--follow", "--tail", "50"])
-                .expect("parse");
+        let cli = Cli::try_parse_from(["vz", "logs", "ctr-123", "--follow", "--tail", "50"])
+            .expect("parse");
         match cli.command {
             Commands::Logs(args) => {
                 assert_eq!(args.id, "ctr-123");
@@ -236,17 +234,15 @@ mod tests {
 
     #[test]
     fn parse_container_run_subcommand() {
-        let cli =
-            Cli::try_parse_from(["vz", "run", "alpine:latest", "--", "echo", "hello"])
-                .expect("parse");
+        let cli = Cli::try_parse_from(["vz", "run", "alpine:latest", "--", "echo", "hello"])
+            .expect("parse");
         assert!(matches!(cli.command, Commands::Run(_)));
     }
 
     #[test]
     fn parse_run_with_publish_flag() {
-        let cli =
-            Cli::try_parse_from(["vz", "run", "nginx:alpine", "--publish", "8080:80"])
-                .expect("parse");
+        let cli = Cli::try_parse_from(["vz", "run", "nginx:alpine", "--publish", "8080:80"])
+            .expect("parse");
 
         match cli.command {
             Commands::Run(args) => {
@@ -270,8 +266,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn parse_vm_stop_subcommand() {
-        let cli =
-            Cli::try_parse_from(["vz", "vm", "stop", "my-vm", "--force"]).expect("parse");
+        let cli = Cli::try_parse_from(["vz", "vm", "stop", "my-vm", "--force"]).expect("parse");
         assert!(matches!(
             cli.command,
             Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::Stop(_))
@@ -321,8 +316,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn parse_vm_cache_clean() {
-        let cli =
-            Cli::try_parse_from(["vz", "vm", "cache", "clean", "--all"]).expect("parse");
+        let cli = Cli::try_parse_from(["vz", "vm", "cache", "clean", "--all"]).expect("parse");
         assert!(matches!(
             cli.command,
             Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::Cache(_))
@@ -491,8 +485,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn parse_vm_validate_manifest() {
-        let cli =
-            Cli::try_parse_from(["vz", "vm", "validate", "manifest"]).expect("parse");
+        let cli = Cli::try_parse_from(["vz", "vm", "validate", "manifest"]).expect("parse");
         if let Commands::Vm(ref vm_args) = cli.command {
             assert!(matches!(
                 vm_args.action,

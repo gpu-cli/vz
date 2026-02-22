@@ -1,5 +1,6 @@
 //! OCI container runtime operations (top-level commands).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process;
 use std::time::Duration;
@@ -647,6 +648,17 @@ async fn create_container(runtime: &vz_oci_macos::Runtime, args: CreateArgs) -> 
         cpu_quota: None,
         cpu_period: None,
         capture_logs: true,
+        cap_add: Vec::new(),
+        cap_drop: Vec::new(),
+        privileged: false,
+        read_only_rootfs: false,
+        sysctls: HashMap::new(),
+        ulimits: Vec::new(),
+        pids_limit: None,
+        hostname: None,
+        domainname: None,
+        stop_signal: None,
+        stop_grace_period_secs: None,
     };
 
     info!(image = %args.image, "creating long-lived container");
@@ -748,7 +760,9 @@ fn list_containers(runtime: &vz_oci_macos::Runtime) -> anyhow::Result<()> {
 
 #[cfg(target_os = "macos")]
 async fn stop_container(runtime: &vz_oci_macos::Runtime, args: StopArgs) -> anyhow::Result<()> {
-    let container = runtime.stop_container(&args.id, args.force).await?;
+    let container = runtime
+        .stop_container(&args.id, args.force, None, None)
+        .await?;
     match container.status {
         vz_oci_macos::ContainerStatus::Running => {
             println!("Container {} remains running", args.id);
@@ -778,12 +792,7 @@ async fn container_logs(runtime: &vz_oci_macos::Runtime, args: LogsArgs) -> anyh
     // Initial fetch: bounded tail -n <count>.
     let tail_n = args.tail.to_string();
     let exec_config = vz_oci_macos::ExecConfig {
-        cmd: vec![
-            "tail".into(),
-            "-n".into(),
-            tail_n,
-            log_file.into(),
-        ],
+        cmd: vec!["tail".into(), "-n".into(), tail_n, log_file.into()],
         working_dir: None,
         env: vec![],
         user: None,
@@ -801,11 +810,7 @@ async fn container_logs(runtime: &vz_oci_macos::Runtime, args: LogsArgs) -> anyh
 
     // Follow mode: track byte offset, poll with tail -c +<offset>.
     let size_config = vz_oci_macos::ExecConfig {
-        cmd: vec![
-            "wc".into(),
-            "-c".into(),
-            log_file.into(),
-        ],
+        cmd: vec!["wc".into(), "-c".into(), log_file.into()],
         working_dir: None,
         env: vec![],
         user: None,
@@ -825,12 +830,7 @@ async fn container_logs(runtime: &vz_oci_macos::Runtime, args: LogsArgs) -> anyh
 
         let offset_arg = format!("+{}", offset + 1);
         let poll_config = vz_oci_macos::ExecConfig {
-            cmd: vec![
-                "tail".into(),
-                "-c".into(),
-                offset_arg,
-                log_file.into(),
-            ],
+            cmd: vec!["tail".into(), "-c".into(), offset_arg, log_file.into()],
             working_dir: None,
             env: vec![],
             user: None,
@@ -875,6 +875,17 @@ fn build_run_config(args: &RunArgs) -> anyhow::Result<vz_oci_macos::RunConfig> {
         cpu_quota: None,
         cpu_period: None,
         capture_logs: false,
+        cap_add: Vec::new(),
+        cap_drop: Vec::new(),
+        privileged: false,
+        read_only_rootfs: false,
+        sysctls: HashMap::new(),
+        ulimits: Vec::new(),
+        pids_limit: None,
+        hostname: None,
+        domainname: None,
+        stop_signal: None,
+        stop_grace_period_secs: None,
     })
 }
 
@@ -923,11 +934,7 @@ async fn pull_image_linux(
         .pull(&args.image)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!(
-        "Pulled {image} as {id}",
-        image = args.image,
-        id = image_id
-    );
+    println!("Pulled {image} as {id}", image = args.image, id = image_id);
     Ok(())
 }
 
@@ -941,11 +948,7 @@ async fn run_image_linux(
     let env = parse_env_vars(&args.env)?;
     let ports = parse_port_mappings(&args.publish)?;
     let mounts = parse_volume_mounts(&args.volume)?;
-    let network_enabled = if args.no_network {
-        Some(false)
-    } else {
-        None
-    };
+    let network_enabled = if args.no_network { Some(false) } else { None };
     let timeout = args.timeout_secs.map(Duration::from_secs);
 
     let config = vz_runtime_contract::RunConfig {
@@ -993,11 +996,7 @@ async fn create_container_linux(
     let env = parse_env_vars(&args.env)?;
     let ports = parse_port_mappings(&args.publish)?;
     let mounts = parse_volume_mounts(&args.volume)?;
-    let network_enabled = if args.no_network {
-        Some(false)
-    } else {
-        None
-    };
+    let network_enabled = if args.no_network { Some(false) } else { None };
 
     let config = vz_runtime_contract::RunConfig {
         cmd: args.command.clone(),

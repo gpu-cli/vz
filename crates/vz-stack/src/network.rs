@@ -408,6 +408,8 @@ mod tests {
             hostname: None,
             domainname: None,
             labels: HashMap::new(),
+            stop_signal: None,
+            stop_grace_period_secs: None,
         }
     }
 

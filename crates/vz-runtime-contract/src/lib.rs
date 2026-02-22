@@ -72,10 +72,15 @@ pub trait RuntimeBackend: Send + Sync {
     ) -> impl Future<Output = Result<ExecOutput, RuntimeError>>;
 
     /// Stop a running container.
+    ///
+    /// `signal` overrides the default stop signal (SIGTERM).
+    /// `grace_period` overrides the default grace period before SIGKILL escalation.
     fn stop_container(
         &self,
         id: &str,
         force: bool,
+        signal: Option<&str>,
+        grace_period: Option<std::time::Duration>,
     ) -> impl Future<Output = Result<ContainerInfo, RuntimeError>>;
 
     /// Remove a stopped container and clean up its resources.

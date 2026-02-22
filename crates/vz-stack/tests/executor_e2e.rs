@@ -72,7 +72,12 @@ impl ContainerRuntime for MockRuntime {
         Ok(id)
     }
 
-    fn stop(&self, container_id: &str) -> Result<(), StackError> {
+    fn stop(
+        &self,
+        container_id: &str,
+        _signal: Option<&str>,
+        _grace_period: Option<std::time::Duration>,
+    ) -> Result<(), StackError> {
         self.calls
             .lock()
             .unwrap()

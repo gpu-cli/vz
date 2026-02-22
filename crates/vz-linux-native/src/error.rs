@@ -41,7 +41,6 @@ pub enum LinuxNativeError {
     /// Image store or pull error.
     #[error(transparent)]
     Image(#[from] vz_image::ImageError),
-
 }
 
 /// Convert platform-agnostic `OciError` into `LinuxNativeError`.

@@ -81,6 +81,9 @@ pub fn service_to_run_config(
         hostname: spec.hostname.clone(),
         domainname: spec.domainname.clone(),
         oci_annotations,
+        // Stop lifecycle
+        stop_signal: spec.stop_signal.clone(),
+        stop_grace_period_secs: spec.stop_grace_period_secs,
         // Remaining fields use defaults; future beads may populate them.
         ..Default::default()
     })
@@ -274,6 +277,8 @@ mod tests {
             hostname: None,
             domainname: None,
             labels: HashMap::new(),
+            stop_signal: None,
+            stop_grace_period_secs: None,
         }
     }
 
@@ -595,6 +600,8 @@ mod tests {
             hostname: None,
             domainname: None,
             labels: HashMap::new(),
+            stop_signal: None,
+            stop_grace_period_secs: None,
         };
 
         let resolved_mounts = vec![ResolvedMount {

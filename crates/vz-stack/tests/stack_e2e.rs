@@ -89,10 +89,18 @@ impl ContainerRuntime for OciContainerRuntime {
         })
     }
 
-    fn stop(&self, container_id: &str) -> Result<(), StackError> {
+    fn stop(
+        &self,
+        container_id: &str,
+        signal: Option<&str>,
+        grace_period: Option<std::time::Duration>,
+    ) -> Result<(), StackError> {
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.backend.stop_container(container_id, false))
+                .block_on(
+                    self.backend
+                        .stop_container(container_id, false, signal, grace_period),
+                )
                 .map(|_| ())
                 .map_err(|e| StackError::Network(format!("stop failed: {e}")))
         })

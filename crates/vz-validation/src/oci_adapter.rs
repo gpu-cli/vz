@@ -8,7 +8,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use tracing::{debug, info};
-use vz_oci_macos::{ExecConfig, ExecutionMode, NetworkServiceConfig, RunConfig, Runtime, RuntimeConfig};
+use vz_oci_macos::{
+    ExecConfig, ExecutionMode, NetworkServiceConfig, RunConfig, Runtime, RuntimeConfig,
+};
 
 use crate::cohort::ImageRef;
 use crate::runner::{ExecOutput, RuntimeAdapter};
@@ -117,7 +119,10 @@ impl RuntimeAdapter for OciRuntimeAdapter {
             };
 
             // 5. Stop + remove container.
-            let _ = self.runtime.stop_container(&container_id, false).await;
+            let _ = self
+                .runtime
+                .stop_container(&container_id, false, None, None)
+                .await;
             lifecycle.push("stop".to_string());
             let _ = self.runtime.remove_container(&container_id).await;
             lifecycle.push("delete".to_string());
@@ -170,6 +175,7 @@ impl RuntimeAdapter for OciRuntimeAdapter {
                 .map(|(i, svc)| NetworkServiceConfig {
                     name: svc.name.clone(),
                     addr: format!("172.20.0.{}/24", i + 2),
+                    network_name: "default".to_string(),
                 })
                 .collect();
 

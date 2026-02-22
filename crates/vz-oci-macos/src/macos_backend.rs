@@ -93,9 +93,11 @@ impl RuntimeBackend for MacosRuntimeBackend {
         &self,
         id: &str,
         force: bool,
+        signal: Option<&str>,
+        grace_period: Option<std::time::Duration>,
     ) -> Result<contract::ContainerInfo, RuntimeError> {
         self.runtime
-            .stop_container(id, force)
+            .stop_container(id, force, signal, grace_period)
             .await
             .map(container_info_to_contract)
             .map_err(oci_err)
@@ -260,6 +262,8 @@ fn run_config_from_contract(c: contract::RunConfig) -> oci_config::RunConfig {
         pids_limit: c.pids_limit,
         hostname: c.hostname,
         domainname: c.domainname,
+        stop_signal: c.stop_signal,
+        stop_grace_period_secs: c.stop_grace_period_secs,
     }
 }
 

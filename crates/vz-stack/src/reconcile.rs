@@ -80,10 +80,13 @@ pub fn apply(
     store: &StateStore,
     health_statuses: &HashMap<String, HealthStatus>,
 ) -> Result<ApplyResult, StackError> {
-    // 1. Persist desired state.
+    // 1. Load previous desired state (for reverse-dep teardown ordering).
+    let previous_desired = store.load_desired_state(&spec.name)?;
+
+    // 2. Persist desired state.
     store.save_desired_state(&spec.name, spec)?;
 
-    // 2. Emit start event.
+    // 3. Emit start event.
     store.emit_event(
         &spec.name,
         &StackEvent::StackApplyStarted {
@@ -92,11 +95,16 @@ pub fn apply(
         },
     )?;
 
-    // 3. Load current observed state.
+    // 4. Load current observed state.
     let observed = store.load_observed_state(&spec.name)?;
 
-    // 4. Compute action plan with dependency gating.
-    let (actions, deferred) = compute_actions(&spec.services, &observed, health_statuses);
+    // 5. Compute action plan with dependency gating.
+    let (actions, deferred) = compute_actions(
+        &spec.services,
+        &observed,
+        health_statuses,
+        previous_desired.as_ref().map(|s| s.services.as_slice()),
+    );
 
     // 5. Emit events for deferred services.
     for d in &deferred {
@@ -202,10 +210,17 @@ pub fn apply(
 /// Services whose dependencies are not ready are deferred.
 /// Actions are topologically sorted by `depends_on` with name-based
 /// tie-breaking for deterministic ordering.
+///
+/// `previous_services` provides dependency info from the previous desired
+/// spec, used to order removals correctly during teardown. When the
+/// current `desired_services` is empty (full teardown), the dep graph
+/// would otherwise be empty and removals would happen in alphabetical
+/// order instead of reverse-dependency order.
 fn compute_actions(
     desired_services: &[ServiceSpec],
     observed: &[ServiceObservedState],
     health_statuses: &HashMap<String, HealthStatus>,
+    previous_services: Option<&[ServiceSpec]>,
 ) -> (Vec<Action>, Vec<DeferredService>) {
     let observed_map: HashMap<&str, &ServiceObservedState> = observed
         .iter()
@@ -261,13 +276,23 @@ fn compute_actions(
     }
 
     // Build dependency graph for ordering.
-    let dep_names: HashMap<&str, Vec<String>> = desired_services
+    // Include deps from both current desired services and previous desired
+    // services (if available). This ensures removals during teardown are
+    // ordered correctly even when desired_services is empty.
+    let mut dep_names: HashMap<&str, Vec<String>> = desired_services
         .iter()
         .map(|s| {
             let names: Vec<String> = s.depends_on.iter().map(|d| d.service.clone()).collect();
             (s.name.as_str(), names)
         })
         .collect();
+    if let Some(prev_services) = previous_services {
+        for svc in prev_services {
+            dep_names
+                .entry(svc.name.as_str())
+                .or_insert_with(|| svc.depends_on.iter().map(|d| d.service.clone()).collect());
+        }
+    }
     let dep_map: HashMap<&str, &[String]> =
         dep_names.iter().map(|(k, v)| (*k, v.as_slice())).collect();
 
@@ -427,6 +452,8 @@ mod tests {
             hostname: None,
             domainname: None,
             labels: HashMap::new(),
+            stop_signal: None,
+            stop_grace_period_secs: None,
         }
     }
 
@@ -499,7 +526,7 @@ mod tests {
         let desired = vec![svc("web", "nginx:latest"), svc("db", "postgres:16")];
         let observed = vec![];
 
-        let (actions, deferred) = compute_actions(&desired, &observed, &no_health());
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
         assert_eq!(actions.len(), 2);
         assert!(deferred.is_empty());
         assert!(
@@ -514,7 +541,7 @@ mod tests {
         let desired = vec![svc("web", "nginx:latest")];
         let observed = vec![obs_running("web")];
 
-        let (actions, _) = compute_actions(&desired, &observed, &no_health());
+        let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
         assert!(actions.is_empty());
     }
 
@@ -523,7 +550,7 @@ mod tests {
         let desired = vec![svc("web", "nginx:latest")];
         let observed = vec![obs_running("web"), obs_running("old-svc")];
 
-        let (actions, _) = compute_actions(&desired, &observed, &no_health());
+        let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
         assert_eq!(actions.len(), 1);
         assert_eq!(
             actions[0],
@@ -538,7 +565,7 @@ mod tests {
         let desired = vec![svc("web", "nginx:latest")];
         let observed = vec![obs("web", ServicePhase::Pending)];
 
-        let (actions, _) = compute_actions(&desired, &observed, &no_health());
+        let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
         assert_eq!(actions.len(), 1);
         assert_eq!(
             actions[0],
@@ -556,7 +583,7 @@ mod tests {
             ..obs("web", ServicePhase::Failed)
         }];
 
-        let (actions, _) = compute_actions(&desired, &observed, &no_health());
+        let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
         assert_eq!(actions.len(), 1);
         assert_eq!(
             actions[0],
@@ -571,7 +598,7 @@ mod tests {
         let desired = vec![svc("web", "nginx:latest")];
         let observed = vec![obs("web", ServicePhase::Stopped)];
 
-        let (actions, _) = compute_actions(&desired, &observed, &no_health());
+        let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
         assert_eq!(actions.len(), 1);
     }
 
@@ -585,7 +612,7 @@ mod tests {
         ];
         let observed = vec![];
 
-        let (actions, _) = compute_actions(&desired, &observed, &no_health());
+        let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
         let names: Vec<&str> = actions.iter().map(|a| a.service_name()).collect();
 
         // db must come before web.
@@ -603,7 +630,7 @@ mod tests {
         ];
         let observed = vec![];
 
-        let (actions, _) = compute_actions(&desired, &observed, &no_health());
+        let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
         let names: Vec<&str> = actions.iter().map(|a| a.service_name()).collect();
 
         // db → api → app
@@ -624,7 +651,7 @@ mod tests {
         ];
         let observed = vec![];
 
-        let (actions, _) = compute_actions(&desired, &observed, &no_health());
+        let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
         let names: Vec<&str> = actions.iter().map(|a| a.service_name()).collect();
         assert_eq!(names, vec!["alpha", "bravo", "charlie"]);
     }
@@ -639,8 +666,8 @@ mod tests {
         ];
         let observed = vec![];
 
-        let (run1, _) = compute_actions(&desired, &observed, &no_health());
-        let (run2, _) = compute_actions(&desired, &observed, &no_health());
+        let (run1, _) = compute_actions(&desired, &observed, &no_health(), None);
+        let (run2, _) = compute_actions(&desired, &observed, &no_health(), None);
         assert_eq!(run1, run2);
     }
 
@@ -650,7 +677,7 @@ mod tests {
         let desired = vec![]; // remove everything
         let observed = vec![obs_running("web"), obs_running("db")];
 
-        let (actions, _) = compute_actions(&desired, &observed, &no_health());
+        let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
         assert_eq!(actions.len(), 2);
         // Both are removes, sorted by name since no deps in this case.
         assert!(
@@ -672,7 +699,7 @@ mod tests {
         ];
         let observed = vec![];
 
-        let (actions, deferred) = compute_actions(&desired, &observed, &no_health());
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
 
         assert_eq!(actions.len(), 2);
         assert!(deferred.is_empty());
@@ -690,7 +717,7 @@ mod tests {
         ];
         let observed = vec![obs("db", ServicePhase::Failed)];
 
-        let (actions, deferred) = compute_actions(&desired, &observed, &no_health());
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
 
         // db gets ServiceCreate (recreate from Failed), web is deferred.
         assert_eq!(actions.len(), 1);
@@ -711,7 +738,7 @@ mod tests {
 
         // No health status — but condition is service_started, so web is unblocked.
         // db is Running (no action), web is not yet created → ServiceCreate.
-        let (actions, deferred) = compute_actions(&desired, &observed, &no_health());
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
 
         assert!(deferred.is_empty());
         assert_eq!(actions.len(), 1);
@@ -729,7 +756,7 @@ mod tests {
         let observed = vec![obs_running("db")];
 
         // No health status → health check hasn't passed → web is deferred.
-        let (actions, deferred) = compute_actions(&desired, &observed, &no_health());
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
 
         assert!(actions.is_empty()); // db is Running, no action needed.
         assert_eq!(deferred.len(), 1);
@@ -751,7 +778,7 @@ mod tests {
         db_health.record_pass();
         health.insert("db".to_string(), db_health);
 
-        let (actions, deferred) = compute_actions(&desired, &observed, &health);
+        let (actions, deferred) = compute_actions(&desired, &observed, &health, None);
 
         // web should now be created.
         assert_eq!(actions.len(), 1);
@@ -769,7 +796,7 @@ mod tests {
         ];
         let observed = vec![];
 
-        let (actions, deferred) = compute_actions(&desired, &observed, &no_health());
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
 
         assert_eq!(actions.len(), 3);
         assert!(deferred.is_empty());
@@ -783,7 +810,7 @@ mod tests {
         let desired = vec![svc("web", "nginx:latest")];
         let observed = vec![];
 
-        let (actions, deferred) = compute_actions(&desired, &observed, &no_health());
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
 
         assert_eq!(actions.len(), 1);
         assert!(deferred.is_empty());
@@ -1012,5 +1039,76 @@ mod tests {
 
         let result = apply(&s, &store, &no_health()).unwrap();
         assert!(result.actions.is_empty());
+    }
+
+    // ── Reverse-dependency teardown ordering tests ──
+
+    #[test]
+    fn teardown_removes_dependents_before_dependencies() {
+        // Chain: C depends on B depends on A.
+        // On teardown (empty desired), removal order should be C, B, A.
+        let a = svc("a", "img:1");
+        let b = svc_with_deps("b", "img:1", vec!["a"]);
+        let c = svc_with_deps("c", "img:1", vec!["b"]);
+        let previous = vec![a, b, c];
+
+        // All three are currently running.
+        let observed = vec![obs_running("a"), obs_running("b"), obs_running("c")];
+
+        // Empty desired = full teardown, with previous deps for ordering.
+        let (actions, deferred) = compute_actions(&[], &observed, &no_health(), Some(&previous));
+
+        assert!(deferred.is_empty());
+        assert_eq!(actions.len(), 3);
+        // All should be removes.
+        assert!(
+            actions
+                .iter()
+                .all(|a| matches!(a, Action::ServiceRemove { .. }))
+        );
+        // Order: c first (depends on b), then b (depends on a), then a.
+        let names: Vec<&str> = actions.iter().map(|a| a.service_name()).collect();
+        assert_eq!(names, vec!["c", "b", "a"]);
+    }
+
+    #[test]
+    fn teardown_via_apply_uses_previous_spec_for_ordering() {
+        let store = StateStore::in_memory().unwrap();
+
+        // Set up a stack with A -> B -> C dependency chain.
+        let a = svc("a", "img:1");
+        let b = svc_with_deps("b", "img:1", vec!["a"]);
+        let c = svc_with_deps("c", "img:1", vec!["b"]);
+        let s = spec("myapp", vec![a, b, c]);
+
+        // First apply creates all three.
+        apply(&s, &store, &no_health()).unwrap();
+
+        // Simulate all Running.
+        for name in &["a", "b", "c"] {
+            store
+                .save_observed_state("myapp", &obs_running(name))
+                .unwrap();
+        }
+
+        // Teardown: empty spec.
+        let empty = spec("myapp", vec![]);
+        let result = apply(&empty, &store, &no_health()).unwrap();
+
+        assert_eq!(result.actions.len(), 3);
+        let names: Vec<&str> = result.actions.iter().map(|a| a.service_name()).collect();
+        // Dependents removed first: c, b, a.
+        assert_eq!(names, vec!["c", "b", "a"]);
+    }
+
+    #[test]
+    fn teardown_without_previous_spec_falls_back_to_alphabetical() {
+        // No previous spec stored, so no dep info for removals.
+        let observed = vec![obs_running("a"), obs_running("b"), obs_running("c")];
+        let (actions, _) = compute_actions(&[], &observed, &no_health(), None);
+
+        let names: Vec<&str> = actions.iter().map(|a| a.service_name()).collect();
+        // Falls back to alphabetical without dependency info.
+        assert_eq!(names, vec!["a", "b", "c"]);
     }
 }

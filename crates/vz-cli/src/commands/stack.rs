@@ -23,7 +23,7 @@ use tracing::info;
 use vz_stack::{
     ApplyResult, ContainerLogs, ContainerRuntime, EventRecord, ExecutionResult,
     OrchestrationConfig, RoundReport, ServiceObservedState, ServicePhase, StackError, StackEvent,
-    StackExecutor, StackOrchestrator, StackSpec, StateStore, parse_compose_with_dir,
+    StackExecutor, StackOrchestrator, StackSpec, StateStore, VolumeManager, parse_compose_with_dir,
 };
 
 /// Log file path inside the container.
@@ -47,6 +47,12 @@ pub enum StackCommand {
     /// List services and their current status.
     Ps(PsArgs),
 
+    /// List all known stacks.
+    Ls(LsArgs),
+
+    /// Validate and print the resolved compose configuration.
+    Config(ConfigArgs),
+
     /// Show stack lifecycle events.
     Events(EventsArgs),
 
@@ -55,6 +61,9 @@ pub enum StackCommand {
 
     /// Execute a command in a running service container.
     Exec(ExecArgs),
+
+    /// Run a one-off command in a service container.
+    Run(RunArgs),
 
     /// Stop an individual service in a running stack.
     Stop(ServiceArgs),
@@ -102,6 +111,10 @@ pub struct DownArgs {
     /// Show planned actions without executing them.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Remove named volumes declared in the compose file.
+    #[arg(long)]
+    pub volumes: bool,
 }
 
 #[derive(Args, Debug)]
@@ -188,6 +201,57 @@ pub struct ServiceArgs {
     pub state_dir: Option<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+pub struct LsArgs {
+    /// Output as JSON.
+    #[arg(long)]
+    pub json: bool,
+
+    /// State directory root (overrides default ~/.vz/stacks/).
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct ConfigArgs {
+    /// Path to compose YAML file.
+    #[arg(short, long, default_value = "compose.yaml")]
+    pub file: PathBuf,
+
+    /// Stack name (defaults to parent directory name).
+    #[arg(short = 'n', long)]
+    pub name: Option<String>,
+
+    /// Only validate, don't print.
+    #[arg(long)]
+    pub quiet: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct RunArgs {
+    /// Stack name.
+    pub name: String,
+
+    /// Service to run the command in.
+    pub service: String,
+
+    /// Command and arguments to execute.
+    #[arg(last = true, required = true)]
+    pub command: Vec<String>,
+
+    /// Path to compose YAML file (for service resolution).
+    #[arg(short, long, default_value = "compose.yaml")]
+    pub file: PathBuf,
+
+    /// State directory for stack persistence.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+
+    /// Remove the container after the command exits.
+    #[arg(long, default_value = "true")]
+    pub rm: bool,
+}
+
 /// Action types for control socket requests.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -226,9 +290,12 @@ pub async fn run(args: StackArgs) -> anyhow::Result<()> {
         StackCommand::Up(args) => cmd_up(args).await,
         StackCommand::Down(args) => cmd_down(args).await,
         StackCommand::Ps(args) => cmd_ps(args).await,
+        StackCommand::Ls(args) => cmd_ls(args).await,
+        StackCommand::Config(args) => cmd_config(args).await,
         StackCommand::Events(args) => cmd_events(args).await,
         StackCommand::Logs(args) => cmd_logs(args).await,
         StackCommand::Exec(args) => cmd_exec(args).await,
+        StackCommand::Run(args) => cmd_run(args).await,
         StackCommand::Stop(args) => cmd_service_action(args, ControlAction::Stop).await,
         StackCommand::Start(args) => cmd_service_action(args, ControlAction::Start).await,
         StackCommand::Restart(args) => cmd_service_action(args, ControlAction::Restart).await,
@@ -322,11 +389,19 @@ impl ContainerRuntime for OciContainerRuntime {
         })
     }
 
-    fn stop(&self, container_id: &str) -> Result<(), StackError> {
+    fn stop(
+        &self,
+        container_id: &str,
+        signal: Option<&str>,
+        grace_period: Option<std::time::Duration>,
+    ) -> Result<(), StackError> {
         use vz_runtime_contract::RuntimeBackend;
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.backend.stop_container(container_id, false))
+                .block_on(
+                    self.backend
+                        .stop_container(container_id, false, signal, grace_period),
+                )
                 .map(|_| ())
                 .map_err(|e| StackError::Network(format!("stop failed: {e}")))
         })
@@ -1026,7 +1101,7 @@ async fn cmd_down(args: DownArgs) -> anyhow::Result<()> {
 
     print_apply_result(&result);
 
-    if result.actions.is_empty() {
+    if result.actions.is_empty() && !args.volumes {
         return Ok(());
     }
 
@@ -1036,18 +1111,33 @@ async fn cmd_down(args: DownArgs) -> anyhow::Result<()> {
     }
 
     // Execute removal actions through the OCI runtime.
-    let oci_runtime =
-        OciContainerRuntime::new(&state_dir).with_context(|| "failed to initialize OCI runtime")?;
+    if !result.actions.is_empty() {
+        let oci_runtime = OciContainerRuntime::new(&state_dir)
+            .with_context(|| "failed to initialize OCI runtime")?;
 
-    let exec_store =
-        StateStore::open(&db_path).with_context(|| "failed to open execution state store")?;
+        let exec_store =
+            StateStore::open(&db_path).with_context(|| "failed to open execution state store")?;
 
-    let mut executor = StackExecutor::new(oci_runtime, exec_store, &state_dir);
-    let exec_result = executor
-        .execute(&empty_spec, &result.actions)
-        .with_context(|| "teardown execution failed")?;
+        let mut executor = StackExecutor::new(oci_runtime, exec_store, &state_dir);
+        let exec_result = executor
+            .execute(&empty_spec, &result.actions)
+            .with_context(|| "teardown execution failed")?;
 
-    print_execution_result(&exec_result);
+        print_execution_result(&exec_result);
+    }
+
+    // Remove named volumes if --volumes was specified.
+    if args.volumes {
+        let volume_mgr = VolumeManager::new(&state_dir);
+        let removed = volume_mgr
+            .remove_all()
+            .with_context(|| "failed to remove volumes")?;
+        if removed > 0 {
+            println!("Removed {removed} volume(s).");
+        } else {
+            println!("No volumes to remove.");
+        }
+    }
 
     Ok(())
 }
@@ -1165,7 +1255,7 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
     }
 
     // Follow mode: track byte offsets per service, poll with tail -c +<offset>.
-    // Get initial file sizes.
+    // Use 200ms poll interval for near-real-time feel.
     let mut offsets: Vec<u64> = Vec::with_capacity(services.len());
     for service in &services {
         let size = get_file_size(&sock_path, service, log_file).await?;
@@ -1173,7 +1263,7 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
     }
 
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         for (i, service) in services.iter().enumerate() {
             let offset_arg = format!("+{}", offsets[i] + 1);
@@ -1189,14 +1279,14 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
     }
 }
 
-/// Print log output, prefixing each line with service name for multi-service stacks.
+/// Print log output, prefixing each line with `[service]` for multi-service stacks.
 fn print_log_output(output: &str, service: &str, multi: bool) {
     if output.is_empty() {
         return;
     }
     if multi {
         for line in output.lines() {
-            println!("{service} | {line}");
+            println!("[{service}] {line}");
         }
     } else {
         print!("{output}");
@@ -1273,6 +1363,218 @@ fn event_service_name(event: &StackEvent) -> Option<&str> {
         | StackEvent::VolumeCreated { .. }
         | StackEvent::StackDestroyed { .. } => None,
     }
+}
+
+// ── ls ─────────────────────────────────────────────────────────────
+
+/// Stack entry for the `ls` listing.
+#[derive(Debug, Serialize)]
+struct StackListEntry {
+    name: String,
+    status: String,
+    services: usize,
+}
+
+async fn cmd_ls(args: LsArgs) -> anyhow::Result<()> {
+    let stacks_dir = match args.state_dir {
+        Some(dir) => dir,
+        None => {
+            let home = std::env::var("HOME").with_context(|| "HOME not set")?;
+            PathBuf::from(home).join(".vz").join("stacks")
+        }
+    };
+
+    if !stacks_dir.exists() {
+        if args.json {
+            println!("[]");
+        } else {
+            println!("No stacks found.");
+        }
+        return Ok(());
+    }
+
+    let mut entries: Vec<StackListEntry> = Vec::new();
+
+    let read_dir =
+        std::fs::read_dir(&stacks_dir).with_context(|| "failed to read stacks directory")?;
+
+    for entry in read_dir {
+        let entry = entry.with_context(|| "failed to read directory entry")?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        let db_path = entry.path().join("state.db");
+        if !db_path.exists() {
+            continue;
+        }
+
+        let stack_name = entry.file_name().to_str().unwrap_or("?").to_string();
+
+        // Try to load observed state for service counts.
+        let (status, service_count) = match StateStore::open(&db_path) {
+            Ok(store) => match store.load_observed_state(&stack_name) {
+                Ok(observed) => {
+                    let running = observed
+                        .iter()
+                        .filter(|o| o.phase == ServicePhase::Running)
+                        .count();
+                    let total = observed.len();
+                    let status = if total == 0 {
+                        "stopped".to_string()
+                    } else if running == total {
+                        "running".to_string()
+                    } else {
+                        format!("partial ({running}/{total})")
+                    };
+                    (status, total)
+                }
+                Err(_) => ("unknown".to_string(), 0),
+            },
+            Err(_) => ("unknown".to_string(), 0),
+        };
+
+        entries.push(StackListEntry {
+            name: stack_name,
+            status,
+            services: service_count,
+        });
+    }
+
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if args.json {
+        let json = serde_json::to_string_pretty(&entries)
+            .with_context(|| "failed to serialize stack list")?;
+        println!("{json}");
+    } else if entries.is_empty() {
+        println!("No stacks found.");
+    } else {
+        println!("{:<20} {:<16} {:<10}", "NAME", "STATUS", "SERVICES");
+        println!("{}", "-".repeat(46));
+        for entry in &entries {
+            println!(
+                "{:<20} {:<16} {:<10}",
+                entry.name, entry.status, entry.services
+            );
+        }
+    }
+
+    Ok(())
+}
+
+// ── config ─────────────────────────────────────────────────────────
+
+async fn cmd_config(args: ConfigArgs) -> anyhow::Result<()> {
+    let yaml = std::fs::read_to_string(&args.file)
+        .with_context(|| format!("failed to read compose file: {}", args.file.display()))?;
+
+    let compose_dir = args
+        .file
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let stack_name = resolve_stack_name(args.name.as_deref(), &args.file)?;
+    let spec = parse_compose_with_dir(&yaml, &stack_name, &compose_dir)
+        .with_context(|| "failed to parse compose file")?;
+
+    if args.quiet {
+        println!("Valid.");
+    } else {
+        let json = serde_json::to_string_pretty(&spec)
+            .with_context(|| "failed to serialize stack spec")?;
+        println!("{json}");
+    }
+
+    Ok(())
+}
+
+// ── run ────────────────────────────────────────────────────────────
+
+async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let state_dir = resolve_state_dir(args.state_dir.as_deref(), &args.name)?;
+    let sock_path = state_dir.join("control.sock");
+
+    if !sock_path.exists() {
+        bail!(
+            "stack '{}' is not running in foreground mode.\n\
+             Start it with: vz stack up -f <compose.yaml>",
+            args.name
+        );
+    }
+
+    // Verify the service exists in the compose file.
+    let yaml = std::fs::read_to_string(&args.file)
+        .with_context(|| format!("failed to read compose file: {}", args.file.display()))?;
+
+    let compose_dir = args
+        .file
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let spec = parse_compose_with_dir(&yaml, &args.name, &compose_dir)
+        .with_context(|| "failed to parse compose file")?;
+
+    if !spec.services.iter().any(|s| s.name == args.service) {
+        bail!(
+            "service '{}' not found in compose file. Available services: {}",
+            args.service,
+            spec.services
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    // Connect to the control socket and exec the command in the service container.
+    let stream = UnixStream::connect(&sock_path).await.with_context(|| {
+        format!(
+            "failed to connect to control socket: {}",
+            sock_path.display()
+        )
+    })?;
+
+    let (reader, mut writer) = stream.into_split();
+
+    let request = ControlRequest {
+        action: ControlAction::Exec,
+        service: args.service,
+        cmd: args.command,
+    };
+    let mut json = serde_json::to_string(&request)?;
+    json.push('\n');
+    writer.write_all(json.as_bytes()).await?;
+    writer.flush().await?;
+
+    let mut lines = BufReader::new(reader).lines();
+    let line = lines
+        .next_line()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("control socket closed without response"))?;
+
+    let resp: ControlResponse =
+        serde_json::from_str(&line).with_context(|| "failed to parse control response")?;
+
+    if let Some(err) = resp.error {
+        bail!("{err}");
+    }
+
+    if !resp.stdout.is_empty() {
+        print!("{}", resp.stdout);
+    }
+    if !resp.stderr.is_empty() {
+        eprint!("{}", resp.stderr);
+    }
+
+    std::process::exit(resp.exit_code);
 }
 
 // ── Helpers ────────────────────────────────────────────────────────

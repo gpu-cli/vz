@@ -40,7 +40,15 @@ pub trait ContainerRuntime: Send + Sync {
     ) -> Result<String, StackError>;
 
     /// Stop a running container. No-op if already stopped.
-    fn stop(&self, container_id: &str) -> Result<(), StackError>;
+    ///
+    /// `signal` overrides the default stop signal (SIGTERM).
+    /// `grace_period` overrides the default grace period before SIGKILL escalation.
+    fn stop(
+        &self,
+        container_id: &str,
+        signal: Option<&str>,
+        grace_period: Option<std::time::Duration>,
+    ) -> Result<(), StackError>;
 
     /// Remove a stopped container and its resources.
     fn remove(&self, container_id: &str) -> Result<(), StackError>;
@@ -867,10 +875,17 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             },
         )?;
 
+        // Look up stop_signal and stop_grace_period from the service spec.
+        let svc_spec = spec.services.iter().find(|s| s.name == service_name);
+        let stop_signal = svc_spec.and_then(|s| s.stop_signal.as_deref());
+        let stop_grace_period = svc_spec
+            .and_then(|s| s.stop_grace_period_secs)
+            .map(std::time::Duration::from_secs);
+
         // Stop and remove if we have a container.
         if let Some(ref cid) = container_id {
             info!(service = %service_name, container = %cid, "stopping container");
-            if let Err(e) = self.runtime.stop(cid) {
+            if let Err(e) = self.runtime.stop(cid, stop_signal, stop_grace_period) {
                 error!(service = %service_name, error = %e, "failed to stop container");
                 // Continue with remove attempt.
             }
@@ -945,6 +960,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 pub(crate) mod tests_support {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use super::*;
 
@@ -967,6 +983,8 @@ pub(crate) mod tests_support {
         pub exec_exit_code: i32,
         /// Whether exec should fail with an error (not just non-zero exit).
         pub fail_exec: bool,
+        /// Optional delay before returning from exec (for timeout testing).
+        pub exec_delay: Option<Duration>,
         /// Tracks calls: (operation, arg).
         pub calls: Mutex<Vec<(String, String)>>,
         /// Counter for create calls (fallback ID generation).
@@ -989,6 +1007,7 @@ pub(crate) mod tests_support {
                 fail_stop: false,
                 exec_exit_code: 0,
                 fail_exec: false,
+                exec_delay: None,
                 calls: Mutex::new(Vec::new()),
                 create_counter: AtomicUsize::new(0),
                 shared_vms: Mutex::new(HashSet::new()),
@@ -1057,7 +1076,12 @@ pub(crate) mod tests_support {
             Ok(id)
         }
 
-        fn stop(&self, container_id: &str) -> Result<(), StackError> {
+        fn stop(
+            &self,
+            container_id: &str,
+            _signal: Option<&str>,
+            _grace_period: Option<std::time::Duration>,
+        ) -> Result<(), StackError> {
             self.calls
                 .lock()
                 .unwrap()
@@ -1081,6 +1105,9 @@ pub(crate) mod tests_support {
                 "exec".to_string(),
                 format!("{container_id}:{}", command.join(" ")),
             ));
+            if let Some(delay) = self.exec_delay {
+                std::thread::sleep(delay);
+            }
             if self.fail_exec {
                 return Err(StackError::InvalidSpec("mock exec failure".to_string()));
             }
@@ -1218,6 +1245,8 @@ mod tests {
             hostname: None,
             domainname: None,
             labels: HashMap::new(),
+            stop_signal: None,
+            stop_grace_period_secs: None,
         }
     }
 
