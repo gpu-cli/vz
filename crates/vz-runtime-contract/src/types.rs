@@ -53,6 +53,14 @@ pub enum MountType {
     Bind,
     /// Ephemeral tmpfs mount inside the container.
     Tmpfs,
+    /// Named volume backed by a persistent disk image inside the VM.
+    ///
+    /// The volume data lives at `/run/vz-oci/volumes/{volume_name}` on
+    /// an ext4 block device attached to the guest VM.
+    Volume {
+        /// Volume name (used as the subdirectory on the disk image).
+        volume_name: String,
+    },
 }
 
 /// Access mode for container mounts.
@@ -291,6 +299,11 @@ pub struct StackResourceHint {
     /// so the shared VM can set them up at boot time (VirtioFS shares are
     /// static and must be configured before the VM starts).
     pub volume_mounts: Vec<StackVolumeMount>,
+    /// Optional path to a disk image to attach as a VirtioBlock device.
+    ///
+    /// Used for persistent named volumes: the image contains an ext4
+    /// filesystem mounted at `/run/vz-oci/volumes` inside the guest VM.
+    pub disk_image_path: Option<PathBuf>,
 }
 
 /// A host directory to expose inside the shared VM via VirtioFS.

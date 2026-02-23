@@ -357,6 +357,7 @@ mod tests {
             networks: vec![],
             volumes: vec![],
             secrets: vec![],
+            disk_size_mb: None,
         }
     }
 
@@ -398,6 +399,7 @@ mod tests {
                 driver_opts: None,
             }],
             secrets: vec![],
+            disk_size_mb: None,
         };
 
         store.save_desired_state("myapp", &spec2).unwrap();
@@ -550,6 +552,7 @@ mod tests {
             networks: vec![],
             volumes: vec![],
             secrets: vec![],
+            disk_size_mb: None,
         };
         let spec2 = StackSpec {
             name: "app2".to_string(),
@@ -557,6 +560,7 @@ mod tests {
             networks: vec![],
             volumes: vec![],
             secrets: vec![],
+            disk_size_mb: None,
         };
 
         store.save_desired_state("app1", &spec1).unwrap();

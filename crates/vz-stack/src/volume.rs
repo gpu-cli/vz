@@ -127,13 +127,21 @@ pub fn orphaned_volumes(defined: &[VolumeSpec], referenced: &HashSet<String>) ->
         .collect()
 }
 
+/// Default size for the sparse disk image (10 GiB).
+const DEFAULT_DISK_IMAGE_SIZE: u64 = 10 * 1024 * 1024 * 1024;
+
 /// Manages on-disk volume directories for a stack.
 ///
 /// Named volumes are stored as directories under a stack-scoped data dir:
 /// `<base_dir>/<stack_name>/volumes/<volume_name>/`.
+///
+/// Persistent volume data is stored in a sparse ext4 disk image at
+/// `<base_dir>/<stack_name>/data.img`, attached as a VirtioBlock device.
 pub struct VolumeManager {
     /// Root directory for this stack's volumes.
     volumes_dir: PathBuf,
+    /// Root directory for this stack's data (parent of volumes_dir).
+    stack_data_dir: PathBuf,
 }
 
 impl VolumeManager {
@@ -143,6 +151,7 @@ impl VolumeManager {
     pub fn new(stack_data_dir: &Path) -> Self {
         Self {
             volumes_dir: stack_data_dir.join("volumes"),
+            stack_data_dir: stack_data_dir.to_path_buf(),
         }
     }
 
@@ -211,10 +220,13 @@ impl VolumeManager {
         Ok(removed)
     }
 
-    /// Remove all volume directories for this stack.
+    /// Remove all volume directories and the disk image for this stack.
     ///
     /// Returns the number of volume directories removed.
     pub fn remove_all(&self) -> Result<usize, StackError> {
+        // Remove the persistent disk image.
+        self.remove_disk_image()?;
+
         if !self.volumes_dir.exists() {
             return Ok(0);
         }
@@ -245,6 +257,47 @@ impl VolumeManager {
         }
         names.sort();
         Ok(names)
+    }
+
+    /// Path to the persistent disk image for named volumes.
+    pub fn disk_image_path(&self) -> PathBuf {
+        self.stack_data_dir.join("data.img")
+    }
+
+    /// Ensure the sparse disk image exists.
+    ///
+    /// Creates a sparse file of the given `size_bytes` if it does not
+    /// already exist. Pass `None` for the default (10 GiB).
+    /// Returns `true` if a new image was created.
+    pub fn ensure_disk_image(&self, size_bytes: Option<u64>) -> Result<bool, StackError> {
+        let path = self.disk_image_path();
+        if path.exists() {
+            return Ok(false);
+        }
+        std::fs::create_dir_all(&self.stack_data_dir)?;
+        let file = std::fs::File::create(&path)?;
+        let actual_size = size_bytes.unwrap_or(DEFAULT_DISK_IMAGE_SIZE);
+        file.set_len(actual_size)?;
+        info!(path = %path.display(), size_bytes = actual_size, "created sparse disk image");
+        Ok(true)
+    }
+
+    /// Check whether the disk image exists.
+    pub fn has_disk_image(&self) -> bool {
+        self.disk_image_path().exists()
+    }
+
+    /// Remove the disk image.
+    ///
+    /// Returns `true` if the image existed and was removed.
+    pub fn remove_disk_image(&self) -> Result<bool, StackError> {
+        let path = self.disk_image_path();
+        if !path.exists() {
+            return Ok(false);
+        }
+        std::fs::remove_file(&path)?;
+        info!(path = %path.display(), "removed disk image");
+        Ok(true)
     }
 
     /// Resolve mount specs using this manager's volumes directory.
@@ -619,6 +672,73 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mgr = VolumeManager::new(tmp.path());
         assert!(mgr.list_volumes().unwrap().is_empty());
+    }
+
+    // --- Disk image tests ---
+
+    #[test]
+    fn manager_disk_image_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = VolumeManager::new(tmp.path());
+        assert_eq!(mgr.disk_image_path(), tmp.path().join("data.img"));
+    }
+
+    #[test]
+    fn manager_ensure_disk_image_creates_sparse_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = VolumeManager::new(tmp.path());
+
+        assert!(!mgr.has_disk_image());
+        assert!(mgr.ensure_disk_image(None).unwrap());
+        assert!(mgr.has_disk_image());
+
+        let metadata = std::fs::metadata(mgr.disk_image_path()).unwrap();
+        assert_eq!(metadata.len(), 10 * 1024 * 1024 * 1024); // 10 GiB
+    }
+
+    #[test]
+    fn manager_ensure_disk_image_custom_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = VolumeManager::new(tmp.path());
+
+        assert!(mgr.ensure_disk_image(Some(512 * 1024 * 1024)).unwrap());
+        let metadata = std::fs::metadata(mgr.disk_image_path()).unwrap();
+        assert_eq!(metadata.len(), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn manager_ensure_disk_image_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = VolumeManager::new(tmp.path());
+
+        assert!(mgr.ensure_disk_image(None).unwrap());
+        // Second call returns false (already exists).
+        assert!(!mgr.ensure_disk_image(None).unwrap());
+    }
+
+    #[test]
+    fn manager_remove_disk_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = VolumeManager::new(tmp.path());
+
+        mgr.ensure_disk_image(None).unwrap();
+        assert!(mgr.remove_disk_image().unwrap());
+        assert!(!mgr.has_disk_image());
+        // Removing non-existent returns false.
+        assert!(!mgr.remove_disk_image().unwrap());
+    }
+
+    #[test]
+    fn manager_remove_all_includes_disk_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = VolumeManager::new(tmp.path());
+
+        mgr.ensure_volumes(&test_volumes()).unwrap();
+        mgr.ensure_disk_image(None).unwrap();
+
+        let count = mgr.remove_all().unwrap();
+        assert_eq!(count, 2); // 2 volume directories
+        assert!(!mgr.has_disk_image()); // disk image also removed
     }
 
     #[test]

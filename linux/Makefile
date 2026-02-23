@@ -145,7 +145,7 @@ $(INITRAMFS_IMAGE): $(BUSYBOX_BINARY) guest-agent \
 
 	cp "$(BUSYBOX_BINARY)" "$(INITRAMFS_ROOT)/bin/busybox"
 	chmod +x "$(INITRAMFS_ROOT)/bin/busybox"
-	for cmd in sh mount umount mkdir cp cat ls ip hostname chroot switch_root udhcpc echo sleep dmesg tail head wget nsenter unshare; do \
+	for cmd in sh mount umount mkdir cp cat ls ip hostname chroot switch_root udhcpc echo sleep dmesg tail head wget nsenter unshare mke2fs blkid; do \
 		ln -sf /bin/busybox "$(INITRAMFS_ROOT)/bin/$$cmd"; \
 	done
 	ln -sf /bin/busybox "$(INITRAMFS_ROOT)/sbin/udhcpc"

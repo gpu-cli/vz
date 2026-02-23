@@ -31,6 +31,11 @@ pub struct LinuxVmConfig {
     pub vsock: bool,
     /// Optional network config.
     pub network: Option<NetworkConfig>,
+    /// Optional disk image to attach as a VirtioBlock device.
+    ///
+    /// Used for persistent named volumes — an ext4 filesystem image
+    /// that is mounted inside the guest at `/run/vz-oci/volumes`.
+    pub disk_image: Option<PathBuf>,
 }
 
 impl LinuxVmConfig {
@@ -158,6 +163,10 @@ impl LinuxVmConfig {
             builder = builder.network(network.clone());
         }
 
+        if let Some(disk_image) = &self.disk_image {
+            builder = builder.disk(disk_image.clone());
+        }
+
         Ok(builder.build()?)
     }
 }
@@ -175,6 +184,7 @@ impl Default for LinuxVmConfig {
             serial_log_file: None,
             vsock: true,
             network: None,
+            disk_image: None,
         }
     }
 }

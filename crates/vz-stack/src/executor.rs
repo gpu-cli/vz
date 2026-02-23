@@ -509,11 +509,12 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 })
                 .collect();
 
-            // Collect all bind/named volume mounts across services so VirtioFS
-            // shares can be configured at VM creation time.  Each service gets
-            // a global tag offset so mount tags don't collide.
+            // Collect all bind mounts across services so VirtioFS shares can
+            // be configured at VM creation time. Named volumes use a persistent
+            // disk image (not VirtioFS), so they're skipped here.
             let mut all_volume_mounts: Vec<vz_runtime_contract::StackVolumeMount> = Vec::new();
             let mut mount_tag_offsets: HashMap<String, usize> = HashMap::new();
+            let mut has_named_volumes = false;
             for svc in &spec.services {
                 let resolved = self
                     .volumes
@@ -521,22 +522,37 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 // This service's bind mounts start at the current global index.
                 mount_tag_offsets.insert(svc.name.clone(), all_volume_mounts.len());
                 for rm in &resolved {
-                    if let Some(host_path) = &rm.host_path {
-                        // Only host-backed bind mounts need VirtioFS shares.
-                        // Named volumes use tmpfs inside the VM, ephemeral mounts
-                        // are also tmpfs — neither needs a host share.
-                        if matches!(rm.kind, crate::volume::ResolvedMountKind::Bind) {
-                            let idx = all_volume_mounts.len();
-                            all_volume_mounts.push(vz_runtime_contract::StackVolumeMount {
-                                tag: format!("vz-mount-{idx}"),
-                                host_path: host_path.clone(),
-                                read_only: rm.read_only,
-                            });
+                    match &rm.kind {
+                        crate::volume::ResolvedMountKind::Bind => {
+                            if let Some(host_path) = &rm.host_path {
+                                let idx = all_volume_mounts.len();
+                                all_volume_mounts.push(vz_runtime_contract::StackVolumeMount {
+                                    tag: format!("vz-mount-{idx}"),
+                                    host_path: host_path.clone(),
+                                    read_only: rm.read_only,
+                                });
+                            }
                         }
+                        crate::volume::ResolvedMountKind::Named { .. } => {
+                            has_named_volumes = true;
+                        }
+                        crate::volume::ResolvedMountKind::Ephemeral => {}
                     }
                 }
             }
             self.mount_tag_offsets = mount_tag_offsets;
+
+            // Create persistent disk image for named volumes if needed.
+            let disk_image_path = if has_named_volumes {
+                let disk_size_bytes = spec.disk_size_mb.map(|mb| mb * 1024 * 1024);
+                let is_new = self.volumes.ensure_disk_image(disk_size_bytes)?;
+                if is_new {
+                    info!(stack = %spec.name, "created persistent disk image for named volumes");
+                }
+                Some(self.volumes.disk_image_path())
+            } else {
+                None
+            };
 
             // Compute aggregate resource hints for VM sizing.
             let resources = {
@@ -559,6 +575,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     cpus: max_cpus,
                     memory_mb: total_memory_mb,
                     volume_mounts: all_volume_mounts,
+                    disk_image_path,
                 }
             };
 
@@ -1349,6 +1366,7 @@ mod tests {
             networks: vec![default_network()],
             volumes: vec![],
             secrets: vec![],
+            disk_size_mb: None,
         }
     }
 
@@ -1640,6 +1658,7 @@ mod tests {
                 driver_opts: None,
             }],
             secrets: vec![],
+            disk_size_mb: None,
         };
 
         let actions = vec![Action::ServiceCreate {
@@ -2636,6 +2655,7 @@ mod tests {
             networks: vec![net("frontend", None), net("backend", None)],
             volumes: vec![],
             secrets: vec![],
+            disk_size_mb: None,
         };
 
         let actions = vec![
@@ -2699,6 +2719,7 @@ mod tests {
             networks: vec![net("frontend", Some("10.0.1.0/24"))],
             volumes: vec![],
             secrets: vec![],
+            disk_size_mb: None,
         };
 
         let actions = vec![
@@ -2747,6 +2768,7 @@ mod tests {
             networks: vec![net("frontend", None), net("backend", None)],
             volumes: vec![],
             secrets: vec![],
+            disk_size_mb: None,
         };
 
         let actions = vec![

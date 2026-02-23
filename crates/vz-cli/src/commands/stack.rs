@@ -690,6 +690,7 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
             networks: vec![],
             volumes: vec![],
             secrets: vec![],
+            disk_size_mb: None,
         };
         let health_statuses = HashMap::new();
         let teardown_actions = vz_stack::apply(&empty_spec, &teardown_store, &health_statuses)
@@ -1235,6 +1236,7 @@ async fn cmd_down(args: DownArgs) -> anyhow::Result<()> {
         networks: vec![],
         volumes: vec![],
         secrets: vec![],
+        disk_size_mb: None,
     };
 
     info!(stack = %stack_name, "tearing down stack");

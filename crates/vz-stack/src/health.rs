@@ -897,6 +897,7 @@ mod tests {
             networks: vec![],
             volumes: vec![],
             secrets: vec![],
+            disk_size_mb: None,
         }
     }
 

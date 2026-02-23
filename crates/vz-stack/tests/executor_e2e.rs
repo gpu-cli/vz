@@ -197,6 +197,7 @@ fn full_pipeline_up_then_down() {
         networks: vec![],
         volumes: vec![],
         secrets: vec![],
+        disk_size_mb: None,
     };
     let down_actions = vec![
         Action::ServiceRemove {
@@ -456,6 +457,7 @@ fn port_allocation_tracked_through_lifecycle() {
         networks: vec![],
         volumes: vec![],
         secrets: vec![],
+        disk_size_mb: None,
     };
     let down = vz_stack::apply(&empty, &store, &health).unwrap();
     executor.execute(&empty, &down.actions).unwrap();

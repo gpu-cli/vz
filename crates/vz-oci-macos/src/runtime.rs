@@ -531,6 +531,11 @@ impl Runtime {
         vm_config.cpus = resources.cpus.unwrap_or(self.config.default_cpus);
         vm_config.memory_mb = resources.memory_mb.unwrap_or(self.config.default_memory_mb);
 
+        // Attach persistent disk image for named volumes.
+        if let Some(ref disk_path) = resources.disk_image_path {
+            vm_config.disk_image = Some(disk_path.clone());
+        }
+
         // Debug: capture serial log for shared VM diagnostics.
         if let Ok(log_path) = std::env::var("VZ_STACK_SERIAL_LOG") {
             vm_config.serial_log_file = Some(std::path::PathBuf::from(log_path));
@@ -546,6 +551,111 @@ impl Runtime {
         if let Err(err) = vm.wait_for_agent(self.config.agent_ready_timeout).await {
             let _ = vm.stop().await;
             return Err(err.into());
+        }
+
+        // Format and mount the persistent volume disk if attached.
+        if resources.disk_image_path.is_some() {
+            let timeout = Duration::from_secs(30);
+
+            // Check if disk already has a filesystem. If not, format it as ext4.
+            let blkid_result = vm
+                .exec_capture(
+                    "/bin/busybox".to_string(),
+                    vec![
+                        "blkid".to_string(),
+                        "/dev/vda".to_string(),
+                    ],
+                    timeout,
+                )
+                .await;
+
+            // Busybox blkid may return exit 0 even on empty disks (with
+            // no output). A disk with a filesystem produces output like
+            // "/dev/vda: TYPE="ext4"". Format only if there's no TYPE output.
+            let needs_format = match &blkid_result {
+                Ok(output) => {
+                    let has_fs = output.exit_code == 0 && output.stdout.contains("TYPE=");
+                    tracing::debug!(
+                        exit_code = output.exit_code,
+                        has_filesystem = has_fs,
+                        "blkid check result"
+                    );
+                    !has_fs
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "blkid exec failed");
+                    true
+                }
+            };
+
+            if needs_format {
+                tracing::info!("formatting persistent volume disk as ext4");
+                // Busybox mke2fs creates ext2 (no -t flag). The ext4 driver
+                // can mount ext2/ext3/ext4, so this is fine.
+                let format_result = vm
+                    .exec_capture(
+                        "/bin/busybox".to_string(),
+                        vec![
+                            "mke2fs".to_string(),
+                            "-F".to_string(),
+                            "/dev/vda".to_string(),
+                        ],
+                        timeout,
+                    )
+                    .await;
+                match &format_result {
+                    Ok(output) if output.exit_code != 0 => {
+                        let _ = vm.stop().await;
+                        return Err(OciError::InvalidConfig(format!(
+                            "failed to format persistent volume disk: {}{}",
+                            output.stdout, output.stderr
+                        )));
+                    }
+                    Err(err) => {
+                        let _ = vm.stop().await;
+                        return Err(OciError::InvalidConfig(format!(
+                            "failed to format persistent volume disk: {err}"
+                        )));
+                    }
+                    Ok(output) => {
+                        tracing::debug!(
+                            stdout = %output.stdout, stderr = %output.stderr,
+                            "mke2fs completed"
+                        );
+                    }
+                }
+            }
+
+            // Mount the formatted disk.
+            let mount_result = vm
+                .exec_capture(
+                    "/bin/busybox".to_string(),
+                    vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "/bin/busybox mkdir -p /run/vz-oci/volumes && /bin/busybox mount -t ext4 /dev/vda /run/vz-oci/volumes".to_string(),
+                    ],
+                    timeout,
+                )
+                .await;
+            match &mount_result {
+                Ok(output) if output.exit_code != 0 => {
+                    let _ = vm.stop().await;
+                    return Err(OciError::InvalidConfig(format!(
+                        "failed to mount persistent volume disk: {}{}",
+                        output.stdout, output.stderr
+                    )));
+                }
+                Err(err) => {
+                    let _ = vm.stop().await;
+                    return Err(OciError::InvalidConfig(format!(
+                        "failed to mount persistent volume disk: {err}"
+                    )));
+                }
+                _ => {
+                    tracing::info!("persistent volume disk mounted at /run/vz-oci/volumes");
+                }
+            }
         }
 
         let vm = Arc::new(vm);
@@ -736,6 +846,36 @@ impl Runtime {
                 typ: "bind".to_string(),
                 options: vec!["rbind".to_string(), "rw".to_string()],
             });
+        }
+
+        // Create directories on the persistent volume disk for named volumes.
+        // These must exist before the OCI runtime bind-mounts them into the container.
+        let volume_dirs: Vec<String> = run
+            .mounts
+            .iter()
+            .filter_map(|m| {
+                if let MountType::Volume { ref volume_name } = m.mount_type {
+                    Some(format!("/run/vz-oci/volumes/{volume_name}"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !volume_dirs.is_empty() {
+            let mkdir_cmd = format!(
+                "/bin/busybox mkdir -p {}",
+                volume_dirs.join(" ")
+            );
+            let mkdir_result = vm
+                .exec_capture(
+                    "/bin/busybox".to_string(),
+                    vec!["sh".to_string(), "-c".to_string(), mkdir_cmd],
+                    Duration::from_secs(10),
+                )
+                .await;
+            if let Err(err) = &mkdir_result {
+                tracing::warn!(error = %err, "failed to create volume directories on persistent disk");
+            }
         }
 
         // extra_hosts are written AFTER the container starts (step 5) via
@@ -2078,15 +2218,27 @@ fn mount_specs_to_bundle_mounts(
                 let opts = vec!["nosuid".to_string(), "nodev".to_string()];
                 ("tmpfs".to_string(), PathBuf::from("tmpfs"), opts)
             }
+            MountType::Volume { volume_name } => {
+                // Named volumes are backed by the persistent ext4 disk image
+                // mounted at /run/vz-oci/volumes inside the guest.
+                let source = PathBuf::from(format!("/run/vz-oci/volumes/{volume_name}"));
+                let mut opts = vec!["rbind".to_string()];
+                match spec.access {
+                    MountAccess::ReadWrite => opts.push("rw".to_string()),
+                    MountAccess::ReadOnly => opts.push("ro".to_string()),
+                }
+                ("bind".to_string(), source, opts)
+            }
         };
 
         // Use the virtio mount tag as the in-guest source path for bind mounts.
+        // Volume mounts already have their guest path set (from /run/vz-oci/volumes).
         let guest_source = match &spec.mount_type {
             MountType::Bind => {
                 let global_idx = tag_offset + idx;
                 PathBuf::from(format!("/mnt/vz-mount-{global_idx}"))
             }
-            MountType::Tmpfs => source,
+            MountType::Tmpfs | MountType::Volume { .. } => source,
         };
 
         bundle_mounts.push(BundleMount {

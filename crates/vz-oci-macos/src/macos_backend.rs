@@ -297,6 +297,9 @@ fn mount_spec_from_contract(m: contract::MountSpec) -> oci_config::MountSpec {
         mount_type: match m.mount_type {
             contract::MountType::Bind => oci_config::MountType::Bind,
             contract::MountType::Tmpfs => oci_config::MountType::Tmpfs,
+            contract::MountType::Volume { volume_name } => {
+                oci_config::MountType::Volume { volume_name }
+            }
         },
         access: match m.access {
             contract::MountAccess::ReadWrite => oci_config::MountAccess::ReadWrite,

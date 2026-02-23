@@ -260,6 +260,7 @@ fn web_redis_teardown_removes_both_services() {
         networks: vec![],
         volumes: vec![],
         secrets: vec![],
+        disk_size_mb: None,
     };
     let result = vz_stack::apply(&empty, &store, &health).unwrap();
 
@@ -505,6 +506,7 @@ fn web_pg_redis_teardown_removes_all_three() {
         networks: vec![],
         volumes: vec![],
         secrets: vec![],
+        disk_size_mb: None,
     };
     let result = vz_stack::apply(&empty, &store, &health).unwrap();
 

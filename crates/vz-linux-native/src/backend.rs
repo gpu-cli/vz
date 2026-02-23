@@ -90,7 +90,7 @@ fn native_err(e: crate::error::LinuxNativeError) -> RuntimeError {
 /// Convert contract MountSpec to bundle BundleMount.
 fn mount_to_bundle(m: &contract::MountSpec) -> BundleMount {
     let options = match m.mount_type {
-        contract::MountType::Bind => {
+        contract::MountType::Bind | contract::MountType::Volume { .. } => {
             let mut opts = vec!["rbind".to_string()];
             match m.access {
                 contract::MountAccess::ReadWrite => opts.push("rw".to_string()),
@@ -111,7 +111,7 @@ fn mount_to_bundle(m: &contract::MountSpec) -> BundleMount {
         destination: m.target.clone(),
         source: m.source.clone().unwrap_or_default(),
         typ: match m.mount_type {
-            contract::MountType::Bind => "bind".to_string(),
+            contract::MountType::Bind | contract::MountType::Volume { .. } => "bind".to_string(),
             contract::MountType::Tmpfs => "tmpfs".to_string(),
         },
         options,

@@ -72,6 +72,12 @@ pub struct StackSpec {
     /// Secret definitions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<SecretDef>,
+    /// Persistent volume disk image size in megabytes.
+    ///
+    /// Configurable via `x-vz.disk_size` in Docker Compose files (accepts
+    /// human-readable sizes like `"20g"`, `"512m"`). Defaults to 10 GiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_size_mb: Option<u64>,
 }
 
 /// Specification for a single service within a stack.
@@ -424,6 +430,7 @@ mod tests {
                 driver_opts: None,
             }],
             secrets: vec![],
+            disk_size_mb: None,
         };
 
         let json = serde_json::to_string_pretty(&spec).unwrap();
@@ -439,6 +446,7 @@ mod tests {
             networks: vec![],
             volumes: vec![],
             secrets: vec![],
+            disk_size_mb: None,
         };
 
         let json = serde_json::to_string(&spec).unwrap();

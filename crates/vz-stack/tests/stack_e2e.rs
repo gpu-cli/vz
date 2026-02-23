@@ -427,6 +427,7 @@ services:
         networks: vec![],
         volumes: vec![],
         secrets: vec![],
+        disk_size_mb: None,
     };
     let down_result = orchestrator.run(&down_spec, None).unwrap();
     assert!(down_result.converged);
@@ -562,6 +563,7 @@ services:
         networks: vec![],
         volumes: vec![],
         secrets: vec![],
+        disk_size_mb: None,
     };
     let down_result = orchestrator.run(&down_spec, None).unwrap();
     assert!(down_result.converged, "teardown should converge");
@@ -722,6 +724,7 @@ services:
         networks: vec![],
         volumes: vec![],
         secrets: vec![],
+        disk_size_mb: None,
     };
     let _ = orchestrator.run(&down_spec, None);
     let _ = orchestrator
@@ -829,6 +832,7 @@ services:
         networks: vec![],
         volumes: vec![],
         secrets: vec![],
+        disk_size_mb: None,
     };
     let _ = orchestrator.run(&down_spec, None);
     let _ = orchestrator

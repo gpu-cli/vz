@@ -175,12 +175,16 @@ fn convert_mounts(resolved: &[ResolvedMount]) -> Vec<vz_runtime_contract::MountS
                 crate::volume::ResolvedMountKind::Bind => {
                     (vz_runtime_contract::MountType::Bind, rm.host_path.clone())
                 }
-                crate::volume::ResolvedMountKind::Named { .. } => {
-                    // Named volumes use tmpfs inside the VM (not VirtioFS from the
-                    // host). VirtioFS doesn't support chown/chmod which breaks
-                    // containers that change ownership of their data directories
-                    // (e.g., postgres). Data persists for the VM's lifetime.
-                    (vz_runtime_contract::MountType::Tmpfs, None)
+                crate::volume::ResolvedMountKind::Named { volume_name } => {
+                    // Named volumes are backed by a persistent ext4 disk image
+                    // attached to the VM. Data lives at `/run/vz-oci/volumes/{name}`
+                    // on the block device and survives across stack restarts.
+                    (
+                        vz_runtime_contract::MountType::Volume {
+                            volume_name: volume_name.clone(),
+                        },
+                        None,
+                    )
                 }
                 crate::volume::ResolvedMountKind::Ephemeral => {
                     (vz_runtime_contract::MountType::Tmpfs, None)
@@ -433,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn named_volume_mount_converts_as_tmpfs() {
+    fn named_volume_mount_converts_as_volume() {
         let resolved = vec![ResolvedMount {
             host_path: Some(PathBuf::from("/volumes/dbdata")),
             target: "/var/lib/db".to_string(),
@@ -444,11 +448,12 @@ mod tests {
         }];
         let spec = minimal_service();
         let config = service_to_run_config(&spec, &resolved, &[]).unwrap();
-        // Named volumes use tmpfs inside the VM (not VirtioFS from host)
-        // because VirtioFS doesn't support chown/chmod.
+        // Named volumes use a persistent ext4 disk image inside the VM.
         assert_eq!(
             config.mounts[0].mount_type,
-            vz_runtime_contract::MountType::Tmpfs
+            vz_runtime_contract::MountType::Volume {
+                volume_name: "dbdata".to_string(),
+            }
         );
         assert!(config.mounts[0].source.is_none());
     }
