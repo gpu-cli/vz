@@ -12,12 +12,14 @@
 
 use std::collections::HashSet;
 use std::io::IsTerminal;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
-use vz_stack::{ApplyResult, ExecutionResult, HealthPollResult, OrchestrationResult, RoundReport};
+use vz_stack::{
+    ApplyResult, ExecutionResult, HealthPollResult, OrchestrationResult, RoundReport, StackEvent,
+};
 
 /// Per-service display phase.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -57,6 +59,9 @@ pub struct StackOutput {
     total: usize,
     done_count: usize,
     fail_count: usize,
+    round: usize,
+    last_activity: Instant,
+    last_plain_heartbeat: Instant,
 }
 
 impl StackOutput {
@@ -135,11 +140,16 @@ impl StackOutput {
             total,
             done_count: 0,
             fail_count: 0,
+            round: 0,
+            last_activity: now,
+            last_plain_heartbeat: now,
         }
     }
 
     /// Process an orchestration round report — updates all service bars.
     pub fn on_round(&mut self, report: &RoundReport) {
+        self.round = report.round;
+        self.last_activity = Instant::now();
         // 1. Apply result → transition to Creating/Removing
         self.process_apply(&report.apply_result);
 
@@ -155,6 +165,77 @@ impl StackOutput {
 
         // Update header.
         self.update_header();
+    }
+
+    /// Process a real-time stack event while orchestration is running.
+    pub fn on_event(&mut self, event: &StackEvent) {
+        self.last_activity = Instant::now();
+        match event {
+            StackEvent::ServiceCreating { service_name, .. } => self.mark_creating(service_name),
+            StackEvent::ServiceReady { service_name, .. } => self.mark_ready(service_name),
+            StackEvent::ServiceStopping { service_name, .. } => self.mark_removing(service_name),
+            StackEvent::ServiceStopped { service_name, .. } => self.mark_removed(service_name),
+            StackEvent::ServiceFailed {
+                service_name,
+                error,
+                ..
+            } => self.mark_failed(service_name, error),
+            StackEvent::HealthCheckPassed { service_name, .. } => self.mark_ready(service_name),
+            StackEvent::HealthCheckFailed {
+                service_name,
+                error,
+                ..
+            } => self.mark_failed(service_name, error),
+            StackEvent::DependencyBlocked {
+                service_name,
+                waiting_on,
+                ..
+            } => self.mark_deferred(service_name, waiting_on),
+            StackEvent::PortConflict {
+                service_name, port, ..
+            } => {
+                self.message(&format!(
+                    " {} {} requested host port {} already in use",
+                    style("!").bold().red(),
+                    service_name,
+                    port
+                ));
+            }
+            StackEvent::VolumeCreated { volume_name, .. } => {
+                self.message(&format!(
+                    " {} volume {} ready",
+                    style("+").bold().cyan(),
+                    volume_name
+                ));
+            }
+            StackEvent::StackApplyFailed { error, .. } => {
+                self.message(&format!(" {} {}", style("!").bold().red(), error));
+            }
+            StackEvent::StackApplyStarted { .. }
+            | StackEvent::StackApplyCompleted { .. }
+            | StackEvent::StackDestroyed { .. } => {}
+        }
+        self.update_header();
+    }
+
+    /// Periodic tick to keep progress visibly active between events.
+    pub fn tick(&mut self) {
+        self.update_header();
+        if !self.is_tty && self.last_plain_heartbeat.elapsed() >= Duration::from_secs(4) {
+            let active = self
+                .total
+                .saturating_sub(self.done_count)
+                .saturating_sub(self.fail_count);
+            println!(
+                "stack progress: ready={}, active={}, failed={}, round={}, elapsed={:.1}s",
+                self.done_count,
+                active,
+                self.fail_count,
+                self.round.max(1),
+                self.start.elapsed().as_secs_f64()
+            );
+            self.last_plain_heartbeat = Instant::now();
+        }
     }
 
     /// Finalize output after orchestration completes.
@@ -264,6 +345,9 @@ impl StackOutput {
             total,
             done_count: 0,
             fail_count: 0,
+            round: 0,
+            last_activity: now,
+            last_plain_heartbeat: now,
         }
     }
 
@@ -410,68 +494,166 @@ impl StackOutput {
 
     // ── internal helpers ────────────────────────────────────────────
 
+    fn service_index(&self, name: &str) -> Option<usize> {
+        self.services
+            .iter()
+            .position(|(service, _)| service == name)
+    }
+
+    fn mark_creating(&mut self, name: &str) {
+        let Some(index) = self.service_index(name) else {
+            return;
+        };
+        let svc = &mut self.services[index].1;
+        if svc.phase != Phase::Pending && svc.phase != Phase::Deferred {
+            return;
+        }
+
+        svc.phase = Phase::Creating;
+        svc.started_at = Instant::now();
+        svc.bar.set_style(svc.spinner_style.clone());
+        svc.bar
+            .set_message(format!("{:<20} {}", name, style("Creating...").cyan()));
+
+        if !self.is_tty {
+            println!("{}: Creating...", name);
+        }
+    }
+
+    fn mark_deferred(&mut self, name: &str, waiting_on: &[String]) {
+        let Some(index) = self.service_index(name) else {
+            return;
+        };
+        let svc = &mut self.services[index].1;
+        if svc.phase != Phase::Pending && svc.phase != Phase::Deferred {
+            return;
+        }
+
+        svc.phase = Phase::Deferred;
+        let deps = waiting_on.join(", ");
+        let pending_style = ProgressStyle::default_spinner()
+            .template("   {msg}")
+            .expect("valid template");
+        svc.bar.set_style(pending_style);
+        svc.bar.set_message(format!(
+            "{} {:<20} {}",
+            style("\u{00b7}").yellow(),
+            name,
+            style(format!("Waiting ({deps})")).yellow()
+        ));
+    }
+
+    fn mark_health_checking(&mut self, name: &str) {
+        let Some(index) = self.service_index(name) else {
+            return;
+        };
+        let svc = &mut self.services[index].1;
+        if svc.phase == Phase::Failed || svc.phase == Phase::Ready {
+            return;
+        }
+
+        svc.phase = Phase::Running;
+        svc.bar.set_style(svc.spinner_style.clone());
+        svc.bar.set_message(format!(
+            "{:<20} {}",
+            name,
+            style("Health check...").yellow()
+        ));
+    }
+
+    fn mark_ready(&mut self, name: &str) {
+        let Some(index) = self.service_index(name) else {
+            return;
+        };
+        let previous = self.services[index].1.phase;
+        if previous == Phase::Ready {
+            return;
+        }
+
+        if previous == Phase::Failed && self.fail_count > 0 {
+            self.fail_count -= 1;
+        }
+        if previous != Phase::Removed {
+            self.done_count = self.done_count.saturating_add(1);
+        }
+
+        let svc = &mut self.services[index].1;
+        set_ready(svc, name, self.is_tty);
+    }
+
+    fn mark_failed(&mut self, name: &str, error: &str) {
+        let Some(index) = self.service_index(name) else {
+            return;
+        };
+        let previous = self.services[index].1.phase;
+        if previous == Phase::Failed {
+            return;
+        }
+
+        if matches!(previous, Phase::Ready | Phase::Removed) && self.done_count > 0 {
+            self.done_count -= 1;
+        }
+        self.fail_count = self.fail_count.saturating_add(1);
+
+        let svc = &mut self.services[index].1;
+        set_failed(svc, name, error, self.is_tty);
+    }
+
+    fn mark_removing(&mut self, name: &str) {
+        let Some(index) = self.service_index(name) else {
+            return;
+        };
+        let svc = &mut self.services[index].1;
+        if svc.phase == Phase::Removing || svc.phase == Phase::Removed {
+            return;
+        }
+
+        svc.phase = Phase::Removing;
+        svc.started_at = Instant::now();
+        svc.bar.set_style(svc.spinner_style.clone());
+        svc.bar
+            .set_message(format!("{:<20} {}", name, style("Removing...").cyan()));
+
+        if !self.is_tty {
+            println!("{}: Removing...", name);
+        }
+    }
+
+    fn mark_removed(&mut self, name: &str) {
+        let Some(index) = self.service_index(name) else {
+            return;
+        };
+        let previous = self.services[index].1.phase;
+        if previous == Phase::Removed {
+            return;
+        }
+
+        if previous == Phase::Failed && self.fail_count > 0 {
+            self.fail_count -= 1;
+        }
+        self.done_count = self.done_count.saturating_add(1);
+
+        let svc = &mut self.services[index].1;
+        set_removed(svc, name, self.is_tty);
+    }
+
     fn process_apply(&mut self, apply: &ApplyResult) {
         for action in &apply.actions {
             let name = action.service_name();
-            if let Some((_, svc)) = self.services.iter_mut().find(|(n, _)| n == name) {
-                match action {
-                    vz_stack::Action::ServiceCreate { .. }
-                    | vz_stack::Action::ServiceRecreate { .. } => {
-                        if svc.phase == Phase::Pending || svc.phase == Phase::Deferred {
-                            svc.phase = Phase::Creating;
-                            svc.started_at = Instant::now();
-                            svc.bar.set_style(svc.spinner_style.clone());
-                            svc.bar.set_message(format!(
-                                "{:<20} {}",
-                                name,
-                                style("Creating...").cyan()
-                            ));
-
-                            if !self.is_tty {
-                                println!("{}: Creating...", name);
-                            }
-                        }
-                    }
-                    vz_stack::Action::ServiceRemove { .. } => {
-                        svc.phase = Phase::Removing;
-                        svc.started_at = Instant::now();
-                        svc.bar.set_style(svc.spinner_style.clone());
-                        svc.bar.set_message(format!(
-                            "{:<20} {}",
-                            name,
-                            style("Removing...").cyan()
-                        ));
-
-                        if !self.is_tty {
-                            println!("{}: Removing...", name);
-                        }
-                    }
+            match action {
+                vz_stack::Action::ServiceCreate { .. }
+                | vz_stack::Action::ServiceRecreate { .. } => {
+                    self.mark_creating(name);
+                }
+                vz_stack::Action::ServiceRemove { .. } => {
+                    self.mark_removing(name);
                 }
             }
         }
 
         // Mark deferred services.
         for deferred in &apply.deferred {
-            if let Some((_, svc)) = self
-                .services
-                .iter_mut()
-                .find(|(n, _)| n == &deferred.service_name)
-            {
-                if svc.phase == Phase::Pending || svc.phase == Phase::Deferred {
-                    svc.phase = Phase::Deferred;
-                    let deps = deferred.waiting_on.join(", ");
-                    let pending_style = ProgressStyle::default_spinner()
-                        .template("   {msg}")
-                        .expect("valid template");
-                    svc.bar.set_style(pending_style);
-                    svc.bar.set_message(format!(
-                        "{} {:<20} {}",
-                        style("\u{00b7}").yellow(),
-                        deferred.service_name,
-                        style(format!("Waiting ({deps})")).yellow()
-                    ));
-                }
-            }
+            self.mark_deferred(&deferred.service_name, &deferred.waiting_on);
         }
     }
 
@@ -480,46 +662,34 @@ impl StackOutput {
 
         for action in &apply.actions {
             let name = action.service_name();
-            if let Some((_, svc)) = self.services.iter_mut().find(|(n, _)| n == name) {
-                match action {
-                    vz_stack::Action::ServiceCreate { .. }
-                    | vz_stack::Action::ServiceRecreate { .. } => {
-                        if failed_names.contains(name) {
-                            let error_msg = exec
-                                .errors
-                                .iter()
-                                .find(|(n, _)| n == name)
-                                .map(|(_, e)| e.as_str())
-                                .unwrap_or("unknown error");
-                            set_failed(svc, name, error_msg, self.is_tty);
-                            self.fail_count += 1;
-                        } else if self.has_health.contains(name) {
-                            svc.phase = Phase::Running;
-                            svc.bar.set_style(svc.spinner_style.clone());
-                            svc.bar.set_message(format!(
-                                "{:<20} {}",
-                                name,
-                                style("Health check...").yellow()
-                            ));
-                        } else {
-                            set_ready(svc, name, self.is_tty);
-                            self.done_count += 1;
-                        }
+            match action {
+                vz_stack::Action::ServiceCreate { .. }
+                | vz_stack::Action::ServiceRecreate { .. } => {
+                    if failed_names.contains(name) {
+                        let error_msg = exec
+                            .errors
+                            .iter()
+                            .find(|(n, _)| n == name)
+                            .map(|(_, e)| e.as_str())
+                            .unwrap_or("unknown error");
+                        self.mark_failed(name, error_msg);
+                    } else if self.has_health.contains(name) {
+                        self.mark_health_checking(name);
+                    } else {
+                        self.mark_ready(name);
                     }
-                    vz_stack::Action::ServiceRemove { .. } => {
-                        if failed_names.contains(name) {
-                            let error_msg = exec
-                                .errors
-                                .iter()
-                                .find(|(n, _)| n == name)
-                                .map(|(_, e)| e.as_str())
-                                .unwrap_or("unknown error");
-                            set_failed(svc, name, error_msg, self.is_tty);
-                            self.fail_count += 1;
-                        } else {
-                            set_removed(svc, name, self.is_tty);
-                            self.done_count += 1;
-                        }
+                }
+                vz_stack::Action::ServiceRemove { .. } => {
+                    if failed_names.contains(name) {
+                        let error_msg = exec
+                            .errors
+                            .iter()
+                            .find(|(n, _)| n == name)
+                            .map(|(_, e)| e.as_str())
+                            .unwrap_or("unknown error");
+                        self.mark_failed(name, error_msg);
+                    } else {
+                        self.mark_removed(name);
                     }
                 }
             }
@@ -528,40 +698,49 @@ impl StackOutput {
 
     fn process_health(&mut self, health: &HealthPollResult) {
         for name in &health.newly_ready {
-            if let Some((_, svc)) = self.services.iter_mut().find(|(n, _)| n == name) {
-                if svc.phase == Phase::Running || svc.phase == Phase::Creating {
-                    set_ready(svc, name, self.is_tty);
-                    self.done_count += 1;
-                }
-            }
+            self.mark_ready(name);
         }
 
         for name in &health.newly_failed {
-            if let Some((_, svc)) = self.services.iter_mut().find(|(n, _)| n == name) {
-                if svc.phase == Phase::Running || svc.phase == Phase::Creating {
-                    set_failed(svc, name, "health check failed", self.is_tty);
-                    self.fail_count += 1;
-                }
-            }
+            self.mark_failed(name, "health check failed");
         }
     }
 
     fn update_header(&self) {
+        let active = self
+            .total
+            .saturating_sub(self.done_count)
+            .saturating_sub(self.fail_count);
+        let elapsed = self.start.elapsed().as_secs_f64();
+        let idle = self.last_activity.elapsed().as_secs_f64();
         let msg = format!(
-            "{} Running {}/{}",
+            "{} Running {}/{} | active {} | failed {} | round {} | {:.1}s elapsed | {:.1}s idle",
             style("[+]").bold().cyan(),
             self.done_count,
             self.total,
+            active,
+            self.fail_count,
+            self.round.max(1),
+            elapsed,
+            idle,
         );
         self.header.set_message(msg);
     }
 
     fn update_header_down(&self) {
+        let active = self
+            .total
+            .saturating_sub(self.done_count)
+            .saturating_sub(self.fail_count);
+        let elapsed = self.start.elapsed().as_secs_f64();
         let msg = format!(
-            "{} Stopping {}/{}",
+            "{} Stopping {}/{} | active {} | failed {} | {:.1}s elapsed",
             style("[-]").bold().cyan(),
             self.done_count,
             self.total,
+            active,
+            self.fail_count,
+            elapsed,
         );
         self.header.set_message(msg);
     }

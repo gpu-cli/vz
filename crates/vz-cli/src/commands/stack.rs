@@ -14,6 +14,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
@@ -589,53 +592,15 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
                 ..Default::default()
             },
         );
-
-        let mut out = StackOutput::new(&spec);
-        let mut warnings_shown = false;
-        let result = orchestrator
-            .run(
-                &spec,
-                Some(&mut |report: &RoundReport| {
-                    if !warnings_shown {
-                        if let Some(ref exec) = report.exec_result {
-                            if !exec.skipped_mounts.is_empty() {
-                                out.on_warnings(&exec.skipped_mounts);
-                            }
-                        }
-                        warnings_shown = true;
-                    }
-                    out.on_round(report);
-                }),
-            )
+        let _ = run_orchestration_with_live_output(&mut orchestrator, &spec)
             .with_context(|| "stack up failed")?;
-
-        out.finish(&result);
     } else {
         // Foreground mode: full orchestration loop until convergence,
         // then keep the VM alive with a control socket for `vz stack exec`.
         let mut orchestrator =
             StackOrchestrator::new(executor, reconcile_store, OrchestrationConfig::default());
-
-        let mut out = StackOutput::new(&spec);
-        let mut warnings_shown = false;
-        let result = orchestrator
-            .run(
-                &spec,
-                Some(&mut |report: &RoundReport| {
-                    if !warnings_shown {
-                        if let Some(ref exec) = report.exec_result {
-                            if !exec.skipped_mounts.is_empty() {
-                                out.on_warnings(&exec.skipped_mounts);
-                            }
-                        }
-                        warnings_shown = true;
-                    }
-                    out.on_round(report);
-                }),
-            )
+        let result = run_orchestration_with_live_output(&mut orchestrator, &spec)
             .with_context(|| "stack orchestration failed")?;
-
-        out.finish(&result);
 
         if result.services_failed > 0 {
             bail!("{} service(s) failed", result.services_failed);
@@ -705,6 +670,66 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn run_orchestration_with_live_output(
+    orchestrator: &mut StackOrchestrator<OciContainerRuntime>,
+    spec: &StackSpec,
+) -> Result<vz_stack::OrchestrationResult, StackError> {
+    let output = Arc::new(Mutex::new(StackOutput::new(spec)));
+    let event_rx = orchestrator.subscribe();
+    let output_for_events = Arc::clone(&output);
+    let event_pump = std::thread::spawn(move || {
+        loop {
+            match event_rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(event) => {
+                    if let Ok(mut out) = output_for_events.lock() {
+                        out.on_event(&event);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Ok(mut out) = output_for_events.lock() {
+                        out.tick();
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+
+    let output_for_rounds = Arc::clone(&output);
+    let mut warnings_shown = false;
+    let result = orchestrator.run(
+        spec,
+        Some(&mut |report: &RoundReport| {
+            if let Ok(mut out) = output_for_rounds.lock() {
+                if !warnings_shown {
+                    if let Some(ref exec) = report.exec_result
+                        && !exec.skipped_mounts.is_empty()
+                    {
+                        out.on_warnings(&exec.skipped_mounts);
+                    }
+                    warnings_shown = true;
+                }
+                out.on_round(report);
+            }
+        }),
+    );
+
+    // Replace sender to close the previous event channel and let the pump exit.
+    drop(orchestrator.subscribe());
+    let _ = event_pump.join();
+
+    if let Ok(mut out) = output.lock() {
+        out.tick();
+        if let Ok(ref orchestration_result) = result {
+            out.finish(orchestration_result);
+        } else {
+            out.message("stack orchestration failed");
+        }
+    }
+
+    result
 }
 
 // ── control socket (for exec) ─────────────────────────────────────
@@ -2238,7 +2263,7 @@ mod tests {
     #[test]
     fn print_ps_table_empty() {
         // Just verify it doesn't panic.
-        print_ps_table(&[]);
+        print_ps_table(&[], None);
     }
 
     #[test]
@@ -2260,7 +2285,7 @@ mod tests {
             },
         ];
         // Just verify it doesn't panic.
-        print_ps_table(&observed);
+        print_ps_table(&observed, None);
     }
 
     #[test]

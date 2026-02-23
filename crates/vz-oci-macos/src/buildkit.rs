@@ -735,7 +735,10 @@ async fn run_buildctl(
 ) -> Result<ExecOutput, BuildkitError> {
     let mut full_args = vec!["--addr".to_string(), BUILDKITD_ADDR.to_string()];
     full_args.extend(args);
-    let mut rawjson_decoder = parse_rawjson.then(BuildkitRawJsonStreamDecoder::default);
+    let mut stdout_decoder = parse_rawjson.then(BuildkitRawJsonStreamDecoder::default);
+    let mut stderr_decoder = parse_rawjson.then(BuildkitRawJsonStreamDecoder::default);
+    let mut stdout_started = false;
+    let mut stderr_started = false;
 
     let output = vm
         .exec_capture_streaming(
@@ -750,31 +753,83 @@ async fn run_buildctl(
                                 stream: BuildLogStream::Stdout,
                                 chunk: chunk.clone(),
                             });
-                            if let Some(decoder) = rawjson_decoder.as_mut() {
+                            if let Some(decoder) = stdout_decoder.as_mut() {
                                 for decoded in decoder.push_chunk(chunk) {
                                     match decoded {
-                                        Ok(status) => callback(BuildEvent::SolveStatus { status }),
-                                        Err(error) => callback(BuildEvent::RawJsonDecodeError {
-                                            line: rawjson_line_preview(&error.line),
-                                            error: error.error,
-                                        }),
+                                        Ok(status) => {
+                                            stdout_started = true;
+                                            callback(BuildEvent::SolveStatus { status });
+                                        }
+                                        Err(error) => {
+                                            if stdout_started || looks_like_json(&error.line) {
+                                                callback(BuildEvent::RawJsonDecodeError {
+                                                    line: rawjson_line_preview(&error.line),
+                                                    error: error.error,
+                                                });
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
-                        ExecEvent::Stderr(chunk) => callback(BuildEvent::Output {
-                            stream: BuildLogStream::Stderr,
-                            chunk: chunk.clone(),
-                        }),
+                        ExecEvent::Stderr(chunk) => {
+                            callback(BuildEvent::Output {
+                                stream: BuildLogStream::Stderr,
+                                chunk: chunk.clone(),
+                            });
+                            if let Some(decoder) = stderr_decoder.as_mut() {
+                                for decoded in decoder.push_chunk(chunk) {
+                                    match decoded {
+                                        Ok(status) => {
+                                            stderr_started = true;
+                                            callback(BuildEvent::SolveStatus { status });
+                                        }
+                                        Err(error) => {
+                                            if stderr_started || looks_like_json(&error.line) {
+                                                callback(BuildEvent::RawJsonDecodeError {
+                                                    line: rawjson_line_preview(&error.line),
+                                                    error: error.error,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         ExecEvent::Exit(_) => {
-                            if let Some(decoder) = rawjson_decoder.as_mut() {
+                            if let Some(decoder) = stdout_decoder.as_mut() {
                                 for decoded in decoder.finish() {
                                     match decoded {
-                                        Ok(status) => callback(BuildEvent::SolveStatus { status }),
-                                        Err(error) => callback(BuildEvent::RawJsonDecodeError {
-                                            line: rawjson_line_preview(&error.line),
-                                            error: error.error,
-                                        }),
+                                        Ok(status) => {
+                                            stdout_started = true;
+                                            callback(BuildEvent::SolveStatus { status });
+                                        }
+                                        Err(error) => {
+                                            if stdout_started || looks_like_json(&error.line) {
+                                                callback(BuildEvent::RawJsonDecodeError {
+                                                    line: rawjson_line_preview(&error.line),
+                                                    error: error.error,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(decoder) = stderr_decoder.as_mut() {
+                                for decoded in decoder.finish() {
+                                    match decoded {
+                                        Ok(status) => {
+                                            stderr_started = true;
+                                            callback(BuildEvent::SolveStatus { status });
+                                        }
+                                        Err(error) => {
+                                            if stderr_started || looks_like_json(&error.line) {
+                                                callback(BuildEvent::RawJsonDecodeError {
+                                                    line: rawjson_line_preview(&error.line),
+                                                    error: error.error,
+                                                });
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -797,6 +852,12 @@ fn rawjson_line_preview(line: &[u8]) -> String {
         preview.push_str("...");
     }
     preview
+}
+
+fn looks_like_json(line: &[u8]) -> bool {
+    line.iter()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .is_some_and(|byte| *byte == b'{' || *byte == b'[')
 }
 
 async fn run_guest_command(
