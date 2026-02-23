@@ -12,7 +12,7 @@ use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -351,33 +351,45 @@ impl ImageStore {
 
         let media = LayerMediaType::from_media_type(media_type);
 
-        let status = match media {
+        let output = match media {
             LayerMediaType::Gzip => Command::new("tar")
                 .arg("-xpf")
                 .arg(&src)
                 .arg("-C")
                 .arg(&tmp_dir)
                 .arg("-z")
-                .status()?,
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()?,
             LayerMediaType::Zstd => Command::new("tar")
                 .arg("-xpf")
                 .arg(&src)
                 .arg("-C")
                 .arg(&tmp_dir)
                 .arg("--zstd")
-                .status()?,
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()?,
             LayerMediaType::Tar => Command::new("tar")
                 .arg("-xpf")
                 .arg(&src)
                 .arg("-C")
                 .arg(&tmp_dir)
-                .status()?,
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()?,
         };
 
-        if !status.success() {
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr.trim())
+            };
             let _ = fs::remove_dir_all(&tmp_dir);
             return Err(io::Error::other(format!(
-                "unable to unpack layer {digest} using media type {media_type}",
+                "unable to unpack layer {digest} using media type {media_type}{detail}",
             )));
         }
 

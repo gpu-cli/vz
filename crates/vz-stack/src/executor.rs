@@ -238,6 +238,8 @@ pub struct ExecutionResult {
     pub failed: usize,
     /// Per-action error messages (service_name → error).
     pub errors: Vec<(String, String)>,
+    /// Bind mounts that were skipped during validation.
+    pub skipped_mounts: Vec<crate::volume::SkippedMount>,
 }
 
 impl ExecutionResult {
@@ -411,6 +413,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
         // Boot shared VM and set up networking if there are create actions
         // and no shared VM is running yet.
+        let mut all_skipped_mounts: Vec<crate::volume::SkippedMount> = Vec::new();
         let has_creates = actions.iter().any(|a| {
             matches!(
                 a,
@@ -519,7 +522,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 let mut resolved = self
                     .volumes
                     .resolve_mounts(&svc.mounts, &spec.volumes)?;
-                crate::volume::validate_bind_mounts(&mut resolved)?;
+                all_skipped_mounts.extend(crate::volume::validate_bind_mounts(&mut resolved)?);
                 // This service's bind mounts start at the current global index.
                 mount_tag_offsets.insert(svc.name.clone(), all_volume_mounts.len());
                 for rm in &resolved {
@@ -755,6 +758,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             }
         }
 
+        result.skipped_mounts = all_skipped_mounts;
         Ok(result)
     }
 
@@ -797,7 +801,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         let mut resolved_mounts = self
             .volumes
             .resolve_mounts(&svc_spec.mounts, &spec.volumes)?;
-        crate::volume::validate_bind_mounts(&mut resolved_mounts)?;
+        // Skipped mounts from prepare_create are surfaced via the shared
+        // VM boot path; single-service creates don't need separate tracking
+        // because the shared boot already validated all service mounts.
+        let _skipped = crate::volume::validate_bind_mounts(&mut resolved_mounts)?;
 
         // Allocate ports (resolves ephemeral ports, checks conflicts).
         let published = match self.ports.allocate(service_name, &svc_spec.ports) {

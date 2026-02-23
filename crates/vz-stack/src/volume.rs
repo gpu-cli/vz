@@ -13,6 +13,20 @@ use tracing::info;
 use crate::error::StackError;
 use crate::spec::{MountSpec, VolumeSpec};
 
+/// A bind mount that was skipped during validation.
+///
+/// Returned by [`validate_bind_mounts`] so callers can surface these
+/// through structured output (e.g. [`StackOutput`]) instead of raw tracing.
+#[derive(Debug, Clone)]
+pub struct SkippedMount {
+    /// Host source path that was skipped.
+    pub source: String,
+    /// Container target path.
+    pub target: String,
+    /// Human-readable reason for skipping.
+    pub reason: String,
+}
+
 /// Resolved mount ready for runtime consumption.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResolvedMount {
@@ -117,9 +131,12 @@ pub fn resolve_mounts(
 ///
 /// Must be called after [`resolve_mounts`] and before the executor builds
 /// VirtioFS tags, so that filtered entries don't consume tag indices.
-pub fn validate_bind_mounts(resolved: &mut Vec<ResolvedMount>) -> Result<(), StackError> {
+pub fn validate_bind_mounts(
+    resolved: &mut Vec<ResolvedMount>,
+) -> Result<Vec<SkippedMount>, StackError> {
     use std::os::unix::fs::FileTypeExt;
 
+    let mut skipped = Vec::new();
     let mut i = 0;
     while i < resolved.len() {
         if resolved[i].kind != ResolvedMountKind::Bind {
@@ -147,11 +164,11 @@ pub fn validate_bind_mounts(resolved: &mut Vec<ResolvedMount>) -> Result<(), Sta
             // its target does not (e.g., /var/run/docker.sock when Docker
             // isn't running). Skip with a warning rather than erroring.
             if absolute.symlink_metadata().is_ok() {
-                tracing::warn!(
-                    source = %host_path.display(),
-                    target = %resolved[i].target,
-                    "skipping bind mount: source is a dangling symlink"
-                );
+                skipped.push(SkippedMount {
+                    source: host_path.display().to_string(),
+                    target: resolved[i].target.clone(),
+                    reason: "dangling symlink".to_string(),
+                });
                 resolved.remove(i);
                 continue;
             }
@@ -201,16 +218,15 @@ pub fn validate_bind_mounts(resolved: &mut Vec<ResolvedMount>) -> Result<(), Sta
             } else {
                 "unsupported file type"
             };
-            tracing::warn!(
-                source = %host_path.display(),
-                target = %resolved[i].target,
-                kind,
-                "skipping bind mount: source is a {kind} (VirtioFS only supports files and directories)"
-            );
+            skipped.push(SkippedMount {
+                source: host_path.display().to_string(),
+                target: resolved[i].target.clone(),
+                reason: kind.to_string(),
+            });
             resolved.remove(i);
         }
     }
-    Ok(())
+    Ok(skipped)
 }
 
 /// Detect whether mount configurations have changed between two service specs.
@@ -888,7 +904,8 @@ mod tests {
             subpath: None,
         }];
 
-        validate_bind_mounts(&mut resolved).unwrap();
+        let skipped = validate_bind_mounts(&mut resolved).unwrap();
+        assert!(skipped.is_empty());
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].host_path, Some(dir));
         assert!(resolved[0].subpath.is_none());
@@ -908,7 +925,8 @@ mod tests {
             subpath: None,
         }];
 
-        validate_bind_mounts(&mut resolved).unwrap();
+        let skipped = validate_bind_mounts(&mut resolved).unwrap();
+        assert!(skipped.is_empty());
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].host_path, Some(tmp.path().to_path_buf()));
         assert_eq!(resolved[0].subpath, Some("config.toml".to_string()));
@@ -954,10 +972,12 @@ mod tests {
             },
         ];
 
-        validate_bind_mounts(&mut resolved).unwrap();
+        let skipped = validate_bind_mounts(&mut resolved).unwrap();
         // Socket should be filtered out, directory should remain.
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].target, "/data");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].reason, "socket");
     }
 
     #[test]
@@ -982,7 +1002,8 @@ mod tests {
         ];
 
         // Should not error — non-bind mounts are passed through without validation.
-        validate_bind_mounts(&mut resolved).unwrap();
+        let skipped = validate_bind_mounts(&mut resolved).unwrap();
+        assert!(skipped.is_empty());
         assert_eq!(resolved.len(), 2);
     }
 }

@@ -382,8 +382,24 @@ impl StackOutput {
         }
     }
 
+    /// Render skipped mount warnings below the header.
+    ///
+    /// Called after the first round report to surface bind mounts that
+    /// were silently removed during validation (dangling symlinks, sockets, etc.).
+    pub fn on_warnings(&self, skipped: &[vz_stack::SkippedMount]) {
+        for skip in skipped {
+            let msg = format!(
+                " {} skipped mount {} \u{2192} {} ({})",
+                style("\u{26a0}").yellow(),
+                style(&skip.source).dim(),
+                style(&skip.target).dim(),
+                skip.reason,
+            );
+            self.message(&msg);
+        }
+    }
+
     /// Print a general-purpose message that doesn't clobber progress bars.
-    #[allow(dead_code)]
     pub fn message(&self, msg: &str) {
         if self.is_tty {
             let _ = self.multi.println(msg);
@@ -577,17 +593,63 @@ fn set_ready(svc: &mut ServiceBar, name: &str, is_tty: bool) {
 }
 
 fn set_failed(svc: &mut ServiceBar, name: &str, error: &str, is_tty: bool) {
+    let display_error = truncate_error(error);
     svc.phase = Phase::Failed;
     svc.bar.set_style(finished_style());
     svc.bar.set_message(format!(
         "{} {:<20} {}",
         style("\u{2718}").red(),
         name,
-        style(format!("Failed: {error}")).red()
+        style(format!("Failed: {display_error}")).red()
     ));
     svc.bar.finish();
     if !is_tty {
-        println!("{}: Failed: {error}", name);
+        println!("{}: Failed: {display_error}", name);
+    }
+}
+
+/// Truncate an error message for user-facing display.
+///
+/// - Extracts the leaf error from colon-separated error chains.
+/// - Truncates sha256 digests to 7 characters.
+/// - Caps total length at 100 characters.
+fn truncate_error(msg: &str) -> String {
+    // Extract the last meaningful segment from error chains like
+    // "network error: create_in_stack failed: storage operation failed: unable to unpack layer..."
+    let leaf = msg
+        .rsplit(": ")
+        .next()
+        .unwrap_or(msg)
+        .trim();
+
+    // Truncate sha256 digests: sha256:e54bc7400b8c... → sha256:e54bc74…
+    let mut result = String::with_capacity(leaf.len());
+    let mut rest = leaf;
+    while let Some(idx) = rest.find("sha256:") {
+        result.push_str(&rest[..idx]);
+        let digest_start = idx + 7; // len("sha256:")
+        let after_prefix = &rest[digest_start..];
+        let hex_len = after_prefix
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .count();
+        if hex_len > 7 {
+            result.push_str("sha256:");
+            result.push_str(&after_prefix[..7]);
+            result.push('\u{2026}');
+            rest = &rest[digest_start + hex_len..];
+        } else {
+            result.push_str(&rest[idx..digest_start]);
+            rest = after_prefix;
+        }
+    }
+    result.push_str(rest);
+
+    if result.len() > 100 {
+        let truncated: String = result.chars().take(97).collect();
+        format!("{truncated}...")
+    } else {
+        result
     }
 }
 
@@ -672,5 +734,41 @@ mod tests {
             }],
         };
         print_dry_run(&result);
+    }
+
+    #[test]
+    fn truncate_error_extracts_leaf() {
+        let msg = "network error: create_in_stack failed: storage operation failed: unable to unpack layer";
+        assert_eq!(truncate_error(msg), "unable to unpack layer");
+    }
+
+    #[test]
+    fn truncate_error_truncates_sha256() {
+        let msg = "unable to unpack layer sha256:e54bc7400b8c60e1d6cea4d86bfcd3725b446856ebdf665cfd6581b861931f66 using media type foo";
+        let result = truncate_error(msg);
+        assert!(result.contains("sha256:e54bc74\u{2026}"));
+        assert!(!result.contains("e54bc7400b8c60e1d6"));
+    }
+
+    #[test]
+    fn truncate_error_chain_and_sha256() {
+        let msg = "network error: create_in_stack failed: storage operation failed: unable to unpack layer sha256:e54bc7400b8c60e1d6cea4d86bfcd3725b446856ebdf665cfd6581b861931f66 using media type application/vnd.oci.image.layer.v1.tar+gzip";
+        let result = truncate_error(msg);
+        assert!(result.starts_with("unable to unpack layer sha256:e54bc74\u{2026}"));
+        assert!(result.chars().count() <= 100);
+    }
+
+    #[test]
+    fn truncate_error_short_passthrough() {
+        let msg = "health check failed";
+        assert_eq!(truncate_error(msg), "health check failed");
+    }
+
+    #[test]
+    fn truncate_error_caps_at_100_chars() {
+        let msg = &"a".repeat(200);
+        let result = truncate_error(msg);
+        assert_eq!(result.chars().count(), 100);
+        assert!(result.ends_with("..."));
     }
 }

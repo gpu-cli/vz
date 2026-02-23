@@ -45,6 +45,6 @@ pub use spec::{
 };
 pub use state_store::{ServiceObservedState, ServicePhase, StateStore};
 pub use volume::{
-    ResolvedMount, ResolvedMountKind, VolumeManager, mounts_changed, orphaned_volumes,
-    referenced_volume_names, resolve_mounts,
+    ResolvedMount, ResolvedMountKind, SkippedMount, VolumeManager, mounts_changed,
+    orphaned_volumes, referenced_volume_names, resolve_mounts,
 };

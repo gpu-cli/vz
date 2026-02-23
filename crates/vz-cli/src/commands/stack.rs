@@ -591,10 +591,19 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
         );
 
         let mut out = StackOutput::new(&spec);
+        let mut warnings_shown = false;
         let result = orchestrator
             .run(
                 &spec,
                 Some(&mut |report: &RoundReport| {
+                    if !warnings_shown {
+                        if let Some(ref exec) = report.exec_result {
+                            if !exec.skipped_mounts.is_empty() {
+                                out.on_warnings(&exec.skipped_mounts);
+                            }
+                        }
+                        warnings_shown = true;
+                    }
                     out.on_round(report);
                 }),
             )
@@ -608,10 +617,19 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
             StackOrchestrator::new(executor, reconcile_store, OrchestrationConfig::default());
 
         let mut out = StackOutput::new(&spec);
+        let mut warnings_shown = false;
         let result = orchestrator
             .run(
                 &spec,
                 Some(&mut |report: &RoundReport| {
+                    if !warnings_shown {
+                        if let Some(ref exec) = report.exec_result {
+                            if !exec.skipped_mounts.is_empty() {
+                                out.on_warnings(&exec.skipped_mounts);
+                            }
+                        }
+                        warnings_shown = true;
+                    }
                     out.on_round(report);
                 }),
             )

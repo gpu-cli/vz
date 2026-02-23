@@ -105,7 +105,7 @@ fn main() -> anyhow::Result<()> {
     let filter = if cli.quiet {
         "error"
     } else if is_stack_progress && cli.verbose == 0 {
-        "warn"
+        "error"
     } else {
         match cli.verbose {
             0 => "info",

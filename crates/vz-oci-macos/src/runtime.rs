@@ -10,7 +10,7 @@ use std::{fs, process};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tracing::warn;
+use tracing::{debug, warn};
 use vz::Vm;
 use vz::protocol::ExecOutput;
 use vz::{NetworkConfig, SharedDirConfig};
@@ -2012,7 +2012,7 @@ async fn start_port_forwarding(
                                     )
                                     .await
                                     {
-                                        warn!(
+                                        debug!(
                                             host_port,
                                             container_port,
                                             error = %error,

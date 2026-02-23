@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::error::StackError;
 use crate::events::StackEvent;
@@ -356,11 +356,11 @@ impl HealthPoller {
                             code
                         }
                         Ok(Err(e)) => {
-                            warn!(service = %svc.name, error = %e, "health check exec failed");
+                            debug!(service = %svc.name, error = %e, "health check exec failed");
                             1
                         }
                         Err(_) => {
-                            warn!(service = %svc.name, timeout_secs = timeout.as_secs(), "health check timed out");
+                            debug!(service = %svc.name, timeout_secs = timeout.as_secs(), "health check timed out");
                             1
                         }
                     }
@@ -434,7 +434,7 @@ impl HealthPoller {
                         Ok(_) => "(no output captured)".to_string(),
                         Err(e) => format!("(logs error: {e})"),
                     };
-                    warn!(
+                    debug!(
                         service = %svc.name,
                         failures = status.consecutive_failures,
                         retries,

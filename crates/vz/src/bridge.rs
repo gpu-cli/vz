@@ -240,7 +240,7 @@ pub(crate) fn ns_error_to_vz_error(error: &NSError) -> VzError {
 /// Convert a `Path` to an `NSURL` file URL.
 pub(crate) fn nsurl_from_path(path: &Path) -> Retained<NSURL> {
     let path_str = NSString::from_str(&path.to_string_lossy());
-    NSURL::initFileURLWithPath(NSURL::alloc(), &path_str)
+    unsafe { NSURL::initFileURLWithPath(NSURL::alloc(), &path_str) }
 }
 
 /// Convert an `NSString` reference to a Rust `String`.
@@ -481,7 +481,7 @@ pub(crate) fn build_objc_config(
                 })?;
 
             let serial_path = NSString::from_str(&serial_log_file.to_string_lossy());
-            NSFileHandle::fileHandleForWritingAtPath(&serial_path).ok_or_else(|| {
+            unsafe { NSFileHandle::fileHandleForWritingAtPath(&serial_path) }.ok_or_else(|| {
                 VzError::InvalidConfig(format!(
                     "failed to open serial log file handle at {}",
                     serial_log_file.display()
@@ -489,7 +489,7 @@ pub(crate) fn build_objc_config(
             })?
         } else {
             let dev_null = NSString::from_str("/dev/null");
-            NSFileHandle::fileHandleForWritingAtPath(&dev_null).ok_or_else(|| {
+            unsafe { NSFileHandle::fileHandleForWritingAtPath(&dev_null) }.ok_or_else(|| {
                 VzError::InvalidConfig("failed to open /dev/null for serial port".to_string())
             })?
         };

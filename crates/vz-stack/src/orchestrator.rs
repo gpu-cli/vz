@@ -176,7 +176,7 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
                 );
                 let result = self.executor.execute(spec, &apply_result.actions)?;
                 if result.failed > 0 {
-                    warn!(failed = result.failed, "some actions failed");
+                    debug!(failed = result.failed, "some actions failed");
                 }
                 Some(result)
             } else {
@@ -194,7 +194,7 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
                     info!(ready = ?result.newly_ready, "services became ready");
                 }
                 if !result.newly_failed.is_empty() {
-                    warn!(failed = ?result.newly_failed, "services failed health checks");
+                    debug!(failed = ?result.newly_failed, "services failed health checks");
                 }
                 Some(result)
             } else {
