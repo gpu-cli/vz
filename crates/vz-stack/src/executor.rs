@@ -255,9 +255,21 @@ impl ExecutionResult {
 /// `&mut self`), then image pull + container create run in parallel.
 struct PreparedCreate {
     service_name: String,
+    replica_index: u32,
     image: String,
     run_config: vz_runtime_contract::RunConfig,
     use_shared_vm: bool,
+}
+
+impl PreparedCreate {
+    /// Full name including replica index if replicas > 1.
+    fn full_name(&self) -> String {
+        if self.replica_index > 1 {
+            format!("{}-{}", self.service_name, self.replica_index)
+        } else {
+            self.service_name.clone()
+        }
+    }
 }
 
 /// Group create/recreate actions into topological levels for parallel execution.
@@ -723,16 +735,37 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             }
 
             // Serial prep: allocate ports, resolve mounts, build configs.
+            // Expand each service into multiple creates based on replica count.
             let mut prepared: Vec<PreparedCreate> = Vec::new();
             for action in level {
                 let service_name = action.service_name();
-                match self.prepare_create(spec, &service_map, service_name, use_shared_vm) {
-                    Ok(prep) => prepared.push(prep),
-                    Err(e) => {
-                        result.failed += 1;
-                        result
-                            .errors
-                            .push((service_name.to_string(), e.to_string()));
+
+                // Get replica count for this service
+                let replicas = if let Some(svc_spec) = service_map.get(service_name) {
+                    svc_spec.resources.replicas.max(1)
+                } else {
+                    1
+                };
+
+                // Create one PreparedCreate per replica
+                for replica_index in 1..=replicas {
+                    match self.prepare_create(
+                        spec,
+                        &service_map,
+                        service_name,
+                        replica_index,
+                        use_shared_vm,
+                    ) {
+                        Ok(prep) => prepared.push(prep),
+                        Err(e) => {
+                            result.failed += 1;
+                            let name = if replicas > 1 {
+                                format!("{}-{}", service_name, replica_index)
+                            } else {
+                                service_name.to_string()
+                            };
+                            result.errors.push((name, e.to_string()));
+                        }
                     }
                 }
             }
@@ -740,12 +773,12 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             if prepared.len() <= 1 {
                 // Single service — execute inline, no thread overhead.
                 for prep in prepared {
-                    let service_name = prep.service_name.clone();
-                    info!(service = %service_name, image = %prep.image, "creating container");
+                    let full_name = prep.full_name();
+                    info!(service = %full_name, image = %prep.image, "creating container");
                     if let Err(e) = self.runtime.pull(&prep.image) {
-                        self.mark_failed(spec, &service_name, &e.to_string())?;
+                        self.mark_failed(spec, &full_name, &e.to_string())?;
                         result.failed += 1;
-                        result.errors.push((service_name, e.to_string()));
+                        result.errors.push((full_name, e.to_string()));
                         continue;
                     }
                     let create_result = if prep.use_shared_vm {
@@ -756,24 +789,24 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     };
                     match create_result {
                         Ok(container_id) => {
-                            self.finalize_create(spec, &service_name, &container_id)?;
+                            self.finalize_create(spec, &full_name, &container_id)?;
                             result.succeeded += 1;
                         }
                         Err(e) => {
-                            self.mark_failed(spec, &service_name, &e.to_string())?;
+                            self.mark_failed(spec, &full_name, &e.to_string())?;
                             result.failed += 1;
-                            result.errors.push((service_name, e.to_string()));
+                            result.errors.push((full_name, e.to_string()));
                         }
                     }
                 }
             } else {
                 // Parallel pull + create for multiple services at the same level.
-                let service_names: Vec<String> =
-                    prepared.iter().map(|p| p.service_name.clone()).collect();
+                // Extract full names (with replica index) before moving prepared.
+                let full_names: Vec<String> = prepared.iter().map(|p| p.full_name()).collect();
                 info!(
-                    services = ?service_names,
+                    services = ?full_names,
                     "creating {} containers in parallel",
-                    service_names.len()
+                    full_names.len()
                 );
 
                 let runtime = &self.runtime;
@@ -782,10 +815,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     let handles: Vec<_> = prepared
                         .into_iter()
                         .map(|prep| {
+                            let full_name = prep.full_name();
                             s.spawn(move || -> Result<String, StackError> {
-                                info!(service = %prep.service_name, image = %prep.image, "pulling image");
+                                info!(service = %full_name, image = %prep.image, "pulling image");
                                 runtime.pull(&prep.image)?;
-                                info!(service = %prep.service_name, image = %prep.image, "creating container");
+                                info!(service = %full_name, image = %prep.image, "creating container");
                                 if prep.use_shared_vm {
                                     runtime.create_in_stack(
                                         stack_name,
@@ -810,7 +844,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 });
 
                 // Serial post: update state for each outcome.
-                for (service_name, outcome) in service_names.iter().zip(outcomes) {
+                for (service_name, outcome) in full_names.iter().zip(outcomes) {
                     match outcome {
                         Ok(container_id) => {
                             self.finalize_create(spec, service_name, &container_id)?;
@@ -852,6 +886,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         spec: &StackSpec,
         service_map: &HashMap<&str, &ServiceSpec>,
         service_name: &str,
+        replica_index: u32,
         use_shared_vm: bool,
     ) -> Result<PreparedCreate, StackError> {
         let svc_spec = service_map.get(service_name).ok_or_else(|| {
@@ -936,13 +971,16 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
         // Convert ServiceSpec → RunConfig.
         let mut run_config = service_to_run_config(svc_spec, &resolved_mounts, &secret_mounts)?;
-        run_config.container_id = Some(
-            svc_spec
-                .container_name
-                .as_deref()
-                .unwrap_or(service_name)
-                .to_string(),
-        );
+
+        // Generate container_id, including replica index if replicas > 1
+        let replicas = svc_spec.resources.replicas;
+        let base_name = svc_spec.container_name.as_deref().unwrap_or(service_name);
+        let container_id = if replicas > 1 {
+            format!("{}-{}", base_name, replica_index)
+        } else {
+            base_name.to_string()
+        };
+        run_config.container_id = Some(container_id);
 
         // Set the VirtioFS mount tag offset for this service in shared VM mode.
         if use_shared_vm {
@@ -1011,6 +1049,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
         Ok(PreparedCreate {
             service_name: service_name.to_string(),
+            replica_index,
             image: svc_spec.image.clone(),
             run_config,
             use_shared_vm,

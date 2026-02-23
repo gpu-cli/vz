@@ -286,6 +286,13 @@ pub struct ResourcesSpec {
     /// Maximum number of PIDs in the container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pids_limit: Option<i64>,
+    /// Number of replica instances to run.
+    #[serde(default = "default_replicas")]
+    pub replicas: u32,
+}
+
+fn default_replicas() -> u32 {
+    1
 }
 
 /// Per-process resource limit (ulimit) specification.
@@ -402,6 +409,7 @@ mod tests {
                     reservation_cpus: None,
                     reservation_memory_bytes: None,
                     pids_limit: None,
+                    replicas: 1,
                 },
                 extra_hosts: vec![],
                 secrets: vec![],

@@ -1306,23 +1306,46 @@ fn parse_deploy(svc_name: &str, map: &serde_yml::Mapping) -> Result<ResourcesSpe
         StackError::ComposeParse(format!("service `{svc_name}`: `deploy` must be a mapping"))
     })?;
 
-    // Only `resources` is accepted under deploy.
+    // Accept `resources` and `replicas` under deploy.
+    let mut replicas: u32 = 1;
     for key in deploy_map.keys() {
         let key_str = key.as_str().unwrap_or("");
-        if key_str != "resources" {
+        if key_str != "resources" && key_str != "replicas" {
             return Err(StackError::ComposeUnsupportedFeature {
                 feature: format!("services.{svc_name}.deploy.{key_str}"),
-                reason: "only `deploy.resources` is supported".to_string(),
+                reason: "only `deploy.resources` and `deploy.replicas` are supported".to_string(),
             });
         }
     }
 
+    // Parse replicas if present.
+    if let Some(replicas_value) = deploy_map.get(val("replicas")) {
+        if !replicas_value.is_null() {
+            replicas = replicas_value.as_i64().ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `deploy.replicas` must be a number"
+                ))
+            })? as u32;
+            if replicas == 0 {
+                return Err(StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `deploy.replicas` must be at least 1"
+                )));
+            }
+        }
+    }
+
     let Some(resources_value) = deploy_map.get(val("resources")) else {
-        return Ok(ResourcesSpec::default());
+        // No resources section, but we might have replicas - return default with replicas
+        let mut spec = ResourcesSpec::default();
+        spec.replicas = replicas;
+        return Ok(spec);
     };
 
     if resources_value.is_null() {
-        return Ok(ResourcesSpec::default());
+        // resources is null, but we might have replicas
+        let mut spec = ResourcesSpec::default();
+        spec.replicas = replicas;
+        return Ok(spec);
     }
 
     let resources_map = resources_value.as_mapping().ok_or_else(|| {
@@ -1352,6 +1375,7 @@ fn parse_deploy(svc_name: &str, map: &serde_yml::Mapping) -> Result<ResourcesSpe
         reservation_cpus,
         reservation_memory_bytes,
         pids_limit,
+        replicas,
     })
 }
 
@@ -1898,9 +1922,9 @@ fn parse_xvz_disk_size(root: &serde_yml::Mapping) -> Result<Option<u64>, StackEr
     let Some(xvz_value) = root.get(val("x-vz")) else {
         return Ok(None);
     };
-    let xvz_map = xvz_value.as_mapping().ok_or_else(|| {
-        StackError::ComposeParse("`x-vz` must be a mapping".into())
-    })?;
+    let xvz_map = xvz_value
+        .as_mapping()
+        .ok_or_else(|| StackError::ComposeParse("`x-vz` must be a mapping".into()))?;
 
     let Some(size_value) = xvz_map.get(val("disk_size")) else {
         return Ok(None);
@@ -3123,7 +3147,7 @@ networks:
     }
 
     #[test]
-    fn reject_deploy_replicas() {
+    fn accept_deploy_replicas() {
         let yaml = r#"
 services:
   web:
@@ -3131,8 +3155,8 @@ services:
     deploy:
       replicas: 3
 "#;
-        let err = parse_compose(yaml, "myapp").unwrap_err();
-        assert!(err.to_string().contains("replicas"));
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].resources.replicas, 3);
     }
 
     #[test]
@@ -3907,7 +3931,10 @@ services:
         // This might parse `limits` as null, which is fine — returns default.
         assert!(result.is_ok());
         let spec = result.unwrap();
-        assert_eq!(spec.services[0].resources, ResourcesSpec::default());
+        // Default replicas is 1 (not 0)
+        let mut expected = ResourcesSpec::default();
+        expected.replicas = 1;
+        assert_eq!(spec.services[0].resources, expected);
     }
 
     #[test]
