@@ -654,7 +654,7 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
             let tui_spec = spec.clone();
             let tui_name = spec.name.clone();
             let tui_db = db_path.clone();
-            crate::tui::run_tui(tui_name, tui_spec, tui_db)?;
+            crate::tui::run_tui(tui_name, tui_spec, tui_db, Some(sock_path.clone()))?;
         } else {
             serve_control_socket(&sock_path, &spec, &mut orchestrator).await?;
         }
@@ -1743,7 +1743,8 @@ async fn cmd_dashboard(args: DashboardArgs) -> anyhow::Result<()> {
             })?
     };
 
-    crate::tui::run_tui(args.name, spec, db_path)
+    let sock_path = state_dir.join("control.sock");
+    crate::tui::run_tui(args.name, spec, db_path, Some(sock_path))
 }
 
 // ── Helpers ────────────────────────────────────────────────────────

@@ -6,7 +6,8 @@
 //! mode) or standalone via `vz stack dashboard <name>`.
 
 use std::collections::HashMap;
-use std::io::{self, IsTerminal, Stdout};
+use std::io::{self, BufRead, IsTerminal, Stdout, Write as _};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -82,6 +83,7 @@ pub struct App {
     logs: HashMap<String, String>,
     selected_log_service: usize,
     log_scroll: usize,
+    sock_path: Option<PathBuf>,
 
     // UI state
     show_help: bool,
@@ -93,7 +95,7 @@ pub struct App {
 
 impl App {
     /// Create a new TUI application.
-    pub fn new(stack_name: String, spec: StackSpec, store: StateStore) -> Self {
+    pub fn new(stack_name: String, spec: StackSpec, store: StateStore, sock_path: Option<PathBuf>) -> Self {
         let service_names: Vec<String> = spec.services.iter().map(|s| s.name.clone()).collect();
         let logs: HashMap<String, String> = service_names
             .iter()
@@ -114,6 +116,7 @@ impl App {
             logs,
             selected_log_service: 0,
             log_scroll: 0,
+            sock_path,
             show_help: false,
             should_quit: false,
             recent_events: Vec::new(),
@@ -144,6 +147,55 @@ impl App {
             // Auto-scroll events tab if enabled.
             if self.event_auto_scroll && !self.events.is_empty() {
                 self.event_scroll = self.events.len().saturating_sub(1);
+            }
+        }
+
+        // Fetch logs only when viewing the Logs tab (avoid unnecessary socket calls).
+        if self.active_tab == Tab::Logs {
+            self.refresh_logs();
+        }
+    }
+
+    /// Fetch logs for the currently-selected service via the control socket.
+    fn refresh_logs(&mut self) {
+        let sock_path = match &self.sock_path {
+            Some(p) if p.exists() => p.clone(),
+            _ => return,
+        };
+
+        let service_name = match self.current_log_service_name() {
+            Some(n) => n,
+            None => return,
+        };
+
+        let stream = match UnixStream::connect(&sock_path) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+
+        let request = serde_json::json!({
+            "action": "exec",
+            "service": service_name,
+            "cmd": ["tail", "-n", "200", "/var/log/vz-oci/output.log"]
+        });
+
+        let mut request_bytes = serde_json::to_vec(&request).unwrap_or_default();
+        request_bytes.push(b'\n');
+
+        if (&stream).write_all(&request_bytes).is_err() {
+            return;
+        }
+
+        let mut reader = io::BufReader::new(&stream);
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_ok() && !line.is_empty() {
+            if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&line) {
+                let stdout = resp.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+                if !stdout.is_empty() {
+                    self.logs.insert(service_name, stdout.to_string());
+                }
             }
         }
     }
@@ -402,7 +454,12 @@ pub fn is_tty() -> bool {
 /// This takes over the terminal and presents a dashboard that polls
 /// the state store at `db_path` every 500ms. Returns when the user
 /// presses `q` or `Ctrl-C`.
-pub fn run_tui(stack_name: String, spec: StackSpec, db_path: PathBuf) -> anyhow::Result<()> {
+pub fn run_tui(
+    stack_name: String,
+    spec: StackSpec,
+    db_path: PathBuf,
+    sock_path: Option<PathBuf>,
+) -> anyhow::Result<()> {
     enable_raw_mode().context("failed to enable raw terminal mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
@@ -414,7 +471,7 @@ pub fn run_tui(stack_name: String, spec: StackSpec, db_path: PathBuf) -> anyhow:
 
     let store =
         StateStore::open(&db_path).context("failed to open state store for TUI dashboard")?;
-    let mut app = App::new(stack_name, spec, store);
+    let mut app = App::new(stack_name, spec, store, sock_path);
 
     // Initial data load.
     app.refresh_data();
@@ -1152,7 +1209,7 @@ mod tests {
     fn app_new_initializes_correctly() {
         let spec = make_test_spec();
         let store = StateStore::in_memory().unwrap();
-        let app = App::new("test".into(), spec, store);
+        let app = App::new("test".into(), spec, store, None);
 
         assert_eq!(app.stack_name, "test");
         assert_eq!(app.active_tab, Tab::Services);
@@ -1167,7 +1224,7 @@ mod tests {
     fn handle_key_quit() {
         let spec = make_test_spec();
         let store = StateStore::in_memory().unwrap();
-        let mut app = App::new("test".into(), spec, store);
+        let mut app = App::new("test".into(), spec, store, None);
 
         app.handle_key(event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(app.should_quit);
@@ -1177,7 +1234,7 @@ mod tests {
     fn handle_key_ctrl_c() {
         let spec = make_test_spec();
         let store = StateStore::in_memory().unwrap();
-        let mut app = App::new("test".into(), spec, store);
+        let mut app = App::new("test".into(), spec, store, None);
 
         app.handle_key(event::KeyEvent::new(
             KeyCode::Char('c'),
@@ -1190,7 +1247,7 @@ mod tests {
     fn handle_key_tab_switch() {
         let spec = make_test_spec();
         let store = StateStore::in_memory().unwrap();
-        let mut app = App::new("test".into(), spec, store);
+        let mut app = App::new("test".into(), spec, store, None);
 
         assert_eq!(app.active_tab, Tab::Services);
 
@@ -1208,7 +1265,7 @@ mod tests {
     fn handle_key_number_tabs() {
         let spec = make_test_spec();
         let store = StateStore::in_memory().unwrap();
-        let mut app = App::new("test".into(), spec, store);
+        let mut app = App::new("test".into(), spec, store, None);
 
         app.handle_key(event::KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
         assert_eq!(app.active_tab, Tab::Events);
@@ -1224,7 +1281,7 @@ mod tests {
     fn handle_key_help_toggle() {
         let spec = make_test_spec();
         let store = StateStore::in_memory().unwrap();
-        let mut app = App::new("test".into(), spec, store);
+        let mut app = App::new("test".into(), spec, store, None);
 
         app.handle_key(event::KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
         assert!(app.show_help);
@@ -1238,7 +1295,7 @@ mod tests {
     fn navigate_services() {
         let spec = make_test_spec();
         let store = StateStore::in_memory().unwrap();
-        let mut app = App::new("test".into(), spec, store);
+        let mut app = App::new("test".into(), spec, store, None);
 
         // Add some observed services.
         app.services = vec![
@@ -1279,7 +1336,7 @@ mod tests {
     fn navigate_jump_top_bottom() {
         let spec = make_test_spec();
         let store = StateStore::in_memory().unwrap();
-        let mut app = App::new("test".into(), spec, store);
+        let mut app = App::new("test".into(), spec, store, None);
 
         app.services = vec![
             ServiceObservedState {
@@ -1338,7 +1395,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut app = App::new("test".into(), spec, store);
+        let mut app = App::new("test".into(), spec, store, None);
         app.refresh_data();
 
         assert_eq!(app.services.len(), 1);
