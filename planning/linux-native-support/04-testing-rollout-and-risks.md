@@ -35,6 +35,8 @@
 - `vz oci run` smoke scenarios
 - `vz stack up/down` multi-service scenarios
 - validation cohort run on Linux host
+- `planning/linux-native-support/run-linux-stack-config-matrix.sh` for automated config-matrix validation (60+ pass/fail variants)
+- manual matrix execution from `05-manual-linux-stack-harness.md` for networking/dependency/logging edge cases
 
 ## Rollout Plan
 

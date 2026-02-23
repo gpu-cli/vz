@@ -1306,13 +1306,17 @@ async fn cmd_ps(args: PsArgs) -> anyhow::Result<()> {
     let observed = store
         .load_observed_state(&args.name)
         .with_context(|| "failed to load observed state")?;
+    
+    // Load desired state for additional info (ports, etc)
+    let desired = store.load_desired_state(&args.name).ok().flatten();
+    let desired_ref = desired.as_ref();
 
     if args.json {
         let json = serde_json::to_string_pretty(&observed)
             .with_context(|| "failed to serialize observed state")?;
         println!("{json}");
     } else {
-        print_ps_table(&observed);
+        print_ps_table(&observed, desired_ref);
     }
 
     Ok(())
@@ -1521,7 +1525,9 @@ fn event_service_name(event: &StackEvent) -> Option<&str> {
 struct StackListEntry {
     name: String,
     status: String,
-    services: usize,
+    ready: usize,
+    total: usize,
+    error_summary: Option<String>,
 }
 
 async fn cmd_ls(args: LsArgs) -> anyhow::Result<()> {
@@ -1547,46 +1553,69 @@ async fn cmd_ls(args: LsArgs) -> anyhow::Result<()> {
     let read_dir =
         std::fs::read_dir(&stacks_dir).with_context(|| "failed to read stacks directory")?;
 
-    for entry in read_dir {
-        let entry = entry.with_context(|| "failed to read directory entry")?;
-        if !entry.file_type()?.is_dir() {
+    for dir_entry in read_dir {
+        let dir_entry = dir_entry.with_context(|| "failed to read directory entry")?;
+        if !dir_entry.file_type()?.is_dir() {
             continue;
         }
 
-        let db_path = entry.path().join("state.db");
+        let db_path = dir_entry.path().join("state.db");
         if !db_path.exists() {
             continue;
         }
 
-        let stack_name = entry.file_name().to_str().unwrap_or("?").to_string();
+        let stack_name = dir_entry.file_name().to_str().unwrap_or("?").to_string();
 
         // Try to load observed state for service counts.
-        let (status, service_count) = match StateStore::open(&db_path) {
+        let (status, ready, total, error_summary) = match StateStore::open(&db_path) {
             Ok(store) => match store.load_observed_state(&stack_name) {
                 Ok(observed) => {
+                    let ready_count = observed
+                        .iter()
+                        .filter(|o| o.phase == ServicePhase::Running && o.ready)
+                        .count();
                     let running = observed
                         .iter()
                         .filter(|o| o.phase == ServicePhase::Running)
                         .count();
-                    let total = observed.len();
-                    let status = if total == 0 {
-                        "stopped".to_string()
-                    } else if running == total {
-                        "running".to_string()
+                    let total = observed
+                        .iter()
+                        .filter(|o| o.phase != ServicePhase::Stopped && o.phase != ServicePhase::Pending)
+                        .count();
+                    let failed = observed
+                        .iter()
+                        .filter(|o| o.phase == ServicePhase::Failed)
+                        .count();
+                    
+                    let (status, error_summary) = if total == 0 && running == 0 {
+                        ("◌ stopped".to_string(), None)
+                    } else if failed > 0 {
+                        let error = observed
+                            .iter()
+                            .find(|o| o.phase == ServicePhase::Failed && o.last_error.is_some())
+                            .and_then(|o| o.last_error.clone());
+                        ("○ failed".to_string(), error)
+                    } else if running > 0 && running == total {
+                        // All services are running (even if ready flag isn't set)
+                        ("● running".to_string(), None)
+                    } else if running > 0 {
+                        ("◐ starting".to_string(), None)
                     } else {
-                        format!("partial ({running}/{total})")
+                        ("◌ stopped".to_string(), None)
                     };
-                    (status, total)
+                    (status, ready_count, total, error_summary)
                 }
-                Err(_) => ("unknown".to_string(), 0),
+                Err(_) => ("○ unknown".to_string(), 0, 0, None),
             },
-            Err(_) => ("unknown".to_string(), 0),
+            Err(_) => ("○ unknown".to_string(), 0, 0, None),
         };
 
         entries.push(StackListEntry {
             name: stack_name,
             status,
-            services: service_count,
+            ready,
+            total,
+            error_summary,
         });
     }
 
@@ -1599,13 +1628,59 @@ async fn cmd_ls(args: LsArgs) -> anyhow::Result<()> {
     } else if entries.is_empty() {
         println!("No stacks found.");
     } else {
-        println!("{:<20} {:<16} {:<10}", "NAME", "STATUS", "SERVICES");
-        println!("{}", "-".repeat(46));
+        // Calculate column widths
+        let name_width = entries.iter().map(|e| e.name.len()).max().unwrap_or(10).max(10);
+        let status_width = 14;
+        let ready_width = 11;
+        
+        // Header
+        println!(
+            "{:<width$} {:<status_width$} {:<ready_width$}",
+            "STACK NAME",
+            "STATUS",
+            "READY/TOTAL",
+            width = name_width
+        );
+        println!("{}", "-".repeat(name_width + status_width + ready_width + 2));
+        
+        // Rows
         for entry in &entries {
+            let ready_str = if entry.total > 0 {
+                format!("{}/{}", entry.ready, entry.total)
+            } else {
+                "-".to_string()
+            };
             println!(
-                "{:<20} {:<16} {:<10}",
-                entry.name, entry.status, entry.services
+                "{:<width$} {:<status_width$} {:<ready_width$}",
+                entry.name,
+                entry.status,
+                ready_str,
+                width = name_width
             );
+            
+            // Show error summary below failed stacks
+            if let Some(ref err) = entry.error_summary {
+                let summary = if err.len() > 50 {
+                    format!("{}...", &err[..47])
+                } else {
+                    err.clone()
+                };
+                println!("  └─ {}", summary);
+            }
+        }
+        
+        // Footer with summary
+        println!();
+        let running = entries.iter().filter(|e| e.status.starts_with("●")).count();
+        let starting = entries.iter().filter(|e| e.status.starts_with("◐")).count();
+        let failed = entries.iter().filter(|e| e.status.starts_with("○ failed")).count();
+        
+        if failed > 0 {
+            println!("Showing {} stacks ({} running, {} starting, {} failed)", 
+                     entries.len(), running, starting, failed);
+            println!("Use 'vz stack logs <name>' for details on failed stacks");
+        } else {
+            println!("Showing {} stacks", entries.len());
         }
     }
 
@@ -1835,28 +1910,96 @@ fn resolve_state_dir(
         .join(stack_name))
 }
 
-fn print_ps_table(observed: &[ServiceObservedState]) {
+fn print_ps_table(observed: &[ServiceObservedState], desired: Option<&StackSpec>) {
     if observed.is_empty() {
         println!("No services found.");
         return;
     }
 
+    // Create a map of service name to ports for quick lookup
+    let ports_map: std::collections::HashMap<&str, Vec<String>> = desired
+        .map(|spec| {
+            spec.services
+                .iter()
+                .map(|s| {
+                    let ports = s.ports
+                        .iter()
+                        .map(|p| {
+                            if let Some(hp) = p.host_port {
+                                format!("{}:{}", hp, p.container_port)
+                            } else {
+                                format!("{}", p.container_port)
+                            }
+                        })
+                        .collect();
+                    (s.name.as_str(), ports)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Header.
-    println!("{:<20} {:<14} {:<40}", "SERVICE", "STATUS", "CONTAINER ID");
-    println!("{}", "-".repeat(74));
+    let name_width = 14;
+    let status_width = 14;
+    let health_width = 8;
+    let ports_width = 16;
+    let container_width = 20;
+    
+    println!(
+        "{:<width_name$} {:<width_status$} {:<width_health$} {:<width_ports$} {:<width_container$}",
+        "SERVICE",
+        "STATUS",
+        "HEALTH",
+        "PORTS",
+        "CONTAINER",
+        width_name = name_width,
+        width_status = status_width,
+        width_health = health_width,
+        width_ports = ports_width,
+        width_container = container_width
+    );
+    println!("{}", "-".repeat(name_width + status_width + health_width + ports_width + container_width + 4));
 
     for svc in observed {
         let status = match svc.phase {
             ServicePhase::Pending => "pending".to_string(),
             ServicePhase::Creating => "creating".to_string(),
-            ServicePhase::Running if svc.ready => "running (ready)".to_string(),
+            ServicePhase::Running if svc.ready => "running".to_string(),
             ServicePhase::Running => "running".to_string(),
             ServicePhase::Stopping => "stopping".to_string(),
             ServicePhase::Stopped => "stopped".to_string(),
             ServicePhase::Failed => "failed".to_string(),
         };
+        
+        let health = if svc.phase == ServicePhase::Failed {
+            "✗ fail".to_string()
+        } else if svc.ready {
+            "✓ ok".to_string()
+        } else if svc.phase == ServicePhase::Running {
+            "-".to_string()
+        } else {
+            "-".to_string()
+        };
+        
+        let ports = ports_map
+            .get(svc.service_name.as_str())
+            .map(|p| p.join(", "))
+            .unwrap_or_else(|| "-".to_string());
+        
         let cid = svc.container_id.as_deref().unwrap_or("-");
-        println!("{:<20} {:<14} {:<40}", svc.service_name, status, cid);
+        println!(
+            "{:<width_name$} {:<width_status$} {:<width_health$} {:<width_ports$} {:<width_container$}",
+            svc.service_name,
+            status,
+            health,
+            ports,
+            cid,
+            width_name = name_width,
+            width_status = status_width,
+            width_health = health_width,
+            width_ports = ports_width,
+            width_container = container_width
+        );
     }
 }
 

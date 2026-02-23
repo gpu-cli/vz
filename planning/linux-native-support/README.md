@@ -118,3 +118,5 @@ vz-macos-backend  vz-linux-native
 - `02-linux-native-backend.md`
 - `03-runtime-selection-and-integration.md`
 - `04-testing-rollout-and-risks.md`
+- `05-manual-linux-stack-harness.md`
+- `run-linux-stack-config-matrix.sh`

@@ -16,7 +16,7 @@ use tracing::{error, info};
 use crate::convert::{secrets_to_mounts, service_to_run_config};
 use crate::error::StackError;
 use crate::events::StackEvent;
-use crate::network::{PublishedPort, resolve_ports};
+use crate::network::{resolve_ports, PublishedPort};
 use crate::reconcile::Action;
 use crate::spec::{ServiceSpec, StackSpec};
 use crate::state_store::{ServiceObservedState, ServicePhase, StateStore};
@@ -519,9 +519,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             let mut mount_tag_offsets: HashMap<String, usize> = HashMap::new();
             let mut has_named_volumes = false;
             for svc in &spec.services {
-                let mut resolved = self
-                    .volumes
-                    .resolve_mounts(&svc.mounts, &spec.volumes)?;
+                let mut resolved = self.volumes.resolve_mounts(&svc.mounts, &spec.volumes)?;
                 all_skipped_mounts.extend(crate::volume::validate_bind_mounts(&mut resolved)?);
                 // This service's bind mounts start at the current global index.
                 mount_tag_offsets.insert(svc.name.clone(), all_volume_mounts.len());
@@ -545,6 +543,82 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 }
             }
             self.mount_tag_offsets = mount_tag_offsets;
+
+            // Stage all secrets before boot so they can be included in VirtioFS shares.
+            // This must happen BEFORE creating resources so secrets are in all_volume_mounts.
+            let secrets_dir = self.data_dir.join("secrets").join(&spec.name);
+            for svc in &spec.services {
+                for secret_ref in &svc.secrets {
+                    let secret_def = spec.secrets.iter().find(|d| d.name == secret_ref.source);
+                    if let Some(def) = secret_def {
+                        let secret_path = secrets_dir.join(&secret_ref.source);
+                        if !secret_path.exists() {
+                            if let Ok(content) = std::fs::read(&def.file) {
+                                let _ = std::fs::create_dir_all(&secrets_dir);
+                                let _ = std::fs::write(&secret_path, content);
+
+                                // Add secret to volume mounts for VirtioFS sharing.
+                                // Use "vz-mount-" prefix so OCI runtime translates to /mnt/vz-mount-X.
+                                let idx = all_volume_mounts.len();
+                                all_volume_mounts.push(vz_runtime_contract::StackVolumeMount {
+                                    tag: format!("vz-mount-{idx}"),
+                                    host_path: secret_path,
+                                    read_only: true,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Adjust mount_tag_offsets to account for secrets added to all_volume_mounts.
+            // The offset needs to account for:
+            // 1. All regular mounts from all services (they come before secrets)
+            // 2. All secrets from services that come before this one
+            //
+            // When OCI runtime calculates global_idx = tag_offset + idx:
+            // - idx is position in the combined [regular + secrets] mount list
+            // - Secrets in all_volume_mounts are after ALL regular mounts
+            // So we need to shift by: total regular mounts + secrets from previous services
+            let total_regular_mounts: usize = spec
+                .services
+                .iter()
+                .map(|s| {
+                    self.volumes
+                        .resolve_mounts(&s.mounts, &spec.volumes)
+                        .map(|m| {
+                            m.iter()
+                                .filter(|m| {
+                                    matches!(m.kind, crate::volume::ResolvedMountKind::Bind)
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0)
+                })
+                .sum();
+
+            let adjustment_for_each_service: Vec<(String, usize)> = spec
+                .services
+                .iter()
+                .map(|svc| {
+                    // Secrets from services that come before this one
+                    let prev_secrets: usize = spec
+                        .services
+                        .iter()
+                        .take_while(|s| s.name != svc.name)
+                        .map(|s| s.secrets.len())
+                        .sum();
+                    // Total regular mounts + previous secrets
+                    let adjustment = total_regular_mounts + prev_secrets;
+                    (svc.name.clone(), adjustment)
+                })
+                .collect();
+
+            for (svc_name, adjustment) in adjustment_for_each_service {
+                if let Some(offset) = self.mount_tag_offsets.get_mut(&svc_name) {
+                    *offset += adjustment;
+                }
+            }
 
             // Create persistent disk image for named volumes if needed.
             let disk_image_path = if has_named_volumes {
@@ -573,7 +647,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                         .filter_map(|s| s.resources.memory_bytes)
                         .map(|b| b / (1024 * 1024))
                         .sum();
-                    if sum > 0 { Some(sum) } else { None }
+                    if sum > 0 {
+                        Some(sum)
+                    } else {
+                        None
+                    }
                 };
                 vz_runtime_contract::StackResourceHint {
                     cpus: max_cpus,
@@ -627,7 +705,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 let should_remove = match action {
                     Action::ServiceRecreate { .. } => true,
                     Action::ServiceCreate { service_name } => {
-                        let observed = self.store.load_observed_state(&spec.name).unwrap_or_default();
+                        let observed = self
+                            .store
+                            .load_observed_state(&spec.name)
+                            .unwrap_or_default();
                         observed
                             .iter()
                             .any(|o| o.service_name == *service_name && o.container_id.is_some())
@@ -1067,8 +1148,8 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 /// Test support: mock container runtime shared across test modules.
 #[cfg(test)]
 pub(crate) mod tests_support {
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use super::*;
@@ -1416,16 +1497,12 @@ mod tests {
 
         // Verify events.
         let events = executor.store().load_events("myapp").unwrap();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, StackEvent::ServiceCreating { .. }))
-        );
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, StackEvent::ServiceReady { .. }))
-        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StackEvent::ServiceCreating { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StackEvent::ServiceReady { .. })));
     }
 
     #[test]
@@ -1557,11 +1634,9 @@ mod tests {
 
         // ServiceFailed event emitted.
         let events = executor.store().load_events("myapp").unwrap();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, StackEvent::ServiceFailed { .. }))
-        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StackEvent::ServiceFailed { .. })));
     }
 
     #[test]
@@ -1682,11 +1757,9 @@ mod tests {
 
         // VolumeCreated event emitted.
         let events = executor.store().load_events("myapp").unwrap();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, StackEvent::VolumeCreated { .. }))
-        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StackEvent::VolumeCreated { .. })));
     }
 
     #[test]
@@ -2038,11 +2111,9 @@ mod tests {
 
         // PortConflict event emitted.
         let events = executor.store().load_events("myapp").unwrap();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, StackEvent::PortConflict { .. }))
-        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StackEvent::PortConflict { .. })));
 
         // api should be marked Failed.
         let observed = executor.store().load_observed_state("myapp").unwrap();
@@ -2302,16 +2373,12 @@ mod tests {
         let web_config = configs.iter().find(|(id, _)| id == "ctr-web").unwrap();
         let web_hosts = &web_config.1.extra_hosts;
         assert_eq!(web_hosts.len(), 2); // api + db
-        assert!(
-            web_hosts
-                .iter()
-                .any(|(h, ip)| h == "api" && ip == "172.20.0.3")
-        );
-        assert!(
-            web_hosts
-                .iter()
-                .any(|(h, ip)| h == "db" && ip == "172.20.0.4")
-        );
+        assert!(web_hosts
+            .iter()
+            .any(|(h, ip)| h == "api" && ip == "172.20.0.3"));
+        assert!(web_hosts
+            .iter()
+            .any(|(h, ip)| h == "db" && ip == "172.20.0.4"));
     }
 
     #[test]

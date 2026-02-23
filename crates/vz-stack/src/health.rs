@@ -353,15 +353,15 @@ impl HealthPoller {
                             if code != 0 {
                                 debug!(service = %svc.name, exit_code = code, cmd = ?cmd, "health check returned non-zero");
                             }
-                            code
+                            (code, None)
                         }
                         Ok(Err(e)) => {
                             debug!(service = %svc.name, error = %e, "health check exec failed");
-                            1
+                            (1, Some(format!("exec error: {e}")))
                         }
                         Err(_) => {
                             debug!(service = %svc.name, timeout_secs = timeout.as_secs(), "health check timed out");
-                            1
+                            (1, Some("timed out".to_string()))
                         }
                     }
                 })
@@ -375,7 +375,8 @@ impl HealthPoller {
 
             result.checks_run += 1;
 
-            if exit_code == 0 {
+            let (code, exec_error) = exit_code;
+            if code == 0 {
                 let was_ready = status.consecutive_passes >= 1;
                 status.record_pass();
 
@@ -406,6 +407,13 @@ impl HealthPoller {
 
                 let retries = hc.retries.unwrap_or(DEFAULT_RETRIES);
 
+                // Build error message with command and exit code or error
+                let error_msg = if let Some(err) = exec_error {
+                    format!("{} → {}", cmd.join(" "), err)
+                } else {
+                    format!("{} → exit code {}", cmd.join(" "), code)
+                };
+
                 // Emit event for every failure.
                 store.emit_event(
                     &spec.name,
@@ -413,7 +421,7 @@ impl HealthPoller {
                         stack_name: spec.name.clone(),
                         service_name: svc.name.clone(),
                         attempt: status.consecutive_failures,
-                        error: format!("exit code {exit_code}"),
+                        error: error_msg,
                     },
                 )?;
 
@@ -426,8 +434,7 @@ impl HealthPoller {
                     // Read container output from VM-level log directory.
                     let log_output = match runtime.logs(container_id) {
                         Ok(logs) if !logs.output.is_empty() => {
-                            let lines: Vec<&str> =
-                                logs.output.lines().rev().take(30).collect();
+                            let lines: Vec<&str> = logs.output.lines().rev().take(30).collect();
                             let lines: Vec<&str> = lines.into_iter().rev().collect();
                             lines.join("\n")
                         }
@@ -438,7 +445,6 @@ impl HealthPoller {
                         service = %svc.name,
                         failures = status.consecutive_failures,
                         retries,
-                        exit_code,
                         container_output = %log_output,
                         "health check retries exhausted, service unhealthy (will keep checking)"
                     );
@@ -942,11 +948,9 @@ mod tests {
 
         // Event emitted.
         let events = store.load_events("app").unwrap();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, StackEvent::HealthCheckPassed { .. }))
-        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StackEvent::HealthCheckPassed { .. })));
     }
 
     #[test]
@@ -975,11 +979,9 @@ mod tests {
 
         // HealthCheckFailed event emitted.
         let events = store.load_events("app").unwrap();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, StackEvent::HealthCheckFailed { .. }))
-        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StackEvent::HealthCheckFailed { .. })));
 
         // Service still Running.
         let observed = store.load_observed_state("app").unwrap();
@@ -1220,10 +1222,8 @@ mod tests {
 
         // Event should be emitted for the failure.
         let events = store.load_events("app").unwrap();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, StackEvent::HealthCheckFailed { .. }))
-        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StackEvent::HealthCheckFailed { .. })));
     }
 }
