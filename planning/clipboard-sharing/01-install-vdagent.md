@@ -122,4 +122,4 @@ pub no_clipboard: bool,
 
 - **macOS 15 clipboard bug**: UTM users report clipboard sharing stops working after a few minutes. `spice-vdagentd` becomes unresponsive. Workaround is restarting both processes. This is an upstream bug in vd_agent, not something we can fix. Monitor for updates.
 - **Security prompts**: On first boot, macOS may prompt the user to allow `spice-vdagent` and `spice-vdagentd`. Since we're provisioning offline (not running the pkg installer interactively), we may need to pre-approve them via TCC database or MDM profile. Investigate if this is an issue.
-- **GPL-3.0**: vd_agent is GPL-3.0. We ship it as a separate binary inside the VM (not linked into our code). This is the same model as any Linux distro shipping SPICE tools. Our code (FSL-1.1-MIT) is not affected.
+- **GPL-3.0**: vd_agent is GPL-3.0. We ship it as a separate binary inside the VM (not linked into our code). This is the same model as any Linux distro shipping SPICE tools. Our code (MIT) is not affected.

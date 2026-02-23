@@ -2,10 +2,15 @@
 
 Cross-platform runtime for containerized workloads and macOS VM automation.
 
-`vz` gives you one CLI for:
+`vz` provides one CLI for:
 - OCI image and container lifecycle
 - Multi-service stacks from Compose files
 - macOS VM provisioning and control (Apple Virtualization.framework)
+
+Typical use cases:
+- Run isolated build/test workloads from OCI images
+- Launch local multi-service environments from Compose
+- Automate deterministic macOS VM test sandboxes
 
 ## Why vz
 
@@ -25,6 +30,12 @@ git clone https://github.com/gpu-cli/vz.git
 cd vz/crates
 cargo build --workspace --release
 ```
+
+## Platform support
+
+- **Linux:** container + stack commands
+- **macOS (Apple Silicon):** container + stack commands, plus `vz vm ...`
+- **macOS VM requirement:** virtualization entitlement (`vz vm self-sign`)
 
 ### macOS VM entitlement (macOS only)
 
