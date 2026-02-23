@@ -486,7 +486,9 @@ pub async fn run_logs(args: LogsArgs) -> anyhow::Result<()> {
 // ── macOS implementation (uses vz_oci_macos::Runtime directly) ──
 
 #[cfg(target_os = "macos")]
-fn build_macos_runtime(opts: &ContainerOpts) -> anyhow::Result<vz_oci_macos::Runtime> {
+pub(crate) fn build_macos_runtime_config(
+    opts: &ContainerOpts,
+) -> anyhow::Result<vz_oci_macos::RuntimeConfig> {
     if opts.username.is_some() && opts.password.is_none() {
         anyhow::bail!("--username requires --password");
     }
@@ -515,7 +517,14 @@ fn build_macos_runtime(opts: &ContainerOpts) -> anyhow::Result<vz_oci_macos::Run
         _ => vz_oci_macos::Auth::Anonymous,
     };
 
-    Ok(vz_oci_macos::Runtime::new(config))
+    Ok(config)
+}
+
+#[cfg(target_os = "macos")]
+fn build_macos_runtime(opts: &ContainerOpts) -> anyhow::Result<vz_oci_macos::Runtime> {
+    Ok(vz_oci_macos::Runtime::new(build_macos_runtime_config(
+        opts,
+    )?))
 }
 
 #[cfg(target_os = "macos")]

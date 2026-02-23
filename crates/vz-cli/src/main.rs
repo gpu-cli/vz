@@ -51,6 +51,10 @@ enum Commands {
     /// Pull and cache an OCI image locally.
     Pull(commands::oci::PullArgs),
 
+    /// Build a Dockerfile into the local vz image store.
+    #[cfg(target_os = "macos")]
+    Build(commands::build::BuildArgs),
+
     /// Run a container from an OCI image.
     Run(Box<commands::oci::RunArgs>),
 
@@ -144,6 +148,8 @@ fn main() -> anyhow::Result<()> {
         let result = match cli.command {
             // Container commands
             Commands::Pull(args) => commands::oci::run_pull(args).await,
+            #[cfg(target_os = "macos")]
+            Commands::Build(args) => commands::build::run(args).await,
             Commands::Run(args) => commands::oci::run_container(*args).await,
             Commands::Create(args) => commands::oci::run_create(*args).await,
             Commands::Exec(args) => commands::oci::run_exec(args).await,
@@ -223,6 +229,24 @@ mod tests {
     fn parse_pull_subcommand() {
         let cli = Cli::try_parse_from(["vz", "pull", "alpine:latest"]).expect("parse");
         assert!(matches!(cli.command, Commands::Pull(_)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_build_subcommand() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "build",
+            "-t",
+            "demo:latest",
+            "-f",
+            "Dockerfile.dev",
+            "--build-arg",
+            "A=1",
+            ".",
+        ])
+        .expect("parse");
+        assert!(matches!(cli.command, Commands::Build(_)));
     }
 
     #[test]

@@ -1,0 +1,831 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+use tracing::warn;
+use vz::NetworkConfig;
+use vz::SharedDirConfig;
+use vz_image::{ImageId, ImageStore};
+use vz_linux::{
+    EnsureKernelOptions, LinuxError, LinuxVm, LinuxVmConfig, ensure_kernel_with_options,
+};
+
+use crate::RuntimeConfig;
+
+const BUILDKIT_VERSION: &str = "0.19.0";
+const BUILDKITD_BINARY: &str = "buildkitd";
+const BUILDKIT_RUNC_BINARY: &str = "buildkit-runc";
+const BUILDCTL_BINARY: &str = "buildctl";
+const VERSION_FILE: &str = "version.json";
+const BUILD_OUTPUT_ARCHIVE: &str = "image.tar";
+const BUILDKITD_ADDR: &str = "tcp://127.0.0.1:8372";
+const BUILDKIT_SETUP_TIMEOUT: Duration = Duration::from_secs(90);
+const BUILDKIT_BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Request for a Dockerfile build executed by BuildKit.
+#[derive(Debug, Clone)]
+pub struct BuildRequest {
+    /// Host directory used as Docker build context.
+    pub context_dir: PathBuf,
+    /// Dockerfile path. Relative paths are resolved against `context_dir`.
+    pub dockerfile: PathBuf,
+    /// Reference to write into the local vz image store.
+    pub tag: String,
+    /// Optional multi-stage target name.
+    pub target: Option<String>,
+    /// Build-time key/value arguments.
+    pub build_args: BTreeMap<String, String>,
+    /// Disable BuildKit cache for this build.
+    pub no_cache: bool,
+}
+
+/// Successful BuildKit execution result.
+#[derive(Debug, Clone)]
+pub struct BuildResult {
+    /// Stored image manifest digest.
+    pub image_id: ImageId,
+    /// Resolved reference written to `refs/`.
+    pub tag: String,
+}
+
+/// BuildKit integration errors.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildkitError {
+    /// Invalid user-provided build configuration.
+    #[error("invalid build configuration: {0}")]
+    InvalidConfig(String),
+
+    /// HOME is unavailable when resolving `~/.vz/buildkit`.
+    #[error("home directory is not set (cannot resolve ~/.vz/buildkit)")]
+    HomeDirectoryUnavailable,
+
+    /// Guest-side setup command failed.
+    #[error("guest command failed ({command}) with exit code {exit_code}: {stderr}\n{stdout}")]
+    GuestCommandFailed {
+        /// Command label for diagnostics.
+        command: String,
+        /// Exit code returned by the guest command.
+        exit_code: i32,
+        /// Captured stdout.
+        stdout: String,
+        /// Captured stderr.
+        stderr: String,
+    },
+
+    /// BuildKit solve failed.
+    #[error("buildctl build failed with exit code {exit_code}: {stderr}\n{stdout}")]
+    BuildFailed {
+        /// Exit code returned by buildctl.
+        exit_code: i32,
+        /// Captured stdout.
+        stdout: String,
+        /// Captured stderr.
+        stderr: String,
+    },
+
+    /// OCI layout import encountered invalid or unsupported data.
+    #[error("invalid OCI image layout: {0}")]
+    InvalidOciLayout(String),
+
+    /// Blob digest did not match expected descriptor digest.
+    #[error("blob digest mismatch for {digest}: expected {expected}, found {found}")]
+    DigestMismatch {
+        /// Digest identifier from descriptor.
+        digest: String,
+        /// Expected hash component.
+        expected: String,
+        /// Computed hash component.
+        found: String,
+    },
+
+    /// Unsupported digest algorithm in OCI descriptor.
+    #[error("unsupported digest algorithm '{algorithm}' in {digest}")]
+    UnsupportedDigestAlgorithm {
+        /// Full digest string.
+        digest: String,
+        /// Algorithm prefix (before colon).
+        algorithm: String,
+    },
+
+    /// Wrapped Linux guest orchestration error.
+    #[error(transparent)]
+    Linux(#[from] LinuxError),
+
+    /// Wrapped filesystem I/O error.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    /// Wrapped JSON parse/serialization error.
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+
+    /// Wrapped HTTP download error.
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
+}
+
+#[derive(Debug, Clone)]
+struct BuildkitArtifacts {
+    base_dir: PathBuf,
+    bin_dir: PathBuf,
+    cache_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BuildkitVersionFile {
+    buildkit: String,
+    downloaded_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OciDescriptor {
+    media_type: String,
+    digest: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OciIndex {
+    manifests: Vec<OciDescriptor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OciManifest {
+    config: OciDescriptor,
+    layers: Vec<OciDescriptor>,
+}
+
+/// Build a Dockerfile and import the resulting image into the local vz store.
+pub async fn build_image(
+    config: &RuntimeConfig,
+    request: BuildRequest,
+) -> Result<BuildResult, BuildkitError> {
+    let context_dir = canonicalize_existing_dir(&request.context_dir)?;
+    if request.tag.trim().is_empty() {
+        return Err(BuildkitError::InvalidConfig(
+            "image tag must not be empty".to_string(),
+        ));
+    }
+
+    let dockerfile_host = resolve_dockerfile_path(&context_dir, &request.dockerfile)?;
+    let dockerfile_relative = dockerfile_host.strip_prefix(&context_dir).map_err(|_| {
+        BuildkitError::InvalidConfig(format!(
+            "Dockerfile must be inside build context: {}",
+            dockerfile_host.display()
+        ))
+    })?;
+
+    let artifacts = ensure_buildkit_artifacts().await?;
+    let kernel = ensure_kernel_with_options(EnsureKernelOptions {
+        install_dir: config.linux_install_dir.clone(),
+        bundle_dir: config.linux_bundle_dir.clone(),
+        require_exact_agent_version: config.require_exact_agent_version,
+    })
+    .await?;
+
+    let output_dir = unique_dir(artifacts.base_dir.join("tmp"), "build-output");
+    tokio::fs::create_dir_all(&output_dir).await?;
+
+    let mut vm_config = LinuxVmConfig::new(kernel.kernel, kernel.initramfs);
+    vm_config.cpus = 4;
+    vm_config.memory_mb = 4096;
+    vm_config.shared_dirs = vec![
+        SharedDirConfig {
+            tag: "buildkit-bin".to_string(),
+            source: artifacts.bin_dir.clone(),
+            read_only: true,
+        },
+        SharedDirConfig {
+            tag: "buildkit-cache".to_string(),
+            source: artifacts.cache_dir.clone(),
+            read_only: false,
+        },
+        SharedDirConfig {
+            tag: "build-context".to_string(),
+            source: context_dir.clone(),
+            read_only: true,
+        },
+        SharedDirConfig {
+            tag: "build-output".to_string(),
+            source: output_dir.clone(),
+            read_only: false,
+        },
+    ];
+
+    if !config.default_network_enabled {
+        vm_config.network = Some(NetworkConfig::None);
+    }
+
+    let vm = LinuxVm::create(vm_config).await?;
+    vm.start().await?;
+
+    if let Err(err) = vm.wait_for_agent(config.agent_ready_timeout).await {
+        let _ = vm.stop().await;
+        return Err(err.into());
+    }
+
+    let build_result = run_guest_build(
+        &vm,
+        &request,
+        dockerfile_relative,
+        "/mnt/build-context",
+        "/mnt/build-output/image.tar",
+    )
+    .await;
+    let stop_result = vm.stop().await;
+
+    if let Err(error) = stop_result {
+        warn!(%error, "failed to stop BuildKit VM cleanly");
+    }
+
+    build_result?;
+
+    let image_tar = output_dir.join(BUILD_OUTPUT_ARCHIVE);
+    if !image_tar.is_file() {
+        return Err(BuildkitError::InvalidOciLayout(format!(
+            "build output archive not found: {}",
+            image_tar.display()
+        )));
+    }
+
+    let data_dir = expand_home_dir(&config.data_dir);
+    let store = ImageStore::new(data_dir);
+    let image_id = import_oci_tar_to_store(&store, &image_tar, &request.tag).await?;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&output_dir).await {
+        warn!(
+            path = %output_dir.display(),
+            %error,
+            "failed to clean temporary BuildKit output directory"
+        );
+    }
+
+    Ok(BuildResult {
+        image_id,
+        tag: request.tag,
+    })
+}
+
+async fn run_guest_build(
+    vm: &LinuxVm,
+    request: &BuildRequest,
+    dockerfile_relative: &Path,
+    guest_context_dir: &str,
+    guest_output_tar: &str,
+) -> Result<(), BuildkitError> {
+    let setup_script = format!(
+        r#"
+set -eu
+
+/bin/busybox mkdir -p /mnt/buildkit-bin /var/lib/buildkit /mnt/build-context /mnt/build-output
+/bin/busybox mount -t virtiofs buildkit-bin /mnt/buildkit-bin 2>/dev/null || true
+/bin/busybox mount -t virtiofs buildkit-cache /var/lib/buildkit 2>/dev/null || true
+/bin/busybox mount -t virtiofs build-context /mnt/build-context 2>/dev/null || true
+/bin/busybox mount -t virtiofs build-output /mnt/build-output 2>/dev/null || true
+
+if ! /mnt/buildkit-bin/buildctl --addr {BUILDKITD_ADDR} debug workers >/dev/null 2>&1; then
+  /mnt/buildkit-bin/buildkitd \
+    --addr {BUILDKITD_ADDR} \
+    --oci-worker-binary /mnt/buildkit-bin/buildkit-runc \
+    --oci-worker-snapshotter overlayfs \
+    --root /var/lib/buildkit >/tmp/buildkitd.log 2>&1 &
+fi
+
+i=0
+while [ "$i" -lt 60 ]; do
+  if /mnt/buildkit-bin/buildctl --addr {BUILDKITD_ADDR} debug workers >/dev/null 2>&1; then
+    exit 0
+  fi
+  i=$((i + 1))
+  /bin/busybox sleep 1
+done
+
+echo "buildkitd did not become ready in guest" >&2
+if [ -f /tmp/buildkitd.log ]; then
+  /bin/busybox tail -n 200 /tmp/buildkitd.log >&2
+fi
+exit 1
+"#
+    );
+    run_guest_command(
+        vm,
+        "setup buildkit guest environment",
+        "/bin/busybox",
+        vec!["sh".to_string(), "-c".to_string(), setup_script],
+        BUILDKIT_SETUP_TIMEOUT,
+    )
+    .await?;
+
+    let mut args = vec![
+        "--addr".to_string(),
+        BUILDKITD_ADDR.to_string(),
+        "build".to_string(),
+        "--progress".to_string(),
+        "plain".to_string(),
+        "--frontend".to_string(),
+        "dockerfile.v0".to_string(),
+        "--local".to_string(),
+        format!("context={guest_context_dir}"),
+        "--local".to_string(),
+        format!("dockerfile={guest_context_dir}"),
+        "--opt".to_string(),
+        format!("filename={}", dockerfile_relative.display()),
+        "--output".to_string(),
+        format!("type=oci,dest={guest_output_tar},name={}", request.tag),
+    ];
+
+    if let Some(target) = &request.target {
+        args.push("--opt".to_string());
+        args.push(format!("target={target}"));
+    }
+    if request.no_cache {
+        args.push("--no-cache".to_string());
+    }
+    for (key, value) in &request.build_args {
+        args.push("--opt".to_string());
+        args.push(format!("build-arg:{key}={value}"));
+    }
+
+    let output = vm
+        .exec_capture(
+            "/mnt/buildkit-bin/buildctl".to_string(),
+            args,
+            BUILDKIT_BUILD_TIMEOUT,
+        )
+        .await?;
+    if output.exit_code != 0 {
+        return Err(BuildkitError::BuildFailed {
+            exit_code: output.exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
+    }
+
+    Ok(())
+}
+
+async fn run_guest_command(
+    vm: &LinuxVm,
+    label: &str,
+    command: &str,
+    args: Vec<String>,
+    timeout: Duration,
+) -> Result<(), BuildkitError> {
+    let output = vm
+        .exec_capture(command.to_string(), args, timeout)
+        .await
+        .map_err(BuildkitError::from)?;
+
+    if output.exit_code != 0 {
+        return Err(BuildkitError::GuestCommandFailed {
+            command: label.to_string(),
+            exit_code: output.exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
+    }
+    Ok(())
+}
+
+async fn ensure_buildkit_artifacts() -> Result<BuildkitArtifacts, BuildkitError> {
+    let base_dir = default_buildkit_dir()?;
+    let bin_dir = base_dir.join("bin");
+    let cache_dir = base_dir.join("cache");
+    tokio::fs::create_dir_all(&cache_dir).await?;
+
+    if artifacts_are_current(&base_dir, &bin_dir).await? {
+        return Ok(BuildkitArtifacts {
+            base_dir,
+            bin_dir,
+            cache_dir,
+        });
+    }
+
+    tokio::fs::create_dir_all(&base_dir).await?;
+    let staging_dir = unique_dir(base_dir.clone(), "download");
+    tokio::fs::create_dir_all(&staging_dir).await?;
+    let tarball_path = staging_dir.join("buildkit.tar.gz");
+
+    let url = format!(
+        "https://github.com/moby/buildkit/releases/download/v{version}/buildkit-v{version}.linux-arm64.tar.gz",
+        version = BUILDKIT_VERSION
+    );
+    download_file(&url, &tarball_path).await?;
+    extract_buildkit_archive(&tarball_path, &staging_dir).await?;
+
+    let extracted_bin_dir = staging_dir.join("bin");
+    let buildkitd_path = extracted_bin_dir.join(BUILDKITD_BINARY);
+    let buildctl_path = extracted_bin_dir.join(BUILDCTL_BINARY);
+    let runc_path = extracted_bin_dir.join(BUILDKIT_RUNC_BINARY);
+    for path in [&buildkitd_path, &buildctl_path, &runc_path] {
+        if !path.is_file() {
+            return Err(BuildkitError::InvalidConfig(format!(
+                "missing expected BuildKit binary: {}",
+                path.display()
+            )));
+        }
+        make_executable(path).await?;
+    }
+
+    if tokio::fs::metadata(&bin_dir).await.is_ok() {
+        tokio::fs::remove_dir_all(&bin_dir).await?;
+    }
+    tokio::fs::rename(&extracted_bin_dir, &bin_dir).await?;
+
+    let version = BuildkitVersionFile {
+        buildkit: BUILDKIT_VERSION.to_string(),
+        downloaded_at: unix_timestamp_secs(),
+    };
+    let version_json = serde_json::to_vec_pretty(&version)?;
+    tokio::fs::write(base_dir.join(VERSION_FILE), version_json).await?;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&staging_dir).await {
+        warn!(
+            path = %staging_dir.display(),
+            %error,
+            "failed to clean BuildKit staging directory"
+        );
+    }
+
+    Ok(BuildkitArtifacts {
+        base_dir,
+        bin_dir,
+        cache_dir,
+    })
+}
+
+async fn artifacts_are_current(base_dir: &Path, bin_dir: &Path) -> Result<bool, BuildkitError> {
+    let version_path = base_dir.join(VERSION_FILE);
+    let version_text = match tokio::fs::read_to_string(version_path).await {
+        Ok(value) => value,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(BuildkitError::Io(err)),
+    };
+    let metadata: BuildkitVersionFile = serde_json::from_str(&version_text)?;
+    if metadata.buildkit != BUILDKIT_VERSION {
+        return Ok(false);
+    }
+
+    for name in [BUILDKITD_BINARY, BUILDCTL_BINARY, BUILDKIT_RUNC_BINARY] {
+        if !bin_dir.join(name).is_file() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn download_file(url: &str, destination: &Path) -> Result<(), BuildkitError> {
+    let client = reqwest::Client::new();
+    let mut response = client.get(url).send().await?.error_for_status()?;
+    let mut file = tokio::fs::File::create(destination).await?;
+
+    while let Some(chunk) = response.chunk().await? {
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    Ok(())
+}
+
+async fn extract_buildkit_archive(
+    tarball_path: &Path,
+    destination: &Path,
+) -> Result<(), BuildkitError> {
+    let output = Command::new("tar")
+        .arg("-xzf")
+        .arg(tarball_path)
+        .arg("-C")
+        .arg(destination)
+        .arg("bin/buildkitd")
+        .arg("bin/buildctl")
+        .arg("bin/buildkit-runc")
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(BuildkitError::InvalidConfig(format!(
+            "failed to extract BuildKit archive with tar: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(())
+}
+
+async fn make_executable(path: &Path) -> Result<(), BuildkitError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut perms = tokio::fs::metadata(path).await?.permissions();
+        perms.set_mode(0o755);
+        tokio::fs::set_permissions(path, perms).await?;
+    }
+    Ok(())
+}
+
+async fn import_oci_tar_to_store(
+    store: &ImageStore,
+    image_tar: &Path,
+    reference: &str,
+) -> Result<ImageId, BuildkitError> {
+    let parent = image_tar.parent().ok_or_else(|| {
+        BuildkitError::InvalidOciLayout("output tar has no parent directory".to_string())
+    })?;
+    let extract_dir = unique_dir(parent.to_path_buf(), "oci-import");
+    tokio::fs::create_dir_all(&extract_dir).await?;
+
+    let extract_output = Command::new("tar")
+        .arg("-xf")
+        .arg(image_tar)
+        .arg("-C")
+        .arg(&extract_dir)
+        .output()
+        .await?;
+    if !extract_output.status.success() {
+        return Err(BuildkitError::InvalidOciLayout(format!(
+            "unable to unpack OCI tarball: {}",
+            String::from_utf8_lossy(&extract_output.stderr)
+        )));
+    }
+
+    let index_json = tokio::fs::read(extract_dir.join("index.json")).await?;
+    let index: OciIndex = serde_json::from_slice(&index_json)?;
+    let descriptor = index
+        .manifests
+        .iter()
+        .find(|descriptor| descriptor.media_type.contains("image.manifest"))
+        .or_else(|| index.manifests.first())
+        .ok_or_else(|| {
+            BuildkitError::InvalidOciLayout("index.json contains no manifests".to_string())
+        })?;
+
+    let manifest_digest = descriptor.digest.clone();
+    let manifest_blob = read_blob(&extract_dir, &manifest_digest).await?;
+    verify_blob_digest(&manifest_digest, &manifest_blob)?;
+    let manifest: OciManifest = serde_json::from_slice(&manifest_blob)?;
+
+    let config_blob = read_blob(&extract_dir, &manifest.config.digest).await?;
+    verify_blob_digest(&manifest.config.digest, &config_blob)?;
+
+    store.ensure_layout()?;
+    store.write_manifest_json(&manifest_digest, &manifest_blob)?;
+    store.write_config_json(&manifest_digest, &config_blob)?;
+
+    for layer in &manifest.layers {
+        let layer_blob = read_blob(&extract_dir, &layer.digest).await?;
+        verify_blob_digest(&layer.digest, &layer_blob)?;
+        store.write_layer_blob(&layer.digest, &layer.media_type, &layer_blob)?;
+    }
+    store.write_reference(reference, &manifest_digest)?;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&extract_dir).await {
+        warn!(
+            path = %extract_dir.display(),
+            %error,
+            "failed to clean OCI import extraction directory"
+        );
+    }
+
+    Ok(ImageId(manifest_digest))
+}
+
+async fn read_blob(root: &Path, digest: &str) -> Result<Vec<u8>, BuildkitError> {
+    let path = blob_path(root, digest)?;
+    tokio::fs::read(path).await.map_err(BuildkitError::from)
+}
+
+fn blob_path(root: &Path, digest: &str) -> Result<PathBuf, BuildkitError> {
+    let (algorithm, encoded) = digest.split_once(':').ok_or_else(|| {
+        BuildkitError::InvalidOciLayout(format!("invalid digest format: {digest}"))
+    })?;
+    Ok(root.join("blobs").join(algorithm).join(encoded))
+}
+
+fn verify_blob_digest(digest: &str, data: &[u8]) -> Result<(), BuildkitError> {
+    let (algorithm, expected) = digest.split_once(':').ok_or_else(|| {
+        BuildkitError::InvalidOciLayout(format!("invalid digest format: {digest}"))
+    })?;
+    if algorithm != "sha256" {
+        return Err(BuildkitError::UnsupportedDigestAlgorithm {
+            digest: digest.to_string(),
+            algorithm: algorithm.to_string(),
+        });
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let found = format!("{:x}", hasher.finalize());
+    let expected = expected.to_ascii_lowercase();
+    if found != expected {
+        return Err(BuildkitError::DigestMismatch {
+            digest: digest.to_string(),
+            expected,
+            found,
+        });
+    }
+    Ok(())
+}
+
+fn resolve_dockerfile_path(
+    context_dir: &Path,
+    dockerfile: &Path,
+) -> Result<PathBuf, BuildkitError> {
+    let path = if dockerfile.is_absolute() {
+        dockerfile.to_path_buf()
+    } else {
+        context_dir.join(dockerfile)
+    };
+    if !path.is_file() {
+        return Err(BuildkitError::InvalidConfig(format!(
+            "Dockerfile not found: {}",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
+fn canonicalize_existing_dir(path: &Path) -> Result<PathBuf, BuildkitError> {
+    let expanded = expand_home_dir(path);
+    let canonical = expanded.canonicalize()?;
+    if !canonical.is_dir() {
+        return Err(BuildkitError::InvalidConfig(format!(
+            "build context is not a directory: {}",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn expand_home_dir(path: &Path) -> PathBuf {
+    if let Some(path_str) = path.to_str() {
+        if let Some(rest) = path_str.strip_prefix("~/")
+            && let Some(home) = std::env::var_os("HOME")
+        {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn default_buildkit_dir() -> Result<PathBuf, BuildkitError> {
+    let home = std::env::var_os("HOME").ok_or(BuildkitError::HomeDirectoryUnavailable)?;
+    Ok(PathBuf::from(home).join(".vz").join("buildkit"))
+}
+
+fn unique_dir(parent: PathBuf, prefix: &str) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    parent.join(format!("{prefix}-{stamp}"))
+}
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[derive(Debug, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct DescriptorJson<'a> {
+        media_type: &'a str,
+        digest: String,
+        size: usize,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct ManifestJson<'a> {
+        schema_version: u8,
+        media_type: &'a str,
+        config: DescriptorJson<'a>,
+        layers: Vec<DescriptorJson<'a>>,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct IndexJson<'a> {
+        schema_version: u8,
+        media_type: &'a str,
+        manifests: Vec<DescriptorJson<'a>>,
+    }
+
+    fn sha256_digest(data: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        format!("sha256:{:x}", hasher.finalize())
+    }
+
+    fn write_blob(root: &Path, digest: &str, data: &[u8]) {
+        let (algo, value) = digest.split_once(':').unwrap();
+        let blob_path = root.join("blobs").join(algo).join(value);
+        fs::create_dir_all(blob_path.parent().unwrap()).unwrap();
+        fs::write(blob_path, data).unwrap();
+    }
+
+    #[tokio::test]
+    async fn import_oci_tar_writes_store_reference_and_blobs() {
+        let tmp = tempdir().unwrap();
+        let layout = tmp.path().join("layout");
+        fs::create_dir_all(layout.join("blobs/sha256")).unwrap();
+        fs::write(
+            layout.join("oci-layout"),
+            r#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let config_json =
+            br#"{"architecture":"arm64","os":"linux","config":{"Cmd":["echo","ok"]}}"#;
+        let config_digest = sha256_digest(config_json);
+        write_blob(&layout, &config_digest, config_json);
+
+        let layer_source = tmp.path().join("layer-src");
+        fs::create_dir_all(&layer_source).unwrap();
+        fs::write(layer_source.join("message.txt"), "hello from layer\n").unwrap();
+        let layer_tar = tmp.path().join("layer.tar");
+        let tar_status = Command::new("tar")
+            .arg("-cf")
+            .arg(&layer_tar)
+            .arg("-C")
+            .arg(&layer_source)
+            .arg(".")
+            .status()
+            .unwrap();
+        assert!(tar_status.success());
+        let layer_bytes = fs::read(&layer_tar).unwrap();
+        let layer_digest = sha256_digest(&layer_bytes);
+        write_blob(&layout, &layer_digest, &layer_bytes);
+
+        let manifest = ManifestJson {
+            schema_version: 2,
+            media_type: "application/vnd.oci.image.manifest.v1+json",
+            config: DescriptorJson {
+                media_type: "application/vnd.oci.image.config.v1+json",
+                digest: config_digest.clone(),
+                size: config_json.len(),
+            },
+            layers: vec![DescriptorJson {
+                media_type: "application/vnd.oci.image.layer.v1.tar",
+                digest: layer_digest.clone(),
+                size: layer_bytes.len(),
+            }],
+        };
+        let manifest_json = serde_json::to_vec(&manifest).unwrap();
+        let manifest_digest = sha256_digest(&manifest_json);
+        write_blob(&layout, &manifest_digest, &manifest_json);
+
+        let index = IndexJson {
+            schema_version: 2,
+            media_type: "application/vnd.oci.image.index.v1+json",
+            manifests: vec![DescriptorJson {
+                media_type: "application/vnd.oci.image.manifest.v1+json",
+                digest: manifest_digest.clone(),
+                size: manifest_json.len(),
+            }],
+        };
+        fs::write(
+            layout.join("index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+
+        let image_tar = tmp.path().join("image.tar");
+        let tar_status = Command::new("tar")
+            .arg("-cf")
+            .arg(&image_tar)
+            .arg("-C")
+            .arg(&layout)
+            .arg(".")
+            .status()
+            .unwrap();
+        assert!(tar_status.success());
+
+        let store = ImageStore::new(tmp.path().join("oci"));
+        let imported = import_oci_tar_to_store(&store, &image_tar, "demo:latest")
+            .await
+            .unwrap();
+
+        assert_eq!(imported.0, manifest_digest);
+        assert_eq!(
+            store.read_reference("demo:latest").unwrap(),
+            manifest_digest
+        );
+        assert!(store.read_manifest_json(&manifest_digest).is_ok());
+        assert!(store.read_config_json(&manifest_digest).is_ok());
+        assert!(store.has_layer_blob(&layer_digest));
+    }
+}

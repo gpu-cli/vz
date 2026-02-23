@@ -1,6 +1,8 @@
 //! CLI command implementations.
 
 #[cfg(target_os = "macos")]
+pub mod build;
+#[cfg(target_os = "macos")]
 pub mod cache;
 #[cfg(target_os = "macos")]
 pub mod cleanup;

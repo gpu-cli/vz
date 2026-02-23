@@ -7,11 +7,13 @@
 #![cfg(target_os = "macos")]
 #![forbid(unsafe_code)]
 
+pub mod buildkit;
 pub mod config;
 pub mod error;
 pub mod macos_backend;
 pub mod runtime;
 
+pub use buildkit::{BuildRequest, BuildResult, BuildkitError};
 pub use config::{
     ExecConfig, ExecutionMode, MountAccess, MountSpec, MountType, OciRuntimeKind, PortMapping,
     PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig,
