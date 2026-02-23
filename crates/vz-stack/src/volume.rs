@@ -143,6 +143,18 @@ pub fn validate_bind_mounts(resolved: &mut Vec<ResolvedMount>) -> Result<(), Sta
         };
 
         if !absolute.exists() {
+            // Check for dangling symlink — the symlink itself exists but
+            // its target does not (e.g., /var/run/docker.sock when Docker
+            // isn't running). Skip with a warning rather than erroring.
+            if absolute.symlink_metadata().is_ok() {
+                tracing::warn!(
+                    source = %host_path.display(),
+                    target = %resolved[i].target,
+                    "skipping bind mount: source is a dangling symlink"
+                );
+                resolved.remove(i);
+                continue;
+            }
             return Err(StackError::InvalidSpec(format!(
                 "bind mount source does not exist: {}",
                 host_path.display()
