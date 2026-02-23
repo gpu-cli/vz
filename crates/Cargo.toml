@@ -143,6 +143,7 @@ docker_credential = "1"
 
 # Progress UI
 indicatif = "0.17"
+console = "0.15"
 
 # TUI
 ratatui = "0.29"

@@ -21,10 +21,12 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use vz_stack::{
-    ApplyResult, ContainerLogs, ContainerRuntime, EventRecord, ExecutionResult,
-    OrchestrationConfig, RoundReport, ServiceObservedState, ServicePhase, StackError, StackEvent,
-    StackExecutor, StackOrchestrator, StackSpec, StateStore, VolumeManager, parse_compose_with_dir,
+    ContainerLogs, ContainerRuntime, EventRecord, OrchestrationConfig, RoundReport,
+    ServiceObservedState, ServicePhase, StackError, StackEvent, StackExecutor, StackOrchestrator,
+    StackSpec, StateStore, VolumeManager, parse_compose_with_dir,
 };
+
+use super::stack_output::{self, StackOutput};
 
 /// Log file path inside the container.
 const CONTAINER_LOG_FILE: &str = "/var/log/vz-oci/output.log";
@@ -372,7 +374,6 @@ impl OciContainerRuntime {
         let handle = tokio::runtime::Handle::current();
         Ok(Self { backend, handle })
     }
-
 }
 
 impl ContainerRuntime for OciContainerRuntime {
@@ -523,9 +524,10 @@ impl ContainerRuntime for OciContainerRuntime {
 
     fn logs(&self, container_id: &str) -> Result<ContainerLogs, StackError> {
         use vz_runtime_contract::RuntimeBackend;
-        let logs = self.backend.logs(container_id).map_err(|e| {
-            StackError::Network(format!("logs failed: {e}"))
-        })?;
+        let logs = self
+            .backend
+            .logs(container_id)
+            .map_err(|e| StackError::Network(format!("logs failed: {e}")))?;
         Ok(ContainerLogs {
             output: logs.output,
         })
@@ -555,19 +557,13 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
 
     let db_path = state_dir.join("state.db");
 
-    info!(
-        stack = %spec.name,
-        services = spec.services.len(),
-        "applying stack"
-    );
-
     if args.dry_run {
         let store = StateStore::open(&db_path)
             .with_context(|| format!("failed to open state store: {}", db_path.display()))?;
         let health_statuses = HashMap::new();
         let result = vz_stack::apply(&spec, &store, &health_statuses)
             .with_context(|| "stack apply failed")?;
-        print_apply_result(&result);
+        stack_output::print_dry_run(&result);
         println!("\n--dry-run: skipping execution");
         return Ok(());
     }
@@ -594,51 +590,34 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
             },
         );
 
+        let mut out = StackOutput::new(&spec);
         let result = orchestrator
             .run(
                 &spec,
                 Some(&mut |report: &RoundReport| {
-                    if let Some(ref apply) = report.apply_result.actions.first() {
-                        let _ = apply; // suppress unused warning
-                        print_apply_result(&report.apply_result);
-                    }
-                    if let Some(ref exec) = report.exec_result {
-                        print_execution_result(exec);
-                    }
+                    out.on_round(report);
                 }),
             )
             .with_context(|| "stack up failed")?;
 
-        println!(
-            "\nDetached: {} ready, {} failed.",
-            result.services_ready, result.services_failed
-        );
+        out.finish(&result);
     } else {
         // Foreground mode: full orchestration loop until convergence,
         // then keep the VM alive with a control socket for `vz stack exec`.
         let mut orchestrator =
             StackOrchestrator::new(executor, reconcile_store, OrchestrationConfig::default());
 
+        let mut out = StackOutput::new(&spec);
         let result = orchestrator
             .run(
                 &spec,
                 Some(&mut |report: &RoundReport| {
-                    print_round_report(report);
+                    out.on_round(report);
                 }),
             )
             .with_context(|| "stack orchestration failed")?;
 
-        if result.converged {
-            println!(
-                "\nStack converged in {} round(s): {} ready, {} failed.",
-                result.rounds, result.services_ready, result.services_failed
-            );
-        } else {
-            println!(
-                "\nStack did not converge after {} rounds: {} ready, {} failed.",
-                result.rounds, result.services_ready, result.services_failed
-            );
-        }
+        out.finish(&result);
 
         if result.services_failed > 0 {
             bail!("{} service(s) failed", result.services_failed);
@@ -1239,24 +1218,28 @@ async fn cmd_down(args: DownArgs) -> anyhow::Result<()> {
         disk_size_mb: None,
     };
 
-    info!(stack = %stack_name, "tearing down stack");
-
     let health_statuses = HashMap::new();
     let result = vz_stack::apply(&empty_spec, &store, &health_statuses)
         .with_context(|| "stack teardown failed")?;
 
-    print_apply_result(&result);
-
-    if result.actions.is_empty() && !args.volumes {
-        return Ok(());
-    }
-
     if args.dry_run {
+        stack_output::print_dry_run(&result);
         println!("\n--dry-run: skipping execution");
         return Ok(());
     }
 
+    if result.actions.is_empty() && !args.volumes {
+        println!("No changes needed.");
+        return Ok(());
+    }
+
     // Execute removal actions through the OCI runtime.
+    let service_names: Vec<String> = result
+        .actions
+        .iter()
+        .map(|a| a.service_name().to_string())
+        .collect();
+
     if !result.actions.is_empty() {
         let oci_runtime = OciContainerRuntime::new(&state_dir)
             .with_context(|| "failed to initialize OCI runtime")?;
@@ -1269,7 +1252,9 @@ async fn cmd_down(args: DownArgs) -> anyhow::Result<()> {
             .execute(&empty_spec, &result.actions)
             .with_context(|| "teardown execution failed")?;
 
-        print_execution_result(&exec_result);
+        let mut out = StackOutput::new_down(&service_names);
+        out.on_down(&result, &exec_result);
+        out.finish_down();
     }
 
     // Remove named volumes if --volumes was specified.
@@ -1831,78 +1816,6 @@ fn resolve_state_dir(
         .join(stack_name))
 }
 
-fn print_round_report(report: &RoundReport) {
-    if !report.apply_result.actions.is_empty() {
-        print_apply_result(&report.apply_result);
-    }
-
-    if let Some(ref exec) = report.exec_result {
-        print_execution_result(exec);
-    }
-
-    if let Some(ref health) = report.health_result {
-        for name in &health.newly_ready {
-            println!("  health ok  {name}");
-        }
-        for name in &health.newly_failed {
-            println!("  health fail  {name}");
-        }
-    }
-
-    if report.services_pending > 0 {
-        println!(
-            "  [{}/{} ready, {} pending]",
-            report.services_ready,
-            report.services_ready + report.services_pending + report.services_failed,
-            report.services_pending
-        );
-    }
-}
-
-fn print_apply_result(result: &ApplyResult) {
-    if result.actions.is_empty() && result.deferred.is_empty() {
-        println!("No changes needed.");
-        return;
-    }
-
-    for action in &result.actions {
-        let verb = match action {
-            vz_stack::Action::ServiceCreate { .. } => "create",
-            vz_stack::Action::ServiceRecreate { .. } => "recreate",
-            vz_stack::Action::ServiceRemove { .. } => "remove",
-        };
-        println!("  {verb:>10}  {}", action.service_name());
-    }
-
-    for deferred in &result.deferred {
-        println!(
-            "  deferred  {} (waiting on: {})",
-            deferred.service_name,
-            deferred.waiting_on.join(", "),
-        );
-    }
-
-    println!(
-        "\n{} action(s), {} deferred",
-        result.actions.len(),
-        result.deferred.len(),
-    );
-}
-
-fn print_execution_result(result: &ExecutionResult) {
-    if result.all_succeeded() {
-        println!("\nAll {} action(s) succeeded.", result.succeeded);
-    } else {
-        println!(
-            "\n{} succeeded, {} failed.",
-            result.succeeded, result.failed
-        );
-        for (service, error) in &result.errors {
-            println!("  error: {service}: {error}");
-        }
-    }
-}
-
 fn print_ps_table(observed: &[ServiceObservedState]) {
     if observed.is_empty() {
         println!("No services found.");
@@ -2172,15 +2085,6 @@ mod tests {
     }
 
     #[test]
-    fn print_apply_result_empty() {
-        let result = ApplyResult {
-            actions: vec![],
-            deferred: vec![],
-        };
-        print_apply_result(&result);
-    }
-
-    #[test]
     fn event_service_name_returns_name_for_service_events() {
         let event = StackEvent::ServiceCreating {
             stack_name: "s".into(),
@@ -2215,25 +2119,6 @@ mod tests {
             stack_name: "s".into(),
         };
         assert_eq!(event_service_name(&event), None);
-    }
-
-    #[test]
-    fn print_apply_result_with_actions() {
-        let result = ApplyResult {
-            actions: vec![
-                vz_stack::Action::ServiceCreate {
-                    service_name: "web".into(),
-                },
-                vz_stack::Action::ServiceRemove {
-                    service_name: "old".into(),
-                },
-            ],
-            deferred: vec![vz_stack::DeferredService {
-                service_name: "app".into(),
-                waiting_on: vec!["db".into()],
-            }],
-        };
-        print_apply_result(&result);
     }
 
     #[test]

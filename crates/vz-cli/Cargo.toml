@@ -26,6 +26,8 @@ libc = { workspace = true }
 ctrlc = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+indicatif = { workspace = true }
+console = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 vz-sandbox = { workspace = true }
@@ -39,7 +41,6 @@ objc2-app-kit = { workspace = true }
 objc2-virtualization = { workspace = true }
 reqwest = { workspace = true }
 tokio-stream = { workspace = true }
-indicatif = { workspace = true }
 base64 = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

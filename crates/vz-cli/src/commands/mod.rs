@@ -22,6 +22,7 @@ pub mod save;
 #[cfg(target_os = "macos")]
 pub mod self_sign;
 pub mod stack;
+mod stack_output;
 #[cfg(target_os = "macos")]
 pub mod stop;
 #[cfg(target_os = "macos")]

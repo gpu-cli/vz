@@ -91,9 +91,21 @@ enum Commands {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Set up tracing based on verbosity
+    // Suppress info-level tracing noise for stack up/down — the StackOutput
+    // abstraction handles user-facing progress display instead.
+    let is_stack_progress = matches!(
+        cli.command,
+        Commands::Stack(ref args) if matches!(
+            args.action,
+            commands::stack::StackCommand::Up(_)
+            | commands::stack::StackCommand::Down(_)
+        )
+    );
+
     let filter = if cli.quiet {
         "error"
+    } else if is_stack_progress && cli.verbose == 0 {
+        "warn"
     } else {
         match cli.verbose {
             0 => "info",
