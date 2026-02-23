@@ -2258,6 +2258,10 @@ fn mount_specs_to_bundle_mounts(
 /// Generate VirtioFS shared directory entries for bind mount sources.
 ///
 /// `tag_offset` shifts the mount tag indices to avoid collisions in shared VM mode.
+///
+/// Note: VirtioFS requires shared directories, not files. For file bind mounts,
+/// we share the parent directory and use the subpath (handled separately in
+/// mount_specs_to_bundle_mounts) to access the specific file.
 fn mount_specs_to_shared_dirs(mounts: &[MountSpec], tag_offset: usize) -> Vec<SharedDirConfig> {
     mounts
         .iter()
@@ -2268,9 +2272,18 @@ fn mount_specs_to_shared_dirs(mounts: &[MountSpec], tag_offset: usize) -> Vec<Sh
             }
             let source = spec.source.as_ref()?;
             let global_idx = tag_offset + idx;
-            Some(SharedDirConfig {
+
+            // VirtioFS requires a directory, not a file. For file mounts,
+            // share the parent directory and rely on subpath in the container.
+            let share_source = if source.is_file() {
+                source.parent().map(|p| p.to_path_buf())
+            } else {
+                Some(source.clone())
+            };
+
+            share_source.map(|source| SharedDirConfig {
                 tag: format!("vz-mount-{global_idx}"),
-                source: source.clone(),
+                source,
                 read_only: matches!(spec.access, MountAccess::ReadOnly),
             })
         })
@@ -3460,6 +3473,36 @@ mod tests {
         assert_eq!(shares[1].tag, "vz-mount-2");
         assert_eq!(shares[1].source, PathBuf::from("/host/b"));
         assert!(shares[1].read_only);
+    }
+
+    #[test]
+    fn mount_specs_to_shared_dirs_shares_parent_for_file_mounts() {
+        // Create a temporary file to simulate a secret file mount
+        let temp_dir = std::env::temp_dir();
+        let secrets_dir = temp_dir.join("vz-test-secrets");
+        std::fs::create_dir_all(&secrets_dir).unwrap();
+        let secret_file = secrets_dir.join("my_secret");
+        std::fs::write(&secret_file, "secret content").unwrap();
+
+        let mounts = vec![MountSpec {
+            source: Some(secret_file.clone()),
+            target: PathBuf::from("/run/secrets/my_secret"),
+            mount_type: MountType::Bind,
+            access: MountAccess::ReadOnly,
+            subpath: Some("my_secret".to_string()),
+        }];
+
+        let shares = mount_specs_to_shared_dirs(&mounts, 0);
+
+        // Should share the parent directory, not the file
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].tag, "vz-mount-0");
+        assert_eq!(shares[0].source, secrets_dir);
+        assert!(shares[0].read_only);
+
+        // Cleanup
+        std::fs::remove_file(secret_file).ok();
+        std::fs::remove_dir(secrets_dir).ok();
     }
 
     #[test]
