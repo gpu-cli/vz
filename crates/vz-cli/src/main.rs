@@ -249,6 +249,13 @@ mod tests {
         assert!(matches!(cli.command, Commands::Build(_)));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_build_cache_du_subcommand() {
+        let cli = Cli::try_parse_from(["vz", "build", "cache", "du"]).expect("parse");
+        assert!(matches!(cli.command, Commands::Build(_)));
+    }
+
     #[test]
     fn parse_logs_subcommand() {
         let cli = Cli::try_parse_from(["vz", "logs", "ctr-123"]).expect("parse");

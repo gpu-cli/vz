@@ -9,6 +9,7 @@ use tokio::process::Command;
 use tracing::warn;
 use vz::NetworkConfig;
 use vz::SharedDirConfig;
+use vz::protocol::ExecOutput;
 use vz_image::{ImageId, ImageStore};
 use vz_linux::{
     EnsureKernelOptions, LinuxError, LinuxVm, LinuxVmConfig, ensure_kernel_with_options,
@@ -25,6 +26,46 @@ const BUILD_OUTPUT_ARCHIVE: &str = "image.tar";
 const BUILDKITD_ADDR: &str = "tcp://127.0.0.1:8372";
 const BUILDKIT_SETUP_TIMEOUT: Duration = Duration::from_secs(90);
 const BUILDKIT_BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const BUILDKIT_RUNC_GUEST_PATH: &str = "/tmp/buildkit-runc";
+const BUILDKIT_CACHE_KEEP_DURATION: &str = "168h";
+const BUILDKIT_CACHE_KEEP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Destination for built image output.
+#[derive(Debug, Clone, Default)]
+pub enum BuildOutput {
+    /// Import built image directly into local vz image store.
+    #[default]
+    VzStore,
+    /// Push built image to registry.
+    RegistryPush,
+    /// Write OCI tar archive to host path.
+    OciTar {
+        /// Destination path for generated archive.
+        dest: PathBuf,
+    },
+}
+
+/// Build progress rendering mode passed to buildctl.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum BuildProgress {
+    /// Buildctl picks plain vs tty based on terminal detection.
+    #[default]
+    Auto,
+    /// Always print plain logs.
+    Plain,
+    /// Always print tty progress UI.
+    Tty,
+}
+
+impl BuildProgress {
+    fn as_buildctl_value(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Plain => "plain",
+            Self::Tty => "tty",
+        }
+    }
+}
 
 /// Request for a Dockerfile build executed by BuildKit.
 #[derive(Debug, Clone)]
@@ -33,23 +74,44 @@ pub struct BuildRequest {
     pub context_dir: PathBuf,
     /// Dockerfile path. Relative paths are resolved against `context_dir`.
     pub dockerfile: PathBuf,
-    /// Reference to write into the local vz image store.
+    /// Image reference (for local tag and/or registry push).
     pub tag: String,
     /// Optional multi-stage target name.
     pub target: Option<String>,
     /// Build-time key/value arguments.
     pub build_args: BTreeMap<String, String>,
+    /// Build secrets forwarded to BuildKit (`id=...,src=...`).
+    pub secrets: Vec<String>,
     /// Disable BuildKit cache for this build.
     pub no_cache: bool,
+    /// Output destination mode.
+    pub output: BuildOutput,
+    /// Progress rendering mode.
+    pub progress: BuildProgress,
 }
 
 /// Successful BuildKit execution result.
 #[derive(Debug, Clone)]
 pub struct BuildResult {
-    /// Stored image manifest digest.
-    pub image_id: ImageId,
-    /// Resolved reference written to `refs/`.
+    /// Stored image manifest digest when imported into local store.
+    pub image_id: Option<ImageId>,
+    /// Resolved image reference.
     pub tag: String,
+    /// Path to emitted archive when output mode writes to disk.
+    pub output_path: Option<PathBuf>,
+    /// Whether the image was pushed to a registry.
+    pub pushed: bool,
+}
+
+/// Options for `buildctl prune` cache command.
+#[derive(Debug, Clone, Default)]
+pub struct CachePruneOptions {
+    /// Remove all cache entries.
+    pub all: bool,
+    /// Keep cache newer than this duration (for example `24h`).
+    pub keep_duration: Option<String>,
+    /// Keep this much storage (for example `5GB`).
+    pub keep_storage: Option<String>,
 }
 
 /// BuildKit integration errors.
@@ -76,8 +138,8 @@ pub enum BuildkitError {
         stderr: String,
     },
 
-    /// BuildKit solve failed.
-    #[error("buildctl build failed with exit code {exit_code}: {stderr}\n{stdout}")]
+    /// BuildKit solve or cache command failed.
+    #[error("buildctl command failed with exit code {exit_code}: {stderr}\n{stdout}")]
     BuildFailed {
         /// Exit code returned by buildctl.
         exit_code: i32,
@@ -130,7 +192,6 @@ pub enum BuildkitError {
 
 #[derive(Debug, Clone)]
 struct BuildkitArtifacts {
-    base_dir: PathBuf,
     bin_dir: PathBuf,
     cache_dir: PathBuf,
 }
@@ -159,7 +220,7 @@ struct OciManifest {
     layers: Vec<OciDescriptor>,
 }
 
-/// Build a Dockerfile and import the resulting image into the local vz store.
+/// Build a Dockerfile and handle the requested output mode.
 pub async fn build_image(
     config: &RuntimeConfig,
     request: BuildRequest,
@@ -179,6 +240,179 @@ pub async fn build_image(
         ))
     })?;
 
+    let output_mode = request.output.clone();
+    let output_dir = match output_mode {
+        BuildOutput::VzStore | BuildOutput::OciTar { .. } => {
+            let base_dir = default_buildkit_dir()?;
+            let dir = unique_dir(base_dir.join("tmp"), "build-output");
+            tokio::fs::create_dir_all(&dir).await?;
+            Some(dir)
+        }
+        BuildOutput::RegistryPush => None,
+    };
+
+    let vm = start_buildkit_vm(config, Some(&context_dir), output_dir.as_deref()).await?;
+    let build_result = run_guest_build(
+        &vm,
+        &request,
+        dockerfile_relative,
+        "/mnt/build-context",
+        output_dir.as_ref().map(|_| "/mnt/build-output/image.tar"),
+    )
+    .await;
+    let stop_result = vm.stop().await;
+    if let Err(error) = stop_result {
+        warn!(%error, "failed to stop BuildKit VM cleanly");
+    }
+    build_result?;
+
+    let final_result = match output_mode {
+        BuildOutput::VzStore => {
+            let output_dir = output_dir.as_ref().ok_or_else(|| {
+                BuildkitError::InvalidConfig("missing output directory".to_string())
+            })?;
+            let image_tar = output_dir.join(BUILD_OUTPUT_ARCHIVE);
+            if !image_tar.is_file() {
+                return Err(BuildkitError::InvalidOciLayout(format!(
+                    "build output archive not found: {}",
+                    image_tar.display()
+                )));
+            }
+
+            let data_dir = expand_home_dir(&config.data_dir);
+            let store = ImageStore::new(data_dir);
+            let image_id = import_oci_tar_to_store(&store, &image_tar, &request.tag).await?;
+
+            BuildResult {
+                image_id: Some(image_id),
+                tag: request.tag,
+                output_path: None,
+                pushed: false,
+            }
+        }
+        BuildOutput::OciTar { dest } => {
+            let output_dir = output_dir.as_ref().ok_or_else(|| {
+                BuildkitError::InvalidConfig("missing output directory".to_string())
+            })?;
+            let image_tar = output_dir.join(BUILD_OUTPUT_ARCHIVE);
+            if !image_tar.is_file() {
+                return Err(BuildkitError::InvalidOciLayout(format!(
+                    "build output archive not found: {}",
+                    image_tar.display()
+                )));
+            }
+
+            let destination = expand_home_dir(&dest);
+            if let Some(parent) = destination.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::copy(&image_tar, &destination).await?;
+
+            BuildResult {
+                image_id: None,
+                tag: request.tag,
+                output_path: Some(destination),
+                pushed: false,
+            }
+        }
+        BuildOutput::RegistryPush => BuildResult {
+            image_id: None,
+            tag: request.tag,
+            output_path: None,
+            pushed: true,
+        },
+    };
+
+    if let Some(output_dir) = output_dir
+        && let Err(error) = tokio::fs::remove_dir_all(&output_dir).await
+    {
+        warn!(
+            path = %output_dir.display(),
+            %error,
+            "failed to clean temporary BuildKit output directory"
+        );
+    }
+
+    Ok(final_result)
+}
+
+/// Return a human-readable BuildKit cache usage table (from `buildctl du`).
+pub async fn cache_disk_usage(config: &RuntimeConfig) -> Result<String, BuildkitError> {
+    let vm = start_buildkit_vm(config, None, None).await?;
+    let output = async {
+        ensure_guest_buildkit_ready(&vm).await?;
+        run_buildctl(
+            &vm,
+            vec!["du".to_string(), "--verbose".to_string()],
+            BUILDKIT_BUILD_TIMEOUT,
+        )
+        .await
+    }
+    .await;
+    let stop_result = vm.stop().await;
+    if let Err(error) = stop_result {
+        warn!(%error, "failed to stop BuildKit VM cleanly");
+    }
+
+    let output = output?;
+    if output.exit_code != 0 {
+        return Err(BuildkitError::BuildFailed {
+            exit_code: output.exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
+    }
+
+    Ok(render_command_output(output))
+}
+
+/// Prune BuildKit cache and return command output summary.
+pub async fn cache_prune(
+    config: &RuntimeConfig,
+    options: CachePruneOptions,
+) -> Result<String, BuildkitError> {
+    let vm = start_buildkit_vm(config, None, None).await?;
+    let output = async {
+        ensure_guest_buildkit_ready(&vm).await?;
+
+        let mut args = vec!["prune".to_string()];
+        if options.all {
+            args.push("--all".to_string());
+        }
+        if let Some(keep_duration) = options.keep_duration {
+            args.push("--keep-duration".to_string());
+            args.push(keep_duration);
+        }
+        if let Some(keep_storage) = options.keep_storage {
+            args.push("--keep-storage".to_string());
+            args.push(keep_storage);
+        }
+
+        run_buildctl(&vm, args, BUILDKIT_BUILD_TIMEOUT).await
+    }
+    .await;
+    let stop_result = vm.stop().await;
+    if let Err(error) = stop_result {
+        warn!(%error, "failed to stop BuildKit VM cleanly");
+    }
+
+    let output = output?;
+    if output.exit_code != 0 {
+        return Err(BuildkitError::BuildFailed {
+            exit_code: output.exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
+    }
+
+    Ok(render_command_output(output))
+}
+
+async fn start_buildkit_vm(
+    config: &RuntimeConfig,
+    context_dir: Option<&Path>,
+    output_dir: Option<&Path>,
+) -> Result<LinuxVm, BuildkitError> {
     let artifacts = ensure_buildkit_artifacts().await?;
     let kernel = ensure_kernel_with_options(EnsureKernelOptions {
         install_dir: config.linux_install_dir.clone(),
@@ -187,34 +421,37 @@ pub async fn build_image(
     })
     .await?;
 
-    let output_dir = unique_dir(artifacts.base_dir.join("tmp"), "build-output");
-    tokio::fs::create_dir_all(&output_dir).await?;
-
     let mut vm_config = LinuxVmConfig::new(kernel.kernel, kernel.initramfs);
     vm_config.cpus = 4;
     vm_config.memory_mb = 4096;
     vm_config.shared_dirs = vec![
         SharedDirConfig {
             tag: "buildkit-bin".to_string(),
-            source: artifacts.bin_dir.clone(),
+            source: artifacts.bin_dir,
             read_only: true,
         },
         SharedDirConfig {
             tag: "buildkit-cache".to_string(),
-            source: artifacts.cache_dir.clone(),
-            read_only: false,
-        },
-        SharedDirConfig {
-            tag: "build-context".to_string(),
-            source: context_dir.clone(),
-            read_only: true,
-        },
-        SharedDirConfig {
-            tag: "build-output".to_string(),
-            source: output_dir.clone(),
+            source: artifacts.cache_dir,
             read_only: false,
         },
     ];
+
+    if let Some(context_dir) = context_dir {
+        vm_config.shared_dirs.push(SharedDirConfig {
+            tag: "build-context".to_string(),
+            source: context_dir.to_path_buf(),
+            read_only: true,
+        });
+    }
+
+    if let Some(output_dir) = output_dir {
+        vm_config.shared_dirs.push(SharedDirConfig {
+            tag: "build-output".to_string(),
+            source: output_dir.to_path_buf(),
+            read_only: false,
+        });
+    }
 
     if !config.default_network_enabled {
         vm_config.network = Some(NetworkConfig::None);
@@ -228,46 +465,7 @@ pub async fn build_image(
         return Err(err.into());
     }
 
-    let build_result = run_guest_build(
-        &vm,
-        &request,
-        dockerfile_relative,
-        "/mnt/build-context",
-        "/mnt/build-output/image.tar",
-    )
-    .await;
-    let stop_result = vm.stop().await;
-
-    if let Err(error) = stop_result {
-        warn!(%error, "failed to stop BuildKit VM cleanly");
-    }
-
-    build_result?;
-
-    let image_tar = output_dir.join(BUILD_OUTPUT_ARCHIVE);
-    if !image_tar.is_file() {
-        return Err(BuildkitError::InvalidOciLayout(format!(
-            "build output archive not found: {}",
-            image_tar.display()
-        )));
-    }
-
-    let data_dir = expand_home_dir(&config.data_dir);
-    let store = ImageStore::new(data_dir);
-    let image_id = import_oci_tar_to_store(&store, &image_tar, &request.tag).await?;
-
-    if let Err(error) = tokio::fs::remove_dir_all(&output_dir).await {
-        warn!(
-            path = %output_dir.display(),
-            %error,
-            "failed to clean temporary BuildKit output directory"
-        );
-    }
-
-    Ok(BuildResult {
-        image_id,
-        tag: request.tag,
-    })
+    Ok(vm)
 }
 
 async fn run_guest_build(
@@ -275,22 +473,104 @@ async fn run_guest_build(
     request: &BuildRequest,
     dockerfile_relative: &Path,
     guest_context_dir: &str,
-    guest_output_tar: &str,
+    guest_output_tar: Option<&str>,
 ) -> Result<(), BuildkitError> {
+    ensure_guest_buildkit_ready(vm).await?;
+
+    let mut args = vec![
+        "build".to_string(),
+        "--progress".to_string(),
+        request.progress.as_buildctl_value().to_string(),
+        "--frontend".to_string(),
+        "dockerfile.v0".to_string(),
+        "--local".to_string(),
+        format!("context={guest_context_dir}"),
+        "--local".to_string(),
+        format!("dockerfile={guest_context_dir}"),
+        "--opt".to_string(),
+        format!("filename={}", dockerfile_relative.display()),
+    ];
+
+    match &request.output {
+        BuildOutput::VzStore | BuildOutput::OciTar { .. } => {
+            let guest_output_tar = guest_output_tar.ok_or_else(|| {
+                BuildkitError::InvalidConfig("missing guest output archive path".to_string())
+            })?;
+            args.push("--output".to_string());
+            args.push(format!(
+                "type=oci,dest={guest_output_tar},name={}",
+                request.tag
+            ));
+        }
+        BuildOutput::RegistryPush => {
+            args.push("--output".to_string());
+            args.push(format!("type=image,name={},push=true", request.tag));
+        }
+    }
+
+    if let Some(target) = &request.target {
+        args.push("--opt".to_string());
+        args.push(format!("target={target}"));
+    }
+    if request.no_cache {
+        args.push("--no-cache".to_string());
+    }
+    for (key, value) in &request.build_args {
+        args.push("--opt".to_string());
+        args.push(format!("build-arg:{key}={value}"));
+    }
+    for secret in &request.secrets {
+        args.push("--secret".to_string());
+        args.push(secret.clone());
+    }
+
+    let output = run_buildctl(vm, args, BUILDKIT_BUILD_TIMEOUT).await?;
+    if output.exit_code != 0 {
+        return Err(BuildkitError::BuildFailed {
+            exit_code: output.exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
+    }
+
+    Ok(())
+}
+
+async fn ensure_guest_buildkit_ready(vm: &LinuxVm) -> Result<(), BuildkitError> {
     let setup_script = format!(
         r#"
 set -eu
 
 /bin/busybox mkdir -p /mnt/buildkit-bin /var/lib/buildkit /mnt/build-context /mnt/build-output
+/bin/busybox mkdir -p /etc/buildkit
 /bin/busybox mount -t virtiofs buildkit-bin /mnt/buildkit-bin 2>/dev/null || true
 /bin/busybox mount -t virtiofs buildkit-cache /var/lib/buildkit 2>/dev/null || true
 /bin/busybox mount -t virtiofs build-context /mnt/build-context 2>/dev/null || true
 /bin/busybox mount -t virtiofs build-output /mnt/build-output 2>/dev/null || true
 
+/bin/busybox cp /mnt/buildkit-bin/buildkit-runc {BUILDKIT_RUNC_GUEST_PATH}
+/bin/busybox chmod 0755 {BUILDKIT_RUNC_GUEST_PATH}
+
+/bin/busybox cat >/etc/buildkit/buildkitd.toml <<'CFG'
+[worker.oci]
+  binary = "{BUILDKIT_RUNC_GUEST_PATH}"
+  gc = true
+  snapshotter = "overlayfs"
+
+[[worker.oci.gcpolicy]]
+  keepDuration = "{BUILDKIT_CACHE_KEEP_DURATION}"
+  all = true
+
+[[worker.oci.gcpolicy]]
+  keepBytes = {BUILDKIT_CACHE_KEEP_BYTES}
+  all = true
+CFG
+
 if ! /mnt/buildkit-bin/buildctl --addr {BUILDKITD_ADDR} debug workers >/dev/null 2>&1; then
   /mnt/buildkit-bin/buildkitd \
+    --config /etc/buildkit/buildkitd.toml \
     --addr {BUILDKITD_ADDR} \
-    --oci-worker-binary /mnt/buildkit-bin/buildkit-runc \
+    --oci-worker-binary {BUILDKIT_RUNC_GUEST_PATH} \
     --oci-worker-snapshotter overlayfs \
     --root /var/lib/buildkit >/tmp/buildkitd.log 2>&1 &
 fi
@@ -311,6 +591,7 @@ fi
 exit 1
 "#
     );
+
     run_guest_command(
         vm,
         "setup buildkit guest environment",
@@ -318,54 +599,23 @@ exit 1
         vec!["sh".to_string(), "-c".to_string(), setup_script],
         BUILDKIT_SETUP_TIMEOUT,
     )
-    .await?;
+    .await
+}
 
-    let mut args = vec![
-        "--addr".to_string(),
-        BUILDKITD_ADDR.to_string(),
-        "build".to_string(),
-        "--progress".to_string(),
-        "plain".to_string(),
-        "--frontend".to_string(),
-        "dockerfile.v0".to_string(),
-        "--local".to_string(),
-        format!("context={guest_context_dir}"),
-        "--local".to_string(),
-        format!("dockerfile={guest_context_dir}"),
-        "--opt".to_string(),
-        format!("filename={}", dockerfile_relative.display()),
-        "--output".to_string(),
-        format!("type=oci,dest={guest_output_tar},name={}", request.tag),
-    ];
-
-    if let Some(target) = &request.target {
-        args.push("--opt".to_string());
-        args.push(format!("target={target}"));
-    }
-    if request.no_cache {
-        args.push("--no-cache".to_string());
-    }
-    for (key, value) in &request.build_args {
-        args.push("--opt".to_string());
-        args.push(format!("build-arg:{key}={value}"));
-    }
+async fn run_buildctl(
+    vm: &LinuxVm,
+    args: Vec<String>,
+    timeout: Duration,
+) -> Result<ExecOutput, BuildkitError> {
+    let mut full_args = vec!["--addr".to_string(), BUILDKITD_ADDR.to_string()];
+    full_args.extend(args);
 
     let output = vm
-        .exec_capture(
-            "/mnt/buildkit-bin/buildctl".to_string(),
-            args,
-            BUILDKIT_BUILD_TIMEOUT,
-        )
-        .await?;
-    if output.exit_code != 0 {
-        return Err(BuildkitError::BuildFailed {
-            exit_code: output.exit_code,
-            stdout: output.stdout,
-            stderr: output.stderr,
-        });
-    }
+        .exec_capture("/mnt/buildkit-bin/buildctl".to_string(), full_args, timeout)
+        .await
+        .map_err(BuildkitError::from)?;
 
-    Ok(())
+    Ok(output)
 }
 
 async fn run_guest_command(
@@ -391,6 +641,20 @@ async fn run_guest_command(
     Ok(())
 }
 
+fn render_command_output(output: ExecOutput) -> String {
+    let mut rendered = String::new();
+    if !output.stdout.trim().is_empty() {
+        rendered.push_str(output.stdout.trim_end());
+    }
+    if !output.stderr.trim().is_empty() {
+        if !rendered.is_empty() {
+            rendered.push('\n');
+        }
+        rendered.push_str(output.stderr.trim_end());
+    }
+    rendered
+}
+
 async fn ensure_buildkit_artifacts() -> Result<BuildkitArtifacts, BuildkitError> {
     let base_dir = default_buildkit_dir()?;
     let bin_dir = base_dir.join("bin");
@@ -398,11 +662,7 @@ async fn ensure_buildkit_artifacts() -> Result<BuildkitArtifacts, BuildkitError>
     tokio::fs::create_dir_all(&cache_dir).await?;
 
     if artifacts_are_current(&base_dir, &bin_dir).await? {
-        return Ok(BuildkitArtifacts {
-            base_dir,
-            bin_dir,
-            cache_dir,
-        });
+        return Ok(BuildkitArtifacts { bin_dir, cache_dir });
     }
 
     tokio::fs::create_dir_all(&base_dir).await?;
@@ -451,11 +711,7 @@ async fn ensure_buildkit_artifacts() -> Result<BuildkitArtifacts, BuildkitError>
         );
     }
 
-    Ok(BuildkitArtifacts {
-        base_dir,
-        bin_dir,
-        cache_dir,
-    })
+    Ok(BuildkitArtifacts { bin_dir, cache_dir })
 }
 
 async fn artifacts_are_current(base_dir: &Path, bin_dir: &Path) -> Result<bool, BuildkitError> {
@@ -735,6 +991,13 @@ mod tests {
         let blob_path = root.join("blobs").join(algo).join(value);
         fs::create_dir_all(blob_path.parent().unwrap()).unwrap();
         fs::write(blob_path, data).unwrap();
+    }
+
+    #[test]
+    fn progress_mode_maps_to_buildctl_values() {
+        assert_eq!(BuildProgress::Auto.as_buildctl_value(), "auto");
+        assert_eq!(BuildProgress::Plain.as_buildctl_value(), "plain");
+        assert_eq!(BuildProgress::Tty.as_buildctl_value(), "tty");
     }
 
     #[tokio::test]

@@ -616,11 +616,7 @@ fn set_failed(svc: &mut ServiceBar, name: &str, error: &str, is_tty: bool) {
 fn truncate_error(msg: &str) -> String {
     // Extract the last meaningful segment from error chains like
     // "network error: create_in_stack failed: storage operation failed: unable to unpack layer..."
-    let leaf = msg
-        .rsplit(": ")
-        .next()
-        .unwrap_or(msg)
-        .trim();
+    let leaf = msg.rsplit(": ").next().unwrap_or(msg).trim();
 
     // Truncate sha256 digests: sha256:e54bc7400b8c... → sha256:e54bc74…
     let mut result = String::with_capacity(leaf.len());

@@ -6,11 +6,12 @@
 //! - Network access for pulling base images
 //!
 //! Run with:
-//! `cargo nextest run -p vz-oci-macos --test buildkit_e2e -- --ignored`
+//! `./scripts/run-buildkit-e2e.sh`
 
 #![allow(clippy::unwrap_used)]
 
 use std::collections::BTreeMap;
+use std::process::Command;
 use std::time::Duration;
 
 use vz_oci_macos::{BuildRequest, RunConfig, Runtime, RuntimeConfig};
@@ -33,9 +34,38 @@ fn test_config(data_dir: &std::path::Path) -> RuntimeConfig {
     }
 }
 
+fn has_virtualization_entitlement() -> bool {
+    let Ok(test_binary) = std::env::current_exe() else {
+        return false;
+    };
+    let Ok(output) = Command::new("codesign")
+        .arg("-d")
+        .arg("--entitlements")
+        .arg(":-")
+        .arg(&test_binary)
+        .output()
+    else {
+        return false;
+    };
+
+    let entitlements = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    entitlements.contains("com.apple.security.virtualization")
+}
+
 #[tokio::test]
 #[ignore = "requires Apple Silicon + Linux kernel artifacts + network"]
 async fn buildkit_builds_dockerfile_and_run_uses_built_image() {
+    if !has_virtualization_entitlement() {
+        eprintln!(
+            "skipping buildkit_e2e: test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-buildkit-e2e.sh"
+        );
+        return;
+    }
+
     init_tracing();
     let tmp = tempfile::tempdir().unwrap();
     let context_dir = tmp.path().join("context");
@@ -57,13 +87,19 @@ CMD ["cat", "/message.txt"]
         tag: tag.clone(),
         target: None,
         build_args: BTreeMap::new(),
+        secrets: Vec::new(),
         no_cache: false,
+        output: vz_oci_macos::buildkit::BuildOutput::VzStore,
+        progress: vz_oci_macos::buildkit::BuildProgress::Plain,
     };
 
     let build_result = vz_oci_macos::buildkit::build_image(&config, request)
         .await
         .unwrap();
-    assert!(!build_result.image_id.0.is_empty());
+    let image_id = build_result
+        .image_id
+        .expect("vz store output should produce local image ID");
+    assert!(!image_id.0.is_empty());
 
     let runtime = Runtime::new(config);
     let output = runtime.run(&tag, RunConfig::default()).await.unwrap();

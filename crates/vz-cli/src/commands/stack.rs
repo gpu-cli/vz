@@ -1306,7 +1306,7 @@ async fn cmd_ps(args: PsArgs) -> anyhow::Result<()> {
     let observed = store
         .load_observed_state(&args.name)
         .with_context(|| "failed to load observed state")?;
-    
+
     // Load desired state for additional info (ports, etc)
     let desired = store.load_desired_state(&args.name).ok().flatten();
     let desired_ref = desired.as_ref();
@@ -1580,13 +1580,15 @@ async fn cmd_ls(args: LsArgs) -> anyhow::Result<()> {
                         .count();
                     let total = observed
                         .iter()
-                        .filter(|o| o.phase != ServicePhase::Stopped && o.phase != ServicePhase::Pending)
+                        .filter(|o| {
+                            o.phase != ServicePhase::Stopped && o.phase != ServicePhase::Pending
+                        })
                         .count();
                     let failed = observed
                         .iter()
                         .filter(|o| o.phase == ServicePhase::Failed)
                         .count();
-                    
+
                     let (status, error_summary) = if total == 0 && running == 0 {
                         ("◌ stopped".to_string(), None)
                     } else if failed > 0 {
@@ -1629,10 +1631,15 @@ async fn cmd_ls(args: LsArgs) -> anyhow::Result<()> {
         println!("No stacks found.");
     } else {
         // Calculate column widths
-        let name_width = entries.iter().map(|e| e.name.len()).max().unwrap_or(10).max(10);
+        let name_width = entries
+            .iter()
+            .map(|e| e.name.len())
+            .max()
+            .unwrap_or(10)
+            .max(10);
         let status_width = 14;
         let ready_width = 11;
-        
+
         // Header
         println!(
             "{:<width$} {:<status_width$} {:<ready_width$}",
@@ -1641,8 +1648,11 @@ async fn cmd_ls(args: LsArgs) -> anyhow::Result<()> {
             "READY/TOTAL",
             width = name_width
         );
-        println!("{}", "-".repeat(name_width + status_width + ready_width + 2));
-        
+        println!(
+            "{}",
+            "-".repeat(name_width + status_width + ready_width + 2)
+        );
+
         // Rows
         for entry in &entries {
             let ready_str = if entry.total > 0 {
@@ -1657,7 +1667,7 @@ async fn cmd_ls(args: LsArgs) -> anyhow::Result<()> {
                 ready_str,
                 width = name_width
             );
-            
+
             // Show error summary below failed stacks
             if let Some(ref err) = entry.error_summary {
                 let summary = if err.len() > 50 {
@@ -1668,16 +1678,24 @@ async fn cmd_ls(args: LsArgs) -> anyhow::Result<()> {
                 println!("  └─ {}", summary);
             }
         }
-        
+
         // Footer with summary
         println!();
         let running = entries.iter().filter(|e| e.status.starts_with("●")).count();
         let starting = entries.iter().filter(|e| e.status.starts_with("◐")).count();
-        let failed = entries.iter().filter(|e| e.status.starts_with("○ failed")).count();
-        
+        let failed = entries
+            .iter()
+            .filter(|e| e.status.starts_with("○ failed"))
+            .count();
+
         if failed > 0 {
-            println!("Showing {} stacks ({} running, {} starting, {} failed)", 
-                     entries.len(), running, starting, failed);
+            println!(
+                "Showing {} stacks ({} running, {} starting, {} failed)",
+                entries.len(),
+                running,
+                starting,
+                failed
+            );
             println!("Use 'vz stack logs <name>' for details on failed stacks");
         } else {
             println!("Showing {} stacks", entries.len());
@@ -1922,7 +1940,8 @@ fn print_ps_table(observed: &[ServiceObservedState], desired: Option<&StackSpec>
             spec.services
                 .iter()
                 .map(|s| {
-                    let ports = s.ports
+                    let ports = s
+                        .ports
                         .iter()
                         .map(|p| {
                             if let Some(hp) = p.host_port {
@@ -1944,7 +1963,7 @@ fn print_ps_table(observed: &[ServiceObservedState], desired: Option<&StackSpec>
     let health_width = 8;
     let ports_width = 16;
     let container_width = 20;
-    
+
     println!(
         "{:<width_name$} {:<width_status$} {:<width_health$} {:<width_ports$} {:<width_container$}",
         "SERVICE",
@@ -1958,7 +1977,10 @@ fn print_ps_table(observed: &[ServiceObservedState], desired: Option<&StackSpec>
         width_ports = ports_width,
         width_container = container_width
     );
-    println!("{}", "-".repeat(name_width + status_width + health_width + ports_width + container_width + 4));
+    println!(
+        "{}",
+        "-".repeat(name_width + status_width + health_width + ports_width + container_width + 4)
+    );
 
     for svc in observed {
         let status = match svc.phase {
@@ -1970,7 +1992,7 @@ fn print_ps_table(observed: &[ServiceObservedState], desired: Option<&StackSpec>
             ServicePhase::Stopped => "stopped".to_string(),
             ServicePhase::Failed => "failed".to_string(),
         };
-        
+
         let health = if svc.phase == ServicePhase::Failed {
             "✗ fail".to_string()
         } else if svc.ready {
@@ -1980,12 +2002,12 @@ fn print_ps_table(observed: &[ServiceObservedState], desired: Option<&StackSpec>
         } else {
             "-".to_string()
         };
-        
+
         let ports = ports_map
             .get(svc.service_name.as_str())
             .map(|p| p.join(", "))
             .unwrap_or_else(|| "-".to_string());
-        
+
         let cid = svc.container_id.as_deref().unwrap_or("-");
         println!(
             "{:<width_name$} {:<width_status$} {:<width_health$} {:<width_ports$} {:<width_container$}",

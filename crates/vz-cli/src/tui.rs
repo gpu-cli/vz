@@ -95,7 +95,12 @@ pub struct App {
 
 impl App {
     /// Create a new TUI application.
-    pub fn new(stack_name: String, spec: StackSpec, store: StateStore, sock_path: Option<PathBuf>) -> Self {
+    pub fn new(
+        stack_name: String,
+        spec: StackSpec,
+        store: StateStore,
+        sock_path: Option<PathBuf>,
+    ) -> Self {
         let service_names: Vec<String> = spec.services.iter().map(|s| s.name.clone()).collect();
         let logs: HashMap<String, String> = service_names
             .iter()

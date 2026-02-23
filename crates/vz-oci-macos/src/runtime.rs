@@ -561,10 +561,7 @@ impl Runtime {
             let blkid_result = vm
                 .exec_capture(
                     "/bin/busybox".to_string(),
-                    vec![
-                        "blkid".to_string(),
-                        "/dev/vda".to_string(),
-                    ],
+                    vec!["blkid".to_string(), "/dev/vda".to_string()],
                     timeout,
                 )
                 .await;
@@ -862,10 +859,7 @@ impl Runtime {
             })
             .collect();
         if !volume_dirs.is_empty() {
-            let mkdir_cmd = format!(
-                "/bin/busybox mkdir -p {}",
-                volume_dirs.join(" ")
-            );
+            let mkdir_cmd = format!("/bin/busybox mkdir -p {}", volume_dirs.join(" "));
             let mkdir_result = vm
                 .exec_capture(
                     "/bin/busybox".to_string(),

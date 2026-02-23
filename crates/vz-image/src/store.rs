@@ -453,6 +453,10 @@ impl ImageStore {
             overlay_copy_layer(&layer_root, &rootfs)?;
         }
 
+        // Fix ownership: files from container images are often owned by root (UID 0),
+        // which causes permission denied errors when the host user tries to access them.
+        fix_ownership(&rootfs)?;
+
         Ok(rootfs)
     }
 
@@ -816,6 +820,61 @@ fn hard_link_or_copy_file(source: &Path, destination: &Path) -> io::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Fix ownership of a directory tree to match the current user.
+///
+/// Container images often have files owned by root (UID 0), which causes
+/// permission denied errors when the host user tries to access them.
+/// This function uses the `chown` command to recursively fix ownership.
+#[cfg(unix)]
+fn fix_ownership(path: &Path) -> io::Result<()> {
+    // Get current user's UID and GID using whoami and id commands
+    let uid = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "".to_string());
+    
+    let gid = std::process::Command::new("id")
+        .arg("-g")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "".to_string());
+    
+    if uid.is_empty() || gid.is_empty() {
+        tracing::warn!("could not determine user ID for ownership fix");
+        return Ok(());
+    }
+    
+    // Use chown -R to recursively fix ownership
+    let output = std::process::Command::new("chown")
+        .args(["-R", &format!("{}:{}", uid, gid)])
+        .arg(path)
+        .output();
+    
+    match output {
+        Ok(o) if o.status.success() => {
+            tracing::debug!("fixed ownership of {} to {}:{}", path.display(), uid, gid);
+            Ok(())
+        }
+        Ok(o) => {
+            // chown might fail for some files but that's okay
+            let err = String::from_utf8_lossy(&o.stderr);
+            tracing::debug!("chown partial failure: {}", err);
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!("failed to run chown: {}", e);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn fix_ownership(_path: &Path) -> io::Result<()> {
+    // No-op on non-Unix systems
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
