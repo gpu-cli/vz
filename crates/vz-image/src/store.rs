@@ -398,6 +398,9 @@ impl ImageStore {
             Ok(()) => {
                 // We won the race — write the completion marker.
                 File::create(&done_marker)?;
+                // Fix ownership: layers extracted from tar preserve root ownership,
+                // which causes permission denied when host user tries to access them.
+                fix_ownership(&destination)?;
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 // Another thread beat us. Clean up our temp dir and wait for theirs.
