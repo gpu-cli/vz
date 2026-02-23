@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use vz::Vm;
-use vz::protocol::{ExecOutput, NetworkServiceConfig, OciContainerState, OciExecResult};
+use vz::protocol::{ExecEvent, ExecOutput, NetworkServiceConfig, OciContainerState, OciExecResult};
 
 use crate::grpc_client::{GrpcAgentClient, GrpcPortForwardStream};
 use crate::{ExecOptions, LinuxError, LinuxVmConfig, OciExecOptions};
@@ -204,6 +204,86 @@ impl LinuxVm {
                     timeout.as_secs_f64()
                 ))
             })?
+    }
+
+    /// Run a command on the guest and stream output events while buffering final output.
+    pub async fn exec_capture_streaming<F>(
+        &self,
+        command: String,
+        args: Vec<String>,
+        timeout: Duration,
+        on_event: F,
+    ) -> Result<ExecOutput, LinuxError>
+    where
+        F: FnMut(&ExecEvent),
+    {
+        self.exec_capture_with_options_streaming(
+            command,
+            args,
+            timeout,
+            ExecOptions::default(),
+            on_event,
+        )
+        .await
+    }
+
+    /// Run a command with explicit execution options and stream output events.
+    pub async fn exec_capture_with_options_streaming<F>(
+        &self,
+        command: String,
+        args: Vec<String>,
+        timeout: Duration,
+        options: ExecOptions,
+        mut on_event: F,
+    ) -> Result<ExecOutput, LinuxError>
+    where
+        F: FnMut(&ExecEvent),
+    {
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
+
+        tokio::time::timeout(timeout, async move {
+            let mut stream = client.exec_stream(command, args, options).await?;
+            let mut stdout_bytes = Vec::new();
+            let mut stderr_bytes = Vec::new();
+            let mut saw_exit = false;
+            let mut exit_code = -1;
+
+            while let Some(event) = stream.next().await {
+                on_event(&event);
+                match event {
+                    ExecEvent::Stdout(data) => stdout_bytes.extend_from_slice(&data),
+                    ExecEvent::Stderr(data) => stderr_bytes.extend_from_slice(&data),
+                    ExecEvent::Exit(code) => {
+                        saw_exit = true;
+                        exit_code = code;
+                        break;
+                    }
+                }
+            }
+
+            if !saw_exit {
+                return Err(LinuxError::Protocol(
+                    "exec stream ended without exit code".to_string(),
+                ));
+            }
+
+            Ok(ExecOutput {
+                exit_code,
+                stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+            })
+        })
+        .await
+        .map_err(|_| {
+            LinuxError::Protocol(format!(
+                "exec timed out after {:.3}s",
+                timeout.as_secs_f64()
+            ))
+        })?
     }
 
     /// Open a dedicated port-forward stream to a guest-local target port.

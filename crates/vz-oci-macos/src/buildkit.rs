@@ -11,7 +11,7 @@ use tokio::process::Command;
 use tracing::warn;
 use vz::NetworkConfig;
 use vz::SharedDirConfig;
-use vz::protocol::ExecOutput;
+use vz::protocol::{ExecEvent, ExecOutput};
 use vz_image::{ImageId, ImageStore};
 use vz_linux::{
     EnsureKernelOptions, LinuxError, LinuxVm, LinuxVmConfig, default_linux_dir,
@@ -19,6 +19,12 @@ use vz_linux::{
 };
 
 use crate::RuntimeConfig;
+use crate::buildkit_rawjson::BuildkitRawJsonStreamDecoder;
+pub use crate::buildkit_rawjson::{
+    BuildkitPosition, BuildkitProgressGroup, BuildkitRange, BuildkitSolveStatus,
+    BuildkitSourceInfo, BuildkitVertex, BuildkitVertexLog, BuildkitVertexStatus,
+    BuildkitVertexWarning,
+};
 
 const BUILDKIT_VERSION: &str = "0.19.0";
 const BUILDKITD_BINARY: &str = "buildkitd";
@@ -50,7 +56,7 @@ pub enum BuildOutput {
 }
 
 /// Build progress rendering mode passed to buildctl.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BuildProgress {
     /// Buildctl picks plain vs tty based on terminal detection.
     #[default]
@@ -59,6 +65,8 @@ pub enum BuildProgress {
     Plain,
     /// Always print tty progress UI.
     Tty,
+    /// Stream machine-readable status objects (one JSON object per line).
+    RawJson,
 }
 
 impl BuildProgress {
@@ -67,8 +75,32 @@ impl BuildProgress {
             Self::Auto => "auto",
             Self::Plain => "plain",
             Self::Tty => "tty",
+            Self::RawJson => "rawjson",
         }
     }
+}
+
+/// Output stream source for BuildKit log chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildLogStream {
+    Stdout,
+    Stderr,
+}
+
+/// Event emitted while running a BuildKit build.
+#[derive(Debug, Clone)]
+pub enum BuildEvent {
+    /// Lifecycle status update (VM boot, import stage, etc.).
+    Status { message: String },
+    /// Raw output bytes from buildctl.
+    Output {
+        stream: BuildLogStream,
+        chunk: Vec<u8>,
+    },
+    /// Parsed BuildKit solve status from `--progress=rawjson`.
+    SolveStatus { status: BuildkitSolveStatus },
+    /// Rawjson decode failure for a single output line.
+    RawJsonDecodeError { line: String, error: String },
 }
 
 /// Request for a Dockerfile build executed by BuildKit.
@@ -229,6 +261,18 @@ pub async fn build_image(
     config: &RuntimeConfig,
     request: BuildRequest,
 ) -> Result<BuildResult, BuildkitError> {
+    build_image_with_events(config, request, |_event| {}).await
+}
+
+/// Build a Dockerfile and stream lifecycle/output events as they happen.
+pub async fn build_image_with_events<F>(
+    config: &RuntimeConfig,
+    request: BuildRequest,
+    mut on_event: F,
+) -> Result<BuildResult, BuildkitError>
+where
+    F: FnMut(BuildEvent),
+{
     let context_dir = canonicalize_existing_dir(&request.context_dir)?;
     if request.tag.trim().is_empty() {
         return Err(BuildkitError::InvalidConfig(
@@ -255,13 +299,20 @@ pub async fn build_image(
         BuildOutput::RegistryPush => None,
     };
 
+    on_event(BuildEvent::Status {
+        message: "Booting BuildKit VM".to_string(),
+    });
     let vm = start_buildkit_vm(config, Some(&context_dir), output_dir.as_deref()).await?;
+    on_event(BuildEvent::Status {
+        message: "Running BuildKit solve".to_string(),
+    });
     let build_result = run_guest_build(
         &vm,
         &request,
         dockerfile_relative,
         "/mnt/build-context",
         output_dir.as_ref().map(|_| "/mnt/build-output/image.tar"),
+        &mut on_event,
     )
     .await;
     let stop_result = vm.stop().await;
@@ -272,6 +323,9 @@ pub async fn build_image(
 
     let final_result = match output_mode {
         BuildOutput::VzStore => {
+            on_event(BuildEvent::Status {
+                message: "Importing OCI archive into local store".to_string(),
+            });
             let output_dir = output_dir.as_ref().ok_or_else(|| {
                 BuildkitError::InvalidConfig("missing output directory".to_string())
             })?;
@@ -295,6 +349,9 @@ pub async fn build_image(
             }
         }
         BuildOutput::OciTar { dest } => {
+            on_event(BuildEvent::Status {
+                message: "Writing OCI archive output".to_string(),
+            });
             let output_dir = output_dir.as_ref().ok_or_else(|| {
                 BuildkitError::InvalidConfig("missing output directory".to_string())
             })?;
@@ -349,6 +406,8 @@ pub async fn cache_disk_usage(config: &RuntimeConfig) -> Result<String, Buildkit
             &vm,
             vec!["du".to_string(), "--verbose".to_string()],
             BUILDKIT_BUILD_TIMEOUT,
+            None,
+            false,
         )
         .await
     }
@@ -392,7 +451,7 @@ pub async fn cache_prune(
             args.push(keep_storage);
         }
 
-        run_buildctl(&vm, args, BUILDKIT_BUILD_TIMEOUT).await
+        run_buildctl(&vm, args, BUILDKIT_BUILD_TIMEOUT, None, false).await
     }
     .await;
     let stop_result = vm.stop().await;
@@ -500,6 +559,7 @@ async fn run_guest_build(
     dockerfile_relative: &Path,
     guest_context_dir: &str,
     guest_output_tar: Option<&str>,
+    on_event: &mut impl FnMut(BuildEvent),
 ) -> Result<(), BuildkitError> {
     ensure_guest_buildkit_ready(vm).await?;
 
@@ -550,7 +610,14 @@ async fn run_guest_build(
         args.push(secret.clone());
     }
 
-    let output = run_buildctl(vm, args, BUILDKIT_BUILD_TIMEOUT).await?;
+    let output = run_buildctl(
+        vm,
+        args,
+        BUILDKIT_BUILD_TIMEOUT,
+        Some(on_event),
+        request.progress == BuildProgress::RawJson,
+    )
+    .await?;
     if output.exit_code != 0 {
         return Err(BuildkitError::BuildFailed {
             exit_code: output.exit_code,
@@ -663,16 +730,73 @@ async fn run_buildctl(
     vm: &LinuxVm,
     args: Vec<String>,
     timeout: Duration,
+    mut on_event: Option<&mut dyn FnMut(BuildEvent)>,
+    parse_rawjson: bool,
 ) -> Result<ExecOutput, BuildkitError> {
     let mut full_args = vec!["--addr".to_string(), BUILDKITD_ADDR.to_string()];
     full_args.extend(args);
+    let mut rawjson_decoder = parse_rawjson.then(BuildkitRawJsonStreamDecoder::default);
 
     let output = vm
-        .exec_capture("/mnt/buildkit-bin/buildctl".to_string(), full_args, timeout)
+        .exec_capture_streaming(
+            "/mnt/buildkit-bin/buildctl".to_string(),
+            full_args,
+            timeout,
+            |event| {
+                if let Some(callback) = on_event.as_mut() {
+                    match event {
+                        ExecEvent::Stdout(chunk) => {
+                            callback(BuildEvent::Output {
+                                stream: BuildLogStream::Stdout,
+                                chunk: chunk.clone(),
+                            });
+                            if let Some(decoder) = rawjson_decoder.as_mut() {
+                                for decoded in decoder.push_chunk(chunk) {
+                                    match decoded {
+                                        Ok(status) => callback(BuildEvent::SolveStatus { status }),
+                                        Err(error) => callback(BuildEvent::RawJsonDecodeError {
+                                            line: rawjson_line_preview(&error.line),
+                                            error: error.error,
+                                        }),
+                                    }
+                                }
+                            }
+                        }
+                        ExecEvent::Stderr(chunk) => callback(BuildEvent::Output {
+                            stream: BuildLogStream::Stderr,
+                            chunk: chunk.clone(),
+                        }),
+                        ExecEvent::Exit(_) => {
+                            if let Some(decoder) = rawjson_decoder.as_mut() {
+                                for decoded in decoder.finish() {
+                                    match decoded {
+                                        Ok(status) => callback(BuildEvent::SolveStatus { status }),
+                                        Err(error) => callback(BuildEvent::RawJsonDecodeError {
+                                            line: rawjson_line_preview(&error.line),
+                                            error: error.error,
+                                        }),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        )
         .await
         .map_err(BuildkitError::from)?;
 
     Ok(output)
+}
+
+fn rawjson_line_preview(line: &[u8]) -> String {
+    const MAX_CHARS: usize = 240;
+    let mut preview = String::from_utf8_lossy(line).into_owned();
+    if preview.chars().count() > MAX_CHARS {
+        preview = preview.chars().take(MAX_CHARS).collect::<String>();
+        preview.push_str("...");
+    }
+    preview
 }
 
 async fn run_guest_command(
@@ -1074,6 +1198,7 @@ mod tests {
         assert_eq!(BuildProgress::Auto.as_buildctl_value(), "auto");
         assert_eq!(BuildProgress::Plain.as_buildctl_value(), "plain");
         assert_eq!(BuildProgress::Tty.as_buildctl_value(), "tty");
+        assert_eq!(BuildProgress::RawJson.as_buildctl_value(), "rawjson");
     }
 
     #[tokio::test]

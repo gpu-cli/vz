@@ -1,6 +1,8 @@
 //! `vz build` -- Build Dockerfiles into the local vz OCI store.
 
 use std::collections::BTreeMap;
+#[cfg(target_os = "macos")]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand, ValueEnum};
@@ -99,6 +101,8 @@ pub enum ProgressArg {
     Auto,
     Plain,
     Tty,
+    #[value(name = "rawjson")]
+    RawJson,
 }
 
 impl From<ProgressArg> for vz_oci_macos::buildkit::BuildProgress {
@@ -107,6 +111,7 @@ impl From<ProgressArg> for vz_oci_macos::buildkit::BuildProgress {
             ProgressArg::Auto => Self::Auto,
             ProgressArg::Plain => Self::Plain,
             ProgressArg::Tty => Self::Tty,
+            ProgressArg::RawJson => Self::RawJson,
         }
     }
 }
@@ -126,6 +131,7 @@ pub async fn run(args: BuildArgs) -> anyhow::Result<()> {
         let build_args = parse_build_args(&args.build_args)?;
         let secrets = parse_secrets(&args.secrets)?;
         let output = parse_output_mode(args.push, args.output.as_deref())?;
+        let progress = args.progress;
 
         let request = vz_oci_macos::BuildRequest {
             context_dir,
@@ -136,10 +142,15 @@ pub async fn run(args: BuildArgs) -> anyhow::Result<()> {
             secrets,
             no_cache: args.no_cache,
             output,
-            progress: args.progress.into(),
+            progress: progress.into(),
         };
 
-        let result = vz_oci_macos::buildkit::build_image(&config, request).await?;
+        let mut streamer = BuildEventStreamer::new(progress);
+        let result = vz_oci_macos::buildkit::build_image_with_events(&config, request, |event| {
+            streamer.handle(event);
+        })
+        .await?;
+        streamer.finish();
         match (&result.image_id, &result.output_path, result.pushed) {
             (Some(image_id), _, _) => println!("Built {} as {}", result.tag, image_id.0),
             (_, Some(path), _) => {
@@ -160,6 +171,89 @@ pub async fn run(args: BuildArgs) -> anyhow::Result<()> {
     {
         let _ = args;
         anyhow::bail!("`vz build` is currently supported only on macOS")
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, Default)]
+struct RawJsonEventCounters {
+    vertexes: usize,
+    statuses: usize,
+    logs: usize,
+    warnings: usize,
+}
+
+#[cfg(target_os = "macos")]
+struct BuildEventStreamer {
+    progress: ProgressArg,
+    stdout: std::io::Stdout,
+    stderr: std::io::Stderr,
+    rawjson: RawJsonEventCounters,
+}
+
+#[cfg(target_os = "macos")]
+impl BuildEventStreamer {
+    fn new(progress: ProgressArg) -> Self {
+        Self {
+            progress,
+            stdout: std::io::stdout(),
+            stderr: std::io::stderr(),
+            rawjson: RawJsonEventCounters::default(),
+        }
+    }
+
+    fn handle(&mut self, event: vz_oci_macos::buildkit::BuildEvent) {
+        use vz_oci_macos::buildkit::{BuildEvent, BuildLogStream};
+
+        match event {
+            BuildEvent::Status { message } => {
+                let _ = writeln!(self.stderr, "==> {message}");
+                let _ = self.stderr.flush();
+            }
+            BuildEvent::Output { stream, chunk } => match stream {
+                BuildLogStream::Stdout => {
+                    let _ = self.stdout.write_all(&chunk);
+                    let _ = self.stdout.flush();
+                }
+                BuildLogStream::Stderr => {
+                    let _ = self.stderr.write_all(&chunk);
+                    let _ = self.stderr.flush();
+                }
+            },
+            BuildEvent::SolveStatus { status } => {
+                if matches!(self.progress, ProgressArg::RawJson) {
+                    self.rawjson.vertexes += status.vertexes.len();
+                    self.rawjson.statuses += status.statuses.len();
+                    self.rawjson.logs += status.logs.len();
+                    self.rawjson.warnings += status.warnings.len();
+                }
+            }
+            BuildEvent::RawJsonDecodeError { line, error } => {
+                if matches!(self.progress, ProgressArg::RawJson) {
+                    let _ = writeln!(
+                        self.stderr,
+                        "warning: failed to parse BuildKit rawjson line ({error}): {line}"
+                    );
+                    let _ = self.stderr.flush();
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        let _ = self.stdout.flush();
+        let _ = self.stderr.flush();
+        if matches!(self.progress, ProgressArg::RawJson) {
+            let _ = writeln!(
+                self.stderr,
+                "rawjson summary: vertexes={}, statuses={}, logs={}, warnings={}",
+                self.rawjson.vertexes,
+                self.rawjson.statuses,
+                self.rawjson.logs,
+                self.rawjson.warnings
+            );
+            let _ = self.stderr.flush();
+        }
     }
 }
 
@@ -307,6 +401,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use clap::ValueEnum;
 
     #[test]
     fn parse_build_args_supports_multiple_values() {
@@ -379,5 +474,20 @@ mod tests {
     fn default_tag_uses_context_directory_name() {
         let tag = default_tag(Path::new("/tmp/My App"));
         assert_eq!(tag, "my-app:latest");
+    }
+
+    #[test]
+    fn progress_arg_supports_rawjson_value() {
+        let parsed = ProgressArg::from_str("rawjson", true).unwrap();
+        assert!(matches!(parsed, ProgressArg::RawJson));
+    }
+
+    #[test]
+    fn progress_arg_maps_to_buildkit_progress() {
+        let mapped: vz_oci_macos::buildkit::BuildProgress = ProgressArg::RawJson.into();
+        assert!(matches!(
+            mapped,
+            vz_oci_macos::buildkit::BuildProgress::RawJson
+        ));
     }
 }

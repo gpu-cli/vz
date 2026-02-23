@@ -7,6 +7,8 @@
 #![cfg(target_os = "macos")]
 #![forbid(unsafe_code)]
 
+mod buildkit_rawjson;
+
 pub mod buildkit;
 pub mod config;
 pub mod error;
