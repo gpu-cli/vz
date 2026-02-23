@@ -3143,6 +3143,7 @@ dependencies = [
 name = "vz-oci-macos"
 version = "0.1.0"
 dependencies = [
+ "oci-distribution",
  "oci-spec",
  "reqwest",
  "serde",

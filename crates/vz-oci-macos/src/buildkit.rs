@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use oci_distribution::Reference;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -12,7 +14,8 @@ use vz::SharedDirConfig;
 use vz::protocol::ExecOutput;
 use vz_image::{ImageId, ImageStore};
 use vz_linux::{
-    EnsureKernelOptions, LinuxError, LinuxVm, LinuxVmConfig, ensure_kernel_with_options,
+    EnsureKernelOptions, LinuxError, LinuxVm, LinuxVmConfig, default_linux_dir,
+    ensure_kernel_with_options,
 };
 
 use crate::RuntimeConfig;
@@ -26,7 +29,8 @@ const BUILD_OUTPUT_ARCHIVE: &str = "image.tar";
 const BUILDKITD_ADDR: &str = "tcp://127.0.0.1:8372";
 const BUILDKIT_SETUP_TIMEOUT: Duration = Duration::from_secs(90);
 const BUILDKIT_BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const BUILDKIT_RUNC_GUEST_PATH: &str = "/tmp/buildkit-runc";
+const BUILDKIT_RUNC_GUEST_PATH: &str = "/tmp/runc";
+const BUILDKIT_SNAPSHOTTER: &str = "overlayfs";
 const BUILDKIT_CACHE_KEEP_DURATION: &str = "168h";
 const BUILDKIT_CACHE_KEEP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
@@ -437,6 +441,28 @@ async fn start_buildkit_vm(
         },
     ];
 
+    if let Some(linux_install_dir) = &config.linux_install_dir {
+        vm_config.shared_dirs.push(SharedDirConfig {
+            tag: "linux-bin".to_string(),
+            source: expand_home_dir(linux_install_dir),
+            read_only: true,
+        });
+    } else if let Ok(default_linux_install_dir) = default_linux_dir() {
+        vm_config.shared_dirs.push(SharedDirConfig {
+            tag: "linux-bin".to_string(),
+            source: default_linux_install_dir,
+            read_only: true,
+        });
+    }
+
+    if let Some(host_ssl_dir) = host_ssl_dir() {
+        vm_config.shared_dirs.push(SharedDirConfig {
+            tag: "host-ssl".to_string(),
+            source: host_ssl_dir,
+            read_only: true,
+        });
+    }
+
     if let Some(context_dir) = context_dir {
         vm_config.shared_dirs.push(SharedDirConfig {
             tag: "build-context".to_string(),
@@ -541,21 +567,52 @@ async fn ensure_guest_buildkit_ready(vm: &LinuxVm) -> Result<(), BuildkitError> 
         r#"
 set -eu
 
-/bin/busybox mkdir -p /mnt/buildkit-bin /var/lib/buildkit /mnt/build-context /mnt/build-output
+/bin/busybox mkdir -p /mnt/buildkit-bin /mnt/buildkit-cache /mnt/linux-bin /var/lib/buildkit /mnt/build-context /mnt/build-output /mnt/host-ssl
 /bin/busybox mkdir -p /etc/buildkit
 /bin/busybox mount -t virtiofs buildkit-bin /mnt/buildkit-bin 2>/dev/null || true
-/bin/busybox mount -t virtiofs buildkit-cache /var/lib/buildkit 2>/dev/null || true
+/bin/busybox mount -t virtiofs buildkit-cache /mnt/buildkit-cache 2>/dev/null || true
+/bin/busybox mount -t virtiofs linux-bin /mnt/linux-bin 2>/dev/null || true
 /bin/busybox mount -t virtiofs build-context /mnt/build-context 2>/dev/null || true
 /bin/busybox mount -t virtiofs build-output /mnt/build-output 2>/dev/null || true
+/bin/busybox mount -t virtiofs host-ssl /mnt/host-ssl 2>/dev/null || true
+/bin/busybox mkdir -p /sys/fs/cgroup
+/bin/busybox mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
 
-/bin/busybox cp /mnt/buildkit-bin/buildkit-runc {BUILDKIT_RUNC_GUEST_PATH}
-/bin/busybox chmod 0755 {BUILDKIT_RUNC_GUEST_PATH}
+/bin/busybox cp /mnt/buildkit-bin/buildkit-runc /tmp/runc-real
+/bin/busybox cat >{BUILDKIT_RUNC_GUEST_PATH} <<'RUNC'
+#!/bin/sh
+set -eu
+
+new_args=""
+inserted=0
+for arg in "$@"; do
+  escaped=$(/bin/busybox sed "s/'/'\\\\''/g" <<EOF
+$arg
+EOF
+)
+  new_args="$new_args '$escaped'"
+  if [ "$inserted" -eq 0 ] && {{ [ "$arg" = "run" ] || [ "$arg" = "create" ]; }}; then
+    new_args="$new_args '--no-pivot'"
+    inserted=1
+  fi
+done
+
+eval "exec /tmp/runc-real $new_args"
+RUNC
+/bin/busybox chmod 0755 {BUILDKIT_RUNC_GUEST_PATH} /tmp/runc-real
+export PATH="/tmp:/mnt/buildkit-bin:$PATH"
+if [ -f /mnt/host-ssl/cert.pem ]; then
+  /bin/busybox mkdir -p /etc/ssl/certs
+  /bin/busybox cp /mnt/host-ssl/cert.pem /etc/ssl/cert.pem
+  /bin/busybox cp /mnt/host-ssl/cert.pem /etc/ssl/certs/ca-certificates.crt
+  export SSL_CERT_FILE=/mnt/host-ssl/cert.pem
+fi
 
 /bin/busybox cat >/etc/buildkit/buildkitd.toml <<'CFG'
 [worker.oci]
   binary = "{BUILDKIT_RUNC_GUEST_PATH}"
   gc = true
-  snapshotter = "overlayfs"
+  snapshotter = "{BUILDKIT_SNAPSHOTTER}"
 
 [[worker.oci.gcpolicy]]
   keepDuration = "{BUILDKIT_CACHE_KEEP_DURATION}"
@@ -571,7 +628,7 @@ if ! /mnt/buildkit-bin/buildctl --addr {BUILDKITD_ADDR} debug workers >/dev/null
     --config /etc/buildkit/buildkitd.toml \
     --addr {BUILDKITD_ADDR} \
     --oci-worker-binary {BUILDKIT_RUNC_GUEST_PATH} \
-    --oci-worker-snapshotter overlayfs \
+    --oci-worker-snapshotter {BUILDKIT_SNAPSHOTTER} \
     --root /var/lib/buildkit >/tmp/buildkitd.log 2>&1 &
 fi
 
@@ -653,6 +710,15 @@ fn render_command_output(output: ExecOutput) -> String {
         rendered.push_str(output.stderr.trim_end());
     }
     rendered
+}
+
+fn host_ssl_dir() -> Option<PathBuf> {
+    let ssl_dir = PathBuf::from("/etc/ssl");
+    if ssl_dir.join("cert.pem").is_file() {
+        Some(ssl_dir)
+    } else {
+        None
+    }
 }
 
 async fn ensure_buildkit_artifacts() -> Result<BuildkitArtifacts, BuildkitError> {
@@ -834,7 +900,11 @@ async fn import_oci_tar_to_store(
         verify_blob_digest(&layer.digest, &layer_blob)?;
         store.write_layer_blob(&layer.digest, &layer.media_type, &layer_blob)?;
     }
-    store.write_reference(reference, &manifest_digest)?;
+    let canonical_reference = canonicalize_reference(reference);
+    store.write_reference(&canonical_reference, &manifest_digest)?;
+    if canonical_reference != reference {
+        store.write_reference(reference, &manifest_digest)?;
+    }
 
     if let Err(error) = tokio::fs::remove_dir_all(&extract_dir).await {
         warn!(
@@ -845,6 +915,12 @@ async fn import_oci_tar_to_store(
     }
 
     Ok(ImageId(manifest_digest))
+}
+
+fn canonicalize_reference(reference: &str) -> String {
+    Reference::from_str(reference)
+        .map(|parsed| parsed.whole())
+        .unwrap_or_else(|_| reference.to_string())
 }
 
 async fn read_blob(root: &Path, digest: &str) -> Result<Vec<u8>, BuildkitError> {
