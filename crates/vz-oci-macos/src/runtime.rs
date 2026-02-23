@@ -2236,7 +2236,11 @@ fn mount_specs_to_bundle_mounts(
         let guest_source = match &spec.mount_type {
             MountType::Bind => {
                 let global_idx = tag_offset + idx;
-                PathBuf::from(format!("/mnt/vz-mount-{global_idx}"))
+                let base = PathBuf::from(format!("/mnt/vz-mount-{global_idx}"));
+                match &spec.subpath {
+                    Some(sub) => base.join(sub),
+                    None => base,
+                }
             }
             MountType::Tmpfs | MountType::Volume { .. } => source,
         };
@@ -3345,6 +3349,7 @@ mod tests {
             target: PathBuf::from("/container/data"),
             mount_type: MountType::Bind,
             access: MountAccess::ReadWrite,
+            subpath: None,
         }];
 
         let bundle_mounts = mount_specs_to_bundle_mounts(&mounts, 0).unwrap();
@@ -3367,6 +3372,7 @@ mod tests {
             target: PathBuf::from("/etc/app"),
             mount_type: MountType::Bind,
             access: MountAccess::ReadOnly,
+            subpath: None,
         }];
 
         let bundle_mounts = mount_specs_to_bundle_mounts(&mounts, 0).unwrap();
@@ -3381,6 +3387,7 @@ mod tests {
             target: PathBuf::from("/tmp"),
             mount_type: MountType::Tmpfs,
             access: MountAccess::ReadWrite,
+            subpath: None,
         }];
 
         let bundle_mounts = mount_specs_to_bundle_mounts(&mounts, 0).unwrap();
@@ -3397,6 +3404,7 @@ mod tests {
             target: PathBuf::from("relative/path"),
             mount_type: MountType::Bind,
             access: MountAccess::ReadWrite,
+            subpath: None,
         }];
 
         let err = mount_specs_to_bundle_mounts(&mounts, 0).unwrap_err();
@@ -3410,6 +3418,7 @@ mod tests {
             target: PathBuf::from("/container/path"),
             mount_type: MountType::Bind,
             access: MountAccess::ReadWrite,
+            subpath: None,
         }];
 
         let err = mount_specs_to_bundle_mounts(&mounts, 0).unwrap_err();
@@ -3424,18 +3433,21 @@ mod tests {
                 target: PathBuf::from("/container/a"),
                 mount_type: MountType::Bind,
                 access: MountAccess::ReadWrite,
+                subpath: None,
             },
             MountSpec {
                 source: None,
                 target: PathBuf::from("/tmp"),
                 mount_type: MountType::Tmpfs,
                 access: MountAccess::ReadWrite,
+                subpath: None,
             },
             MountSpec {
                 source: Some(PathBuf::from("/host/b")),
                 target: PathBuf::from("/container/b"),
                 mount_type: MountType::Bind,
                 access: MountAccess::ReadOnly,
+                subpath: None,
             },
         ];
 
@@ -3463,6 +3475,7 @@ mod tests {
                 target: PathBuf::from("/data"),
                 mount_type: MountType::Bind,
                 access: MountAccess::ReadWrite,
+                subpath: None,
             }],
             ..RunConfig::default()
         };

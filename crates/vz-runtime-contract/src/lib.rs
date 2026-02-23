@@ -201,6 +201,7 @@ mod tests {
             target: std::path::PathBuf::from("/data"),
             mount_type: MountType::Tmpfs,
             access: MountAccess::ReadWrite,
+            subpath: None,
         };
         let _net = NetworkServiceConfig {
             name: "web".to_string(),

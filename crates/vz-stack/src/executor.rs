@@ -516,9 +516,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             let mut mount_tag_offsets: HashMap<String, usize> = HashMap::new();
             let mut has_named_volumes = false;
             for svc in &spec.services {
-                let resolved = self
+                let mut resolved = self
                     .volumes
                     .resolve_mounts(&svc.mounts, &spec.volumes)?;
+                crate::volume::validate_bind_mounts(&mut resolved)?;
                 // This service's bind mounts start at the current global index.
                 mount_tag_offsets.insert(svc.name.clone(), all_volume_mounts.len());
                 for rm in &resolved {
@@ -793,9 +794,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         )?;
 
         // Resolve mounts using volume manager.
-        let resolved_mounts = self
+        let mut resolved_mounts = self
             .volumes
             .resolve_mounts(&svc_spec.mounts, &spec.volumes)?;
+        crate::volume::validate_bind_mounts(&mut resolved_mounts)?;
 
         // Allocate ports (resolves ephemeral ports, checks conflicts).
         let published = match self.ports.allocate(service_name, &svc_spec.ports) {

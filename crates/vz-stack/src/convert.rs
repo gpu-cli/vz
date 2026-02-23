@@ -107,6 +107,7 @@ pub fn secrets_to_mounts(
             target: PathBuf::from(format!("/run/secrets/{}", s.target)),
             mount_type: vz_runtime_contract::MountType::Bind,
             access: vz_runtime_contract::MountAccess::ReadOnly,
+            subpath: None,
         })
         .collect()
 }
@@ -202,6 +203,7 @@ fn convert_mounts(resolved: &[ResolvedMount]) -> Vec<vz_runtime_contract::MountS
                 target: PathBuf::from(&rm.target),
                 mount_type,
                 access,
+                subpath: rm.subpath.clone(),
             }
         })
         .collect()
@@ -420,6 +422,7 @@ mod tests {
             target: "/container/data".to_string(),
             read_only: true,
             kind: ResolvedMountKind::Bind,
+            subpath: None,
         }];
         let spec = minimal_service();
         let config = service_to_run_config(&spec, &resolved, &[]).unwrap();
@@ -445,6 +448,7 @@ mod tests {
             kind: ResolvedMountKind::Named {
                 volume_name: "dbdata".to_string(),
             },
+            subpath: None,
         }];
         let spec = minimal_service();
         let config = service_to_run_config(&spec, &resolved, &[]).unwrap();
@@ -465,6 +469,7 @@ mod tests {
             target: "/tmp".to_string(),
             read_only: false,
             kind: ResolvedMountKind::Ephemeral,
+            subpath: None,
         }];
         let spec = minimal_service();
         let config = service_to_run_config(&spec, &resolved, &[]).unwrap();
@@ -619,6 +624,7 @@ mod tests {
             target: "/config".to_string(),
             read_only: true,
             kind: ResolvedMountKind::Bind,
+            subpath: None,
         }];
 
         let config = service_to_run_config(&spec, &resolved_mounts, &[]).unwrap();

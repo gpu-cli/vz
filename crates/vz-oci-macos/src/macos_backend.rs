@@ -305,6 +305,7 @@ fn mount_spec_from_contract(m: contract::MountSpec) -> oci_config::MountSpec {
             contract::MountAccess::ReadWrite => oci_config::MountAccess::ReadWrite,
             contract::MountAccess::ReadOnly => oci_config::MountAccess::ReadOnly,
         },
+        subpath: m.subpath,
     }
 }
 

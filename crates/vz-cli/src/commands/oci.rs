@@ -1350,6 +1350,7 @@ fn parse_volume_mount(spec: &str) -> anyhow::Result<MountSpec> {
         target: PathBuf::from(target),
         mount_type: MountType::Bind,
         access,
+        subpath: None,
     })
 }
 

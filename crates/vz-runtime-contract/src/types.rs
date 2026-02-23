@@ -84,6 +84,11 @@ pub struct MountSpec {
     pub mount_type: MountType,
     /// Access mode.
     pub access: MountAccess,
+    /// For file bind mounts: subpath within the VirtioFS-shared parent directory.
+    ///
+    /// The VirtioFS share exposes the parent dir; the OCI bundle bind-mounts
+    /// `/mnt/vz-mount-{idx}/{subpath}` to the container target.
+    pub subpath: Option<String>,
 }
 
 // ── Run configuration ─────────────────────────────────────────────

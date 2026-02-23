@@ -24,6 +24,10 @@ pub struct ResolvedMount {
     pub read_only: bool,
     /// Mount kind.
     pub kind: ResolvedMountKind,
+    /// For file bind mounts: the filename within the VirtioFS-shared parent directory.
+    ///
+    /// When set, `host_path` points to the parent directory (not the file itself).
+    pub subpath: Option<String>,
 }
 
 /// Kind of a resolved mount.
@@ -65,6 +69,7 @@ pub fn resolve_mounts(
                     target: target.clone(),
                     read_only: *read_only,
                     kind: ResolvedMountKind::Bind,
+                    subpath: None,
                 });
             }
             MountSpec::Named {
@@ -85,6 +90,7 @@ pub fn resolve_mounts(
                     kind: ResolvedMountKind::Named {
                         volume_name: source.clone(),
                     },
+                    subpath: None,
                 });
             }
             MountSpec::Ephemeral { target } => {
@@ -93,12 +99,106 @@ pub fn resolve_mounts(
                     target: target.clone(),
                     read_only: false,
                     kind: ResolvedMountKind::Ephemeral,
+                    subpath: None,
                 });
             }
         }
     }
 
     Ok(resolved)
+}
+
+/// Validate bind mount source paths and handle file/socket sources.
+///
+/// - **Non-existent source** → error with clear message
+/// - **Regular file** → set `host_path` to parent dir, `subpath` to filename
+/// - **Socket/pipe/device** → remove from list with warning
+/// - **Directory** → resolve to absolute path, pass through
+///
+/// Must be called after [`resolve_mounts`] and before the executor builds
+/// VirtioFS tags, so that filtered entries don't consume tag indices.
+pub fn validate_bind_mounts(resolved: &mut Vec<ResolvedMount>) -> Result<(), StackError> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let mut i = 0;
+    while i < resolved.len() {
+        if resolved[i].kind != ResolvedMountKind::Bind {
+            i += 1;
+            continue;
+        }
+        let host_path = match &resolved[i].host_path {
+            Some(p) => p.clone(),
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+
+        let absolute = if host_path.is_relative() {
+            std::env::current_dir()
+                .map_err(|e| StackError::InvalidSpec(format!("cannot resolve CWD: {e}")))?
+                .join(&host_path)
+        } else {
+            host_path.clone()
+        };
+
+        if !absolute.exists() {
+            return Err(StackError::InvalidSpec(format!(
+                "bind mount source does not exist: {}",
+                host_path.display()
+            )));
+        }
+
+        let metadata = std::fs::metadata(&absolute).map_err(|e| {
+            StackError::InvalidSpec(format!(
+                "cannot stat bind mount source {}: {e}",
+                absolute.display()
+            ))
+        })?;
+
+        if metadata.is_file() {
+            let parent = absolute.parent().ok_or_else(|| {
+                StackError::InvalidSpec(format!(
+                    "file bind mount has no parent directory: {}",
+                    absolute.display()
+                ))
+            })?;
+            let filename = absolute.file_name().ok_or_else(|| {
+                StackError::InvalidSpec(format!(
+                    "file bind mount has no filename: {}",
+                    absolute.display()
+                ))
+            })?;
+            resolved[i].host_path = Some(parent.to_path_buf());
+            resolved[i].subpath = Some(filename.to_string_lossy().into_owned());
+            i += 1;
+        } else if metadata.is_dir() {
+            resolved[i].host_path = Some(absolute);
+            i += 1;
+        } else {
+            // Socket, pipe, device, etc. — VirtioFS cannot share these.
+            let ft = metadata.file_type();
+            let kind = if ft.is_socket() {
+                "socket"
+            } else if ft.is_fifo() {
+                "named pipe"
+            } else if ft.is_block_device() {
+                "block device"
+            } else if ft.is_char_device() {
+                "character device"
+            } else {
+                "unsupported file type"
+            };
+            tracing::warn!(
+                source = %host_path.display(),
+                target = %resolved[i].target,
+                kind,
+                "skipping bind mount: source is a {kind} (VirtioFS only supports files and directories)"
+            );
+            resolved.remove(i);
+        }
+    }
+    Ok(())
 }
 
 /// Detect whether mount configurations have changed between two service specs.
@@ -758,5 +858,119 @@ mod tests {
             resolved[0].host_path,
             Some(mgr.volumes_dir().join("dbdata"))
         );
+    }
+
+    // --- validate_bind_mounts tests ---
+
+    #[test]
+    fn validate_bind_mounts_directory_resolves_to_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("mydir");
+        std::fs::create_dir(&dir).unwrap();
+
+        let mut resolved = vec![ResolvedMount {
+            host_path: Some(dir.clone()),
+            target: "/data".to_string(),
+            read_only: false,
+            kind: ResolvedMountKind::Bind,
+            subpath: None,
+        }];
+
+        validate_bind_mounts(&mut resolved).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].host_path, Some(dir));
+        assert!(resolved[0].subpath.is_none());
+    }
+
+    #[test]
+    fn validate_bind_mounts_file_sets_subpath() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("config.toml");
+        std::fs::write(&file, "key = 'value'").unwrap();
+
+        let mut resolved = vec![ResolvedMount {
+            host_path: Some(file),
+            target: "/etc/config.toml".to_string(),
+            read_only: true,
+            kind: ResolvedMountKind::Bind,
+            subpath: None,
+        }];
+
+        validate_bind_mounts(&mut resolved).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].host_path, Some(tmp.path().to_path_buf()));
+        assert_eq!(resolved[0].subpath, Some("config.toml".to_string()));
+    }
+
+    #[test]
+    fn validate_bind_mounts_nonexistent_returns_error() {
+        let mut resolved = vec![ResolvedMount {
+            host_path: Some(PathBuf::from("/nonexistent/path/that/does/not/exist")),
+            target: "/data".to_string(),
+            read_only: false,
+            kind: ResolvedMountKind::Bind,
+            subpath: None,
+        }];
+
+        let err = validate_bind_mounts(&mut resolved).unwrap_err();
+        assert!(matches!(err, StackError::InvalidSpec(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_bind_mounts_socket_is_skipped() {
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("test.sock");
+        let _listener = UnixListener::bind(&sock_path).unwrap();
+
+        let mut resolved = vec![
+            ResolvedMount {
+                host_path: Some(sock_path),
+                target: "/var/run/test.sock".to_string(),
+                read_only: false,
+                kind: ResolvedMountKind::Bind,
+                subpath: None,
+            },
+            ResolvedMount {
+                host_path: Some(tmp.path().to_path_buf()),
+                target: "/data".to_string(),
+                read_only: false,
+                kind: ResolvedMountKind::Bind,
+                subpath: None,
+            },
+        ];
+
+        validate_bind_mounts(&mut resolved).unwrap();
+        // Socket should be filtered out, directory should remain.
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].target, "/data");
+    }
+
+    #[test]
+    fn validate_bind_mounts_skips_non_bind_mounts() {
+        let mut resolved = vec![
+            ResolvedMount {
+                host_path: None,
+                target: "/tmp".to_string(),
+                read_only: false,
+                kind: ResolvedMountKind::Ephemeral,
+                subpath: None,
+            },
+            ResolvedMount {
+                host_path: Some(PathBuf::from("/volumes/dbdata")),
+                target: "/var/lib/db".to_string(),
+                read_only: false,
+                kind: ResolvedMountKind::Named {
+                    volume_name: "dbdata".to_string(),
+                },
+                subpath: None,
+            },
+        ];
+
+        // Should not error — non-bind mounts are passed through without validation.
+        validate_bind_mounts(&mut resolved).unwrap();
+        assert_eq!(resolved.len(), 2);
     }
 }
