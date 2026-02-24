@@ -233,7 +233,82 @@ pub fn validate_bind_mounts(
 ///
 /// Returns `true` if mounts differ, which should trigger a service recreate.
 pub fn mounts_changed(old: &[MountSpec], new: &[MountSpec]) -> bool {
-    old != new
+    let mut old_normalized: Vec<String> = old.iter().map(normalize_mount_spec).collect();
+    let mut new_normalized: Vec<String> = new.iter().map(normalize_mount_spec).collect();
+
+    old_normalized.sort();
+    new_normalized.sort();
+
+    old_normalized != new_normalized
+}
+
+fn normalize_mount_spec(spec: &MountSpec) -> String {
+    match spec {
+        MountSpec::Bind {
+            source,
+            target,
+            read_only,
+        } => format!(
+            "bind|{}|{}|{}",
+            normalize_host_path(source),
+            normalize_container_path(target),
+            read_only
+        ),
+        MountSpec::Named {
+            source,
+            target,
+            read_only,
+        } => format!(
+            "named|{}|{}|{}",
+            source.trim(),
+            normalize_container_path(target),
+            read_only
+        ),
+        MountSpec::Ephemeral { target } => {
+            format!("ephemeral|{}", normalize_container_path(target))
+        }
+    }
+}
+
+fn normalize_host_path(source: &str) -> String {
+    let trimmed = source.trim();
+    let path = Path::new(trimmed);
+    let absolute = if path.is_relative() {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    normalize_path_components(&absolute).display().to_string()
+}
+
+fn normalize_container_path(target: &str) -> String {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    normalize_path_components(Path::new(trimmed))
+        .display()
+        .to_string()
+}
+
+fn normalize_path_components(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
 }
 
 /// Collect named volume names referenced by a set of services.
@@ -567,6 +642,36 @@ mod tests {
             read_only: false,
         }];
         assert!(!mounts_changed(&mounts, &mounts));
+    }
+
+    #[test]
+    fn mounts_changed_ignores_mount_order_and_path_spelling() {
+        let old = vec![
+            MountSpec::Bind {
+                source: "/tmp/vz/../vz/workspace".to_string(),
+                target: "/workspace/./src".to_string(),
+                read_only: false,
+            },
+            MountSpec::Named {
+                source: "cache".to_string(),
+                target: "/cache".to_string(),
+                read_only: true,
+            },
+        ];
+        let new = vec![
+            MountSpec::Named {
+                source: "cache".to_string(),
+                target: "/cache".to_string(),
+                read_only: true,
+            },
+            MountSpec::Bind {
+                source: "/tmp/vz/workspace".to_string(),
+                target: "/workspace/src".to_string(),
+                read_only: false,
+            },
+        ];
+
+        assert!(!mounts_changed(&old, &new));
     }
 
     #[test]

@@ -12,6 +12,7 @@ use crate::events::StackEvent;
 use crate::health::{DependencyCheck, HealthStatus, check_dependencies};
 use crate::spec::{ServiceSpec, StackSpec};
 use crate::state_store::{ServiceObservedState, ServicePhase, StateStore};
+use crate::volume;
 
 /// A reconciliation action to converge observed state toward desired state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +236,11 @@ fn compute_actions(
         .iter()
         .map(|o| (o.service_name.as_str(), o))
         .collect();
+    let previous_service_map: HashMap<&str, &ServiceSpec> = previous_services
+        .unwrap_or(&[])
+        .iter()
+        .map(|svc| (svc.name.as_str(), svc))
+        .collect();
 
     let desired_names: HashSet<&str> = desired_services.iter().map(|s| s.name.as_str()).collect();
 
@@ -243,6 +249,14 @@ fn compute_actions(
 
     // Services to create or recreate.
     for svc in desired_services {
+        let mount_topology_changed = previous_service_map
+            .get(svc.name.as_str())
+            .is_some_and(|previous| volume::mounts_changed(&previous.mounts, &svc.mounts));
+        let needs_recreate = mount_topology_changed
+            && observed_map
+                .get(svc.name.as_str())
+                .is_some_and(|obs| matches!(obs.phase, ServicePhase::Running));
+
         let needs_create = match observed_map.get(svc.name.as_str()) {
             None => true,
             Some(obs) => {
@@ -254,13 +268,19 @@ fn compute_actions(
             }
         };
 
-        if needs_create {
+        if needs_recreate || needs_create {
             // Check dependency readiness before allowing creation.
             match check_dependencies(svc, observed, desired_services, health_statuses) {
                 DependencyCheck::Ready => {
-                    actions.push(Action::ServiceCreate {
-                        service_name: svc.name.clone(),
-                    });
+                    if needs_recreate {
+                        actions.push(Action::ServiceRecreate {
+                            service_name: svc.name.clone(),
+                        });
+                    } else {
+                        actions.push(Action::ServiceCreate {
+                            service_name: svc.name.clone(),
+                        });
+                    }
                 }
                 DependencyCheck::Blocked { waiting_on } => {
                     deferred.push(DeferredService {
@@ -432,7 +452,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use crate::spec::{ServiceDependency, StackSpec};
+    use crate::spec::{MountSpec, ServiceDependency, StackSpec};
 
     fn svc(name: &str, image: &str) -> ServiceSpec {
         ServiceSpec {
@@ -554,6 +574,63 @@ mod tests {
 
         let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn compute_actions_recreates_running_service_when_mounts_change() {
+        let desired = vec![ServiceSpec {
+            mounts: vec![MountSpec::Bind {
+                source: "/workspace/new".to_string(),
+                target: "/workspace".to_string(),
+                read_only: false,
+            }],
+            ..svc("web", "nginx:latest")
+        }];
+        let previous = vec![ServiceSpec {
+            mounts: vec![MountSpec::Bind {
+                source: "/workspace/old".to_string(),
+                target: "/workspace".to_string(),
+                read_only: false,
+            }],
+            ..svc("web", "nginx:latest")
+        }];
+        let observed = vec![obs_running("web")];
+
+        let (actions, deferred) =
+            compute_actions(&desired, &observed, &no_health(), Some(previous.as_slice()));
+        assert_eq!(
+            actions,
+            vec![Action::ServiceRecreate {
+                service_name: "web".to_string(),
+            }]
+        );
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn compute_actions_keeps_running_service_when_mounts_match_previous_spec() {
+        let desired = vec![ServiceSpec {
+            mounts: vec![MountSpec::Bind {
+                source: "/workspace/src".to_string(),
+                target: "/workspace".to_string(),
+                read_only: false,
+            }],
+            ..svc("web", "nginx:latest")
+        }];
+        let previous = vec![ServiceSpec {
+            mounts: vec![MountSpec::Bind {
+                source: "/workspace/src".to_string(),
+                target: "/workspace".to_string(),
+                read_only: false,
+            }],
+            ..svc("web", "nginx:latest")
+        }];
+        let observed = vec![obs_running("web")];
+
+        let (actions, deferred) =
+            compute_actions(&desired, &observed, &no_health(), Some(previous.as_slice()));
+        assert!(actions.is_empty());
+        assert!(deferred.is_empty());
     }
 
     #[test]

@@ -8,12 +8,14 @@
 // its size is dictated by the tonic crate and cannot be reduced here.
 #![allow(clippy::result_large_err)]
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(target_os = "linux")]
 use tracing::error;
@@ -29,6 +31,77 @@ use crate::process_table::ProcessTable;
 pub struct SharedState {
     /// Process table for tracking spawned child processes.
     pub process_table: Arc<Mutex<ProcessTable>>,
+}
+
+#[derive(Clone)]
+struct ExecOrderContext {
+    sender: tokio::sync::mpsc::Sender<Result<ExecEvent, Status>>,
+    gate: Arc<Mutex<()>>,
+    sequence: Arc<AtomicU64>,
+}
+
+impl ExecOrderContext {
+    fn new(sender: tokio::sync::mpsc::Sender<Result<ExecEvent, Status>>) -> Self {
+        Self {
+            sender,
+            gate: Arc::new(Mutex::new(())),
+            sequence: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+static EXEC_ORDER_CONTEXTS: OnceLock<StdMutex<HashMap<u64, ExecOrderContext>>> = OnceLock::new();
+
+fn exec_order_contexts() -> &'static StdMutex<HashMap<u64, ExecOrderContext>> {
+    EXEC_ORDER_CONTEXTS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn with_exec_order_contexts<R>(f: impl FnOnce(&mut HashMap<u64, ExecOrderContext>) -> R) -> R {
+    let mut guard = exec_order_contexts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut guard)
+}
+
+fn register_exec_order_context(exec_id: u64, context: ExecOrderContext) {
+    with_exec_order_contexts(|contexts| {
+        contexts.insert(exec_id, context);
+    });
+}
+
+fn lookup_exec_order_context(exec_id: u64) -> Option<ExecOrderContext> {
+    with_exec_order_contexts(|contexts| contexts.get(&exec_id).cloned())
+}
+
+fn remove_exec_order_context(exec_id: u64) {
+    with_exec_order_contexts(|contexts| {
+        contexts.remove(&exec_id);
+    });
+}
+
+async fn send_ordered_exec_event(exec_id: u64, event: exec_event::Event) -> Result<u64, ()> {
+    let Some(context) = lookup_exec_order_context(exec_id) else {
+        return Err(());
+    };
+    let _guard = context.gate.lock().await;
+    let sequence = context.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+    context
+        .sender
+        .send(Ok(ExecEvent { event: Some(event) }))
+        .await
+        .map_err(|_| ())?;
+    Ok(sequence)
+}
+
+async fn mark_ordered_control(exec_id: u64, operation: &str) -> Option<u64> {
+    let context = lookup_exec_order_context(exec_id)?;
+    let _guard = context.gate.lock().await;
+    let sequence = context.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+    debug!(
+        exec_id,
+        sequence, operation, "grpc: exec control op ordered"
+    );
+    Some(sequence)
 }
 
 // ── AgentService ────────────────────────────────────────────────────
@@ -154,11 +227,11 @@ impl agent_service_server::AgentService for AgentServiceImpl {
 
         // Channel for streaming ExecEvents back to the client.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ExecEvent, Status>>(64);
+        register_exec_order_context(exec_id, ExecOrderContext::new(tx.clone()));
 
         let process_table = self.state.process_table.clone();
 
         // Spawn stdout reader.
-        let stdout_tx = tx.clone();
         let stdout_handle = tokio::spawn(async move {
             if let Some(mut stdout) = stdout {
                 let mut buf = vec![0u8; 65536];
@@ -166,14 +239,16 @@ impl agent_service_server::AgentService for AgentServiceImpl {
                     match stdout.read(&mut buf).await {
                         Ok(0) => break,
                         Ok(n) => {
-                            if stdout_tx
-                                .send(Ok(ExecEvent {
-                                    event: Some(exec_event::Event::Stdout(buf[..n].to_vec())),
-                                }))
-                                .await
-                                .is_err()
+                            match send_ordered_exec_event(
+                                exec_id,
+                                exec_event::Event::Stdout(buf[..n].to_vec()),
+                            )
+                            .await
                             {
-                                break; // Client disconnected.
+                                Ok(sequence) => {
+                                    debug!(exec_id, sequence, bytes = n, "grpc: stdout chunk");
+                                }
+                                Err(_) => break, // Stream no longer active.
                             }
                         }
                         Err(e) => {
@@ -186,7 +261,6 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         });
 
         // Spawn stderr reader.
-        let stderr_tx = tx.clone();
         let stderr_handle = tokio::spawn(async move {
             if let Some(mut stderr) = stderr {
                 let mut buf = vec![0u8; 65536];
@@ -194,14 +268,16 @@ impl agent_service_server::AgentService for AgentServiceImpl {
                     match stderr.read(&mut buf).await {
                         Ok(0) => break,
                         Ok(n) => {
-                            if stderr_tx
-                                .send(Ok(ExecEvent {
-                                    event: Some(exec_event::Event::Stderr(buf[..n].to_vec())),
-                                }))
-                                .await
-                                .is_err()
+                            match send_ordered_exec_event(
+                                exec_id,
+                                exec_event::Event::Stderr(buf[..n].to_vec()),
+                            )
+                            .await
                             {
-                                break;
+                                Ok(sequence) => {
+                                    debug!(exec_id, sequence, bytes = n, "grpc: stderr chunk");
+                                }
+                                Err(_) => break,
                             }
                         }
                         Err(e) => {
@@ -214,7 +290,6 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         });
 
         // Spawn exit watcher.
-        let exit_tx = tx;
         let exit_table = process_table;
         tokio::spawn(async move {
             // Wait for child exit before draining pipes.
@@ -242,17 +317,18 @@ impl agent_service_server::AgentService for AgentServiceImpl {
 
             info!(exec_id, exit_code, "grpc: process exited");
 
-            let _ = exit_tx
-                .send(Ok(ExecEvent {
-                    event: Some(exec_event::Event::ExitCode(exit_code)),
-                }))
-                .await;
+            if let Ok(sequence) =
+                send_ordered_exec_event(exec_id, exec_event::Event::ExitCode(exit_code)).await
+            {
+                debug!(exec_id, sequence, "grpc: exit event");
+            }
 
             // Remove from process table.
             {
                 let mut table = exit_table.lock().await;
                 table.remove(exec_id);
             }
+            remove_exec_order_context(exec_id);
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -265,6 +341,14 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         use tokio::io::AsyncWriteExt;
 
         let req = request.into_inner();
+        if let Some(sequence) = mark_ordered_control(req.exec_id, "stdin_write").await {
+            debug!(
+                exec_id = req.exec_id,
+                sequence,
+                bytes = req.data.len(),
+                "grpc: stdin write ordered"
+            );
+        }
         let mut table = self.state.process_table.lock().await;
 
         let entry = table
@@ -289,6 +373,9 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         request: Request<StdinCloseRequest>,
     ) -> Result<Response<StdinCloseResponse>, Status> {
         let req = request.into_inner();
+        if let Some(sequence) = mark_ordered_control(req.exec_id, "stdin_close").await {
+            debug!(exec_id = req.exec_id, sequence, "grpc: stdin close ordered");
+        }
         let mut table = self.state.process_table.lock().await;
 
         if let Some(entry) = table.get_mut(req.exec_id) {
@@ -309,6 +396,14 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         request: Request<SignalRequest>,
     ) -> Result<Response<SignalResponse>, Status> {
         let req = request.into_inner();
+        if let Some(sequence) = mark_ordered_control(req.exec_id, "signal").await {
+            debug!(
+                exec_id = req.exec_id,
+                sequence,
+                signal = req.signal,
+                "grpc: signal ordered"
+            );
+        }
         let table = self.state.process_table.lock().await;
 
         if let Some(entry) = table.get(req.exec_id) {
@@ -972,4 +1067,78 @@ async fn do_network_teardown(
     _service_names: &[String],
 ) -> Result<Response<NetworkTeardownResponse>, Status> {
     Err(Status::unimplemented("network teardown requires Linux"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    fn test_exec_id() -> u64 {
+        static NEXT_EXEC_ID: AtomicU64 = AtomicU64::new(10_000);
+        NEXT_EXEC_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[tokio::test]
+    async fn exec_order_sequence_is_monotonic_across_control_ops() {
+        let exec_id = test_exec_id();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<ExecEvent, Status>>(8);
+        register_exec_order_context(exec_id, ExecOrderContext::new(tx));
+
+        let first_event = match send_ordered_exec_event(
+            exec_id,
+            exec_event::Event::Stdout(b"a".to_vec()),
+        )
+        .await
+        {
+            Ok(sequence) => sequence,
+            Err(()) => panic!("first event should send"),
+        };
+        let control = match mark_ordered_control(exec_id, "stdin_close").await {
+            Some(sequence) => sequence,
+            None => panic!("control op should be ordered"),
+        };
+        let second_event = match send_ordered_exec_event(
+            exec_id,
+            exec_event::Event::Stderr(b"b".to_vec()),
+        )
+        .await
+        {
+            Ok(sequence) => sequence,
+            Err(()) => panic!("second event should send"),
+        };
+
+        assert_eq!(first_event, 1);
+        assert_eq!(control, 2);
+        assert_eq!(second_event, 3);
+
+        let first = rx.recv().await;
+        assert!(matches!(
+            first,
+            Some(Ok(ExecEvent {
+                event: Some(exec_event::Event::Stdout(_)),
+            }))
+        ));
+        let second = rx.recv().await;
+        assert!(matches!(
+            second,
+            Some(Ok(ExecEvent {
+                event: Some(exec_event::Event::Stderr(_)),
+            }))
+        ));
+
+        remove_exec_order_context(exec_id);
+    }
+
+    #[tokio::test]
+    async fn ordered_send_and_control_require_registered_exec_context() {
+        let exec_id = test_exec_id();
+        remove_exec_order_context(exec_id);
+
+        let sent = send_ordered_exec_event(exec_id, exec_event::Event::ExitCode(0)).await;
+        assert!(sent.is_err());
+        let control = mark_ordered_control(exec_id, "signal").await;
+        assert!(control.is_none());
+    }
 }
