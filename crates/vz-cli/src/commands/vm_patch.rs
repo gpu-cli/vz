@@ -1010,15 +1010,21 @@ fn create_delta(args: CreateDeltaArgs) -> anyhow::Result<()> {
     let patched_image = workspace.path().join("patched.img");
 
     clone_or_copy_image_with_sidecars(&base_image, &patched_image, true)?;
+    let manifest = verify_bundle(&bundle)?;
+    validate_patch_target_base_policy(&manifest)?;
     let state_path = workspace.path().join("patch-state.json");
-    apply_with_state_path(
-        ApplyArgs {
-            bundle: bundle.clone(),
-            root: None,
-            image: Some(patched_image.clone()),
-        },
-        &state_path,
-    )?;
+
+    let disk = crate::provision::attach_and_mount(&patched_image).with_context(|| {
+        format!(
+            "failed to attach and mount image {} before patch apply",
+            patched_image.display()
+        )
+    })?;
+    let apply_result =
+        apply_verified_manifest_with_root(manifest, &bundle, &disk.mount_point, &state_path);
+    let detach_result = disk.detach();
+    apply_result?;
+    detach_result?;
 
     let chunk_size = mib_to_bytes(args.chunk_size_mib)?;
     let header = create_image_delta_file(&base_image, &patched_image, &delta, chunk_size)
