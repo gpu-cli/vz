@@ -207,6 +207,7 @@ Phase 1 must complete before Phase 2 or Phase 3 can begin. Phase 2 and Phase 3 c
 | `09-signing.md` | **Entitlements (com.apple.security.virtualization), code signing with Developer ID, notarization, CI signing workflow, distribution (Homebrew, GitHub Releases, cargo install, install script)** |
 | `on-demand-elevation/README.md` | One-command UX with stage-gated elevation: request admin privileges only when offline provisioning requires it; includes security, UX, and rollout plan |
 | `pinned-ipsw-patches/README.md` | Pinned base matrix + signed file-level patch bundle strategy to keep system reliability while enabling no-local-sudo artifact workflows |
+| `agent-loader-bootstrap/README.md` | Stage-0 loader + signed swappable guest-agent artifact plan to avoid frequent image deltas for agent updates |
 | `sandbox/README.md` | Agent sandbox platform track: first-class primitives (`Sandbox`, `Session`, `Run`, `Policy`), Rust library surface, runtime integration plan, and OpenAPI contract |
 | `docker-in-sandbox/README.md` | Full Docker-inside-sandbox platform track: core primitives (`EngineInstance`, `EndpointLease`, filesystem and policy model) and reusable infrastructure surface across SDK/CLI/OpenAPI |
 | `oci-runtime/README.md` | Linux OCI runtime track (current): Linux VM bootstrap, image pulling, container lifecycle, unified API prerequisites |
