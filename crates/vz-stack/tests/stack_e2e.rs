@@ -106,6 +106,59 @@ impl OciContainerRuntime {
             (out.exit_code, out.stdout, out.stderr)
         })
     }
+
+    fn save_shared_vm_snapshot(
+        &self,
+        stack_id: &str,
+        snapshot_path: &Path,
+    ) -> Result<(), StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(
+                    self.backend
+                        .inner()
+                        .save_shared_vm_snapshot(stack_id, snapshot_path),
+                )
+                .map_err(|e| StackError::Network(format!("save_shared_vm_snapshot failed: {e}")))
+        })
+    }
+
+    fn restore_shared_vm_snapshot(
+        &self,
+        stack_id: &str,
+        snapshot_path: &Path,
+    ) -> Result<(), StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(
+                    self.backend
+                        .inner()
+                        .restore_shared_vm_snapshot(stack_id, snapshot_path),
+                )
+                .map_err(|e| StackError::Network(format!("restore_shared_vm_snapshot failed: {e}")))
+        })
+    }
+
+    fn exec_in_shared_vm(
+        &self,
+        stack_id: &str,
+        command: &str,
+        args: Vec<String>,
+        timeout: Duration,
+    ) -> Result<(i32, String, String), StackError> {
+        tokio::task::block_in_place(|| {
+            let out = self
+                .handle
+                .block_on(self.backend.inner().exec_in_shared_vm(
+                    stack_id,
+                    command.to_string(),
+                    args,
+                    timeout,
+                ))
+                .map_err(|e| StackError::Network(format!("exec_in_shared_vm failed: {e}")))?;
+            Ok((out.exit_code, out.stdout, out.stderr))
+        })
+    }
 }
 
 impl ContainerRuntime for OciContainerRuntime {
@@ -1003,4 +1056,250 @@ services:
         .executor()
         .runtime()
         .shutdown_shared_vm("port-fwd");
+}
+
+/// Use-case scenario:
+/// - Run a realistic multi-service stack (`api + postgres + redis`)
+/// - Initialize state in the shared VM
+/// - Save shared VM snapshot
+/// - Mutate state after snapshot
+/// - Restore snapshot and verify VM state rewinds + stack still converges
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn complex_stack_snapshot_restore_rewinds_shared_vm_state() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,vz_oci_macos=debug,vz_linux=debug,vz_stack=debug")
+        .with_test_writer()
+        .try_init();
+
+    let yaml = r#"
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: app
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "app"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  cache:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  api:
+    image: alpine:latest
+    command: ["sleep", "300"]
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+"#;
+
+    let home = std::env::var("HOME").unwrap();
+    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    std::fs::create_dir_all(&oci_data).unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("state.db");
+    let snapshot_path = tmp.path().join("snapshot-stack.state");
+
+    let spec = parse_compose(yaml, "snapshot-stack").unwrap();
+    let bridge = OciContainerRuntime::new(&oci_data);
+    let exec_store = StateStore::open(&db_path).unwrap();
+    let reconcile_store = StateStore::open(&db_path).unwrap();
+    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+
+    let orch_config = OrchestrationConfig {
+        poll_interval: Some(2),
+        max_rounds: 30,
+    };
+    let mut orchestrator = StackOrchestrator::new(executor, reconcile_store, orch_config);
+    let result = orchestrator.run(&spec, None).unwrap();
+    assert!(
+        result.converged,
+        "stack should converge: ready={}, failed={}, rounds={}",
+        result.services_ready, result.services_failed, result.rounds
+    );
+    assert_eq!(result.services_ready, 3, "all services should be ready");
+
+    let observed = orchestrator
+        .executor()
+        .store()
+        .load_observed_state("snapshot-stack")
+        .unwrap();
+    for service_name in ["db", "cache", "api"] {
+        let service = observed
+            .iter()
+            .find(|entry| entry.service_name == service_name)
+            .unwrap_or_else(|| panic!("{service_name} should be in observed state"));
+        assert!(
+            service.container_id.is_some(),
+            "{service_name} should have a container id"
+        );
+    }
+
+    let marker_cmd = |runtime: &OciContainerRuntime, value: &str| -> Result<(), String> {
+        let (exit_code, _stdout, stderr) = runtime
+            .exec_in_shared_vm(
+                "snapshot-stack",
+                "/bin/sh",
+                vec![
+                    "-c".to_string(),
+                    format!("printf '%s' {value:?} > /tmp/vz-snapshot-marker"),
+                ],
+                Duration::from_secs(15),
+            )
+            .map_err(|err| err.to_string())?;
+        if exit_code != 0 {
+            return Err(format!("marker write failed: {stderr}"));
+        }
+        Ok(())
+    };
+    let read_marker = |runtime: &OciContainerRuntime| -> Result<String, String> {
+        let (exit_code, stdout, stderr) = runtime
+            .exec_in_shared_vm(
+                "snapshot-stack",
+                "/bin/sh",
+                vec!["-c".to_string(), "cat /tmp/vz-snapshot-marker".to_string()],
+                Duration::from_secs(15),
+            )
+            .map_err(|err| err.to_string())?;
+        if exit_code != 0 {
+            return Err(format!("marker read failed: {stderr}"));
+        }
+        Ok(stdout.trim().to_string())
+    };
+
+    marker_cmd(orchestrator.executor().runtime(), "before-snapshot").unwrap();
+    assert_eq!(
+        read_marker(orchestrator.executor().runtime()).unwrap(),
+        "before-snapshot"
+    );
+
+    orchestrator
+        .executor()
+        .runtime()
+        .save_shared_vm_snapshot("snapshot-stack", &snapshot_path)
+        .unwrap();
+
+    marker_cmd(orchestrator.executor().runtime(), "after-snapshot").unwrap();
+    assert_eq!(
+        read_marker(orchestrator.executor().runtime()).unwrap(),
+        "after-snapshot"
+    );
+
+    orchestrator
+        .executor()
+        .runtime()
+        .restore_shared_vm_snapshot("snapshot-stack", &snapshot_path)
+        .unwrap();
+
+    let mut restored_marker: Option<String> = None;
+    for attempt in 1..=20 {
+        match read_marker(orchestrator.executor().runtime()) {
+            Ok(value) => {
+                restored_marker = Some(value);
+                break;
+            }
+            Err(err) => {
+                eprintln!("restore marker read attempt {attempt}/20 failed: {err}; retrying...");
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let restored_marker =
+        restored_marker.unwrap_or_else(|| panic!("marker did not become readable after restore"));
+    assert_eq!(
+        restored_marker, "before-snapshot",
+        "snapshot restore should rewind marker to pre-snapshot value"
+    );
+
+    let converge_after_restore = orchestrator.run(&spec, None).unwrap();
+    assert!(
+        converge_after_restore.converged,
+        "stack should converge after restore: ready={}, failed={}, rounds={}",
+        converge_after_restore.services_ready,
+        converge_after_restore.services_failed,
+        converge_after_restore.rounds
+    );
+    assert_eq!(
+        converge_after_restore.services_failed, 0,
+        "no services should fail after restore reconciliation"
+    );
+
+    let mut marker_check_after_reconcile: Option<String> = None;
+    for attempt in 1..=10 {
+        match read_marker(orchestrator.executor().runtime()) {
+            Ok(value) => {
+                marker_check_after_reconcile = Some(value);
+                break;
+            }
+            Err(err) => {
+                eprintln!(
+                    "post-reconcile marker read attempt {attempt}/10 failed: {err}; retrying..."
+                );
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(
+        marker_check_after_reconcile
+            .unwrap_or_else(|| panic!("marker not readable after post-restore reconcile")),
+        "before-snapshot",
+        "marker should remain rewound after reconcile"
+    );
+
+    let mut services_ready_count: Option<usize> = None;
+    for attempt in 1..=10 {
+        let current = orchestrator
+            .executor()
+            .store()
+            .load_observed_state("snapshot-stack")
+            .unwrap();
+        let ready = current
+            .iter()
+            .filter(|service| service.container_id.is_some())
+            .count();
+        if ready >= 3 {
+            services_ready_count = Some(ready);
+            break;
+        }
+        eprintln!(
+            "post-restore observed-state attempt {attempt}/10 has ready={ready}; retrying..."
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(
+        services_ready_count.unwrap_or(0),
+        3,
+        "all services should remain represented after restore"
+    );
+
+    let down_spec = vz_stack::StackSpec {
+        name: "snapshot-stack".to_string(),
+        services: vec![],
+        networks: vec![],
+        volumes: vec![],
+        secrets: vec![],
+        disk_size_mb: None,
+    };
+    let _ = orchestrator.run(&down_spec, None);
+    let _ = orchestrator
+        .executor()
+        .runtime()
+        .shutdown_shared_vm("snapshot-stack");
 }

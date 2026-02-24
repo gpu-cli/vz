@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,6 +54,37 @@ impl LinuxVm {
     pub async fn stop(&self) -> Result<(), LinuxError> {
         self.vm.stop().await?;
         Ok(())
+    }
+
+    /// Save an in-place VM state snapshot and resume guest execution.
+    ///
+    /// This pauses the VM, writes state to `path`, resumes the VM, and clears
+    /// any cached gRPC client so subsequent operations reconnect cleanly.
+    pub async fn save_state_snapshot(&self, path: &Path) -> Result<(), LinuxError> {
+        self.vm.pause().await?;
+        self.vm.save_state(path).await?;
+        self.vm.resume().await?;
+        let mut grpc = self.grpc.lock().await;
+        *grpc = None;
+        Ok(())
+    }
+
+    /// Restore VM state from `path`, resume guest execution, and wait for agent.
+    ///
+    /// This force-stops the current VM execution, restores state, resumes, and
+    /// reestablishes guest-agent readiness before returning.
+    pub async fn restore_state_snapshot(
+        &self,
+        path: &Path,
+        agent_ready_timeout: Duration,
+    ) -> Result<(), LinuxError> {
+        self.vm.stop().await?;
+        self.vm.restore_state(path).await?;
+        self.vm.resume().await?;
+        let mut grpc = self.grpc.lock().await;
+        *grpc = None;
+        drop(grpc);
+        self.wait_for_agent(agent_ready_timeout).await
     }
 
     /// Start the VM and wait until guest agent is reachable.

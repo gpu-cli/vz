@@ -21,6 +21,7 @@ PROFILE="debug"
 OUTPUT_ROOT="$REPO_ROOT/.artifacts/sandbox-vm-e2e"
 KEEP_GOING=false
 SUITE_TOKENS=()
+SCENARIO_TOKENS=()
 RUN_ARGS=("--ignored" "--nocapture" "--test-threads=1")
 
 usage() {
@@ -34,6 +35,14 @@ Options:
   --suite <name>              Suite to run (repeatable, comma-separated allowed)
                               names: runtime, stack, buildkit, sandbox, all
                               default: sandbox (runtime + stack)
+  --scenario <name>           Run named use-case scenario(s) (repeatable/comma-separated)
+                              names:
+                                runtime-smoke, runtime-lifecycle, runtime-port-forwarding,
+                                runtime-shared-vm-net, stack-real-services,
+                                stack-control-socket, stack-port-forwarding,
+                                stack-snapshot-restore, buildkit-roundtrip,
+                                sandbox-usecases, all-usecases
+                              note: when set, suite selection is derived from scenarios
   --output-dir <path>         Artifacts/log root (default: .artifacts/sandbox-vm-e2e)
   --keep-going                Continue running remaining suites after failures
   -h, --help                  Show help
@@ -63,6 +72,17 @@ append_unique() {
         fi
     done
     RESOLVED_SUITES+=("$value")
+}
+
+append_unique_scenario() {
+    local value="$1"
+    local existing
+    for existing in "${RESOLVED_SCENARIOS[@]}"; do
+        if [[ "$existing" == "$value" ]]; then
+            return
+        fi
+    done
+    RESOLVED_SCENARIOS+=("$value")
 }
 
 expand_suite_token() {
@@ -101,6 +121,99 @@ expand_suite_token() {
     done
 }
 
+expand_scenario_token() {
+    local token="$1"
+    local lowered
+    lowered="$(echo "$token" | tr '[:upper:]' '[:lower:]')"
+
+    local part
+    IFS=',' read -r -a parts <<< "$lowered"
+    for part in "${parts[@]}"; do
+        case "$part" in
+            "")
+                ;;
+            runtime-smoke|runtime-lifecycle|runtime-port-forwarding|runtime-shared-vm-net|stack-real-services|stack-control-socket|stack-port-forwarding|stack-snapshot-restore|buildkit-roundtrip)
+                append_unique_scenario "$part"
+                ;;
+            sandbox-usecases)
+                append_unique_scenario "runtime-smoke"
+                append_unique_scenario "runtime-lifecycle"
+                append_unique_scenario "runtime-shared-vm-net"
+                append_unique_scenario "stack-real-services"
+                append_unique_scenario "stack-control-socket"
+                append_unique_scenario "stack-port-forwarding"
+                append_unique_scenario "stack-snapshot-restore"
+                ;;
+            all-usecases)
+                append_unique_scenario "runtime-smoke"
+                append_unique_scenario "runtime-lifecycle"
+                append_unique_scenario "runtime-port-forwarding"
+                append_unique_scenario "runtime-shared-vm-net"
+                append_unique_scenario "stack-real-services"
+                append_unique_scenario "stack-control-socket"
+                append_unique_scenario "stack-port-forwarding"
+                append_unique_scenario "stack-snapshot-restore"
+                append_unique_scenario "buildkit-roundtrip"
+                ;;
+            *)
+                err "unknown scenario '$part'"
+                ;;
+        esac
+    done
+}
+
+scenario_suite() {
+    case "$1" in
+        runtime-smoke|runtime-lifecycle|runtime-port-forwarding|runtime-shared-vm-net)
+            echo "runtime"
+            ;;
+        stack-real-services|stack-control-socket|stack-port-forwarding|stack-snapshot-restore)
+            echo "stack"
+            ;;
+        buildkit-roundtrip)
+            echo "buildkit"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+scenario_test_filter() {
+    case "$1" in
+        runtime-smoke)
+            echo "smoke_pull_and_run_alpine"
+            ;;
+        runtime-lifecycle)
+            echo "lifecycle_create_exec_stop_remove"
+            ;;
+        runtime-port-forwarding)
+            echo "port_forwarding_tcp"
+            ;;
+        runtime-shared-vm-net)
+            echo "shared_vm_inter_service_connectivity"
+            ;;
+        stack-real-services)
+            echo "real_services_postgres_and_redis"
+            ;;
+        stack-control-socket)
+            echo "exec_via_control_socket"
+            ;;
+        stack-port-forwarding)
+            echo "stack_port_forwarding"
+            ;;
+        stack-snapshot-restore)
+            echo "complex_stack_snapshot_restore_rewinds_shared_vm_state"
+            ;;
+        buildkit-roundtrip)
+            echo "buildkit_builds_dockerfile_and_run_uses_built_image"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --profile)
@@ -109,6 +222,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --suite)
             SUITE_TOKENS+=("${2:-}")
+            shift 2
+            ;;
+        --scenario)
+            SCENARIO_TOKENS+=("${2:-}")
             shift 2
             ;;
         --output-dir)
@@ -138,14 +255,30 @@ if [[ "$PROFILE" != "debug" && "$PROFILE" != "release" ]]; then
     err "--profile must be one of: debug, release"
 fi
 
-if [[ ${#SUITE_TOKENS[@]} -eq 0 ]]; then
-    SUITE_TOKENS=("sandbox")
-fi
-
 RESOLVED_SUITES=()
-for token in "${SUITE_TOKENS[@]}"; do
-    expand_suite_token "$token"
-done
+RESOLVED_SCENARIOS=()
+
+if [[ ${#SCENARIO_TOKENS[@]} -gt 0 ]]; then
+    for token in "${SCENARIO_TOKENS[@]}"; do
+        expand_scenario_token "$token"
+    done
+    if [[ ${#RESOLVED_SCENARIOS[@]} -eq 0 ]]; then
+        err "no scenarios selected"
+    fi
+    if [[ ${#SUITE_TOKENS[@]} -gt 0 ]]; then
+        warn "--suite is ignored when --scenario is provided"
+    fi
+    for scenario in "${RESOLVED_SCENARIOS[@]}"; do
+        append_unique "$(scenario_suite "$scenario")"
+    done
+else
+    if [[ ${#SUITE_TOKENS[@]} -eq 0 ]]; then
+        SUITE_TOKENS=("sandbox")
+    fi
+    for token in "${SUITE_TOKENS[@]}"; do
+        expand_suite_token "$token"
+    done
+fi
 
 if [[ ${#RESOLVED_SUITES[@]} -eq 0 ]]; then
     err "no suites selected"
@@ -263,13 +396,16 @@ suite_test_name() {
 
 run_and_log() {
     local suite="$1"
-    local binary="$2"
-    local log_file="$RUN_DIR/${suite}.log"
+    local label="$2"
+    local binary="$3"
+    shift 3
+    local args=("$@")
+    local log_file="$RUN_DIR/${label}.log"
 
-    echo "running [$suite]: $binary ${RUN_ARGS[*]}"
+    echo "running [$label/$suite]: $binary ${args[*]}"
 
     set +e
-    "$binary" "${RUN_ARGS[@]}" 2>&1 | tee "$log_file"
+    "$binary" "${args[@]}" 2>&1 | tee "$log_file"
     local status=${PIPESTATUS[0]}
     set -e
 
@@ -282,6 +418,7 @@ echo "==> output directory: $RUN_DIR"
     echo "host=$(hostname)"
     echo "profile=$PROFILE"
     echo "suites=${RESOLVED_SUITES[*]}"
+    echo "scenarios=${RESOLVED_SCENARIOS[*]:-none}"
     echo "run_args=${RUN_ARGS[*]}"
 } > "$RUN_DIR/run-info.txt"
 
@@ -300,6 +437,7 @@ fi
 
 FAILED=()
 PASSED=()
+should_stop=false
 
 for suite in "${RESOLVED_SUITES[@]}"; do
     package="$(suite_package "$suite")" || err "unknown suite '$suite'"
@@ -315,16 +453,43 @@ for suite in "${RESOLVED_SUITES[@]}"; do
 
     sign_binary "$test_binary" "$ENTITLEMENTS"
 
-    if run_and_log "$suite" "$test_binary"; then
-        echo "==> suite passed: $suite"
-        PASSED+=("$suite")
+    if [[ ${#RESOLVED_SCENARIOS[@]} -gt 0 ]]; then
+        for scenario in "${RESOLVED_SCENARIOS[@]}"; do
+            if [[ "$(scenario_suite "$scenario")" != "$suite" ]]; then
+                continue
+            fi
+            test_filter="$(scenario_test_filter "$scenario")" || err "unknown scenario '$scenario'"
+            scenario_args=("${RUN_ARGS[@]}" "--exact" "$test_filter")
+
+            if run_and_log "$suite" "$scenario" "$test_binary" "${scenario_args[@]}"; then
+                echo "==> scenario passed: $scenario"
+                PASSED+=("$scenario")
+            else
+                status=$?
+                echo "==> scenario failed: $scenario (exit $status)"
+                FAILED+=("$scenario:$status")
+                if [[ "$KEEP_GOING" != "true" ]]; then
+                    should_stop=true
+                    break
+                fi
+            fi
+        done
     else
-        status=$?
-        echo "==> suite failed: $suite (exit $status)"
-        FAILED+=("$suite:$status")
-        if [[ "$KEEP_GOING" != "true" ]]; then
-            break
+        if run_and_log "$suite" "$suite" "$test_binary" "${RUN_ARGS[@]}"; then
+            echo "==> suite passed: $suite"
+            PASSED+=("$suite")
+        else
+            status=$?
+            echo "==> suite failed: $suite (exit $status)"
+            FAILED+=("$suite:$status")
+            if [[ "$KEEP_GOING" != "true" ]]; then
+                should_stop=true
+            fi
         fi
+    fi
+
+    if [[ "$should_stop" == "true" ]]; then
+        break
     fi
 done
 

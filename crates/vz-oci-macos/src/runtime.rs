@@ -1163,6 +1163,67 @@ impl Runtime {
         self.stack_vms.lock().await.contains_key(stack_id)
     }
 
+    /// Save a shared stack VM snapshot to disk.
+    ///
+    /// The VM is paused, state is saved, then the VM is resumed and the guest
+    /// agent is revalidated before returning.
+    pub async fn save_shared_vm_snapshot(
+        &self,
+        stack_id: &str,
+        state_path: impl AsRef<Path>,
+    ) -> Result<(), OciError> {
+        let vm = self
+            .stack_vms
+            .lock()
+            .await
+            .get(stack_id)
+            .cloned()
+            .ok_or_else(|| {
+                OciError::InvalidConfig(format!("no shared VM running for stack '{stack_id}'"))
+            })?;
+
+        let state_path = state_path.as_ref();
+        if let Some(parent) = state_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        vm.save_state_snapshot(state_path).await?;
+        vm.wait_for_agent(self.config.agent_ready_timeout).await?;
+        Ok(())
+    }
+
+    /// Restore a shared stack VM from a saved snapshot file.
+    ///
+    /// Existing shared VM instance is stopped, restored from `state_path`, then
+    /// resumed and reconnected to the guest agent.
+    pub async fn restore_shared_vm_snapshot(
+        &self,
+        stack_id: &str,
+        state_path: impl AsRef<Path>,
+    ) -> Result<(), OciError> {
+        let vm = self
+            .stack_vms
+            .lock()
+            .await
+            .get(stack_id)
+            .cloned()
+            .ok_or_else(|| {
+                OciError::InvalidConfig(format!("no shared VM running for stack '{stack_id}'"))
+            })?;
+
+        let state_path = state_path.as_ref();
+        if !state_path.exists() {
+            return Err(OciError::InvalidConfig(format!(
+                "shared VM snapshot path does not exist: {}",
+                state_path.display()
+            )));
+        }
+
+        vm.restore_state_snapshot(state_path, self.config.agent_ready_timeout)
+            .await?;
+        Ok(())
+    }
+
     /// Execute a raw command in the shared VM (not through the OCI runtime).
     ///
     /// Useful for diagnostics, inspecting the guest filesystem, or running

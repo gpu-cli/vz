@@ -27,6 +27,27 @@ Default suite is `sandbox`, which expands to:
 - `runtime` (`vz-oci-macos/tests/runtime_e2e.rs`)
 - `stack` (`vz-stack/tests/stack_e2e.rs`)
 
+## Use-Case Scenarios
+
+Use `--scenario` to run deterministic sandbox workflows by name.
+
+Capability matrix:
+
+- `runtime-smoke` → `smoke_pull_and_run_alpine`
+- `runtime-lifecycle` → `lifecycle_create_exec_stop_remove`
+- `runtime-port-forwarding` → `port_forwarding_tcp`
+- `runtime-shared-vm-net` → `shared_vm_inter_service_connectivity`
+- `stack-real-services` → `real_services_postgres_and_redis`
+- `stack-control-socket` → `exec_via_control_socket`
+- `stack-port-forwarding` → `stack_port_forwarding`
+- `stack-snapshot-restore` → `complex_stack_snapshot_restore_rewinds_shared_vm_state`
+- `buildkit-roundtrip` → `buildkit_builds_dockerfile_and_run_uses_built_image`
+
+Scenario groups:
+
+- `sandbox-usecases` → runtime + stack use-cases (no buildkit)
+- `all-usecases` → runtime + stack + buildkit use-cases
+
 ## Suite Selection
 
 ```bash
@@ -60,6 +81,12 @@ Supported suite tokens:
 
 # Override rust test args (replaces default args)
 ./scripts/run-sandbox-vm-e2e.sh --suite runtime -- --ignored --nocapture --exact smoke_pull_and_run_alpine
+
+# Run sandbox use-case matrix (runtime + stack)
+./scripts/run-sandbox-vm-e2e.sh --scenario sandbox-usecases
+
+# Run only snapshot/restore use-case scenario
+./scripts/run-sandbox-vm-e2e.sh --scenario stack-snapshot-restore
 ```
 
 Default rust test args are:
@@ -79,7 +106,7 @@ By default, artifacts are written under:
 Each run creates a timestamped directory containing:
 
 - `run-info.txt` (host/profile/suites/args)
-- `<suite>.log` files
+- `<suite>.log` files or `<scenario>.log` files (scenario mode)
 - `summary.txt`
 
 A `latest` symlink points to the most recent run.
