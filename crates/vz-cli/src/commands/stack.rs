@@ -2811,6 +2811,29 @@ mod tests {
     }
 
     #[test]
+    fn cli_transport_parity_matrix_is_claimed_for_idempotency_behavior() {
+        let components = ["stack-a", "web-service", "echo_hello"];
+        for entry in vz_runtime_contract::PRIMITIVE_CONFORMANCE_MATRIX {
+            if !entry.cli {
+                continue;
+            }
+
+            let key = runtime_idempotency_key(entry.operation, &components);
+            let expected = entry
+                .operation
+                .idempotency_key_prefix()
+                .map(|prefix| format!("{prefix}:stack-a:web-service:echo_hello"));
+
+            assert_eq!(
+                key,
+                expected,
+                "CLI parity key mismatch for {}",
+                entry.operation.as_str()
+            );
+        }
+    }
+
+    #[test]
     fn control_request_idempotency_key_is_deterministic() {
         let key = control_request_idempotency_key(
             "stack-1",

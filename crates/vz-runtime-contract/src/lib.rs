@@ -43,6 +43,376 @@ pub const REQUIRED_IDEMPOTENT_MUTATIONS: &[RuntimeOperation] = &[
     RuntimeOperation::ForkCheckpoint,
 ];
 
+/// Canonical OpenAPI surface mapping for a runtime operation.
+#[derive(Debug, Clone, Copy)]
+pub struct OpenApiPrimitiveSurface {
+    /// Relative OpenAPI path (path template for request construction).
+    pub path: &'static str,
+    /// Canonical error surface label expected for unsupported operations.
+    pub surface: &'static str,
+}
+
+/// Shared conformance matrix for runtime primitive surface coverage.
+///
+/// This matrix is the authoritative coverage source for required operation
+/// parity checks across external transports and CLI/manager paths.
+#[derive(Debug, Clone, Copy)]
+pub struct PrimitiveConformanceEntry {
+    /// Runtime primitive this matrix row represents.
+    pub operation: RuntimeOperation,
+    /// OpenAPI surface claim for this primitive.
+    pub openapi: Option<OpenApiPrimitiveSurface>,
+    /// Whether the manager layer exposes/handles this primitive path.
+    pub manager: bool,
+    /// Whether gRPC transport metadata generation currently covers this primitive.
+    pub grpc_metadata: bool,
+    /// Whether stack CLI currently emits transport metadata assumptions for this primitive.
+    pub cli: bool,
+}
+
+/// Coverage matrix for required sandbox/runtime operations.
+///
+/// Keep this list complete and aligned with `REQUIRED_RUNTIME_OPERATIONS`.
+pub const PRIMITIVE_CONFORMANCE_MATRIX: &[PrimitiveConformanceEntry] = &[
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::CreateSandbox,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/sandboxes",
+            surface: "sandboxes",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::GetSandbox,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/sandboxes",
+            surface: "sandboxes",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::TerminateSandbox,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/sandboxes",
+            surface: "sandboxes",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::OpenLease,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/leases",
+            surface: "leases",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::HeartbeatLease,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/leases",
+            surface: "leases",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::CloseLease,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/leases",
+            surface: "leases",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::ResolveImage,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/images",
+            surface: "images",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::PullImage,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/images",
+            surface: "images",
+        }),
+        manager: true,
+        grpc_metadata: false,
+        cli: true,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::StartBuild,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/builds",
+            surface: "builds",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::GetBuild,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/builds",
+            surface: "builds",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::StreamBuildEvents,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/builds",
+            surface: "builds",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::CancelBuild,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/builds",
+            surface: "builds",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::CreateContainer,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/containers",
+            surface: "containers",
+        }),
+        manager: true,
+        grpc_metadata: true,
+        cli: true,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::StartContainer,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/containers",
+            surface: "containers",
+        }),
+        manager: false,
+        grpc_metadata: true,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::StopContainer,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/containers",
+            surface: "containers",
+        }),
+        manager: true,
+        grpc_metadata: true,
+        cli: true,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::RemoveContainer,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/containers",
+            surface: "containers",
+        }),
+        manager: true,
+        grpc_metadata: true,
+        cli: true,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::GetContainerLogs,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/containers",
+            surface: "containers",
+        }),
+        manager: true,
+        grpc_metadata: false,
+        cli: true,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::ExecContainer,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/executions",
+            surface: "executions",
+        }),
+        manager: true,
+        grpc_metadata: true,
+        cli: true,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::WriteExecStdin,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/executions",
+            surface: "executions",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::SignalExec,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/executions",
+            surface: "executions",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::ResizeExecPty,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/executions",
+            surface: "executions",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::CancelExec,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/executions",
+            surface: "executions",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::CreateCheckpoint,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/checkpoints",
+            surface: "checkpoints",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::RestoreCheckpoint,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/checkpoints",
+            surface: "checkpoints",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::ForkCheckpoint,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/checkpoints",
+            surface: "checkpoints",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::CreateVolume,
+        openapi: None,
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::AttachVolume,
+        openapi: None,
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::DetachVolume,
+        openapi: None,
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::CreateNetworkDomain,
+        openapi: None,
+        manager: false,
+        grpc_metadata: true,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::PublishPort,
+        openapi: None,
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::ConnectContainer,
+        openapi: None,
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::ListEvents,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/events/{stack_name}",
+            surface: "events",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::GetReceipt,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/receipts",
+            surface: "receipts",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+    PrimitiveConformanceEntry {
+        operation: RuntimeOperation::GetCapabilities,
+        openapi: Some(OpenApiPrimitiveSurface {
+            path: "/v1/capabilities",
+            surface: "capabilities",
+        }),
+        manager: false,
+        grpc_metadata: false,
+        cli: false,
+    },
+];
+
+/// Generate the transport metadata payload for a sequence number and operation.
+///
+/// This is used by transports that need deterministic request metadata and
+/// deterministic idempotency keys for repeatable retries.
+pub fn transport_metadata_for_sequence(
+    request_sequence: u64,
+    operation: Option<RuntimeOperation>,
+) -> (String, Option<String>) {
+    let request_id = format!("req_{:016x}", request_sequence.saturating_add(1));
+    let idempotency_key = operation
+        .and_then(RuntimeOperation::idempotency_key_prefix)
+        .map(|prefix| format!("{prefix}:{request_id}"));
+    (request_id, idempotency_key)
+}
+
 /// Docker-compat command set supported by the Runtime V2 translation shim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DockerShimCommand {
@@ -1122,7 +1492,7 @@ pub trait RuntimeBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeSet, HashSet};
     use std::future::{Future, ready};
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Wake, Waker};
@@ -1348,6 +1718,11 @@ mod tests {
         fn remove_container(&self, _id: &str) -> impl Future<Output = Result<(), RuntimeError>> {
             self.record("remove_container");
             ready(Ok(()))
+        }
+
+        fn logs(&self, _container_id: &str) -> Result<ContainerLogs, RuntimeError> {
+            self.record("logs");
+            Ok(ContainerLogs::default())
         }
 
         fn list_containers(&self) -> Result<Vec<ContainerInfo>, RuntimeError> {
@@ -2235,6 +2610,126 @@ mod tests {
         assert_eq!(
             RuntimeOperation::GetCapabilities.idempotency_key_prefix(),
             None
+        );
+    }
+
+    #[test]
+    fn primitive_conformance_matrix_is_complete_and_stable() {
+        assert_eq!(
+            REQUIRED_RUNTIME_OPERATIONS.len(),
+            PRIMITIVE_CONFORMANCE_MATRIX.len()
+        );
+
+        let mut by_operation = HashSet::new();
+        for entry in PRIMITIVE_CONFORMANCE_MATRIX {
+            assert!(
+                by_operation.insert(entry.operation),
+                "duplicate conformance entry for operation `{}`",
+                entry.operation.as_str()
+            );
+            assert!(
+                REQUIRED_RUNTIME_OPERATIONS.contains(&entry.operation),
+                "coverage entry uses non-required operation `{}`",
+                entry.operation.as_str()
+            );
+            if let Some(surface) = entry.openapi {
+                assert!(surface.path.starts_with('/'));
+                assert!(!surface.surface.is_empty());
+            }
+        }
+
+        for operation in REQUIRED_RUNTIME_OPERATIONS {
+            assert!(
+                by_operation.contains(operation),
+                "missing conformance entry for operation `{}`",
+                operation.as_str()
+            );
+        }
+
+        let mut required_paths = BTreeSet::new();
+        let mut covered_by_matrix = 0usize;
+        for entry in PRIMITIVE_CONFORMANCE_MATRIX {
+            if let Some(surface) = entry.openapi {
+                covered_by_matrix += 1;
+                required_paths.insert(surface.path);
+            }
+            // Rows without an explicit external claim represent transport-op gaps tracked
+            // in the Runtime V2 readiness plan.
+        }
+
+        assert!(covered_by_matrix > 0);
+        assert!(required_paths.len() >= 3);
+    }
+
+    #[test]
+    fn primitive_conformance_matrix_idempotency_and_metadata_are_consistent() {
+        for entry in PRIMITIVE_CONFORMANCE_MATRIX {
+            assert_eq!(
+                entry.operation.requires_idempotency_key(),
+                entry.operation.idempotency_key_prefix().is_some()
+            );
+
+            let (request_id, expected_key) =
+                transport_metadata_for_sequence(0, Some(entry.operation));
+            assert_eq!(request_id, "req_0000000000000001");
+
+            let expected_prefix = entry
+                .operation
+                .idempotency_key_prefix()
+                .map(|prefix| format!("{prefix}:{request_id}"));
+            assert_eq!(expected_key, expected_prefix);
+        }
+    }
+
+    fn expected_manager_surface_operations() -> HashSet<RuntimeOperation> {
+        [
+            RuntimeOperation::PullImage,
+            RuntimeOperation::CreateContainer,
+            RuntimeOperation::ExecContainer,
+            RuntimeOperation::StopContainer,
+            RuntimeOperation::RemoveContainer,
+            RuntimeOperation::GetContainerLogs,
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn primitive_conformance_matrix_manager_rows_match_surface_contract() {
+        let expected = expected_manager_surface_operations();
+        let actual = PRIMITIVE_CONFORMANCE_MATRIX
+            .iter()
+            .filter(|entry| entry.manager)
+            .map(|entry| entry.operation)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn workspace_runtime_manager_routes_claimed_parity_operations() {
+        let backend = ManagerRoutingBackend::new(RuntimeCapabilities::stack_baseline());
+        let manager = WorkspaceRuntimeManager::new(backend);
+
+        let _ = poll_immediate(manager.pull_image("alpine:latest")).unwrap();
+        let _ = poll_immediate(manager.create_container("alpine:latest", RunConfig::default()))
+            .unwrap();
+        let _ =
+            poll_immediate(manager.exec_container("container-1", ExecConfig::default())).unwrap();
+        let _ = poll_immediate(manager.stop_container("container-1", false, None, None));
+        let _ = poll_immediate(manager.remove_container("container-1")).unwrap();
+        manager.container_logs("container-1").unwrap();
+
+        assert_eq!(
+            manager.backend().calls(),
+            [
+                "pull",
+                "create_container",
+                "exec_container",
+                "stop_container",
+                "remove_container",
+                "logs"
+            ]
         );
     }
 

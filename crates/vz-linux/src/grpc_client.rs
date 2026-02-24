@@ -157,10 +157,10 @@ impl GrpcAgentClient {
         operation: Option<RuntimeOperation>,
     ) -> ProtoTransportMetadata {
         self.next_request_sequence = self.next_request_sequence.saturating_add(1);
-        let request_id = format!("req_{:016x}", self.next_request_sequence);
-        let idempotency_key = operation
-            .and_then(RuntimeOperation::idempotency_key_prefix)
-            .map(|prefix| format!("{prefix}:{request_id}"));
+        let (request_id, idempotency_key) = vz_runtime_contract::transport_metadata_for_sequence(
+            self.next_request_sequence,
+            operation,
+        );
         let normalized = ContractRequestMetadata::new(Some(request_id), idempotency_key);
 
         ProtoTransportMetadata {
@@ -842,5 +842,37 @@ mod tests {
             validate_exec_event_metadata(&mut last_sequence, &mut expected_request_id, 2, "req_2")
                 .unwrap_err();
         assert!(err.to_string().contains("request_id mismatch"));
+    }
+
+    #[test]
+    fn transport_parity_grpc_metadata_generation_is_stable_for_matrixed_operations() {
+        let mut expected_sequence = 0u64;
+        for entry in vz_runtime_contract::PRIMITIVE_CONFORMANCE_MATRIX {
+            if !entry.grpc_metadata {
+                continue;
+            }
+
+            let (expected_request_id, expected_key) =
+                vz_runtime_contract::transport_metadata_for_sequence(
+                    expected_sequence,
+                    Some(entry.operation),
+                );
+            expected_sequence = expected_sequence.saturating_add(1);
+
+            let expected_prefix = entry
+                .operation
+                .idempotency_key_prefix()
+                .map(|prefix| format!("{prefix}:{expected_request_id}"));
+            assert_eq!(expected_key, expected_prefix);
+
+            assert_eq!(
+                expected_request_id,
+                format!("req_{:016x}", expected_sequence),
+                "request id sequence mismatch for {}",
+                entry.operation.as_str()
+            );
+        }
+
+        assert!(expected_sequence > 0);
     }
 }

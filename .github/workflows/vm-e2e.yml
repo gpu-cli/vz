@@ -22,15 +22,87 @@ on:
         default: false
         type: boolean
   schedule:
-    - cron: "0 8 * * 1"
+    - cron: "0 8 * * *"
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
-  vm-e2e:
-    name: Real VM Sandbox E2E
+  vm-e2e-smoke:
+    name: VM E2E Smoke Lane
+    if: github.event_name == 'schedule'
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 240
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+
+      - name: Run sandbox VM E2E harness
+        run: |
+          PROFILE="${{ github.event.inputs.profile }}"
+          if [[ -z "$PROFILE" ]]; then
+            PROFILE="debug"
+          fi
+          SUITES="sandbox"
+
+          ./scripts/run-sandbox-vm-e2e.sh \
+            --suite "$SUITES" \
+            --profile "$PROFILE" \
+            --output-dir "$RUNNER_TEMP/sandbox-vm-e2e-smoke"
+
+      - name: Upload VM E2E artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-vm-e2e-smoke-artifacts
+          path: ${{ runner.temp }}/sandbox-vm-e2e-smoke
+          if-no-files-found: warn
+
+  vm-e2e-nightly-full:
+    name: VM E2E Nightly Full Lane
+    if: github.event_name == 'schedule'
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 480
+    needs: vm-e2e-smoke
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+
+      - name: Run sandbox VM E2E full lane
+        run: |
+          PROFILE="${{ github.event.inputs.profile }}"
+          if [[ -z "$PROFILE" ]]; then
+            PROFILE="debug"
+          fi
+          ./scripts/run-sandbox-vm-e2e.sh \
+            --suite all \
+            --profile "$PROFILE" \
+            --output-dir "$RUNNER_TEMP/sandbox-vm-e2e-full"
+
+      - name: Upload VM E2E artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-vm-e2e-nightly-full-artifacts
+          path: ${{ runner.temp }}/sandbox-vm-e2e-full
+          if-no-files-found: warn
+
+  vm-e2e-manual:
+    name: VM E2E Manual
+    if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 240
 

@@ -126,3 +126,13 @@ Self-hosted VM E2E automation is in:
 - `.github/workflows/vm-e2e.yml`
 
 The workflow calls the same script so local and CI behavior stay aligned.
+
+The scheduled workflow now runs:
+
+- `vm-e2e-smoke` (`sandbox` suite)
+- `vm-e2e-nightly-full` (`all` suite, depends on smoke)
+
+Artifacts are published as:
+
+- `sandbox-vm-e2e-smoke-artifacts`
+- `sandbox-vm-e2e-nightly-full-artifacts`

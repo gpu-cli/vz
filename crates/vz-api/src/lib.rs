@@ -392,6 +392,7 @@ mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
+    use std::collections::BTreeSet;
     use tempfile::tempdir;
     use tower::ServiceExt;
     use vz_stack::StackEvent;
@@ -406,6 +407,13 @@ mod tests {
             },
             event_poll_interval: Duration::from_millis(10),
             default_event_page_size: 2,
+        }
+    }
+
+    fn sample_openapi_path(path: &str) -> String {
+        match path {
+            "/v1/events/{stack_name}" => "/v1/events/runtime-conformance-stack".to_string(),
+            _ => path.to_string(),
         }
     }
 
@@ -597,5 +605,81 @@ mod tests {
         assert!(paths.contains_key("/v1/executions"));
         assert!(paths.contains_key("/v1/events/{stack_name}/stream"));
         assert!(paths.contains_key("/v1/events/{stack_name}/ws"));
+    }
+
+    #[tokio::test]
+    async fn transport_parity_openapi_matrix_paths_match_contract() {
+        let document = openapi_document();
+        let paths = document["paths"].as_object().unwrap();
+        let mut matrix_paths = BTreeSet::new();
+
+        for entry in vz_runtime_contract::PRIMITIVE_CONFORMANCE_MATRIX {
+            if let Some(surface) = entry.openapi {
+                assert!(!surface.path.is_empty());
+                assert!(surface.path.starts_with('/'));
+                assert!(!surface.surface.is_empty());
+                assert!(
+                    paths.contains_key(surface.path),
+                    "missing OpenAPI path `{}` for `{}`",
+                    surface.path,
+                    entry.operation.as_str()
+                );
+                matrix_paths.insert(surface.path);
+            }
+        }
+
+        assert!(!matrix_paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn transport_parity_openapi_surface_errors_match_runtime_operation_labels() {
+        let temp_dir = tempdir().unwrap();
+        let state_path = temp_dir.path().join("state.db");
+        StateStore::open(&state_path).unwrap();
+
+        let app = router(test_config(state_path));
+
+        for entry in vz_runtime_contract::PRIMITIVE_CONFORMANCE_MATRIX {
+            let Some(surface) = entry.openapi else {
+                continue;
+            };
+
+            let request = Request::builder()
+                .uri(sample_openapi_path(surface.path))
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+
+            if status == StatusCode::NOT_IMPLEMENTED {
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let envelope: MachineErrorEnvelope = serde_json::from_slice(&body).unwrap();
+
+                assert_eq!(
+                    envelope.error.code,
+                    vz_runtime_contract::MachineErrorCode::UnsupportedOperation
+                );
+                assert_eq!(
+                    envelope.error.details.get("operation").map(String::as_str),
+                    Some(surface.surface),
+                    "matrix operation mismatch for `{}` at `{}`",
+                    entry.operation.as_str(),
+                    surface.path
+                );
+                continue;
+            }
+
+            if status == StatusCode::OK
+                && matches!(surface.path, "/v1/capabilities" | "/v1/events/{stack_name}")
+            {
+                continue;
+            }
+
+            panic!(
+                "unexpected matrix API status for `{}` at `{}`: {status}",
+                entry.operation.as_str(),
+                surface.path
+            );
+        }
     }
 }

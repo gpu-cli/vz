@@ -160,6 +160,10 @@ Full VM lanes (runtime + stack + buildkit):
 
 See `docs/sandbox-vm-e2e.md` for reproducible debug workflow and artifact paths.
 
+Conformance and parity coverage:
+
+- [Runtime primitive conformance matrix](docs/runtime-primitive-conformance.md)
+
 ## License
 
 [MIT](LICENSE.md)
