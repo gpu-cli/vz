@@ -127,21 +127,36 @@ fn full_pipeline_parse_apply_execute() {
     let dir = tempfile::tempdir().unwrap();
     let store = StateStore::open(&dir.path().join("state.db")).unwrap();
 
-    // Step 1: Reconcile to get actions.
+    // Step 1: Reconcile first round (strict dependency gating starts roots first).
     let health = HashMap::new();
-    let result = vz_stack::apply(&spec, &store, &health).unwrap();
-    assert_eq!(result.actions.len(), 2);
+    let first = vz_stack::apply(&spec, &store, &health).unwrap();
+    assert_eq!(first.actions.len(), 1);
+    assert!(matches!(
+        &first.actions[0],
+        Action::ServiceCreate { service_name } if service_name == "web"
+    ));
 
-    // Step 2: Execute actions through mock runtime.
+    // Step 2: Execute first round through mock runtime.
     let runtime = MockRuntime::new(vec!["ctr-web", "ctr-api"]);
     let exec_store = StateStore::open(&dir.path().join("state.db")).unwrap();
     let mut executor = StackExecutor::new(runtime, exec_store, dir.path());
 
-    let exec_result = executor.execute(&spec, &result.actions).unwrap();
-    assert!(exec_result.all_succeeded());
-    assert_eq!(exec_result.succeeded, 2);
+    let first_exec = executor.execute(&spec, &first.actions).unwrap();
+    assert!(first_exec.all_succeeded());
+    assert_eq!(first_exec.succeeded, 1);
 
-    // Step 3: Verify observed state.
+    // Step 3: Reconcile + execute second round (api unblocked once web is running).
+    let second = vz_stack::apply(&spec, &store, &health).unwrap();
+    assert_eq!(second.actions.len(), 1);
+    assert!(matches!(
+        &second.actions[0],
+        Action::ServiceCreate { service_name } if service_name == "api"
+    ));
+    let second_exec = executor.execute(&spec, &second.actions).unwrap();
+    assert!(second_exec.all_succeeded());
+    assert_eq!(second_exec.succeeded, 1);
+
+    // Step 4: Verify observed state.
     let observed = executor.store().load_observed_state("myapp").unwrap();
     assert_eq!(observed.len(), 2);
 
@@ -153,7 +168,7 @@ fn full_pipeline_parse_apply_execute() {
     assert_eq!(api.phase, ServicePhase::Running);
     assert_eq!(api.container_id, Some("ctr-api".to_string()));
 
-    // Step 4: Verify events emitted.
+    // Step 5: Verify events emitted.
     // Note: apply() also emits ServiceCreating events, so we get 2 from apply + 2 from executor = 4.
     // ServiceReady events are only emitted by the executor (2 total).
     let events = executor.store().load_events("myapp").unwrap();
@@ -176,17 +191,32 @@ fn full_pipeline_up_then_down() {
     let dir = tempfile::tempdir().unwrap();
     let store = StateStore::open(&dir.path().join("state.db")).unwrap();
 
-    // UP: apply + execute.
+    // UP round 1: start dependency roots.
     let health = HashMap::new();
-    let up_result = vz_stack::apply(&spec, &store, &health).unwrap();
+    let up_result_1 = vz_stack::apply(&spec, &store, &health).unwrap();
+    assert_eq!(up_result_1.actions.len(), 1);
+    assert!(matches!(
+        &up_result_1.actions[0],
+        Action::ServiceCreate { service_name } if service_name == "web"
+    ));
 
     let runtime = MockRuntime::new(vec!["ctr-web", "ctr-api"]);
     let exec_store = StateStore::open(&dir.path().join("state.db")).unwrap();
     let mut executor = StackExecutor::new(runtime, exec_store, dir.path());
-    executor.execute(&spec, &up_result.actions).unwrap();
+    executor.execute(&spec, &up_result_1.actions).unwrap();
+
+    // UP round 2: dependent service can now start.
+    let up_result_2 = vz_stack::apply(&spec, &store, &health).unwrap();
+    assert_eq!(up_result_2.actions.len(), 1);
+    assert!(matches!(
+        &up_result_2.actions[0],
+        Action::ServiceCreate { service_name } if service_name == "api"
+    ));
+    executor.execute(&spec, &up_result_2.actions).unwrap();
 
     // Verify running.
     let observed = executor.store().load_observed_state("myapp").unwrap();
+    assert_eq!(observed.len(), 2);
     assert!(observed.iter().all(|o| o.phase == ServicePhase::Running));
 
     // DOWN: construct remove actions directly (bypassing apply, which
@@ -240,7 +270,8 @@ services:
   app:
     image: myapp:latest
     depends_on:
-      - db
+      db:
+        condition: service_healthy
 "#;
 
 #[test]
@@ -248,17 +279,21 @@ fn health_check_gates_dependent_service() {
     let spec = parse_compose(HEALTHCHECK_COMPOSE, "hc-test").unwrap();
     let dir = tempfile::tempdir().unwrap();
 
-    // Initial apply creates both (topo sort handles fresh deploy).
+    // Initial apply creates only db; app is gated on db health.
     let store = StateStore::open(&dir.path().join("state.db")).unwrap();
     let health = HashMap::new();
-    let result = vz_stack::apply(&spec, &store, &health).unwrap();
-    assert_eq!(result.actions.len(), 2);
+    let first = vz_stack::apply(&spec, &store, &health).unwrap();
+    assert_eq!(first.actions.len(), 1);
+    assert!(matches!(
+        &first.actions[0],
+        Action::ServiceCreate { service_name } if service_name == "db"
+    ));
 
-    // Execute: both start running.
+    // Execute first round: db starts running.
     let runtime = MockRuntime::new(vec!["ctr-db", "ctr-app"]);
     let exec_store = StateStore::open(&dir.path().join("state.db")).unwrap();
     let mut executor = StackExecutor::new(runtime, exec_store, dir.path());
-    executor.execute(&spec, &result.actions).unwrap();
+    executor.execute(&spec, &first.actions).unwrap();
 
     // Health check: db returns healthy.
     let mut poller = HealthPoller::new();
@@ -271,6 +306,15 @@ fn health_check_gates_dependent_service() {
     let observed = executor.store().load_observed_state("hc-test").unwrap();
     let db = observed.iter().find(|o| o.service_name == "db").unwrap();
     assert!(db.ready);
+
+    // Reconcile again: app is now unblocked by healthy db.
+    let second = vz_stack::apply(&spec, &store, poller.statuses()).unwrap();
+    assert_eq!(second.actions.len(), 1);
+    assert!(matches!(
+        &second.actions[0],
+        Action::ServiceCreate { service_name } if service_name == "app"
+    ));
+    executor.execute(&spec, &second.actions).unwrap();
 }
 
 #[test]
@@ -515,20 +559,34 @@ fn re_apply_after_execution_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let store = StateStore::open(&dir.path().join("state.db")).unwrap();
 
-    // First apply + execute.
+    // First apply + execute (starts dependency root only).
     let health = HashMap::new();
     let result = vz_stack::apply(&spec, &store, &health).unwrap();
+    assert_eq!(result.actions.len(), 1);
+    assert!(matches!(
+        &result.actions[0],
+        Action::ServiceCreate { service_name } if service_name == "web"
+    ));
 
     let runtime = MockRuntime::new(vec!["ctr-web", "ctr-api"]);
     let exec_store = StateStore::open(&dir.path().join("state.db")).unwrap();
     let mut executor = StackExecutor::new(runtime, exec_store, dir.path());
     executor.execute(&spec, &result.actions).unwrap();
 
-    // Second apply: should produce no actions since services are Running.
+    // Second apply + execute starts dependent service.
     let result2 = vz_stack::apply(&spec, &store, &health).unwrap();
+    assert_eq!(result2.actions.len(), 1);
+    assert!(matches!(
+        &result2.actions[0],
+        Action::ServiceCreate { service_name } if service_name == "api"
+    ));
+    executor.execute(&spec, &result2.actions).unwrap();
+
+    // Third apply: should be idempotent after both services are running.
+    let result3 = vz_stack::apply(&spec, &store, &health).unwrap();
     assert!(
-        result2.actions.is_empty(),
-        "second apply should be idempotent after execution: {:?}",
-        result2.actions
+        result3.actions.is_empty(),
+        "third apply should be idempotent after staged execution: {:?}",
+        result3.actions
     );
 }

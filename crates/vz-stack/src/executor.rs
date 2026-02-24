@@ -1440,12 +1440,13 @@ mod tests {
     use super::tests_support::MockContainerRuntime;
     use super::*;
     use crate::spec::MountSpec as StackMountSpec;
-    use crate::spec::{PortSpec, ResourcesSpec, StackSpec, VolumeSpec};
+    use crate::spec::{PortSpec, ResourcesSpec, ServiceKind, StackSpec, VolumeSpec};
     use std::collections::HashMap;
 
     fn svc(name: &str, image: &str) -> ServiceSpec {
         ServiceSpec {
             name: name.to_string(),
+            kind: ServiceKind::Service,
             image: image.to_string(),
             command: None,
             entrypoint: None,

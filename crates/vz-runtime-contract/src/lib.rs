@@ -38,6 +38,166 @@ pub const REQUIRED_IDEMPOTENT_MUTATIONS: &[RuntimeOperation] = &[
     RuntimeOperation::ForkCheckpoint,
 ];
 
+/// Workspace-oriented runtime manager that routes stack operations
+/// through backend capabilities with deterministic fallback behavior.
+pub struct WorkspaceRuntimeManager<B: RuntimeBackend> {
+    backend: B,
+}
+
+impl<B: RuntimeBackend> WorkspaceRuntimeManager<B> {
+    /// Create a new runtime manager over a concrete backend.
+    pub fn new(backend: B) -> Self {
+        Self { backend }
+    }
+
+    /// Access the wrapped backend.
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    /// Consume the manager and return the wrapped backend.
+    pub fn into_inner(self) -> B {
+        self.backend
+    }
+
+    /// Backend name for diagnostics.
+    pub fn name(&self) -> &'static str {
+        self.backend.name()
+    }
+
+    /// Capability snapshot.
+    pub fn capabilities(&self) -> RuntimeCapabilities {
+        self.backend.capabilities()
+    }
+
+    /// Pull an image reference and return resolved image id.
+    pub async fn pull_image(&self, image: &str) -> Result<String, RuntimeError> {
+        self.backend.pull(image).await
+    }
+
+    /// Create a standalone container.
+    pub async fn create_container(
+        &self,
+        image: &str,
+        config: RunConfig,
+    ) -> Result<String, RuntimeError> {
+        self.backend.create_container(image, config).await
+    }
+
+    /// Execute command inside a running container.
+    pub async fn exec_container(
+        &self,
+        id: &str,
+        config: ExecConfig,
+    ) -> Result<ExecOutput, RuntimeError> {
+        self.backend.exec_container(id, config).await
+    }
+
+    /// Stop a running container.
+    pub async fn stop_container(
+        &self,
+        id: &str,
+        force: bool,
+        signal: Option<&str>,
+        grace_period: Option<std::time::Duration>,
+    ) -> Result<ContainerInfo, RuntimeError> {
+        self.backend
+            .stop_container(id, force, signal, grace_period)
+            .await
+    }
+
+    /// Remove a container.
+    pub async fn remove_container(&self, id: &str) -> Result<(), RuntimeError> {
+        self.backend.remove_container(id).await
+    }
+
+    /// Fetch persisted container logs if supported by backend.
+    pub fn container_logs(&self, container_id: &str) -> Result<ContainerLogs, RuntimeError> {
+        self.backend.logs(container_id)
+    }
+
+    /// Ensure stack runtime environment is prepared.
+    ///
+    /// Transitional behavior: when `shared_vm` is unsupported this is a no-op
+    /// and stack services fall back to plain container primitives.
+    pub async fn ensure_stack_runtime(
+        &self,
+        stack_id: &str,
+        ports: Vec<PortMapping>,
+        resources: StackResourceHint,
+    ) -> Result<(), RuntimeError> {
+        if self.capabilities().shared_vm {
+            self.backend
+                .boot_shared_vm(stack_id, ports, resources)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Create a stack service container.
+    ///
+    /// If shared runtime capability is present, route through backend stack
+    /// create path; otherwise fall back to plain `create_container`.
+    pub async fn create_stack_container(
+        &self,
+        stack_id: &str,
+        image: &str,
+        config: RunConfig,
+    ) -> Result<String, RuntimeError> {
+        if self.capabilities().shared_vm {
+            self.backend
+                .create_container_in_stack(stack_id, image, config)
+                .await
+        } else {
+            self.backend.create_container(image, config).await
+        }
+    }
+
+    /// Configure stack service networking when capability is available.
+    pub async fn setup_stack_network(
+        &self,
+        stack_id: &str,
+        services: Vec<NetworkServiceConfig>,
+    ) -> Result<(), RuntimeError> {
+        let caps = self.capabilities();
+        if caps.shared_vm && caps.stack_networking {
+            self.backend.network_setup(stack_id, services).await?;
+        }
+        Ok(())
+    }
+
+    /// Tear down stack service networking when capability is available.
+    pub async fn teardown_stack_network(
+        &self,
+        stack_id: &str,
+        service_names: Vec<String>,
+    ) -> Result<(), RuntimeError> {
+        let caps = self.capabilities();
+        if caps.shared_vm && caps.stack_networking {
+            self.backend
+                .network_teardown(stack_id, service_names)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Shut down stack runtime environment when capability is available.
+    pub async fn shutdown_stack_runtime(&self, stack_id: &str) -> Result<(), RuntimeError> {
+        if self.capabilities().shared_vm {
+            self.backend.shutdown_shared_vm(stack_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Whether stack runtime is currently active.
+    pub fn has_stack_runtime(&self, stack_id: &str) -> bool {
+        if !self.capabilities().shared_vm {
+            return false;
+        }
+        self.backend.has_shared_vm(stack_id)
+    }
+}
+
 /// Backend-neutral container runtime trait.
 ///
 /// Each host platform provides an implementation of this trait. The
@@ -238,7 +398,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::future::{Future, ready};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Wake, Waker};
 
     fn unsupported(operation: &str) -> RuntimeError {
@@ -328,6 +488,141 @@ mod tests {
 
         fn list_containers(&self) -> Result<Vec<ContainerInfo>, RuntimeError> {
             Err(unsupported("list_containers"))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ManagerRoutingBackend {
+        capabilities: RuntimeCapabilities,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl ManagerRoutingBackend {
+        fn new(capabilities: RuntimeCapabilities) -> Self {
+            Self {
+                capabilities,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, call: &str) {
+            self.calls.lock().unwrap().push(call.to_string());
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl RuntimeBackend for ManagerRoutingBackend {
+        fn name(&self) -> &'static str {
+            "manager-routing"
+        }
+
+        fn capabilities(&self) -> RuntimeCapabilities {
+            self.capabilities
+        }
+
+        fn pull(&self, _image: &str) -> impl Future<Output = Result<String, RuntimeError>> {
+            self.record("pull");
+            ready(Ok("sha256:test".to_string()))
+        }
+
+        fn images(&self) -> Result<Vec<ImageInfo>, RuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn prune_images(&self) -> Result<PruneResult, RuntimeError> {
+            Ok(PruneResult {
+                removed_refs: 0,
+                removed_manifests: 0,
+                removed_configs: 0,
+                removed_layer_dirs: 0,
+            })
+        }
+
+        fn run(
+            &self,
+            _image: &str,
+            _config: RunConfig,
+        ) -> impl Future<Output = Result<ExecOutput, RuntimeError>> {
+            self.record("run");
+            ready(Ok(ExecOutput {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }))
+        }
+
+        fn create_container(
+            &self,
+            _image: &str,
+            _config: RunConfig,
+        ) -> impl Future<Output = Result<String, RuntimeError>> {
+            self.record("create_container");
+            ready(Ok("ctr-plain".to_string()))
+        }
+
+        fn exec_container(
+            &self,
+            _id: &str,
+            _config: ExecConfig,
+        ) -> impl Future<Output = Result<ExecOutput, RuntimeError>> {
+            self.record("exec_container");
+            ready(Ok(ExecOutput {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }))
+        }
+
+        fn stop_container(
+            &self,
+            _id: &str,
+            _force: bool,
+            _signal: Option<&str>,
+            _grace_period: Option<std::time::Duration>,
+        ) -> impl Future<Output = Result<ContainerInfo, RuntimeError>> {
+            self.record("stop_container");
+            ready(Err(unsupported("stop_container")))
+        }
+
+        fn remove_container(&self, _id: &str) -> impl Future<Output = Result<(), RuntimeError>> {
+            self.record("remove_container");
+            ready(Ok(()))
+        }
+
+        fn list_containers(&self) -> Result<Vec<ContainerInfo>, RuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn boot_shared_vm(
+            &self,
+            _stack_id: &str,
+            _ports: Vec<PortMapping>,
+            _resources: StackResourceHint,
+        ) -> impl Future<Output = Result<(), RuntimeError>> {
+            self.record("boot_shared_vm");
+            ready(Ok(()))
+        }
+
+        fn create_container_in_stack(
+            &self,
+            _stack_id: &str,
+            _image: &str,
+            _config: RunConfig,
+        ) -> impl Future<Output = Result<String, RuntimeError>> {
+            self.record("create_container_in_stack");
+            ready(Ok("ctr-stack".to_string()))
+        }
+
+        fn network_setup(
+            &self,
+            _stack_id: &str,
+            _services: Vec<NetworkServiceConfig>,
+        ) -> impl Future<Output = Result<(), RuntimeError>> {
+            self.record("network_setup");
+            ready(Ok(()))
         }
     }
 
@@ -551,6 +846,52 @@ mod tests {
                 other => panic!("expected unsupported operation error, got: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn workspace_runtime_manager_routes_stack_create_with_shared_runtime() {
+        let backend = ManagerRoutingBackend::new(RuntimeCapabilities::stack_baseline());
+        let manager = WorkspaceRuntimeManager::new(backend);
+
+        let created = poll_immediate(manager.create_stack_container(
+            "stack-1",
+            "nginx:latest",
+            RunConfig::default(),
+        ))
+        .unwrap();
+
+        assert_eq!(created, "ctr-stack");
+        assert_eq!(manager.backend().calls(), vec!["create_container_in_stack"]);
+    }
+
+    #[test]
+    fn workspace_runtime_manager_falls_back_to_plain_create_when_shared_disabled() {
+        let mut caps = RuntimeCapabilities::stack_baseline();
+        caps.shared_vm = false;
+        let backend = ManagerRoutingBackend::new(caps);
+        let manager = WorkspaceRuntimeManager::new(backend);
+
+        let created = poll_immediate(manager.create_stack_container(
+            "stack-1",
+            "nginx:latest",
+            RunConfig::default(),
+        ))
+        .unwrap();
+
+        assert_eq!(created, "ctr-plain");
+        assert_eq!(manager.backend().calls(), vec!["create_container"]);
+    }
+
+    #[test]
+    fn workspace_runtime_manager_skips_network_setup_without_capability() {
+        let mut caps = RuntimeCapabilities::stack_baseline();
+        caps.stack_networking = false;
+        let backend = ManagerRoutingBackend::new(caps);
+        let manager = WorkspaceRuntimeManager::new(backend);
+
+        poll_immediate(manager.setup_stack_network("stack-1", Vec::new())).unwrap();
+
+        assert!(manager.backend().calls().is_empty());
     }
 
     #[test]

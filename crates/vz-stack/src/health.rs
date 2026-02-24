@@ -100,16 +100,16 @@ pub fn is_service_ready(
 
 /// Check if any dependency blocks creation of this service.
 ///
-/// The reconciler uses topological sort to order actions within a
-/// single apply batch, so dependencies that are not yet observed
-/// (being created in the same batch) do NOT block. A dependency
-/// only blocks when:
+/// Dependency gating is strict: downstream services only start after
+/// dependencies satisfy the declared readiness predicates.
 ///
-/// - It is in a terminal state (`Failed` / `Stopped`).
-/// - The condition is `service_healthy` and the health check has
-///   not yet passed.
-/// - The condition is `service_completed_successfully` and the
-///   service has not exited with code 0.
+/// A dependency blocks when:
+/// - It has no observed state yet.
+/// - The condition is `service_started` and the dependency is not `Running`.
+/// - The condition is `service_healthy` and the dependency is not `Running`
+///   with a passing health check.
+/// - The condition is `service_completed_successfully` and the dependency
+///   is not `Stopped` with no recorded error.
 ///
 /// With the default `service_started` condition, a running service
 /// is considered ready regardless of health check status — matching
@@ -140,34 +140,23 @@ pub fn check_dependencies(
         let dep_health = health_statuses.get(&dep.service);
 
         let blocked = match dep_obs {
-            None => {
-                // Not yet created — topo sort handles ordering within the batch.
-                false
-            }
-            Some(obs) => match obs.phase {
-                // Terminal states block dependent creation.
-                ServicePhase::Failed | ServicePhase::Stopped => true,
-                // Running: behaviour depends on the condition.
-                ServicePhase::Running => match dep.condition {
-                    DependencyCondition::ServiceStarted => {
-                        // Running is sufficient — don't check health.
-                        false
-                    }
-                    DependencyCondition::ServiceHealthy => {
-                        // Must have a passing health check.
+            None => true,
+            Some(obs) => match dep.condition {
+                DependencyCondition::ServiceStarted => obs.phase != ServicePhase::Running,
+                DependencyCondition::ServiceHealthy => {
+                    if obs.phase != ServicePhase::Running {
+                        true
+                    } else {
                         let healthcheck = dep_spec.and_then(|s| s.healthcheck.as_ref());
                         match healthcheck {
                             None => false, // No health check defined = ready.
                             Some(hc) => !is_service_ready(obs, Some(hc), dep_health),
                         }
                     }
-                    DependencyCondition::ServiceCompletedSuccessfully => {
-                        // Running means not completed yet → blocked.
-                        true
-                    }
-                },
-                // Pending/Creating/Stopping — in progress, don't block.
-                _ => false,
+                }
+                DependencyCondition::ServiceCompletedSuccessfully => {
+                    !(obs.phase == ServicePhase::Stopped && obs.last_error.is_none())
+                }
             },
         };
 
@@ -489,12 +478,13 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use crate::spec::ServiceDependency;
+    use crate::spec::{ServiceDependency, ServiceKind};
     use std::collections::HashMap;
 
     fn svc(name: &str) -> ServiceSpec {
         ServiceSpec {
             name: name.to_string(),
+            kind: ServiceKind::Service,
             image: "img:latest".to_string(),
             command: None,
             entrypoint: None,
@@ -535,6 +525,19 @@ mod tests {
     fn svc_with_healthy_deps(name: &str, deps: Vec<&str>) -> ServiceSpec {
         ServiceSpec {
             depends_on: deps.into_iter().map(ServiceDependency::healthy).collect(),
+            ..svc(name)
+        }
+    }
+
+    fn svc_with_completed_deps(name: &str, deps: Vec<&str>) -> ServiceSpec {
+        ServiceSpec {
+            depends_on: deps
+                .into_iter()
+                .map(|dep| ServiceDependency {
+                    service: dep.to_string(),
+                    condition: DependencyCondition::ServiceCompletedSuccessfully,
+                })
+                .collect(),
             ..svc(name)
         }
     }
@@ -690,13 +693,17 @@ mod tests {
     }
 
     #[test]
-    fn dep_not_created_is_not_blocked() {
-        // Not-yet-created deps don't block — topo sort handles ordering.
+    fn dep_not_created_is_blocked() {
         let service = svc_with_deps("web", vec!["db"]);
         let all_services = vec![svc("db"), service.clone()];
 
         let result = check_dependencies(&service, &[], &all_services, &HashMap::new());
-        assert_eq!(result, DependencyCheck::Ready);
+        assert_eq!(
+            result,
+            DependencyCheck::Blocked {
+                waiting_on: vec!["db".to_string()]
+            }
+        );
     }
 
     #[test]
@@ -710,14 +717,18 @@ mod tests {
     }
 
     #[test]
-    fn dep_pending_is_not_blocked() {
-        // Pending deps don't block — topo sort handles ordering.
+    fn dep_pending_is_blocked() {
         let service = svc_with_deps("web", vec!["db"]);
         let all_services = vec![svc("db"), service.clone()];
         let observed = vec![obs("db", ServicePhase::Pending)];
 
         let result = check_dependencies(&service, &observed, &all_services, &HashMap::new());
-        assert_eq!(result, DependencyCheck::Ready);
+        assert_eq!(
+            result,
+            DependencyCheck::Blocked {
+                waiting_on: vec!["db".to_string()]
+            }
+        );
     }
 
     #[test]
@@ -797,19 +808,58 @@ mod tests {
     }
 
     #[test]
-    fn chain_deps_not_created_are_not_blocked() {
-        // app → api → db. Nothing running. Topo sort handles ordering.
+    fn chain_deps_not_created_are_blocked() {
+        // app → api → db. Nothing observed, both should be blocked.
         let db = svc("db");
         let api = svc_with_deps("api", vec!["db"]);
         let app = svc_with_deps("app", vec!["api"]);
         let all = vec![db, api.clone(), app.clone()];
 
-        // No observed state — all deps unblocked (topo sort handles order).
         let api_check = check_dependencies(&api, &[], &all, &HashMap::new());
-        assert_eq!(api_check, DependencyCheck::Ready);
+        assert_eq!(
+            api_check,
+            DependencyCheck::Blocked {
+                waiting_on: vec!["db".to_string()]
+            }
+        );
 
         let app_check = check_dependencies(&app, &[], &all, &HashMap::new());
-        assert_eq!(app_check, DependencyCheck::Ready);
+        assert_eq!(
+            app_check,
+            DependencyCheck::Blocked {
+                waiting_on: vec!["api".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn dep_completed_successfully_requires_stopped_without_error() {
+        let service = svc_with_completed_deps("web", vec!["job"]);
+        let all_services = vec![svc("job"), service.clone()];
+
+        let running = vec![obs("job", ServicePhase::Running)];
+        assert_eq!(
+            check_dependencies(&service, &running, &all_services, &HashMap::new()),
+            DependencyCheck::Blocked {
+                waiting_on: vec!["job".to_string()]
+            }
+        );
+
+        let mut stopped_ok = obs("job", ServicePhase::Stopped);
+        stopped_ok.last_error = None;
+        assert_eq!(
+            check_dependencies(&service, &[stopped_ok], &all_services, &HashMap::new()),
+            DependencyCheck::Ready
+        );
+
+        let mut stopped_err = obs("job", ServicePhase::Stopped);
+        stopped_err.last_error = Some("exit code 1".to_string());
+        assert_eq!(
+            check_dependencies(&service, &[stopped_err], &all_services, &HashMap::new()),
+            DependencyCheck::Blocked {
+                waiting_on: vec!["job".to_string()]
+            }
+        );
     }
 
     #[test]

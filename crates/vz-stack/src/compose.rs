@@ -13,8 +13,8 @@ use serde_yml::Value;
 use crate::error::StackError;
 use crate::spec::{
     DependencyCondition, HealthCheckSpec, MountSpec, NetworkSpec, PortSpec, ResourcesSpec,
-    RestartPolicy, SecretDef, ServiceDependency, ServiceSecretRef, ServiceSpec, StackSpec,
-    UlimitSpec, VolumeSpec,
+    RestartPolicy, SecretDef, ServiceDependency, ServiceKind, ServiceSecretRef, ServiceSpec,
+    StackSpec, UlimitSpec, VolumeSpec,
 };
 
 // ── Accepted key sets ──────────────────────────────────────────────
@@ -61,6 +61,8 @@ const ACCEPTED_SERVICE: &[&str] = &[
     // Stop lifecycle
     "stop_signal",
     "stop_grace_period",
+    // Service-level extensions
+    "x-vz",
 ];
 
 /// Volume-level keys allowed inside `volumes.<name>`.
@@ -318,6 +320,8 @@ fn parse_compose_inner(
         }
     }
 
+    validate_workspace_service_invariants(&services)?;
+
     // ── Parse x-vz extensions ────────────────────────────────────────
     let disk_size_mb = parse_xvz_disk_size(root_map)?;
 
@@ -427,6 +431,7 @@ fn parse_service(
             StackError::ComposeValidation(format!("service `{name}` is missing required `image`"))
         })?
         .to_string();
+    let kind = parse_service_kind(name, svc_map)?;
 
     let command = parse_string_or_list(svc_map, "command")?;
     let entrypoint = parse_string_or_list(svc_map, "entrypoint")?;
@@ -534,6 +539,7 @@ fn parse_service(
 
     Ok(ServiceSpec {
         name: name.to_string(),
+        kind,
         image,
         command,
         entrypoint,
@@ -562,6 +568,64 @@ fn parse_service(
         stop_signal,
         stop_grace_period_secs,
     })
+}
+
+fn parse_service_kind(
+    svc_name: &str,
+    svc_map: &serde_yml::Mapping,
+) -> Result<ServiceKind, StackError> {
+    let Some(xvz_value) = svc_map.get(val("x-vz")) else {
+        return Ok(ServiceKind::Service);
+    };
+
+    let xvz_map = xvz_value.as_mapping().ok_or_else(|| {
+        StackError::ComposeParse(format!("service `{svc_name}`: `x-vz` must be a mapping"))
+    })?;
+
+    for key in xvz_map.keys() {
+        let key_str = key.as_str().unwrap_or("");
+        if key_str != "kind" {
+            return Err(StackError::ComposeUnsupportedFeature {
+                feature: format!("services.{svc_name}.x-vz.{key_str}"),
+                reason: "unknown `x-vz` service extension key; accepted keys are: kind".to_string(),
+            });
+        }
+    }
+
+    let Some(kind_value) = xvz_map.get(val("kind")) else {
+        return Ok(ServiceKind::Service);
+    };
+    let kind_str = kind_value.as_str().ok_or_else(|| {
+        StackError::ComposeParse(format!(
+            "service `{svc_name}`: `x-vz.kind` must be a string"
+        ))
+    })?;
+
+    match kind_str.trim() {
+        "workspace" => Ok(ServiceKind::Workspace),
+        "service" => Ok(ServiceKind::Service),
+        "task" => Ok(ServiceKind::Task),
+        other => Err(StackError::ComposeValidation(format!(
+            "service `{svc_name}`: invalid `x-vz.kind` `{other}`; expected workspace|service|task"
+        ))),
+    }
+}
+
+fn validate_workspace_service_invariants(services: &[ServiceSpec]) -> Result<(), StackError> {
+    let workspace_services: Vec<&str> = services
+        .iter()
+        .filter(|svc| svc.kind == ServiceKind::Workspace)
+        .map(|svc| svc.name.as_str())
+        .collect();
+
+    if workspace_services.len() > 1 {
+        return Err(StackError::ComposeValidation(format!(
+            "multiple workspace services defined ({}); only one workspace service is allowed",
+            workspace_services.join(", ")
+        )));
+    }
+
+    Ok(())
 }
 
 // ── Field parsers ──────────────────────────────────────────────────
@@ -3514,6 +3578,57 @@ services:
 "#;
         let err = parse_compose(yaml, "myapp").unwrap_err();
         assert!(err.to_string().contains("missing_vol"));
+    }
+
+    #[test]
+    fn parse_service_kind_workspace() {
+        let yaml = r#"
+services:
+  ws:
+    image: ghcr.io/acme/workspace:latest
+    x-vz:
+      kind: workspace
+  api:
+    image: ghcr.io/acme/api:latest
+    x-vz:
+      kind: service
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services.len(), 2);
+        assert_eq!(spec.services[0].name, "api");
+        assert_eq!(spec.services[0].kind, ServiceKind::Service);
+        assert_eq!(spec.services[1].name, "ws");
+        assert_eq!(spec.services[1].kind, ServiceKind::Workspace);
+    }
+
+    #[test]
+    fn reject_invalid_service_kind() {
+        let yaml = r#"
+services:
+  ws:
+    image: ghcr.io/acme/workspace:latest
+    x-vz:
+      kind: daemon
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("x-vz.kind"));
+    }
+
+    #[test]
+    fn reject_multiple_workspace_services() {
+        let yaml = r#"
+services:
+  ws-a:
+    image: ghcr.io/acme/workspace-a:latest
+    x-vz:
+      kind: workspace
+  ws-b:
+    image: ghcr.io/acme/workspace-b:latest
+    x-vz:
+      kind: workspace
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        assert!(err.to_string().contains("workspace services"));
     }
 
     #[test]

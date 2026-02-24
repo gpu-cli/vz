@@ -233,13 +233,21 @@ pub fn validate_bind_mounts(
 ///
 /// Returns `true` if mounts differ, which should trigger a service recreate.
 pub fn mounts_changed(old: &[MountSpec], new: &[MountSpec]) -> bool {
-    let mut old_normalized: Vec<String> = old.iter().map(normalize_mount_spec).collect();
-    let mut new_normalized: Vec<String> = new.iter().map(normalize_mount_spec).collect();
+    mount_plan_digest(old) != mount_plan_digest(new)
+}
 
-    old_normalized.sort();
-    new_normalized.sort();
+/// Build a deterministic digest string for a service mount plan.
+///
+/// This canonicalizes mount specs, sorts entries, and joins them into a
+/// stable string suitable for persistence and equality comparison.
+pub fn mount_plan_digest(mounts: &[MountSpec]) -> String {
+    let mut normalized = normalized_mount_entries(mounts);
+    normalized.sort();
+    normalized.join("\n")
+}
 
-    old_normalized != new_normalized
+fn normalized_mount_entries(mounts: &[MountSpec]) -> Vec<String> {
+    mounts.iter().map(normalize_mount_spec).collect()
 }
 
 fn normalize_mount_spec(spec: &MountSpec) -> String {
@@ -672,6 +680,36 @@ mod tests {
         ];
 
         assert!(!mounts_changed(&old, &new));
+    }
+
+    #[test]
+    fn mount_plan_digest_is_deterministic_across_order_and_path_spelling() {
+        let old = vec![
+            MountSpec::Bind {
+                source: "/tmp/vz/../vz/workspace".to_string(),
+                target: "/workspace/./src".to_string(),
+                read_only: false,
+            },
+            MountSpec::Named {
+                source: "cache".to_string(),
+                target: "/cache".to_string(),
+                read_only: true,
+            },
+        ];
+        let new = vec![
+            MountSpec::Named {
+                source: "cache".to_string(),
+                target: "/cache".to_string(),
+                read_only: true,
+            },
+            MountSpec::Bind {
+                source: "/tmp/vz/workspace".to_string(),
+                target: "/workspace/src".to_string(),
+                read_only: false,
+            },
+        ];
+
+        assert_eq!(mount_plan_digest(&old), mount_plan_digest(&new));
     }
 
     #[test]

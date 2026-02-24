@@ -10,9 +10,10 @@ use std::collections::HashMap;
 
 use tracing::{debug, info};
 
+use crate::error::StackError;
 use crate::reconcile::Action;
 use crate::spec::{RestartPolicy, StackSpec};
-use crate::state_store::{ServiceObservedState, ServicePhase};
+use crate::state_store::{ServiceObservedState, ServicePhase, StateStore};
 
 /// Tracks restart counts and decides whether services should restart.
 pub struct RestartTracker {
@@ -116,6 +117,25 @@ impl Default for RestartTracker {
     }
 }
 
+/// Clear stale reconcile progress markers that are already complete.
+///
+/// Returns `true` when a stale marker was removed.
+pub fn cleanup_orphaned_reconcile_progress(
+    store: &StateStore,
+    stack_name: &str,
+) -> Result<bool, StackError> {
+    let Some(progress) = store.load_reconcile_progress(stack_name)? else {
+        return Ok(false);
+    };
+
+    if progress.next_action_index >= progress.actions.len() {
+        store.clear_reconcile_progress(stack_name)?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 /// Evaluate all services and produce restart actions.
 ///
 /// Scans observed state for services that are `Stopped` or `Failed`
@@ -165,11 +185,12 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use crate::spec::ServiceSpec;
+    use crate::spec::{ServiceKind, ServiceSpec};
 
     fn svc(name: &str, policy: Option<RestartPolicy>) -> ServiceSpec {
         ServiceSpec {
             name: name.to_string(),
+            kind: ServiceKind::Service,
             image: "img:latest".to_string(),
             command: None,
             entrypoint: None,
@@ -219,6 +240,36 @@ mod tests {
             secrets: vec![],
             disk_size_mb: None,
         }
+    }
+
+    #[test]
+    fn cleanup_orphaned_progress_clears_completed_marker() {
+        let store = StateStore::in_memory().unwrap();
+        let actions = vec![Action::ServiceCreate {
+            service_name: "web".to_string(),
+        }];
+        store
+            .save_reconcile_progress("app", "op-1", &actions, 1)
+            .unwrap();
+
+        let cleaned = cleanup_orphaned_reconcile_progress(&store, "app").unwrap();
+        assert!(cleaned);
+        assert!(store.load_reconcile_progress("app").unwrap().is_none());
+    }
+
+    #[test]
+    fn cleanup_orphaned_progress_keeps_inflight_marker() {
+        let store = StateStore::in_memory().unwrap();
+        let actions = vec![Action::ServiceCreate {
+            service_name: "web".to_string(),
+        }];
+        store
+            .save_reconcile_progress("app", "op-1", &actions, 0)
+            .unwrap();
+
+        let cleaned = cleanup_orphaned_reconcile_progress(&store, "app").unwrap();
+        assert!(!cleaned);
+        assert!(store.load_reconcile_progress("app").unwrap().is_some());
     }
 
     // ── should_restart ──

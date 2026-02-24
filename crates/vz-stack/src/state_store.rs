@@ -5,6 +5,7 @@
 //! - **Observed state**: per-service runtime state from the reconciler
 //! - **Events**: structured lifecycle events for observability
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc;
 
@@ -14,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::StackSpec;
 use crate::error::StackError;
 use crate::events::{EventRecord, StackEvent};
+use crate::reconcile::Action;
 
 /// Observable phase of a service within a stack.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -48,6 +50,63 @@ pub struct ServiceObservedState {
     /// Whether the service is ready (health checks passing or no check defined).
     #[serde(default)]
     pub ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum StoredActionKind {
+    ServiceCreate,
+    ServiceRecreate,
+    ServiceRemove,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct StoredAction {
+    kind: StoredActionKind,
+    service_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileProgress {
+    /// Stable identifier for the in-flight operation batch.
+    pub operation_id: String,
+    /// Next action index to execute from `actions`.
+    pub next_action_index: usize,
+    /// Ordered action plan persisted for restart-safe replay.
+    pub actions: Vec<Action>,
+}
+
+impl StoredAction {
+    fn from_action(action: &Action) -> Self {
+        match action {
+            Action::ServiceCreate { service_name } => Self {
+                kind: StoredActionKind::ServiceCreate,
+                service_name: service_name.clone(),
+            },
+            Action::ServiceRecreate { service_name } => Self {
+                kind: StoredActionKind::ServiceRecreate,
+                service_name: service_name.clone(),
+            },
+            Action::ServiceRemove { service_name } => Self {
+                kind: StoredActionKind::ServiceRemove,
+                service_name: service_name.clone(),
+            },
+        }
+    }
+
+    fn into_action(self) -> Action {
+        match self.kind {
+            StoredActionKind::ServiceCreate => Action::ServiceCreate {
+                service_name: self.service_name,
+            },
+            StoredActionKind::ServiceRecreate => Action::ServiceRecreate {
+                service_name: self.service_name,
+            },
+            StoredActionKind::ServiceRemove => Action::ServiceRemove {
+                service_name: self.service_name,
+            },
+        }
+    }
 }
 
 /// Durable state store backed by a single SQLite database file.
@@ -108,6 +167,24 @@ impl StateStore {
                 UNIQUE(stack_name, service_name)
             );
 
+            CREATE TABLE IF NOT EXISTS service_mount_digests (
+                id INTEGER PRIMARY KEY,
+                stack_name TEXT NOT NULL,
+                service_name TEXT NOT NULL,
+                mount_digest TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(stack_name, service_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS reconcile_progress (
+                id INTEGER PRIMARY KEY,
+                stack_name TEXT NOT NULL UNIQUE,
+                operation_id TEXT NOT NULL,
+                actions_json TEXT NOT NULL,
+                next_action_index INTEGER NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 stack_name TEXT NOT NULL,
@@ -147,6 +224,131 @@ impl StateStore {
             }
             None => Ok(None),
         }
+    }
+
+    /// Persist the normalized mount plan digest for a service.
+    pub fn save_service_mount_digest(
+        &self,
+        stack_name: &str,
+        service_name: &str,
+        mount_digest: &str,
+    ) -> Result<(), StackError> {
+        self.conn.execute(
+            "INSERT INTO service_mount_digests (stack_name, service_name, mount_digest)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(stack_name, service_name) DO UPDATE SET
+                mount_digest = excluded.mount_digest,
+                updated_at = datetime('now')",
+            params![stack_name, service_name, mount_digest],
+        )?;
+        Ok(())
+    }
+
+    /// Remove the persisted mount plan digest for a service.
+    pub fn delete_service_mount_digest(
+        &self,
+        stack_name: &str,
+        service_name: &str,
+    ) -> Result<(), StackError> {
+        self.conn.execute(
+            "DELETE FROM service_mount_digests
+             WHERE stack_name = ?1 AND service_name = ?2",
+            params![stack_name, service_name],
+        )?;
+        Ok(())
+    }
+
+    /// Load all persisted service mount digests for a stack.
+    pub fn load_service_mount_digests(
+        &self,
+        stack_name: &str,
+    ) -> Result<HashMap<String, String>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT service_name, mount_digest
+             FROM service_mount_digests
+             WHERE stack_name = ?1",
+        )?;
+        let rows = stmt.query_map(params![stack_name], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut digests = HashMap::new();
+        for row in rows {
+            let (service_name, digest) = row?;
+            digests.insert(service_name, digest);
+        }
+        Ok(digests)
+    }
+
+    /// Persist progress for an in-flight reconcile operation.
+    pub fn save_reconcile_progress(
+        &self,
+        stack_name: &str,
+        operation_id: &str,
+        actions: &[Action],
+        next_action_index: usize,
+    ) -> Result<(), StackError> {
+        let stored_actions: Vec<StoredAction> =
+            actions.iter().map(StoredAction::from_action).collect();
+        let actions_json = serde_json::to_string(&stored_actions)?;
+
+        self.conn.execute(
+            "INSERT INTO reconcile_progress (stack_name, operation_id, actions_json, next_action_index)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(stack_name) DO UPDATE SET
+                operation_id = excluded.operation_id,
+                actions_json = excluded.actions_json,
+                next_action_index = excluded.next_action_index,
+                updated_at = datetime('now')",
+            params![
+                stack_name,
+                operation_id,
+                actions_json,
+                next_action_index as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load progress for an in-flight reconcile operation.
+    pub fn load_reconcile_progress(
+        &self,
+        stack_name: &str,
+    ) -> Result<Option<ReconcileProgress>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT operation_id, actions_json, next_action_index
+             FROM reconcile_progress
+             WHERE stack_name = ?1",
+        )?;
+        let mut rows = stmt.query(params![stack_name])?;
+
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+
+        let operation_id: String = row.get(0)?;
+        let actions_json: String = row.get(1)?;
+        let next_action_index: i64 = row.get(2)?;
+        let stored_actions: Vec<StoredAction> = serde_json::from_str(&actions_json)?;
+        let actions = stored_actions
+            .into_iter()
+            .map(StoredAction::into_action)
+            .collect();
+
+        Ok(Some(ReconcileProgress {
+            operation_id,
+            next_action_index: next_action_index.max(0) as usize,
+            actions,
+        }))
+    }
+
+    /// Clear any persisted reconcile progress for a stack.
+    pub fn clear_reconcile_progress(&self, stack_name: &str) -> Result<(), StackError> {
+        self.conn.execute(
+            "DELETE FROM reconcile_progress WHERE stack_name = ?1",
+            params![stack_name],
+        )?;
+        Ok(())
     }
 
     /// Persist observed state for a single service.
@@ -283,7 +485,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use crate::spec::{NetworkSpec, ServiceSpec, VolumeSpec};
+    use crate::spec::{NetworkSpec, ServiceKind, ServiceSpec, VolumeSpec};
     use std::collections::HashMap;
 
     fn sample_spec() -> StackSpec {
@@ -292,6 +494,7 @@ mod tests {
             services: vec![
                 ServiceSpec {
                     name: "web".to_string(),
+                    kind: ServiceKind::Service,
                     image: "nginx:latest".to_string(),
                     command: None,
                     entrypoint: None,
@@ -322,6 +525,7 @@ mod tests {
                 },
                 ServiceSpec {
                     name: "db".to_string(),
+                    kind: ServiceKind::Service,
                     image: "postgres:16".to_string(),
                     command: None,
                     entrypoint: None,
@@ -406,6 +610,66 @@ mod tests {
         let loaded = store.load_desired_state("myapp").unwrap().unwrap();
         assert_eq!(loaded, spec2);
         assert!(loaded.services.is_empty());
+    }
+
+    #[test]
+    fn service_mount_digest_round_trip_and_delete() {
+        let store = StateStore::in_memory().unwrap();
+
+        store
+            .save_service_mount_digest("myapp", "web", "digest-web-v1")
+            .unwrap();
+        store
+            .save_service_mount_digest("myapp", "db", "digest-db-v1")
+            .unwrap();
+
+        let digests = store.load_service_mount_digests("myapp").unwrap();
+        assert_eq!(digests.len(), 2);
+        assert_eq!(digests.get("web"), Some(&"digest-web-v1".to_string()));
+        assert_eq!(digests.get("db"), Some(&"digest-db-v1".to_string()));
+
+        store
+            .save_service_mount_digest("myapp", "web", "digest-web-v2")
+            .unwrap();
+        let digests = store.load_service_mount_digests("myapp").unwrap();
+        assert_eq!(digests.get("web"), Some(&"digest-web-v2".to_string()));
+
+        store.delete_service_mount_digest("myapp", "db").unwrap();
+        let digests = store.load_service_mount_digests("myapp").unwrap();
+        assert_eq!(digests.len(), 1);
+        assert!(digests.get("db").is_none());
+    }
+
+    #[test]
+    fn reconcile_progress_round_trip_and_clear() {
+        let store = StateStore::in_memory().unwrap();
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "api".to_string(),
+            },
+        ];
+
+        store
+            .save_reconcile_progress("myapp", "op-1", &actions, 0)
+            .unwrap();
+
+        let progress = store.load_reconcile_progress("myapp").unwrap().unwrap();
+        assert_eq!(progress.operation_id, "op-1");
+        assert_eq!(progress.next_action_index, 0);
+        assert_eq!(progress.actions, actions);
+
+        store
+            .save_reconcile_progress("myapp", "op-1", &progress.actions, 1)
+            .unwrap();
+        let updated = store.load_reconcile_progress("myapp").unwrap().unwrap();
+        assert_eq!(updated.next_action_index, 1);
+        assert_eq!(updated.actions.len(), 2);
+
+        store.clear_reconcile_progress("myapp").unwrap();
+        assert!(store.load_reconcile_progress("myapp").unwrap().is_none());
     }
 
     #[test]

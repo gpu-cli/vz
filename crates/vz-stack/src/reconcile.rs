@@ -92,6 +92,21 @@ pub fn apply(
 ) -> Result<ApplyResult, StackError> {
     // 1. Load previous desired state (for reverse-dep teardown ordering).
     let previous_desired = store.load_desired_state(&spec.name)?;
+    let previous_mount_digests: HashMap<String, String> = previous_desired
+        .as_ref()
+        .map(|stack| {
+            stack
+                .services
+                .iter()
+                .map(|svc| (svc.name.clone(), volume::mount_plan_digest(&svc.mounts)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let desired_service_map: HashMap<&str, &ServiceSpec> = spec
+        .services
+        .iter()
+        .map(|svc| (svc.name.as_str(), svc))
+        .collect();
 
     // 2. Persist desired state.
     store.save_desired_state(&spec.name, spec)?;
@@ -107,13 +122,15 @@ pub fn apply(
 
     // 4. Load current observed state.
     let observed = store.load_observed_state(&spec.name)?;
+    let stored_mount_digests = store.load_service_mount_digests(&spec.name)?;
 
     // 5. Compute action plan with dependency gating.
-    let (actions, deferred) = compute_actions(
+    let (actions, deferred) = compute_actions_with_mount_digests(
         &spec.services,
         &observed,
         health_statuses,
         previous_desired.as_ref().map(|s| s.services.as_slice()),
+        &stored_mount_digests,
     );
 
     // 5. Emit events for deferred services.
@@ -134,6 +151,10 @@ pub fn apply(
     for action in &actions {
         match action {
             Action::ServiceCreate { service_name } => {
+                if let Some(service) = desired_service_map.get(service_name.as_str()) {
+                    let digest = volume::mount_plan_digest(&service.mounts);
+                    store.save_service_mount_digest(&spec.name, service_name, &digest)?;
+                }
                 store.save_observed_state(
                     &spec.name,
                     &ServiceObservedState {
@@ -154,6 +175,23 @@ pub fn apply(
                 succeeded += 1;
             }
             Action::ServiceRecreate { service_name } => {
+                let desired_digest = desired_service_map
+                    .get(service_name.as_str())
+                    .map(|service| volume::mount_plan_digest(&service.mounts))
+                    .unwrap_or_default();
+                let previous_digest = stored_mount_digests
+                    .get(service_name)
+                    .cloned()
+                    .or_else(|| previous_mount_digests.get(service_name).cloned());
+                store.emit_event(
+                    &spec.name,
+                    &StackEvent::MountTopologyRecreateRequired {
+                        stack_name: spec.name.clone(),
+                        service_name: service_name.clone(),
+                        previous_digest,
+                        desired_digest: desired_digest.clone(),
+                    },
+                )?;
                 store.save_observed_state(
                     &spec.name,
                     &ServiceObservedState {
@@ -164,6 +202,7 @@ pub fn apply(
                         ready: false,
                     },
                 )?;
+                store.save_service_mount_digest(&spec.name, service_name, &desired_digest)?;
                 store.emit_event(
                     &spec.name,
                     &StackEvent::ServiceCreating {
@@ -174,6 +213,7 @@ pub fn apply(
                 succeeded += 1;
             }
             Action::ServiceRemove { service_name } => {
+                store.delete_service_mount_digest(&spec.name, service_name)?;
                 store.save_observed_state(
                     &spec.name,
                     &ServiceObservedState {
@@ -226,11 +266,29 @@ pub fn apply(
 /// current `desired_services` is empty (full teardown), the dep graph
 /// would otherwise be empty and removals would happen in alphabetical
 /// order instead of reverse-dependency order.
+#[cfg(test)]
 fn compute_actions(
     desired_services: &[ServiceSpec],
     observed: &[ServiceObservedState],
     health_statuses: &HashMap<String, HealthStatus>,
     previous_services: Option<&[ServiceSpec]>,
+) -> (Vec<Action>, Vec<DeferredService>) {
+    let observed_mount_digests = HashMap::new();
+    compute_actions_with_mount_digests(
+        desired_services,
+        observed,
+        health_statuses,
+        previous_services,
+        &observed_mount_digests,
+    )
+}
+
+fn compute_actions_with_mount_digests(
+    desired_services: &[ServiceSpec],
+    observed: &[ServiceObservedState],
+    health_statuses: &HashMap<String, HealthStatus>,
+    previous_services: Option<&[ServiceSpec]>,
+    observed_mount_digests: &HashMap<String, String>,
 ) -> (Vec<Action>, Vec<DeferredService>) {
     let observed_map: HashMap<&str, &ServiceObservedState> = observed
         .iter()
@@ -249,9 +307,18 @@ fn compute_actions(
 
     // Services to create or recreate.
     for svc in desired_services {
-        let mount_topology_changed = previous_service_map
+        let desired_mount_digest = volume::mount_plan_digest(&svc.mounts);
+        let previous_mount_digest = observed_mount_digests
             .get(svc.name.as_str())
-            .is_some_and(|previous| volume::mounts_changed(&previous.mounts, &svc.mounts));
+            .cloned()
+            .or_else(|| {
+                previous_service_map
+                    .get(svc.name.as_str())
+                    .map(|previous| volume::mount_plan_digest(&previous.mounts))
+            });
+        let mount_topology_changed = previous_mount_digest
+            .as_ref()
+            .is_some_and(|previous| previous != &desired_mount_digest);
         let needs_recreate = mount_topology_changed
             && observed_map
                 .get(svc.name.as_str())
@@ -452,11 +519,12 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use crate::spec::{MountSpec, ServiceDependency, StackSpec};
+    use crate::spec::{MountSpec, ServiceDependency, ServiceKind, StackSpec};
 
     fn svc(name: &str, image: &str) -> ServiceSpec {
         ServiceSpec {
             name: name.to_string(),
+            kind: ServiceKind::Service,
             image: image.to_string(),
             command: None,
             entrypoint: None,
@@ -608,6 +676,43 @@ mod tests {
     }
 
     #[test]
+    fn compute_actions_recreates_running_service_when_persisted_digest_changes() {
+        let desired = vec![ServiceSpec {
+            mounts: vec![MountSpec::Bind {
+                source: "/workspace/new".to_string(),
+                target: "/workspace".to_string(),
+                read_only: false,
+            }],
+            ..svc("web", "nginx:latest")
+        }];
+        let observed = vec![obs_running("web")];
+        let mut observed_mount_digests = HashMap::new();
+        observed_mount_digests.insert(
+            "web".to_string(),
+            volume::mount_plan_digest(&[MountSpec::Bind {
+                source: "/workspace/old".to_string(),
+                target: "/workspace".to_string(),
+                read_only: false,
+            }]),
+        );
+
+        let (actions, deferred) = compute_actions_with_mount_digests(
+            &desired,
+            &observed,
+            &no_health(),
+            None,
+            &observed_mount_digests,
+        );
+        assert_eq!(
+            actions,
+            vec![Action::ServiceRecreate {
+                service_name: "web".to_string(),
+            }]
+        );
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
     fn compute_actions_keeps_running_service_when_mounts_match_previous_spec() {
         let desired = vec![ServiceSpec {
             mounts: vec![MountSpec::Bind {
@@ -700,13 +805,13 @@ mod tests {
         ];
         let observed = vec![];
 
-        let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
         let names: Vec<&str> = actions.iter().map(|a| a.service_name()).collect();
 
-        // db must come before web.
-        let db_idx = names.iter().position(|&n| n == "db").unwrap();
-        let web_idx = names.iter().position(|&n| n == "web").unwrap();
-        assert!(db_idx < web_idx);
+        // Strict dependency gating: only db is actionable in the first pass.
+        assert_eq!(names, vec!["db"]);
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].service_name, "web");
     }
 
     #[test]
@@ -718,15 +823,17 @@ mod tests {
         ];
         let observed = vec![];
 
-        let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
         let names: Vec<&str> = actions.iter().map(|a| a.service_name()).collect();
 
-        // db → api → app
-        let db_idx = names.iter().position(|&n| n == "db").unwrap();
-        let api_idx = names.iter().position(|&n| n == "api").unwrap();
-        let app_idx = names.iter().position(|&n| n == "app").unwrap();
-        assert!(db_idx < api_idx);
-        assert!(api_idx < app_idx);
+        // First pass only schedules the root dependency.
+        assert_eq!(names, vec!["db"]);
+        let mut deferred_names: Vec<&str> = deferred
+            .iter()
+            .map(|entry| entry.service_name.as_str())
+            .collect();
+        deferred_names.sort();
+        assert_eq!(deferred_names, vec!["api", "app"]);
     }
 
     #[test]
@@ -778,9 +885,7 @@ mod tests {
     // ── Dependency gating tests ──
 
     #[test]
-    fn dep_gating_no_healthcheck_creates_all_in_batch() {
-        // Without health checks, all services are created in one pass
-        // (topo sorted). No gating needed.
+    fn dep_gating_no_healthcheck_waits_for_started_dependency() {
         let desired = vec![
             svc("db", "postgres:16"),
             svc_with_deps("web", "nginx:latest", vec!["db"]),
@@ -789,11 +894,10 @@ mod tests {
 
         let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
 
-        assert_eq!(actions.len(), 2);
-        assert!(deferred.is_empty());
-        // db comes before web (topo order).
+        assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].service_name(), "db");
-        assert_eq!(actions[1].service_name(), "web");
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].service_name, "web");
     }
 
     #[test]
@@ -875,8 +979,8 @@ mod tests {
     }
 
     #[test]
-    fn dep_gating_chain_all_in_one_pass_without_healthcheck() {
-        // app → api → db. No health checks. All created in one pass.
+    fn dep_gating_chain_defers_until_dependencies_started() {
+        // app → api → db. Only db can start in the first pass.
         let desired = vec![
             svc("db", "postgres:16"),
             svc_with_deps("api", "api:latest", vec!["db"]),
@@ -886,11 +990,11 @@ mod tests {
 
         let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
 
-        assert_eq!(actions.len(), 3);
-        assert!(deferred.is_empty());
-        // Topo order: db → api → app.
-        let names: Vec<&str> = actions.iter().map(|a| a.service_name()).collect();
-        assert_eq!(names, vec!["db", "api", "app"]);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].service_name(), "db");
+        assert_eq!(deferred.len(), 2);
+        assert_eq!(deferred[0].service_name, "api");
+        assert_eq!(deferred[1].service_name, "app");
     }
 
     #[test]
@@ -999,6 +1103,71 @@ mod tests {
     }
 
     #[test]
+    fn apply_emits_mount_topology_recreate_required_before_service_creating() {
+        let store = StateStore::in_memory().unwrap();
+
+        let s1 = spec(
+            "myapp",
+            vec![ServiceSpec {
+                mounts: vec![MountSpec::Bind {
+                    source: "/workspace/old".to_string(),
+                    target: "/workspace".to_string(),
+                    read_only: false,
+                }],
+                ..svc("web", "nginx:latest")
+            }],
+        );
+        apply(&s1, &store, &no_health()).unwrap();
+        store
+            .save_observed_state("myapp", &obs_running("web"))
+            .unwrap();
+
+        let s2 = spec(
+            "myapp",
+            vec![ServiceSpec {
+                mounts: vec![MountSpec::Bind {
+                    source: "/workspace/new".to_string(),
+                    target: "/workspace".to_string(),
+                    read_only: false,
+                }],
+                ..svc("web", "nginx:latest")
+            }],
+        );
+        let result = apply(&s2, &store, &no_health()).unwrap();
+        assert_eq!(
+            result.actions,
+            vec![Action::ServiceRecreate {
+                service_name: "web".to_string(),
+            }]
+        );
+
+        let events = store.load_events("myapp").unwrap();
+        let recreate_idx = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    StackEvent::MountTopologyRecreateRequired { service_name, .. }
+                        if service_name == "web"
+                )
+            })
+            .unwrap();
+        let creating_idx = events
+            .iter()
+            .rposition(
+                |event| matches!(event, StackEvent::ServiceCreating { service_name, .. } if service_name == "web"),
+            )
+            .unwrap();
+        assert!(recreate_idx < creating_idx);
+
+        let digests = store.load_service_mount_digests("myapp").unwrap();
+        assert_eq!(
+            digests.get("web"),
+            Some(&volume::mount_plan_digest(&s2.services[0].mounts))
+        );
+    }
+
+    #[test]
     fn apply_with_healthcheck_gating_service_healthy() {
         let store = StateStore::in_memory().unwrap();
         // db has a health check; web depends on db with service_healthy condition.
@@ -1010,34 +1179,23 @@ mod tests {
             ],
         );
 
-        // First apply: db is created, web is created too (both in batch, topo sorted).
+        // First apply: only db is created, web waits for dependency readiness.
         let r1 = apply(&s, &store, &no_health()).unwrap();
-        assert_eq!(r1.actions.len(), 2);
+        assert_eq!(r1.actions.len(), 1);
         assert_eq!(r1.actions[0].service_name(), "db");
-        assert_eq!(r1.actions[1].service_name(), "web");
+        assert_eq!(r1.deferred.len(), 1);
+        assert_eq!(r1.deferred[0].service_name, "web");
 
         // Simulate db Running but health check NOT yet passing.
         store
             .save_observed_state("myapp", &obs_running("db"))
             .unwrap();
-        store
-            .save_observed_state("myapp", &obs_running("web"))
-            .unwrap();
 
-        // Both are running, second apply is a no-op.
+        // With no health pass, web is still deferred.
         let r2 = apply(&s, &store, &no_health()).unwrap();
         assert!(r2.actions.is_empty());
-
-        // Now test: if web was stopped, it should be deferred until db is healthy.
-        store
-            .save_observed_state("myapp", &obs("web", ServicePhase::Stopped))
-            .unwrap();
-
-        // Apply with no health status: web is deferred (service_healthy condition, not passed).
-        let r3 = apply(&s, &store, &no_health()).unwrap();
-        assert!(r3.actions.is_empty()); // No create for web.
-        assert_eq!(r3.deferred.len(), 1);
-        assert_eq!(r3.deferred[0].service_name, "web");
+        assert_eq!(r2.deferred.len(), 1);
+        assert_eq!(r2.deferred[0].service_name, "web");
 
         // Apply with db healthy: web should be created.
         let mut health = HashMap::new();
@@ -1045,10 +1203,10 @@ mod tests {
         db_health.record_pass();
         health.insert("db".to_string(), db_health);
 
-        let r4 = apply(&s, &store, &health).unwrap();
-        assert_eq!(r4.actions.len(), 1);
-        assert_eq!(r4.actions[0].service_name(), "web");
-        assert!(r4.deferred.is_empty());
+        let r3 = apply(&s, &store, &health).unwrap();
+        assert_eq!(r3.actions.len(), 1);
+        assert_eq!(r3.actions[0].service_name(), "web");
+        assert!(r3.deferred.is_empty());
     }
 
     #[test]

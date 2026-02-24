@@ -358,6 +358,7 @@ fn event_color(event: &StackEvent) -> Color {
         StackEvent::HealthCheckPassed { .. } => Color::Green,
         StackEvent::HealthCheckFailed { .. } => Color::Yellow,
         StackEvent::DependencyBlocked { .. } => Color::Magenta,
+        StackEvent::MountTopologyRecreateRequired { .. } => Color::Yellow,
     }
 }
 
@@ -417,6 +418,15 @@ fn format_event_summary(event: &StackEvent) -> String {
         } => format!(
             "DependencyBlock  {service_name} -> {}",
             waiting_on.join(", ")
+        ),
+        StackEvent::MountTopologyRecreateRequired {
+            service_name,
+            previous_digest,
+            desired_digest,
+            ..
+        } => format!(
+            "MountRecreate   {service_name} ({:?} -> {desired_digest})",
+            previous_digest.as_deref().unwrap_or("<none>")
         ),
     }
 }
@@ -1136,6 +1146,7 @@ mod tests {
             services: vec![
                 vz_stack::ServiceSpec {
                     name: "web".into(),
+                    kind: vz_stack::ServiceKind::Service,
                     image: "nginx:latest".into(),
                     command: None,
                     entrypoint: None,
@@ -1170,6 +1181,7 @@ mod tests {
                 },
                 vz_stack::ServiceSpec {
                     name: "db".into(),
+                    kind: vz_stack::ServiceKind::Service,
                     image: "postgres:16".into(),
                     command: None,
                     entrypoint: None,

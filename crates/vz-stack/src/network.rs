@@ -384,6 +384,7 @@ mod tests {
     fn svc(name: &str, ports: Vec<PortSpec>) -> ServiceSpec {
         ServiceSpec {
             name: name.to_string(),
+            kind: crate::spec::ServiceKind::Service,
             image: "img:latest".to_string(),
             command: None,
             entrypoint: None,

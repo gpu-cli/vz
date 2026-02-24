@@ -80,11 +80,43 @@ pub struct StackSpec {
     pub disk_size_mb: Option<u64>,
 }
 
+/// High-level service classification for workspace-first orchestration.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceKind {
+    /// Long-lived interactive workspace container.
+    Workspace,
+    /// Long-lived background service container.
+    #[default]
+    Service,
+    /// Short-lived task/init style container.
+    Task,
+}
+
+impl ServiceKind {
+    /// Whether this kind is the default (`service`) variant.
+    pub fn is_service(&self) -> bool {
+        matches!(self, Self::Service)
+    }
+
+    /// Stable string form used in runtime metadata.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::Service => "service",
+            Self::Task => "task",
+        }
+    }
+}
+
 /// Specification for a single service within a stack.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ServiceSpec {
     /// Service name, unique within the stack.
     pub name: String,
+    /// Service classification for runtime and reconciler policy decisions.
+    #[serde(default, skip_serializing_if = "ServiceKind::is_service")]
+    pub kind: ServiceKind,
     /// OCI image reference.
     pub image: String,
     /// Override command (replaces image CMD).
@@ -372,6 +404,7 @@ mod tests {
             name: "myapp".to_string(),
             services: vec![ServiceSpec {
                 name: "web".to_string(),
+                kind: ServiceKind::Service,
                 image: "nginx:latest".to_string(),
                 command: Some(vec!["nginx".to_string(), "-g".to_string()]),
                 entrypoint: None,
@@ -516,6 +549,27 @@ mod tests {
         let json = r#"{"name":"vol1"}"#;
         let spec: VolumeSpec = serde_json::from_str(json).unwrap();
         assert_eq!(spec.driver, "local");
+    }
+
+    #[test]
+    fn service_kind_defaults_to_service_when_missing() {
+        let json = r#"{"name":"web","image":"nginx:latest"}"#;
+        let spec: ServiceSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.kind, ServiceKind::Service);
+    }
+
+    #[test]
+    fn service_kind_round_trip_variants() {
+        let kinds = [
+            ServiceKind::Workspace,
+            ServiceKind::Service,
+            ServiceKind::Task,
+        ];
+        for kind in kinds {
+            let json = serde_json::to_string(&kind).unwrap();
+            let decoded: ServiceKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, kind);
+        }
     }
 
     #[test]

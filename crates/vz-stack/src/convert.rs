@@ -10,6 +10,8 @@ use crate::error::StackError;
 use crate::spec::{PortSpec, ResourcesSpec, ServiceSecretRef, ServiceSpec};
 use crate::volume::ResolvedMount;
 
+const SERVICE_KIND_ANNOTATION: &str = "io.vz.service.kind";
+
 /// Convert a [`ServiceSpec`] into a vz-oci [`RunConfig`].
 ///
 /// Mounts must be pre-resolved via [`crate::resolve_mounts`] because
@@ -32,11 +34,17 @@ pub fn service_to_run_config(
     let resources = convert_resources(&spec.resources);
 
     // Convert labels to OCI annotations.
-    let oci_annotations: Vec<(String, String)> = spec
+    let mut oci_annotations: Vec<(String, String)> = spec
         .labels
         .iter()
+        .filter(|(k, _)| k.as_str() != SERVICE_KIND_ANNOTATION)
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    oci_annotations.push((
+        SERVICE_KIND_ANNOTATION.to_string(),
+        spec.kind.as_str().to_string(),
+    ));
+    oci_annotations.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Convert sysctls from HashMap to Vec.
     let sysctls: Vec<(String, String)> = spec
@@ -255,7 +263,7 @@ mod tests {
 
     use super::*;
     use crate::spec::{
-        HealthCheckSpec, MountSpec as StackMountSpec, RestartPolicy, ServiceDependency,
+        HealthCheckSpec, MountSpec as StackMountSpec, RestartPolicy, ServiceDependency, ServiceKind,
     };
     use crate::volume::{ResolvedMount, ResolvedMountKind};
     use std::collections::HashMap;
@@ -263,6 +271,7 @@ mod tests {
     fn minimal_service() -> ServiceSpec {
         ServiceSpec {
             name: "web".to_string(),
+            kind: ServiceKind::Service,
             image: "nginx:latest".to_string(),
             command: None,
             entrypoint: None,
@@ -307,6 +316,23 @@ mod tests {
         assert_eq!(config.memory_mb, None);
         assert_eq!(config.network_enabled, Some(true));
         assert!(config.capture_logs, "stack containers must capture logs");
+    }
+
+    #[test]
+    fn service_kind_annotation_is_always_emitted() {
+        let mut spec = minimal_service();
+        spec.kind = ServiceKind::Task;
+        spec.labels
+            .insert(SERVICE_KIND_ANNOTATION.to_string(), "service".to_string());
+        let config = service_to_run_config(&spec, &[], &[]).unwrap();
+
+        let kind_annotations: Vec<&(String, String)> = config
+            .oci_annotations
+            .iter()
+            .filter(|(key, _)| key == SERVICE_KIND_ANNOTATION)
+            .collect();
+        assert_eq!(kind_annotations.len(), 1);
+        assert_eq!(kind_annotations[0].1, "task");
     }
 
     #[test]
@@ -556,6 +582,7 @@ mod tests {
     fn full_service_converts() {
         let spec = ServiceSpec {
             name: "api".to_string(),
+            kind: ServiceKind::Service,
             image: "myapp:latest".to_string(),
             command: Some(vec!["serve".to_string()]),
             entrypoint: Some(vec!["/app/bin".to_string()]),

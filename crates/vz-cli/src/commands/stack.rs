@@ -371,7 +371,7 @@ type PlatformBackend = vz_linux_native::LinuxNativeBackend;
 /// to call async runtime backend methods from within the synchronous
 /// executor context.
 struct OciContainerRuntime {
-    backend: PlatformBackend,
+    manager: vz_runtime_contract::WorkspaceRuntimeManager<PlatformBackend>,
     handle: tokio::runtime::Handle,
 }
 
@@ -466,8 +466,9 @@ impl OciContainerRuntime {
         }
         let runtime = vz_oci_macos::Runtime::new(config);
         let backend = vz_oci_macos::MacosRuntimeBackend::new(runtime);
+        let manager = vz_runtime_contract::WorkspaceRuntimeManager::new(backend);
         let handle = tokio::runtime::Handle::current();
-        Ok(Self { backend, handle })
+        Ok(Self { manager, handle })
     }
 
     #[cfg(target_os = "linux")]
@@ -480,13 +481,13 @@ impl OciContainerRuntime {
             config.auth = auth;
         }
         let backend = vz_linux_native::LinuxNativeBackend::new(config);
+        let manager = vz_runtime_contract::WorkspaceRuntimeManager::new(backend);
         let handle = tokio::runtime::Handle::current();
-        Ok(Self { backend, handle })
+        Ok(Self { manager, handle })
     }
 
     fn capabilities(&self) -> vz_runtime_contract::RuntimeCapabilities {
-        use vz_runtime_contract::RuntimeBackend;
-        self.backend.capabilities()
+        self.manager.capabilities()
     }
 
     fn ensure_capability(
@@ -498,12 +499,11 @@ impl OciContainerRuntime {
         if enabled {
             return Ok(());
         }
-        use vz_runtime_contract::RuntimeBackend;
         Err(unsupported_operation_error(
             operation,
             format!(
                 "backend={} missing capability {}",
-                self.backend.name(),
+                self.manager.name(),
                 capability_name
             ),
         ))
@@ -512,7 +512,6 @@ impl OciContainerRuntime {
 
 impl ContainerRuntime for OciContainerRuntime {
     fn pull(&self, image: &str) -> Result<String, StackError> {
-        use vz_runtime_contract::RuntimeBackend;
         let idempotency_key =
             runtime_idempotency_key(vz_runtime_contract::RuntimeOperation::PullImage, &[image]);
         if let Some(key) = idempotency_key.as_deref() {
@@ -525,7 +524,7 @@ impl ContainerRuntime for OciContainerRuntime {
         }
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.backend.pull(image))
+                .block_on(self.manager.pull_image(image))
                 .map_err(|e| map_runtime_error("pull", e))
         })
     }
@@ -535,7 +534,6 @@ impl ContainerRuntime for OciContainerRuntime {
         image: &str,
         config: vz_runtime_contract::RunConfig,
     ) -> Result<String, StackError> {
-        use vz_runtime_contract::RuntimeBackend;
         let id_hint = config.container_id.as_deref().unwrap_or("auto");
         let idempotency_key = runtime_idempotency_key(
             vz_runtime_contract::RuntimeOperation::CreateContainer,
@@ -552,7 +550,7 @@ impl ContainerRuntime for OciContainerRuntime {
         }
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.backend.create_container(image, config))
+                .block_on(self.manager.create_container(image, config))
                 .map_err(|e| map_runtime_error("create", e))
         })
     }
@@ -563,11 +561,10 @@ impl ContainerRuntime for OciContainerRuntime {
         signal: Option<&str>,
         grace_period: Option<std::time::Duration>,
     ) -> Result<(), StackError> {
-        use vz_runtime_contract::RuntimeBackend;
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(
-                    self.backend
+                    self.manager
                         .stop_container(container_id, false, signal, grace_period),
                 )
                 .map(|_| ())
@@ -576,10 +573,9 @@ impl ContainerRuntime for OciContainerRuntime {
     }
 
     fn remove(&self, container_id: &str) -> Result<(), StackError> {
-        use vz_runtime_contract::RuntimeBackend;
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.backend.remove_container(container_id))
+                .block_on(self.manager.remove_container(container_id))
                 .map_err(|e| map_runtime_error("remove", e))
         })
     }
@@ -594,7 +590,6 @@ impl ContainerRuntime for OciContainerRuntime {
         container_id: &str,
         command: &[String],
     ) -> Result<(i32, String, String), StackError> {
-        use vz_runtime_contract::RuntimeBackend;
         let command_fingerprint = command.join("_");
         let idempotency_key = runtime_idempotency_key(
             vz_runtime_contract::RuntimeOperation::ExecContainer,
@@ -614,7 +609,7 @@ impl ContainerRuntime for OciContainerRuntime {
                 ..Default::default()
             };
             self.handle
-                .block_on(self.backend.exec_container(container_id, exec_config))
+                .block_on(self.manager.exec_container(container_id, exec_config))
                 .map(|output| (output.exit_code, output.stdout, output.stderr))
                 .map_err(|e| map_runtime_error("exec", e))
         })
@@ -626,14 +621,13 @@ impl ContainerRuntime for OciContainerRuntime {
         ports: &[vz_runtime_contract::PortMapping],
         resources: vz_runtime_contract::StackResourceHint,
     ) -> Result<(), StackError> {
-        use vz_runtime_contract::RuntimeBackend;
         let capabilities = self.capabilities();
         self.ensure_capability("boot_shared_vm", "shared_vm", capabilities.shared_vm)?;
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(
-                    self.backend
-                        .boot_shared_vm(stack_id, ports.to_vec(), resources),
+                    self.manager
+                        .ensure_stack_runtime(stack_id, ports.to_vec(), resources),
                 )
                 .map_err(|e| map_runtime_error("boot_shared_vm", e))
         })
@@ -644,7 +638,6 @@ impl ContainerRuntime for OciContainerRuntime {
         stack_id: &str,
         services: &[vz_runtime_contract::NetworkServiceConfig],
     ) -> Result<(), StackError> {
-        use vz_runtime_contract::RuntimeBackend;
         let capabilities = self.capabilities();
         self.ensure_capability("network_setup", "shared_vm", capabilities.shared_vm)?;
         self.ensure_capability(
@@ -654,13 +647,15 @@ impl ContainerRuntime for OciContainerRuntime {
         )?;
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.backend.network_setup(stack_id, services.to_vec()))
+                .block_on(
+                    self.manager
+                        .setup_stack_network(stack_id, services.to_vec()),
+                )
                 .map_err(|e| map_runtime_error("network_setup", e))
         })
     }
 
     fn network_teardown(&self, stack_id: &str, service_names: &[String]) -> Result<(), StackError> {
-        use vz_runtime_contract::RuntimeBackend;
         let capabilities = self.capabilities();
         self.ensure_capability("network_teardown", "shared_vm", capabilities.shared_vm)?;
         self.ensure_capability(
@@ -671,8 +666,8 @@ impl ContainerRuntime for OciContainerRuntime {
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(
-                    self.backend
-                        .network_teardown(stack_id, service_names.to_vec()),
+                    self.manager
+                        .teardown_stack_network(stack_id, service_names.to_vec()),
                 )
                 .map_err(|e| map_runtime_error("network_teardown", e))
         })
@@ -684,7 +679,6 @@ impl ContainerRuntime for OciContainerRuntime {
         image: &str,
         config: vz_runtime_contract::RunConfig,
     ) -> Result<String, StackError> {
-        use vz_runtime_contract::RuntimeBackend;
         let capabilities = self.capabilities();
         self.ensure_capability("create_in_stack", "shared_vm", capabilities.shared_vm)?;
         let id_hint = config.container_id.as_deref().unwrap_or("auto");
@@ -704,40 +698,34 @@ impl ContainerRuntime for OciContainerRuntime {
         }
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(
-                    self.backend
-                        .create_container_in_stack(stack_id, image, config),
-                )
+                .block_on(self.manager.create_stack_container(stack_id, image, config))
                 .map_err(|e| map_runtime_error("create_in_stack", e))
         })
     }
 
     fn shutdown_shared_vm(&self, stack_id: &str) -> Result<(), StackError> {
-        use vz_runtime_contract::RuntimeBackend;
         let capabilities = self.capabilities();
         self.ensure_capability("shutdown_shared_vm", "shared_vm", capabilities.shared_vm)?;
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.backend.shutdown_shared_vm(stack_id))
+                .block_on(self.manager.shutdown_stack_runtime(stack_id))
                 .map_err(|e| map_runtime_error("shutdown_shared_vm", e))
         })
     }
 
     fn has_shared_vm(&self, stack_id: &str) -> bool {
-        use vz_runtime_contract::RuntimeBackend;
         if !self.capabilities().shared_vm {
             return false;
         }
-        self.backend.has_shared_vm(stack_id)
+        self.manager.has_stack_runtime(stack_id)
     }
 
     fn logs(&self, container_id: &str) -> Result<ContainerLogs, StackError> {
-        use vz_runtime_contract::RuntimeBackend;
         let capabilities = self.capabilities();
         self.ensure_capability("logs", "container_logs", capabilities.container_logs)?;
         let logs = self
-            .backend
-            .logs(container_id)
+            .manager
+            .container_logs(container_id)
             .map_err(|e| map_runtime_error("logs", e))?;
         Ok(ContainerLogs {
             output: logs.output,
@@ -1844,7 +1832,8 @@ fn event_service_name(event: &StackEvent) -> Option<&str> {
         | StackEvent::PortConflict { service_name, .. }
         | StackEvent::HealthCheckPassed { service_name, .. }
         | StackEvent::HealthCheckFailed { service_name, .. }
-        | StackEvent::DependencyBlocked { service_name, .. } => Some(service_name),
+        | StackEvent::DependencyBlocked { service_name, .. }
+        | StackEvent::MountTopologyRecreateRequired { service_name, .. } => Some(service_name),
         StackEvent::StackApplyStarted { .. }
         | StackEvent::StackApplyCompleted { .. }
         | StackEvent::StackApplyFailed { .. }
@@ -2435,6 +2424,15 @@ fn format_event_summary(event: &StackEvent) -> String {
         } => format!(
             "blocked: {service_name} waiting on {}",
             waiting_on.join(", ")
+        ),
+        StackEvent::MountTopologyRecreateRequired {
+            service_name,
+            previous_digest,
+            desired_digest,
+            ..
+        } => format!(
+            "mount recreate: {service_name} ({:?} -> {desired_digest})",
+            previous_digest.as_deref().unwrap_or("<none>")
         ),
     }
 }

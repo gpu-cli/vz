@@ -83,9 +83,7 @@ fn web_redis_initial_apply_creates_both_services() {
 
     let result = vz_stack::apply(&spec, &store, &health).unwrap();
 
-    // Both services should be created in one pass — depends_on ordering
-    // is handled by topo sort, not by health gating (redis has no
-    // passing health check yet, but that only blocks on subsequent applies).
+    // Strict dependency gating: only redis is created in the first pass.
     let created: Vec<&str> = result
         .actions
         .iter()
@@ -96,34 +94,12 @@ fn web_redis_initial_apply_creates_both_services() {
         .collect();
 
     assert!(
-        created.contains(&"web"),
-        "web should be created: {created:?}"
-    );
-    assert!(
         created.contains(&"redis"),
         "redis should be created: {created:?}"
     );
-
-    // Topo sort: redis before web (web depends on redis).
-    let redis_pos = result
-        .actions
-        .iter()
-        .position(|a| a.service_name() == "redis")
-        .unwrap();
-    let web_pos = result
-        .actions
-        .iter()
-        .position(|a| a.service_name() == "web")
-        .unwrap();
-    assert!(
-        redis_pos < web_pos,
-        "redis should be created before web (topo order)"
-    );
-
-    assert!(
-        result.deferred.is_empty(),
-        "no services should be deferred on initial apply"
-    );
+    assert_eq!(created, vec!["redis"]);
+    assert_eq!(result.deferred.len(), 1);
+    assert_eq!(result.deferred[0].service_name, "web");
 }
 
 #[test]
@@ -383,29 +359,15 @@ fn web_pg_redis_initial_apply_creates_all_three() {
         })
         .collect();
 
-    assert_eq!(created.len(), 3, "all three services should be created");
-    assert!(created.contains(&"web"));
+    assert_eq!(
+        created.len(),
+        2,
+        "only dependencies should be created first"
+    );
     assert!(created.contains(&"postgres"));
     assert!(created.contains(&"redis"));
-
-    // Topo: postgres and redis before web.
-    let web_pos = result
-        .actions
-        .iter()
-        .position(|a| a.service_name() == "web")
-        .unwrap();
-    let pg_pos = result
-        .actions
-        .iter()
-        .position(|a| a.service_name() == "postgres")
-        .unwrap();
-    let redis_pos = result
-        .actions
-        .iter()
-        .position(|a| a.service_name() == "redis")
-        .unwrap();
-    assert!(pg_pos < web_pos, "postgres before web");
-    assert!(redis_pos < web_pos, "redis before web");
+    assert_eq!(result.deferred.len(), 1);
+    assert_eq!(result.deferred[0].service_name, "web");
 }
 
 #[test]

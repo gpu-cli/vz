@@ -136,6 +136,18 @@ pub enum StackEvent {
         /// Dependencies not yet ready.
         waiting_on: Vec<String>,
     },
+    /// A running service requires recreate because mount topology changed.
+    #[serde(rename = "mount_topology_recreate_required")]
+    MountTopologyRecreateRequired {
+        /// Stack name.
+        stack_name: String,
+        /// Service requiring recreate.
+        service_name: String,
+        /// Previously persisted mount digest, if available.
+        previous_digest: Option<String>,
+        /// Desired mount digest from the current spec.
+        desired_digest: String,
+    },
 }
 
 /// Persisted event record with metadata from the store.
@@ -223,6 +235,12 @@ mod tests {
                 service_name: "web".to_string(),
                 waiting_on: vec!["db".to_string()],
             },
+            StackEvent::MountTopologyRecreateRequired {
+                stack_name: "myapp".to_string(),
+                service_name: "web".to_string(),
+                previous_digest: Some("old".to_string()),
+                desired_digest: "new".to_string(),
+            },
         ];
 
         for event in events {
@@ -277,6 +295,15 @@ mod tests {
                     stack_name: "t".to_string(),
                 },
                 "stack_destroyed",
+            ),
+            (
+                StackEvent::MountTopologyRecreateRequired {
+                    stack_name: "t".to_string(),
+                    service_name: "w".to_string(),
+                    previous_digest: Some("old".to_string()),
+                    desired_digest: "new".to_string(),
+                },
+                "mount_topology_recreate_required",
             ),
         ];
 

@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info, warn};
 
@@ -18,6 +18,7 @@ use crate::events::StackEvent;
 use crate::executor::{ContainerRuntime, ExecutionResult, StackExecutor};
 use crate::health::{HealthPollResult, HealthPoller};
 use crate::reconcile::{ApplyResult, apply};
+use crate::restart::cleanup_orphaned_reconcile_progress;
 use crate::spec::StackSpec;
 use crate::state_store::{ServicePhase, StateStore};
 
@@ -164,6 +165,11 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
 
         let has_health_checks = spec.services.iter().any(|s| s.healthcheck.is_some());
 
+        // Best-effort cleanup for stale completed markers from prior crashes.
+        let _ = cleanup_orphaned_reconcile_progress(&self.reconcile_store, &spec.name)?;
+        // Resume any incomplete action batch before starting new planning rounds.
+        let _ = self.resume_incomplete_apply(spec)?;
+
         for round in 1..=self.config.max_rounds {
             info!(round, "orchestration round");
 
@@ -173,17 +179,33 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
 
             // 2. Execute any new actions.
             let exec_result = if !apply_result.actions.is_empty() {
+                let operation_id = Self::next_operation_id(&spec.name, round);
+                self.reconcile_store.save_reconcile_progress(
+                    &spec.name,
+                    &operation_id,
+                    &apply_result.actions,
+                    0,
+                )?;
+
                 info!(
                     actions = apply_result.actions.len(),
                     deferred = apply_result.deferred.len(),
                     "executing actions"
                 );
                 let result = self.executor.execute(spec, &apply_result.actions)?;
+                self.reconcile_store.save_reconcile_progress(
+                    &spec.name,
+                    &operation_id,
+                    &apply_result.actions,
+                    apply_result.actions.len(),
+                )?;
+                self.reconcile_store.clear_reconcile_progress(&spec.name)?;
                 if result.failed > 0 {
                     debug!(failed = result.failed, "some actions failed");
                 }
                 Some(result)
             } else {
+                self.reconcile_store.clear_reconcile_progress(&spec.name)?;
                 None
             };
 
@@ -305,6 +327,48 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
     fn reconciler_reports_converged(pending: usize, apply_result: &ApplyResult) -> bool {
         pending == 0 && apply_result.deferred.is_empty()
     }
+
+    fn next_operation_id(stack_name: &str, round: usize) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("{stack_name}-round-{round}-{nanos}")
+    }
+
+    fn resume_incomplete_apply(
+        &mut self,
+        spec: &StackSpec,
+    ) -> Result<Option<ExecutionResult>, StackError> {
+        let Some(progress) = self.reconcile_store.load_reconcile_progress(&spec.name)? else {
+            return Ok(None);
+        };
+
+        let total = progress.actions.len();
+        if progress.next_action_index >= total {
+            self.reconcile_store.clear_reconcile_progress(&spec.name)?;
+            return Ok(None);
+        }
+
+        let remaining = progress.actions[progress.next_action_index..].to_vec();
+        info!(
+            stack = %spec.name,
+            operation_id = %progress.operation_id,
+            remaining = remaining.len(),
+            total,
+            "resuming incomplete apply operation"
+        );
+
+        let result = self.executor.execute(spec, &remaining)?;
+        self.reconcile_store.save_reconcile_progress(
+            &spec.name,
+            &progress.operation_id,
+            &progress.actions,
+            total,
+        )?;
+        self.reconcile_store.clear_reconcile_progress(&spec.name)?;
+        Ok(Some(result))
+    }
 }
 
 #[cfg(test)]
@@ -313,11 +377,13 @@ mod tests {
 
     use super::*;
     use crate::executor::tests_support::MockContainerRuntime;
-    use crate::spec::{HealthCheckSpec, ServiceDependency, ServiceSpec, StackSpec};
+    use crate::reconcile::Action;
+    use crate::spec::{HealthCheckSpec, ServiceDependency, ServiceKind, ServiceSpec, StackSpec};
 
     fn svc(name: &str) -> ServiceSpec {
         ServiceSpec {
             name: name.to_string(),
+            kind: ServiceKind::Service,
             image: "img:latest".to_string(),
             command: None,
             entrypoint: None,
@@ -630,5 +696,61 @@ mod tests {
 
         let events = orch.executor().store().load_events("app").unwrap();
         assert!(!events.is_empty());
+    }
+
+    #[test]
+    fn resumes_incomplete_action_batch_before_next_round() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
+        let (mut orch, _tmp) = make_orchestrator_shared(runtime);
+        let spec = stack("app", vec![svc("web")]);
+
+        let pending = vec![Action::ServiceCreate {
+            service_name: "web".to_string(),
+        }];
+        orch.executor()
+            .store()
+            .save_reconcile_progress("app", "resume-op-1", &pending, 0)
+            .unwrap();
+
+        let result = orch.run(&spec, None).unwrap();
+        assert!(result.converged);
+        assert!(
+            orch.executor()
+                .store()
+                .load_reconcile_progress("app")
+                .unwrap()
+                .is_none()
+        );
+
+        let create_calls = orch
+            .executor()
+            .runtime()
+            .call_log()
+            .into_iter()
+            .filter(|(op, _)| op == "create" || op == "create_in_stack")
+            .count();
+        assert_eq!(create_calls, 1);
+    }
+
+    #[test]
+    fn clears_completed_progress_marker_on_start() {
+        let runtime = MockContainerRuntime::new();
+        let (mut orch, _tmp) = make_orchestrator_shared(runtime);
+        let spec = stack("app", vec![]);
+
+        orch.executor()
+            .store()
+            .save_reconcile_progress("app", "completed-op", &[], 0)
+            .unwrap();
+
+        let result = orch.run(&spec, None).unwrap();
+        assert!(result.converged);
+        assert!(
+            orch.executor()
+                .store()
+                .load_reconcile_progress("app")
+                .unwrap()
+                .is_none()
+        );
     }
 }

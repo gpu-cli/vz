@@ -191,6 +191,19 @@ impl StackOutput {
                 waiting_on,
                 ..
             } => self.mark_deferred(service_name, waiting_on),
+            StackEvent::MountTopologyRecreateRequired {
+                service_name,
+                previous_digest,
+                desired_digest,
+                ..
+            } => {
+                self.message(&format!(
+                    " {} {} mount topology changed ({:?} -> {desired_digest}); recreate required",
+                    style("!").bold().yellow(),
+                    service_name,
+                    previous_digest.as_deref().unwrap_or("<none>")
+                ));
+            }
             StackEvent::PortConflict {
                 service_name, port, ..
             } => {
