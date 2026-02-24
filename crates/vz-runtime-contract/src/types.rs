@@ -1,5 +1,6 @@
 //! Backend-neutral runtime types shared across all container backends.
 
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -241,6 +242,182 @@ pub struct ContainerInfo {
     pub rootfs_path: Option<PathBuf>,
     /// Host process ID currently managing this container, if running.
     pub host_pid: Option<u32>,
+}
+
+impl ContainerInfo {
+    /// Verify the lifecycle timestamps are internally consistent for this status.
+    pub fn ensure_lifecycle_consistency(&self) -> Result<(), ContractInvariantError> {
+        match &self.status {
+            ContainerStatus::Created => {
+                if self.started_unix_secs.is_some() {
+                    return Err(
+                        self.lifecycle_error("created containers must not report a start time")
+                    );
+                }
+                if self.stopped_unix_secs.is_some() {
+                    return Err(
+                        self.lifecycle_error("created containers must not report a stop time")
+                    );
+                }
+            }
+            ContainerStatus::Running => {
+                let started = match self.started_unix_secs {
+                    Some(val) => val,
+                    None => {
+                        return Err(
+                            self.lifecycle_error("running containers must record a start time")
+                        );
+                    }
+                };
+                if self.stopped_unix_secs.is_some() {
+                    return Err(
+                        self.lifecycle_error("running containers must not report a stop time")
+                    );
+                }
+                if started < self.created_unix_secs {
+                    return Err(self.lifecycle_error("start time cannot precede create time"));
+                }
+            }
+            ContainerStatus::Stopped { .. } => {
+                let started = match self.started_unix_secs {
+                    Some(val) => val,
+                    None => {
+                        return Err(
+                            self.lifecycle_error("stopped containers must record a start time")
+                        );
+                    }
+                };
+                let stopped = match self.stopped_unix_secs {
+                    Some(val) => val,
+                    None => {
+                        return Err(
+                            self.lifecycle_error("stopped containers must record a stop time")
+                        );
+                    }
+                };
+                if started > stopped {
+                    return Err(self.lifecycle_error("stop time cannot precede start time"));
+                }
+                if started < self.created_unix_secs {
+                    return Err(self.lifecycle_error("start time cannot precede create time"));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn lifecycle_error(&self, details: &str) -> ContractInvariantError {
+        ContractInvariantError::LifecycleInconsistency {
+            container_id: self.id.clone(),
+            details: details.to_string(),
+        }
+    }
+}
+
+/// Contract invariants that must hold consistently for runtime data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContractInvariantError {
+    /// Container lifecycle timestamps are inconsistent with the reported status.
+    LifecycleInconsistency {
+        container_id: String,
+        details: String,
+    },
+    /// Shared VM phase transitions violated the allowed state machine.
+    SharedVmPhaseTransition {
+        from: SharedVmPhase,
+        to: SharedVmPhase,
+    },
+}
+
+impl fmt::Display for ContractInvariantError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ContractInvariantError::LifecycleInconsistency {
+                container_id,
+                details,
+            } => write!(
+                f,
+                "Lifecycle invariant violated for container {}: {}",
+                container_id, details
+            ),
+            ContractInvariantError::SharedVmPhaseTransition { from, to } => write!(
+                f,
+                "Invalid shared VM phase transition from {:?} to {:?}",
+                from, to
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ContractInvariantError {}
+
+/// Runtime phases for a shared stack VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedVmPhase {
+    /// No shared VM is currently booted.
+    Shutdown,
+    /// A shared VM is in the process of booting.
+    Booting,
+    /// A shared VM has booted and is available for containers.
+    Ready,
+    /// The shared VM is in the process of shutting down.
+    ShuttingDown,
+}
+
+impl SharedVmPhase {
+    fn can_transition_to(self, next: SharedVmPhase) -> bool {
+        matches!(
+            (self, next),
+            (SharedVmPhase::Shutdown, SharedVmPhase::Booting)
+                | (SharedVmPhase::Booting, SharedVmPhase::Ready)
+                | (SharedVmPhase::Ready, SharedVmPhase::ShuttingDown)
+                | (SharedVmPhase::ShuttingDown, SharedVmPhase::Shutdown)
+        )
+    }
+}
+
+/// Tracks shared VM phases and validates transitions.
+#[derive(Debug, Clone)]
+pub struct SharedVmPhaseTracker {
+    phase: SharedVmPhase,
+}
+
+impl Default for SharedVmPhaseTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedVmPhaseTracker {
+    /// Start tracking from the shutdown phase.
+    pub fn new() -> Self {
+        Self {
+            phase: SharedVmPhase::Shutdown,
+        }
+    }
+
+    /// Current known shared VM phase.
+    pub fn phase(&self) -> SharedVmPhase {
+        self.phase
+    }
+
+    /// Attempt to transition to a new phase, returning an error if invalid.
+    pub fn transition_to(&mut self, next: SharedVmPhase) -> Result<(), ContractInvariantError> {
+        if self.phase == next {
+            return Ok(());
+        }
+
+        if !self.phase.can_transition_to(next) {
+            return Err(ContractInvariantError::SharedVmPhaseTransition {
+                from: self.phase,
+                to: next,
+            });
+        }
+
+        self.phase = next;
+        Ok(())
+    }
 }
 
 // ── Image types ───────────────────────────────────────────────────

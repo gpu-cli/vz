@@ -12,9 +12,10 @@ pub mod types;
 pub use error::RuntimeError;
 pub use selection::{HostBackend, ResolvedBackend};
 pub use types::{
-    ContainerInfo, ContainerLogs, ContainerStatus, ExecConfig, ExecOutput, ImageInfo, MountAccess,
-    MountSpec, MountType, NetworkServiceConfig, PortMapping, PortProtocol, PruneResult, RunConfig,
-    StackResourceHint, StackVolumeMount,
+    ContainerInfo, ContainerLogs, ContainerStatus, ContractInvariantError, ExecConfig, ExecOutput,
+    ImageInfo, MountAccess, MountSpec, MountType, NetworkServiceConfig, PortMapping, PortProtocol,
+    PruneResult, RunConfig, SharedVmPhase, SharedVmPhaseTracker, StackResourceHint,
+    StackVolumeMount,
 };
 
 /// Backend-neutral container runtime trait.
@@ -209,6 +210,54 @@ mod tests {
             network_name: "default".to_string(),
         };
         let _logs = ContainerLogs::default();
+    }
+
+    #[test]
+    fn lifecycle_consistency_checks() {
+        let mut info = ContainerInfo {
+            id: "c1".to_string(),
+            image: "img".to_string(),
+            image_id: "sha256:abc".to_string(),
+            status: ContainerStatus::Running,
+            created_unix_secs: 0,
+            started_unix_secs: Some(1),
+            stopped_unix_secs: None,
+            rootfs_path: None,
+            host_pid: None,
+        };
+
+        assert!(info.ensure_lifecycle_consistency().is_ok());
+
+        info.started_unix_secs = None;
+        assert!(matches!(
+            info.ensure_lifecycle_consistency(),
+            Err(ContractInvariantError::LifecycleInconsistency { .. })
+        ));
+
+        info.status = ContainerStatus::Stopped { exit_code: 0 };
+        info.created_unix_secs = 2;
+        info.started_unix_secs = Some(1);
+        info.stopped_unix_secs = Some(3);
+        assert!(matches!(
+            info.ensure_lifecycle_consistency(),
+            Err(ContractInvariantError::LifecycleInconsistency { .. })
+        ));
+    }
+
+    #[test]
+    fn shared_vm_phase_transitions() {
+        let mut tracker = SharedVmPhaseTracker::new();
+        assert_eq!(tracker.phase(), SharedVmPhase::Shutdown);
+
+        tracker.transition_to(SharedVmPhase::Booting).unwrap();
+        tracker.transition_to(SharedVmPhase::Ready).unwrap();
+        tracker.transition_to(SharedVmPhase::ShuttingDown).unwrap();
+        tracker.transition_to(SharedVmPhase::Shutdown).unwrap();
+
+        assert!(matches!(
+            tracker.transition_to(SharedVmPhase::Ready),
+            Err(ContractInvariantError::SharedVmPhaseTransition { .. })
+        ));
     }
 
     #[test]
