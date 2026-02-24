@@ -3180,12 +3180,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde",
+ "serde_json",
  "shell-words",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "vz",
  "vz-linux",
+ "vz-runtime-contract",
 ]
 
 [[package]]

@@ -12,7 +12,8 @@ pub mod types;
 pub use error::{MachineErrorCode, RuntimeError};
 pub use selection::{HostBackend, ResolvedBackend};
 pub use types::{
-    Build, BuildSpec, BuildState, Capability, Checkpoint, CheckpointClass, CheckpointState,
+    Build, BuildSpec, BuildState, Capability, Checkpoint, CheckpointClass, CheckpointClassMetadata,
+    CheckpointCompatibilityMetadata, CheckpointLineageStore, CheckpointMetadata, CheckpointState,
     Container, ContainerInfo, ContainerLogs, ContainerMount, ContainerResources, ContainerSpec,
     ContainerState, ContainerStatus, ContractInvariantError, Event, EventRange, EventScope,
     ExecConfig, ExecOutput, Execution, ExecutionSpec, ExecutionState, Image, ImageInfo, Lease,
@@ -792,6 +793,21 @@ mod tests {
             created_at: 60,
             compatibility_fingerprint: "linux-amd64".to_string(),
         };
+        let _checkpoint_class_metadata = CheckpointClass::FsQuick.metadata();
+        let _checkpoint_compatibility = CheckpointCompatibilityMetadata {
+            backend_id: "macos-vz".to_string(),
+            backend_version: "0.1.0".to_string(),
+            runtime_version: "2".to_string(),
+            guest_artifact_versions: BTreeMap::from([("agent".to_string(), "1.2.3".to_string())]),
+            config_hash: "sha256:abc".to_string(),
+            host_compatibility_markers: BTreeMap::from([(
+                "host.os".to_string(),
+                "macos-15".to_string(),
+            )]),
+        };
+        let _checkpoint_metadata =
+            CheckpointMetadata::new(_checkpoint.clone(), _checkpoint_compatibility);
+        let _checkpoint_store = CheckpointLineageStore::default();
         let _event = Event {
             event_id: 1,
             ts: 70,
@@ -892,6 +908,93 @@ mod tests {
         poll_immediate(manager.setup_stack_network("stack-1", Vec::new())).unwrap();
 
         assert!(manager.backend().calls().is_empty());
+    }
+
+    #[test]
+    fn checkpoint_lineage_store_enforces_parent_and_duplicates() {
+        let mut store = CheckpointLineageStore::default();
+        let compatibility = CheckpointCompatibilityMetadata {
+            backend_id: "linux-native".to_string(),
+            backend_version: "0.1.0".to_string(),
+            runtime_version: "2".to_string(),
+            guest_artifact_versions: BTreeMap::new(),
+            config_hash: "sha256:config".to_string(),
+            host_compatibility_markers: BTreeMap::new(),
+        };
+        assert!(compatibility.is_complete());
+
+        let root = CheckpointMetadata::new(
+            Checkpoint {
+                checkpoint_id: "ckpt-root".to_string(),
+                sandbox_id: "sbx-1".to_string(),
+                parent_checkpoint_id: None,
+                class: CheckpointClass::FsQuick,
+                state: CheckpointState::Ready,
+                created_at: 1,
+                compatibility_fingerprint: "fingerprint-1".to_string(),
+            },
+            compatibility.clone(),
+        );
+        assert_eq!(
+            root.class_metadata,
+            CheckpointClassMetadata {
+                includes_filesystem_state: true,
+                includes_memory_state: false,
+                includes_cpu_and_device_state: false,
+            }
+        );
+        store.register(root).unwrap();
+
+        let child = CheckpointMetadata::new(
+            Checkpoint {
+                checkpoint_id: "ckpt-child".to_string(),
+                sandbox_id: "sbx-2".to_string(),
+                parent_checkpoint_id: Some("ckpt-root".to_string()),
+                class: CheckpointClass::VmFull,
+                state: CheckpointState::Ready,
+                created_at: 2,
+                compatibility_fingerprint: "fingerprint-2".to_string(),
+            },
+            compatibility.clone(),
+        );
+        store.register(child).unwrap();
+
+        assert_eq!(store.children_of("ckpt-root").len(), 1);
+        assert_eq!(store.list_for_sandbox("sbx-2").len(), 1);
+
+        let missing_parent = CheckpointMetadata::new(
+            Checkpoint {
+                checkpoint_id: "ckpt-missing-parent".to_string(),
+                sandbox_id: "sbx-3".to_string(),
+                parent_checkpoint_id: Some("does-not-exist".to_string()),
+                class: CheckpointClass::FsQuick,
+                state: CheckpointState::Creating,
+                created_at: 3,
+                compatibility_fingerprint: "fingerprint-3".to_string(),
+            },
+            compatibility.clone(),
+        );
+        assert!(matches!(
+            store.register(missing_parent),
+            Err(ContractInvariantError::CheckpointParentNotFound { .. })
+        ));
+
+        let duplicate = CheckpointMetadata::new(
+            Checkpoint {
+                checkpoint_id: "ckpt-root".to_string(),
+                sandbox_id: "sbx-1".to_string(),
+                parent_checkpoint_id: None,
+                class: CheckpointClass::FsQuick,
+                state: CheckpointState::Ready,
+                created_at: 4,
+                compatibility_fingerprint: "fingerprint-4".to_string(),
+            },
+            compatibility,
+        );
+        assert!(matches!(
+            store.register(duplicate),
+            Err(ContractInvariantError::CheckpointAlreadyExists { .. })
+        ));
     }
 
     #[test]

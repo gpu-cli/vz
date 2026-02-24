@@ -38,6 +38,28 @@ pub enum SandboxError {
         active_workloads: Vec<String>,
     },
 
+    /// Checkpoint metadata store file is malformed or unreadable as JSON.
+    #[error("checkpoint catalog at {} is invalid: {reason}", path.display())]
+    CheckpointCatalogCorrupt {
+        /// Catalog file path.
+        path: PathBuf,
+        /// Parse/validation reason.
+        reason: String,
+    },
+
+    /// Checkpoint metadata store could not be persisted.
+    #[error("failed to persist checkpoint catalog at {}: {reason}", path.display())]
+    CheckpointCatalogPersistence {
+        /// Catalog file path.
+        path: PathBuf,
+        /// Persistence error details.
+        reason: String,
+    },
+
+    /// Checkpoint lineage invariants were violated.
+    #[error("checkpoint lineage violation: {0}")]
+    CheckpointLineageViolation(String),
+
     /// A VM-level error from the vz crate.
     #[error(transparent)]
     Vm(#[from] vz::VzError),
@@ -111,5 +133,38 @@ mod tests {
         assert!(msg.contains("lease-0-1"));
         assert!(msg.contains("workspace-main:workspace"));
         assert!(msg.contains("svc-db:service"));
+    }
+
+    #[test]
+    fn checkpoint_catalog_corrupt_display() {
+        let err = SandboxError::CheckpointCatalogCorrupt {
+            path: PathBuf::from("/tmp/checkpoint-lineage.json"),
+            reason: "expected map at line 1 column 1".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("/tmp/checkpoint-lineage.json"));
+        assert!(msg.contains("expected map"));
+    }
+
+    #[test]
+    fn checkpoint_catalog_persistence_display() {
+        let err = SandboxError::CheckpointCatalogPersistence {
+            path: PathBuf::from("/tmp/checkpoint-lineage.json"),
+            reason: "permission denied".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("/tmp/checkpoint-lineage.json"));
+        assert!(msg.contains("permission denied"));
+    }
+
+    #[test]
+    fn checkpoint_lineage_violation_display() {
+        let err = SandboxError::CheckpointLineageViolation(
+            "Checkpoint child references missing parent root".to_string(),
+        );
+        assert_eq!(
+            err.to_string(),
+            "checkpoint lineage violation: Checkpoint child references missing parent root"
+        );
     }
 }
