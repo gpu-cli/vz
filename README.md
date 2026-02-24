@@ -149,7 +149,7 @@ vz vm patch create \
   --signing-key /tmp/vz-patch-signing-key.pem
 
 vz vm patch verify --bundle /tmp/patch-1.vzpatch
-sudo vz vm patch apply --bundle /tmp/patch-1.vzpatch --root /tmp/mounted-root
+sudo vz vm patch apply --bundle /tmp/patch-1.vzpatch --image ~/.vz/images/base.img
 ```
 
 For advanced CI workflows, `vz vm patch create` also supports `--operations <json>` + `--payload-dir <dir>`.

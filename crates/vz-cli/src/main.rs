@@ -702,7 +702,45 @@ mod tests {
                 commands::vm::VmCommand::Patch(patch_args) => match patch_args.action {
                     commands::vm_patch::VmPatchCommand::Apply(apply) => {
                         assert_eq!(apply.bundle, PathBuf::from("/tmp/patch-bundle.vzpatch"));
-                        assert_eq!(apply.root, PathBuf::from("/tmp/mounted-root"));
+                        assert_eq!(
+                            apply.root.as_ref(),
+                            Some(&PathBuf::from("/tmp/mounted-root"))
+                        );
+                        assert!(apply.image.is_none());
+                    }
+                    other => panic!("unexpected vm patch action: {other:?}"),
+                },
+                other => panic!("unexpected vm command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_patch_apply_image_target() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "vm",
+            "patch",
+            "apply",
+            "--bundle",
+            "/tmp/patch-bundle.vzpatch",
+            "--image",
+            "~/.vz/images/base.img",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Vm(args) => match args.action {
+                commands::vm::VmCommand::Patch(patch_args) => match patch_args.action {
+                    commands::vm_patch::VmPatchCommand::Apply(apply) => {
+                        assert_eq!(apply.bundle, PathBuf::from("/tmp/patch-bundle.vzpatch"));
+                        assert_eq!(
+                            apply.image.as_ref(),
+                            Some(&PathBuf::from("~/.vz/images/base.img"))
+                        );
+                        assert!(apply.root.is_none());
                     }
                     other => panic!("unexpected vm patch action: {other:?}"),
                 },

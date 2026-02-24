@@ -138,8 +138,12 @@ pub struct ApplyArgs {
     pub bundle: PathBuf,
 
     /// Mounted root path to apply operations under.
-    #[arg(long)]
-    pub root: PathBuf,
+    #[arg(long, conflicts_with = "image", required_unless_present = "image")]
+    pub root: Option<PathBuf>,
+
+    /// Raw VM disk image path to mount/apply/detach automatically.
+    #[arg(long, conflicts_with = "root", required_unless_present = "root")]
+    pub image: Option<PathBuf>,
 }
 
 /// Typed bundle manifest.
@@ -923,10 +927,62 @@ fn patch_state_path() -> PathBuf {
 }
 
 fn apply_with_state_path(args: ApplyArgs, patch_state_path: &Path) -> anyhow::Result<()> {
-    let manifest = verify_bundle(&args.bundle)?;
+    match (args.root.as_ref(), args.image.as_ref()) {
+        (Some(root), None) => apply_with_root(&args.bundle, root, patch_state_path),
+        (None, Some(image)) => apply_with_image(&args.bundle, image, patch_state_path),
+        _ => bail!("exactly one apply target is required: --root <path> or --image <path>"),
+    }
+}
+
+fn apply_with_image(bundle: &Path, image: &Path, patch_state_path: &Path) -> anyhow::Result<()> {
+    let image = expand_home(image);
+    if !image.exists() {
+        bail!("disk image not found: {}", image.display());
+    }
+
+    let manifest = verify_bundle(bundle)?;
     validate_patch_target_base_policy(&manifest)?;
-    let root = fs::canonicalize(&args.root)
-        .with_context(|| format!("failed to resolve apply root {}", args.root.display()))?;
+    super::vm_base::verify_image_for_base_id(&image, &manifest.target_base_id).with_context(
+        || {
+            format!(
+                "pinned base verification failed before applying patch to image {}",
+                image.display()
+            )
+        },
+    )?;
+
+    let disk = crate::provision::attach_and_mount(&image).with_context(|| {
+        format!(
+            "failed to attach and mount image {} before patch apply",
+            image.display()
+        )
+    })?;
+
+    let result =
+        apply_verified_manifest_with_root(manifest, bundle, &disk.mount_point, patch_state_path);
+    let detach_result = disk.detach();
+
+    result?;
+    detach_result?;
+
+    println!("Patch apply completed for image {}", image.display());
+    Ok(())
+}
+
+fn apply_with_root(bundle: &Path, root: &Path, patch_state_path: &Path) -> anyhow::Result<()> {
+    let manifest = verify_bundle(bundle)?;
+    validate_patch_target_base_policy(&manifest)?;
+    apply_verified_manifest_with_root(manifest, bundle, root, patch_state_path)
+}
+
+fn apply_verified_manifest_with_root(
+    manifest: PatchBundleManifest,
+    bundle: &Path,
+    root_arg: &Path,
+    patch_state_path: &Path,
+) -> anyhow::Result<()> {
+    let root = fs::canonicalize(root_arg)
+        .with_context(|| format!("failed to resolve apply root {}", root_arg.display()))?;
     if !root.is_dir() {
         bail!("apply root {} is not a directory", root.display());
     }
@@ -953,7 +1009,7 @@ fn apply_with_state_path(args: ApplyArgs, patch_state_path: &Path) -> anyhow::Re
         );
     }
 
-    let paths = BundlePaths::from_bundle_dir(&args.bundle);
+    let paths = BundlePaths::from_bundle_dir(bundle);
     let payload_by_digest = load_payload_archive(&paths.payload)?;
     validate_apply_preflight(&manifest, &payload_by_digest)?;
     apply_operations_transactional(&root, &manifest, &payload_by_digest)?;
@@ -1231,6 +1287,16 @@ fn decode_pem_private_key(raw: &[u8]) -> anyhow::Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(body)
         .context("private key PEM body is not valid base64")
+}
+
+fn expand_home(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(format!("{}{}", home, &s[1..]));
+        }
+    }
+    path.to_path_buf()
 }
 
 fn verify_bundle(bundle_dir: &Path) -> anyhow::Result<PatchBundleManifest> {
@@ -2257,7 +2323,8 @@ mod tests {
         apply_with_state_path(
             ApplyArgs {
                 bundle: bundle.to_path_buf(),
-                root: root.to_path_buf(),
+                root: Some(root.to_path_buf()),
+                image: None,
             },
             patch_state_path,
         )
