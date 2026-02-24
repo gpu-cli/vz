@@ -2,6 +2,64 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
+/// Stable machine-readable error codes for Runtime V2 operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineErrorCode {
+    /// Input failed validation or violated schema constraints.
+    ValidationError,
+    /// Referenced entity was not found.
+    NotFound,
+    /// Requested transition conflicts with current state.
+    StateConflict,
+    /// Policy explicitly denied the requested operation.
+    PolicyDenied,
+    /// Operation exceeded timeout/deadline.
+    Timeout,
+    /// Backend was unavailable or transport/storage was disrupted.
+    BackendUnavailable,
+    /// Operation unsupported by current backend/capabilities.
+    UnsupportedOperation,
+    /// Unexpected internal runtime failure.
+    InternalError,
+}
+
+impl MachineErrorCode {
+    /// All stable machine-readable codes.
+    pub const ALL: [MachineErrorCode; 8] = [
+        MachineErrorCode::ValidationError,
+        MachineErrorCode::NotFound,
+        MachineErrorCode::StateConflict,
+        MachineErrorCode::PolicyDenied,
+        MachineErrorCode::Timeout,
+        MachineErrorCode::BackendUnavailable,
+        MachineErrorCode::UnsupportedOperation,
+        MachineErrorCode::InternalError,
+    ];
+
+    /// Canonical snake_case code string.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            MachineErrorCode::ValidationError => "validation_error",
+            MachineErrorCode::NotFound => "not_found",
+            MachineErrorCode::StateConflict => "state_conflict",
+            MachineErrorCode::PolicyDenied => "policy_denied",
+            MachineErrorCode::Timeout => "timeout",
+            MachineErrorCode::BackendUnavailable => "backend_unavailable",
+            MachineErrorCode::UnsupportedOperation => "unsupported_operation",
+            MachineErrorCode::InternalError => "internal_error",
+        }
+    }
+}
+
+impl std::fmt::Display for MachineErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Errors returned by [`RuntimeBackend`](crate::RuntimeBackend) operations.
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
@@ -82,4 +140,41 @@ pub enum RuntimeError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+}
+
+impl RuntimeError {
+    /// Stable machine-readable code for this runtime error.
+    pub fn machine_code(&self) -> MachineErrorCode {
+        fn reason_looks_like_timeout(reason: &str) -> bool {
+            let reason_lc = reason.to_ascii_lowercase();
+            reason_lc.contains("timeout")
+                || reason_lc.contains("timed out")
+                || reason_lc.contains("deadline")
+        }
+
+        match self {
+            RuntimeError::InvalidConfig(_) | RuntimeError::InvalidRootfs { .. } => {
+                MachineErrorCode::ValidationError
+            }
+            RuntimeError::ContainerNotFound { .. } | RuntimeError::ImageNotFound { .. } => {
+                MachineErrorCode::NotFound
+            }
+            RuntimeError::PullFailed { reason, .. } if reason_looks_like_timeout(reason) => {
+                MachineErrorCode::Timeout
+            }
+            RuntimeError::PullFailed { .. } => MachineErrorCode::BackendUnavailable,
+            RuntimeError::ContainerFailed { reason, .. }
+            | RuntimeError::ExecFailed { reason, .. }
+                if reason_looks_like_timeout(reason) =>
+            {
+                MachineErrorCode::Timeout
+            }
+            RuntimeError::ContainerFailed { .. } | RuntimeError::ExecFailed { .. } => {
+                MachineErrorCode::StateConflict
+            }
+            RuntimeError::UnsupportedOperation { .. } => MachineErrorCode::UnsupportedOperation,
+            RuntimeError::Io(_) => MachineErrorCode::BackendUnavailable,
+            RuntimeError::Backend { .. } => MachineErrorCode::InternalError,
+        }
+    }
 }

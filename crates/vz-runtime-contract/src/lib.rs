@@ -9,14 +9,34 @@ pub mod error;
 pub mod selection;
 pub mod types;
 
-pub use error::RuntimeError;
+pub use error::{MachineErrorCode, RuntimeError};
 pub use selection::{HostBackend, ResolvedBackend};
 pub use types::{
-    ContainerInfo, ContainerLogs, ContainerStatus, ContractInvariantError, ExecConfig, ExecOutput,
-    ImageInfo, MountAccess, MountSpec, MountType, NetworkServiceConfig, PortMapping, PortProtocol,
-    PruneResult, RunConfig, RuntimeCapabilities, SharedVmPhase, SharedVmPhaseTracker,
-    StackResourceHint, StackVolumeMount,
+    Build, BuildSpec, BuildState, Capability, Checkpoint, CheckpointClass, CheckpointState,
+    Container, ContainerInfo, ContainerLogs, ContainerMount, ContainerResources, ContainerSpec,
+    ContainerState, ContainerStatus, ContractInvariantError, Event, EventRange, EventScope,
+    ExecConfig, ExecOutput, Execution, ExecutionSpec, ExecutionState, Image, ImageInfo, Lease,
+    LeaseState, MountAccess, MountSpec, MountType, NetworkDomain, NetworkDomainState,
+    NetworkServiceConfig, PortMapping, PortProtocol, PruneResult, PublishedPort, Receipt,
+    ReceiptResultClassification, RunConfig, RuntimeCapabilities, RuntimeOperation, Sandbox,
+    SandboxBackend, SandboxSpec, SandboxState, SandboxVolumeMount, SharedVmPhase,
+    SharedVmPhaseTracker, StackResourceHint, StackVolumeMount, Volume, VolumeType,
 };
+
+/// Canonical Runtime V2 operation surface expected from implementations.
+pub const REQUIRED_RUNTIME_OPERATIONS: &[RuntimeOperation] = &RuntimeOperation::ALL;
+
+/// Required idempotent mutation paths and their canonical operation names.
+pub const REQUIRED_IDEMPOTENT_MUTATIONS: &[RuntimeOperation] = &[
+    RuntimeOperation::CreateSandbox,
+    RuntimeOperation::OpenLease,
+    RuntimeOperation::PullImage,
+    RuntimeOperation::StartBuild,
+    RuntimeOperation::CreateContainer,
+    RuntimeOperation::ExecContainer,
+    RuntimeOperation::CreateCheckpoint,
+    RuntimeOperation::ForkCheckpoint,
+];
 
 /// Backend-neutral container runtime trait.
 ///
@@ -165,6 +185,7 @@ pub trait RuntimeBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     /// Verify the trait is object-safe enough for our usage pattern.
     /// We use `impl RuntimeBackend` (static dispatch) not `dyn RuntimeBackend`,
@@ -220,6 +241,142 @@ mod tests {
         let _logs = ContainerLogs::default();
         let _capabilities = RuntimeCapabilities::default();
         let _stack_capabilities = RuntimeCapabilities::stack_baseline();
+        let _sandbox_spec = SandboxSpec {
+            cpus: Some(2),
+            memory_mb: Some(4096),
+            network_profile: Some("default".to_string()),
+            volume_mounts: vec![SandboxVolumeMount {
+                volume_id: "vol-1".to_string(),
+                target: "/data".to_string(),
+                read_only: false,
+            }],
+        };
+        let _sandbox = Sandbox {
+            sandbox_id: "sbx-1".to_string(),
+            backend: SandboxBackend::MacosVz,
+            spec: _sandbox_spec.clone(),
+            state: SandboxState::Ready,
+            created_at: 10,
+            updated_at: 11,
+            labels: BTreeMap::new(),
+        };
+        let _lease = Lease {
+            lease_id: "lease-1".to_string(),
+            sandbox_id: "sbx-1".to_string(),
+            ttl_secs: 60,
+            last_heartbeat_at: 20,
+            state: LeaseState::Active,
+        };
+        let _image = Image {
+            image_ref: "alpine:latest".to_string(),
+            resolved_digest: "sha256:abc".to_string(),
+            platform: "linux/amd64".to_string(),
+            source_registry: "docker.io".to_string(),
+            pulled_at: 30,
+        };
+        let _build = Build {
+            build_id: "b-1".to_string(),
+            sandbox_id: "sbx-1".to_string(),
+            build_spec: BuildSpec {
+                context: ".".to_string(),
+                dockerfile: Some("Dockerfile".to_string()),
+                args: BTreeMap::new(),
+            },
+            state: BuildState::Queued,
+            result_digest: None,
+            started_at: 40,
+            ended_at: None,
+        };
+        let _container = Container {
+            container_id: "ctr-1".to_string(),
+            sandbox_id: "sbx-1".to_string(),
+            image_digest: "sha256:abc".to_string(),
+            container_spec: ContainerSpec {
+                cmd: vec!["sleep".to_string(), "1".to_string()],
+                env: BTreeMap::new(),
+                cwd: None,
+                user: None,
+                mounts: vec![ContainerMount {
+                    volume_id: "vol-1".to_string(),
+                    target: "/work".to_string(),
+                    access_mode: MountAccess::ReadWrite,
+                }],
+                resources: ContainerResources::default(),
+                network_attachments: vec!["net-1".to_string()],
+            },
+            state: ContainerState::Created,
+            created_at: 50,
+            started_at: None,
+            ended_at: None,
+        };
+        let _execution = Execution {
+            execution_id: "exec-1".to_string(),
+            container_id: "ctr-1".to_string(),
+            exec_spec: ExecutionSpec {
+                cmd: vec!["echo".to_string()],
+                args: vec!["hello".to_string()],
+                env_override: BTreeMap::new(),
+                pty: false,
+                timeout_secs: Some(10),
+            },
+            state: ExecutionState::Queued,
+            exit_code: None,
+            started_at: None,
+            ended_at: None,
+        };
+        let _volume = Volume {
+            volume_id: "vol-1".to_string(),
+            sandbox_id: "sbx-1".to_string(),
+            volume_type: VolumeType::Named,
+            source: "named://vol-1".to_string(),
+            target: "/data".to_string(),
+            access_mode: MountAccess::ReadWrite,
+        };
+        let _network = NetworkDomain {
+            network_id: "net-1".to_string(),
+            sandbox_id: Some("sbx-1".to_string()),
+            stack_id: None,
+            state: NetworkDomainState::Ready,
+            dns_zone: "sandbox.local".to_string(),
+            published_ports: vec![PublishedPort {
+                host_port: 8080,
+                container_port: 80,
+                protocol: PortProtocol::Tcp,
+            }],
+        };
+        let _checkpoint = Checkpoint {
+            checkpoint_id: "ckpt-1".to_string(),
+            sandbox_id: "sbx-1".to_string(),
+            parent_checkpoint_id: None,
+            class: CheckpointClass::FsQuick,
+            state: CheckpointState::Creating,
+            created_at: 60,
+            compatibility_fingerprint: "linux-amd64".to_string(),
+        };
+        let _event = Event {
+            event_id: 1,
+            ts: 70,
+            scope: EventScope::Sandbox,
+            scope_id: "sbx-1".to_string(),
+            event_type: "sandbox.ready".to_string(),
+            payload: BTreeMap::new(),
+            trace_id: Some("trace-1".to_string()),
+        };
+        let _receipt = Receipt {
+            receipt_id: "r-1".to_string(),
+            scope: EventScope::Sandbox,
+            scope_id: "sbx-1".to_string(),
+            request_hash: "req".to_string(),
+            policy_hash: None,
+            result_classification: ReceiptResultClassification::Success,
+            artifacts: vec![],
+            resource_summary: BTreeMap::new(),
+            event_range: EventRange {
+                start_event_id: 1,
+                end_event_id: 1,
+            },
+        };
+        let _capability = Capability::ComposeAdapter;
     }
 
     #[test]
@@ -268,6 +425,286 @@ mod tests {
             tracker.transition_to(SharedVmPhase::Ready),
             Err(ContractInvariantError::SharedVmPhaseTransition { .. })
         ));
+    }
+
+    #[test]
+    fn sandbox_and_lease_state_invariants() {
+        let mut sandbox = Sandbox {
+            sandbox_id: "s-1".to_string(),
+            backend: SandboxBackend::LinuxFirecracker,
+            spec: SandboxSpec::default(),
+            state: SandboxState::Creating,
+            created_at: 0,
+            updated_at: 0,
+            labels: BTreeMap::new(),
+        };
+
+        assert!(matches!(
+            sandbox.ensure_can_open_lease(),
+            Err(ContractInvariantError::LeaseRequiresReadySandbox { .. })
+        ));
+
+        sandbox.transition_to(SandboxState::Ready).unwrap();
+        sandbox.ensure_can_open_lease().unwrap();
+        sandbox.transition_to(SandboxState::Draining).unwrap();
+        sandbox.transition_to(SandboxState::Terminated).unwrap();
+        assert!(matches!(
+            sandbox.transition_to(SandboxState::Ready),
+            Err(ContractInvariantError::SandboxStateTransition { .. })
+        ));
+
+        let mut lease = Lease {
+            lease_id: "l-1".to_string(),
+            sandbox_id: "s-1".to_string(),
+            ttl_secs: 30,
+            last_heartbeat_at: 1,
+            state: LeaseState::Opening,
+        };
+        assert!(matches!(
+            lease.ensure_can_submit_work("create_container"),
+            Err(ContractInvariantError::WorkRequiresActiveLease { .. })
+        ));
+        lease.transition_to(LeaseState::Active).unwrap();
+        lease.ensure_can_submit_work("create_container").unwrap();
+        lease.transition_to(LeaseState::Closed).unwrap();
+        assert!(matches!(
+            lease.ensure_can_submit_work("create_container"),
+            Err(ContractInvariantError::WorkRequiresActiveLease { .. })
+        ));
+        assert!(matches!(
+            lease.transition_to(LeaseState::Active),
+            Err(ContractInvariantError::LeaseStateTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn container_and_execution_state_invariants() {
+        let mut container = Container {
+            container_id: "c-1".to_string(),
+            sandbox_id: "s-1".to_string(),
+            image_digest: "sha256:abc".to_string(),
+            container_spec: ContainerSpec::default(),
+            state: ContainerState::Created,
+            created_at: 1,
+            started_at: None,
+            ended_at: None,
+        };
+
+        assert!(matches!(
+            container.ensure_can_exec(),
+            Err(ContractInvariantError::ExecRequiresRunningContainer { .. })
+        ));
+        container.transition_to(ContainerState::Starting).unwrap();
+        container.transition_to(ContainerState::Running).unwrap();
+        container.ensure_can_exec().unwrap();
+        container.transition_to(ContainerState::Stopping).unwrap();
+        container.transition_to(ContainerState::Exited).unwrap();
+        assert!(matches!(
+            container.ensure_can_exec(),
+            Err(ContractInvariantError::ExecRequiresRunningContainer { .. })
+        ));
+        container.transition_to(ContainerState::Removed).unwrap();
+        assert!(matches!(
+            container.transition_to(ContainerState::Running),
+            Err(ContractInvariantError::ContainerStateTransition { .. })
+        ));
+
+        let mut execution = Execution {
+            execution_id: "e-1".to_string(),
+            container_id: "c-1".to_string(),
+            exec_spec: ExecutionSpec::default(),
+            state: ExecutionState::Queued,
+            exit_code: None,
+            started_at: None,
+            ended_at: None,
+        };
+        execution.ensure_lifecycle_consistency().unwrap();
+        execution.transition_to(ExecutionState::Running).unwrap();
+        execution.started_at = Some(2);
+        execution.ensure_lifecycle_consistency().unwrap();
+        execution.transition_to(ExecutionState::Exited).unwrap();
+        execution.ended_at = Some(3);
+        execution.exit_code = Some(0);
+        execution.ensure_lifecycle_consistency().unwrap();
+        assert!(matches!(
+            execution.transition_to(ExecutionState::Running),
+            Err(ContractInvariantError::ExecutionStateTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn build_receipt_and_capability_invariants() {
+        let mut build = Build {
+            build_id: "b-1".to_string(),
+            sandbox_id: "s-1".to_string(),
+            build_spec: BuildSpec::default(),
+            state: BuildState::Queued,
+            result_digest: None,
+            started_at: 1,
+            ended_at: None,
+        };
+        build.ensure_lifecycle_consistency().unwrap();
+        build.transition_to(BuildState::Running).unwrap();
+        build.transition_to(BuildState::Succeeded).unwrap();
+        build.result_digest = Some("sha256:abcd".to_string());
+        build.ended_at = Some(2);
+        build.ensure_lifecycle_consistency().unwrap();
+        assert!(matches!(
+            build.transition_to(BuildState::Running),
+            Err(ContractInvariantError::BuildStateTransition { .. })
+        ));
+
+        let image = Image {
+            image_ref: "alpine:latest".to_string(),
+            resolved_digest: "sha256:abcd".to_string(),
+            platform: "linux/amd64".to_string(),
+            source_registry: "docker.io".to_string(),
+            pulled_at: 1,
+        };
+        image.ensure_digest_immutable().unwrap();
+
+        let bad_image = Image {
+            image_ref: "alpine:latest".to_string(),
+            resolved_digest: "latest".to_string(),
+            platform: "linux/amd64".to_string(),
+            source_registry: "docker.io".to_string(),
+            pulled_at: 1,
+        };
+        assert!(matches!(
+            bad_image.ensure_digest_immutable(),
+            Err(ContractInvariantError::ImageDigestInvariant { .. })
+        ));
+
+        let receipt = Receipt {
+            receipt_id: "r-1".to_string(),
+            scope: EventScope::Sandbox,
+            scope_id: "s-1".to_string(),
+            request_hash: "req".to_string(),
+            policy_hash: None,
+            result_classification: ReceiptResultClassification::Success,
+            artifacts: vec![],
+            resource_summary: BTreeMap::new(),
+            event_range: EventRange {
+                start_event_id: 10,
+                end_event_id: 11,
+            },
+        };
+        receipt.ensure_event_range_ordered().unwrap();
+
+        let bad_receipt = Receipt {
+            event_range: EventRange {
+                start_event_id: 12,
+                end_event_id: 11,
+            },
+            ..receipt
+        };
+        assert!(matches!(
+            bad_receipt.ensure_event_range_ordered(),
+            Err(ContractInvariantError::ReceiptEventRangeInvalid { .. })
+        ));
+
+        let list = RuntimeCapabilities::stack_baseline().to_capability_list();
+        assert!(list.contains(&Capability::ComposeAdapter));
+        assert!(list.contains(&Capability::SharedVm));
+        assert!(list.contains(&Capability::StackNetworking));
+    }
+
+    #[test]
+    fn required_operations_and_idempotency_surface_match_contract() {
+        assert_eq!(REQUIRED_RUNTIME_OPERATIONS.len(), 34);
+        assert_eq!(
+            RuntimeOperation::ALL.len(),
+            REQUIRED_RUNTIME_OPERATIONS.len()
+        );
+        assert_eq!(REQUIRED_IDEMPOTENT_MUTATIONS.len(), 8);
+
+        for operation in REQUIRED_RUNTIME_OPERATIONS {
+            assert_eq!(
+                operation.requires_idempotency_key(),
+                operation.idempotency_key_prefix().is_some()
+            );
+        }
+
+        assert!(REQUIRED_IDEMPOTENT_MUTATIONS.contains(&RuntimeOperation::CreateSandbox));
+        assert!(REQUIRED_IDEMPOTENT_MUTATIONS.contains(&RuntimeOperation::OpenLease));
+        assert!(REQUIRED_IDEMPOTENT_MUTATIONS.contains(&RuntimeOperation::PullImage));
+        assert!(REQUIRED_IDEMPOTENT_MUTATIONS.contains(&RuntimeOperation::StartBuild));
+        assert!(REQUIRED_IDEMPOTENT_MUTATIONS.contains(&RuntimeOperation::CreateContainer));
+        assert!(REQUIRED_IDEMPOTENT_MUTATIONS.contains(&RuntimeOperation::ExecContainer));
+        assert!(REQUIRED_IDEMPOTENT_MUTATIONS.contains(&RuntimeOperation::CreateCheckpoint));
+        assert!(REQUIRED_IDEMPOTENT_MUTATIONS.contains(&RuntimeOperation::ForkCheckpoint));
+
+        assert!(!RuntimeOperation::GetReceipt.requires_idempotency_key());
+        assert!(!RuntimeOperation::ListEvents.requires_idempotency_key());
+        assert_eq!(
+            RuntimeOperation::CreateSandbox.idempotency_key_prefix(),
+            Some("create_sandbox")
+        );
+        assert_eq!(
+            RuntimeOperation::GetCapabilities.idempotency_key_prefix(),
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_error_machine_codes_are_stable() {
+        assert_eq!(
+            MachineErrorCode::ALL.map(MachineErrorCode::as_str),
+            [
+                "validation_error",
+                "not_found",
+                "state_conflict",
+                "policy_denied",
+                "timeout",
+                "backend_unavailable",
+                "unsupported_operation",
+                "internal_error",
+            ]
+        );
+
+        assert_eq!(
+            RuntimeError::InvalidConfig("bad".to_string()).machine_code(),
+            MachineErrorCode::ValidationError
+        );
+        assert_eq!(
+            RuntimeError::ContainerNotFound {
+                id: "c1".to_string()
+            }
+            .machine_code(),
+            MachineErrorCode::NotFound
+        );
+        assert_eq!(
+            RuntimeError::ContainerFailed {
+                id: "c1".to_string(),
+                reason: "already stopped".to_string(),
+            }
+            .machine_code(),
+            MachineErrorCode::StateConflict
+        );
+        assert_eq!(
+            RuntimeError::PullFailed {
+                reference: "img:latest".to_string(),
+                reason: "network timeout".to_string(),
+            }
+            .machine_code(),
+            MachineErrorCode::Timeout
+        );
+        assert_eq!(
+            RuntimeError::UnsupportedOperation {
+                operation: "fork_checkpoint".to_string(),
+                reason: "missing checkpoint_fork capability".to_string(),
+            }
+            .machine_code(),
+            MachineErrorCode::UnsupportedOperation
+        );
+        assert_eq!(
+            RuntimeError::Backend {
+                message: "agent unavailable".to_string(),
+                source: Box::new(std::io::Error::other("dial failed")),
+            }
+            .machine_code(),
+            MachineErrorCode::InternalError
+        );
     }
 
     #[test]

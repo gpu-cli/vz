@@ -14,13 +14,15 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::unwrap_used)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::Duration;
 
 use vz_oci_macos::{MacosRuntimeBackend, RuntimeConfig};
 use vz_runtime_contract::{
-    ExecConfig, NetworkServiceConfig, PortMapping, RunConfig, RuntimeBackend,
+    Container, ContainerState, ContractInvariantError, ExecConfig, Lease, LeaseState,
+    MachineErrorCode, NetworkServiceConfig, PortMapping, RunConfig, RuntimeBackend, Sandbox,
+    SandboxBackend, SandboxSpec, SandboxState,
 };
 use vz_stack::{
     Action, ContainerRuntime, OrchestrationConfig, StackError, StackEvent, StackExecutor,
@@ -193,6 +195,89 @@ impl ContainerRuntime for OciContainerRuntime {
     fn has_shared_vm(&self, stack_id: &str) -> bool {
         self.backend.has_shared_vm(stack_id)
     }
+}
+
+#[test]
+fn stack_error_machine_code_normalization() {
+    assert_eq!(
+        StackError::InvalidSpec("bad config".to_string()).machine_code(),
+        MachineErrorCode::ValidationError
+    );
+    assert_eq!(
+        StackError::Network("unsupported_operation: operation=exec".to_string()).machine_code(),
+        MachineErrorCode::UnsupportedOperation
+    );
+    assert_eq!(
+        StackError::Network("image not found".to_string()).machine_code(),
+        MachineErrorCode::NotFound
+    );
+    assert_eq!(
+        StackError::Network("request timed out".to_string()).machine_code(),
+        MachineErrorCode::Timeout
+    );
+    assert_eq!(
+        StackError::Network("bridge unavailable".to_string()).machine_code(),
+        MachineErrorCode::BackendUnavailable
+    );
+    assert_eq!(
+        StackError::Machine {
+            code: MachineErrorCode::PolicyDenied,
+            message: "denied".to_string(),
+        }
+        .machine_code(),
+        MachineErrorCode::PolicyDenied
+    );
+}
+
+#[test]
+fn contract_terminal_state_and_lease_exec_gating_rules() {
+    let mut sandbox = Sandbox {
+        sandbox_id: "sbx-test".to_string(),
+        backend: SandboxBackend::MacosVz,
+        spec: SandboxSpec::default(),
+        state: SandboxState::Ready,
+        created_at: 1,
+        updated_at: 1,
+        labels: BTreeMap::new(),
+    };
+    sandbox.ensure_can_open_lease().unwrap();
+    sandbox.transition_to(SandboxState::Draining).unwrap();
+    sandbox.transition_to(SandboxState::Terminated).unwrap();
+    assert!(matches!(
+        sandbox.ensure_can_open_lease(),
+        Err(ContractInvariantError::LeaseRequiresReadySandbox { .. })
+    ));
+
+    let mut lease = Lease {
+        lease_id: "lease-test".to_string(),
+        sandbox_id: "sbx-test".to_string(),
+        ttl_secs: 60,
+        last_heartbeat_at: 1,
+        state: LeaseState::Active,
+    };
+    lease.ensure_can_submit_work("create_container").unwrap();
+    lease.transition_to(LeaseState::Closed).unwrap();
+    assert!(matches!(
+        lease.ensure_can_submit_work("exec_container"),
+        Err(ContractInvariantError::WorkRequiresActiveLease { .. })
+    ));
+
+    let mut container = Container {
+        container_id: "ctr-test".to_string(),
+        sandbox_id: "sbx-test".to_string(),
+        image_digest: "sha256:abc".to_string(),
+        container_spec: Default::default(),
+        state: ContainerState::Running,
+        created_at: 1,
+        started_at: Some(1),
+        ended_at: None,
+    };
+    container.ensure_can_exec().unwrap();
+    container.transition_to(ContainerState::Exited).unwrap();
+    assert!(matches!(
+        container.ensure_can_exec(),
+        Err(ContractInvariantError::ExecRequiresRunningContainer { .. })
+    ));
 }
 
 /// Parse a 2-service compose YAML, reconcile, execute through real OCI runtime,

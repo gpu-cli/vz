@@ -21,7 +21,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{debug, info};
 
 use vz_stack::{
     ContainerLogs, ContainerRuntime, EventRecord, OrchestrationConfig, RoundReport,
@@ -319,6 +319,8 @@ struct ControlRequest {
     service: String,
     #[serde(default)]
     cmd: Vec<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 fn default_action() -> ControlAction {
@@ -393,6 +395,65 @@ fn map_runtime_error(operation: &str, error: vz_runtime_contract::RuntimeError) 
     }
 }
 
+fn normalize_idempotency_component(component: &str) -> String {
+    component
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn runtime_idempotency_key(
+    operation: vz_runtime_contract::RuntimeOperation,
+    components: &[&str],
+) -> Option<String> {
+    operation.idempotency_key_prefix().map(|prefix| {
+        let suffix = components
+            .iter()
+            .map(|part| normalize_idempotency_component(part))
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(":");
+
+        if suffix.is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{prefix}:{suffix}")
+        }
+    })
+}
+
+fn control_action_operation(action: &ControlAction) -> vz_runtime_contract::RuntimeOperation {
+    match action {
+        ControlAction::Exec => vz_runtime_contract::RuntimeOperation::ExecContainer,
+        ControlAction::Stop => vz_runtime_contract::RuntimeOperation::StopContainer,
+        ControlAction::Start | ControlAction::Restart => {
+            vz_runtime_contract::RuntimeOperation::CreateContainer
+        }
+    }
+}
+
+fn control_request_idempotency_key(
+    stack_name: &str,
+    action: &ControlAction,
+    service: &str,
+    command: &[String],
+) -> Option<String> {
+    let operation = control_action_operation(action);
+    let command_fingerprint = if command.is_empty() {
+        String::new()
+    } else {
+        command.join("_")
+    };
+
+    runtime_idempotency_key(operation, &[stack_name, service, &command_fingerprint])
+}
+
 impl OciContainerRuntime {
     #[cfg(target_os = "macos")]
     fn new(oci_data_dir: &Path, auth: Option<vz_image::Auth>) -> anyhow::Result<Self> {
@@ -452,6 +513,16 @@ impl OciContainerRuntime {
 impl ContainerRuntime for OciContainerRuntime {
     fn pull(&self, image: &str) -> Result<String, StackError> {
         use vz_runtime_contract::RuntimeBackend;
+        let idempotency_key =
+            runtime_idempotency_key(vz_runtime_contract::RuntimeOperation::PullImage, &[image]);
+        if let Some(key) = idempotency_key.as_deref() {
+            debug!(
+                operation = vz_runtime_contract::RuntimeOperation::PullImage.as_str(),
+                idempotency_key = %key,
+                image = %image,
+                "runtime mutation idempotency key"
+            );
+        }
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(self.backend.pull(image))
@@ -465,6 +536,20 @@ impl ContainerRuntime for OciContainerRuntime {
         config: vz_runtime_contract::RunConfig,
     ) -> Result<String, StackError> {
         use vz_runtime_contract::RuntimeBackend;
+        let id_hint = config.container_id.as_deref().unwrap_or("auto");
+        let idempotency_key = runtime_idempotency_key(
+            vz_runtime_contract::RuntimeOperation::CreateContainer,
+            &[image, id_hint],
+        );
+        if let Some(key) = idempotency_key.as_deref() {
+            debug!(
+                operation = vz_runtime_contract::RuntimeOperation::CreateContainer.as_str(),
+                idempotency_key = %key,
+                image = %image,
+                container_hint = %id_hint,
+                "runtime mutation idempotency key"
+            );
+        }
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(self.backend.create_container(image, config))
@@ -510,6 +595,19 @@ impl ContainerRuntime for OciContainerRuntime {
         command: &[String],
     ) -> Result<(i32, String, String), StackError> {
         use vz_runtime_contract::RuntimeBackend;
+        let command_fingerprint = command.join("_");
+        let idempotency_key = runtime_idempotency_key(
+            vz_runtime_contract::RuntimeOperation::ExecContainer,
+            &[container_id, &command_fingerprint],
+        );
+        if let Some(key) = idempotency_key.as_deref() {
+            debug!(
+                operation = vz_runtime_contract::RuntimeOperation::ExecContainer.as_str(),
+                idempotency_key = %key,
+                container = %container_id,
+                "runtime mutation idempotency key"
+            );
+        }
         tokio::task::block_in_place(|| {
             let exec_config = vz_runtime_contract::ExecConfig {
                 cmd: command.to_vec(),
@@ -589,6 +687,21 @@ impl ContainerRuntime for OciContainerRuntime {
         use vz_runtime_contract::RuntimeBackend;
         let capabilities = self.capabilities();
         self.ensure_capability("create_in_stack", "shared_vm", capabilities.shared_vm)?;
+        let id_hint = config.container_id.as_deref().unwrap_or("auto");
+        let idempotency_key = runtime_idempotency_key(
+            vz_runtime_contract::RuntimeOperation::CreateContainer,
+            &[stack_id, image, id_hint],
+        );
+        if let Some(key) = idempotency_key.as_deref() {
+            debug!(
+                operation = vz_runtime_contract::RuntimeOperation::CreateContainer.as_str(),
+                idempotency_key = %key,
+                stack = %stack_id,
+                image = %image,
+                container_hint = %id_hint,
+                "runtime mutation idempotency key"
+            );
+        }
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(
@@ -987,14 +1100,34 @@ async fn handle_control_connection_bg(
     let resp = match orchestrator.lock() {
         Ok(mut orch) => match request.action {
             ControlAction::Exec => handle_exec(spec, &orch, &request),
-            ControlAction::Stop => handle_service_stop(spec, &mut orch, &request.service),
-            ControlAction::Start => handle_service_start(spec, &mut orch, &request.service),
+            ControlAction::Stop => handle_service_stop(
+                spec,
+                &mut orch,
+                &request.service,
+                request.idempotency_key.as_deref(),
+            ),
+            ControlAction::Start => handle_service_start(
+                spec,
+                &mut orch,
+                &request.service,
+                request.idempotency_key.as_deref(),
+            ),
             ControlAction::Restart => {
-                let stop_resp = handle_service_stop(spec, &mut orch, &request.service);
+                let stop_resp = handle_service_stop(
+                    spec,
+                    &mut orch,
+                    &request.service,
+                    request.idempotency_key.as_deref(),
+                );
                 if stop_resp.error.is_some() {
                     stop_resp
                 } else {
-                    handle_service_start(spec, &mut orch, &request.service)
+                    handle_service_start(
+                        spec,
+                        &mut orch,
+                        &request.service,
+                        request.idempotency_key.as_deref(),
+                    )
                 }
             }
         },
@@ -1045,14 +1178,34 @@ async fn handle_control_connection(
 
     let resp = match request.action {
         ControlAction::Exec => handle_exec(spec, orchestrator, &request),
-        ControlAction::Stop => handle_service_stop(spec, orchestrator, &request.service),
-        ControlAction::Start => handle_service_start(spec, orchestrator, &request.service),
+        ControlAction::Stop => handle_service_stop(
+            spec,
+            orchestrator,
+            &request.service,
+            request.idempotency_key.as_deref(),
+        ),
+        ControlAction::Start => handle_service_start(
+            spec,
+            orchestrator,
+            &request.service,
+            request.idempotency_key.as_deref(),
+        ),
         ControlAction::Restart => {
-            let stop_resp = handle_service_stop(spec, orchestrator, &request.service);
+            let stop_resp = handle_service_stop(
+                spec,
+                orchestrator,
+                &request.service,
+                request.idempotency_key.as_deref(),
+            );
             if stop_resp.error.is_some() {
                 stop_resp
             } else {
-                handle_service_start(spec, orchestrator, &request.service)
+                handle_service_start(
+                    spec,
+                    orchestrator,
+                    &request.service,
+                    request.idempotency_key.as_deref(),
+                )
             }
         }
     };
@@ -1098,6 +1251,7 @@ fn handle_exec(
     info!(
         service = %request.service,
         container = %container_id,
+        idempotency_key = %request.idempotency_key.as_deref().unwrap_or("-"),
         cmd = ?request.cmd,
         "exec request"
     );
@@ -1124,8 +1278,13 @@ fn handle_service_stop(
     spec: &StackSpec,
     orchestrator: &mut StackOrchestrator<OciContainerRuntime>,
     service_name: &str,
+    idempotency_key: Option<&str>,
 ) -> ControlResponse {
-    info!(service = %service_name, "stop request");
+    info!(
+        service = %service_name,
+        idempotency_key = %idempotency_key.unwrap_or("-"),
+        "stop request"
+    );
 
     let actions = vec![vz_stack::Action::ServiceRemove {
         service_name: service_name.to_string(),
@@ -1167,6 +1326,7 @@ fn handle_service_start(
     spec: &StackSpec,
     orchestrator: &mut StackOrchestrator<OciContainerRuntime>,
     service_name: &str,
+    idempotency_key: Option<&str>,
 ) -> ControlResponse {
     // Verify the service exists in the spec.
     if !spec.services.iter().any(|s| s.name == service_name) {
@@ -1178,7 +1338,11 @@ fn handle_service_start(
         };
     }
 
-    info!(service = %service_name, "start request");
+    info!(
+        service = %service_name,
+        idempotency_key = %idempotency_key.unwrap_or("-"),
+        "start request"
+    );
 
     let actions = vec![vz_stack::Action::ServiceCreate {
         service_name: service_name.to_string(),
@@ -1256,10 +1420,14 @@ async fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
 
     // Send the exec request.
+    let action = ControlAction::Exec;
+    let service = args.service;
+    let command = args.command;
     let request = ControlRequest {
-        action: ControlAction::Exec,
-        service: args.service,
-        cmd: args.command,
+        idempotency_key: control_request_idempotency_key(&args.name, &action, &service, &command),
+        action,
+        service,
+        cmd: command,
     };
     let mut json = serde_json::to_string(&request)?;
     json.push('\n');
@@ -1319,6 +1487,7 @@ async fn cmd_service_action(args: ServiceArgs, action: ControlAction) -> anyhow:
     let (reader, mut writer) = stream.into_split();
 
     let request = ControlRequest {
+        idempotency_key: control_request_idempotency_key(&args.name, &action, &args.service, &[]),
         action,
         service: args.service,
         cmd: vec![],
@@ -1542,8 +1711,13 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
     // Initial fetch: bounded tail -n <count>.
     for service in &services {
         let tail_n = args.tail.to_string();
-        let output =
-            exec_via_socket(&sock_path, service, &["tail", "-n", &tail_n, log_file]).await?;
+        let output = exec_via_socket(
+            &sock_path,
+            &args.name,
+            service,
+            &["tail", "-n", &tail_n, log_file],
+        )
+        .await?;
         print_log_output(&output, service, multi);
     }
 
@@ -1555,7 +1729,7 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
     // Use 200ms poll interval for near-real-time feel.
     let mut offsets: Vec<u64> = Vec::with_capacity(services.len());
     for service in &services {
-        let size = get_file_size(&sock_path, service, log_file).await?;
+        let size = get_file_size(&sock_path, &args.name, service, log_file).await?;
         offsets.push(size);
     }
 
@@ -1564,9 +1738,13 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
 
         for (i, service) in services.iter().enumerate() {
             let offset_arg = format!("+{}", offsets[i] + 1);
-            let output =
-                exec_via_socket(&sock_path, service, &["tail", "-c", &offset_arg, log_file])
-                    .await?;
+            let output = exec_via_socket(
+                &sock_path,
+                &args.name,
+                service,
+                &["tail", "-c", &offset_arg, log_file],
+            )
+            .await?;
 
             if !output.is_empty() {
                 print_log_output(&output, service, multi);
@@ -1591,8 +1769,13 @@ fn print_log_output(output: &str, service: &str, multi: bool) {
 }
 
 /// Get file size inside a container via `wc -c`.
-async fn get_file_size(sock_path: &Path, service: &str, path: &str) -> anyhow::Result<u64> {
-    let output = exec_via_socket(sock_path, service, &["wc", "-c", path]).await?;
+async fn get_file_size(
+    sock_path: &Path,
+    stack_name: &str,
+    service: &str,
+    path: &str,
+) -> anyhow::Result<u64> {
+    let output = exec_via_socket(sock_path, stack_name, service, &["wc", "-c", path]).await?;
     // wc -c output: "  12345 /path/to/file\n"
     let size: u64 = output
         .split_whitespace()
@@ -1603,7 +1786,12 @@ async fn get_file_size(sock_path: &Path, service: &str, path: &str) -> anyhow::R
 }
 
 /// Execute a command in a service container via the control socket.
-async fn exec_via_socket(sock_path: &Path, service: &str, cmd: &[&str]) -> anyhow::Result<String> {
+async fn exec_via_socket(
+    sock_path: &Path,
+    stack_name: &str,
+    service: &str,
+    cmd: &[&str],
+) -> anyhow::Result<String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
@@ -1616,10 +1804,13 @@ async fn exec_via_socket(sock_path: &Path, service: &str, cmd: &[&str]) -> anyho
 
     let (reader, mut writer) = stream.into_split();
 
+    let action = ControlAction::Exec;
+    let command: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
     let request = ControlRequest {
-        action: ControlAction::Exec,
+        idempotency_key: control_request_idempotency_key(stack_name, &action, service, &command),
+        action,
         service: service.to_string(),
-        cmd: cmd.iter().map(|s| s.to_string()).collect(),
+        cmd: command,
     };
     let mut json = serde_json::to_string(&request)?;
     json.push('\n');
@@ -1930,10 +2121,14 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
 
     let (reader, mut writer) = stream.into_split();
 
+    let action = ControlAction::Exec;
+    let service = args.service;
+    let command = args.command;
     let request = ControlRequest {
-        action: ControlAction::Exec,
-        service: args.service,
-        cmd: args.command,
+        idempotency_key: control_request_idempotency_key(&args.name, &action, &service, &command),
+        action,
+        service,
+        cmd: command,
     };
     let mut json = serde_json::to_string(&request)?;
     json.push('\n');
@@ -2489,12 +2684,17 @@ mod tests {
             action: ControlAction::Exec,
             service: "db".into(),
             cmd: vec!["psql".into(), "-U".into(), "app".into()],
+            idempotency_key: Some("exec_container:stack1:db:psql_-U_app".into()),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ControlRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.action, ControlAction::Exec);
         assert_eq!(parsed.service, "db");
         assert_eq!(parsed.cmd, vec!["psql", "-U", "app"]);
+        assert_eq!(
+            parsed.idempotency_key.as_deref(),
+            Some("exec_container:stack1:db:psql_-U_app")
+        );
     }
 
     #[test]
@@ -2503,6 +2703,7 @@ mod tests {
         let json = r#"{"service":"web","cmd":["echo","hi"]}"#;
         let parsed: ControlRequest = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.action, ControlAction::Exec);
+        assert!(parsed.idempotency_key.is_none());
     }
 
     #[test]
@@ -2511,6 +2712,7 @@ mod tests {
             action: ControlAction::Stop,
             service: "web".into(),
             cmd: vec![],
+            idempotency_key: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ControlRequest = serde_json::from_str(&json).unwrap();
@@ -2524,6 +2726,7 @@ mod tests {
             action: ControlAction::Restart,
             service: "cache".into(),
             cmd: vec![],
+            idempotency_key: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ControlRequest = serde_json::from_str(&json).unwrap();
@@ -2590,6 +2793,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn runtime_idempotency_key_is_only_emitted_for_required_operations() {
+        let key = runtime_idempotency_key(
+            vz_runtime_contract::RuntimeOperation::CreateContainer,
+            &["stack-a", "web", "ctr-1"],
+        )
+        .unwrap();
+        assert!(key.starts_with("create_container:"));
+        assert_eq!(key, "create_container:stack-a:web:ctr-1");
+
+        let no_key = runtime_idempotency_key(
+            vz_runtime_contract::RuntimeOperation::StopContainer,
+            &["stack-a", "web"],
+        );
+        assert!(no_key.is_none());
+    }
+
+    #[test]
+    fn control_request_idempotency_key_is_deterministic() {
+        let key = control_request_idempotency_key(
+            "stack-1",
+            &ControlAction::Exec,
+            "api",
+            &["echo".to_string(), "hello world".to_string()],
+        )
+        .unwrap();
+        assert_eq!(key, "exec_container:stack-1:api:echo_hello_world");
+
+        let stop_key = control_request_idempotency_key("stack-1", &ControlAction::Stop, "api", &[]);
+        assert!(stop_key.is_none());
+    }
+
     #[tokio::test]
     async fn control_socket_roundtrip() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -2632,6 +2867,7 @@ mod tests {
             action: ControlAction::Exec,
             service: "cache".into(),
             cmd: vec!["redis-cli".into(), "PING".into()],
+            idempotency_key: Some("exec_container:test:cache:redis-cli_PING".into()),
         };
         let mut json = serde_json::to_string(&req).unwrap();
         json.push('\n');
