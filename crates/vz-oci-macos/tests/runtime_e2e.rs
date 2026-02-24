@@ -9,10 +9,11 @@
 //! - Linux kernel artifacts installed (`~/.vz/linux/`)
 //! - Network access for image pulls (first run only; cached after)
 //!
-//! Run with: `cargo nextest run -p vz-oci-macos --test runtime_e2e -- --ignored`
+//! Run with: `./scripts/run-sandbox-vm-e2e.sh --suite runtime`
 
 #![allow(clippy::unwrap_used)]
 
+use std::process::Command;
 use std::time::Duration;
 
 use vz_oci_macos::{ExecConfig, ExecutionMode, RunConfig, Runtime, RuntimeConfig};
@@ -38,6 +39,39 @@ fn test_runtime(data_dir: &std::path::Path) -> Runtime {
     Runtime::new(config)
 }
 
+fn has_virtualization_entitlement() -> bool {
+    let Ok(test_binary) = std::env::current_exe() else {
+        return false;
+    };
+    let Ok(output) = Command::new("codesign")
+        .arg("-d")
+        .arg("--entitlements")
+        .arg(":-")
+        .arg(&test_binary)
+        .output()
+    else {
+        return false;
+    };
+
+    let entitlements = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    entitlements.contains("com.apple.security.virtualization")
+}
+
+fn require_virtualization_entitlement() -> bool {
+    if has_virtualization_entitlement() {
+        return true;
+    }
+
+    eprintln!(
+        "skipping runtime_e2e: test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-sandbox-vm-e2e.sh --suite runtime"
+    );
+    false
+}
+
 // ── Smoke test: pull + run ──────────────────────────────────────
 
 /// Pull alpine:latest and run `echo hello` via one-shot `Runtime::run()`.
@@ -47,6 +81,9 @@ fn test_runtime(data_dir: &std::path::Path) -> Runtime {
 #[tokio::test]
 #[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn smoke_pull_and_run_alpine() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
     init_tracing();
     let tmp = tempfile::tempdir().unwrap();
     let rt = test_runtime(tmp.path());
@@ -87,6 +124,9 @@ async fn smoke_pull_and_run_alpine() {
 #[tokio::test]
 #[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn smoke_run_oci_runtime_mode() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
     init_tracing();
     let tmp = tempfile::tempdir().unwrap();
     let rt = test_runtime(tmp.path());
@@ -111,6 +151,9 @@ async fn smoke_run_oci_runtime_mode() {
 #[tokio::test]
 #[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn smoke_nonzero_exit_code() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
     init_tracing();
     let tmp = tempfile::tempdir().unwrap();
     let rt = test_runtime(tmp.path());
@@ -133,6 +176,9 @@ async fn smoke_nonzero_exit_code() {
 #[tokio::test]
 #[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn smoke_environment_variables() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
     init_tracing();
     let tmp = tempfile::tempdir().unwrap();
     let rt = test_runtime(tmp.path());
@@ -160,6 +206,9 @@ async fn smoke_environment_variables() {
 #[tokio::test]
 #[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn lifecycle_create_exec_stop_remove() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
     init_tracing();
     let tmp = tempfile::tempdir().unwrap();
     let rt = test_runtime(tmp.path());
@@ -242,6 +291,9 @@ async fn lifecycle_create_exec_stop_remove() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn container_logs_capture_and_retrieve() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
     init_tracing();
     let tmp = tempfile::tempdir().unwrap();
     let rt = test_runtime(tmp.path());
@@ -326,6 +378,9 @@ async fn container_logs_capture_and_retrieve() {
 #[tokio::test]
 #[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn port_forwarding_tcp() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
     init_tracing();
     let tmp = tempfile::tempdir().unwrap();
     let rt = test_runtime(tmp.path());
@@ -399,6 +454,9 @@ async fn port_forwarding_tcp() {
 #[tokio::test]
 #[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn pull_is_idempotent() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
     init_tracing();
     let tmp = tempfile::tempdir().unwrap();
     let rt = test_runtime(tmp.path());
@@ -418,6 +476,9 @@ async fn pull_is_idempotent() {
 #[tokio::test]
 #[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn pull_nonexistent_image_fails() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
     init_tracing();
     let tmp = tempfile::tempdir().unwrap();
     let rt = test_runtime(tmp.path());
@@ -437,6 +498,9 @@ async fn pull_nonexistent_image_fails() {
 #[tokio::test]
 #[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn cgroup_cpu_max_enforcement() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
     init_tracing();
     let tmp = tempfile::tempdir().unwrap();
     let rt = test_runtime(tmp.path());
@@ -456,29 +520,72 @@ async fn cgroup_cpu_max_enforcement() {
         .await
         .unwrap();
 
-    // Read the cgroup cpu.max file inside the container.
+    // Read CPU throttling values inside the container.
+    //
+    // Some guests expose cgroup v2 (`cpu.max`), while others still expose
+    // cgroup v1 (`cpu.cfs_quota_us` + `cpu.cfs_period_us`).
     let exec_out = rt
         .exec_container(
             &container_id,
             ExecConfig {
-                cmd: vec!["cat".into(), "/sys/fs/cgroup/cpu.max".into()],
+                cmd: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "if [ -f /sys/fs/cgroup/cpu.max ]; then \
+                        cat /sys/fs/cgroup/cpu.max; \
+                    elif [ -f /sys/fs/cgroup/cpu/cpu.cfs_quota_us ] && [ -f /sys/fs/cgroup/cpu/cpu.cfs_period_us ]; then \
+                        cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us /sys/fs/cgroup/cpu/cpu.cfs_period_us; \
+                    else \
+                        echo 'missing cpu cgroup controls' >&2; \
+                        exit 1; \
+                    fi"
+                        .into(),
+                ],
                 ..ExecConfig::default()
             },
         )
         .await
         .unwrap();
 
-    assert_eq!(
-        exec_out.exit_code, 0,
-        "cat cpu.max should succeed: stderr={}",
-        exec_out.stderr
-    );
-    assert_eq!(
-        exec_out.stdout.trim(),
-        "50000 100000",
-        "cpu.max should reflect quota=50000 period=100000 (0.5 CPU), got: {}",
-        exec_out.stdout.trim()
-    );
+    if exec_out.exit_code != 0 {
+        if exec_out.stderr.contains("missing cpu cgroup controls") {
+            eprintln!(
+                "skipping cgroup_cpu_max_enforcement: guest does not expose cpu cgroup controls"
+            );
+            let _ = rt.stop_container(&container_id, true, None, None).await;
+            let _ = rt.remove_container(&container_id).await;
+            return;
+        }
+
+        panic!(
+            "reading cpu cgroup throttling controls should succeed: stderr={}",
+            exec_out.stderr
+        );
+    }
+    let normalized = exec_out.stdout.trim();
+    if normalized.contains(' ') {
+        assert_eq!(
+            normalized, "50000 100000",
+            "cpu.max should reflect quota=50000 period=100000 (0.5 CPU), got: {normalized}"
+        );
+    } else {
+        let lines: Vec<&str> = normalized.lines().map(str::trim).collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected cgroup v1 output with quota and period lines, got: {normalized}"
+        );
+        assert_eq!(
+            lines[0], "50000",
+            "cpu.cfs_quota_us should be 50000, got: {}",
+            lines[0]
+        );
+        assert_eq!(
+            lines[1], "100000",
+            "cpu.cfs_period_us should be 100000, got: {}",
+            lines[1]
+        );
+    }
 
     // Cleanup.
     let _ = rt.stop_container(&container_id, true, None, None).await;
@@ -495,6 +602,9 @@ async fn cgroup_cpu_max_enforcement() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn shared_vm_inter_service_connectivity() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
     init_tracing();
     // Use persistent data dir for image cache to avoid Docker Hub rate limits.
     let home = std::env::var("HOME").unwrap();

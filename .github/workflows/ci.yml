@@ -177,15 +177,5 @@ jobs:
           cargo nextest run -p vz-runtime-contract backend_adapter
           cargo nextest run -p vz-stack --test backend_conformance backend_conformance_cross_backend
 
-  # Layer 3: VM tests (self-hosted, requires golden image)
-  # Uncomment when self-hosted macOS ARM64 runner is available
-  # test-vm:
-  #   name: VM Tests (macOS ARM64, self-hosted)
-  #   runs-on: [self-hosted, macOS, ARM64]
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: dtolnay/rust-toolchain@stable
-  #     - uses: taiki-e/install-action@nextest
-  #     - name: Test (with VM tests)
-  #       working-directory: crates
-  #       run: cargo nextest run --workspace --features vm-tests
+  # Real VM sandbox E2E coverage is executed in `.github/workflows/vm-e2e.yml`
+  # so local and CI runs share the same signed harness entrypoint.

@@ -1,0 +1,77 @@
+name: VM E2E (Sandbox)
+
+on:
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: "Suites to run: runtime, stack, buildkit, sandbox, or all"
+        required: false
+        default: "sandbox"
+        type: string
+      profile:
+        description: "Cargo profile"
+        required: false
+        default: "debug"
+        type: choice
+        options:
+          - debug
+          - release
+      keep_going:
+        description: "Continue running suites after failures"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "0 8 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  vm-e2e:
+    name: Real VM Sandbox E2E
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 240
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+
+      - name: Run sandbox VM E2E harness
+        run: |
+          SUITES="${{ github.event.inputs.suites }}"
+          PROFILE="${{ github.event.inputs.profile }}"
+          KEEP_GOING="${{ github.event.inputs.keep_going }}"
+
+          if [[ -z "$SUITES" ]]; then
+            SUITES="sandbox"
+          fi
+          if [[ -z "$PROFILE" ]]; then
+            PROFILE="debug"
+          fi
+
+          ARGS=(
+            --suite "$SUITES"
+            --profile "$PROFILE"
+            --output-dir "$RUNNER_TEMP/sandbox-vm-e2e"
+          )
+
+          if [[ "$KEEP_GOING" == "true" ]]; then
+            ARGS+=(--keep-going)
+          fi
+
+          ./scripts/run-sandbox-vm-e2e.sh "${ARGS[@]}"
+
+      - name: Upload VM E2E artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-vm-e2e-artifacts
+          path: ${{ runner.temp }}/sandbox-vm-e2e
+          if-no-files-found: warn

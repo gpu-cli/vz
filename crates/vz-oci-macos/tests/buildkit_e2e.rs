@@ -6,7 +6,7 @@
 //! - Network access for pulling base images
 //!
 //! Run with:
-//! `./scripts/run-buildkit-e2e.sh`
+//! `./scripts/run-sandbox-vm-e2e.sh --suite buildkit`
 
 #![allow(clippy::unwrap_used)]
 
@@ -61,7 +61,7 @@ fn has_virtualization_entitlement() -> bool {
 async fn buildkit_builds_dockerfile_and_run_uses_built_image() {
     if !has_virtualization_entitlement() {
         eprintln!(
-            "skipping buildkit_e2e: test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-buildkit-e2e.sh"
+            "skipping buildkit_e2e: test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-sandbox-vm-e2e.sh --suite buildkit"
         );
         return;
     }

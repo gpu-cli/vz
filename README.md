@@ -146,6 +146,20 @@ cargo clippy --workspace -- -D warnings
 cargo nextest run --workspace
 ```
 
+Sandbox-specific real VM integration validation (macOS ARM64):
+
+```bash
+./scripts/run-sandbox-vm-e2e.sh --suite sandbox
+```
+
+Full VM lanes (runtime + stack + buildkit):
+
+```bash
+./scripts/run-sandbox-vm-e2e.sh --suite all
+```
+
+See `docs/sandbox-vm-e2e.md` for reproducible debug workflow and artifact paths.
+
 ## License
 
 [MIT](LICENSE.md)
