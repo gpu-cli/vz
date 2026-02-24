@@ -752,6 +752,76 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn parse_vm_patch_create_delta() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "vm",
+            "patch",
+            "create-delta",
+            "--bundle",
+            "/tmp/patch-bundle.vzpatch",
+            "--base-image",
+            "/tmp/base.img",
+            "--delta",
+            "/tmp/patch.vzdelta",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Vm(args) => match args.action {
+                commands::vm::VmCommand::Patch(patch_args) => match patch_args.action {
+                    commands::vm_patch::VmPatchCommand::CreateDelta(create_delta) => {
+                        assert_eq!(
+                            create_delta.bundle,
+                            PathBuf::from("/tmp/patch-bundle.vzpatch")
+                        );
+                        assert_eq!(create_delta.base_image, PathBuf::from("/tmp/base.img"));
+                        assert_eq!(create_delta.delta, PathBuf::from("/tmp/patch.vzdelta"));
+                        assert_eq!(create_delta.chunk_size_mib, 4);
+                    }
+                    other => panic!("unexpected vm patch action: {other:?}"),
+                },
+                other => panic!("unexpected vm command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_patch_apply_delta() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "vm",
+            "patch",
+            "apply-delta",
+            "--base-image",
+            "/tmp/base.img",
+            "--delta",
+            "/tmp/patch.vzdelta",
+            "--output-image",
+            "/tmp/patched.img",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Vm(args) => match args.action {
+                commands::vm::VmCommand::Patch(patch_args) => match patch_args.action {
+                    commands::vm_patch::VmPatchCommand::ApplyDelta(apply_delta) => {
+                        assert_eq!(apply_delta.base_image, PathBuf::from("/tmp/base.img"));
+                        assert_eq!(apply_delta.delta, PathBuf::from("/tmp/patch.vzdelta"));
+                        assert_eq!(apply_delta.output_image, PathBuf::from("/tmp/patched.img"));
+                    }
+                    other => panic!("unexpected vm patch action: {other:?}"),
+                },
+                other => panic!("unexpected vm command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn parse_vm_cleanup() {
         let cli = Cli::try_parse_from(["vz", "vm", "cleanup"]).expect("parse");
         assert!(matches!(

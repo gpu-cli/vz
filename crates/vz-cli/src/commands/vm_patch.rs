@@ -1,11 +1,12 @@
-//! `vz vm patch` -- Signed patch bundle verification and apply.
+//! `vz vm patch` -- Signed patch bundles plus binary image deltas.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, lchown, symlink};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -30,6 +31,11 @@ const DEFAULT_FILE_MODE: u32 = 0o644;
 const PATCH_STATE_FILE: &str = "patch-state.json";
 const PATCH_STATE_VERSION: u32 = 1;
 const PATCH_STATE_FILE_MODE: u32 = 0o600;
+const IMAGE_DELTA_MAGIC: &[u8; 8] = b"VZDELTA1";
+const IMAGE_DELTA_VERSION: u32 = 1;
+const DEFAULT_IMAGE_DELTA_CHUNK_SIZE_MIB: u32 = 4;
+const MIN_IMAGE_DELTA_CHUNK_SIZE_MIB: u32 = 1;
+const MAX_IMAGE_DELTA_CHUNK_SIZE_MIB: u32 = 64;
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -49,6 +55,10 @@ pub enum VmPatchCommand {
     Verify(VerifyArgs),
     /// Verify, then transactionally apply patch operations.
     Apply(ApplyArgs),
+    /// Create a binary image delta by applying a bundle to a temporary image copy.
+    CreateDelta(CreateDeltaArgs),
+    /// Apply a binary image delta to a base image without sudo/mounting.
+    ApplyDelta(ApplyDeltaArgs),
 }
 
 /// Arguments for `vz vm patch create`.
@@ -144,6 +154,56 @@ pub struct ApplyArgs {
     /// Raw VM disk image path to mount/apply/detach automatically.
     #[arg(long, conflicts_with = "root", required_unless_present = "root")]
     pub image: Option<PathBuf>,
+}
+
+/// Arguments for `vz vm patch create-delta`.
+#[derive(Args, Debug)]
+pub struct CreateDeltaArgs {
+    /// Bundle directory to apply when producing the patched image snapshot.
+    #[arg(long)]
+    pub bundle: PathBuf,
+
+    /// Base raw VM image path (for example: `~/.vz/images/base.img`).
+    #[arg(long)]
+    pub base_image: PathBuf,
+
+    /// Output binary delta file path (for example: `/tmp/patch-1.vzdelta`).
+    #[arg(long)]
+    pub delta: PathBuf,
+
+    /// Chunk size in MiB used for diffing.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_IMAGE_DELTA_CHUNK_SIZE_MIB,
+        value_parser = clap::value_parser!(u32).range(MIN_IMAGE_DELTA_CHUNK_SIZE_MIB as i64..=(MAX_IMAGE_DELTA_CHUNK_SIZE_MIB as i64))
+    )]
+    pub chunk_size_mib: u32,
+}
+
+/// Arguments for `vz vm patch apply-delta`.
+#[derive(Args, Debug)]
+pub struct ApplyDeltaArgs {
+    /// Base raw VM image path used as delta source.
+    #[arg(long)]
+    pub base_image: PathBuf,
+
+    /// Binary delta file produced by `vz vm patch create-delta`.
+    #[arg(long)]
+    pub delta: PathBuf,
+
+    /// Output raw VM image path to write patched result to.
+    #[arg(long)]
+    pub output_image: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImageDeltaHeader {
+    chunk_size: u32,
+    base_size: u64,
+    target_size: u64,
+    base_sha256: [u8; 32],
+    target_sha256: [u8; 32],
+    changed_chunks: u64,
 }
 
 /// Typed bundle manifest.
@@ -566,6 +626,8 @@ pub async fn run(args: VmPatchArgs) -> anyhow::Result<()> {
         VmPatchCommand::Create(args) => create(args),
         VmPatchCommand::Verify(args) => verify(args),
         VmPatchCommand::Apply(args) => apply(args),
+        VmPatchCommand::CreateDelta(args) => create_delta(args),
+        VmPatchCommand::ApplyDelta(args) => apply_delta(args),
     }
 }
 
@@ -934,6 +996,75 @@ fn apply_with_state_path(args: ApplyArgs, patch_state_path: &Path) -> anyhow::Re
     }
 }
 
+fn create_delta(args: CreateDeltaArgs) -> anyhow::Result<()> {
+    let base_image = expand_home(&args.base_image);
+    let bundle = expand_home(&args.bundle);
+    let delta = expand_home(&args.delta);
+    ensure_regular_file(&base_image, "--base-image")?;
+    ensure_dir(&bundle, "--bundle")?;
+    ensure_output_file_parent(&delta)?;
+    ensure_output_path_absent(&delta, "--delta")?;
+
+    let workspace = TempWorkspace::new("vz-image-delta-create")?;
+    let patched_image = workspace.path().join("patched.img");
+
+    clone_or_copy_file(&base_image, &patched_image)?;
+    let state_path = workspace.path().join("patch-state.json");
+    apply_with_state_path(
+        ApplyArgs {
+            bundle: bundle.clone(),
+            root: None,
+            image: Some(patched_image.clone()),
+        },
+        &state_path,
+    )?;
+
+    let chunk_size = mib_to_bytes(args.chunk_size_mib)?;
+    let header = create_image_delta_file(&base_image, &patched_image, &delta, chunk_size)
+        .with_context(|| {
+            format!(
+                "failed to build image delta from {} to {}",
+                base_image.display(),
+                patched_image.display()
+            )
+        })?;
+
+    println!(
+        "Image delta created at {} (chunk={} MiB, changed_chunks={}, base={}, target={})",
+        delta.display(),
+        args.chunk_size_mib,
+        header.changed_chunks,
+        base_image.display(),
+        patched_image.display()
+    );
+    Ok(())
+}
+
+fn apply_delta(args: ApplyDeltaArgs) -> anyhow::Result<()> {
+    let base_image = expand_home(&args.base_image);
+    let delta = expand_home(&args.delta);
+    let output_image = expand_home(&args.output_image);
+    ensure_regular_file(&base_image, "--base-image")?;
+    ensure_regular_file(&delta, "--delta")?;
+    ensure_output_file_parent(&output_image)?;
+    ensure_output_path_absent(&output_image, "--output-image")?;
+
+    let header = apply_image_delta_file(&base_image, &delta, &output_image).with_context(|| {
+        format!(
+            "failed to apply image delta {} to {}",
+            delta.display(),
+            base_image.display()
+        )
+    })?;
+    println!(
+        "Image delta applied to {} (changed_chunks={}, target_size={} bytes)",
+        output_image.display(),
+        header.changed_chunks,
+        header.target_size
+    );
+    Ok(())
+}
+
 fn apply_with_image(bundle: &Path, image: &Path, patch_state_path: &Path) -> anyhow::Result<()> {
     let image = expand_home(image);
     if !image.exists() {
@@ -1028,6 +1159,492 @@ fn apply_verified_manifest_with_root(
         root.display()
     );
     Ok(())
+}
+
+fn ensure_regular_file(path: &Path, arg_name: &str) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("{} not found: {}", arg_name, path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("{} must be a regular file: {}", arg_name, path.display());
+    }
+    Ok(())
+}
+
+fn ensure_dir(path: &Path, arg_name: &str) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("{} not found: {}", arg_name, path.display()))?;
+    if !metadata.file_type().is_dir() {
+        bail!("{} must be a directory: {}", arg_name, path.display());
+    }
+    Ok(())
+}
+
+fn ensure_output_file_parent(path: &Path) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("output path '{}' has no parent directory", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create parent directory {}", parent.display()))
+}
+
+fn ensure_output_path_absent(path: &Path, arg_name: &str) -> anyhow::Result<()> {
+    if path.exists() {
+        bail!("{} already exists: {}", arg_name, path.display());
+    }
+    Ok(())
+}
+
+fn mib_to_bytes(mib: u32) -> anyhow::Result<usize> {
+    let bytes = (mib as u64)
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow!("chunk size overflow"))?;
+    usize::try_from(bytes).context("chunk size does not fit usize")
+}
+
+struct TempWorkspace {
+    path: PathBuf,
+}
+
+impl TempWorkspace {
+    fn new(prefix: &str) -> anyhow::Result<Self> {
+        let temp_root = std::env::temp_dir();
+        for _ in 0..64 {
+            let suffix = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let candidate = temp_root.join(format!("{prefix}-{}-{suffix}", now_unix_seconds()));
+            match fs::create_dir(&candidate) {
+                Ok(()) => return Ok(Self { path: candidate }),
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("failed to create {}", candidate.display()));
+                }
+            }
+        }
+        bail!(
+            "failed to allocate temporary workspace under {}",
+            temp_root.display()
+        );
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempWorkspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn clone_or_copy_file(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    if destination == source {
+        bail!(
+            "destination must be different from source: {}",
+            destination.display()
+        );
+    }
+    ensure_regular_file(source, "source image")?;
+    let parent = destination.parent().ok_or_else(|| {
+        anyhow!(
+            "destination path '{}' has no parent directory",
+            destination.display()
+        )
+    })?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    ensure_output_path_absent(destination, "destination image")?;
+
+    let cp_status = Command::new("cp")
+        .arg("-c")
+        .arg(source)
+        .arg(destination)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    if let Ok(status) = cp_status {
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    fs::copy(source, destination).with_context(|| {
+        format!(
+            "failed to copy {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn create_image_delta_file(
+    base_image: &Path,
+    target_image: &Path,
+    delta_path: &Path,
+    chunk_size: usize,
+) -> anyhow::Result<ImageDeltaHeader> {
+    if chunk_size == 0 {
+        bail!("chunk size must be greater than zero");
+    }
+    ensure_regular_file(base_image, "base image")?;
+    ensure_regular_file(target_image, "target image")?;
+    ensure_output_file_parent(delta_path)?;
+    ensure_output_path_absent(delta_path, "delta output")?;
+
+    let base_size = fs::metadata(base_image)
+        .with_context(|| format!("failed to inspect {}", base_image.display()))?
+        .len();
+    let target_size = fs::metadata(target_image)
+        .with_context(|| format!("failed to inspect {}", target_image.display()))?
+        .len();
+
+    let mut base_reader = File::open(base_image)
+        .with_context(|| format!("failed to open {}", base_image.display()))?;
+    let mut target_reader = File::open(target_image)
+        .with_context(|| format!("failed to open {}", target_image.display()))?;
+    let mut delta_file = OpenOptions::new()
+        .write(true)
+        .read(true)
+        .create_new(true)
+        .open(delta_path)
+        .with_context(|| format!("failed to create {}", delta_path.display()))?;
+
+    let mut header = ImageDeltaHeader {
+        chunk_size: u32::try_from(chunk_size).context("chunk size exceeds u32")?,
+        base_size,
+        target_size,
+        base_sha256: [0u8; 32],
+        target_sha256: [0u8; 32],
+        changed_chunks: 0,
+    };
+    write_image_delta_header(&mut delta_file, &header)?;
+
+    let mut base_hasher = Sha256::new();
+    let mut target_hasher = Sha256::new();
+    let mut base_buf = vec![0u8; chunk_size];
+    let mut target_buf = vec![0u8; chunk_size];
+    let mut chunk_index = 0u64;
+
+    loop {
+        let base_n = read_full_chunk(&mut base_reader, &mut base_buf)?;
+        let target_n = read_full_chunk(&mut target_reader, &mut target_buf)?;
+        if base_n == 0 && target_n == 0 {
+            break;
+        }
+
+        base_hasher.update(&base_buf[..base_n]);
+        target_hasher.update(&target_buf[..target_n]);
+
+        let unchanged = base_n == target_n && base_buf[..base_n] == target_buf[..target_n];
+        if !unchanged && target_n > 0 {
+            let compressed =
+                zstd::stream::encode_all(std::io::Cursor::new(&target_buf[..target_n]), 0)
+                    .context("failed to compress changed chunk")?;
+            write_u64_le(&mut delta_file, chunk_index)?;
+            write_u32_le(
+                &mut delta_file,
+                u32::try_from(target_n).context("chunk length exceeds u32")?,
+            )?;
+            write_u32_le(
+                &mut delta_file,
+                u32::try_from(compressed.len()).context("compressed chunk exceeds u32")?,
+            )?;
+            delta_file
+                .write_all(&compressed)
+                .context("failed to write compressed chunk")?;
+            header.changed_chunks = header
+                .changed_chunks
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("changed chunk counter overflow"))?;
+        }
+
+        chunk_index = chunk_index
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("chunk index overflow"))?;
+    }
+
+    let base_digest = base_hasher.finalize();
+    let target_digest = target_hasher.finalize();
+    header.base_sha256.copy_from_slice(base_digest.as_ref());
+    header.target_sha256.copy_from_slice(target_digest.as_ref());
+
+    delta_file
+        .seek(SeekFrom::Start(0))
+        .with_context(|| format!("failed to rewind {}", delta_path.display()))?;
+    write_image_delta_header(&mut delta_file, &header)?;
+    delta_file
+        .sync_all()
+        .with_context(|| format!("failed to sync {}", delta_path.display()))?;
+
+    Ok(header)
+}
+
+fn apply_image_delta_file(
+    base_image: &Path,
+    delta_path: &Path,
+    output_image: &Path,
+) -> anyhow::Result<ImageDeltaHeader> {
+    ensure_regular_file(base_image, "base image")?;
+    ensure_regular_file(delta_path, "delta file")?;
+    ensure_output_file_parent(output_image)?;
+    ensure_output_path_absent(output_image, "output image")?;
+
+    let mut delta_reader = File::open(delta_path)
+        .with_context(|| format!("failed to open {}", delta_path.display()))?;
+    let header = read_image_delta_header(&mut delta_reader)?;
+
+    let actual_base_size = fs::metadata(base_image)
+        .with_context(|| format!("failed to inspect {}", base_image.display()))?
+        .len();
+    if actual_base_size != header.base_size {
+        bail!(
+            "base image size mismatch: expected {} bytes, actual {} bytes",
+            header.base_size,
+            actual_base_size
+        );
+    }
+
+    let actual_base_sha = sha256_file_raw(base_image)?;
+    if actual_base_sha != header.base_sha256 {
+        bail!(
+            "base image digest mismatch: expected {}, actual {}",
+            sha256_digest_hex(&header.base_sha256),
+            sha256_digest_hex(&actual_base_sha)
+        );
+    }
+
+    clone_or_copy_file(base_image, output_image)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .read(true)
+        .open(output_image)
+        .with_context(|| format!("failed to open {}", output_image.display()))?;
+    output
+        .set_len(header.target_size)
+        .with_context(|| format!("failed to resize {}", output_image.display()))?;
+
+    let mut previous_index = None::<u64>;
+    for _ in 0..header.changed_chunks {
+        let chunk_index = read_u64_le(&mut delta_reader).context("failed to read chunk index")?;
+        if let Some(prev) = previous_index {
+            if chunk_index <= prev {
+                bail!(
+                    "delta chunk records must be strictly increasing (got {} after {})",
+                    chunk_index,
+                    prev
+                );
+            }
+        }
+        previous_index = Some(chunk_index);
+
+        let target_len =
+            read_u32_le(&mut delta_reader).context("failed to read chunk target length")? as usize;
+        let compressed_len = read_u32_le(&mut delta_reader)
+            .context("failed to read compressed chunk length")?
+            as usize;
+        if target_len == 0 || target_len > header.chunk_size as usize {
+            bail!(
+                "invalid chunk length {} (chunk size is {})",
+                target_len,
+                header.chunk_size
+            );
+        }
+
+        let offset = chunk_index
+            .checked_mul(header.chunk_size as u64)
+            .ok_or_else(|| anyhow!("chunk offset overflow"))?;
+        let end = offset
+            .checked_add(target_len as u64)
+            .ok_or_else(|| anyhow!("chunk end overflow"))?;
+        if end > header.target_size {
+            bail!(
+                "chunk {} writes past target size (end={}, target_size={})",
+                chunk_index,
+                end,
+                header.target_size
+            );
+        }
+
+        let mut compressed = vec![0u8; compressed_len];
+        delta_reader
+            .read_exact(&mut compressed)
+            .with_context(|| format!("failed to read compressed data for chunk {chunk_index}"))?;
+        let decompressed = zstd::stream::decode_all(std::io::Cursor::new(compressed))
+            .with_context(|| format!("failed to decompress chunk {chunk_index}"))?;
+        if decompressed.len() != target_len {
+            bail!(
+                "chunk {} length mismatch after decompression: expected {}, actual {}",
+                chunk_index,
+                target_len,
+                decompressed.len()
+            );
+        }
+
+        output
+            .seek(SeekFrom::Start(offset))
+            .with_context(|| format!("failed to seek output to {offset}"))?;
+        output
+            .write_all(&decompressed)
+            .with_context(|| format!("failed to write chunk {chunk_index}"))?;
+    }
+
+    let mut trailing = [0u8; 1];
+    if delta_reader.read(&mut trailing)? != 0 {
+        bail!(
+            "delta file {} has unexpected trailing data",
+            delta_path.display()
+        );
+    }
+
+    output
+        .sync_all()
+        .with_context(|| format!("failed to sync {}", output_image.display()))?;
+    let output_sha = sha256_file_raw(output_image)?;
+    if output_sha != header.target_sha256 {
+        bail!(
+            "patched output digest mismatch: expected {}, actual {}",
+            sha256_digest_hex(&header.target_sha256),
+            sha256_digest_hex(&output_sha)
+        );
+    }
+
+    Ok(header)
+}
+
+fn write_image_delta_header(writer: &mut File, header: &ImageDeltaHeader) -> anyhow::Result<()> {
+    writer
+        .write_all(IMAGE_DELTA_MAGIC)
+        .context("failed to write delta magic")?;
+    write_u32_le(writer, IMAGE_DELTA_VERSION)?;
+    write_u32_le(writer, header.chunk_size)?;
+    write_u64_le(writer, header.base_size)?;
+    write_u64_le(writer, header.target_size)?;
+    writer
+        .write_all(&header.base_sha256)
+        .context("failed to write base digest")?;
+    writer
+        .write_all(&header.target_sha256)
+        .context("failed to write target digest")?;
+    write_u64_le(writer, header.changed_chunks)?;
+    Ok(())
+}
+
+fn read_image_delta_header(reader: &mut File) -> anyhow::Result<ImageDeltaHeader> {
+    let mut magic = [0u8; 8];
+    reader
+        .read_exact(&mut magic)
+        .context("failed to read delta magic")?;
+    if &magic != IMAGE_DELTA_MAGIC {
+        bail!("invalid delta file magic");
+    }
+
+    let version = read_u32_le(reader).context("failed to read delta version")?;
+    if version != IMAGE_DELTA_VERSION {
+        bail!(
+            "unsupported delta version {} (expected {})",
+            version,
+            IMAGE_DELTA_VERSION
+        );
+    }
+
+    let chunk_size = read_u32_le(reader).context("failed to read chunk size")?;
+    if chunk_size == 0 {
+        bail!("delta chunk size must be greater than zero");
+    }
+
+    let base_size = read_u64_le(reader).context("failed to read base size")?;
+    let target_size = read_u64_le(reader).context("failed to read target size")?;
+    let mut base_sha256 = [0u8; 32];
+    let mut target_sha256 = [0u8; 32];
+    reader
+        .read_exact(&mut base_sha256)
+        .context("failed to read base digest")?;
+    reader
+        .read_exact(&mut target_sha256)
+        .context("failed to read target digest")?;
+    let changed_chunks = read_u64_le(reader).context("failed to read changed chunk count")?;
+
+    Ok(ImageDeltaHeader {
+        chunk_size,
+        base_size,
+        target_size,
+        base_sha256,
+        target_sha256,
+        changed_chunks,
+    })
+}
+
+fn write_u32_le(writer: &mut File, value: u32) -> anyhow::Result<()> {
+    writer
+        .write_all(&value.to_le_bytes())
+        .context("failed to write u32")
+}
+
+fn write_u64_le(writer: &mut File, value: u64) -> anyhow::Result<()> {
+    writer
+        .write_all(&value.to_le_bytes())
+        .context("failed to write u64")
+}
+
+fn read_u32_le(reader: &mut File) -> anyhow::Result<u32> {
+    let mut bytes = [0u8; 4];
+    reader
+        .read_exact(&mut bytes)
+        .context("failed to read u32")?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64_le(reader: &mut File) -> anyhow::Result<u64> {
+    let mut bytes = [0u8; 8];
+    reader
+        .read_exact(&mut bytes)
+        .context("failed to read u64")?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_full_chunk(reader: &mut File, buf: &mut [u8]) -> anyhow::Result<usize> {
+    let mut read_total = 0usize;
+    while read_total < buf.len() {
+        match reader.read(&mut buf[read_total..]) {
+            Ok(0) => break,
+            Ok(read_n) => read_total += read_n,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err).context("failed while reading chunk"),
+        }
+    }
+    Ok(read_total)
+}
+
+fn sha256_file_raw(path: &Path) -> anyhow::Result<[u8; 32]> {
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+
+    loop {
+        let read_n = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if read_n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read_n]);
+    }
+
+    let digest = hasher.finalize();
+    let mut result = [0u8; 32];
+    result.copy_from_slice(digest.as_ref());
+    Ok(result)
+}
+
+fn sha256_digest_hex(digest: &[u8; 32]) -> String {
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 fn prepare_bundle_output_dir(path: &Path) -> anyhow::Result<()> {
@@ -3041,5 +3658,70 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains("operation[0]"));
         assert!(message.contains("/etc/does-not-exist"));
+    }
+
+    #[test]
+    fn image_delta_roundtrip_matches_target() {
+        let dir = tempdir().expect("create temp dir");
+        let base = dir.path().join("base.img");
+        let target = dir.path().join("target.img");
+        let delta = dir.path().join("patch.vzdelta");
+        let output = dir.path().join("output.img");
+
+        let mut base_bytes = vec![0u8; 1024 * 1024];
+        for (idx, byte) in base_bytes.iter_mut().enumerate() {
+            *byte = (idx % 251) as u8;
+        }
+        let mut target_bytes = base_bytes.clone();
+        target_bytes[16_384..16_384 + 1024].fill(0xAA);
+        target_bytes[512_000..512_000 + 2048].fill(0x55);
+        target_bytes.extend_from_slice(b"tail-bytes");
+
+        fs::write(&base, &base_bytes).expect("write base");
+        fs::write(&target, &target_bytes).expect("write target");
+
+        let header =
+            create_image_delta_file(&base, &target, &delta, 128 * 1024).expect("create delta");
+        assert!(header.changed_chunks > 0);
+        let applied_header =
+            apply_image_delta_file(&base, &delta, &output).expect("apply delta should succeed");
+        assert_eq!(applied_header, header);
+        assert_eq!(fs::read(&output).expect("read output"), target_bytes);
+    }
+
+    #[test]
+    fn image_delta_apply_rejects_base_digest_mismatch() {
+        let dir = tempdir().expect("create temp dir");
+        let base = dir.path().join("base.img");
+        let target = dir.path().join("target.img");
+        let delta = dir.path().join("patch.vzdelta");
+        let output = dir.path().join("output.img");
+
+        fs::write(&base, b"base-original").expect("write base");
+        fs::write(&target, b"base-modified").expect("write target");
+        create_image_delta_file(&base, &target, &delta, 64 * 1024).expect("create delta");
+
+        fs::write(&base, b"base-tampered").expect("tamper base");
+        let err = apply_image_delta_file(&base, &delta, &output)
+            .expect_err("tampered base must fail digest check");
+        assert!(format!("{err:#}").contains("base image digest mismatch"));
+    }
+
+    #[test]
+    fn image_delta_apply_rejects_existing_output_path() {
+        let dir = tempdir().expect("create temp dir");
+        let base = dir.path().join("base.img");
+        let target = dir.path().join("target.img");
+        let delta = dir.path().join("patch.vzdelta");
+        let output = dir.path().join("output.img");
+
+        fs::write(&base, b"abc").expect("write base");
+        fs::write(&target, b"abd").expect("write target");
+        fs::write(&output, b"existing").expect("write existing output");
+        create_image_delta_file(&base, &target, &delta, 64 * 1024).expect("create delta");
+
+        let err = apply_image_delta_file(&base, &delta, &output)
+            .expect_err("existing output should fail");
+        assert!(format!("{err:#}").contains("output image already exists"));
     }
 }

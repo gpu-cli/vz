@@ -154,6 +154,25 @@ sudo vz vm patch apply --bundle /tmp/patch-1.vzpatch --image ~/.vz/images/base.i
 
 For advanced CI workflows, `vz vm patch create` also supports `--operations <json>` + `--payload-dir <dir>`.
 
+### 7. Primary image-delta patch flow (sudo once, then sudoless apply)
+
+```bash
+# 1) Create a binary image delta from a signed bundle (runs bundle apply on a temp image copy)
+sudo vz vm patch create-delta \
+  --bundle /tmp/patch-1.vzpatch \
+  --base-image ~/.vz/images/base.img \
+  --delta /tmp/patch-1.vzdelta
+
+# 2) Apply the binary delta without sudo to produce a new bootable image
+vz vm patch apply-delta \
+  --base-image ~/.vz/images/base.img \
+  --delta /tmp/patch-1.vzdelta \
+  --output-image ~/.vz/images/base-patched.img
+
+# 3) Boot-test the patched image
+vz vm run --image ~/.vz/images/base-patched.img --name delta-test --headless
+```
+
 ## Command groups
 
 ### Containers
