@@ -5,6 +5,12 @@
 //! events incrementally using [`StateStore::load_events_since`].
 
 use serde::{Deserialize, Serialize};
+use vz_runtime_contract::{
+    RequestMetadata, RuntimeExtensionFailureKind, RuntimeExtensionPoint,
+    map_runtime_extension_failure,
+};
+
+use crate::error::StackError;
 
 /// Structured event emitted during stack lifecycle operations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -163,15 +169,76 @@ pub struct EventRecord {
     pub event: StackEvent,
 }
 
+/// Event sink error type for extension adapters.
+pub type StackEventSinkError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Generic sink interface for forwarding stack events to integrations.
+pub trait StackEventSink: Send + Sync {
+    fn emit(
+        &self,
+        event: &StackEvent,
+        metadata: &RequestMetadata,
+    ) -> Result<(), StackEventSinkError>;
+}
+
+/// Closure-backed sink adapter for simple integration points.
+pub struct FnStackEventSink<F>
+where
+    F: Fn(&StackEvent, &RequestMetadata) -> Result<(), StackEventSinkError> + Send + Sync,
+{
+    emit_fn: F,
+}
+
+impl<F> FnStackEventSink<F>
+where
+    F: Fn(&StackEvent, &RequestMetadata) -> Result<(), StackEventSinkError> + Send + Sync,
+{
+    pub fn new(emit_fn: F) -> Self {
+        Self { emit_fn }
+    }
+}
+
+impl<F> StackEventSink for FnStackEventSink<F>
+where
+    F: Fn(&StackEvent, &RequestMetadata) -> Result<(), StackEventSinkError> + Send + Sync,
+{
+    fn emit(
+        &self,
+        event: &StackEvent,
+        metadata: &RequestMetadata,
+    ) -> Result<(), StackEventSinkError> {
+        (self.emit_fn)(event, metadata)
+    }
+}
+
+/// Emit a stack event through an extension sink with stable error mapping.
+pub fn emit_event_to_sink(
+    sink: &dyn StackEventSink,
+    event: &StackEvent,
+    metadata: &RequestMetadata,
+) -> Result<(), StackError> {
+    sink.emit(event, metadata).map_err(|error| {
+        StackError::from(map_runtime_extension_failure(
+            RuntimeExtensionPoint::EventSink,
+            "stack.emit_event",
+            RuntimeExtensionFailureKind::Transport,
+            error.to_string(),
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::*;
+    use std::io;
+    use std::sync::{Arc, Mutex};
 
-    #[test]
-    fn event_round_trip_all_variants() {
-        let events: Vec<StackEvent> = vec![
+    use super::*;
+    use vz_runtime_contract::MachineErrorCode;
+
+    fn sample_events() -> Vec<StackEvent> {
+        vec![
             StackEvent::StackApplyStarted {
                 stack_name: "myapp".to_string(),
                 services_count: 3,
@@ -241,12 +308,42 @@ mod tests {
                 previous_digest: Some("old".to_string()),
                 desired_digest: "new".to_string(),
             },
-        ];
+        ]
+    }
 
+    #[test]
+    fn event_round_trip_all_variants() {
+        let events = sample_events();
         for event in events {
             let json = serde_json::to_string(&event).unwrap();
             let deserialized: StackEvent = serde_json::from_str(&json).unwrap();
             assert_eq!(deserialized, event);
+        }
+    }
+
+    #[test]
+    fn event_tags_forbid_product_domain_primitives() {
+        const FORBIDDEN: [&str; 5] = [
+            "identity_provider",
+            "memory_provider",
+            "tool_gateway",
+            "mission",
+            "workflow",
+        ];
+
+        for event in sample_events() {
+            let json = serde_json::to_value(&event).unwrap();
+            let event_type = json
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap();
+            let normalized = event_type.to_ascii_lowercase();
+            for forbidden in FORBIDDEN {
+                assert!(
+                    !normalized.contains(forbidden),
+                    "stack event type `{event_type}` must not contain forbidden primitive `{forbidden}`"
+                );
+            }
         }
     }
 
@@ -312,5 +409,43 @@ mod tests {
             let expected = format!("\"type\":\"{expected_tag}\"");
             assert!(json.contains(&expected), "tag mismatch for {json}");
         }
+    }
+
+    #[test]
+    fn event_sink_adapter_forwards_event_and_metadata() {
+        let captured = Arc::new(Mutex::new(None::<(StackEvent, Option<String>)>));
+        let captured_clone = Arc::clone(&captured);
+        let sink = FnStackEventSink::new(move |event, metadata| {
+            *captured_clone.lock().unwrap() = Some((event.clone(), metadata.request_id.clone()));
+            Ok(())
+        });
+
+        let event = StackEvent::StackDestroyed {
+            stack_name: "myapp".to_string(),
+        };
+        let metadata = RequestMetadata::from_optional_refs(Some("req-55"), None);
+        emit_event_to_sink(&sink, &event, &metadata).unwrap();
+
+        let stored = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(stored.0, event);
+        assert_eq!(stored.1.as_deref(), Some("req-55"));
+    }
+
+    #[test]
+    fn event_sink_adapter_maps_transport_failures_to_machine_code() {
+        let sink = FnStackEventSink::new(|_, _| {
+            Err::<(), StackEventSinkError>(Box::new(io::Error::other("sink disconnected")))
+        });
+        let event = StackEvent::StackDestroyed {
+            stack_name: "myapp".to_string(),
+        };
+        let metadata = RequestMetadata::default();
+
+        let error = emit_event_to_sink(&sink, &event, &metadata).unwrap_err();
+        assert_eq!(error.machine_code(), MachineErrorCode::BackendUnavailable);
+        let message = error.to_string();
+        assert!(message.contains("extension_failure:"));
+        assert!(message.contains("extension=event_sink"));
+        assert!(message.contains("operation=stack.emit_event"));
     }
 }

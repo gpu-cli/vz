@@ -118,6 +118,9 @@ pub struct ServiceSpec {
     #[serde(default, skip_serializing_if = "ServiceKind::is_service")]
     pub kind: ServiceKind,
     /// OCI image reference.
+    ///
+    /// When sourced from Compose and a service defines `build` without an
+    /// explicit `image`, the adapter derives a deterministic local image tag.
     pub image: String,
     /// Override command (replaces image CMD).
     #[serde(default, skip_serializing_if = "Option::is_none")]

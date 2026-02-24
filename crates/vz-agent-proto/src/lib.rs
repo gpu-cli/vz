@@ -70,6 +70,10 @@ mod tests {
                 .into_iter()
                 .collect(),
             user: "dev".to_string(),
+            metadata: Some(TransportMetadata {
+                request_id: "req_exec_1".to_string(),
+                idempotency_key: "exec_container:req_exec_1".to_string(),
+            }),
         };
         let encoded = msg.encode_to_vec();
         let decoded = ExecRequest::decode(encoded.as_slice()).unwrap();
@@ -80,6 +84,8 @@ mod tests {
     fn exec_event_stdout() {
         let msg = ExecEvent {
             event: Some(exec_event::Event::Stdout(b"hello world\n".to_vec())),
+            sequence: 1,
+            request_id: "req_exec_1".to_string(),
         };
         let encoded = msg.encode_to_vec();
         let decoded = ExecEvent::decode(encoded.as_slice()).unwrap();
@@ -97,6 +103,8 @@ mod tests {
     fn exec_event_exit_code() {
         let msg = ExecEvent {
             event: Some(exec_event::Event::ExitCode(0)),
+            sequence: 2,
+            request_id: "req_exec_1".to_string(),
         };
         let encoded = msg.encode_to_vec();
         let decoded = ExecEvent::decode(encoded.as_slice()).unwrap();
@@ -108,6 +116,10 @@ mod tests {
         let msg = StdinWriteRequest {
             exec_id: 42,
             data: vec![0x00, 0xFF, 0x80, 0x7F],
+            metadata: Some(TransportMetadata {
+                request_id: "req_exec_2".to_string(),
+                idempotency_key: String::new(),
+            }),
         };
         let encoded = msg.encode_to_vec();
         let decoded = StdinWriteRequest::decode(encoded.as_slice()).unwrap();
@@ -119,6 +131,10 @@ mod tests {
         let msg = SignalRequest {
             exec_id: 1,
             signal: 15, // SIGTERM
+            metadata: Some(TransportMetadata {
+                request_id: "req_exec_2".to_string(),
+                idempotency_key: String::new(),
+            }),
         };
         let encoded = msg.encode_to_vec();
         let decoded = SignalRequest::decode(encoded.as_slice()).unwrap();
@@ -134,6 +150,10 @@ mod tests {
                 target_port: 8080,
                 protocol: "tcp".to_string(),
                 target_host: "172.20.0.2".to_string(),
+                metadata: Some(TransportMetadata {
+                    request_id: "req_pf_1".to_string(),
+                    idempotency_key: String::new(),
+                }),
             })),
         };
         let encoded = msg.encode_to_vec();
@@ -160,6 +180,10 @@ mod tests {
         let msg = OciCreateRequest {
             container_id: "svc-web".to_string(),
             bundle_path: "/run/vz-oci/bundles/svc-web".to_string(),
+            metadata: Some(TransportMetadata {
+                request_id: "req_create_1".to_string(),
+                idempotency_key: "create_container:req_create_1".to_string(),
+            }),
         };
         let encoded = msg.encode_to_vec();
         let decoded = OciCreateRequest::decode(encoded.as_slice()).unwrap();
@@ -196,6 +220,10 @@ mod tests {
             .collect(),
             working_dir: "/workspace".to_string(),
             user: "1000:1000".to_string(),
+            metadata: Some(TransportMetadata {
+                request_id: "req_exec_3".to_string(),
+                idempotency_key: "exec_container:req_exec_3".to_string(),
+            }),
         };
         let encoded = msg.encode_to_vec();
         let decoded = OciExecRequest::decode(encoded.as_slice()).unwrap();
@@ -219,6 +247,10 @@ mod tests {
         let msg = OciKillRequest {
             container_id: "svc-web".to_string(),
             signal: "SIGTERM".to_string(),
+            metadata: Some(TransportMetadata {
+                request_id: "req_kill_1".to_string(),
+                idempotency_key: String::new(),
+            }),
         };
         let encoded = msg.encode_to_vec();
         let decoded = OciKillRequest::decode(encoded.as_slice()).unwrap();
@@ -230,6 +262,10 @@ mod tests {
         let msg = OciDeleteRequest {
             container_id: "svc-web".to_string(),
             force: true,
+            metadata: Some(TransportMetadata {
+                request_id: "req_delete_1".to_string(),
+                idempotency_key: String::new(),
+            }),
         };
         let encoded = msg.encode_to_vec();
         let decoded = OciDeleteRequest::decode(encoded.as_slice()).unwrap();
@@ -254,6 +290,10 @@ mod tests {
                     network_name: "default".to_string(),
                 },
             ],
+            metadata: Some(TransportMetadata {
+                request_id: "req_net_setup_1".to_string(),
+                idempotency_key: String::new(),
+            }),
         };
         let encoded = msg.encode_to_vec();
         let decoded = NetworkSetupRequest::decode(encoded.as_slice()).unwrap();
@@ -265,6 +305,10 @@ mod tests {
         let msg = NetworkTeardownRequest {
             stack_id: "my-stack".to_string(),
             service_names: vec!["web".to_string(), "db".to_string()],
+            metadata: Some(TransportMetadata {
+                request_id: "req_net_teardown_1".to_string(),
+                idempotency_key: String::new(),
+            }),
         };
         let encoded = msg.encode_to_vec();
         let decoded = NetworkTeardownRequest::decode(encoded.as_slice()).unwrap();

@@ -6,6 +6,7 @@ pub mod build;
 pub mod cache;
 #[cfg(target_os = "macos")]
 pub mod cleanup;
+pub mod docker;
 #[cfg(target_os = "macos")]
 pub mod exec;
 #[cfg(target_os = "macos")]

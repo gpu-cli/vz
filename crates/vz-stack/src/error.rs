@@ -1,4 +1,8 @@
-use vz_runtime_contract::MachineErrorCode;
+use std::collections::BTreeMap;
+
+use vz_runtime_contract::{
+    MachineError, MachineErrorCode, MachineErrorEnvelope, RequestMetadata, RuntimeError,
+};
 
 /// Errors produced by `vz-stack` operations.
 #[derive(Debug, thiserror::Error)]
@@ -24,7 +28,7 @@ pub enum StackError {
     ComposeParse(String),
 
     /// Compose file uses an unsupported feature.
-    #[error("unsupported compose feature `{feature}`: {reason}")]
+    #[error("unsupported_operation: surface=compose; feature={feature}; reason={reason}")]
     ComposeUnsupportedFeature {
         /// The unsupported key or feature name.
         feature: String,
@@ -86,5 +90,111 @@ impl StackError {
             StackError::Network(_) => MachineErrorCode::BackendUnavailable,
             StackError::Machine { code, .. } => *code,
         }
+    }
+
+    fn machine_details(&self) -> BTreeMap<String, String> {
+        let mut details = BTreeMap::new();
+        match self {
+            StackError::Store(error) => {
+                details.insert("reason".to_string(), error.to_string());
+            }
+            StackError::Serialization(error) => {
+                details.insert("reason".to_string(), error.to_string());
+            }
+            StackError::InvalidSpec(message)
+            | StackError::Network(message)
+            | StackError::ComposeParse(message)
+            | StackError::ComposeValidation(message) => {
+                details.insert("reason".to_string(), message.clone());
+            }
+            StackError::ComposeUnsupportedFeature { feature, reason } => {
+                details.insert("feature".to_string(), feature.clone());
+                details.insert("reason".to_string(), reason.clone());
+            }
+            StackError::VolumeIo(error) => {
+                details.insert("reason".to_string(), error.to_string());
+            }
+            StackError::Machine { message, .. } => {
+                details.insert("reason".to_string(), message.clone());
+            }
+        }
+        details
+    }
+
+    /// Convert a stack error into the shared machine-error payload.
+    pub fn to_machine_error(&self, metadata: &RequestMetadata) -> MachineError {
+        MachineError::new(
+            self.machine_code(),
+            self.to_string(),
+            metadata.request_id.clone(),
+            self.machine_details(),
+        )
+    }
+
+    /// Convert a stack error into the shared transport error envelope.
+    pub fn to_machine_error_envelope(&self, metadata: &RequestMetadata) -> MachineErrorEnvelope {
+        MachineErrorEnvelope::new(self.to_machine_error(metadata))
+    }
+}
+
+impl From<RuntimeError> for StackError {
+    fn from(error: RuntimeError) -> Self {
+        StackError::Machine {
+            code: error.machine_code(),
+            message: error.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_error_conversion_preserves_machine_code() {
+        let stack_error = StackError::from(RuntimeError::UnsupportedOperation {
+            operation: "create_checkpoint".to_string(),
+            reason: "missing fs_quick_checkpoint capability".to_string(),
+        });
+
+        assert_eq!(
+            stack_error.machine_code(),
+            MachineErrorCode::UnsupportedOperation
+        );
+        assert!(matches!(stack_error, StackError::Machine { .. }));
+    }
+
+    #[test]
+    fn machine_error_envelope_propagates_request_id_and_details() {
+        let metadata = RequestMetadata::from_optional_refs(Some("req_77"), None);
+        let stack_error = StackError::ComposeUnsupportedFeature {
+            feature: "deploy.mode".to_string(),
+            reason: "replicated mode is not supported".to_string(),
+        };
+
+        let envelope = stack_error.to_machine_error_envelope(&metadata);
+        assert_eq!(envelope.error.code, MachineErrorCode::UnsupportedOperation);
+        assert_eq!(envelope.error.request_id.as_deref(), Some("req_77"));
+        assert_eq!(
+            envelope.error.details.get("feature").map(String::as_str),
+            Some("deploy.mode")
+        );
+        assert_eq!(
+            envelope.error.details.get("reason").map(String::as_str),
+            Some("replicated mode is not supported")
+        );
+    }
+
+    #[test]
+    fn compose_unsupported_message_prefix_is_stable() {
+        let stack_error = StackError::ComposeUnsupportedFeature {
+            feature: "services.web.networks.frontend.aliases".to_string(),
+            reason: "network attachment options are not supported".to_string(),
+        };
+
+        let message = stack_error.to_string();
+        assert!(message.starts_with("unsupported_operation:"));
+        assert!(message.contains("surface=compose"));
+        assert!(message.contains("feature=services.web.networks.frontend.aliases"));
     }
 }

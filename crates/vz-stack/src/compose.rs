@@ -27,6 +27,7 @@ const ACCEPTED_TOP_LEVEL: &[&str] = &[
 /// Service-level keys allowed inside `services.<name>`.
 const ACCEPTED_SERVICE: &[&str] = &[
     "image",
+    "build",
     "command",
     "entrypoint",
     "environment",
@@ -78,10 +79,6 @@ const REJECTED_TOP_LEVEL: &[(&str, &str)] = &[(
 
 /// Service-level keys explicitly rejected with stable error codes.
 const REJECTED_SERVICE: &[(&str, &str)] = &[
-    (
-        "build",
-        "image building is not supported; use pre-built OCI images",
-    ),
     (
         "profiles",
         "conditional profiles are not supported; define separate compose files instead",
@@ -424,13 +421,23 @@ fn parse_service(
 
     validate_service_keys(name, svc_map)?;
 
+    let has_build = parse_build_directive(name, svc_map)?;
     let image = svc_map
         .get(val("image"))
         .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            if has_build {
+                Some(default_compose_build_image(name))
+            } else {
+                None
+            }
+        })
         .ok_or_else(|| {
-            StackError::ComposeValidation(format!("service `{name}` is missing required `image`"))
-        })?
-        .to_string();
+            StackError::ComposeValidation(format!(
+                "service `{name}` must define `image` or `build`"
+            ))
+        })?;
     let kind = parse_service_kind(name, svc_map)?;
 
     let command = parse_string_or_list(svc_map, "command")?;
@@ -568,6 +575,146 @@ fn parse_service(
         stop_signal,
         stop_grace_period_secs,
     })
+}
+
+fn parse_build_directive(svc_name: &str, svc_map: &serde_yml::Mapping) -> Result<bool, StackError> {
+    let Some(value) = svc_map.get(val("build")) else {
+        return Ok(false);
+    };
+
+    if let Some(context) = value.as_str() {
+        if context.trim().is_empty() {
+            return Err(StackError::ComposeParse(format!(
+                "service `{svc_name}`: `build` context must not be empty"
+            )));
+        }
+        return Ok(true);
+    }
+
+    let Some(build_map) = value.as_mapping() else {
+        return Err(StackError::ComposeParse(format!(
+            "service `{svc_name}`: `build` must be a string or mapping"
+        )));
+    };
+
+    for key in build_map.keys() {
+        let key_str = key.as_str().unwrap_or("");
+        if key_str != "context"
+            && key_str != "dockerfile"
+            && key_str != "args"
+            && key_str != "target"
+        {
+            return Err(StackError::ComposeUnsupportedFeature {
+                feature: format!("services.{svc_name}.build.{key_str}"),
+                reason:
+                    "only `context`, `dockerfile`, `args`, and `target` are supported under `build`"
+                        .to_string(),
+            });
+        }
+    }
+
+    if let Some(context_value) = build_map.get(val("context")) {
+        let context = context_value.as_str().ok_or_else(|| {
+            StackError::ComposeParse(format!(
+                "service `{svc_name}`: `build.context` must be a string"
+            ))
+        })?;
+        if context.trim().is_empty() {
+            return Err(StackError::ComposeParse(format!(
+                "service `{svc_name}`: `build.context` must not be empty"
+            )));
+        }
+    }
+
+    if let Some(dockerfile_value) = build_map.get(val("dockerfile")) {
+        if dockerfile_value.as_str().is_none() {
+            return Err(StackError::ComposeParse(format!(
+                "service `{svc_name}`: `build.dockerfile` must be a string"
+            )));
+        }
+    }
+
+    if let Some(target_value) = build_map.get(val("target")) {
+        if target_value.as_str().is_none() {
+            return Err(StackError::ComposeParse(format!(
+                "service `{svc_name}`: `build.target` must be a string"
+            )));
+        }
+    }
+
+    if let Some(args_value) = build_map.get(val("args")) {
+        parse_build_args(svc_name, args_value)?;
+    }
+
+    Ok(true)
+}
+
+fn parse_build_args(
+    svc_name: &str,
+    value: &serde_yml::Value,
+) -> Result<HashMap<String, String>, StackError> {
+    if let Some(obj) = value.as_mapping() {
+        let mut args = HashMap::new();
+        for (k, v) in obj {
+            let key = k.as_str().ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `build.args` keys must be strings"
+                ))
+            })?;
+            let value = match v {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                Value::Null => String::new(),
+                _ => {
+                    return Err(StackError::ComposeParse(format!(
+                        "service `{svc_name}`: `build.args` values must be scalars"
+                    )));
+                }
+            };
+            args.insert(key.to_string(), value);
+        }
+        return Ok(args);
+    }
+
+    if let Some(seq) = value.as_sequence() {
+        let mut args = HashMap::new();
+        for entry in seq {
+            let item = entry.as_str().ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `build.args` list entries must be strings"
+                ))
+            })?;
+            let Some((key, val)) = item.split_once('=') else {
+                return Err(StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `build.args` entries must be \"KEY=VALUE\", got \"{item}\""
+                )));
+            };
+            args.insert(key.to_string(), val.to_string());
+        }
+        return Ok(args);
+    }
+
+    Err(StackError::ComposeParse(format!(
+        "service `{svc_name}`: `build.args` must be a mapping or list"
+    )))
+}
+
+fn default_compose_build_image(service_name: &str) -> String {
+    let mut normalized = String::new();
+    for ch in service_name.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            normalized.push(ch.to_ascii_lowercase());
+        } else {
+            normalized.push('-');
+        }
+    }
+    let stem = normalized.trim_matches('-');
+    if stem.is_empty() {
+        "compose-build:latest".to_string()
+    } else {
+        format!("{stem}:latest")
+    }
 }
 
 fn parse_service_kind(
@@ -1002,6 +1149,19 @@ fn parse_mount_short(
 
 /// Parse long-form mount: `{ type, source, target, read_only }`.
 fn parse_mount_long(svc_name: &str, obj: &serde_yml::Mapping) -> Result<MountSpec, StackError> {
+    for key in obj.keys() {
+        let key_str = key.as_str().unwrap_or("");
+        if key_str != "type" && key_str != "source" && key_str != "target" && key_str != "read_only"
+        {
+            return Err(StackError::ComposeUnsupportedFeature {
+                feature: format!("services.{svc_name}.volumes.{key_str}"),
+                reason:
+                    "only `type`, `source`, `target`, and `read_only` are supported for long-form volumes"
+                        .to_string(),
+            });
+        }
+    }
+
     let mount_type = obj
         .get(val("type"))
         .and_then(|v| v.as_str())
@@ -1120,6 +1280,16 @@ fn parse_dependency_condition(
         // No condition specified → default.
         return Ok(DependencyCondition::ServiceStarted);
     };
+
+    for key in obj.keys() {
+        let key_str = key.as_str().unwrap_or("");
+        if key_str != "condition" {
+            return Err(StackError::ComposeUnsupportedFeature {
+                feature: format!("services.{svc_name}.depends_on.{dep_name}.{key_str}"),
+                reason: "only `condition` is supported for `depends_on` entries".to_string(),
+            });
+        }
+    }
 
     let Some(cond_val) = obj.get(val("condition")) else {
         return Ok(DependencyCondition::ServiceStarted);
@@ -2088,6 +2258,16 @@ fn parse_networks(root: &serde_yml::Mapping) -> Result<Vec<NetworkSpec>, StackEr
             StackError::ComposeParse(format!("network `{net_name}` must be a mapping or empty"))
         })?;
 
+        for key in net_map.keys() {
+            let key_str = key.as_str().unwrap_or("");
+            if key_str != "driver" && key_str != "ipam" {
+                return Err(StackError::ComposeUnsupportedFeature {
+                    feature: format!("networks.{net_name}.{key_str}"),
+                    reason: "only `driver` and `ipam` are supported for networks".to_string(),
+                });
+            }
+        }
+
         let driver = net_map
             .get(val("driver"))
             .and_then(|v| v.as_str())
@@ -2102,6 +2282,41 @@ fn parse_networks(root: &serde_yml::Mapping) -> Result<Vec<NetworkSpec>, StackEr
         }
 
         // Parse optional IPAM config for subnet.
+        if let Some(ipam_value) = net_map.get(val("ipam"))
+            && let Some(ipam_map) = ipam_value.as_mapping()
+        {
+            for key in ipam_map.keys() {
+                let key_str = key.as_str().unwrap_or("");
+                if key_str != "config" {
+                    return Err(StackError::ComposeUnsupportedFeature {
+                        feature: format!("networks.{net_name}.ipam.{key_str}"),
+                        reason: "only `ipam.config` is supported".to_string(),
+                    });
+                }
+            }
+            if let Some(config_value) = ipam_map.get(val("config"))
+                && let Some(config_seq) = config_value.as_sequence()
+            {
+                for (index, item) in config_seq.iter().enumerate() {
+                    if let Some(config_map) = item.as_mapping() {
+                        for key in config_map.keys() {
+                            let key_str = key.as_str().unwrap_or("");
+                            if key_str != "subnet" {
+                                return Err(StackError::ComposeUnsupportedFeature {
+                                    feature: format!(
+                                        "networks.{net_name}.ipam.config[{index}].{key_str}"
+                                    ),
+                                    reason:
+                                        "only `subnet` is supported inside `ipam.config` entries"
+                                            .to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let subnet = net_map
             .get(val("ipam"))
             .and_then(|v| v.as_mapping())
@@ -2164,12 +2379,34 @@ fn parse_service_networks(
     // Mapping form: { frontend: {}, backend: null }
     if let Some(net_map) = value.as_mapping() {
         let mut names = Vec::new();
-        for key in net_map.keys() {
+        for (key, network_value) in net_map {
             let name = key.as_str().ok_or_else(|| {
                 StackError::ComposeParse(format!(
                     "service `{svc_name}`: `networks` mapping keys must be strings"
                 ))
             })?;
+
+            if network_value.is_null() {
+                names.push(name.to_string());
+                continue;
+            }
+
+            let Some(attachment_map) = network_value.as_mapping() else {
+                return Err(StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `networks.{name}` must be a mapping or null"
+                )));
+            };
+
+            if let Some(attachment_key) = attachment_map.keys().next() {
+                let attachment_key = attachment_key.as_str().unwrap_or("");
+                return Err(StackError::ComposeUnsupportedFeature {
+                    feature: format!("services.{svc_name}.networks.{name}.{attachment_key}"),
+                    reason:
+                        "network attachment options are not supported; use plain network membership"
+                            .to_string(),
+                });
+            }
+
             names.push(name.to_string());
         }
         return Ok(names);
@@ -2752,6 +2989,24 @@ services:
         );
     }
 
+    #[test]
+    fn mount_long_form_rejects_unknown_key() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    volumes:
+      - type: bind
+        source: /host/path
+        target: /container/path
+        propagation: rshared
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("services.web.volumes.propagation"));
+        assert!(msg.contains("only `type`, `source`, `target`, and `read_only`"));
+    }
+
     // ── depends_on parsing ────────────────────────────────────────
 
     #[test]
@@ -2818,6 +3073,45 @@ services:
         let spec = parse_compose(yaml, "myapp").unwrap();
         let web = spec.services.iter().find(|s| s.name == "web").unwrap();
         assert_eq!(web.depends_on, vec![ServiceDependency::started("db")]);
+    }
+
+    #[test]
+    fn depends_on_mapping_form_service_completed_successfully() {
+        let yaml = r#"
+services:
+  init:
+    image: alpine:latest
+  web:
+    image: nginx:latest
+    depends_on:
+      init:
+        condition: service_completed_successfully
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        let web = spec.services.iter().find(|s| s.name == "web").unwrap();
+        assert_eq!(
+            web.depends_on[0].condition,
+            DependencyCondition::ServiceCompletedSuccessfully
+        );
+    }
+
+    #[test]
+    fn depends_on_rejects_unsupported_dependency_option() {
+        let yaml = r#"
+services:
+  db:
+    image: postgres:15
+  web:
+    image: nginx:latest
+    depends_on:
+      db:
+        condition: service_started
+        required: false
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("depends_on.db.required"));
+        assert!(msg.contains("only `condition` is supported"));
     }
 
     // ── Healthcheck parsing ───────────────────────────────────────
@@ -3014,20 +3308,51 @@ services:
     // ── Rejection tests ───────────────────────────────────────────
 
     #[test]
-    fn reject_build() {
+    fn build_short_form_without_image_derives_default_image() {
         let yaml = r#"
 services:
   web:
     build: .
-    image: nginx:latest
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].name, "web");
+        assert_eq!(spec.services[0].image, "web:latest");
+    }
+
+    #[test]
+    fn build_mapping_form_with_args_is_accepted() {
+        let yaml = r#"
+services:
+  api:
+    image: custom/api:dev
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      target: runtime
+      args:
+        APP_ENV: development
+        PORT: 8080
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].name, "api");
+        assert_eq!(spec.services[0].image, "custom/api:dev");
+    }
+
+    #[test]
+    fn build_rejects_unknown_mapping_key() {
+        let yaml = r#"
+services:
+  web:
+    image: web:latest
+    build:
+      context: .
+      cache_from:
+        - web:cache
 "#;
         let err = parse_compose(yaml, "myapp").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("build"), "error should mention `build`: {msg}");
-        assert!(
-            msg.contains("pre-built OCI images"),
-            "error should be actionable: {msg}"
-        );
+        assert!(msg.contains("build.cache_from"));
+        assert!(msg.contains("only `context`, `dockerfile`, `args`, and `target`"));
     }
 
     // ── Network parsing ──────────────────────────────────────────
@@ -3129,6 +3454,25 @@ networks:
     }
 
     #[test]
+    fn reject_service_network_attachment_options() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    networks:
+      frontend:
+        aliases:
+          - web-local
+networks:
+  frontend:
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("services.web.networks.frontend.aliases"));
+        assert!(msg.contains("network attachment options are not supported"));
+    }
+
+    #[test]
     fn no_networks_section_creates_implicit_default() {
         let yaml = r#"
 services:
@@ -3208,6 +3552,22 @@ networks:
             msg.contains("overlay"),
             "error should mention the unsupported driver: {msg}"
         );
+    }
+
+    #[test]
+    fn reject_top_level_network_unknown_key() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+networks:
+  frontend:
+    internal: true
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("networks.frontend.internal"));
+        assert!(msg.contains("only `driver` and `ipam` are supported"));
     }
 
     #[test]

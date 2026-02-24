@@ -587,6 +587,50 @@ fn web_pg_redis_deterministic_across_runs() {
     }
 }
 
+#[test]
+fn compose_build_fixture_derives_image_and_dependency_condition() {
+    let yaml = r#"
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+  db:
+    image: postgres:16
+    healthcheck:
+      test: ["CMD", "pg_isready"]
+"#;
+
+    let spec = parse_compose(yaml, "build-fixture").unwrap();
+    let api = spec.services.iter().find(|s| s.name == "api").unwrap();
+    assert_eq!(api.image, "api:latest");
+    assert_eq!(api.depends_on, vec![ServiceDependency::healthy("db")]);
+}
+
+#[test]
+fn compose_fixture_unsupported_network_attachment_is_stable() {
+    let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    networks:
+      frontend:
+        aliases:
+          - web-local
+networks:
+  frontend:
+"#;
+
+    let err = parse_compose(yaml, "unsupported-fixture").unwrap_err();
+    let message = err.to_string();
+    assert!(message.starts_with("unsupported_operation:"));
+    assert!(message.contains("surface=compose"));
+    assert!(message.contains("services.web.networks.frontend.aliases"));
+}
+
 // ── Helpers ────────────────────────────────────────────────────────
 
 fn open_temp_store() -> (StateStore, tempfile::TempDir) {

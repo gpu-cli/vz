@@ -19,12 +19,14 @@ use vz_agent_proto::{
     ExecRequest as ProtoExecRequest, NetworkSetupRequest, NetworkTeardownRequest, OciCreateRequest,
     OciDeleteRequest, OciExecRequest, OciKillRequest, OciStartRequest, OciStateRequest,
     PingRequest, PortForwardFrame, PortForwardOpen, ResourceStatsRequest, ResourceStatsResponse,
-    SystemInfoRequest, SystemInfoResponse, agent_service_client::AgentServiceClient, exec_event,
+    SystemInfoRequest, SystemInfoResponse, TransportMetadata as ProtoTransportMetadata,
+    agent_service_client::AgentServiceClient, exec_event,
     network_service_client::NetworkServiceClient, oci_service_client::OciServiceClient,
     port_forward_frame,
 };
 use vz_runtime_contract::{
-    CheckpointClass, RuntimeCapabilities, RuntimeOperation,
+    CheckpointClass, RequestMetadata as ContractRequestMetadata, RuntimeCapabilities,
+    RuntimeOperation,
     ensure_checkpoint_class_supported as contract_ensure_checkpoint_class_supported,
 };
 
@@ -77,17 +79,46 @@ pub struct GrpcAgentClient {
     oci: OciServiceClient<Channel>,
     /// Network namespace management client.
     network: NetworkServiceClient<Channel>,
+    /// Monotonic request sequence used to mint request IDs.
+    next_request_sequence: u64,
+}
+
+fn validate_exec_event_metadata(
+    last_sequence: &mut u64,
+    expected_request_id: &mut Option<String>,
+    sequence: u64,
+    request_id: &str,
+) -> Result<(), LinuxError> {
+    if sequence > 0 {
+        if sequence <= *last_sequence {
+            return Err(LinuxError::Protocol(format!(
+                "exec event ordering violation: got sequence {sequence} after {last_sequence}"
+            )));
+        }
+        *last_sequence = sequence;
+    }
+
+    if !request_id.is_empty() {
+        if let Some(expected) = expected_request_id {
+            if expected != request_id {
+                return Err(LinuxError::Protocol(format!(
+                    "exec request_id mismatch: expected `{expected}`, got `{request_id}`"
+                )));
+            }
+        } else {
+            *expected_request_id = Some(request_id.to_string());
+        }
+    }
+
+    Ok(())
 }
 
 impl GrpcAgentClient {
     /// Runtime capability declaration for this gRPC guest path.
     pub fn advertised_runtime_capabilities() -> RuntimeCapabilities {
-        RuntimeCapabilities {
-            fs_quick_checkpoint: true,
-            checkpoint_fork: true,
-            vm_full_checkpoint: false,
-            ..RuntimeCapabilities::default()
-        }
+        vz_runtime_contract::canonical_backend_capabilities(
+            &vz_runtime_contract::SandboxBackend::LinuxFirecracker,
+        )
     }
 
     /// Enforce checkpoint class capability gating before guest operations.
@@ -117,7 +148,25 @@ impl GrpcAgentClient {
             agent: AgentServiceClient::new(channel.clone()),
             oci: OciServiceClient::new(channel.clone()),
             network: NetworkServiceClient::new(channel),
+            next_request_sequence: 0,
         })
+    }
+
+    fn next_transport_metadata(
+        &mut self,
+        operation: Option<RuntimeOperation>,
+    ) -> ProtoTransportMetadata {
+        self.next_request_sequence = self.next_request_sequence.saturating_add(1);
+        let request_id = format!("req_{:016x}", self.next_request_sequence);
+        let idempotency_key = operation
+            .and_then(RuntimeOperation::idempotency_key_prefix)
+            .map(|prefix| format!("{prefix}:{request_id}"));
+        let normalized = ContractRequestMetadata::new(Some(request_id), idempotency_key);
+
+        ProtoTransportMetadata {
+            request_id: normalized.request_id.unwrap_or_default(),
+            idempotency_key: normalized.idempotency_key.unwrap_or_default(),
+        }
     }
 
     /// Establish a gRPC channel using the default agent port.
@@ -154,6 +203,13 @@ impl GrpcAgentClient {
         options: ExecOptions,
     ) -> Result<ExecOutput, LinuxError> {
         let env = options.env.into_iter().collect::<HashMap<String, String>>();
+        let metadata = self.next_transport_metadata(Some(RuntimeOperation::ExecContainer));
+        let mut last_sequence = 0;
+        let mut expected_request_id = if metadata.request_id.is_empty() {
+            None
+        } else {
+            Some(metadata.request_id.clone())
+        };
 
         let request = ProtoExecRequest {
             command,
@@ -161,6 +217,7 @@ impl GrpcAgentClient {
             working_dir: options.working_dir.unwrap_or_default(),
             env,
             user: options.user.unwrap_or_default(),
+            metadata: Some(metadata),
         };
 
         let response = self.agent.exec(request).await?;
@@ -171,29 +228,37 @@ impl GrpcAgentClient {
 
         loop {
             match stream.message().await? {
-                Some(event) => match event.event {
-                    Some(exec_event::Event::Stdout(data)) => {
-                        stdout_bytes.extend_from_slice(&data);
+                Some(event) => {
+                    validate_exec_event_metadata(
+                        &mut last_sequence,
+                        &mut expected_request_id,
+                        event.sequence,
+                        event.request_id.as_str(),
+                    )?;
+                    match event.event {
+                        Some(exec_event::Event::Stdout(data)) => {
+                            stdout_bytes.extend_from_slice(&data);
+                        }
+                        Some(exec_event::Event::Stderr(data)) => {
+                            stderr_bytes.extend_from_slice(&data);
+                        }
+                        Some(exec_event::Event::ExitCode(code)) => {
+                            return Ok(ExecOutput {
+                                exit_code: code,
+                                stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+                                stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+                            });
+                        }
+                        Some(exec_event::Event::Error(msg)) => {
+                            return Err(LinuxError::Protocol(format!(
+                                "guest exec failed to start: {msg}"
+                            )));
+                        }
+                        None => {
+                            // Empty event frame, skip.
+                        }
                     }
-                    Some(exec_event::Event::Stderr(data)) => {
-                        stderr_bytes.extend_from_slice(&data);
-                    }
-                    Some(exec_event::Event::ExitCode(code)) => {
-                        return Ok(ExecOutput {
-                            exit_code: code,
-                            stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
-                            stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
-                        });
-                    }
-                    Some(exec_event::Event::Error(msg)) => {
-                        return Err(LinuxError::Protocol(format!(
-                            "guest exec failed to start: {msg}"
-                        )));
-                    }
-                    None => {
-                        // Empty event frame, skip.
-                    }
-                },
+                }
                 None => {
                     // Stream ended without an exit code.
                     return Err(LinuxError::Protocol(
@@ -216,6 +281,12 @@ impl GrpcAgentClient {
         options: ExecOptions,
     ) -> Result<GrpcExecStream, LinuxError> {
         let env = options.env.into_iter().collect::<HashMap<String, String>>();
+        let metadata = self.next_transport_metadata(Some(RuntimeOperation::ExecContainer));
+        let expected_request_id = if metadata.request_id.is_empty() {
+            None
+        } else {
+            Some(metadata.request_id.clone())
+        };
 
         let request = ProtoExecRequest {
             command,
@@ -223,10 +294,14 @@ impl GrpcAgentClient {
             working_dir: options.working_dir.unwrap_or_default(),
             env,
             user: options.user.unwrap_or_default(),
+            metadata: Some(metadata),
         };
 
         let response = self.agent.exec(request).await?;
-        Ok(GrpcExecStream::new(response.into_inner()))
+        Ok(GrpcExecStream::new(
+            response.into_inner(),
+            expected_request_id,
+        ))
     }
 
     /// Execute `buildctl` inside the guest and collect output.
@@ -266,10 +341,12 @@ impl GrpcAgentClient {
 
     /// Create an OCI container from a prepared bundle.
     pub async fn oci_create(&mut self, id: String, bundle_path: String) -> Result<(), LinuxError> {
+        let metadata = self.next_transport_metadata(Some(RuntimeOperation::CreateContainer));
         self.oci
             .create(OciCreateRequest {
                 container_id: id,
                 bundle_path,
+                metadata: Some(metadata),
             })
             .await?;
         Ok(())
@@ -277,13 +354,26 @@ impl GrpcAgentClient {
 
     /// Start a previously created OCI container.
     pub async fn oci_start(&mut self, id: String) -> Result<(), LinuxError> {
-        self.oci.start(OciStartRequest { container_id: id }).await?;
+        let metadata = self.next_transport_metadata(Some(RuntimeOperation::StartContainer));
+        self.oci
+            .start(OciStartRequest {
+                container_id: id,
+                metadata: Some(metadata),
+            })
+            .await?;
         Ok(())
     }
 
     /// Query runtime state for an OCI container.
     pub async fn oci_state(&mut self, id: String) -> Result<OciContainerState, LinuxError> {
-        let response = self.oci.state(OciStateRequest { container_id: id }).await?;
+        let metadata = self.next_transport_metadata(None);
+        let response = self
+            .oci
+            .state(OciStateRequest {
+                container_id: id,
+                metadata: Some(metadata),
+            })
+            .await?;
         let state = response.into_inner();
         Ok(OciContainerState {
             id: state.container_id,
@@ -306,6 +396,7 @@ impl GrpcAgentClient {
         options: OciExecOptions,
     ) -> Result<OciExecResult, LinuxError> {
         let env = options.env.into_iter().collect::<HashMap<String, String>>();
+        let metadata = self.next_transport_metadata(Some(RuntimeOperation::ExecContainer));
 
         let response = self
             .oci
@@ -316,6 +407,7 @@ impl GrpcAgentClient {
                 env,
                 working_dir: options.cwd.unwrap_or_default(),
                 user: options.user.unwrap_or_default(),
+                metadata: Some(metadata),
             })
             .await?;
         let result = response.into_inner();
@@ -328,10 +420,12 @@ impl GrpcAgentClient {
 
     /// Send a signal to a running OCI container.
     pub async fn oci_kill(&mut self, id: String, signal: String) -> Result<(), LinuxError> {
+        let metadata = self.next_transport_metadata(Some(RuntimeOperation::StopContainer));
         self.oci
             .kill(OciKillRequest {
                 container_id: id,
                 signal,
+                metadata: Some(metadata),
             })
             .await?;
         Ok(())
@@ -339,10 +433,12 @@ impl GrpcAgentClient {
 
     /// Delete an OCI container from runtime state.
     pub async fn oci_delete(&mut self, id: String, force: bool) -> Result<(), LinuxError> {
+        let metadata = self.next_transport_metadata(Some(RuntimeOperation::RemoveContainer));
         self.oci
             .delete(OciDeleteRequest {
                 container_id: id,
                 force,
+                metadata: Some(metadata),
             })
             .await?;
         Ok(())
@@ -354,8 +450,13 @@ impl GrpcAgentClient {
         stack_id: String,
         services: Vec<vz_agent_proto::NetworkServiceConfig>,
     ) -> Result<(), LinuxError> {
+        let metadata = self.next_transport_metadata(Some(RuntimeOperation::CreateNetworkDomain));
         self.network
-            .setup(NetworkSetupRequest { stack_id, services })
+            .setup(NetworkSetupRequest {
+                stack_id,
+                services,
+                metadata: Some(metadata),
+            })
             .await?;
         Ok(())
     }
@@ -366,10 +467,12 @@ impl GrpcAgentClient {
         stack_id: String,
         service_names: Vec<String>,
     ) -> Result<(), LinuxError> {
+        let metadata = self.next_transport_metadata(None);
         self.network
             .teardown(NetworkTeardownRequest {
                 stack_id,
                 service_names,
+                metadata: Some(metadata),
             })
             .await?;
         Ok(())
@@ -389,11 +492,13 @@ impl GrpcAgentClient {
         let (tx, rx) = mpsc::channel::<PortForwardFrame>(64);
 
         // Send the open frame as the first message.
+        let metadata = self.next_transport_metadata(None);
         let open_frame = PortForwardFrame {
             frame: Some(port_forward_frame::Frame::Open(PortForwardOpen {
                 target_port: u32::from(target_port),
                 protocol: protocol.to_string(),
                 target_host: target_host.unwrap_or_default().to_string(),
+                metadata: Some(metadata),
             })),
         };
         tx.send(open_frame).await.map_err(|_| {
@@ -414,12 +519,22 @@ impl GrpcAgentClient {
 pub struct GrpcExecStream {
     inner: tonic::Streaming<vz_agent_proto::ExecEvent>,
     done: bool,
+    last_sequence: u64,
+    expected_request_id: Option<String>,
 }
 
 impl GrpcExecStream {
     /// Wrap a tonic streaming response.
-    fn new(inner: tonic::Streaming<vz_agent_proto::ExecEvent>) -> Self {
-        Self { inner, done: false }
+    fn new(
+        inner: tonic::Streaming<vz_agent_proto::ExecEvent>,
+        expected_request_id: Option<String>,
+    ) -> Self {
+        Self {
+            inner,
+            done: false,
+            last_sequence: 0,
+            expected_request_id,
+        }
     }
 
     /// Read the next event from the stream.
@@ -433,26 +548,39 @@ impl GrpcExecStream {
 
         loop {
             match self.inner.message().await {
-                Ok(Some(proto_event)) => match proto_event.event {
-                    Some(exec_event::Event::Stdout(data)) => {
-                        return Some(vz::protocol::ExecEvent::Stdout(data));
-                    }
-                    Some(exec_event::Event::Stderr(data)) => {
-                        return Some(vz::protocol::ExecEvent::Stderr(data));
-                    }
-                    Some(exec_event::Event::ExitCode(code)) => {
-                        self.done = true;
-                        return Some(vz::protocol::ExecEvent::Exit(code));
-                    }
-                    Some(exec_event::Event::Error(_)) => {
+                Ok(Some(proto_event)) => {
+                    if validate_exec_event_metadata(
+                        &mut self.last_sequence,
+                        &mut self.expected_request_id,
+                        proto_event.sequence,
+                        proto_event.request_id.as_str(),
+                    )
+                    .is_err()
+                    {
                         self.done = true;
                         return Some(vz::protocol::ExecEvent::Exit(-1));
                     }
-                    None => {
-                        // Empty event frame, skip.
-                        continue;
+                    match proto_event.event {
+                        Some(exec_event::Event::Stdout(data)) => {
+                            return Some(vz::protocol::ExecEvent::Stdout(data));
+                        }
+                        Some(exec_event::Event::Stderr(data)) => {
+                            return Some(vz::protocol::ExecEvent::Stderr(data));
+                        }
+                        Some(exec_event::Event::ExitCode(code)) => {
+                            self.done = true;
+                            return Some(vz::protocol::ExecEvent::Exit(code));
+                        }
+                        Some(exec_event::Event::Error(_)) => {
+                            self.done = true;
+                            return Some(vz::protocol::ExecEvent::Exit(-1));
+                        }
+                        None => {
+                            // Empty event frame, skip.
+                            continue;
+                        }
                     }
-                },
+                }
                 Ok(None) | Err(_) => {
                     self.done = true;
                     return None;
@@ -662,6 +790,15 @@ mod tests {
         assert!(capabilities.fs_quick_checkpoint);
         assert!(capabilities.checkpoint_fork);
         assert!(!capabilities.vm_full_checkpoint);
+        assert!(!capabilities.docker_compat);
+        assert!(capabilities.compose_adapter);
+        assert!(!capabilities.gpu_passthrough);
+        assert!(!capabilities.live_resize);
+        assert!(capabilities.shared_vm);
+        assert!(capabilities.stack_networking);
+        assert!(capabilities.container_logs);
+        vz_runtime_contract::validate_backend_adapter_contract_surface().unwrap();
+        vz_runtime_contract::validate_backend_adapter_parity(capabilities).unwrap();
     }
 
     #[test]
@@ -674,5 +811,36 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("vm_full_checkpoint"));
         assert!(message.contains("create_checkpoint"));
+    }
+
+    #[test]
+    fn validate_exec_event_metadata_accepts_monotonic_sequence() {
+        let mut last_sequence = 0;
+        let mut expected_request_id = Some("req_1".to_string());
+        validate_exec_event_metadata(&mut last_sequence, &mut expected_request_id, 1, "req_1")
+            .unwrap();
+        validate_exec_event_metadata(&mut last_sequence, &mut expected_request_id, 2, "req_1")
+            .unwrap();
+        assert_eq!(last_sequence, 2);
+    }
+
+    #[test]
+    fn validate_exec_event_metadata_rejects_out_of_order_sequence() {
+        let mut last_sequence = 2;
+        let mut expected_request_id = Some("req_1".to_string());
+        let err =
+            validate_exec_event_metadata(&mut last_sequence, &mut expected_request_id, 2, "req_1")
+                .unwrap_err();
+        assert!(err.to_string().contains("ordering violation"));
+    }
+
+    #[test]
+    fn validate_exec_event_metadata_rejects_request_id_mismatch() {
+        let mut last_sequence = 1;
+        let mut expected_request_id = Some("req_1".to_string());
+        let err =
+            validate_exec_event_metadata(&mut last_sequence, &mut expected_request_id, 2, "req_2")
+                .unwrap_err();
+        assert!(err.to_string().contains("request_id mismatch"));
     }
 }

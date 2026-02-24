@@ -25,7 +25,10 @@ pub use compose::{
 };
 pub use convert::service_to_run_config;
 pub use error::StackError;
-pub use events::{EventRecord, StackEvent};
+pub use events::{
+    EventRecord, FnStackEventSink, StackEvent, StackEventSink, StackEventSinkError,
+    emit_event_to_sink,
+};
 pub use executor::{ContainerLogs, ContainerRuntime, ExecutionResult, PortTracker, StackExecutor};
 pub use health::{
     DependencyCheck, HealthPollResult, HealthPoller, HealthStatus, check_dependencies,

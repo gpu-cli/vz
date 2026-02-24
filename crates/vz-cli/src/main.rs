@@ -82,6 +82,9 @@ enum Commands {
     /// Show container logs.
     Logs(commands::oci::LogsArgs),
 
+    /// Docker-compatible translation shim over Runtime V2 operations.
+    Docker(commands::docker::DockerArgs),
+
     // ── Stack orchestration (cross-platform) ──
     /// Manage multi-service stacks from Compose files.
     Stack(commands::stack::StackArgs),
@@ -159,6 +162,7 @@ fn main() -> anyhow::Result<()> {
             Commands::Stop(args) => commands::oci::run_stop(args).await,
             Commands::Rm(args) => commands::oci::run_rm(args).await,
             Commands::Logs(args) => commands::oci::run_logs(args).await,
+            Commands::Docker(args) => commands::docker::run(args).await,
 
             // Stack orchestration
             Commands::Stack(args) => commands::stack::run(args).await,
@@ -260,6 +264,76 @@ mod tests {
     fn parse_logs_subcommand() {
         let cli = Cli::try_parse_from(["vz", "logs", "ctr-123"]).expect("parse");
         assert!(matches!(cli.command, Commands::Logs(_)));
+    }
+
+    #[test]
+    fn parse_docker_pull_subcommand() {
+        let cli = Cli::try_parse_from(["vz", "docker", "pull", "alpine:latest"]).expect("parse");
+        assert!(matches!(cli.command, Commands::Docker(_)));
+    }
+
+    #[test]
+    fn parse_docker_run_subcommand() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "docker",
+            "run",
+            "--rm",
+            "alpine:latest",
+            "--",
+            "echo",
+            "hello",
+        ])
+        .expect("parse");
+        assert!(matches!(cli.command, Commands::Docker(_)));
+    }
+
+    #[test]
+    fn parse_docker_exec_subcommand() {
+        let cli = Cli::try_parse_from(["vz", "docker", "exec", "ctr-1", "--", "echo", "ok"])
+            .expect("parse");
+        assert!(matches!(cli.command, Commands::Docker(_)));
+    }
+
+    #[test]
+    fn parse_docker_ps_subcommand() {
+        let cli = Cli::try_parse_from(["vz", "docker", "ps"]).expect("parse");
+        assert!(matches!(cli.command, Commands::Docker(_)));
+    }
+
+    #[test]
+    fn parse_docker_logs_subcommand() {
+        let cli = Cli::try_parse_from(["vz", "docker", "logs", "ctr-123"]).expect("parse");
+        assert!(matches!(cli.command, Commands::Docker(_)));
+    }
+
+    #[test]
+    fn parse_docker_stop_subcommand() {
+        let cli = Cli::try_parse_from(["vz", "docker", "stop", "ctr-123"]).expect("parse");
+        assert!(matches!(cli.command, Commands::Docker(_)));
+    }
+
+    #[test]
+    fn parse_docker_rm_subcommand() {
+        let cli = Cli::try_parse_from(["vz", "docker", "rm", "ctr-123"]).expect("parse");
+        assert!(matches!(cli.command, Commands::Docker(_)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_docker_build_subcommand() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "docker",
+            "build",
+            "-t",
+            "demo:latest",
+            "--file",
+            "Dockerfile",
+            ".",
+        ])
+        .expect("parse");
+        assert!(matches!(cli.command, Commands::Docker(_)));
     }
 
     #[test]

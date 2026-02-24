@@ -399,6 +399,8 @@ impl SandboxPool {
         &self,
         session: &SandboxSession,
         checkpoint_id: &str,
+        expected_class: CheckpointClass,
+        allow_class_degradation: bool,
         expected_fingerprint: &str,
         expected_compatibility: Option<CheckpointCompatibilityMetadata>,
     ) -> Result<CheckpointMetadata, SandboxError> {
@@ -409,6 +411,8 @@ impl SandboxPool {
             &metadata,
             expected_fingerprint,
             expected_compatibility.as_ref(),
+            expected_class,
+            allow_class_degradation,
         )
         .map_err(|err| SandboxError::CheckpointCompatibilityMismatch {
             checkpoint_id: checkpoint_id.to_string(),
@@ -1100,6 +1104,8 @@ mod tests {
             .restore_checkpoint(
                 &session,
                 "ckpt-root",
+                CheckpointClass::FsQuick,
+                false,
                 "fp-mismatch",
                 Some(compatibility("0.1.0")),
             )
@@ -1109,6 +1115,52 @@ mod tests {
             err,
             SandboxError::CheckpointCompatibilityMismatch { .. }
         ));
+
+        pool.release(session).await.unwrap();
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_checkpoint_rejects_class_degradation_without_acknowledgement() {
+        let temp = unique_temp_dir("restore-class-degrade");
+        let mut config = test_config();
+        config.checkpoint_catalog_path = Some(temp.join("lineage.json"));
+
+        let pool = SandboxPool::new(config, 1).await.unwrap();
+        pool.register_checkpoint_metadata(checkpoint_metadata(
+            "ckpt-root",
+            "sbx-1",
+            None,
+            CheckpointClass::FsQuick,
+            "fp-root",
+            1,
+            "0.1.0",
+        ))
+        .await
+        .unwrap();
+
+        let session = pool
+            .acquire(Path::new("/Users/dev/workspace/project"))
+            .await
+            .unwrap();
+        let err = pool
+            .restore_checkpoint(
+                &session,
+                "ckpt-root",
+                CheckpointClass::VmFull,
+                false,
+                "fp-root",
+                Some(compatibility("0.1.0")),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            SandboxError::CheckpointCompatibilityMismatch { details, .. } => {
+                assert!(details.contains("degradation"));
+                assert!(details.contains("allow_class_degradation=true"));
+            }
+            other => panic!("expected checkpoint compatibility mismatch, got: {other:?}"),
+        }
 
         pool.release(session).await.unwrap();
         fs::remove_dir_all(&temp).unwrap();

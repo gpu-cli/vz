@@ -5,6 +5,10 @@
 //! implement. Callers depend only on this contract, making the backend
 //! selection transparent.
 
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
 pub mod error;
 pub mod selection;
 pub mod types;
@@ -39,14 +43,609 @@ pub const REQUIRED_IDEMPOTENT_MUTATIONS: &[RuntimeOperation] = &[
     RuntimeOperation::ForkCheckpoint,
 ];
 
+/// Docker-compat command set supported by the Runtime V2 translation shim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockerShimCommand {
+    Run,
+    Exec,
+    Ps,
+    Logs,
+    Pull,
+    Build,
+    Stop,
+    Rm,
+}
+
+impl DockerShimCommand {
+    /// V1 command coverage set in canonical order.
+    pub const V1_ALL: [DockerShimCommand; 8] = [
+        DockerShimCommand::Run,
+        DockerShimCommand::Exec,
+        DockerShimCommand::Ps,
+        DockerShimCommand::Logs,
+        DockerShimCommand::Pull,
+        DockerShimCommand::Build,
+        DockerShimCommand::Stop,
+        DockerShimCommand::Rm,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DockerShimCommand::Run => "run",
+            DockerShimCommand::Exec => "exec",
+            DockerShimCommand::Ps => "ps",
+            DockerShimCommand::Logs => "logs",
+            DockerShimCommand::Pull => "pull",
+            DockerShimCommand::Build => "build",
+            DockerShimCommand::Stop => "stop",
+            DockerShimCommand::Rm => "rm",
+        }
+    }
+
+    /// Canonical Runtime V2 operation mapped from this shim command.
+    ///
+    /// `None` indicates a read-only shim command handled via backend listing
+    /// and not yet represented by a dedicated Runtime V2 operation enum variant.
+    pub const fn runtime_operation(self) -> Option<RuntimeOperation> {
+        match self {
+            DockerShimCommand::Run => Some(RuntimeOperation::CreateContainer),
+            DockerShimCommand::Exec => Some(RuntimeOperation::ExecContainer),
+            DockerShimCommand::Ps => None,
+            DockerShimCommand::Logs => Some(RuntimeOperation::GetContainerLogs),
+            DockerShimCommand::Pull => Some(RuntimeOperation::PullImage),
+            DockerShimCommand::Build => Some(RuntimeOperation::StartBuild),
+            DockerShimCommand::Stop => Some(RuntimeOperation::StopContainer),
+            DockerShimCommand::Rm => Some(RuntimeOperation::RemoveContainer),
+        }
+    }
+}
+
+/// Runtime operations every backend adapter must preserve with shared semantics.
+///
+/// This is the backend-facing subset of [`REQUIRED_RUNTIME_OPERATIONS`].
+pub const REQUIRED_BACKEND_ADAPTER_OPERATIONS: &[RuntimeOperation] = &[
+    RuntimeOperation::CreateSandbox,
+    RuntimeOperation::TerminateSandbox,
+    RuntimeOperation::CreateContainer,
+    RuntimeOperation::StartContainer,
+    RuntimeOperation::StopContainer,
+    RuntimeOperation::RemoveContainer,
+    RuntimeOperation::GetContainerLogs,
+    RuntimeOperation::ExecContainer,
+    RuntimeOperation::WriteExecStdin,
+    RuntimeOperation::SignalExec,
+    RuntimeOperation::ResizeExecPty,
+    RuntimeOperation::CancelExec,
+    RuntimeOperation::CreateCheckpoint,
+    RuntimeOperation::RestoreCheckpoint,
+    RuntimeOperation::ForkCheckpoint,
+    RuntimeOperation::AttachVolume,
+    RuntimeOperation::DetachVolume,
+    RuntimeOperation::CreateNetworkDomain,
+    RuntimeOperation::ConnectContainer,
+    RuntimeOperation::PublishPort,
+    RuntimeOperation::GetCapabilities,
+];
+
+/// Canonical capability matrix fields that may vary across backends.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackendCapabilityMatrix {
+    pub fs_quick_checkpoint: bool,
+    pub vm_full_checkpoint: bool,
+    pub checkpoint_fork: bool,
+    pub docker_compat: bool,
+    pub compose_adapter: bool,
+    pub gpu_passthrough: bool,
+    pub live_resize: bool,
+}
+
+impl BackendCapabilityMatrix {
+    /// Stable field names exposed by the Runtime V2 backend capability matrix.
+    pub const FIELD_NAMES: [&'static str; 7] = [
+        "fs_quick_checkpoint",
+        "vm_full_checkpoint",
+        "checkpoint_fork",
+        "docker_compat",
+        "compose_adapter",
+        "gpu_passthrough",
+        "live_resize",
+    ];
+
+    pub const fn from_runtime_capabilities(capabilities: RuntimeCapabilities) -> Self {
+        Self {
+            fs_quick_checkpoint: capabilities.fs_quick_checkpoint,
+            vm_full_checkpoint: capabilities.vm_full_checkpoint,
+            checkpoint_fork: capabilities.checkpoint_fork,
+            docker_compat: capabilities.docker_compat,
+            compose_adapter: capabilities.compose_adapter,
+            gpu_passthrough: capabilities.gpu_passthrough,
+            live_resize: capabilities.live_resize,
+        }
+    }
+}
+
+/// Project backend capabilities into the canonical backend matrix shape.
+pub const fn backend_capability_matrix(
+    capabilities: RuntimeCapabilities,
+) -> BackendCapabilityMatrix {
+    BackendCapabilityMatrix::from_runtime_capabilities(capabilities)
+}
+
+/// Canonical Runtime V2 capability surface for first-party backend adapters.
+pub fn canonical_backend_capabilities(backend: &SandboxBackend) -> RuntimeCapabilities {
+    let mut capabilities = RuntimeCapabilities::stack_baseline();
+    match backend {
+        SandboxBackend::MacosVz | SandboxBackend::LinuxFirecracker => {
+            capabilities.fs_quick_checkpoint = true;
+            capabilities.vm_full_checkpoint = false;
+            capabilities.checkpoint_fork = true;
+        }
+        SandboxBackend::Other(_) => {}
+    }
+    capabilities
+}
+
+/// Validate backend adapter operation parity rules that are independent of capabilities.
+pub fn validate_backend_adapter_contract_surface() -> Result<(), RuntimeError> {
+    for operation in REQUIRED_BACKEND_ADAPTER_OPERATIONS {
+        if operation.requires_idempotency_key() && operation.idempotency_key_prefix().is_none() {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "backend adapter operation `{}` requires idempotency key metadata",
+                operation.as_str()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate backend adapter capability parity requirements shared across runtimes.
+pub fn validate_backend_adapter_parity(
+    capabilities: RuntimeCapabilities,
+) -> Result<(), RuntimeError> {
+    let matrix = backend_capability_matrix(capabilities);
+    if !matrix.fs_quick_checkpoint {
+        return Err(RuntimeError::UnsupportedOperation {
+            operation: RuntimeOperation::CreateCheckpoint.as_str().to_string(),
+            reason: "backend parity requires fs_quick_checkpoint baseline".to_string(),
+        });
+    }
+    if !matrix.checkpoint_fork {
+        return Err(RuntimeError::UnsupportedOperation {
+            operation: RuntimeOperation::ForkCheckpoint.as_str().to_string(),
+            reason: "backend parity requires checkpoint_fork baseline".to_string(),
+        });
+    }
+    if !capabilities.shared_vm {
+        return Err(RuntimeError::UnsupportedOperation {
+            operation: RuntimeOperation::CreateContainer.as_str().to_string(),
+            reason: "backend parity requires shared_vm baseline".to_string(),
+        });
+    }
+    if !capabilities.stack_networking {
+        return Err(RuntimeError::UnsupportedOperation {
+            operation: RuntimeOperation::CreateNetworkDomain.as_str().to_string(),
+            reason: "backend parity requires stack_networking baseline".to_string(),
+        });
+    }
+    if !capabilities.container_logs {
+        return Err(RuntimeError::UnsupportedOperation {
+            operation: RuntimeOperation::GetContainerLogs.as_str().to_string(),
+            reason: "backend parity requires container_logs baseline".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Opaque metadata key/value pairs passed through runtime integrations.
+pub type RuntimePassthroughMetadata = BTreeMap<String, String>;
+
+/// Generic runtime extension points that may be provided by integrators.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeExtensionPoint {
+    PolicyHook,
+    EventSink,
+    MetadataPassthrough,
+}
+
+impl RuntimeExtensionPoint {
+    pub const ALL: [RuntimeExtensionPoint; 3] = [
+        RuntimeExtensionPoint::PolicyHook,
+        RuntimeExtensionPoint::EventSink,
+        RuntimeExtensionPoint::MetadataPassthrough,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RuntimeExtensionPoint::PolicyHook => "policy_hook",
+            RuntimeExtensionPoint::EventSink => "event_sink",
+            RuntimeExtensionPoint::MetadataPassthrough => "metadata_passthrough",
+        }
+    }
+}
+
+/// Stable extension failure classes mapped into runtime errors.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeExtensionFailureKind {
+    PolicyDenied,
+    Transport,
+    InvalidMetadata,
+}
+
+impl RuntimeExtensionFailureKind {
+    pub const ALL: [RuntimeExtensionFailureKind; 3] = [
+        RuntimeExtensionFailureKind::PolicyDenied,
+        RuntimeExtensionFailureKind::Transport,
+        RuntimeExtensionFailureKind::InvalidMetadata,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RuntimeExtensionFailureKind::PolicyDenied => "policy_denied",
+            RuntimeExtensionFailureKind::Transport => "transport",
+            RuntimeExtensionFailureKind::InvalidMetadata => "invalid_metadata",
+        }
+    }
+}
+
+/// Map extension failures into stable runtime taxonomy variants.
+pub fn map_runtime_extension_failure(
+    extension: RuntimeExtensionPoint,
+    operation: &str,
+    kind: RuntimeExtensionFailureKind,
+    reason: impl Into<String>,
+) -> RuntimeError {
+    let operation = {
+        let trimmed = operation.trim();
+        if trimmed.is_empty() {
+            "unknown_operation".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    let reason = normalize_required_reason(reason.into());
+    let extension_name = extension.as_str();
+
+    match kind {
+        RuntimeExtensionFailureKind::PolicyDenied => RuntimeError::PolicyDenied {
+            operation,
+            reason: format!("extension={extension_name}; reason={reason}"),
+        },
+        RuntimeExtensionFailureKind::Transport => RuntimeError::Io(std::io::Error::other(format!(
+            "extension_failure: extension={extension_name}; operation={operation}; kind={}; reason={reason}",
+            kind.as_str()
+        ))),
+        RuntimeExtensionFailureKind::InvalidMetadata => RuntimeError::InvalidConfig(format!(
+            "extension_failure: extension={extension_name}; operation={operation}; kind={}; reason={reason}",
+            kind.as_str()
+        )),
+    }
+}
+
+/// Policy hook decision for an operation preflight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyDecision {
+    Allow,
+    Deny { reason: String },
+}
+
+/// Generic policy extension hook for runtime operations.
+pub trait RuntimePolicyHook: Send + Sync {
+    fn evaluate(
+        &self,
+        operation: RuntimeOperation,
+        metadata: &RequestMetadata,
+    ) -> Result<PolicyDecision, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Enforce a policy hook decision with stable error taxonomy mapping.
+pub fn enforce_runtime_policy_hook(
+    hook: &dyn RuntimePolicyHook,
+    operation: RuntimeOperation,
+    metadata: &RequestMetadata,
+) -> Result<(), RuntimeError> {
+    match hook.evaluate(operation, metadata) {
+        Ok(PolicyDecision::Allow) => Ok(()),
+        Ok(PolicyDecision::Deny { reason }) => Err(map_runtime_extension_failure(
+            RuntimeExtensionPoint::PolicyHook,
+            operation.as_str(),
+            RuntimeExtensionFailureKind::PolicyDenied,
+            reason,
+        )),
+        Err(error) => Err(map_runtime_extension_failure(
+            RuntimeExtensionPoint::PolicyHook,
+            operation.as_str(),
+            RuntimeExtensionFailureKind::Transport,
+            error.to_string(),
+        )),
+    }
+}
+
+/// Structured request metadata propagated across transports.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RequestMetadata {
+    /// Transport-stable request identifier (for logs/tracing/client correlation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Stable idempotency key for mutation retries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// Optional trace identifier for cross-system event correlation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    /// Opaque metadata labels propagated to extensions.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub passthrough: RuntimePassthroughMetadata,
+}
+
+impl RequestMetadata {
+    /// Build metadata while normalizing empty fields to `None`.
+    pub fn new(request_id: Option<String>, idempotency_key: Option<String>) -> Self {
+        Self {
+            request_id: normalize_optional_metadata_field(request_id),
+            idempotency_key: normalize_optional_metadata_field(idempotency_key),
+            trace_id: None,
+            passthrough: BTreeMap::new(),
+        }
+    }
+
+    /// Build metadata from optional borrowed values.
+    pub fn from_optional_refs(request_id: Option<&str>, idempotency_key: Option<&str>) -> Self {
+        Self::new(
+            request_id.map(ToOwned::to_owned),
+            idempotency_key.map(ToOwned::to_owned),
+        )
+    }
+
+    /// Attach optional trace identifier metadata.
+    pub fn with_trace_id(mut self, trace_id: Option<String>) -> Self {
+        self.trace_id = normalize_optional_metadata_field(trace_id);
+        self
+    }
+
+    /// Attach passthrough metadata with normalization and validation.
+    pub fn with_passthrough(
+        mut self,
+        operation: RuntimeOperation,
+        passthrough: RuntimePassthroughMetadata,
+    ) -> Result<Self, RuntimeError> {
+        self.passthrough = normalize_passthrough_metadata(operation, passthrough)?;
+        Ok(self)
+    }
+}
+
+fn normalize_optional_metadata_field(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn normalize_required_reason(reason: String) -> String {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        "unspecified extension failure".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn normalize_required_metadata_field(
+    value: String,
+    extension: RuntimeExtensionPoint,
+    operation: RuntimeOperation,
+    field_name: &str,
+) -> Result<String, RuntimeError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(map_runtime_extension_failure(
+            extension,
+            operation.as_str(),
+            RuntimeExtensionFailureKind::InvalidMetadata,
+            format!("{field_name} cannot be empty"),
+        ));
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn validate_passthrough_key(
+    operation: RuntimeOperation,
+    key: &str,
+) -> Result<String, RuntimeError> {
+    let normalized = normalize_required_metadata_field(
+        key.to_string(),
+        RuntimeExtensionPoint::MetadataPassthrough,
+        operation,
+        "passthrough key",
+    )?;
+    if normalized.starts_with("vz.") {
+        return Err(map_runtime_extension_failure(
+            RuntimeExtensionPoint::MetadataPassthrough,
+            operation.as_str(),
+            RuntimeExtensionFailureKind::InvalidMetadata,
+            format!("passthrough key `{normalized}` uses reserved `vz.` prefix"),
+        ));
+    }
+    Ok(normalized)
+}
+
+/// Normalize and validate passthrough metadata fields for an operation.
+pub fn normalize_passthrough_metadata(
+    operation: RuntimeOperation,
+    passthrough: RuntimePassthroughMetadata,
+) -> Result<RuntimePassthroughMetadata, RuntimeError> {
+    let mut normalized = BTreeMap::new();
+    for (key, value) in passthrough {
+        let key = validate_passthrough_key(operation, &key)?;
+        let value = value.trim().to_string();
+        normalized.insert(key, value);
+    }
+    Ok(normalized)
+}
+
+/// Validate request metadata requirements for a runtime operation.
+pub fn validate_request_metadata_for_operation(
+    operation: RuntimeOperation,
+    metadata: &RequestMetadata,
+) -> Result<(), RuntimeError> {
+    if operation.requires_idempotency_key() && metadata.idempotency_key.is_none() {
+        return Err(RuntimeError::InvalidConfig(format!(
+            "operation `{}` requires idempotency_key metadata",
+            operation.as_str()
+        )));
+    }
+    if metadata
+        .trace_id
+        .as_ref()
+        .is_some_and(|trace| trace.trim().is_empty())
+    {
+        return Err(map_runtime_extension_failure(
+            RuntimeExtensionPoint::MetadataPassthrough,
+            operation.as_str(),
+            RuntimeExtensionFailureKind::InvalidMetadata,
+            "trace_id cannot be empty",
+        ));
+    }
+    for key in metadata.passthrough.keys() {
+        let _ = validate_passthrough_key(operation, key)?;
+    }
+
+    Ok(())
+}
+
+/// Structured machine-error detail map used across transports.
+pub type MachineErrorDetails = BTreeMap<String, String>;
+
+/// Stable machine-error payload emitted by all transports.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MachineError {
+    /// Stable machine-readable code.
+    pub code: MachineErrorCode,
+    /// Human-readable diagnostic message.
+    pub message: String,
+    /// Correlated request identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Optional structured details.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub details: MachineErrorDetails,
+}
+
+impl MachineError {
+    /// Build a machine-error payload.
+    pub fn new(
+        code: MachineErrorCode,
+        message: String,
+        request_id: Option<String>,
+        details: MachineErrorDetails,
+    ) -> Self {
+        Self {
+            code,
+            message,
+            request_id: normalize_optional_metadata_field(request_id),
+            details,
+        }
+    }
+}
+
+/// Transport-stable machine-error response envelope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MachineErrorEnvelope {
+    /// Wrapped machine error.
+    pub error: MachineError,
+}
+
+impl MachineErrorEnvelope {
+    /// Build an envelope from a machine-error payload.
+    pub fn new(error: MachineError) -> Self {
+        Self { error }
+    }
+}
+
+fn runtime_error_details(error: &RuntimeError) -> MachineErrorDetails {
+    let mut details = BTreeMap::new();
+    match error {
+        RuntimeError::InvalidConfig(reason) => {
+            details.insert("reason".to_string(), reason.clone());
+        }
+        RuntimeError::ContainerNotFound { id } => {
+            details.insert("container_id".to_string(), id.clone());
+        }
+        RuntimeError::ImageNotFound { reference } => {
+            details.insert("image_reference".to_string(), reference.clone());
+        }
+        RuntimeError::PullFailed { reference, reason } => {
+            details.insert("image_reference".to_string(), reference.clone());
+            details.insert("reason".to_string(), reason.clone());
+        }
+        RuntimeError::ContainerFailed { id, reason } | RuntimeError::ExecFailed { id, reason } => {
+            details.insert("container_id".to_string(), id.clone());
+            details.insert("reason".to_string(), reason.clone());
+        }
+        RuntimeError::UnsupportedOperation { operation, reason } => {
+            details.insert("operation".to_string(), operation.clone());
+            details.insert("reason".to_string(), reason.clone());
+        }
+        RuntimeError::PolicyDenied { operation, reason } => {
+            details.insert("operation".to_string(), operation.clone());
+            details.insert("reason".to_string(), reason.clone());
+        }
+        RuntimeError::InvalidRootfs { path } => {
+            details.insert("path".to_string(), path.display().to_string());
+        }
+        RuntimeError::Io(error) => {
+            details.insert("reason".to_string(), error.to_string());
+        }
+        RuntimeError::Backend { message, source } => {
+            details.insert("message".to_string(), message.clone());
+            details.insert("source".to_string(), source.to_string());
+        }
+    }
+    details
+}
+
+/// Convert a runtime error into a transport-stable machine-error payload.
+pub fn runtime_error_machine_error(
+    error: &RuntimeError,
+    metadata: &RequestMetadata,
+) -> MachineError {
+    MachineError::new(
+        error.machine_code(),
+        error.to_string(),
+        metadata.request_id.clone(),
+        runtime_error_details(error),
+    )
+}
+
+/// Convert a runtime error into a transport-stable error envelope.
+pub fn runtime_error_machine_envelope(
+    error: &RuntimeError,
+    metadata: &RequestMetadata,
+) -> MachineErrorEnvelope {
+    MachineErrorEnvelope::new(runtime_error_machine_error(error, metadata))
+}
+
 /// Validate checkpoint restore compatibility constraints.
 ///
 /// Returns `RuntimeError::InvalidConfig` with explicit mismatch details when
 /// fingerprint or compatibility metadata constraints are violated.
+///
+/// Returns `RuntimeError::UnsupportedOperation` when checkpoint class semantics
+/// would degrade without explicit caller acknowledgement.
 pub fn validate_checkpoint_restore_compatibility(
     metadata: &CheckpointMetadata,
     expected_fingerprint: &str,
     expected_compatibility: Option<&CheckpointCompatibilityMetadata>,
+    expected_class: CheckpointClass,
+    allow_class_degradation: bool,
 ) -> Result<(), RuntimeError> {
     let actual_fingerprint = metadata.checkpoint.compatibility_fingerprint.as_str();
     if actual_fingerprint != expected_fingerprint {
@@ -94,14 +693,51 @@ pub fn validate_checkpoint_restore_compatibility(
     }
 
     if mismatches.is_empty() {
+        // Continue to class validation below.
+    } else {
+        return Err(RuntimeError::InvalidConfig(format!(
+            "checkpoint {} is incompatible for restore: {}",
+            metadata.checkpoint.checkpoint_id,
+            mismatches.join("; ")
+        )));
+    }
+
+    let actual_class = metadata.checkpoint.class;
+    if actual_class == expected_class {
         return Ok(());
     }
 
-    Err(RuntimeError::InvalidConfig(format!(
-        "checkpoint {} is incompatible for restore: {}",
-        metadata.checkpoint.checkpoint_id,
-        mismatches.join("; ")
-    )))
+    let is_degradation = matches!(
+        (expected_class, actual_class),
+        (CheckpointClass::VmFull, CheckpointClass::FsQuick)
+    );
+    if is_degradation && allow_class_degradation {
+        return Ok(());
+    }
+
+    let expected_label = checkpoint_class_label(expected_class);
+    let actual_label = checkpoint_class_label(actual_class);
+    let reason = if is_degradation {
+        format!(
+            "checkpoint class degradation for restore_checkpoint: expected `{expected_label}`, got `{actual_label}`; set allow_class_degradation=true to acknowledge fallback"
+        )
+    } else {
+        format!(
+            "checkpoint class mismatch for restore_checkpoint: expected `{expected_label}`, got `{actual_label}`"
+        )
+    };
+
+    Err(RuntimeError::UnsupportedOperation {
+        operation: RuntimeOperation::RestoreCheckpoint.as_str().to_string(),
+        reason,
+    })
+}
+
+fn checkpoint_class_label(class: CheckpointClass) -> &'static str {
+    match class {
+        CheckpointClass::FsQuick => "fs_quick",
+        CheckpointClass::VmFull => "vm_full",
+    }
 }
 
 /// Validate checkpoint-class capability gating for an operation.
@@ -515,6 +1151,38 @@ mod tests {
         match Future::poll(future.as_mut(), &mut cx) {
             Poll::Ready(output) => output,
             Poll::Pending => panic!("future unexpectedly pending"),
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum StubPolicyMode {
+        Allow,
+        Deny,
+        Fail,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("{0}")]
+    struct StubPolicyError(&'static str);
+
+    #[derive(Debug, Clone, Copy)]
+    struct StubPolicyHook {
+        mode: StubPolicyMode,
+    }
+
+    impl RuntimePolicyHook for StubPolicyHook {
+        fn evaluate(
+            &self,
+            _operation: RuntimeOperation,
+            _metadata: &RequestMetadata,
+        ) -> Result<PolicyDecision, Box<dyn std::error::Error + Send + Sync>> {
+            match self.mode {
+                StubPolicyMode::Allow => Ok(PolicyDecision::Allow),
+                StubPolicyMode::Deny => Ok(PolicyDecision::Deny {
+                    reason: "blocked by test policy".to_string(),
+                }),
+                StubPolicyMode::Fail => Err(Box::new(StubPolicyError("policy backend offline"))),
+            }
         }
     }
 
@@ -1115,7 +1783,14 @@ mod tests {
             compatibility.clone(),
         );
 
-        validate_checkpoint_restore_compatibility(&metadata, "fp-1", Some(&compatibility)).unwrap();
+        validate_checkpoint_restore_compatibility(
+            &metadata,
+            "fp-1",
+            Some(&compatibility),
+            CheckpointClass::FsQuick,
+            false,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1151,6 +1826,8 @@ mod tests {
                 config_hash: "sha256:cfg-b".to_string(),
                 host_compatibility_markers: BTreeMap::new(),
             }),
+            CheckpointClass::VmFull,
+            false,
         )
         .unwrap_err();
 
@@ -1172,6 +1849,8 @@ mod tests {
                 config_hash: "sha256:cfg-b".to_string(),
                 host_compatibility_markers: BTreeMap::new(),
             }),
+            CheckpointClass::VmFull,
+            false,
         )
         .unwrap_err();
 
@@ -1183,6 +1862,78 @@ mod tests {
             }
             other => panic!("expected invalid config error, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn validate_checkpoint_restore_compatibility_rejects_class_degradation_without_ack() {
+        let metadata = CheckpointMetadata::new(
+            Checkpoint {
+                checkpoint_id: "ckpt-3".to_string(),
+                sandbox_id: "sbx-1".to_string(),
+                parent_checkpoint_id: None,
+                class: CheckpointClass::FsQuick,
+                state: CheckpointState::Ready,
+                created_at: 12,
+                compatibility_fingerprint: "fp-3".to_string(),
+            },
+            CheckpointCompatibilityMetadata {
+                backend_id: "macos-vz".to_string(),
+                backend_version: "0.1.0".to_string(),
+                runtime_version: "2".to_string(),
+                guest_artifact_versions: BTreeMap::new(),
+                config_hash: "sha256:cfg".to_string(),
+                host_compatibility_markers: BTreeMap::new(),
+            },
+        );
+
+        let err = validate_checkpoint_restore_compatibility(
+            &metadata,
+            "fp-3",
+            Some(&metadata.compatibility),
+            CheckpointClass::VmFull,
+            false,
+        )
+        .unwrap_err();
+        match err {
+            RuntimeError::UnsupportedOperation { operation, reason } => {
+                assert_eq!(operation, RuntimeOperation::RestoreCheckpoint.as_str());
+                assert!(reason.contains("degradation"));
+                assert!(reason.contains("allow_class_degradation=true"));
+            }
+            other => panic!("expected unsupported operation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_checkpoint_restore_compatibility_allows_class_degradation_with_ack() {
+        let metadata = CheckpointMetadata::new(
+            Checkpoint {
+                checkpoint_id: "ckpt-4".to_string(),
+                sandbox_id: "sbx-1".to_string(),
+                parent_checkpoint_id: None,
+                class: CheckpointClass::FsQuick,
+                state: CheckpointState::Ready,
+                created_at: 13,
+                compatibility_fingerprint: "fp-4".to_string(),
+            },
+            CheckpointCompatibilityMetadata {
+                backend_id: "macos-vz".to_string(),
+                backend_version: "0.1.0".to_string(),
+                runtime_version: "2".to_string(),
+                guest_artifact_versions: BTreeMap::new(),
+                config_hash: "sha256:cfg".to_string(),
+                host_compatibility_markers: BTreeMap::new(),
+            },
+        );
+
+        validate_checkpoint_restore_compatibility(
+            &metadata,
+            "fp-4",
+            Some(&metadata.compatibility),
+            CheckpointClass::VmFull,
+            true,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1488,6 +2239,251 @@ mod tests {
     }
 
     #[test]
+    fn docker_shim_v1_command_mapping_is_stable() {
+        assert_eq!(DockerShimCommand::V1_ALL.len(), 8);
+        assert_eq!(DockerShimCommand::Run.as_str(), "run");
+        assert_eq!(
+            DockerShimCommand::Run.runtime_operation(),
+            Some(RuntimeOperation::CreateContainer)
+        );
+        assert_eq!(
+            DockerShimCommand::Exec.runtime_operation(),
+            Some(RuntimeOperation::ExecContainer)
+        );
+        assert_eq!(DockerShimCommand::Ps.runtime_operation(), None);
+        assert_eq!(
+            DockerShimCommand::Logs.runtime_operation(),
+            Some(RuntimeOperation::GetContainerLogs)
+        );
+        assert_eq!(
+            DockerShimCommand::Pull.runtime_operation(),
+            Some(RuntimeOperation::PullImage)
+        );
+        assert_eq!(
+            DockerShimCommand::Build.runtime_operation(),
+            Some(RuntimeOperation::StartBuild)
+        );
+        assert_eq!(
+            DockerShimCommand::Stop.runtime_operation(),
+            Some(RuntimeOperation::StopContainer)
+        );
+        assert_eq!(
+            DockerShimCommand::Rm.runtime_operation(),
+            Some(RuntimeOperation::RemoveContainer)
+        );
+    }
+
+    #[test]
+    fn required_backend_adapter_operations_are_subset_of_runtime_surface() {
+        assert!(!REQUIRED_BACKEND_ADAPTER_OPERATIONS.is_empty());
+        for operation in REQUIRED_BACKEND_ADAPTER_OPERATIONS {
+            assert!(REQUIRED_RUNTIME_OPERATIONS.contains(operation));
+        }
+        assert!(REQUIRED_BACKEND_ADAPTER_OPERATIONS.contains(&RuntimeOperation::CreateSandbox));
+        assert!(REQUIRED_BACKEND_ADAPTER_OPERATIONS.contains(&RuntimeOperation::ExecContainer));
+        assert!(REQUIRED_BACKEND_ADAPTER_OPERATIONS.contains(&RuntimeOperation::GetCapabilities));
+    }
+
+    #[test]
+    fn canonical_backend_capabilities_share_same_matrix_shape() {
+        let macos = canonical_backend_capabilities(&SandboxBackend::MacosVz);
+        let linux = canonical_backend_capabilities(&SandboxBackend::LinuxFirecracker);
+        assert_eq!(
+            backend_capability_matrix(macos),
+            backend_capability_matrix(linux)
+        );
+
+        let matrix = backend_capability_matrix(macos);
+        assert!(matrix.fs_quick_checkpoint);
+        assert!(!matrix.vm_full_checkpoint);
+        assert!(matrix.checkpoint_fork);
+        assert!(!matrix.docker_compat);
+        assert!(matrix.compose_adapter);
+        assert!(!matrix.gpu_passthrough);
+        assert!(!matrix.live_resize);
+        assert_eq!(
+            BackendCapabilityMatrix::FIELD_NAMES,
+            [
+                "fs_quick_checkpoint",
+                "vm_full_checkpoint",
+                "checkpoint_fork",
+                "docker_compat",
+                "compose_adapter",
+                "gpu_passthrough",
+                "live_resize",
+            ]
+        );
+    }
+
+    #[test]
+    fn backend_adapter_contract_surface_has_valid_idempotency_mapping() {
+        validate_backend_adapter_contract_surface().unwrap();
+    }
+
+    #[test]
+    fn backend_adapter_parity_validates_required_capability_baseline() {
+        let capabilities = canonical_backend_capabilities(&SandboxBackend::MacosVz);
+        validate_backend_adapter_parity(capabilities).unwrap();
+
+        let mut missing_checkpoint = capabilities;
+        missing_checkpoint.fs_quick_checkpoint = false;
+        let err = validate_backend_adapter_parity(missing_checkpoint).unwrap_err();
+        match err {
+            RuntimeError::UnsupportedOperation { operation, reason } => {
+                assert_eq!(operation, RuntimeOperation::CreateCheckpoint.as_str());
+                assert!(reason.contains("fs_quick_checkpoint"));
+            }
+            other => panic!("expected unsupported operation error, got: {other:?}"),
+        }
+
+        let mut missing_network = capabilities;
+        missing_network.stack_networking = false;
+        let err = validate_backend_adapter_parity(missing_network).unwrap_err();
+        match err {
+            RuntimeError::UnsupportedOperation { operation, reason } => {
+                assert_eq!(operation, RuntimeOperation::CreateNetworkDomain.as_str());
+                assert!(reason.contains("stack_networking"));
+            }
+            other => panic!("expected unsupported operation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_metadata_validation_enforces_required_idempotency_keys() {
+        let metadata =
+            RequestMetadata::from_optional_refs(Some(" req-1 "), Some(" create_container:abc "))
+                .with_trace_id(Some(" trace-7 ".to_string()))
+                .with_passthrough(
+                    RuntimeOperation::CreateContainer,
+                    BTreeMap::from([(" customer ".to_string(), " west ".to_string())]),
+                )
+                .unwrap();
+        assert_eq!(metadata.request_id.as_deref(), Some("req-1"));
+        assert_eq!(
+            metadata.idempotency_key.as_deref(),
+            Some("create_container:abc")
+        );
+        assert_eq!(metadata.trace_id.as_deref(), Some("trace-7"));
+        assert_eq!(
+            metadata.passthrough.get("customer").map(String::as_str),
+            Some("west")
+        );
+
+        validate_request_metadata_for_operation(RuntimeOperation::CreateContainer, &metadata)
+            .unwrap();
+        validate_request_metadata_for_operation(RuntimeOperation::GetReceipt, &metadata).unwrap();
+
+        let missing = RequestMetadata::default();
+        let err =
+            validate_request_metadata_for_operation(RuntimeOperation::CreateContainer, &missing)
+                .unwrap_err();
+        assert!(matches!(err, RuntimeError::InvalidConfig(_)));
+        assert!(err.to_string().contains("create_container"));
+    }
+
+    #[test]
+    fn metadata_passthrough_rejects_reserved_keys() {
+        let err = RequestMetadata::default()
+            .with_passthrough(
+                RuntimeOperation::CreateContainer,
+                BTreeMap::from([("vz.internal".to_string(), "1".to_string())]),
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, RuntimeError::InvalidConfig(_)));
+        assert!(err.to_string().contains("metadata_passthrough"));
+        assert!(err.to_string().contains("reserved `vz.` prefix"));
+    }
+
+    #[test]
+    fn runtime_extension_failure_mapping_is_stable() {
+        let denied = map_runtime_extension_failure(
+            RuntimeExtensionPoint::PolicyHook,
+            RuntimeOperation::CreateContainer.as_str(),
+            RuntimeExtensionFailureKind::PolicyDenied,
+            "no quota",
+        );
+        assert_eq!(denied.machine_code(), MachineErrorCode::PolicyDenied);
+        assert!(denied.to_string().contains("extension=policy_hook"));
+
+        let transport = map_runtime_extension_failure(
+            RuntimeExtensionPoint::EventSink,
+            "stack.emit_event",
+            RuntimeExtensionFailureKind::Transport,
+            "sink closed",
+        );
+        assert_eq!(
+            transport.machine_code(),
+            MachineErrorCode::BackendUnavailable
+        );
+        assert!(transport.to_string().contains("extension_failure:"));
+        assert!(transport.to_string().contains("extension=event_sink"));
+        assert!(transport.to_string().contains("operation=stack.emit_event"));
+
+        let invalid = map_runtime_extension_failure(
+            RuntimeExtensionPoint::MetadataPassthrough,
+            RuntimeOperation::CreateContainer.as_str(),
+            RuntimeExtensionFailureKind::InvalidMetadata,
+            "key cannot be empty",
+        );
+        assert_eq!(invalid.machine_code(), MachineErrorCode::ValidationError);
+        assert!(invalid.to_string().contains("kind=invalid_metadata"));
+    }
+
+    #[test]
+    fn runtime_policy_hook_maps_allow_deny_and_transport_errors() {
+        let metadata = RequestMetadata::from_optional_refs(Some("req-7"), None);
+
+        let allow_hook = StubPolicyHook {
+            mode: StubPolicyMode::Allow,
+        };
+        enforce_runtime_policy_hook(&allow_hook, RuntimeOperation::CreateContainer, &metadata)
+            .unwrap();
+
+        let deny_hook = StubPolicyHook {
+            mode: StubPolicyMode::Deny,
+        };
+        let deny =
+            enforce_runtime_policy_hook(&deny_hook, RuntimeOperation::CreateContainer, &metadata)
+                .unwrap_err();
+        assert_eq!(deny.machine_code(), MachineErrorCode::PolicyDenied);
+        assert!(deny.to_string().contains("blocked by test policy"));
+
+        let fail_hook = StubPolicyHook {
+            mode: StubPolicyMode::Fail,
+        };
+        let transport =
+            enforce_runtime_policy_hook(&fail_hook, RuntimeOperation::CreateContainer, &metadata)
+                .unwrap_err();
+        assert_eq!(
+            transport.machine_code(),
+            MachineErrorCode::BackendUnavailable
+        );
+        assert!(transport.to_string().contains("operation=create_container"));
+    }
+
+    #[test]
+    fn runtime_error_machine_envelope_carries_request_id_and_details() {
+        let metadata = RequestMetadata::from_optional_refs(Some("req_123"), None);
+        let error = RuntimeError::UnsupportedOperation {
+            operation: "restore_checkpoint".to_string(),
+            reason: "missing vm_full_checkpoint capability".to_string(),
+        };
+
+        let envelope = runtime_error_machine_envelope(&error, &metadata);
+        assert_eq!(envelope.error.code, MachineErrorCode::UnsupportedOperation);
+        assert_eq!(envelope.error.request_id.as_deref(), Some("req_123"));
+        assert_eq!(
+            envelope.error.details.get("operation").map(String::as_str),
+            Some("restore_checkpoint")
+        );
+        assert_eq!(
+            envelope.error.details.get("reason").map(String::as_str),
+            Some("missing vm_full_checkpoint capability")
+        );
+    }
+
+    #[test]
     fn runtime_error_machine_codes_are_stable() {
         assert_eq!(
             MachineErrorCode::ALL.map(MachineErrorCode::as_str),
@@ -1539,6 +2535,14 @@ mod tests {
             MachineErrorCode::UnsupportedOperation
         );
         assert_eq!(
+            RuntimeError::PolicyDenied {
+                operation: "create_container".to_string(),
+                reason: "extension=policy_hook; reason=test".to_string(),
+            }
+            .machine_code(),
+            MachineErrorCode::PolicyDenied
+        );
+        assert_eq!(
             RuntimeError::Backend {
                 message: "agent unavailable".to_string(),
                 source: Box::new(std::io::Error::other("dial failed")),
@@ -1546,6 +2550,33 @@ mod tests {
             .machine_code(),
             MachineErrorCode::InternalError
         );
+    }
+
+    #[test]
+    fn runtime_surface_forbids_product_domain_primitives() {
+        const FORBIDDEN: [&str; 5] = [
+            "identity_provider",
+            "memory_provider",
+            "tool_gateway",
+            "mission",
+            "workflow",
+        ];
+
+        let mut labels = Vec::new();
+        labels.extend(RuntimeOperation::ALL.map(RuntimeOperation::as_str));
+        labels.extend(MachineErrorCode::ALL.map(MachineErrorCode::as_str));
+        labels.extend(RuntimeExtensionPoint::ALL.map(RuntimeExtensionPoint::as_str));
+        labels.extend(DockerShimCommand::V1_ALL.map(DockerShimCommand::as_str));
+
+        for label in labels {
+            let normalized = label.to_ascii_lowercase();
+            for forbidden in FORBIDDEN {
+                assert!(
+                    !normalized.contains(forbidden),
+                    "runtime surface label `{label}` must not contain forbidden primitive `{forbidden}`"
+                );
+            }
+        }
     }
 
     #[test]

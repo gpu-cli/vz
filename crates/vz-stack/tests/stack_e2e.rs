@@ -230,6 +230,18 @@ fn stack_error_machine_code_normalization() {
 }
 
 #[test]
+fn compose_unsupported_error_shape_is_stable() {
+    let err = StackError::ComposeUnsupportedFeature {
+        feature: "services.web.networks.frontend.aliases".to_string(),
+        reason: "network attachment options are not supported".to_string(),
+    };
+    assert_eq!(err.machine_code(), MachineErrorCode::UnsupportedOperation);
+    let message = err.to_string();
+    assert!(message.starts_with("unsupported_operation:"));
+    assert!(message.contains("surface=compose"));
+}
+
+#[test]
 fn contract_terminal_state_and_lease_exec_gating_rules() {
     let mut sandbox = Sandbox {
         sandbox_id: "sbx-test".to_string(),

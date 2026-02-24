@@ -205,6 +205,9 @@ Phase 1 must complete before Phase 2 or Phase 3 can begin. Phase 2 and Phase 3 c
 | `07-golden-image.md` | IPSW to bootable macOS VM pipeline, dev tool provisioning, image versioning, **automated first-boot provisioning (skip Setup Assistant, pre-create user), fully unattended vz init flow** |
 | `08-testing.md` | Testing strategy for a virtualization library: unit tests (mock ObjC), integration tests (real VMs), CI on Apple Silicon, and measured-claims benchmark requirements |
 | `09-signing.md` | **Entitlements (com.apple.security.virtualization), code signing with Developer ID, notarization, CI signing workflow, distribution (Homebrew, GitHub Releases, cargo install, install script)** |
+| `../docs/runtime-api-review.md` | Runtime/product boundary enforcement checklist for contract/API changes, extension guardrails, and redesign triggers |
+| `runtime-v2-rollout.md` | Runtime V2 phased rollout tracker (Phase 0-6) with entry/exit gates, ownership, evidence requirements, and Beads linkage |
+| `runtime-v2-risks.md` | Runtime V2 rollout risk register with mitigation execution tracking, acceptance criteria, and review cadence |
 | `on-demand-elevation/README.md` | One-command UX with stage-gated elevation: request admin privileges only when offline provisioning requires it; includes security, UX, and rollout plan |
 | `pinned-ipsw-patches/README.md` | Pinned base matrix + signed file-level patch bundle strategy to keep system reliability while enabling no-local-sudo artifact workflows |
 | `sandbox/README.md` | Agent sandbox platform track: first-class primitives (`Sandbox`, `Session`, `Run`, `Policy`), Rust library surface, runtime integration plan, and OpenAPI contract |

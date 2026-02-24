@@ -143,11 +143,9 @@ impl Runtime {
 
     /// Advertised checkpoint capabilities for this backend runtime.
     pub fn checkpoint_capabilities(&self) -> vz_runtime_contract::RuntimeCapabilities {
-        let mut caps = vz_runtime_contract::RuntimeCapabilities::stack_baseline();
-        caps.fs_quick_checkpoint = true;
-        caps.checkpoint_fork = true;
-        caps.vm_full_checkpoint = false;
-        caps
+        vz_runtime_contract::canonical_backend_capabilities(
+            &vz_runtime_contract::SandboxBackend::MacosVz,
+        )
     }
 
     /// Validate that checkpoint class semantics are supported before execution.
@@ -2743,6 +2741,15 @@ mod tests {
         assert!(caps.fs_quick_checkpoint);
         assert!(caps.checkpoint_fork);
         assert!(!caps.vm_full_checkpoint);
+        assert!(!caps.docker_compat);
+        assert!(caps.compose_adapter);
+        assert!(!caps.gpu_passthrough);
+        assert!(!caps.live_resize);
+        assert!(caps.shared_vm);
+        assert!(caps.stack_networking);
+        assert!(caps.container_logs);
+        vz_runtime_contract::validate_backend_adapter_contract_surface().unwrap();
+        vz_runtime_contract::validate_backend_adapter_parity(caps).unwrap();
     }
 
     #[test]

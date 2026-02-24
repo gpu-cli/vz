@@ -36,6 +36,16 @@ pub struct ResourceStatsResponse {
     #[prost(double, repeated, tag = "7")]
     pub load_average: ::prost::alloc::vec::Vec<f64>,
 }
+/// Shared transport metadata for request parity across protocols.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TransportMetadata {
+    /// Correlated request identifier.
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    /// Idempotency key for retry-safe mutation calls.
+    #[prost(string, tag = "2")]
+    pub idempotency_key: ::prost::alloc::string::String,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecRequest {
     #[prost(string, tag = "1")]
@@ -53,11 +63,19 @@ pub struct ExecRequest {
     /// empty = agent's user (root)
     #[prost(string, tag = "5")]
     pub user: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "6")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
 }
 /// Server-streamed event for a running exec. The last event is always
 /// exit_code (or error if the command failed to start).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecEvent {
+    /// Monotonic sequence index within one exec stream.
+    #[prost(uint64, tag = "5")]
+    pub sequence: u64,
+    /// Correlated request identifier echoed from the originating request.
+    #[prost(string, tag = "6")]
+    pub request_id: ::prost::alloc::string::String,
     #[prost(oneof = "exec_event::Event", tags = "1, 2, 3, 4")]
     pub event: ::core::option::Option<exec_event::Event>,
 }
@@ -81,22 +99,28 @@ pub struct StdinWriteRequest {
     pub exec_id: u64,
     #[prost(bytes = "vec", tag = "2")]
     pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "3")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct StdinWriteResponse {}
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StdinCloseRequest {
     #[prost(uint64, tag = "1")]
     pub exec_id: u64,
+    #[prost(message, optional, tag = "2")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct StdinCloseResponse {}
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SignalRequest {
     #[prost(uint64, tag = "1")]
     pub exec_id: u64,
     #[prost(int32, tag = "2")]
     pub signal: i32,
+    #[prost(message, optional, tag = "3")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct SignalResponse {}
@@ -125,6 +149,8 @@ pub struct PortForwardOpen {
     /// empty = "127.0.0.1"
     #[prost(string, tag = "3")]
     pub target_host: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OciCreateRequest {
@@ -132,6 +158,8 @@ pub struct OciCreateRequest {
     pub container_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub bundle_path: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct OciCreateResponse {}
@@ -139,6 +167,8 @@ pub struct OciCreateResponse {}
 pub struct OciStartRequest {
     #[prost(string, tag = "1")]
     pub container_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct OciStartResponse {}
@@ -146,6 +176,8 @@ pub struct OciStartResponse {}
 pub struct OciStateRequest {
     #[prost(string, tag = "1")]
     pub container_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OciStateResponse {
@@ -177,6 +209,8 @@ pub struct OciExecRequest {
     pub working_dir: ::prost::alloc::string::String,
     #[prost(string, tag = "6")]
     pub user: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "7")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OciExecResponse {
@@ -194,6 +228,8 @@ pub struct OciKillRequest {
     /// e.g. "SIGTERM"
     #[prost(string, tag = "2")]
     pub signal: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct OciKillResponse {}
@@ -203,6 +239,8 @@ pub struct OciDeleteRequest {
     pub container_id: ::prost::alloc::string::String,
     #[prost(bool, tag = "2")]
     pub force: bool,
+    #[prost(message, optional, tag = "3")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct OciDeleteResponse {}
@@ -224,6 +262,8 @@ pub struct NetworkSetupRequest {
     pub stack_id: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "2")]
     pub services: ::prost::alloc::vec::Vec<NetworkServiceConfig>,
+    #[prost(message, optional, tag = "3")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct NetworkSetupResponse {}
@@ -233,6 +273,8 @@ pub struct NetworkTeardownRequest {
     pub stack_id: ::prost::alloc::string::String,
     #[prost(string, repeated, tag = "2")]
     pub service_names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "3")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct NetworkTeardownResponse {}

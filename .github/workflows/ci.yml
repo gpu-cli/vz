@@ -20,8 +20,23 @@ jobs:
     env:
       # Crates that compile on Linux. Update when adding new cross-platform crates.
       LINUX_CRATES: "-p vz-cli -p vz-stack -p vz-runtime-contract -p vz-linux-native"
+      # Cross-transport parity gate crates for Runtime V2 gRPC/OpenAPI checks.
+      TRANSPORT_PARITY_CRATES: "-p vz-api -p vz-agent-proto -p vz-linux -p vz-guest-agent -p vz-runtime-contract"
     steps:
       - uses: actions/checkout@v4
+
+      - name: Runtime V2 Benchmark Methodology Gate
+        run: |
+          DOC="docs/benchmarks/runtime-v2-methodology.md"
+          test -f "$DOC"
+          grep -q "## 1. Workload Classes" "$DOC"
+          grep -q "## 2. Host Hardware and OS Versions" "$DOC"
+          grep -q "## 4. Metrics and Distribution Summary" "$DOC"
+          grep -q "p50" "$DOC"
+          grep -q "p95" "$DOC"
+          grep -q "p99" "$DOC"
+          grep -q "## 5. Variance and Confidence" "$DOC"
+          grep -q "## 7. Raw Artifacts and Reproduction" "$DOC"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -49,6 +64,18 @@ jobs:
       - name: Test (Linux-compatible crates)
         working-directory: crates
         run: cargo nextest run $LINUX_CRATES
+
+      - name: Runtime V2 Gate - State Machine / Idempotency / Checkpoint
+        working-directory: crates
+        run: cargo nextest run -p vz-runtime-contract
+
+      - name: Runtime V2 Gate - Shim Mapping / Negative Paths
+        working-directory: crates
+        run: cargo nextest run -p vz-stack --test quality_gates
+
+      - name: Transport Parity Gates (gRPC/OpenAPI)
+        working-directory: crates
+        run: cargo nextest run $TRANSPORT_PARITY_CRATES transport_parity
 
   # Layers 1-2: Full test suite on macOS ARM64
   test-macos:
@@ -88,6 +115,67 @@ jobs:
         run: |
           ./scripts/sign-dev.sh --profile debug
           codesign --display --entitlements - crates/target/debug/vz 2>&1 || true
+
+  # Runtime V2 backend conformance lanes.
+  conformance-linux-backend:
+    name: Conformance (Linux Backend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Linux backend conformance suite
+        working-directory: crates
+        run: cargo nextest run -p vz-stack --test backend_conformance backend_conformance_linux
+
+  conformance-macos-backend:
+    name: Conformance (macOS Backend)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: macOS backend conformance suite
+        working-directory: crates
+        run: cargo nextest run -p vz-stack --test backend_conformance backend_conformance_macos
+
+  conformance-cross-backend:
+    name: Conformance (Cross-Backend Parity)
+    runs-on: ubuntu-latest
+    needs: [conformance-linux-backend, conformance-macos-backend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cross-backend conformance suite
+        working-directory: crates
+        run: |
+          cargo nextest run -p vz-runtime-contract backend_adapter
+          cargo nextest run -p vz-stack --test backend_conformance backend_conformance_cross_backend
 
   # Layer 3: VM tests (self-hosted, requires golden image)
   # Uncomment when self-hosted macOS ARM64 runner is available

@@ -377,7 +377,7 @@ struct OciContainerRuntime {
 
 fn unsupported_operation_error(operation: &str, reason: impl Into<String>) -> StackError {
     StackError::Network(format!(
-        "unsupported_operation: operation={operation}; reason={}",
+        "unsupported_operation: surface=stack; operation={operation}; reason={}",
         reason.into()
     ))
 }
@@ -2772,6 +2772,7 @@ mod tests {
         match stack_error {
             StackError::Network(message) => {
                 assert!(message.contains("unsupported_operation"));
+                assert!(message.contains("surface=stack"));
                 assert!(message.contains("operation=network_setup"));
                 assert!(message.contains("missing stack_networking capability"));
             }
@@ -2785,6 +2786,7 @@ mod tests {
         match err {
             StackError::Network(message) => {
                 assert!(message.starts_with("unsupported_operation:"));
+                assert!(message.contains("surface=stack"));
                 assert!(message.contains("operation=logs"));
             }
             other => panic!("expected StackError::Network, got {other:?}"),

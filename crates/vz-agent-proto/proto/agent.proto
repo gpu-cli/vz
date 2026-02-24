@@ -99,6 +99,14 @@ message ResourceStatsResponse {
   repeated double load_average = 7;
 }
 
+// Shared transport metadata for request parity across protocols.
+message TransportMetadata {
+  // Correlated request identifier.
+  string request_id = 1;
+  // Idempotency key for retry-safe mutation calls.
+  string idempotency_key = 2;
+}
+
 // ─── Exec ───────────────────────────────────────────────────────
 
 message ExecRequest {
@@ -107,6 +115,7 @@ message ExecRequest {
   string working_dir = 3;     // empty = agent's cwd
   map<string, string> env = 4;
   string user = 5;            // empty = agent's user (root)
+  TransportMetadata metadata = 6;
 }
 
 // Server-streamed event for a running exec. The last event is always
@@ -118,22 +127,29 @@ message ExecEvent {
     int32 exit_code = 3;
     string error = 4;
   }
+  // Monotonic sequence index within one exec stream.
+  uint64 sequence = 5;
+  // Correlated request identifier echoed from the originating request.
+  string request_id = 6;
 }
 
 message StdinWriteRequest {
   uint64 exec_id = 1;
   bytes data = 2;
+  TransportMetadata metadata = 3;
 }
 message StdinWriteResponse {}
 
 message StdinCloseRequest {
   uint64 exec_id = 1;
+  TransportMetadata metadata = 2;
 }
 message StdinCloseResponse {}
 
 message SignalRequest {
   uint64 exec_id = 1;
   int32 signal = 2;
+  TransportMetadata metadata = 3;
 }
 message SignalResponse {}
 
@@ -150,6 +166,7 @@ message PortForwardOpen {
   uint32 target_port = 1;
   string protocol = 2;       // "tcp" or "udp"
   string target_host = 3;    // empty = "127.0.0.1"
+  TransportMetadata metadata = 4;
 }
 
 // ─── OCI Messages ───────────────────────────────────────────────
@@ -157,16 +174,19 @@ message PortForwardOpen {
 message OciCreateRequest {
   string container_id = 1;
   string bundle_path = 2;
+  TransportMetadata metadata = 3;
 }
 message OciCreateResponse {}
 
 message OciStartRequest {
   string container_id = 1;
+  TransportMetadata metadata = 2;
 }
 message OciStartResponse {}
 
 message OciStateRequest {
   string container_id = 1;
+  TransportMetadata metadata = 2;
 }
 message OciStateResponse {
   string container_id = 1;
@@ -182,6 +202,7 @@ message OciExecRequest {
   map<string, string> env = 4;
   string working_dir = 5;
   string user = 6;
+  TransportMetadata metadata = 7;
 }
 message OciExecResponse {
   int32 exit_code = 1;
@@ -192,12 +213,14 @@ message OciExecResponse {
 message OciKillRequest {
   string container_id = 1;
   string signal = 2;          // e.g. "SIGTERM"
+  TransportMetadata metadata = 3;
 }
 message OciKillResponse {}
 
 message OciDeleteRequest {
   string container_id = 1;
   bool force = 2;
+  TransportMetadata metadata = 3;
 }
 message OciDeleteResponse {}
 
@@ -212,11 +235,13 @@ message NetworkServiceConfig {
 message NetworkSetupRequest {
   string stack_id = 1;
   repeated NetworkServiceConfig services = 2;
+  TransportMetadata metadata = 3;
 }
 message NetworkSetupResponse {}
 
 message NetworkTeardownRequest {
   string stack_id = 1;
   repeated string service_names = 2;
+  TransportMetadata metadata = 3;
 }
 message NetworkTeardownResponse {}

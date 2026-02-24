@@ -38,14 +38,19 @@ struct ExecOrderContext {
     sender: tokio::sync::mpsc::Sender<Result<ExecEvent, Status>>,
     gate: Arc<Mutex<()>>,
     sequence: Arc<AtomicU64>,
+    request_id: String,
 }
 
 impl ExecOrderContext {
-    fn new(sender: tokio::sync::mpsc::Sender<Result<ExecEvent, Status>>) -> Self {
+    fn new(
+        sender: tokio::sync::mpsc::Sender<Result<ExecEvent, Status>>,
+        request_id: String,
+    ) -> Self {
         Self {
             sender,
             gate: Arc::new(Mutex::new(())),
             sequence: Arc::new(AtomicU64::new(0)),
+            request_id,
         }
     }
 }
@@ -79,6 +84,25 @@ fn remove_exec_order_context(exec_id: u64) {
     });
 }
 
+fn generated_request_id(prefix: &str) -> String {
+    static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+    let seq = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{seq:016x}")
+}
+
+fn request_id_from_metadata(metadata: Option<&TransportMetadata>, prefix: &str) -> String {
+    metadata
+        .and_then(|metadata| {
+            let trimmed = metadata.request_id.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .unwrap_or_else(|| generated_request_id(prefix))
+}
+
 async fn send_ordered_exec_event(exec_id: u64, event: exec_event::Event) -> Result<u64, ()> {
     let Some(context) = lookup_exec_order_context(exec_id) else {
         return Err(());
@@ -87,7 +111,11 @@ async fn send_ordered_exec_event(exec_id: u64, event: exec_event::Event) -> Resu
     let sequence = context.sequence.fetch_add(1, Ordering::Relaxed) + 1;
     context
         .sender
-        .send(Ok(ExecEvent { event: Some(event) }))
+        .send(Ok(ExecEvent {
+            event: Some(event),
+            sequence,
+            request_id: context.request_id.clone(),
+        }))
         .await
         .map_err(|_| ())?;
     Ok(sequence)
@@ -172,6 +200,7 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         use tokio::io::AsyncReadExt;
 
         let req = request.into_inner();
+        let request_id = request_id_from_metadata(req.metadata.as_ref(), "exec");
         let env: Vec<(String, String)> = req.env.into_iter().collect();
         let working_dir = if req.working_dir.is_empty() {
             None
@@ -199,19 +228,21 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         let mut child = match spawn_result {
             Ok(child) => child,
             Err(e) => {
-                warn!(command = %req.command, error = %e, "grpc: exec spawn failed");
+                warn!(request_id = %request_id, command = %req.command, error = %e, "grpc: exec spawn failed");
                 // Return a stream with a single error event.
                 let (tx, rx) = tokio::sync::mpsc::channel(1);
                 let _ = tx
                     .send(Ok(ExecEvent {
                         event: Some(exec_event::Event::Error(e.to_string())),
+                        sequence: 1,
+                        request_id: request_id.clone(),
                     }))
                     .await;
                 return Ok(Response::new(ReceiverStream::new(rx)));
             }
         };
 
-        info!(command = %req.command, args = ?req.args, "grpc: process spawned");
+        info!(request_id = %request_id, command = %req.command, args = ?req.args, "grpc: process spawned");
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -227,7 +258,7 @@ impl agent_service_server::AgentService for AgentServiceImpl {
 
         // Channel for streaming ExecEvents back to the client.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ExecEvent, Status>>(64);
-        register_exec_order_context(exec_id, ExecOrderContext::new(tx.clone()));
+        register_exec_order_context(exec_id, ExecOrderContext::new(tx.clone(), request_id));
 
         let process_table = self.state.process_table.clone();
 
@@ -541,7 +572,13 @@ impl oci_service_server::OciService for OciServiceImpl {
         request: Request<OciCreateRequest>,
     ) -> Result<Response<OciCreateResponse>, Status> {
         let req = request.into_inner();
-        info!(container_id = %req.container_id, bundle_path = %req.bundle_path, "oci: create");
+        let request_id = request_id_from_metadata(req.metadata.as_ref(), "oci-create");
+        info!(
+            request_id = %request_id,
+            container_id = %req.container_id,
+            bundle_path = %req.bundle_path,
+            "oci: create"
+        );
 
         // Patch the OCI config to work in the minimal guest VM kernel.
         let config_path = format!("{}/config.json", &req.bundle_path);
@@ -571,7 +608,8 @@ impl oci_service_server::OciService for OciServiceImpl {
         request: Request<OciStartRequest>,
     ) -> Result<Response<OciStartResponse>, Status> {
         let req = request.into_inner();
-        info!(container_id = %req.container_id, "oci: start");
+        let request_id = request_id_from_metadata(req.metadata.as_ref(), "oci-start");
+        info!(request_id = %request_id, container_id = %req.container_id, "oci: start");
 
         run_youki(&["start", &req.container_id]).await?;
         Ok(Response::new(OciStartResponse {}))
@@ -582,6 +620,8 @@ impl oci_service_server::OciService for OciServiceImpl {
         request: Request<OciStateRequest>,
     ) -> Result<Response<OciStateResponse>, Status> {
         let req = request.into_inner();
+        let request_id = request_id_from_metadata(req.metadata.as_ref(), "oci-state");
+        debug!(request_id = %request_id, container_id = %req.container_id, "oci: state");
 
         let output =
             run_youki_output(&["state", &req.container_id], YOUKI_LIFECYCLE_TIMEOUT).await?;
@@ -601,7 +641,13 @@ impl oci_service_server::OciService for OciServiceImpl {
         request: Request<OciExecRequest>,
     ) -> Result<Response<OciExecResponse>, Status> {
         let req = request.into_inner();
-        info!(container_id = %req.container_id, command = %req.command, "oci: exec");
+        let request_id = request_id_from_metadata(req.metadata.as_ref(), "oci-exec");
+        info!(
+            request_id = %request_id,
+            container_id = %req.container_id,
+            command = %req.command,
+            "oci: exec"
+        );
 
         // Youki 0.5.7 exec doesn't properly enter the container's mount
         // namespace, causing commands to see the initramfs instead of the
@@ -675,7 +721,13 @@ impl oci_service_server::OciService for OciServiceImpl {
         request: Request<OciKillRequest>,
     ) -> Result<Response<OciKillResponse>, Status> {
         let req = request.into_inner();
-        info!(container_id = %req.container_id, signal = %req.signal, "oci: kill");
+        let request_id = request_id_from_metadata(req.metadata.as_ref(), "oci-kill");
+        info!(
+            request_id = %request_id,
+            container_id = %req.container_id,
+            signal = %req.signal,
+            "oci: kill"
+        );
 
         run_youki(&["kill", &req.container_id, &req.signal]).await?;
         Ok(Response::new(OciKillResponse {}))
@@ -686,7 +738,13 @@ impl oci_service_server::OciService for OciServiceImpl {
         request: Request<OciDeleteRequest>,
     ) -> Result<Response<OciDeleteResponse>, Status> {
         let req = request.into_inner();
-        info!(container_id = %req.container_id, force = req.force, "oci: delete");
+        let request_id = request_id_from_metadata(req.metadata.as_ref(), "oci-delete");
+        info!(
+            request_id = %request_id,
+            container_id = %req.container_id,
+            force = req.force,
+            "oci: delete"
+        );
 
         if req.force {
             run_youki(&["delete", "--force", &req.container_id]).await?;
@@ -985,6 +1043,13 @@ impl network_service_server::NetworkService for NetworkServiceImpl {
         request: Request<NetworkSetupRequest>,
     ) -> Result<Response<NetworkSetupResponse>, Status> {
         let req = request.into_inner();
+        let request_id = request_id_from_metadata(req.metadata.as_ref(), "network-setup");
+        debug!(
+            request_id = %request_id,
+            stack_id = %req.stack_id,
+            services = req.services.len(),
+            "grpc: network setup request"
+        );
         do_network_setup(&req.stack_id, &req.services)
     }
 
@@ -993,6 +1058,13 @@ impl network_service_server::NetworkService for NetworkServiceImpl {
         request: Request<NetworkTeardownRequest>,
     ) -> Result<Response<NetworkTeardownResponse>, Status> {
         let req = request.into_inner();
+        let request_id = request_id_from_metadata(req.metadata.as_ref(), "network-teardown");
+        debug!(
+            request_id = %request_id,
+            stack_id = %req.stack_id,
+            services = req.service_names.len(),
+            "grpc: network teardown request"
+        );
         do_network_teardown(&req.stack_id, &req.service_names).await
     }
 }
@@ -1084,7 +1156,7 @@ mod tests {
     async fn exec_order_sequence_is_monotonic_across_control_ops() {
         let exec_id = test_exec_id();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<ExecEvent, Status>>(8);
-        register_exec_order_context(exec_id, ExecOrderContext::new(tx));
+        register_exec_order_context(exec_id, ExecOrderContext::new(tx, "req-test".to_string()));
 
         let first_event = match send_ordered_exec_event(
             exec_id,
@@ -1117,15 +1189,19 @@ mod tests {
         assert!(matches!(
             first,
             Some(Ok(ExecEvent {
+                sequence: 1,
+                request_id,
                 event: Some(exec_event::Event::Stdout(_)),
-            }))
+            })) if request_id == "req-test"
         ));
         let second = rx.recv().await;
         assert!(matches!(
             second,
             Some(Ok(ExecEvent {
+                sequence: 3,
+                request_id,
                 event: Some(exec_event::Event::Stderr(_)),
-            }))
+            })) if request_id == "req-test"
         ));
 
         remove_exec_order_context(exec_id);

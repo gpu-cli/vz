@@ -117,6 +117,15 @@ pub enum RuntimeError {
         reason: String,
     },
 
+    /// Policy hook explicitly denied the requested operation.
+    #[error("policy denied `{operation}`: {reason}")]
+    PolicyDenied {
+        /// Operation name denied by policy.
+        operation: String,
+        /// Actionable denial reason.
+        reason: String,
+    },
+
     /// Rootfs directory is missing or invalid.
     #[error("invalid rootfs: {path}")]
     InvalidRootfs {
@@ -172,6 +181,7 @@ impl RuntimeError {
             RuntimeError::ContainerFailed { .. } | RuntimeError::ExecFailed { .. } => {
                 MachineErrorCode::StateConflict
             }
+            RuntimeError::PolicyDenied { .. } => MachineErrorCode::PolicyDenied,
             RuntimeError::UnsupportedOperation { .. } => MachineErrorCode::UnsupportedOperation,
             RuntimeError::Io(_) => MachineErrorCode::BackendUnavailable,
             RuntimeError::Backend { .. } => MachineErrorCode::InternalError,

@@ -443,6 +443,25 @@ impl StateStore {
         Self::collect_event_records(&mut stmt, params![stack_name, after_id])
     }
 
+    /// Load events created after a given event ID (exclusive), capped by limit.
+    ///
+    /// `limit` is clamped to `[1, 1000]` to keep API pagination bounded.
+    pub fn load_events_since_limited(
+        &self,
+        stack_name: &str,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>, StackError> {
+        let clamped_limit = limit.clamp(1, 1000) as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, stack_name, event_json, created_at
+             FROM events WHERE stack_name = ?1 AND id > ?2
+             ORDER BY id ASC
+             LIMIT ?3",
+        )?;
+        Self::collect_event_records(&mut stmt, params![stack_name, after_id, clamped_limit])
+    }
+
     /// Count the total number of events for a stack.
     pub fn event_count(&self, stack_name: &str) -> Result<usize, StackError> {
         let mut stmt = self
@@ -950,6 +969,32 @@ mod tests {
 
         let empty = store.load_events_since("myapp", 999_999).unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn load_events_since_limited_applies_limit_and_order() {
+        let store = StateStore::in_memory().unwrap();
+        for index in 0..3 {
+            store
+                .emit_event(
+                    "myapp",
+                    &StackEvent::ServiceCreating {
+                        stack_name: "myapp".to_string(),
+                        service_name: format!("svc-{index}"),
+                    },
+                )
+                .unwrap();
+        }
+
+        let first_page = store.load_events_since_limited("myapp", 0, 2).unwrap();
+        assert_eq!(first_page.len(), 2);
+        assert!(first_page[0].id < first_page[1].id);
+
+        let second_page = store
+            .load_events_since_limited("myapp", first_page[1].id, 2)
+            .unwrap();
+        assert_eq!(second_page.len(), 1);
+        assert!(second_page[0].id > first_page[1].id);
     }
 
     #[test]
