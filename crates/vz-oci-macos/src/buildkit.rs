@@ -41,8 +41,9 @@ const VERSION_FILE: &str = "version.json";
 const BUILD_OUTPUT_ARCHIVE: &str = "image.tar";
 const BUILDKITD_ADDR: &str = "tcp://127.0.0.1:8372";
 const BUILDKIT_SETUP_TIMEOUT: Duration = Duration::from_secs(90);
-const BUILDKIT_BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const BUILDKIT_BUILD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const BUILDKIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
+const BUILDKIT_OUTPUT_COPY_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const BUILDKIT_RUNC_GUEST_PATH: &str = "/tmp/runc";
 const BUILDKIT_AUTH_TAG: &str = "buildkit-auth";
 const BUILDKIT_AUTH_GUEST_DIR: &str = "/mnt/buildkit-auth";
@@ -52,6 +53,9 @@ const BUILDKIT_CACHE_KEEP_DURATION: &str = "168h";
 const BUILDKIT_CACHE_KEEP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const BUILDKIT_CACHE_DISK_IMAGE: &str = "cache.img";
 const BUILDKIT_CACHE_DISK_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const BUILDKIT_VM_MEMORY_MB: u64 = 8192;
+const BUILDKIT_GUEST_OUTPUT_ARCHIVE: &str = "/var/lib/buildkit/build-output/image.tar";
+const BUILDKIT_GUEST_HOST_OUTPUT_ARCHIVE: &str = "/mnt/build-output/image.tar";
 
 /// Destination for built image output.
 #[derive(Debug, Clone, Default)]
@@ -960,10 +964,21 @@ where
             &request,
             dockerfile_relative,
             "/mnt/build-context",
-            output_dir.as_ref().map(|_| "/mnt/build-output/image.tar"),
+            output_dir.as_ref().map(|_| BUILDKIT_GUEST_OUTPUT_ARCHIVE),
             &mut on_event,
         )
         .await;
+        if build_result.is_ok() && output_dir.is_some() {
+            on_event(BuildEvent::Status {
+                message: "Copying OCI archive from BuildKit VM".to_string(),
+            });
+            copy_guest_output_archive(
+                &vm,
+                BUILDKIT_GUEST_OUTPUT_ARCHIVE,
+                BUILDKIT_GUEST_HOST_OUTPUT_ARCHIVE,
+            )
+            .await?;
+        }
         if let Err(error) = shutdown_guest_buildkitd(&vm).await {
             warn!(%error, "failed to stop buildkitd in guest before VM shutdown");
         }
@@ -1369,7 +1384,7 @@ async fn start_buildkit_vm(
 
     let mut vm_config = LinuxVmConfig::new(kernel.kernel, kernel.initramfs);
     vm_config.cpus = 4;
-    vm_config.memory_mb = 4096;
+    vm_config.memory_mb = BUILDKIT_VM_MEMORY_MB;
     vm_config.disk_image = Some(artifacts.disk_image_path.clone());
     vm_config.shared_dirs = vec![
         SharedDirConfig {
@@ -1563,6 +1578,35 @@ exit 0
     .await
 }
 
+async fn copy_guest_output_archive(
+    vm: &LinuxVm,
+    source: &str,
+    dest: &str,
+) -> Result<(), BuildkitError> {
+    let copy_script = format!(
+        r#"
+set -eu
+
+if [ ! -f "{source}" ]; then
+  echo "build output archive missing: {source}" >&2
+  exit 1
+fi
+
+/bin/busybox mkdir -p /mnt/build-output
+/bin/busybox cp "{source}" "{dest}"
+"#
+    );
+
+    run_guest_command(
+        vm,
+        "copy build output archive to host mount",
+        "/bin/busybox",
+        vec!["sh".to_string(), "-c".to_string(), copy_script],
+        BUILDKIT_OUTPUT_COPY_TIMEOUT,
+    )
+    .await
+}
+
 async fn ensure_guest_buildkit_ready(vm: &LinuxVm) -> Result<(), BuildkitError> {
     let setup_script = format!(
         r#"
@@ -1581,6 +1625,7 @@ if ! /bin/busybox grep -q " /var/lib/buildkit " /proc/mounts; then
   /bin/busybox mke2fs -F /dev/vda >/tmp/buildkit-disk-format.log 2>&1
   /bin/busybox mount -t ext4 /dev/vda /var/lib/buildkit
 fi
+/bin/busybox mkdir -p /var/lib/buildkit/build-output
 /bin/busybox mount -t virtiofs linux-bin /mnt/linux-bin 2>/dev/null || true
 /bin/busybox mount -t virtiofs build-context /mnt/build-context 2>/dev/null || true
 /bin/busybox mount -t virtiofs build-output /mnt/build-output 2>/dev/null || true
