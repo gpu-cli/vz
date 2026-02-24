@@ -33,7 +33,7 @@ impl RuntimeBackend for MacosRuntimeBackend {
     }
 
     fn capabilities(&self) -> contract::RuntimeCapabilities {
-        contract::RuntimeCapabilities::stack_baseline()
+        self.runtime.checkpoint_capabilities()
     }
 
     async fn pull(&self, image: &str) -> Result<String, RuntimeError> {

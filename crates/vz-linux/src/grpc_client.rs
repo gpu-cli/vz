@@ -23,6 +23,10 @@ use vz_agent_proto::{
     network_service_client::NetworkServiceClient, oci_service_client::OciServiceClient,
     port_forward_frame,
 };
+use vz_runtime_contract::{
+    CheckpointClass, RuntimeCapabilities, RuntimeOperation,
+    ensure_checkpoint_class_supported as contract_ensure_checkpoint_class_supported,
+};
 
 use crate::LinuxError;
 
@@ -76,6 +80,29 @@ pub struct GrpcAgentClient {
 }
 
 impl GrpcAgentClient {
+    /// Runtime capability declaration for this gRPC guest path.
+    pub fn advertised_runtime_capabilities() -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            fs_quick_checkpoint: true,
+            checkpoint_fork: true,
+            vm_full_checkpoint: false,
+            ..RuntimeCapabilities::default()
+        }
+    }
+
+    /// Enforce checkpoint class capability gating before guest operations.
+    pub fn ensure_checkpoint_class_supported_for_guest(
+        class: CheckpointClass,
+        operation: RuntimeOperation,
+    ) -> Result<(), LinuxError> {
+        contract_ensure_checkpoint_class_supported(
+            Self::advertised_runtime_capabilities(),
+            class,
+            operation,
+        )
+        .map_err(|err| LinuxError::Protocol(err.to_string()))
+    }
+
     /// Establish a gRPC channel over vsock to the guest agent.
     ///
     /// Connects to the given VM's vsock device on `port` (default 7424)
@@ -627,5 +654,25 @@ mod tests {
         assert_eq!(args[3], GUEST_BUILDCTL_BINARY);
         assert_eq!(args[4], "--addr");
         assert_eq!(args[6], "debug");
+    }
+
+    #[test]
+    fn advertised_runtime_capabilities_gate_vm_full() {
+        let capabilities = GrpcAgentClient::advertised_runtime_capabilities();
+        assert!(capabilities.fs_quick_checkpoint);
+        assert!(capabilities.checkpoint_fork);
+        assert!(!capabilities.vm_full_checkpoint);
+    }
+
+    #[test]
+    fn ensure_checkpoint_class_supported_for_guest_rejects_vm_full() {
+        let err = GrpcAgentClient::ensure_checkpoint_class_supported_for_guest(
+            CheckpointClass::VmFull,
+            RuntimeOperation::CreateCheckpoint,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("vm_full_checkpoint"));
+        assert!(message.contains("create_checkpoint"));
     }
 }

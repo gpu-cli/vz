@@ -11,17 +11,17 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
-use vz::protocol::ExecOutput;
 use vz::Vm;
+use vz::protocol::ExecOutput;
 use vz::{NetworkConfig, SharedDirConfig};
 use vz_image::{
-    parse_image_config_summary_from_store, ImageConfigSummary, ImageId, ImagePuller, ImageStore,
+    ImageConfigSummary, ImageId, ImagePuller, ImageStore, parse_image_config_summary_from_store,
 };
 use vz_linux::{
-    ensure_kernel_with_options, EnsureKernelOptions, ExecOptions, KernelPaths, LinuxError, LinuxVm,
-    LinuxVmConfig, OciExecOptions,
+    EnsureKernelOptions, ExecOptions, KernelPaths, LinuxError, LinuxVm, LinuxVmConfig,
+    OciExecOptions, ensure_kernel_with_options,
 };
-use vz_oci::bundle::{write_oci_bundle, BundleMount, BundleSpec};
+use vz_oci::bundle::{BundleMount, BundleSpec, write_oci_bundle};
 use vz_oci::container_store::{ContainerInfo, ContainerStatus, ContainerStore};
 
 use tokio::sync::Mutex;
@@ -139,6 +139,29 @@ impl Runtime {
     /// Return configured data directory.
     pub fn data_dir(&self) -> &PathBuf {
         &self.config.data_dir
+    }
+
+    /// Advertised checkpoint capabilities for this backend runtime.
+    pub fn checkpoint_capabilities(&self) -> vz_runtime_contract::RuntimeCapabilities {
+        let mut caps = vz_runtime_contract::RuntimeCapabilities::stack_baseline();
+        caps.fs_quick_checkpoint = true;
+        caps.checkpoint_fork = true;
+        caps.vm_full_checkpoint = false;
+        caps
+    }
+
+    /// Validate that checkpoint class semantics are supported before execution.
+    pub fn ensure_checkpoint_class_supported(
+        &self,
+        class: vz_runtime_contract::CheckpointClass,
+        operation: vz_runtime_contract::RuntimeOperation,
+    ) -> Result<(), OciError> {
+        vz_runtime_contract::ensure_checkpoint_class_supported(
+            self.checkpoint_capabilities(),
+            class,
+            operation,
+        )
+        .map_err(|err| OciError::InvalidConfig(err.to_string()))
     }
 
     /// Create a [`MacosRuntimeBackend`] adapter for this runtime.
@@ -2711,6 +2734,34 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_capabilities_disable_vm_full_by_default() {
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir: unique_temp_dir("checkpoint-caps"),
+            ..RuntimeConfig::default()
+        });
+        let caps = runtime.checkpoint_capabilities();
+        assert!(caps.fs_quick_checkpoint);
+        assert!(caps.checkpoint_fork);
+        assert!(!caps.vm_full_checkpoint);
+    }
+
+    #[test]
+    fn ensure_checkpoint_class_supported_rejects_vm_full_without_capability() {
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir: unique_temp_dir("checkpoint-vmfull-gate"),
+            ..RuntimeConfig::default()
+        });
+        let err = runtime
+            .ensure_checkpoint_class_supported(
+                vz_runtime_contract::CheckpointClass::VmFull,
+                vz_runtime_contract::RuntimeOperation::CreateCheckpoint,
+            )
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("vm_full_checkpoint"));
+    }
+
+    #[test]
     fn runtime_list_containers_reads_from_store() {
         let data_dir = unique_temp_dir("list");
         let runtime = Runtime::new(RuntimeConfig {
@@ -2858,12 +2909,14 @@ mod tests {
 
         assert!(runtime.list_containers().unwrap().is_empty());
         assert!(!rootfs_path.exists());
-        assert!(runtime
-            .active_lifecycle
-            .lock()
-            .await
-            .get("one-off")
-            .is_none());
+        assert!(
+            runtime
+                .active_lifecycle
+                .lock()
+                .await
+                .get("one-off")
+                .is_none()
+        );
     }
 
     #[tokio::test]

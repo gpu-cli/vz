@@ -3108,6 +3108,7 @@ dependencies = [
  "tracing-subscriber",
  "vz",
  "vz-agent-proto",
+ "vz-runtime-contract",
 ]
 
 [[package]]

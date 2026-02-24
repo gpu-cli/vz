@@ -104,6 +104,30 @@ pub fn validate_checkpoint_restore_compatibility(
     )))
 }
 
+/// Validate checkpoint-class capability gating for an operation.
+pub fn ensure_checkpoint_class_supported(
+    capabilities: RuntimeCapabilities,
+    class: CheckpointClass,
+    operation: RuntimeOperation,
+) -> Result<(), RuntimeError> {
+    let supported = match class {
+        CheckpointClass::FsQuick => capabilities.fs_quick_checkpoint,
+        CheckpointClass::VmFull => capabilities.vm_full_checkpoint,
+    };
+    if supported {
+        return Ok(());
+    }
+
+    let missing_capability = match class {
+        CheckpointClass::FsQuick => "fs_quick_checkpoint",
+        CheckpointClass::VmFull => "vm_full_checkpoint",
+    };
+    Err(RuntimeError::UnsupportedOperation {
+        operation: operation.as_str().to_string(),
+        reason: format!("missing {missing_capability} capability"),
+    })
+}
+
 /// Workspace-oriented runtime manager that routes stack operations
 /// through backend capabilities with deterministic fallback behavior.
 pub struct WorkspaceRuntimeManager<B: RuntimeBackend> {
@@ -1159,6 +1183,41 @@ mod tests {
             }
             other => panic!("expected invalid config error, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn ensure_checkpoint_class_supported_rejects_missing_vm_full_capability() {
+        let mut capabilities = RuntimeCapabilities::stack_baseline();
+        capabilities.fs_quick_checkpoint = true;
+        capabilities.vm_full_checkpoint = false;
+
+        let err = ensure_checkpoint_class_supported(
+            capabilities,
+            CheckpointClass::VmFull,
+            RuntimeOperation::CreateCheckpoint,
+        )
+        .unwrap_err();
+
+        match err {
+            RuntimeError::UnsupportedOperation { operation, reason } => {
+                assert_eq!(operation, RuntimeOperation::CreateCheckpoint.as_str());
+                assert!(reason.contains("vm_full_checkpoint"));
+            }
+            other => panic!("expected unsupported operation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_checkpoint_class_supported_allows_enabled_class_capability() {
+        let mut capabilities = RuntimeCapabilities::stack_baseline();
+        capabilities.fs_quick_checkpoint = true;
+
+        ensure_checkpoint_class_supported(
+            capabilities,
+            CheckpointClass::FsQuick,
+            RuntimeOperation::RestoreCheckpoint,
+        )
+        .unwrap();
     }
 
     #[test]
