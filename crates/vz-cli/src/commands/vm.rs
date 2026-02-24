@@ -54,7 +54,7 @@ pub enum VmCommand {
     /// Manage supported base image definitions.
     Base(super::vm_base::VmBaseArgs),
 
-    /// Verify signed patch bundles before apply.
+    /// Create, verify, and apply signed patch bundles.
     Patch(super::vm_patch::VmPatchArgs),
 }
 

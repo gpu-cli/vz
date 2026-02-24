@@ -552,6 +552,49 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn parse_vm_patch_create() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "vm",
+            "patch",
+            "create",
+            "--bundle",
+            "/tmp/patch-bundle.vzpatch",
+            "--base-id",
+            "stable",
+            "--operations",
+            "/tmp/operations.json",
+            "--payload-dir",
+            "/tmp/payload",
+            "--signing-key",
+            "/tmp/signing-key.pem",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Vm(args) => match args.action {
+                commands::vm::VmCommand::Patch(patch_args) => match patch_args.action {
+                    commands::vm_patch::VmPatchCommand::Create(create) => {
+                        assert_eq!(create.bundle, PathBuf::from("/tmp/patch-bundle.vzpatch"));
+                        assert_eq!(create.base_id, "stable");
+                        assert_eq!(create.operations, PathBuf::from("/tmp/operations.json"));
+                        assert_eq!(create.payload_dir, PathBuf::from("/tmp/payload"));
+                        assert_eq!(create.signing_key, PathBuf::from("/tmp/signing-key.pem"));
+                        assert_eq!(create.patch_version, "1.0.0");
+                        assert!(create.post_state_hashes.is_none());
+                        assert!(create.bundle_id.is_none());
+                        assert!(create.created_at.is_none());
+                    }
+                    other => panic!("unexpected vm patch action: {other:?}"),
+                },
+                other => panic!("unexpected vm command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn parse_vm_patch_verify() {
         let cli = Cli::try_parse_from([
             "vz",

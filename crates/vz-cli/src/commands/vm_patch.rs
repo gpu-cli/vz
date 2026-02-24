@@ -7,11 +7,13 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, lchown, symlink};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow, bail};
 use base64::Engine as _;
 use clap::{Args, Subcommand};
 use ring::signature;
+use ring::signature::KeyPair;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -41,10 +43,53 @@ pub struct VmPatchArgs {
 /// `vz vm patch` subcommands.
 #[derive(Subcommand, Debug)]
 pub enum VmPatchCommand {
+    /// Create a signed patch bundle from operations + payload inputs.
+    Create(CreateArgs),
     /// Verify bundle signature and digests before apply.
     Verify(VerifyArgs),
     /// Verify, then transactionally apply patch operations.
     Apply(ApplyArgs),
+}
+
+/// Arguments for `vz vm patch create`.
+#[derive(Args, Debug)]
+pub struct CreateArgs {
+    /// Output bundle directory to write (for example: `/tmp/patch-1.vzpatch`).
+    #[arg(long)]
+    pub bundle: PathBuf,
+
+    /// Pinned base selector (`base_id`, `stable`, or `previous`).
+    #[arg(long, value_name = "SELECTOR")]
+    pub base_id: String,
+
+    /// JSON file containing an ordered array of patch operations.
+    #[arg(long)]
+    pub operations: PathBuf,
+
+    /// Directory containing payload files named by SHA-256 digest.
+    #[arg(long)]
+    pub payload_dir: PathBuf,
+
+    /// Ed25519 private key path (PKCS#8 DER or PEM).
+    #[arg(long)]
+    pub signing_key: PathBuf,
+
+    /// Optional JSON object file for post-state hashes (`path -> sha256`).
+    /// When omitted, hashes are derived from `write_file` and `symlink` operations.
+    #[arg(long)]
+    pub post_state_hashes: Option<PathBuf>,
+
+    /// Patch version label.
+    #[arg(long, default_value = "1.0.0")]
+    pub patch_version: String,
+
+    /// Optional explicit bundle identifier.
+    #[arg(long)]
+    pub bundle_id: Option<String>,
+
+    /// Optional creation timestamp metadata.
+    #[arg(long)]
+    pub created_at: Option<String>,
 }
 
 /// Arguments for `vz vm patch verify`.
@@ -484,9 +529,97 @@ fn normalize_sha256_field(field: &str, value: &str) -> anyhow::Result<String> {
 /// Entry point for `vz vm patch`.
 pub async fn run(args: VmPatchArgs) -> anyhow::Result<()> {
     match args.action {
+        VmPatchCommand::Create(args) => create(args),
         VmPatchCommand::Verify(args) => verify(args),
         VmPatchCommand::Apply(args) => apply(args),
     }
+}
+
+fn create(args: CreateArgs) -> anyhow::Result<()> {
+    prepare_bundle_output_dir(&args.bundle)?;
+
+    let resolved_base =
+        super::vm_base::resolve_base_selector(&args.base_id).with_context(|| {
+            format!(
+                "failed to resolve --base-id selector '{}' for patch creation",
+                args.base_id
+            )
+        })?;
+
+    let operations = load_operations_file(&args.operations)?;
+    let payload_entries = load_payload_entries(&args.payload_dir)?;
+    let payload_digest_index = payload_digest_index(&payload_entries);
+    let payload = build_payload_archive(&payload_entries)?;
+
+    let post_state_hashes = if let Some(path) = args.post_state_hashes.as_ref() {
+        load_post_state_hashes_file(path)?
+    } else {
+        derive_post_state_hashes(&operations)?
+    };
+
+    let key_pair = load_ed25519_key_pair(&args.signing_key)?;
+    let signing_identity = format!(
+        "ed25519:{}",
+        base64::engine::general_purpose::STANDARD.encode(key_pair.public_key().as_ref())
+    );
+    let created_at = args.created_at.unwrap_or_else(default_created_at);
+    let bundle_id = args
+        .bundle_id
+        .unwrap_or_else(|| default_bundle_id(&resolved_base.base.base_id));
+    let target_base_fingerprint = BundleBaseFingerprint {
+        img_sha256: resolved_base.base.fingerprint.img_sha256.clone(),
+        aux_sha256: resolved_base.base.fingerprint.aux_sha256.clone(),
+        hwmodel_sha256: resolved_base.base.fingerprint.hwmodel_sha256.clone(),
+        machineid_sha256: resolved_base.base.fingerprint.machineid_sha256.clone(),
+    };
+
+    let manifest = PatchBundleManifest {
+        bundle_id,
+        patch_version: args.patch_version,
+        target_base_id: resolved_base.base.base_id.clone(),
+        target_base_fingerprint,
+        operations_digest: operations_digest_hex(&operations)?,
+        payload_digest: sha256_bytes_hex(&payload),
+        post_state_hashes,
+        created_at,
+        signing_identity,
+        operations,
+    };
+    manifest.validate()?;
+    validate_apply_preflight(&manifest, &payload_digest_index)?;
+
+    let manifest_bytes =
+        serde_json::to_vec_pretty(&manifest).context("failed to serialize manifest")?;
+    fs::write(args.bundle.join(MANIFEST_FILE), &manifest_bytes).with_context(|| {
+        format!(
+            "failed to write bundle manifest {}",
+            args.bundle.join(MANIFEST_FILE).display()
+        )
+    })?;
+    fs::write(args.bundle.join(PAYLOAD_FILE), &payload).with_context(|| {
+        format!(
+            "failed to write bundle payload {}",
+            args.bundle.join(PAYLOAD_FILE).display()
+        )
+    })?;
+    let signature = key_pair.sign(&manifest_bytes);
+    fs::write(args.bundle.join(SIGNATURE_FILE), signature.as_ref()).with_context(|| {
+        format!(
+            "failed to write detached signature {}",
+            args.bundle.join(SIGNATURE_FILE).display()
+        )
+    })?;
+
+    let verified = verify_bundle(&args.bundle)?;
+    validate_patch_target_base_policy(&verified)?;
+
+    println!(
+        "Patch bundle '{}' created at {} for target base '{}'",
+        verified.bundle_id,
+        args.bundle.display(),
+        verified.target_base_id
+    );
+    Ok(())
 }
 
 fn verify(args: VerifyArgs) -> anyhow::Result<()> {
@@ -558,6 +691,265 @@ fn apply_with_state_path(args: ApplyArgs, patch_state_path: &Path) -> anyhow::Re
         root.display()
     );
     Ok(())
+}
+
+fn prepare_bundle_output_dir(path: &Path) -> anyhow::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                bail!(
+                    "bundle output path {} exists and is not a directory",
+                    path.display()
+                );
+            }
+            let mut entries = fs::read_dir(path).with_context(|| {
+                format!("failed to inspect existing bundle dir {}", path.display())
+            })?;
+            if entries.next().is_some() {
+                bail!(
+                    "bundle output directory {} already exists and is not empty",
+                    path.display()
+                );
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            fs::create_dir_all(path).with_context(|| {
+                format!("failed to create bundle output dir {}", path.display())
+            })?;
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to inspect bundle output path {}", path.display())
+            });
+        }
+    }
+    Ok(())
+}
+
+fn load_operations_file(path: &Path) -> anyhow::Result<Vec<PatchOperation>> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read operations file {}", path.display()))?;
+    let operations: Vec<PatchOperation> = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse operations JSON {}", path.display()))?;
+    if operations.is_empty() {
+        bail!(
+            "operations file {} must contain at least one operation",
+            path.display()
+        );
+    }
+    for (index, operation) in operations.iter().enumerate() {
+        operation
+            .validate(index)
+            .with_context(|| format!("invalid operation in {}", path.display()))?;
+    }
+    Ok(operations)
+}
+
+fn load_post_state_hashes_file(path: &Path) -> anyhow::Result<BTreeMap<String, String>> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read post_state_hashes file {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse post_state_hashes JSON {}", path.display()))
+}
+
+fn derive_post_state_hashes(
+    operations: &[PatchOperation],
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut hashes = BTreeMap::new();
+    for (index, operation) in operations.iter().enumerate() {
+        match operation {
+            PatchOperation::WriteFile {
+                path,
+                content_digest,
+                ..
+            } => {
+                let digest = normalize_sha256_field(
+                    &operation_field(index, "content_digest"),
+                    content_digest,
+                )?;
+                hashes.insert(path.clone(), digest);
+            }
+            PatchOperation::Symlink { path, target } => {
+                hashes.insert(
+                    path.clone(),
+                    sha256_bytes_hex(Path::new(target).as_os_str().as_bytes()),
+                );
+            }
+            PatchOperation::DeleteFile { path } => {
+                hashes.remove(path);
+            }
+            PatchOperation::Mkdir { .. }
+            | PatchOperation::SetOwner { .. }
+            | PatchOperation::SetMode { .. } => {}
+        }
+    }
+    Ok(hashes)
+}
+
+fn default_bundle_id(target_base_id: &str) -> String {
+    format!("patch-{target_base_id}-{}", now_unix_seconds())
+}
+
+fn default_created_at() -> String {
+    format!("{}", now_unix_seconds())
+}
+
+fn now_unix_seconds() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => 0,
+    }
+}
+
+fn load_payload_entries(payload_dir: &Path) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let metadata = fs::symlink_metadata(payload_dir)
+        .with_context(|| format!("failed to inspect payload dir {}", payload_dir.display()))?;
+    if !metadata.is_dir() {
+        bail!("payload dir {} is not a directory", payload_dir.display());
+    }
+
+    let mut entries = Vec::new();
+    let read_dir = fs::read_dir(payload_dir)
+        .with_context(|| format!("failed to read payload dir {}", payload_dir.display()))?;
+    for entry in read_dir {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to iterate payload entries under {}",
+                payload_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to inspect payload entry {}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            bail!(
+                "payload entry {} must be a regular file named by SHA-256 digest",
+                path.display()
+            );
+        }
+
+        let digest_label = entry.file_name();
+        let digest_label = digest_label.to_str().ok_or_else(|| {
+            anyhow!(
+                "payload entry {} file name is not valid UTF-8",
+                path.display()
+            )
+        })?;
+        let digest = normalize_sha256_field(
+            &format!("payload entry name '{}'", path.display()),
+            digest_label,
+        )?;
+        let bytes = fs::read(&path)
+            .with_context(|| format!("failed to read payload entry {}", path.display()))?;
+        let actual = sha256_bytes_hex(&bytes);
+        if actual != digest {
+            bail!(
+                "payload entry {} digest mismatch: file name is {}, content hash is {}",
+                path.display(),
+                digest,
+                actual
+            );
+        }
+        entries.push((digest, bytes));
+    }
+
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for pair in entries.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            bail!(
+                "payload dir {} contains duplicate digest {}",
+                payload_dir.display(),
+                pair[0].0
+            );
+        }
+    }
+
+    Ok(entries)
+}
+
+fn payload_digest_index(entries: &[(String, Vec<u8>)]) -> BTreeMap<String, Vec<u8>> {
+    let mut index = BTreeMap::new();
+    for (digest, _) in entries {
+        index.insert(digest.clone(), Vec::new());
+    }
+    index
+}
+
+fn build_payload_archive(entries: &[(String, Vec<u8>)]) -> anyhow::Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    let encoder = zstd::Encoder::new(&mut payload, 0).context("failed to create zstd encoder")?;
+    let mut builder = tar::Builder::new(encoder);
+
+    for (digest, bytes) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, digest, bytes.as_slice())
+            .with_context(|| format!("failed to append payload entry '{digest}'"))?;
+    }
+
+    let encoder = builder
+        .into_inner()
+        .context("failed to finalize tar payload")?;
+    encoder
+        .finish()
+        .context("failed to finalize zstd payload")?;
+    Ok(payload)
+}
+
+fn load_ed25519_key_pair(path: &Path) -> anyhow::Result<signature::Ed25519KeyPair> {
+    let pkcs8 = load_pkcs8_private_key(path)?;
+    signature::Ed25519KeyPair::from_pkcs8(&pkcs8)
+        .or_else(|_| signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(&pkcs8))
+        .map_err(|_| {
+            anyhow!(
+                "failed to parse Ed25519 private key from {} (expected PKCS#8 DER or PEM)",
+                path.display()
+            )
+        })
+}
+
+fn load_pkcs8_private_key(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let raw =
+        fs::read(path).with_context(|| format!("failed to read signing key {}", path.display()))?;
+    if raw.starts_with(b"-----BEGIN ") {
+        decode_pem_private_key(&raw)
+            .with_context(|| format!("failed to decode PEM private key {}", path.display()))
+    } else {
+        Ok(raw)
+    }
+}
+
+fn decode_pem_private_key(raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let text = std::str::from_utf8(raw).context("private key PEM is not valid UTF-8")?;
+    let mut inside = false;
+    let mut saw_footer = false;
+    let mut body = String::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("-----BEGIN ") && trimmed.ends_with("-----") {
+            inside = true;
+            continue;
+        }
+        if trimmed.starts_with("-----END ") && trimmed.ends_with("-----") {
+            saw_footer = true;
+            break;
+        }
+        if inside && !trimmed.is_empty() {
+            body.push_str(trimmed);
+        }
+    }
+
+    if !inside || !saw_footer || body.is_empty() {
+        bail!("private key PEM is missing BEGIN/END markers or base64 body");
+    }
+
+    base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .context("private key PEM body is not valid base64")
 }
 
 fn verify_bundle(bundle_dir: &Path) -> anyhow::Result<PatchBundleManifest> {
@@ -1510,6 +1902,12 @@ mod tests {
         payload
     }
 
+    fn write_test_signing_key(path: &Path) {
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate test key");
+        fs::write(path, pkcs8.as_ref()).expect("write signing key");
+    }
+
     fn default_test_base_fingerprint() -> BundleBaseFingerprint {
         BundleBaseFingerprint {
             img_sha256: "1".repeat(64),
@@ -1590,6 +1988,116 @@ mod tests {
         let manifest = verify_bundle(bundle.path()).expect("bundle should verify");
         assert_eq!(manifest.bundle_id, "vz-cih-2-1-bundle");
         assert_eq!(manifest.patch_version, "1.0.0");
+    }
+
+    #[test]
+    fn patch_create_builds_signed_bundle_from_inputs() {
+        let dir = tempdir().expect("create temp dir");
+        let bundle_dir = dir.path().join("created-bundle.vzpatch");
+        let payload_dir = dir.path().join("payload");
+        fs::create_dir_all(&payload_dir).expect("create payload dir");
+
+        let payload_bytes = b"tool-bytes".to_vec();
+        let payload_digest = sha256_bytes_hex(&payload_bytes);
+        fs::write(payload_dir.join(&payload_digest), &payload_bytes).expect("write payload entry");
+
+        let operations = vec![
+            PatchOperation::WriteFile {
+                path: "/opt/tool".to_string(),
+                content_digest: payload_digest.clone(),
+                mode: Some(0o755),
+            },
+            PatchOperation::Symlink {
+                path: "/usr/local/bin/tool".to_string(),
+                target: "/opt/tool".to_string(),
+            },
+        ];
+        let operations_path = dir.path().join("operations.json");
+        fs::write(
+            &operations_path,
+            serde_json::to_vec_pretty(&operations).expect("serialize operations"),
+        )
+        .expect("write operations file");
+
+        let signing_key_path = dir.path().join("signing-key.pkcs8");
+        write_test_signing_key(&signing_key_path);
+
+        create(CreateArgs {
+            bundle: bundle_dir.clone(),
+            base_id: BASE_CHANNEL_STABLE.to_string(),
+            operations: operations_path,
+            payload_dir,
+            signing_key: signing_key_path,
+            post_state_hashes: None,
+            patch_version: "2.0.0".to_string(),
+            bundle_id: Some("bundle-create-test".to_string()),
+            created_at: Some("2026-02-24T19:00:00Z".to_string()),
+        })
+        .expect("create should succeed");
+
+        assert!(bundle_dir.join(MANIFEST_FILE).exists());
+        assert!(bundle_dir.join(PAYLOAD_FILE).exists());
+        assert!(bundle_dir.join(SIGNATURE_FILE).exists());
+
+        let manifest = verify_bundle(&bundle_dir).expect("created bundle should verify");
+        assert_eq!(manifest.bundle_id, "bundle-create-test");
+        assert_eq!(manifest.patch_version, "2.0.0");
+        assert_eq!(manifest.target_base_id, ACTIVE_BASE_ID);
+        assert_eq!(manifest.operations, operations);
+        assert_eq!(
+            manifest
+                .post_state_hashes
+                .get("/opt/tool")
+                .expect("write file hash"),
+            &payload_digest
+        );
+        assert_eq!(
+            manifest
+                .post_state_hashes
+                .get("/usr/local/bin/tool")
+                .expect("symlink hash"),
+            &sha256_bytes_hex(Path::new("/opt/tool").as_os_str().as_bytes())
+        );
+    }
+
+    #[test]
+    fn patch_create_rejects_payload_digest_mismatch() {
+        let dir = tempdir().expect("create temp dir");
+        let bundle_dir = dir.path().join("created-bundle.vzpatch");
+        let payload_dir = dir.path().join("payload");
+        fs::create_dir_all(&payload_dir).expect("create payload dir");
+
+        let expected_digest = sha256_bytes_hex(b"expected");
+        fs::write(payload_dir.join(&expected_digest), b"unexpected").expect("write payload entry");
+
+        let operations = vec![PatchOperation::WriteFile {
+            path: "/opt/tool".to_string(),
+            content_digest: expected_digest,
+            mode: Some(0o755),
+        }];
+        let operations_path = dir.path().join("operations.json");
+        fs::write(
+            &operations_path,
+            serde_json::to_vec_pretty(&operations).expect("serialize operations"),
+        )
+        .expect("write operations file");
+
+        let signing_key_path = dir.path().join("signing-key.pkcs8");
+        write_test_signing_key(&signing_key_path);
+
+        let err = create(CreateArgs {
+            bundle: bundle_dir,
+            base_id: BASE_CHANNEL_STABLE.to_string(),
+            operations: operations_path,
+            payload_dir,
+            signing_key: signing_key_path,
+            post_state_hashes: None,
+            patch_version: "2.0.0".to_string(),
+            bundle_id: None,
+            created_at: None,
+        })
+        .expect_err("mismatched payload digest should fail");
+        assert!(format!("{err:#}").contains("digest mismatch"));
     }
 
     #[test]

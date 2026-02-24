@@ -131,6 +131,43 @@ vz vm init --allow-unpinned --ipsw ~/Downloads/restore.ipsw
 sudo vz vm provision --image ~/.vz/images/base.img --allow-unpinned
 ```
 
+### 6. Create signed patch bundles
+
+```bash
+# Generate an Ed25519 signing key (PKCS#8 PEM)
+openssl genpkey -algorithm Ed25519 -out /tmp/vz-patch-signing-key.pem
+
+# Prepare operations and payload digests
+cat >/tmp/patch-operations.json <<'JSON'
+[
+  {
+    "type": "write_file",
+    "path": "/usr/local/libexec/vz-agent",
+    "content_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "mode": 493
+  },
+  {
+    "type": "set_mode",
+    "path": "/usr/local/libexec/vz-agent",
+    "mode": 493
+  }
+]
+JSON
+
+mkdir -p /tmp/patch-payload
+cp /path/to/vz-agent /tmp/patch-payload/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+vz vm patch create \
+  --bundle /tmp/patch-1.vzpatch \
+  --base-id stable \
+  --operations /tmp/patch-operations.json \
+  --payload-dir /tmp/patch-payload \
+  --signing-key /tmp/vz-patch-signing-key.pem
+
+vz vm patch verify --bundle /tmp/patch-1.vzpatch
+sudo vz vm patch apply --bundle /tmp/patch-1.vzpatch --root /tmp/mounted-root
+```
+
 ## Command groups
 
 ### Containers
@@ -143,7 +180,7 @@ sudo vz vm provision --image ~/.vz/images/base.img --allow-unpinned
 
 ### VMs (macOS)
 
-`vm init`, `vm run`, `vm exec`, `vm save`, `vm restore`, `vm list`, `vm stop`, `vm cache`, `vm provision`, `vm cleanup`, `vm self-sign`, `vm validate`
+`vm init`, `vm run`, `vm exec`, `vm save`, `vm restore`, `vm list`, `vm stop`, `vm cache`, `vm provision`, `vm cleanup`, `vm self-sign`, `vm validate`, `vm base`, `vm patch`
 
 ## Architecture
 
