@@ -364,7 +364,7 @@ mod tests {
             Some(ContainerLifecycleClass::Workspace)
         );
         assert_eq!(session.pinned_workload_count(), 1);
-        assert_eq!(session.unpin_workload("missing-workload"), None,);
+        assert_eq!(session.unpin_workload("missing-workload"), None);
     }
 
     #[test]
