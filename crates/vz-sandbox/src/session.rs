@@ -23,6 +23,8 @@ use vz_linux::grpc_client::{ExecOptions, GrpcAgentClient, GrpcExecStream};
 
 use crate::error::SandboxError;
 
+const DEFAULT_EXEC_USER: &str = "dev";
+
 // ---------------------------------------------------------------------------
 // SandboxSession
 // ---------------------------------------------------------------------------
@@ -164,6 +166,8 @@ impl SandboxSession {
     /// Execute a command inside the sandbox and collect all output.
     ///
     /// The command string is parsed using shell-words for proper quoting.
+    /// Commands run as the sandbox's default user (`"dev"`) unless an explicit
+    /// user is requested.
     /// The working directory is set to the project's guest-side mount path.
     ///
     /// Uses the session's default timeout if `timeout` is `None`.
@@ -212,7 +216,7 @@ impl SandboxSession {
             let options = ExecOptions {
                 working_dir: Some(self.guest_project_path.clone()),
                 env: Vec::new(),
-                user: None,
+                user: Some(DEFAULT_EXEC_USER.to_string()),
             };
             let stream = client
                 .exec_stream(command, args, options)
@@ -241,7 +245,7 @@ impl SandboxSession {
 
         debug!(
             cmd = cmd,
-            user = user,
+            user = resolve_exec_user(user),
             timeout = ?timeout,
             slot = self.slot_index,
             "exec"
@@ -252,7 +256,7 @@ impl SandboxSession {
             let options = ExecOptions {
                 working_dir: Some(self.guest_project_path.clone()),
                 env: Vec::new(),
-                user: user.map(String::from),
+                user: Some(resolve_exec_user(user).to_string()),
             };
 
             let exec_future = client.exec(command, args, options);
@@ -300,6 +304,10 @@ impl SandboxSession {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+fn resolve_exec_user(user: Option<&str>) -> &str {
+    user.unwrap_or(DEFAULT_EXEC_USER)
 }
 
 // ---------------------------------------------------------------------------
@@ -420,6 +428,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output.exit_code, 0);
+    }
+
+    #[test]
+    fn resolve_exec_user_defaults_to_dev() {
+        assert_eq!(resolve_exec_user(None), "dev");
+    }
+
+    #[test]
+    fn resolve_exec_user_preserves_explicit_override() {
+        assert_eq!(resolve_exec_user(Some("root")), "root");
     }
 
     #[test]

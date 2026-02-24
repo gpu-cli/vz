@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite};
+use tracing::warn;
 use tonic::transport::server::Connected;
 
 /// AF_VSOCK listener that accepts connections from the host.
@@ -85,6 +86,8 @@ struct SockaddrVm {
 
 /// VMADDR_CID_ANY: accept connections from any CID (i.e., the host).
 const VMADDR_CID_ANY: u32 = u32::MAX; // -1 as u32
+/// VMADDR_CID_HOST: standard host CID for AF_VSOCK.
+const VMADDR_CID_HOST: u32 = 2;
 
 /// AF_VSOCK address family on macOS.
 #[cfg(target_os = "macos")]
@@ -165,40 +168,82 @@ impl VsockListener {
 
         let listener_fd = self.fd.as_raw_fd();
 
-        // Use tokio's blocking task pool for the accept() syscall since
-        // we can't easily register a vsock fd with epoll/kqueue through tokio.
-        let conn_fd = tokio::task::spawn_blocking(move || -> io::Result<RawFd> {
-            let mut addr: SockaddrVm = unsafe { std::mem::zeroed() };
-            let mut addr_len = std::mem::size_of::<SockaddrVm>() as libc::socklen_t;
+        loop {
+            // Use tokio's blocking task pool for the accept() syscall since
+            // we can't easily register a vsock fd with epoll/kqueue through tokio.
+            let (conn_fd, source_cid) = tokio::task::spawn_blocking(
+                move || -> io::Result<(RawFd, u32)> {
+                    let mut addr: SockaddrVm = unsafe { std::mem::zeroed() };
+                    let mut addr_len = std::mem::size_of::<SockaddrVm>() as libc::socklen_t;
 
-            // SAFETY: accept() with a valid listening fd.
-            let fd = unsafe {
-                libc::accept(
-                    listener_fd,
-                    &mut addr as *mut SockaddrVm as *mut libc::sockaddr,
-                    &mut addr_len,
-                )
-            };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
+                    // SAFETY: accept() with a valid listening fd.
+                    let fd = unsafe {
+                        libc::accept(
+                            listener_fd,
+                            &mut addr as *mut SockaddrVm as *mut libc::sockaddr,
+                            &mut addr_len,
+                        )
+                    };
+                    if fd < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+
+                    Ok((fd, source_cid_from_addr(&addr)))
+                },
+            )
+            .await
+            .map_err(io::Error::other)??;
+
+            if !is_host_peer(source_cid) {
+                // SAFETY: close accepted fd on explicit rejection.
+                let close_result = unsafe { libc::close(conn_fd) };
+                if close_result != 0 {
+                    warn!(
+                        source_cid = source_cid,
+                        error = %io::Error::last_os_error(),
+                        "failed to close rejected vsock connection"
+                    );
+                } else {
+                    warn!(
+                        source_cid = source_cid,
+                        "rejected vsock connection from non-host CID"
+                    );
+                }
+                continue;
             }
 
-            Ok(fd)
-        })
-        .await
-        .map_err(io::Error::other)??;
+            // Convert the raw fd to a tokio UnixStream for async I/O.
+            // vsock fds are regular file descriptors that support read/write,
+            // and UnixStream is the simplest tokio wrapper for arbitrary fds.
+            // SAFETY: conn_fd is a valid, newly accepted file descriptor.
+            let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(conn_fd) };
+            std_stream.set_nonblocking(true)?;
+            let tokio_stream = tokio::net::UnixStream::from_std(std_stream)?;
 
-        // Convert the raw fd to a tokio UnixStream for async I/O.
-        // vsock fds are regular file descriptors that support read/write,
-        // and UnixStream is the simplest tokio wrapper for arbitrary fds.
-        // SAFETY: conn_fd is a valid, newly accepted file descriptor.
-        let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(conn_fd) };
-        std_stream.set_nonblocking(true)?;
-        let tokio_stream = tokio::net::UnixStream::from_std(std_stream)?;
+            return Ok(VsockStream {
+                inner: tokio_stream,
+            });
+        }
+    }
+}
 
-        Ok(VsockStream {
-            inner: tokio_stream,
-        })
+fn source_cid_from_addr(addr: &SockaddrVm) -> u32 {
+    addr.svm_cid
+}
+
+fn is_host_peer(cid: u32) -> bool {
+    cid == VMADDR_CID_HOST
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_cid_accepted_only_for_host() {
+        assert!(is_host_peer(VMADDR_CID_HOST));
+        assert!(!is_host_peer(3));
+        assert!(!is_host_peer(1024));
     }
 }
 
