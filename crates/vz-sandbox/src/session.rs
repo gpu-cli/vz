@@ -11,7 +11,9 @@
 //!   [`GrpcExecStream`] that yields events as they arrive.
 //! - [`exec_as_root`](SandboxSession::exec_as_root) — Like `exec`, but runs as root.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tokio::sync::Mutex;
@@ -25,6 +27,28 @@ use crate::error::SandboxError;
 // SandboxSession
 // ---------------------------------------------------------------------------
 
+/// Runtime lifecycle class for a pinned workload in a lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ContainerLifecycleClass {
+    /// Long-lived interactive container.
+    Workspace,
+    /// Long-lived service container.
+    Service,
+    /// One-off short-lived command container.
+    Ephemeral,
+}
+
+impl fmt::Display for ContainerLifecycleClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Workspace => "workspace",
+            Self::Service => "service",
+            Self::Ephemeral => "ephemeral",
+        };
+        write!(f, "{value}")
+    }
+}
+
 /// An active sandbox session with a mounted project directory.
 ///
 /// Provides command execution inside the VM. Created by
@@ -34,6 +58,8 @@ use crate::error::SandboxError;
 /// Commands are parsed with `shell-words` for proper quoting support,
 /// then sent as structured gRPC `Exec` requests to the guest agent.
 pub struct SandboxSession {
+    /// Lease identity for this session.
+    lease_id: String,
     /// Pool slot index this session occupies.
     slot_index: usize,
     /// Guest-side path to the mounted project directory.
@@ -42,11 +68,14 @@ pub struct SandboxSession {
     default_exec_timeout: Option<Duration>,
     /// gRPC agent client (None when no VM is connected, e.g. in tests).
     grpc: Arc<Mutex<Option<GrpcAgentClient>>>,
+    /// Active pinned workloads keyed by workload ID.
+    pinned_workloads: StdMutex<BTreeMap<String, ContainerLifecycleClass>>,
 }
 
 impl std::fmt::Debug for SandboxSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SandboxSession")
+            .field("lease_id", &self.lease_id)
             .field("slot_index", &self.slot_index)
             .field("guest_project_path", &self.guest_project_path)
             .field("default_exec_timeout", &self.default_exec_timeout)
@@ -57,17 +86,25 @@ impl std::fmt::Debug for SandboxSession {
 impl SandboxSession {
     /// Create a new session. Called by [`SandboxPool::acquire`](crate::pool::SandboxPool::acquire).
     pub(crate) fn new(
+        lease_id: String,
         slot_index: usize,
         guest_project_path: String,
         default_exec_timeout: Option<Duration>,
         grpc: Arc<Mutex<Option<GrpcAgentClient>>>,
     ) -> Self {
         Self {
+            lease_id,
             slot_index,
             guest_project_path,
             default_exec_timeout,
             grpc,
+            pinned_workloads: StdMutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Lease identifier for this session.
+    pub fn lease_id(&self) -> &str {
+        &self.lease_id
     }
 
     /// Get the pool slot index for this session.
@@ -85,6 +122,43 @@ impl SandboxSession {
     /// Get the default exec timeout for this session.
     pub fn default_exec_timeout(&self) -> Option<Duration> {
         self.default_exec_timeout
+    }
+
+    /// Pin a workload to this lease.
+    ///
+    /// Returns the previous class if the workload was already pinned.
+    pub fn pin_workload(
+        &self,
+        workload_id: impl Into<String>,
+        class: ContainerLifecycleClass,
+    ) -> Option<ContainerLifecycleClass> {
+        self.pinned_workloads_lock()
+            .insert(workload_id.into(), class)
+    }
+
+    /// Remove a workload pin from this lease.
+    ///
+    /// Returns the removed class when the workload existed.
+    pub fn unpin_workload(&self, workload_id: &str) -> Option<ContainerLifecycleClass> {
+        self.pinned_workloads_lock().remove(workload_id)
+    }
+
+    /// Snapshot active pinned workloads as `(workload_id, class)` tuples.
+    pub fn pinned_workloads(&self) -> Vec<(String, ContainerLifecycleClass)> {
+        self.pinned_workloads_lock()
+            .iter()
+            .map(|(workload_id, class)| (workload_id.clone(), *class))
+            .collect()
+    }
+
+    /// Number of active pinned workloads.
+    pub fn pinned_workload_count(&self) -> usize {
+        self.pinned_workloads_lock().len()
+    }
+
+    /// Whether any pinned workloads remain active for this lease.
+    pub fn has_pinned_workloads(&self) -> bool {
+        !self.pinned_workloads_lock().is_empty()
     }
 
     /// Execute a command inside the sandbox and collect all output.
@@ -218,6 +292,14 @@ impl SandboxSession {
 
         Ok((command, args))
     }
+
+    fn pinned_workloads_lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BTreeMap<String, ContainerLifecycleClass>> {
+        self.pinned_workloads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +312,7 @@ mod tests {
 
     fn make_session() -> SandboxSession {
         SandboxSession::new(
+            "lease-1".to_string(),
             0,
             "/mnt/workspace/my-project".to_string(),
             Some(Duration::from_secs(30)),
@@ -240,12 +323,48 @@ mod tests {
     #[test]
     fn session_accessors() {
         let session = make_session();
+        assert_eq!(session.lease_id(), "lease-1");
         assert_eq!(session.slot_index(), 0);
         assert_eq!(session.project_path(), "/mnt/workspace/my-project");
         assert_eq!(
             session.default_exec_timeout(),
             Some(Duration::from_secs(30))
         );
+    }
+
+    #[test]
+    fn session_pin_and_unpin_workloads() {
+        let session = make_session();
+        assert_eq!(session.pinned_workload_count(), 0);
+        assert!(!session.has_pinned_workloads());
+
+        assert_eq!(
+            session.pin_workload("workspace-main", ContainerLifecycleClass::Workspace),
+            None
+        );
+        assert_eq!(
+            session.pin_workload("svc-db", ContainerLifecycleClass::Service),
+            None
+        );
+        assert!(session.has_pinned_workloads());
+        assert_eq!(session.pinned_workload_count(), 2);
+        assert_eq!(
+            session.pinned_workloads(),
+            vec![
+                ("svc-db".to_string(), ContainerLifecycleClass::Service),
+                (
+                    "workspace-main".to_string(),
+                    ContainerLifecycleClass::Workspace,
+                ),
+            ],
+        );
+
+        assert_eq!(
+            session.unpin_workload("workspace-main"),
+            Some(ContainerLifecycleClass::Workspace)
+        );
+        assert_eq!(session.pinned_workload_count(), 1);
+        assert_eq!(session.unpin_workload("missing-workload"), None,);
     }
 
     #[test]
@@ -316,6 +435,7 @@ mod tests {
     #[test]
     fn session_no_timeout() {
         let session = SandboxSession::new(
+            "lease-2".to_string(),
             1,
             "/mnt/workspace/other".to_string(),
             None,

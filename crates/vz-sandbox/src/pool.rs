@@ -1,13 +1,14 @@
 //! Pre-warmed VM pool for fast sandbox acquisition.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
-use vz::Vm;
 use vz::protocol::AGENT_PORT;
+use vz::Vm;
 use vz_linux::grpc_client::GrpcAgentClient;
 
 use crate::error::SandboxError;
@@ -118,6 +119,7 @@ struct PoolEntry {
 pub struct SandboxPool {
     config: SandboxConfig,
     entries: Mutex<Vec<PoolEntry>>,
+    lease_counter: AtomicU64,
 }
 
 impl SandboxPool {
@@ -172,6 +174,7 @@ impl SandboxPool {
         Ok(Self {
             config,
             entries: Mutex::new(entries),
+            lease_counter: AtomicU64::new(0),
         })
     }
 
@@ -210,6 +213,7 @@ impl SandboxPool {
             guest_path = %guest_project_path,
             "acquired pool slot"
         );
+        let lease_id = self.next_lease_id(slot_index);
 
         // If RestoreOnAcquire, restore VM from saved state
         if self.config.isolation == IsolationMode::RestoreOnAcquire {
@@ -258,6 +262,7 @@ impl SandboxPool {
         };
 
         Ok(SandboxSession::new(
+            lease_id,
             slot_index,
             guest_project_path,
             self.config.default_exec_timeout,
@@ -265,9 +270,29 @@ impl SandboxPool {
         ))
     }
 
+    /// Validate that a session can be safely released.
+    pub fn validate_release(&self, session: &SandboxSession) -> Result<(), SandboxError> {
+        let pinned = session.pinned_workloads();
+        if pinned.is_empty() {
+            return Ok(());
+        }
+
+        let active_workloads = pinned
+            .into_iter()
+            .map(|(workload_id, class)| format!("{workload_id}:{class}"))
+            .collect();
+
+        Err(SandboxError::LeaseReleaseDenied {
+            lease_id: session.lease_id().to_string(),
+            active_workloads,
+        })
+    }
+
     /// Release a sandbox session back to the pool.
     ///
     /// Kills any remaining child processes and marks the VM as available.
+    /// Call [`validate_release`](Self::validate_release) first when lifecycle
+    /// pinning is enabled.
     pub async fn release(&self, session: SandboxSession) -> Result<(), SandboxError> {
         let slot_index = session.slot_index();
 
@@ -416,6 +441,11 @@ impl SandboxPool {
         let entries = self.entries.lock().await;
         entries.len()
     }
+
+    fn next_lease_id(&self, slot_index: usize) -> String {
+        let seq = self.lease_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        format!("lease-{slot_index}-{seq}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +554,55 @@ mod tests {
 
         pool.release(session).await.unwrap();
         assert_eq!(pool.available().await, 1);
+    }
+
+    #[tokio::test]
+    async fn validate_release_allows_unpinned_session() {
+        let pool = SandboxPool::new(test_config(), 1).await.unwrap();
+        let session = pool
+            .acquire(Path::new("/Users/dev/workspace/proj"))
+            .await
+            .unwrap();
+
+        assert!(pool.validate_release(&session).is_ok());
+        pool.release(session).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_release_denies_active_pinned_workloads() {
+        let pool = SandboxPool::new(test_config(), 1).await.unwrap();
+        let session = pool
+            .acquire(Path::new("/Users/dev/workspace/proj"))
+            .await
+            .unwrap();
+
+        session.pin_workload(
+            "workspace-main",
+            crate::session::ContainerLifecycleClass::Workspace,
+        );
+        session.pin_workload("svc-db", crate::session::ContainerLifecycleClass::Service);
+
+        let err = pool.validate_release(&session).unwrap_err();
+        assert!(matches!(err, SandboxError::LeaseReleaseDenied { .. }));
+        if let SandboxError::LeaseReleaseDenied {
+            lease_id,
+            active_workloads,
+        } = err
+        {
+            assert_eq!(lease_id, session.lease_id());
+            assert_eq!(
+                active_workloads,
+                vec![
+                    "svc-db:service".to_string(),
+                    "workspace-main:workspace".to_string(),
+                ],
+            );
+        }
+
+        session.unpin_workload("workspace-main");
+        session.unpin_workload("svc-db");
+        assert!(pool.validate_release(&session).is_ok());
+        pool.release(session).await.unwrap();
     }
 
     #[tokio::test]

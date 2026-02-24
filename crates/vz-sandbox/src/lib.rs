@@ -44,6 +44,6 @@ pub mod session;
 
 pub use error::SandboxError;
 pub use pool::{IsolationMode, NetworkPolicy, SandboxConfig, SandboxPool};
-pub use session::SandboxSession;
+pub use session::{ContainerLifecycleClass, SandboxSession};
 pub use vz::protocol::{ExecEvent, ExecOutput};
 pub use vz_linux::grpc_client::GrpcExecStream;

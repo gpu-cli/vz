@@ -29,6 +29,15 @@ pub enum SandboxError {
     #[error("handshake failed: {0}")]
     HandshakeFailed(String),
 
+    /// Lease release was denied because pinned workloads are still active.
+    #[error("cannot release lease {lease_id}: active pinned workloads {active_workloads:?}")]
+    LeaseReleaseDenied {
+        /// Lease identity associated with the release attempt.
+        lease_id: String,
+        /// Workloads still pinned to the lease (`<workload-id>:<class>`).
+        active_workloads: Vec<String>,
+    },
+
     /// A VM-level error from the vz crate.
     #[error(transparent)]
     Vm(#[from] vz::VzError),
@@ -87,5 +96,20 @@ mod tests {
     fn handshake_failed_display() {
         let err = SandboxError::HandshakeFailed("version mismatch".to_string());
         assert_eq!(err.to_string(), "handshake failed: version mismatch");
+    }
+
+    #[test]
+    fn lease_release_denied_display() {
+        let err = SandboxError::LeaseReleaseDenied {
+            lease_id: "lease-0-1".to_string(),
+            active_workloads: vec![
+                "workspace-main:workspace".to_string(),
+                "svc-db:service".to_string(),
+            ],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("lease-0-1"));
+        assert!(msg.contains("workspace-main:workspace"));
+        assert!(msg.contains("svc-db:service"));
     }
 }

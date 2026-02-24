@@ -11,17 +11,17 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
-use vz::Vm;
 use vz::protocol::ExecOutput;
+use vz::Vm;
 use vz::{NetworkConfig, SharedDirConfig};
 use vz_image::{
-    ImageConfigSummary, ImageId, ImagePuller, ImageStore, parse_image_config_summary_from_store,
+    parse_image_config_summary_from_store, ImageConfigSummary, ImageId, ImagePuller, ImageStore,
 };
 use vz_linux::{
-    EnsureKernelOptions, ExecOptions, KernelPaths, LinuxError, LinuxVm, LinuxVmConfig,
-    OciExecOptions, ensure_kernel_with_options,
+    ensure_kernel_with_options, EnsureKernelOptions, ExecOptions, KernelPaths, LinuxError, LinuxVm,
+    LinuxVmConfig, OciExecOptions,
 };
-use vz_oci::bundle::{BundleMount, BundleSpec, write_oci_bundle};
+use vz_oci::bundle::{write_oci_bundle, BundleMount, BundleSpec};
 use vz_oci::container_store::{ContainerInfo, ContainerStatus, ContainerStore};
 
 use tokio::sync::Mutex;
@@ -39,6 +39,37 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const OCI_RUNTIME_BIN_SHARE_TAG: &str = "oci-runtime-bin";
 const OCI_DEFAULT_GUEST_STATE_DIR: &str = "/run/vz-oci";
 const OCI_BUNDLE_DIRNAME: &str = "bundles";
+const OCI_ANNOTATION_CONTAINER_CLASS: &str = "io.vz.container.class";
+const OCI_ANNOTATION_AUTO_REMOVE: &str = "io.vz.container.auto_remove";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerLifecycleClass {
+    Workspace,
+    Service,
+    Ephemeral,
+}
+
+impl ContainerLifecycleClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::Service => "service",
+            Self::Ephemeral => "ephemeral",
+        }
+    }
+}
+
+impl fmt::Display for ContainerLifecycleClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveContainerLifecycle {
+    class: ContainerLifecycleClass,
+    auto_remove: bool,
+}
 
 /// Unified runtime entrypoint.
 #[derive(Clone)]
@@ -70,6 +101,10 @@ pub struct Runtime {
     /// Kept alive so TCP listeners for shared VM stacks continue running.
     /// Cleaned up when the shared VM is shut down.
     stack_port_forwards: Arc<Mutex<HashMap<String, PortForwarding>>>,
+    /// Active container lifecycle metadata keyed by container ID.
+    ///
+    /// Entries exist only while container lifecycle is active (running/leased).
+    active_lifecycle: Arc<Mutex<HashMap<String, ActiveContainerLifecycle>>>,
 }
 
 impl Runtime {
@@ -92,6 +127,7 @@ impl Runtime {
             container_stack: Arc::new(Mutex::new(HashMap::new())),
             port_forwards: Arc::new(Mutex::new(HashMap::new())),
             stack_port_forwards: Arc::new(Mutex::new(HashMap::new())),
+            active_lifecycle: Arc::new(Mutex::new(HashMap::new())),
         };
 
         runtime.reconcile_stale_containers();
@@ -154,6 +190,8 @@ impl Runtime {
         if let Some(vm) = self.vm_handles.lock().await.remove(id) {
             let _ = vm.oci_delete(id.to_string(), true).await;
         }
+        self.container_stack.lock().await.remove(id);
+        self.active_lifecycle.lock().await.remove(id);
 
         self.container_store.remove(id).map_err(OciError::from)?;
 
@@ -192,6 +230,7 @@ impl Runtime {
             })?;
 
         if !matches!(container.status, ContainerStatus::Running) {
+            self.active_lifecycle.lock().await.remove(id);
             return Ok(container);
         }
 
@@ -209,6 +248,7 @@ impl Runtime {
 
         let effective_grace = grace_period.unwrap_or(STOP_GRACE_PERIOD);
         let exit_code = stop_via_oci_runtime(&*vm, id, force, effective_grace, signal).await?;
+        let lifecycle = self.active_lifecycle.lock().await.remove(id);
 
         // Best-effort OCI delete.
         let _ = vm.oci_delete(id.to_string(), true).await;
@@ -236,6 +276,14 @@ impl Runtime {
         self.container_store
             .upsert(container.clone())
             .map_err(OciError::from)?;
+
+        if lifecycle.is_some_and(|state| state.auto_remove) {
+            // Keep one-off semantics best-effort: cleanup failure should not
+            // mask a successful stop result.
+            if let Err(err) = self.remove_container(id).await {
+                warn!(container_id = %id, error = %err, "auto-remove cleanup failed after stop");
+            }
+        }
 
         Ok(container)
     }
@@ -295,6 +343,11 @@ impl Runtime {
         // local store, no dependency on assembled rootfs).
         let image_config = parse_image_config_summary_from_store(&self.store, &image_id.0)?;
         let run = resolve_run_config(image_config, run, &container_id)?;
+        let lifecycle = resolve_container_lifecycle(
+            &run.oci_annotations,
+            ContainerLifecycleClass::Ephemeral,
+            true,
+        )?;
 
         // Await rootfs assembly before proceeding to VM boot.
         let rootfs_dir = match rootfs_handle.await {
@@ -306,6 +359,8 @@ impl Runtime {
                 self.container_store
                     .upsert(container)
                     .map_err(OciError::from)?;
+                self.finalize_one_off_cleanup(&container_id, lifecycle.auto_remove)
+                    .await;
                 return Err(err.into());
             }
             Err(join_err) => {
@@ -315,6 +370,8 @@ impl Runtime {
                 self.container_store
                     .upsert(container)
                     .map_err(OciError::from)?;
+                self.finalize_one_off_cleanup(&container_id, lifecycle.auto_remove)
+                    .await;
                 return Err(OciError::Storage(std::io::Error::other(
                     join_err.to_string(),
                 )));
@@ -328,6 +385,8 @@ impl Runtime {
         self.container_store
             .upsert(container.clone())
             .map_err(OciError::from)?;
+        self.track_active_lifecycle(container_id.clone(), lifecycle)
+            .await;
 
         let output = match run.execution_mode {
             ExecutionMode::GuestExec => self.run_rootfs(&rootfs_dir, run).await,
@@ -353,6 +412,8 @@ impl Runtime {
         self.container_store
             .upsert(container)
             .map_err(OciError::from)?;
+        self.finalize_one_off_cleanup(&container_id, lifecycle.auto_remove)
+            .await;
 
         output
     }
@@ -400,6 +461,11 @@ impl Runtime {
         // Parse image config concurrently with rootfs assembly.
         let image_config = parse_image_config_summary_from_store(&self.store, &image_id.0)?;
         let run = resolve_run_config(image_config, run, &container_id)?;
+        let lifecycle = resolve_container_lifecycle(
+            &run.oci_annotations,
+            ContainerLifecycleClass::Workspace,
+            false,
+        )?;
 
         // Await rootfs assembly before booting the VM.
         let rootfs_dir = match rootfs_handle.await {
@@ -442,6 +508,8 @@ impl Runtime {
                 self.container_store
                     .upsert(container)
                     .map_err(OciError::from)?;
+                self.track_active_lifecycle(container_id.clone(), lifecycle)
+                    .await;
                 Ok(container_id)
             }
             Err(err) => {
@@ -738,6 +806,11 @@ impl Runtime {
             })?;
         tracing::debug!("step 2 OK");
         let run = resolve_run_config(image_config, run, &container_id)?;
+        let lifecycle = resolve_container_lifecycle(
+            &run.oci_annotations,
+            ContainerLifecycleClass::Service,
+            false,
+        )?;
 
         // Build OCI bundle referencing the assembled rootfs (shared via VirtioFS).
         //
@@ -954,6 +1027,8 @@ impl Runtime {
         self.container_store
             .upsert(container)
             .map_err(OciError::from)?;
+        self.track_active_lifecycle(container_id.clone(), lifecycle)
+            .await;
 
         // Step 5: Write /etc/hosts inside the running container via oci_exec.
         // This writes directly into the container's mount namespace after
@@ -1043,9 +1118,11 @@ impl Runtime {
         {
             let mut vm_handles = self.vm_handles.lock().await;
             let mut cs = self.container_stack.lock().await;
+            let mut active_lifecycle = self.active_lifecycle.lock().await;
             for cid in &stack_containers {
                 vm_handles.remove(cid);
                 cs.remove(cid);
+                active_lifecycle.remove(cid);
             }
         }
 
@@ -1782,6 +1859,31 @@ impl Runtime {
         let _ = fs::remove_dir_all(rootfs_dir);
     }
 
+    async fn track_active_lifecycle(
+        &self,
+        container_id: String,
+        lifecycle: ActiveContainerLifecycle,
+    ) {
+        self.active_lifecycle
+            .lock()
+            .await
+            .insert(container_id, lifecycle);
+    }
+
+    async fn finalize_one_off_cleanup(&self, container_id: &str, auto_remove: bool) {
+        self.active_lifecycle.lock().await.remove(container_id);
+
+        if auto_remove {
+            if let Err(err) = self.remove_container(container_id).await {
+                warn!(
+                    container_id = %container_id,
+                    error = %err,
+                    "one-off auto-remove cleanup failed"
+                );
+            }
+        }
+    }
+
     fn cleanup_orphaned_rootfs(&self) {
         let rootfs_root = self.config.data_dir.join("rootfs");
         if !rootfs_root.is_dir() {
@@ -2432,6 +2534,52 @@ impl fmt::Debug for Runtime {
     }
 }
 
+fn resolve_container_lifecycle(
+    oci_annotations: &[(String, String)],
+    default_class: ContainerLifecycleClass,
+    default_auto_remove: bool,
+) -> Result<ActiveContainerLifecycle, OciError> {
+    let mut class = None;
+    let mut auto_remove = None;
+
+    for (key, value) in oci_annotations {
+        if key == OCI_ANNOTATION_CONTAINER_CLASS {
+            class = Some(parse_container_lifecycle_class(value)?);
+            continue;
+        }
+
+        if key == OCI_ANNOTATION_AUTO_REMOVE {
+            auto_remove = Some(parse_auto_remove_flag(value)?);
+        }
+    }
+
+    Ok(ActiveContainerLifecycle {
+        class: class.unwrap_or(default_class),
+        auto_remove: auto_remove.unwrap_or(default_auto_remove),
+    })
+}
+
+fn parse_container_lifecycle_class(raw: &str) -> Result<ContainerLifecycleClass, OciError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "workspace" => Ok(ContainerLifecycleClass::Workspace),
+        "service" => Ok(ContainerLifecycleClass::Service),
+        "ephemeral" => Ok(ContainerLifecycleClass::Ephemeral),
+        other => Err(OciError::InvalidConfig(format!(
+            "invalid OCI annotation '{OCI_ANNOTATION_CONTAINER_CLASS}={other}'; expected one of: workspace, service, ephemeral"
+        ))),
+    }
+}
+
+fn parse_auto_remove_flag(raw: &str) -> Result<bool, OciError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(OciError::InvalidConfig(format!(
+            "invalid OCI annotation '{OCI_ANNOTATION_AUTO_REMOVE}={other}'; expected true or false"
+        ))),
+    }
+}
+
 fn resolve_run_config(
     image_config: ImageConfigSummary,
     run: RunConfig,
@@ -2673,6 +2821,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_off_auto_remove_cleanup_path_removes_container_and_lifecycle() {
+        let data_dir = unique_temp_dir("one-off-auto-remove");
+        let rootfs_path = data_dir.join("rootfs").join("one-off");
+        fs::create_dir_all(&rootfs_path).unwrap();
+
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir: data_dir.clone(),
+            ..RuntimeConfig::default()
+        });
+
+        runtime
+            .container_store
+            .upsert(ContainerInfo {
+                id: "one-off".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                image_id: "sha256:img1".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 0 },
+                created_unix_secs: 100,
+                started_unix_secs: Some(101),
+                stopped_unix_secs: Some(102),
+                rootfs_path: Some(rootfs_path.clone()),
+                host_pid: None,
+            })
+            .unwrap();
+
+        runtime.active_lifecycle.lock().await.insert(
+            "one-off".to_string(),
+            ActiveContainerLifecycle {
+                class: ContainerLifecycleClass::Ephemeral,
+                auto_remove: true,
+            },
+        );
+
+        runtime.finalize_one_off_cleanup("one-off", true).await;
+
+        assert!(runtime.list_containers().unwrap().is_empty());
+        assert!(!rootfs_path.exists());
+        assert!(runtime
+            .active_lifecycle
+            .lock()
+            .await
+            .get("one-off")
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn stop_via_oci_runtime_sends_sigterm_and_polls_state() {
         let mock = MockOciLifecycleOps::new(ExecOutput {
             exit_code: 0,
@@ -2888,6 +3082,72 @@ mod tests {
 
         let resolved = resolve_run_config(image_config, run, "container-123").unwrap();
         assert_eq!(resolved.execution_mode, ExecutionMode::OciRuntime);
+    }
+
+    #[test]
+    fn resolve_container_lifecycle_uses_expected_defaults() {
+        let empty = Vec::new();
+
+        let run_defaults =
+            resolve_container_lifecycle(&empty, ContainerLifecycleClass::Ephemeral, true).unwrap();
+        assert_eq!(run_defaults.class, ContainerLifecycleClass::Ephemeral);
+        assert!(run_defaults.auto_remove);
+
+        let workspace_defaults =
+            resolve_container_lifecycle(&empty, ContainerLifecycleClass::Workspace, false).unwrap();
+        assert_eq!(workspace_defaults.class, ContainerLifecycleClass::Workspace);
+        assert!(!workspace_defaults.auto_remove);
+
+        let service_defaults =
+            resolve_container_lifecycle(&empty, ContainerLifecycleClass::Service, false).unwrap();
+        assert_eq!(service_defaults.class, ContainerLifecycleClass::Service);
+        assert!(!service_defaults.auto_remove);
+    }
+
+    #[test]
+    fn resolve_container_lifecycle_honors_annotation_overrides() {
+        let annotations = vec![
+            (
+                OCI_ANNOTATION_CONTAINER_CLASS.to_string(),
+                "service".to_string(),
+            ),
+            (OCI_ANNOTATION_AUTO_REMOVE.to_string(), "true".to_string()),
+        ];
+
+        let lifecycle =
+            resolve_container_lifecycle(&annotations, ContainerLifecycleClass::Workspace, false)
+                .unwrap();
+
+        assert_eq!(lifecycle.class, ContainerLifecycleClass::Service);
+        assert!(lifecycle.auto_remove);
+    }
+
+    #[test]
+    fn resolve_container_lifecycle_rejects_invalid_annotation_values() {
+        let invalid_class = vec![(
+            OCI_ANNOTATION_CONTAINER_CLASS.to_string(),
+            "daemon".to_string(),
+        )];
+        let class_err =
+            resolve_container_lifecycle(&invalid_class, ContainerLifecycleClass::Workspace, false)
+                .unwrap_err();
+        assert!(
+            matches!(class_err, OciError::InvalidConfig(ref msg) if msg.contains(OCI_ANNOTATION_CONTAINER_CLASS))
+        );
+
+        let invalid_auto_remove = vec![(
+            OCI_ANNOTATION_AUTO_REMOVE.to_string(),
+            "sometimes".to_string(),
+        )];
+        let auto_remove_err = resolve_container_lifecycle(
+            &invalid_auto_remove,
+            ContainerLifecycleClass::Workspace,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(auto_remove_err, OciError::InvalidConfig(ref msg) if msg.contains(OCI_ANNOTATION_AUTO_REMOVE))
+        );
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
