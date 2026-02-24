@@ -33,6 +33,9 @@ pub enum VmCommand {
     /// Stop a running VM.
     Stop(super::stop::StopArgs),
 
+    /// Remove VM runtime metadata (and optionally image artifacts).
+    Rm(super::rm::RmArgs),
+
     /// Manage cached files (IPSWs, downloads).
     Cache(super::cache::CacheArgs),
 
@@ -59,6 +62,7 @@ pub async fn run(args: VmArgs) -> anyhow::Result<()> {
         VmCommand::Restore(a) => super::restore::run(a).await,
         VmCommand::List(a) => super::list::run(a).await,
         VmCommand::Stop(a) => super::stop::run(a).await,
+        VmCommand::Rm(a) => super::rm::run(a).await,
         VmCommand::Cache(a) => super::cache::run(a).await,
         VmCommand::Provision(a) => super::provision::run(a).await,
         VmCommand::Cleanup(a) => super::cleanup::run(a).await,

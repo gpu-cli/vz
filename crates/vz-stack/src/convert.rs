@@ -229,11 +229,7 @@ struct ConvertedResources {
 fn convert_resources(resources: &ResourcesSpec) -> ConvertedResources {
     let cpus = resources.cpus.map(|c| {
         let rounded = c.ceil() as u8;
-        if rounded == 0 {
-            1
-        } else {
-            rounded
-        }
+        if rounded == 0 { 1 } else { rounded }
     });
 
     let memory_mb = resources.memory_bytes.map(|bytes| bytes / (1024 * 1024));

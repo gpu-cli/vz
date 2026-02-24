@@ -1,8 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
+use docker_credential::{CredentialRetrievalError, DockerCredential, get_credential};
 use oci_distribution::Reference;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,6 +38,9 @@ const BUILDKITD_ADDR: &str = "tcp://127.0.0.1:8372";
 const BUILDKIT_SETUP_TIMEOUT: Duration = Duration::from_secs(90);
 const BUILDKIT_BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const BUILDKIT_RUNC_GUEST_PATH: &str = "/tmp/runc";
+const BUILDKIT_AUTH_TAG: &str = "buildkit-auth";
+const BUILDKIT_AUTH_GUEST_DIR: &str = "/mnt/buildkit-auth";
+const BUILDKIT_AUTH_GUEST_CONFIG: &str = "/mnt/buildkit-auth/config.json";
 const BUILDKIT_SNAPSHOTTER: &str = "overlayfs";
 const BUILDKIT_CACHE_KEEP_DURATION: &str = "168h";
 const BUILDKIT_CACHE_KEEP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
@@ -224,6 +229,16 @@ pub enum BuildkitError {
     /// Wrapped HTTP download error.
     #[error(transparent)]
     Http(#[from] reqwest::Error),
+
+    /// Docker credential helper lookup failed.
+    #[error("failed to resolve docker credentials for registry '{registry}': {source}")]
+    CredentialLookup {
+        /// Registry host used for credential lookup.
+        registry: String,
+        /// Underlying credential helper failure.
+        #[source]
+        source: CredentialRetrievalError,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +269,19 @@ struct OciIndex {
 struct OciManifest {
     config: OciDescriptor,
     layers: Vec<OciDescriptor>,
+}
+
+#[derive(Debug, Serialize)]
+struct DockerConfigFile {
+    auths: BTreeMap<String, DockerConfigAuth>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DockerConfigAuth {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identitytoken: Option<String>,
 }
 
 /// Build a Dockerfile and handle the requested output mode.
@@ -298,108 +326,123 @@ where
         }
         BuildOutput::RegistryPush => None,
     };
-
-    on_event(BuildEvent::Status {
-        message: "Booting BuildKit VM".to_string(),
-    });
-    let vm = start_buildkit_vm(config, Some(&context_dir), output_dir.as_deref()).await?;
-    on_event(BuildEvent::Status {
-        message: "Running BuildKit solve".to_string(),
-    });
-    let build_result = run_guest_build(
-        &vm,
-        &request,
-        dockerfile_relative,
-        "/mnt/build-context",
-        output_dir.as_ref().map(|_| "/mnt/build-output/image.tar"),
-        &mut on_event,
-    )
-    .await;
-    let stop_result = vm.stop().await;
-    if let Err(error) = stop_result {
-        warn!(%error, "failed to stop BuildKit VM cleanly");
+    let dockerfile_text = tokio::fs::read_to_string(&dockerfile_host).await?;
+    let auth_dir = prepare_buildkit_auth_dir(config, &dockerfile_text, &request).await?;
+    if auth_dir.is_some() {
+        on_event(BuildEvent::Status {
+            message: "Using registry credentials for BuildKit".to_string(),
+        });
     }
-    build_result?;
 
-    let final_result = match output_mode {
-        BuildOutput::VzStore => {
-            on_event(BuildEvent::Status {
-                message: "Importing OCI archive into local store".to_string(),
-            });
-            let output_dir = output_dir.as_ref().ok_or_else(|| {
-                BuildkitError::InvalidConfig("missing output directory".to_string())
-            })?;
-            let image_tar = output_dir.join(BUILD_OUTPUT_ARCHIVE);
-            if !image_tar.is_file() {
-                return Err(BuildkitError::InvalidOciLayout(format!(
-                    "build output archive not found: {}",
-                    image_tar.display()
-                )));
-            }
-
-            let data_dir = expand_home_dir(&config.data_dir);
-            let store = ImageStore::new(data_dir);
-            let image_id = import_oci_tar_to_store(&store, &image_tar, &request.tag).await?;
-
-            BuildResult {
-                image_id: Some(image_id),
-                tag: request.tag,
-                output_path: None,
-                pushed: false,
-            }
+    let result = async {
+        on_event(BuildEvent::Status {
+            message: "Booting BuildKit VM".to_string(),
+        });
+        let vm = start_buildkit_vm(
+            config,
+            Some(&context_dir),
+            output_dir.as_deref(),
+            auth_dir.as_deref(),
+        )
+        .await?;
+        on_event(BuildEvent::Status {
+            message: "Running BuildKit solve".to_string(),
+        });
+        let build_result = run_guest_build(
+            &vm,
+            &request,
+            dockerfile_relative,
+            "/mnt/build-context",
+            output_dir.as_ref().map(|_| "/mnt/build-output/image.tar"),
+            &mut on_event,
+        )
+        .await;
+        let stop_result = vm.stop().await;
+        if let Err(error) = stop_result {
+            warn!(%error, "failed to stop BuildKit VM cleanly");
         }
-        BuildOutput::OciTar { dest } => {
-            on_event(BuildEvent::Status {
-                message: "Writing OCI archive output".to_string(),
-            });
-            let output_dir = output_dir.as_ref().ok_or_else(|| {
-                BuildkitError::InvalidConfig("missing output directory".to_string())
-            })?;
-            let image_tar = output_dir.join(BUILD_OUTPUT_ARCHIVE);
-            if !image_tar.is_file() {
-                return Err(BuildkitError::InvalidOciLayout(format!(
-                    "build output archive not found: {}",
-                    image_tar.display()
-                )));
-            }
+        build_result?;
 
-            let destination = expand_home_dir(&dest);
-            if let Some(parent) = destination.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            tokio::fs::copy(&image_tar, &destination).await?;
+        let final_result = match output_mode {
+            BuildOutput::VzStore => {
+                on_event(BuildEvent::Status {
+                    message: "Importing OCI archive into local store".to_string(),
+                });
+                let output_dir = output_dir.as_ref().ok_or_else(|| {
+                    BuildkitError::InvalidConfig("missing output directory".to_string())
+                })?;
+                let image_tar = output_dir.join(BUILD_OUTPUT_ARCHIVE);
+                if !image_tar.is_file() {
+                    return Err(BuildkitError::InvalidOciLayout(format!(
+                        "build output archive not found: {}",
+                        image_tar.display()
+                    )));
+                }
 
-            BuildResult {
+                let data_dir = expand_home_dir(&config.data_dir);
+                let store = ImageStore::new(data_dir);
+                let image_id = import_oci_tar_to_store(&store, &image_tar, &request.tag).await?;
+
+                BuildResult {
+                    image_id: Some(image_id),
+                    tag: request.tag,
+                    output_path: None,
+                    pushed: false,
+                }
+            }
+            BuildOutput::OciTar { dest } => {
+                on_event(BuildEvent::Status {
+                    message: "Writing OCI archive output".to_string(),
+                });
+                let output_dir = output_dir.as_ref().ok_or_else(|| {
+                    BuildkitError::InvalidConfig("missing output directory".to_string())
+                })?;
+                let image_tar = output_dir.join(BUILD_OUTPUT_ARCHIVE);
+                if !image_tar.is_file() {
+                    return Err(BuildkitError::InvalidOciLayout(format!(
+                        "build output archive not found: {}",
+                        image_tar.display()
+                    )));
+                }
+
+                let destination = expand_home_dir(&dest);
+                if let Some(parent) = destination.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::copy(&image_tar, &destination).await?;
+
+                BuildResult {
+                    image_id: None,
+                    tag: request.tag,
+                    output_path: Some(destination),
+                    pushed: false,
+                }
+            }
+            BuildOutput::RegistryPush => BuildResult {
                 image_id: None,
                 tag: request.tag,
-                output_path: Some(destination),
-                pushed: false,
-            }
-        }
-        BuildOutput::RegistryPush => BuildResult {
-            image_id: None,
-            tag: request.tag,
-            output_path: None,
-            pushed: true,
-        },
-    };
+                output_path: None,
+                pushed: true,
+            },
+        };
 
-    if let Some(output_dir) = output_dir
-        && let Err(error) = tokio::fs::remove_dir_all(&output_dir).await
-    {
-        warn!(
-            path = %output_dir.display(),
-            %error,
-            "failed to clean temporary BuildKit output directory"
-        );
+        Ok(final_result)
+    }
+    .await;
+
+    if let Some(output_dir) = &output_dir {
+        cleanup_temp_dir(output_dir, "BuildKit output").await;
+    }
+    if let Some(auth_dir) = &auth_dir {
+        cleanup_temp_dir(auth_dir, "BuildKit auth").await;
     }
 
-    Ok(final_result)
+    result
 }
 
 /// Return a human-readable BuildKit cache usage table (from `buildctl du`).
 pub async fn cache_disk_usage(config: &RuntimeConfig) -> Result<String, BuildkitError> {
-    let vm = start_buildkit_vm(config, None, None).await?;
+    let vm = start_buildkit_vm(config, None, None, None).await?;
     let output = async {
         ensure_guest_buildkit_ready(&vm).await?;
         run_buildctl(
@@ -434,7 +477,7 @@ pub async fn cache_prune(
     config: &RuntimeConfig,
     options: CachePruneOptions,
 ) -> Result<String, BuildkitError> {
-    let vm = start_buildkit_vm(config, None, None).await?;
+    let vm = start_buildkit_vm(config, None, None, None).await?;
     let output = async {
         ensure_guest_buildkit_ready(&vm).await?;
 
@@ -471,10 +514,234 @@ pub async fn cache_prune(
     Ok(render_command_output(output))
 }
 
+async fn prepare_buildkit_auth_dir(
+    config: &RuntimeConfig,
+    dockerfile_text: &str,
+    request: &BuildRequest,
+) -> Result<Option<PathBuf>, BuildkitError> {
+    let mut registries = registries_for_build(dockerfile_text, request);
+    if registries.is_empty() {
+        registries.insert("docker.io".to_string());
+    }
+
+    let mut auths = BTreeMap::new();
+    match &config.auth {
+        vz_image::Auth::Anonymous => return Ok(None),
+        vz_image::Auth::Basic { username, password } => {
+            let entry = basic_docker_auth(username, password);
+            for registry in &registries {
+                for key in docker_auth_keys_for_registry(registry) {
+                    auths.insert(key, entry.clone());
+                }
+            }
+        }
+        vz_image::Auth::DockerConfig => {
+            for registry in &registries {
+                let server = docker_server_for_registry(registry);
+                match get_credential(&server) {
+                    Ok(DockerCredential::UsernamePassword(username, password)) => {
+                        let entry = basic_docker_auth(&username, &password);
+                        for key in docker_auth_keys_for_registry(registry) {
+                            auths.insert(key, entry.clone());
+                        }
+                    }
+                    Ok(DockerCredential::IdentityToken(token)) => {
+                        let entry = DockerConfigAuth {
+                            auth: None,
+                            identitytoken: Some(token),
+                        };
+                        for key in docker_auth_keys_for_registry(registry) {
+                            auths.insert(key, entry.clone());
+                        }
+                    }
+                    Err(error) if is_nonfatal_credential_lookup_error(&error) => {}
+                    Err(error) => {
+                        return Err(BuildkitError::CredentialLookup {
+                            registry: registry.clone(),
+                            source: error,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if auths.is_empty() {
+        return Ok(None);
+    }
+
+    let base_dir = default_buildkit_dir()?;
+    let auth_dir = unique_dir(base_dir.join("tmp"), "build-auth");
+    tokio::fs::create_dir_all(&auth_dir).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&auth_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    let config_file = DockerConfigFile { auths };
+    let config_json = serde_json::to_vec_pretty(&config_file)?;
+    let config_path = auth_dir.join("config.json");
+    tokio::fs::write(&config_path, config_json).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(Some(auth_dir))
+}
+
+fn registries_for_build(dockerfile_text: &str, request: &BuildRequest) -> BTreeSet<String> {
+    let mut registries = parse_dockerfile_registries(dockerfile_text);
+    if let Some(registry) = parse_dockerfile_syntax_registry(dockerfile_text) {
+        registries.insert(registry);
+    }
+    // Dockerfile frontend images are frequently hosted on Docker Hub.
+    // Keep Hub credentials available even when FROM references only other registries.
+    registries.insert("docker.io".to_string());
+
+    if matches!(request.output, BuildOutput::RegistryPush)
+        && let Some(registry) = parse_registry_from_reference(&request.tag)
+    {
+        registries.insert(registry);
+    }
+
+    registries
+}
+
+fn parse_dockerfile_registries(dockerfile_text: &str) -> BTreeSet<String> {
+    let mut registries = BTreeSet::new();
+
+    for line in dockerfile_text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let mut tokens = trimmed.split_whitespace();
+        let Some(first) = tokens.next() else {
+            continue;
+        };
+        if !first.eq_ignore_ascii_case("from") {
+            continue;
+        }
+
+        let image = tokens.find(|token| !token.starts_with("--"));
+        let Some(image) = image else {
+            continue;
+        };
+
+        if image.contains("${") {
+            continue;
+        }
+
+        if let Some(registry) = parse_registry_from_reference(image) {
+            registries.insert(registry);
+        }
+    }
+
+    registries
+}
+
+fn parse_dockerfile_syntax_registry(dockerfile_text: &str) -> Option<String> {
+    for line in dockerfile_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !trimmed.starts_with('#') {
+            return None;
+        }
+
+        let directive = trimmed.trim_start_matches('#').trim();
+        let Some(rest) = directive.strip_prefix("syntax=") else {
+            continue;
+        };
+        let image_ref = rest.trim();
+        if image_ref.is_empty() || image_ref.contains("${") {
+            return None;
+        }
+        return parse_registry_from_reference(image_ref);
+    }
+
+    None
+}
+
+fn parse_registry_from_reference(reference: &str) -> Option<String> {
+    Reference::from_str(reference)
+        .ok()
+        .map(|parsed| parsed.registry().to_string())
+}
+
+fn docker_server_for_registry(registry: &str) -> String {
+    if is_docker_hub_registry(registry) {
+        "https://index.docker.io/v1/".to_string()
+    } else {
+        registry.to_string()
+    }
+}
+
+fn docker_auth_keys_for_registry(registry: &str) -> Vec<String> {
+    if is_docker_hub_registry(registry) {
+        vec![
+            "https://index.docker.io/v1/".to_string(),
+            "docker.io".to_string(),
+            "index.docker.io".to_string(),
+            "registry-1.docker.io".to_string(),
+        ]
+    } else {
+        vec![registry.to_string()]
+    }
+}
+
+fn is_docker_hub_registry(registry: &str) -> bool {
+    matches!(
+        registry,
+        "docker.io" | "index.docker.io" | "registry-1.docker.io"
+    )
+}
+
+fn basic_docker_auth(username: &str, password: &str) -> DockerConfigAuth {
+    let encoded =
+        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+    DockerConfigAuth {
+        auth: Some(encoded),
+        identitytoken: None,
+    }
+}
+
+fn is_nonfatal_credential_lookup_error(error: &CredentialRetrievalError) -> bool {
+    match error {
+        CredentialRetrievalError::NoCredentialConfigured
+        | CredentialRetrievalError::ConfigNotFound
+        | CredentialRetrievalError::ConfigReadError => true,
+        CredentialRetrievalError::HelperFailure { stdout, stderr, .. } => {
+            let text = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+            text.contains("not found")
+                || text.contains("credentials not found")
+                || text.contains("no credentials")
+        }
+        _ => false,
+    }
+}
+
+async fn cleanup_temp_dir(path: &Path, label: &str) {
+    if let Err(error) = tokio::fs::remove_dir_all(path).await {
+        warn!(
+            label,
+            path = %path.display(),
+            %error,
+            "failed to clean temporary directory"
+        );
+    }
+}
+
 async fn start_buildkit_vm(
     config: &RuntimeConfig,
     context_dir: Option<&Path>,
     output_dir: Option<&Path>,
+    auth_dir: Option<&Path>,
 ) -> Result<LinuxVm, BuildkitError> {
     let artifacts = ensure_buildkit_artifacts().await?;
     let kernel = ensure_kernel_with_options(EnsureKernelOptions {
@@ -535,6 +802,14 @@ async fn start_buildkit_vm(
             tag: "build-output".to_string(),
             source: output_dir.to_path_buf(),
             read_only: false,
+        });
+    }
+
+    if let Some(auth_dir) = auth_dir {
+        vm_config.shared_dirs.push(SharedDirConfig {
+            tag: BUILDKIT_AUTH_TAG.to_string(),
+            source: auth_dir.to_path_buf(),
+            read_only: true,
         });
     }
 
@@ -634,7 +909,7 @@ async fn ensure_guest_buildkit_ready(vm: &LinuxVm) -> Result<(), BuildkitError> 
         r#"
 set -eu
 
-/bin/busybox mkdir -p /mnt/buildkit-bin /mnt/buildkit-cache /mnt/linux-bin /var/lib/buildkit /mnt/build-context /mnt/build-output /mnt/host-ssl
+/bin/busybox mkdir -p /mnt/buildkit-bin /mnt/buildkit-cache /mnt/linux-bin /var/lib/buildkit /mnt/build-context /mnt/build-output /mnt/host-ssl {BUILDKIT_AUTH_GUEST_DIR}
 /bin/busybox mkdir -p /etc/buildkit
 /bin/busybox mount -t virtiofs buildkit-bin /mnt/buildkit-bin 2>/dev/null || true
 /bin/busybox mount -t virtiofs buildkit-cache /mnt/buildkit-cache 2>/dev/null || true
@@ -642,6 +917,7 @@ set -eu
 /bin/busybox mount -t virtiofs build-context /mnt/build-context 2>/dev/null || true
 /bin/busybox mount -t virtiofs build-output /mnt/build-output 2>/dev/null || true
 /bin/busybox mount -t virtiofs host-ssl /mnt/host-ssl 2>/dev/null || true
+/bin/busybox mount -t virtiofs {BUILDKIT_AUTH_TAG} {BUILDKIT_AUTH_GUEST_DIR} 2>/dev/null || true
 /bin/busybox mkdir -p /sys/fs/cgroup
 /bin/busybox mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
 
@@ -674,6 +950,13 @@ if [ -f /mnt/host-ssl/cert.pem ]; then
   /bin/busybox cp /mnt/host-ssl/cert.pem /etc/ssl/certs/ca-certificates.crt
   export SSL_CERT_FILE=/mnt/host-ssl/cert.pem
 fi
+if [ -f {BUILDKIT_AUTH_GUEST_CONFIG} ]; then
+  /bin/busybox mkdir -p /root/.docker
+  /bin/busybox cp {BUILDKIT_AUTH_GUEST_CONFIG} /root/.docker/config.json
+  /bin/busybox chmod 0600 /root/.docker/config.json
+fi
+export HOME=/root
+export DOCKER_CONFIG=/root/.docker
 
 /bin/busybox cat >/etc/buildkit/buildkitd.toml <<'CFG'
 [worker.oci]
@@ -742,8 +1025,17 @@ async fn run_buildctl(
 
     let output = vm
         .exec_capture_streaming(
-            "/mnt/buildkit-bin/buildctl".to_string(),
-            full_args,
+            "/bin/busybox".to_string(),
+            {
+                let mut args = vec![
+                    "env".to_string(),
+                    "HOME=/root".to_string(),
+                    "DOCKER_CONFIG=/root/.docker".to_string(),
+                    "/mnt/buildkit-bin/buildctl".to_string(),
+                ];
+                args.extend(full_args);
+                args
+            },
             timeout,
             |event| {
                 if let Some(callback) = on_event.as_mut() {
@@ -1260,6 +1552,62 @@ mod tests {
         assert_eq!(BuildProgress::Plain.as_buildctl_value(), "plain");
         assert_eq!(BuildProgress::Tty.as_buildctl_value(), "tty");
         assert_eq!(BuildProgress::RawJson.as_buildctl_value(), "rawjson");
+    }
+
+    #[test]
+    fn parse_dockerfile_registries_extracts_from_lines() {
+        let dockerfile = r#"
+            FROM --platform=$BUILDPLATFORM golang:1.22 AS builder
+            FROM ghcr.io/example/base:latest
+            FROM builder AS final
+            # FROM should not be parsed in comments
+        "#;
+
+        let registries = parse_dockerfile_registries(dockerfile);
+        assert!(registries.contains("docker.io"));
+        assert!(registries.contains("ghcr.io"));
+    }
+
+    #[test]
+    fn parse_dockerfile_syntax_registry_extracts_registry() {
+        let dockerfile = r#"
+            # syntax=docker/dockerfile:1.4
+            FROM alpine:3.20
+        "#;
+        assert_eq!(
+            parse_dockerfile_syntax_registry(dockerfile).as_deref(),
+            Some("docker.io")
+        );
+    }
+
+    #[test]
+    fn registries_for_build_always_includes_docker_hub_for_frontend() {
+        let dockerfile = r#"
+            # syntax=docker/dockerfile:1.4
+            FROM mcr.microsoft.com/dotnet/sdk:8.0
+        "#;
+        let request = BuildRequest {
+            context_dir: PathBuf::from("."),
+            dockerfile: PathBuf::from("Dockerfile"),
+            tag: "example:test".to_string(),
+            target: None,
+            build_args: BTreeMap::new(),
+            secrets: vec![],
+            no_cache: false,
+            output: BuildOutput::VzStore,
+            progress: BuildProgress::Plain,
+        };
+        let registries = registries_for_build(dockerfile, &request);
+        assert!(registries.contains("docker.io"));
+        assert!(registries.contains("mcr.microsoft.com"));
+    }
+
+    #[test]
+    fn docker_hub_registry_keys_include_helper_and_host_variants() {
+        let keys = docker_auth_keys_for_registry("docker.io");
+        assert!(keys.iter().any(|k| k == "https://index.docker.io/v1/"));
+        assert!(keys.iter().any(|k| k == "docker.io"));
+        assert!(keys.iter().any(|k| k == "registry-1.docker.io"));
     }
 
     #[tokio::test]

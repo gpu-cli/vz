@@ -112,6 +112,25 @@ pub struct UpArgs {
     /// Disable TUI dashboard (use plain text output).
     #[arg(long)]
     pub no_tui: bool,
+
+    #[command(flatten)]
+    pub auth: StackRegistryAuthOpts,
+}
+
+/// Registry authentication options for image pulls during stack startup.
+#[derive(Args, Debug, Clone, Default)]
+pub struct StackRegistryAuthOpts {
+    /// Use credentials from local Docker credential configuration.
+    #[arg(long, conflicts_with_all = ["username", "password"])]
+    pub docker_config: bool,
+
+    /// Registry username when using basic auth.
+    #[arg(long, requires = "password", conflicts_with = "docker_config")]
+    pub username: Option<String>,
+
+    /// Registry password when using basic auth.
+    #[arg(long, requires = "username", conflicts_with = "docker_config")]
+    pub password: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -356,11 +375,14 @@ struct OciContainerRuntime {
 
 impl OciContainerRuntime {
     #[cfg(target_os = "macos")]
-    fn new(oci_data_dir: &Path) -> anyhow::Result<Self> {
-        let config = vz_oci_macos::RuntimeConfig {
+    fn new(oci_data_dir: &Path, auth: Option<vz_image::Auth>) -> anyhow::Result<Self> {
+        let mut config = vz_oci_macos::RuntimeConfig {
             data_dir: oci_data_dir.to_path_buf(),
             ..Default::default()
         };
+        if let Some(auth) = auth {
+            config.auth = auth;
+        }
         let runtime = vz_oci_macos::Runtime::new(config);
         let backend = vz_oci_macos::MacosRuntimeBackend::new(runtime);
         let handle = tokio::runtime::Handle::current();
@@ -368,11 +390,14 @@ impl OciContainerRuntime {
     }
 
     #[cfg(target_os = "linux")]
-    fn new(oci_data_dir: &Path) -> anyhow::Result<Self> {
-        let config = vz_linux_native::LinuxNativeConfig {
+    fn new(oci_data_dir: &Path, auth: Option<vz_image::Auth>) -> anyhow::Result<Self> {
+        let mut config = vz_linux_native::LinuxNativeConfig {
             data_dir: oci_data_dir.to_path_buf(),
             ..Default::default()
         };
+        if let Some(auth) = auth {
+            config.auth = auth;
+        }
         let backend = vz_linux_native::LinuxNativeBackend::new(config);
         let handle = tokio::runtime::Handle::current();
         Ok(Self { backend, handle })
@@ -539,6 +564,28 @@ impl ContainerRuntime for OciContainerRuntime {
 
 // ── up ─────────────────────────────────────────────────────────────
 
+fn resolve_stack_registry_auth(
+    opts: &StackRegistryAuthOpts,
+) -> anyhow::Result<Option<vz_image::Auth>> {
+    if opts.username.is_some() && opts.password.is_none() {
+        bail!("--username requires --password");
+    }
+    if opts.password.is_some() && opts.username.is_none() {
+        bail!("--password requires --username");
+    }
+
+    let auth = match (&opts.docker_config, &opts.username, &opts.password) {
+        (true, _, _) => Some(vz_image::Auth::DockerConfig),
+        (false, Some(username), Some(password)) => Some(vz_image::Auth::Basic {
+            username: username.clone(),
+            password: password.clone(),
+        }),
+        _ => None,
+    };
+
+    Ok(auth)
+}
+
 async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
     let file = resolve_compose_file(args.file)?;
     let yaml = std::fs::read_to_string(&file)
@@ -571,9 +618,11 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let runtime_auth = resolve_stack_registry_auth(&args.auth)?;
+
     // Set up runtime, executor, and orchestrator.
-    let oci_runtime =
-        OciContainerRuntime::new(&state_dir).with_context(|| "failed to initialize OCI runtime")?;
+    let oci_runtime = OciContainerRuntime::new(&state_dir, runtime_auth.clone())
+        .with_context(|| "failed to initialize OCI runtime")?;
 
     let exec_store =
         StateStore::open(&db_path).with_context(|| "failed to open execution state store")?;
@@ -659,7 +708,7 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
             .with_context(|| "teardown apply failed")?;
         if !teardown_actions.actions.is_empty() {
             let mut teardown_executor = StackExecutor::new(
-                OciContainerRuntime::new(&state_dir)
+                OciContainerRuntime::new(&state_dir, runtime_auth)
                     .with_context(|| "failed to create teardown runtime")?,
                 StateStore::open(&db_path).with_context(|| "failed to open teardown exec store")?,
                 &state_dir,
@@ -1284,7 +1333,7 @@ async fn cmd_down(args: DownArgs) -> anyhow::Result<()> {
         .collect();
 
     if !result.actions.is_empty() {
-        let oci_runtime = OciContainerRuntime::new(&state_dir)
+        let oci_runtime = OciContainerRuntime::new(&state_dir, None)
             .with_context(|| "failed to initialize OCI runtime")?;
 
         let exec_store =
@@ -2130,6 +2179,40 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn resolve_stack_registry_auth_defaults_to_none() {
+        let opts = StackRegistryAuthOpts::default();
+        let auth = resolve_stack_registry_auth(&opts).unwrap();
+        assert!(auth.is_none());
+    }
+
+    #[test]
+    fn resolve_stack_registry_auth_supports_docker_config() {
+        let opts = StackRegistryAuthOpts {
+            docker_config: true,
+            ..Default::default()
+        };
+        let auth = resolve_stack_registry_auth(&opts).unwrap();
+        assert_eq!(auth, Some(vz_image::Auth::DockerConfig));
+    }
+
+    #[test]
+    fn resolve_stack_registry_auth_supports_basic_credentials() {
+        let opts = StackRegistryAuthOpts {
+            username: Some("alice".to_string()),
+            password: Some("s3cr3t".to_string()),
+            ..Default::default()
+        };
+        let auth = resolve_stack_registry_auth(&opts).unwrap();
+        assert_eq!(
+            auth,
+            Some(vz_image::Auth::Basic {
+                username: "alice".to_string(),
+                password: "s3cr3t".to_string(),
+            })
+        );
+    }
 
     #[test]
     fn resolve_stack_name_explicit() {

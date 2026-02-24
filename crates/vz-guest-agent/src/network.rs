@@ -363,7 +363,10 @@ fn find_veth_peer(host_name: &str) -> io::Result<String> {
         .args(["link", "show"])
         .output()
         .map_err(|e| {
-            io::Error::new(e.kind(), format!("failed to exec `{IP_BIN} link show`: {e}"))
+            io::Error::new(
+                e.kind(),
+                format!("failed to exec `{IP_BIN} link show`: {e}"),
+            )
         })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);

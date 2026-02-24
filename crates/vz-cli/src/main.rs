@@ -319,6 +319,17 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn parse_vm_rm_subcommand() {
+        let cli = Cli::try_parse_from(["vz", "vm", "rm", "my-vm", "--force", "--delete-image"])
+            .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::Rm(_))
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn parse_vm_save_subcommand() {
         let cli = Cli::try_parse_from(["vz", "vm", "save", "my-vm", "--output", "state.bin"])
             .expect("parse");
@@ -385,6 +396,54 @@ mod tests {
             cli.command,
             Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::SelfSign(_))
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_provision_user_agent_mode() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "vm",
+            "provision",
+            "--image",
+            "base.img",
+            "--agent-mode",
+            "user",
+        ])
+        .expect("parse");
+
+        if let Commands::Vm(ref vm_args) = cli.command {
+            if let commands::vm::VmCommand::Provision(ref provision) = vm_args.action {
+                assert!(matches!(
+                    provision.agent_mode,
+                    commands::provision::AgentModeArg::User
+                ));
+            } else {
+                panic!("expected Provision");
+            }
+        } else {
+            panic!("expected Vm");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_provision_defaults_to_system_agent_mode() {
+        let cli =
+            Cli::try_parse_from(["vz", "vm", "provision", "--image", "base.img"]).expect("parse");
+
+        if let Commands::Vm(ref vm_args) = cli.command {
+            if let commands::vm::VmCommand::Provision(ref provision) = vm_args.action {
+                assert!(matches!(
+                    provision.agent_mode,
+                    commands::provision::AgentModeArg::System
+                ));
+            } else {
+                panic!("expected Provision");
+            }
+        } else {
+            panic!("expected Vm");
+        }
     }
 
     #[test]

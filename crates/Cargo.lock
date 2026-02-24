@@ -3043,6 +3043,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vz",
+ "vz-image",
  "vz-linux",
  "vz-linux-native",
  "vz-oci-macos",
@@ -3144,6 +3145,7 @@ name = "vz-oci-macos"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "docker_credential",
  "oci-distribution",
  "oci-spec",
  "reqwest",

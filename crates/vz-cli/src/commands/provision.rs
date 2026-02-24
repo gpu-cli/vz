@@ -2,8 +2,23 @@
 
 use std::path::PathBuf;
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use tracing::info;
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AgentModeArg {
+    System,
+    User,
+}
+
+impl From<AgentModeArg> for crate::provision::AgentInstallMode {
+    fn from(value: AgentModeArg) -> Self {
+        match value {
+            AgentModeArg::System => crate::provision::AgentInstallMode::SystemLaunchDaemon,
+            AgentModeArg::User => crate::provision::AgentInstallMode::UserLaunchAgent,
+        }
+    }
+}
 
 /// Provision a VM disk image with user account and guest agent.
 ///
@@ -24,6 +39,10 @@ pub struct ProvisionArgs {
     /// Path to a pre-built guest agent binary. Auto-detected if omitted.
     #[arg(long)]
     pub agent: Option<PathBuf>,
+
+    /// Guest agent install mode: system LaunchDaemon or user LaunchAgent.
+    #[arg(long, value_enum, default_value_t = AgentModeArg::System)]
+    pub agent_mode: AgentModeArg,
 }
 
 pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
@@ -67,10 +86,21 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
         image = %image.display(),
         user = %user_config.username,
         agent = ?agent_path,
+        mode = ?args.agent_mode,
         "provisioning disk image"
     );
 
-    let result = crate::provision::provision_image(&image, &user_config, agent_path.as_deref())?;
+    let install_mode = crate::provision::AgentInstallMode::from(args.agent_mode);
+    let mode_label = match args.agent_mode {
+        AgentModeArg::System => "system",
+        AgentModeArg::User => "user",
+    };
+    let result = crate::provision::provision_image(
+        &image,
+        &user_config,
+        agent_path.as_deref(),
+        install_mode,
+    )?;
 
     println!("Image provisioned successfully: {}", image.display());
     println!(
@@ -79,7 +109,8 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
     );
     println!("  Password: {}", user_config.password);
     if agent_path.is_some() {
-        println!("  Guest agent: installed (starts automatically on boot)");
+        println!("  Guest agent mode: {}", mode_label);
+        println!("  Guest agent: installed");
     }
 
     if result.needs_ownership_fix {

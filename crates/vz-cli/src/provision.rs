@@ -80,6 +80,16 @@ impl Default for ProvisionConfig {
     }
 }
 
+/// How the guest agent should be installed for startup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentInstallMode {
+    /// Install as a system LaunchDaemon (root-owned, starts before login).
+    #[default]
+    SystemLaunchDaemon,
+    /// Install as a per-user LaunchAgent (rootless-friendly, starts at login).
+    UserLaunchAgent,
+}
+
 // ---------------------------------------------------------------------------
 // Auto-configuration (applied to disk image before first boot)
 // ---------------------------------------------------------------------------
@@ -98,6 +108,7 @@ pub fn apply_auto_config(
     mount_point: &Path,
     user_config: &UserConfig,
     guest_agent_binary: Option<&Path>,
+    install_mode: AgentInstallMode,
 ) -> anyhow::Result<()> {
     info!(
         mount_point = %mount_point.display(),
@@ -105,12 +116,51 @@ pub fn apply_auto_config(
         "applying auto-configuration to disk image"
     );
 
-    skip_setup_assistant(mount_point)?;
-    create_user_account(mount_point, user_config)?;
-    enable_auto_login(mount_point, &user_config.username, &user_config.password)?;
+    let user_home_rel = user_config
+        .home
+        .strip_prefix('/')
+        .unwrap_or(&user_config.home);
+    let user_home_exists = mount_point.join(user_home_rel).exists();
+
+    match install_mode {
+        AgentInstallMode::SystemLaunchDaemon => {
+            skip_setup_assistant(mount_point)?;
+            create_user_account(mount_point, user_config)?;
+            enable_auto_login(mount_point, &user_config.username, &user_config.password)?;
+        }
+        AgentInstallMode::UserLaunchAgent => {
+            if let Err(error) = skip_setup_assistant(mount_point) {
+                warn!(
+                    error = %error,
+                    "failed to write .AppleSetupDone in user mode; continuing"
+                );
+            }
+
+            if let Err(error) = create_user_account(mount_point, user_config) {
+                if user_home_exists {
+                    warn!(
+                        error = %error,
+                        user = %user_config.username,
+                        "unable to modify dslocal in user mode; existing user home found, continuing"
+                    );
+                } else {
+                    return Err(error);
+                }
+            }
+
+            if let Err(error) =
+                enable_auto_login(mount_point, &user_config.username, &user_config.password)
+            {
+                warn!(
+                    error = %error,
+                    "failed to set auto-login in user mode; continuing"
+                );
+            }
+        }
+    }
 
     if let Some(agent_path) = guest_agent_binary {
-        install_guest_agent(mount_point, agent_path, user_config)?;
+        install_guest_agent(mount_point, agent_path, user_config, install_mode)?;
     }
 
     info!("auto-configuration complete");
@@ -373,14 +423,25 @@ fn encode_kcpassword(password: &str) -> Vec<u8> {
 
 /// Install the guest agent binary and launchd plist into the disk image.
 ///
-/// Uses a LaunchDaemon (system-level) which starts at boot, before any user
-/// logs in. Requires running as root so files get root:wheel ownership —
-/// launchd silently ignores LaunchDaemon plists not owned by root.
+/// Supports both system LaunchDaemon and per-user LaunchAgent modes.
 fn install_guest_agent(
     mount_point: &Path,
     agent_binary: &Path,
-    _user_config: &UserConfig,
+    user_config: &UserConfig,
+    install_mode: AgentInstallMode,
 ) -> anyhow::Result<()> {
+    match install_mode {
+        AgentInstallMode::SystemLaunchDaemon => {
+            install_guest_agent_system(mount_point, agent_binary)
+        }
+        AgentInstallMode::UserLaunchAgent => {
+            install_guest_agent_user(mount_point, agent_binary, user_config)
+        }
+    }
+}
+
+/// Install the guest agent as a system LaunchDaemon.
+fn install_guest_agent_system(mount_point: &Path, agent_binary: &Path) -> anyhow::Result<()> {
     if !agent_binary.exists() {
         anyhow::bail!("guest agent binary not found: {}", agent_binary.display());
     }
@@ -427,6 +488,87 @@ fn install_guest_agent(
         "installed guest agent (LaunchDaemon)"
     );
     Ok(())
+}
+
+/// Install the guest agent as a per-user LaunchAgent.
+fn install_guest_agent_user(
+    mount_point: &Path,
+    agent_binary: &Path,
+    user_config: &UserConfig,
+) -> anyhow::Result<()> {
+    if !agent_binary.exists() {
+        anyhow::bail!("guest agent binary not found: {}", agent_binary.display());
+    }
+
+    let user_home_rel = user_config
+        .home
+        .strip_prefix('/')
+        .unwrap_or(&user_config.home);
+    let user_home = mount_point.join(user_home_rel);
+    let guest_binary_path = PathBuf::from(&user_config.home)
+        .join("Library")
+        .join("Application Support")
+        .join("vz")
+        .join("vz-guest-agent");
+
+    let agent_dir = user_home.join("Library/Application Support/vz");
+    std::fs::create_dir_all(&agent_dir)?;
+    let dest_binary = agent_dir.join("vz-guest-agent");
+    std::fs::copy(agent_binary, &dest_binary)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest_binary, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    let launch_agents = user_home.join("Library/LaunchAgents");
+    std::fs::create_dir_all(&launch_agents)?;
+    let plist_path = launch_agents.join("com.vz.user-guest-agent.plist");
+    let plist = guest_agent_launchagent_plist(&guest_binary_path);
+    std::fs::write(&plist_path, plist)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&plist_path, std::fs::Permissions::from_mode(0o644))?;
+    }
+
+    info!(
+        user = %user_config.username,
+        binary = %dest_binary.display(),
+        plist = %plist_path.display(),
+        "installed guest agent (LaunchAgent)"
+    );
+    Ok(())
+}
+
+fn guest_agent_launchagent_plist(program_path: &Path) -> String {
+    let program = program_path.to_string_lossy();
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vz.user-guest-agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{program}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/vz-guest-agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/vz-guest-agent.log</string>
+</dict>
+</plist>
+"#
+    )
 }
 
 /// launchd plist for the guest agent daemon.
@@ -806,12 +948,15 @@ pub fn provision_image(
     image_path: &Path,
     user_config: &UserConfig,
     guest_agent_binary: Option<&Path>,
+    install_mode: AgentInstallMode,
 ) -> anyhow::Result<ProvisionResult> {
     // LaunchDaemon plists must be owned by root:wheel. When running as root,
     // files are created with UID 0 automatically. When not root, we still
     // write the files but warn that ownership needs fixing.
     #[cfg(unix)]
-    let needs_ownership_fix = guest_agent_binary.is_some() && !is_root();
+    let needs_ownership_fix = guest_agent_binary.is_some()
+        && install_mode == AgentInstallMode::SystemLaunchDaemon
+        && !is_root();
     #[cfg(not(unix))]
     let needs_ownership_fix = false;
 
@@ -824,7 +969,12 @@ pub fn provision_image(
 
     let disk = attach_and_mount(image_path)?;
 
-    let result = apply_auto_config(&disk.mount_point, user_config, guest_agent_binary);
+    let result = apply_auto_config(
+        &disk.mount_point,
+        user_config,
+        guest_agent_binary,
+        install_mode,
+    );
 
     // If running as non-root, try to fix ownership via sudo (best effort)
     if needs_ownership_fix && result.is_ok() {
@@ -864,13 +1014,31 @@ pub fn provision_image(
     // Save password to sidecar file so `vz run` can display it.
     // Mode 0644 — this is a local dev VM password, not a production secret.
     let password_path = image_path.with_extension("password");
-    std::fs::write(&password_path, &user_config.password)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&password_path, std::fs::Permissions::from_mode(0o644))?;
+    match std::fs::write(&password_path, &user_config.password) {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(error) =
+                    std::fs::set_permissions(&password_path, std::fs::Permissions::from_mode(0o644))
+                {
+                    warn!(
+                        path = %password_path.display(),
+                        error = %error,
+                        "failed to set permissions on credentials sidecar"
+                    );
+                }
+            }
+            info!(path = %password_path.display(), "saved credentials");
+        }
+        Err(error) => {
+            warn!(
+                path = %password_path.display(),
+                error = %error,
+                "failed to persist credentials sidecar; continuing"
+            );
+        }
     }
-    info!(path = %password_path.display(), "saved credentials");
 
     info!("image provisioned successfully");
     Ok(ProvisionResult {
@@ -1018,6 +1186,7 @@ mod tests {
             tmp.path(),
             Path::new("/nonexistent/vz-guest-agent"),
             &config,
+            AgentInstallMode::SystemLaunchDaemon,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
@@ -1036,7 +1205,13 @@ mod tests {
         std::fs::create_dir_all(&mount).unwrap();
 
         let config = UserConfig::default();
-        install_guest_agent(&mount, &fake_binary, &config).unwrap();
+        install_guest_agent(
+            &mount,
+            &fake_binary,
+            &config,
+            AgentInstallMode::SystemLaunchDaemon,
+        )
+        .unwrap();
 
         // Check binary was copied
         assert!(mount.join("usr/local/bin/vz-guest-agent").exists());
@@ -1046,5 +1221,39 @@ mod tests {
         assert!(plist.exists());
         let content = std::fs::read_to_string(plist).unwrap();
         assert!(content.contains("com.vz.guest-agent"));
+    }
+
+    #[test]
+    fn install_guest_agent_user_mode_writes_launch_agent_files() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let fake_binary = tmp.path().join("fake-agent");
+        std::fs::write(&fake_binary, b"#!/bin/bash\necho agent").unwrap();
+
+        let mount = tmp.path().join("mount");
+        std::fs::create_dir_all(&mount).unwrap();
+
+        let config = UserConfig {
+            username: "dev".to_string(),
+            home: "/Users/dev".to_string(),
+            ..Default::default()
+        };
+        install_guest_agent(
+            &mount,
+            &fake_binary,
+            &config,
+            AgentInstallMode::UserLaunchAgent,
+        )
+        .unwrap();
+
+        let user_binary = mount.join("Users/dev/Library/Application Support/vz/vz-guest-agent");
+        assert!(user_binary.exists());
+
+        let plist = mount.join("Users/dev/Library/LaunchAgents/com.vz.user-guest-agent.plist");
+        assert!(plist.exists());
+        let content = std::fs::read_to_string(plist).unwrap();
+        assert!(content.contains("com.vz.user-guest-agent"));
+        assert!(content.contains("/Users/dev/Library/Application Support/vz/vz-guest-agent"));
+        assert!(!content.contains(&mount.to_string_lossy().to_string()));
     }
 }

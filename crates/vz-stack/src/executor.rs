@@ -16,7 +16,7 @@ use tracing::{error, info};
 use crate::convert::{secrets_to_mounts, service_to_run_config};
 use crate::error::StackError;
 use crate::events::StackEvent;
-use crate::network::{resolve_ports, PublishedPort};
+use crate::network::{PublishedPort, resolve_ports};
 use crate::reconcile::Action;
 use crate::spec::{ServiceSpec, StackSpec};
 use crate::state_store::{ServiceObservedState, ServicePhase, StateStore};
@@ -659,11 +659,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                         .filter_map(|s| s.resources.memory_bytes)
                         .map(|b| b / (1024 * 1024))
                         .sum();
-                    if sum > 0 {
-                        Some(sum)
-                    } else {
-                        None
-                    }
+                    if sum > 0 { Some(sum) } else { None }
                 };
                 vz_runtime_contract::StackResourceHint {
                     cpus: max_cpus,
@@ -1187,8 +1183,8 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 /// Test support: mock container runtime shared across test modules.
 #[cfg(test)]
 pub(crate) mod tests_support {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
@@ -1536,12 +1532,16 @@ mod tests {
 
         // Verify events.
         let events = executor.store().load_events("myapp").unwrap();
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StackEvent::ServiceCreating { .. })));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StackEvent::ServiceReady { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::ServiceCreating { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::ServiceReady { .. }))
+        );
     }
 
     #[test]
@@ -1673,9 +1673,11 @@ mod tests {
 
         // ServiceFailed event emitted.
         let events = executor.store().load_events("myapp").unwrap();
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StackEvent::ServiceFailed { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::ServiceFailed { .. }))
+        );
     }
 
     #[test]
@@ -1796,9 +1798,11 @@ mod tests {
 
         // VolumeCreated event emitted.
         let events = executor.store().load_events("myapp").unwrap();
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StackEvent::VolumeCreated { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::VolumeCreated { .. }))
+        );
     }
 
     #[test]
@@ -2150,9 +2154,11 @@ mod tests {
 
         // PortConflict event emitted.
         let events = executor.store().load_events("myapp").unwrap();
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StackEvent::PortConflict { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::PortConflict { .. }))
+        );
 
         // api should be marked Failed.
         let observed = executor.store().load_observed_state("myapp").unwrap();
@@ -2412,12 +2418,16 @@ mod tests {
         let web_config = configs.iter().find(|(id, _)| id == "ctr-web").unwrap();
         let web_hosts = &web_config.1.extra_hosts;
         assert_eq!(web_hosts.len(), 2); // api + db
-        assert!(web_hosts
-            .iter()
-            .any(|(h, ip)| h == "api" && ip == "172.20.0.3"));
-        assert!(web_hosts
-            .iter()
-            .any(|(h, ip)| h == "db" && ip == "172.20.0.4"));
+        assert!(
+            web_hosts
+                .iter()
+                .any(|(h, ip)| h == "api" && ip == "172.20.0.3")
+        );
+        assert!(
+            web_hosts
+                .iter()
+                .any(|(h, ip)| h == "db" && ip == "172.20.0.4")
+        );
     }
 
     #[test]

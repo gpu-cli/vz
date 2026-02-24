@@ -948,9 +948,11 @@ mod tests {
 
         // Event emitted.
         let events = store.load_events("app").unwrap();
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StackEvent::HealthCheckPassed { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::HealthCheckPassed { .. }))
+        );
     }
 
     #[test]
@@ -979,9 +981,11 @@ mod tests {
 
         // HealthCheckFailed event emitted.
         let events = store.load_events("app").unwrap();
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StackEvent::HealthCheckFailed { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::HealthCheckFailed { .. }))
+        );
 
         // Service still Running.
         let observed = store.load_observed_state("app").unwrap();
@@ -1222,8 +1226,10 @@ mod tests {
 
         // Event should be emitted for the failure.
         let events = store.load_events("app").unwrap();
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StackEvent::HealthCheckFailed { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::HealthCheckFailed { .. }))
+        );
     }
 }

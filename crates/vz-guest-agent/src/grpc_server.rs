@@ -452,13 +452,19 @@ impl oci_service_server::OciService for OciServiceImpl {
         let config_path = format!("{}/config.json", &req.bundle_path);
         match patch_oci_config(&config_path).await {
             Ok(()) => info!(container_id = %req.container_id, "oci: config patched for guest VM"),
-            Err(e) => error!(container_id = %req.container_id, error = %e, "oci: failed to patch config"),
+            Err(e) => {
+                error!(container_id = %req.container_id, error = %e, "oci: failed to patch config")
+            }
         }
 
         // Log bundle config for diagnostics.
         match tokio::fs::read_to_string(&config_path).await {
-            Ok(config) => info!(container_id = %req.container_id, config = %config, "oci: bundle config"),
-            Err(e) => error!(container_id = %req.container_id, error = %e, "oci: failed to read bundle config"),
+            Ok(config) => {
+                info!(container_id = %req.container_id, config = %config, "oci: bundle config")
+            }
+            Err(e) => {
+                error!(container_id = %req.container_id, error = %e, "oci: failed to read bundle config")
+            }
         }
 
         run_youki(&["create", "--bundle", &req.bundle_path, &req.container_id]).await?;
@@ -482,7 +488,8 @@ impl oci_service_server::OciService for OciServiceImpl {
     ) -> Result<Response<OciStateResponse>, Status> {
         let req = request.into_inner();
 
-        let output = run_youki_output(&["state", &req.container_id], YOUKI_LIFECYCLE_TIMEOUT).await?;
+        let output =
+            run_youki_output(&["state", &req.container_id], YOUKI_LIFECYCLE_TIMEOUT).await?;
         let state: serde_json::Value = serde_json::from_slice(&output.stdout)
             .map_err(|e| Status::internal(format!("failed to parse youki state: {e}")))?;
 
@@ -505,11 +512,8 @@ impl oci_service_server::OciService for OciServiceImpl {
         // namespace, causing commands to see the initramfs instead of the
         // container rootfs. Work around this by using nsenter: get the init
         // PID from `youki state`, then nsenter into its namespaces.
-        let state_output = run_youki_output(
-            &["state", &req.container_id],
-            YOUKI_LIFECYCLE_TIMEOUT,
-        )
-        .await?;
+        let state_output =
+            run_youki_output(&["state", &req.container_id], YOUKI_LIFECYCLE_TIMEOUT).await?;
         let state: serde_json::Value = serde_json::from_slice(&state_output.stdout)
             .map_err(|e| Status::internal(format!("failed to parse youki state: {e}")))?;
         let pid = state["pid"]
@@ -529,9 +533,8 @@ impl oci_service_server::OciService for OciServiceImpl {
         // Always set a standard PATH so commands like pg_isready are found.
         let has_path = req.env.keys().any(|k| k == "PATH");
         if !has_path {
-            nsenter_args.push(
-                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
-            );
+            nsenter_args
+                .push("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
         }
 
         for (key, value) in &req.env {
@@ -664,7 +667,9 @@ async fn run_youki(args: &[&str]) -> Result<(), Status> {
     };
 
     if !status.success() {
-        let youki_log = tokio::fs::read_to_string(&log_file).await.unwrap_or_default();
+        let youki_log = tokio::fs::read_to_string(&log_file)
+            .await
+            .unwrap_or_default();
         error!(command = %subcmd, log = %youki_log, "youki command failed");
         // Include the last few lines of the youki log in the error response
         // so the host can surface them without needing VM access.
@@ -727,7 +732,10 @@ async fn run_youki_output(
         Err(_) => {
             error!(cmd = %cmd_desc, timeout_secs = timeout.as_secs(), "youki command timed out");
             dump_youki_log(&log_file).await;
-            Err(Status::internal(format!("{cmd_desc} timed out after {}s", timeout.as_secs())))
+            Err(Status::internal(format!(
+                "{cmd_desc} timed out after {}s",
+                timeout.as_secs()
+            )))
         }
     }
 }
@@ -755,7 +763,10 @@ async fn patch_oci_config(config_path: &str) -> Result<(), Status> {
         mounts.retain(|m| {
             let typ = m.get("type").and_then(|t| t.as_str()).unwrap_or("");
             if !supported_types.contains(&typ) {
-                tracing::info!(mount_type = typ, "stripping unsupported mount type from OCI config");
+                tracing::info!(
+                    mount_type = typ,
+                    "stripping unsupported mount type from OCI config"
+                );
                 false
             } else {
                 true

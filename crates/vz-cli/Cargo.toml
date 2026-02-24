@@ -15,6 +15,7 @@ path = "src/main.rs"
 # Cross-platform dependencies
 vz-stack = { workspace = true }
 vz-runtime-contract = { workspace = true }
+vz-image = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -838,24 +838,24 @@ fn fix_ownership(path: &Path) -> io::Result<()> {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|_| "".to_string());
-    
+
     let gid = std::process::Command::new("id")
         .arg("-g")
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|_| "".to_string());
-    
+
     if uid.is_empty() || gid.is_empty() {
         tracing::warn!("could not determine user ID for ownership fix");
         return Ok(());
     }
-    
+
     // Use chown -R to recursively fix ownership
     let output = std::process::Command::new("chown")
         .args(["-R", &format!("{}:{}", uid, gid)])
         .arg(path)
         .output();
-    
+
     match output {
         Ok(o) if o.status.success() => {
             tracing::debug!("fixed ownership of {} to {}:{}", path.display(), uid, gid);
