@@ -12,7 +12,10 @@ use tracing::{debug, info, warn};
 use vz::Vm;
 use vz::protocol::AGENT_PORT;
 use vz_linux::grpc_client::GrpcAgentClient;
-use vz_runtime_contract::{CheckpointLineageStore, CheckpointMetadata};
+use vz_runtime_contract::{
+    Checkpoint, CheckpointClass, CheckpointCompatibilityMetadata, CheckpointLineageStore,
+    CheckpointMetadata, CheckpointState, validate_checkpoint_restore_compatibility,
+};
 
 use crate::error::SandboxError;
 use crate::session::SandboxSession;
@@ -98,6 +101,23 @@ pub enum NetworkPolicy {
     None,
     /// NAT networking — guest can reach the internet via host.
     Nat,
+}
+
+/// Parameters for checkpoint creation.
+#[derive(Debug, Clone)]
+pub struct CreateCheckpointSpec {
+    /// Owning sandbox identifier.
+    pub sandbox_id: String,
+    /// New checkpoint identifier.
+    pub checkpoint_id: String,
+    /// Checkpoint class semantics.
+    pub class: CheckpointClass,
+    /// Optional parent checkpoint lineage id.
+    pub parent_checkpoint_id: Option<String>,
+    /// Compatibility fingerprint used for restore guards.
+    pub compatibility_fingerprint: String,
+    /// Structured compatibility metadata.
+    pub compatibility: CheckpointCompatibilityMetadata,
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +363,120 @@ impl SandboxPool {
         lineage.children_of(parent_checkpoint_id)
     }
 
+    /// Capture a checkpoint for the VM bound to this session.
+    pub async fn create_checkpoint(
+        &self,
+        session: &SandboxSession,
+        spec: CreateCheckpointSpec,
+    ) -> Result<CheckpointMetadata, SandboxError> {
+        let slot_index = session.slot_index();
+        let vm = self.vm_for_slot(slot_index).await?;
+        let artifact_path = self.checkpoint_artifact_path(&spec.checkpoint_id, spec.class);
+        vm.create_checkpoint(&artifact_path).await?;
+
+        let metadata = CheckpointMetadata::new(
+            Checkpoint {
+                checkpoint_id: spec.checkpoint_id,
+                sandbox_id: spec.sandbox_id,
+                parent_checkpoint_id: spec.parent_checkpoint_id,
+                class: spec.class,
+                state: CheckpointState::Ready,
+                created_at: Self::now_unix_secs(),
+                compatibility_fingerprint: spec.compatibility_fingerprint,
+            },
+            spec.compatibility,
+        );
+        if let Err(err) = self.register_checkpoint_metadata(metadata.clone()).await {
+            let _ = fs::remove_file(&artifact_path);
+            return Err(err);
+        }
+
+        Ok(metadata)
+    }
+
+    /// Restore a checkpoint for the VM bound to this session.
+    pub async fn restore_checkpoint(
+        &self,
+        session: &SandboxSession,
+        checkpoint_id: &str,
+        expected_fingerprint: &str,
+        expected_compatibility: Option<CheckpointCompatibilityMetadata>,
+    ) -> Result<CheckpointMetadata, SandboxError> {
+        let Some(metadata) = self.checkpoint_metadata(checkpoint_id).await else {
+            return Err(SandboxError::CheckpointNotFound(checkpoint_id.to_string()));
+        };
+        validate_checkpoint_restore_compatibility(
+            &metadata,
+            expected_fingerprint,
+            expected_compatibility.as_ref(),
+        )
+        .map_err(|err| SandboxError::CheckpointCompatibilityMismatch {
+            checkpoint_id: checkpoint_id.to_string(),
+            details: err.to_string(),
+        })?;
+
+        let artifact_path = self.checkpoint_artifact_path(checkpoint_id, metadata.checkpoint.class);
+        if !artifact_path.exists() {
+            return Err(SandboxError::CheckpointArtifactMissing(artifact_path));
+        }
+
+        let vm = self.vm_for_slot(session.slot_index()).await?;
+        if let Err(err) = vm.stop().await {
+            warn!(
+                slot = session.slot_index(),
+                checkpoint_id,
+                error = %err,
+                "failed to stop VM before checkpoint restore"
+            );
+        }
+        vm.restore_checkpoint(&artifact_path).await?;
+        vm.resume().await?;
+        Ok(metadata)
+    }
+
+    /// Fork a checkpoint into a new checkpoint lineage branch.
+    pub async fn fork_checkpoint(
+        &self,
+        source_checkpoint_id: &str,
+        fork_checkpoint_id: &str,
+        fork_sandbox_id: &str,
+        compatibility_fingerprint: String,
+        compatibility: CheckpointCompatibilityMetadata,
+    ) -> Result<CheckpointMetadata, SandboxError> {
+        let Some(source) = self.checkpoint_metadata(source_checkpoint_id).await else {
+            return Err(SandboxError::CheckpointNotFound(
+                source_checkpoint_id.to_string(),
+            ));
+        };
+
+        let source_path =
+            self.checkpoint_artifact_path(source_checkpoint_id, source.checkpoint.class);
+        if !source_path.exists() {
+            return Err(SandboxError::CheckpointArtifactMissing(source_path));
+        }
+
+        let fork_path = self.checkpoint_artifact_path(fork_checkpoint_id, source.checkpoint.class);
+        vz::Vm::fork_checkpoint(&source_path, &fork_path).await?;
+
+        let metadata = CheckpointMetadata::new(
+            Checkpoint {
+                checkpoint_id: fork_checkpoint_id.to_string(),
+                sandbox_id: fork_sandbox_id.to_string(),
+                parent_checkpoint_id: Some(source_checkpoint_id.to_string()),
+                class: source.checkpoint.class,
+                state: CheckpointState::Ready,
+                created_at: Self::now_unix_secs(),
+                compatibility_fingerprint,
+            },
+            compatibility,
+        );
+        if let Err(err) = self.register_checkpoint_metadata(metadata.clone()).await {
+            let _ = fs::remove_file(&fork_path);
+            return Err(err);
+        }
+        Ok(metadata)
+    }
+
     /// Release a sandbox session back to the pool.
     ///
     /// Kills any remaining child processes and marks the VM as available.
@@ -571,6 +705,37 @@ impl SandboxPool {
         out
     }
 
+    fn checkpoint_artifact_path(&self, checkpoint_id: &str, class: CheckpointClass) -> PathBuf {
+        let stem = checkpoint_id.replace('/', "_");
+        let class_suffix = match class {
+            CheckpointClass::FsQuick => "fs_quick",
+            CheckpointClass::VmFull => "vm_full",
+        };
+        self.checkpoint_catalog_path
+            .with_file_name("checkpoint-artifacts")
+            .join(format!("{stem}.{class_suffix}.state"))
+    }
+
+    fn now_unix_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0)
+    }
+
+    async fn vm_for_slot(&self, slot_index: usize) -> Result<Arc<Vm>, SandboxError> {
+        let entries = self.entries.lock().await;
+        entries
+            .iter()
+            .find(|entry| entry.index == slot_index)
+            .and_then(|entry| entry.vm.clone())
+            .ok_or_else(|| {
+                SandboxError::VmError(format!(
+                    "no VM available in pool slot {slot_index} for checkpoint operation"
+                ))
+            })
+    }
+
     /// Mark a pool entry as poisoned (needs replacement).
     #[allow(dead_code)]
     async fn poison_entry(&self, slot_index: usize) {
@@ -636,6 +801,29 @@ mod tests {
             config_hash: "sha256:config".to_string(),
             host_compatibility_markers: std::collections::BTreeMap::new(),
         }
+    }
+
+    fn checkpoint_metadata(
+        checkpoint_id: &str,
+        sandbox_id: &str,
+        parent_checkpoint_id: Option<&str>,
+        class: CheckpointClass,
+        compatibility_fingerprint: &str,
+        created_at: u64,
+        compatibility_version: &str,
+    ) -> CheckpointMetadata {
+        CheckpointMetadata::new(
+            Checkpoint {
+                checkpoint_id: checkpoint_id.to_string(),
+                sandbox_id: sandbox_id.to_string(),
+                parent_checkpoint_id: parent_checkpoint_id.map(str::to_string),
+                class,
+                state: CheckpointState::Ready,
+                created_at,
+                compatibility_fingerprint: compatibility_fingerprint.to_string(),
+            },
+            compatibility(compatibility_version),
+        )
     }
 
     fn test_config() -> SandboxConfig {
@@ -882,6 +1070,125 @@ mod tests {
                 if message.contains("missing parent")
         ));
 
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_checkpoint_rejects_compatibility_mismatch_before_vm_restore() {
+        let temp = unique_temp_dir("restore-mismatch");
+        let mut config = test_config();
+        config.checkpoint_catalog_path = Some(temp.join("lineage.json"));
+
+        let pool = SandboxPool::new(config, 1).await.unwrap();
+        pool.register_checkpoint_metadata(checkpoint_metadata(
+            "ckpt-root",
+            "sbx-1",
+            None,
+            CheckpointClass::FsQuick,
+            "fp-root",
+            1,
+            "0.1.0",
+        ))
+        .await
+        .unwrap();
+
+        let session = pool
+            .acquire(Path::new("/Users/dev/workspace/project"))
+            .await
+            .unwrap();
+        let err = pool
+            .restore_checkpoint(
+                &session,
+                "ckpt-root",
+                "fp-mismatch",
+                Some(compatibility("0.1.0")),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SandboxError::CheckpointCompatibilityMismatch { .. }
+        ));
+
+        pool.release(session).await.unwrap();
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_checkpoint_copies_artifact_and_registers_child() {
+        let temp = unique_temp_dir("fork");
+        let mut config = test_config();
+        config.checkpoint_catalog_path = Some(temp.join("lineage.json"));
+
+        let pool = SandboxPool::new(config, 1).await.unwrap();
+        let source = checkpoint_metadata(
+            "ckpt-source",
+            "sbx-source",
+            None,
+            CheckpointClass::FsQuick,
+            "fp-source",
+            1,
+            "0.1.0",
+        );
+        pool.register_checkpoint_metadata(source.clone())
+            .await
+            .unwrap();
+
+        let source_path = pool
+            .checkpoint_artifact_path(&source.checkpoint.checkpoint_id, source.checkpoint.class);
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::write(&source_path, b"checkpoint-data").unwrap();
+
+        let child = pool
+            .fork_checkpoint(
+                "ckpt-source",
+                "ckpt-child",
+                "sbx-fork",
+                "fp-child".to_string(),
+                compatibility("0.1.1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            child.checkpoint.parent_checkpoint_id.as_deref(),
+            Some("ckpt-source")
+        );
+        assert_eq!(child.checkpoint.sandbox_id, "sbx-fork");
+
+        let child_path =
+            pool.checkpoint_artifact_path(&child.checkpoint.checkpoint_id, child.checkpoint.class);
+        assert_eq!(fs::read(child_path).unwrap(), b"checkpoint-data");
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_checkpoint_returns_vm_error_when_slot_has_no_vm() {
+        let temp = unique_temp_dir("create-no-vm");
+        let mut config = test_config();
+        config.checkpoint_catalog_path = Some(temp.join("lineage.json"));
+        let pool = SandboxPool::new(config, 1).await.unwrap();
+
+        let session = pool
+            .acquire(Path::new("/Users/dev/workspace/project"))
+            .await
+            .unwrap();
+        let err = pool
+            .create_checkpoint(
+                &session,
+                CreateCheckpointSpec {
+                    sandbox_id: "sbx-1".to_string(),
+                    checkpoint_id: "ckpt-new".to_string(),
+                    class: CheckpointClass::FsQuick,
+                    parent_checkpoint_id: None,
+                    compatibility_fingerprint: "fp".to_string(),
+                    compatibility: compatibility("0.1.0"),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SandboxError::VmError(_)));
+
+        pool.release(session).await.unwrap();
         fs::remove_dir_all(&temp).unwrap();
     }
 

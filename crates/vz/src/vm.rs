@@ -296,6 +296,34 @@ impl Vm {
         })
     }
 
+    /// Capture checkpoint state to disk.
+    ///
+    /// Runtime V2 currently uses VM save-state mechanics for checkpoint
+    /// persistence. Class-level semantics are enforced at the caller layer.
+    pub async fn create_checkpoint(&self, path: &Path) -> Result<(), VzError> {
+        self.save_state(path).await
+    }
+
+    /// Restore a checkpoint state from disk.
+    ///
+    /// After restoration, the VM is paused; callers should explicitly resume.
+    pub async fn restore_checkpoint(&self, path: &Path) -> Result<(), VzError> {
+        self.restore_state(path).await
+    }
+
+    /// Fork a checkpoint artifact into a new checkpoint lineage branch.
+    pub async fn fork_checkpoint(source: &Path, destination: &Path) -> Result<(), VzError> {
+        if let Some(parent) = destination.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|err| VzError::DiskError(format!("create checkpoint dir: {err}")))?;
+        }
+        tokio::fs::copy(source, destination)
+            .await
+            .map_err(|err| VzError::DiskError(format!("fork checkpoint copy failed: {err}")))?;
+        Ok(())
+    }
+
     /// Connect to the guest over vsock on the given port.
     ///
     /// Returns a bidirectional async byte stream.
@@ -455,5 +483,39 @@ impl std::fmt::Debug for Vm {
             .field("state", &self.state())
             .field("queue", &self.queue)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Vm;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let mut base = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        base.push(format!(
+            "vz-vm-checkpoint-test-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[tokio::test]
+    async fn fork_checkpoint_copies_artifact() {
+        let temp = unique_temp_dir("fork-copy");
+        let source = temp.join("source.state");
+        let destination = temp.join("fork").join("destination.state");
+        std::fs::write(&source, b"checkpoint-bytes").unwrap();
+
+        Vm::fork_checkpoint(&source, &destination).await.unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"checkpoint-bytes");
+
+        std::fs::remove_dir_all(temp).unwrap();
     }
 }

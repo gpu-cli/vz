@@ -39,6 +39,71 @@ pub const REQUIRED_IDEMPOTENT_MUTATIONS: &[RuntimeOperation] = &[
     RuntimeOperation::ForkCheckpoint,
 ];
 
+/// Validate checkpoint restore compatibility constraints.
+///
+/// Returns `RuntimeError::InvalidConfig` with explicit mismatch details when
+/// fingerprint or compatibility metadata constraints are violated.
+pub fn validate_checkpoint_restore_compatibility(
+    metadata: &CheckpointMetadata,
+    expected_fingerprint: &str,
+    expected_compatibility: Option<&CheckpointCompatibilityMetadata>,
+) -> Result<(), RuntimeError> {
+    let actual_fingerprint = metadata.checkpoint.compatibility_fingerprint.as_str();
+    if actual_fingerprint != expected_fingerprint {
+        return Err(RuntimeError::InvalidConfig(format!(
+            "checkpoint {} compatibility fingerprint mismatch: expected `{expected_fingerprint}`, got `{actual_fingerprint}`",
+            metadata.checkpoint.checkpoint_id
+        )));
+    }
+
+    let Some(expected) = expected_compatibility else {
+        return Ok(());
+    };
+
+    let actual = &metadata.compatibility;
+    let mut mismatches = Vec::new();
+    if actual.backend_id != expected.backend_id {
+        mismatches.push(format!(
+            "backend_id expected `{}`, got `{}`",
+            expected.backend_id, actual.backend_id
+        ));
+    }
+    if actual.backend_version != expected.backend_version {
+        mismatches.push(format!(
+            "backend_version expected `{}`, got `{}`",
+            expected.backend_version, actual.backend_version
+        ));
+    }
+    if actual.runtime_version != expected.runtime_version {
+        mismatches.push(format!(
+            "runtime_version expected `{}`, got `{}`",
+            expected.runtime_version, actual.runtime_version
+        ));
+    }
+    if actual.config_hash != expected.config_hash {
+        mismatches.push(format!(
+            "config_hash expected `{}`, got `{}`",
+            expected.config_hash, actual.config_hash
+        ));
+    }
+    if actual.guest_artifact_versions != expected.guest_artifact_versions {
+        mismatches.push("guest_artifact_versions differ".to_string());
+    }
+    if actual.host_compatibility_markers != expected.host_compatibility_markers {
+        mismatches.push("host_compatibility_markers differ".to_string());
+    }
+
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+
+    Err(RuntimeError::InvalidConfig(format!(
+        "checkpoint {} is incompatible for restore: {}",
+        metadata.checkpoint.checkpoint_id,
+        mismatches.join("; ")
+    )))
+}
+
 /// Workspace-oriented runtime manager that routes stack operations
 /// through backend capabilities with deterministic fallback behavior.
 pub struct WorkspaceRuntimeManager<B: RuntimeBackend> {
@@ -995,6 +1060,105 @@ mod tests {
             store.register(duplicate),
             Err(ContractInvariantError::CheckpointAlreadyExists { .. })
         ));
+    }
+
+    #[test]
+    fn validate_checkpoint_restore_compatibility_accepts_matching_metadata() {
+        let compatibility = CheckpointCompatibilityMetadata {
+            backend_id: "macos-vz".to_string(),
+            backend_version: "0.1.0".to_string(),
+            runtime_version: "2".to_string(),
+            guest_artifact_versions: BTreeMap::from([(
+                "guest-agent".to_string(),
+                "1.0.0".to_string(),
+            )]),
+            config_hash: "sha256:cfg".to_string(),
+            host_compatibility_markers: BTreeMap::from([(
+                "host.cpu".to_string(),
+                "apple-silicon".to_string(),
+            )]),
+        };
+        let metadata = CheckpointMetadata::new(
+            Checkpoint {
+                checkpoint_id: "ckpt-1".to_string(),
+                sandbox_id: "sbx-1".to_string(),
+                parent_checkpoint_id: None,
+                class: CheckpointClass::FsQuick,
+                state: CheckpointState::Ready,
+                created_at: 10,
+                compatibility_fingerprint: "fp-1".to_string(),
+            },
+            compatibility.clone(),
+        );
+
+        validate_checkpoint_restore_compatibility(&metadata, "fp-1", Some(&compatibility)).unwrap();
+    }
+
+    #[test]
+    fn validate_checkpoint_restore_compatibility_rejects_mismatch() {
+        let metadata = CheckpointMetadata::new(
+            Checkpoint {
+                checkpoint_id: "ckpt-2".to_string(),
+                sandbox_id: "sbx-1".to_string(),
+                parent_checkpoint_id: None,
+                class: CheckpointClass::VmFull,
+                state: CheckpointState::Ready,
+                created_at: 11,
+                compatibility_fingerprint: "fp-actual".to_string(),
+            },
+            CheckpointCompatibilityMetadata {
+                backend_id: "linux-native".to_string(),
+                backend_version: "0.1.0".to_string(),
+                runtime_version: "2".to_string(),
+                guest_artifact_versions: BTreeMap::new(),
+                config_hash: "sha256:cfg-a".to_string(),
+                host_compatibility_markers: BTreeMap::new(),
+            },
+        );
+
+        let err = validate_checkpoint_restore_compatibility(
+            &metadata,
+            "fp-expected",
+            Some(&CheckpointCompatibilityMetadata {
+                backend_id: "macos-vz".to_string(),
+                backend_version: "0.1.0".to_string(),
+                runtime_version: "2".to_string(),
+                guest_artifact_versions: BTreeMap::new(),
+                config_hash: "sha256:cfg-b".to_string(),
+                host_compatibility_markers: BTreeMap::new(),
+            }),
+        )
+        .unwrap_err();
+
+        match err {
+            RuntimeError::InvalidConfig(message) => {
+                assert!(message.contains("compatibility fingerprint mismatch"));
+            }
+            other => panic!("expected invalid config error, got: {other:?}"),
+        }
+
+        let err = validate_checkpoint_restore_compatibility(
+            &metadata,
+            "fp-actual",
+            Some(&CheckpointCompatibilityMetadata {
+                backend_id: "macos-vz".to_string(),
+                backend_version: "0.1.0".to_string(),
+                runtime_version: "2".to_string(),
+                guest_artifact_versions: BTreeMap::new(),
+                config_hash: "sha256:cfg-b".to_string(),
+                host_compatibility_markers: BTreeMap::new(),
+            }),
+        )
+        .unwrap_err();
+
+        match err {
+            RuntimeError::InvalidConfig(message) => {
+                assert!(message.contains("incompatible for restore"));
+                assert!(message.contains("backend_id"));
+                assert!(message.contains("config_hash"));
+            }
+            other => panic!("expected invalid config error, got: {other:?}"),
+        }
     }
 
     #[test]

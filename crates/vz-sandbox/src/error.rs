@@ -60,6 +60,23 @@ pub enum SandboxError {
     #[error("checkpoint lineage violation: {0}")]
     CheckpointLineageViolation(String),
 
+    /// Checkpoint id was not found in lineage metadata.
+    #[error("checkpoint not found: {0}")]
+    CheckpointNotFound(String),
+
+    /// Checkpoint compatibility validation failed for restore.
+    #[error("checkpoint compatibility mismatch for {checkpoint_id}: {details}")]
+    CheckpointCompatibilityMismatch {
+        /// Checkpoint identifier involved in restore.
+        checkpoint_id: String,
+        /// Mismatch details.
+        details: String,
+    },
+
+    /// Checkpoint artifact file is missing from disk.
+    #[error("checkpoint artifact missing: {}", .0.display())]
+    CheckpointArtifactMissing(PathBuf),
+
     /// A VM-level error from the vz crate.
     #[error(transparent)]
     Vm(#[from] vz::VzError),
@@ -165,6 +182,32 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "checkpoint lineage violation: Checkpoint child references missing parent root"
+        );
+    }
+
+    #[test]
+    fn checkpoint_not_found_display() {
+        let err = SandboxError::CheckpointNotFound("ckpt-404".to_string());
+        assert_eq!(err.to_string(), "checkpoint not found: ckpt-404");
+    }
+
+    #[test]
+    fn checkpoint_compatibility_mismatch_display() {
+        let err = SandboxError::CheckpointCompatibilityMismatch {
+            checkpoint_id: "ckpt-7".to_string(),
+            details: "backend_version expected `1`, got `2`".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("ckpt-7"));
+        assert!(msg.contains("backend_version"));
+    }
+
+    #[test]
+    fn checkpoint_artifact_missing_display() {
+        let err = SandboxError::CheckpointArtifactMissing(PathBuf::from("/tmp/ckpt.state"));
+        assert_eq!(
+            err.to_string(),
+            "checkpoint artifact missing: /tmp/ckpt.state"
         );
     }
 }
