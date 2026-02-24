@@ -28,6 +28,10 @@ use crate::LinuxError;
 
 /// Default gRPC agent port (matches [`vz::protocol::AGENT_PORT`]).
 const GRPC_AGENT_PORT: u32 = 7424;
+/// BusyBox command path used to set env vars for `buildctl`.
+const GUEST_BUSYBOX_BINARY: &str = "/bin/busybox";
+/// Guest path where BuildKit tooling is mounted.
+const GUEST_BUILDCTL_BINARY: &str = "/mnt/buildkit-bin/buildctl";
 
 /// Timeout for establishing the vsock connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -196,6 +200,41 @@ impl GrpcAgentClient {
 
         let response = self.agent.exec(request).await?;
         Ok(GrpcExecStream::new(response.into_inner()))
+    }
+
+    /// Execute `buildctl` inside the guest and collect output.
+    pub async fn buildctl(&mut self, args: Vec<String>) -> Result<ExecOutput, LinuxError> {
+        self.buildctl_with_options(args, ExecOptions::default())
+            .await
+    }
+
+    /// Execute `buildctl` inside the guest with explicit execution options.
+    pub async fn buildctl_with_options(
+        &mut self,
+        args: Vec<String>,
+        options: ExecOptions,
+    ) -> Result<ExecOutput, LinuxError> {
+        let (command, args) = buildctl_guest_command(args);
+        self.exec(command, args, options).await
+    }
+
+    /// Execute `buildctl` inside the guest and stream output events.
+    pub async fn buildctl_stream(
+        &mut self,
+        args: Vec<String>,
+    ) -> Result<GrpcExecStream, LinuxError> {
+        self.buildctl_stream_with_options(args, ExecOptions::default())
+            .await
+    }
+
+    /// Execute `buildctl` inside the guest with explicit options and streamed output.
+    pub async fn buildctl_stream_with_options(
+        &mut self,
+        args: Vec<String>,
+        options: ExecOptions,
+    ) -> Result<GrpcExecStream, LinuxError> {
+        let (command, args) = buildctl_guest_command(args);
+        self.exec_stream(command, args, options).await
     }
 
     /// Create an OCI container from a prepared bundle.
@@ -552,6 +591,17 @@ async fn create_vsock_channel(vm: Arc<Vm>, port: u32) -> Result<Channel, LinuxEr
     Ok(channel)
 }
 
+fn buildctl_guest_command(args: Vec<String>) -> (String, Vec<String>) {
+    let mut command_args = vec![
+        "env".to_string(),
+        "HOME=/root".to_string(),
+        "DOCKER_CONFIG=/root/.docker".to_string(),
+        GUEST_BUILDCTL_BINARY.to_string(),
+    ];
+    command_args.extend(args);
+    (GUEST_BUSYBOX_BINARY.to_string(), command_args)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,5 +609,23 @@ mod tests {
     #[test]
     fn grpc_agent_port_matches_protocol_agent_port() {
         assert_eq!(GRPC_AGENT_PORT, vz::protocol::AGENT_PORT);
+    }
+
+    #[test]
+    fn buildctl_guest_command_wraps_busybox_and_env() {
+        let (command, args) = buildctl_guest_command(vec![
+            "--addr".to_string(),
+            "tcp://127.0.0.1:8372".to_string(),
+            "debug".to_string(),
+            "workers".to_string(),
+        ]);
+
+        assert_eq!(command, GUEST_BUSYBOX_BINARY);
+        assert_eq!(args[0], "env");
+        assert_eq!(args[1], "HOME=/root");
+        assert_eq!(args[2], "DOCKER_CONFIG=/root/.docker");
+        assert_eq!(args[3], GUEST_BUILDCTL_BINARY);
+        assert_eq!(args[4], "--addr");
+        assert_eq!(args[6], "debug");
     }
 }

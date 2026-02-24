@@ -180,12 +180,156 @@ pub trait RuntimeBackend: Send + Sync {
     fn logs(&self, _container_id: &str) -> Result<ContainerLogs, RuntimeError> {
         Ok(ContainerLogs::default())
     }
+
+    // ── Build operations ──────────────────────────────────────────
+
+    /// Start an asynchronous build.
+    fn start_build(
+        &self,
+        _sandbox_id: &str,
+        _build_spec: BuildSpec,
+        _idempotency_key: Option<String>,
+    ) -> impl Future<Output = Result<Build, RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::StartBuild.as_str().to_string(),
+                reason: "build operations are not supported by this backend".to_string(),
+            })
+        }
+    }
+
+    /// Get build status/details.
+    fn get_build(&self, _build_id: &str) -> impl Future<Output = Result<Build, RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::GetBuild.as_str().to_string(),
+                reason: "build operations are not supported by this backend".to_string(),
+            })
+        }
+    }
+
+    /// Stream historical build events for a build ID.
+    fn stream_build_events(
+        &self,
+        _build_id: &str,
+        _after_event_id: Option<u64>,
+    ) -> impl Future<Output = Result<Vec<Event>, RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::StreamBuildEvents.as_str().to_string(),
+                reason: "build operations are not supported by this backend".to_string(),
+            })
+        }
+    }
+
+    /// Cancel an in-flight build.
+    fn cancel_build(&self, _build_id: &str) -> impl Future<Output = Result<Build, RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::CancelBuild.as_str().to_string(),
+                reason: "build operations are not supported by this backend".to_string(),
+            })
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::future::{Future, ready};
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    fn unsupported(operation: &str) -> RuntimeError {
+        RuntimeError::UnsupportedOperation {
+            operation: operation.to_string(),
+            reason: "test stub".to_string(),
+        }
+    }
+
+    struct NoopWaker;
+
+    impl Wake for NoopWaker {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn poll_immediate<F>(future: F) -> F::Output
+    where
+        F: Future,
+    {
+        let waker = Waker::from(Arc::new(NoopWaker));
+        let mut cx = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+
+        match Future::poll(future.as_mut(), &mut cx) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("future unexpectedly pending"),
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct StubBackend;
+
+    impl RuntimeBackend for StubBackend {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+
+        fn pull(&self, _image: &str) -> impl Future<Output = Result<String, RuntimeError>> {
+            ready(Err(unsupported("pull")))
+        }
+
+        fn images(&self) -> Result<Vec<ImageInfo>, RuntimeError> {
+            Err(unsupported("images"))
+        }
+
+        fn prune_images(&self) -> Result<PruneResult, RuntimeError> {
+            Err(unsupported("prune_images"))
+        }
+
+        fn run(
+            &self,
+            _image: &str,
+            _config: RunConfig,
+        ) -> impl Future<Output = Result<ExecOutput, RuntimeError>> {
+            ready(Err(unsupported("run")))
+        }
+
+        fn create_container(
+            &self,
+            _image: &str,
+            _config: RunConfig,
+        ) -> impl Future<Output = Result<String, RuntimeError>> {
+            ready(Err(unsupported("create_container")))
+        }
+
+        fn exec_container(
+            &self,
+            _id: &str,
+            _config: ExecConfig,
+        ) -> impl Future<Output = Result<ExecOutput, RuntimeError>> {
+            ready(Err(unsupported("exec_container")))
+        }
+
+        fn stop_container(
+            &self,
+            _id: &str,
+            _force: bool,
+            _signal: Option<&str>,
+            _grace_period: Option<std::time::Duration>,
+        ) -> impl Future<Output = Result<ContainerInfo, RuntimeError>> {
+            ready(Err(unsupported("stop_container")))
+        }
+
+        fn remove_container(&self, _id: &str) -> impl Future<Output = Result<(), RuntimeError>> {
+            ready(Err(unsupported("remove_container")))
+        }
+
+        fn list_containers(&self) -> Result<Vec<ContainerInfo>, RuntimeError> {
+            Err(unsupported("list_containers"))
+        }
+    }
 
     /// Verify the trait is object-safe enough for our usage pattern.
     /// We use `impl RuntimeBackend` (static dispatch) not `dyn RuntimeBackend`,
@@ -377,6 +521,36 @@ mod tests {
             },
         };
         let _capability = Capability::ComposeAdapter;
+    }
+
+    #[test]
+    fn default_build_operations_return_unsupported_operation() {
+        let backend = StubBackend;
+
+        let start_error = poll_immediate(backend.start_build(
+            "sandbox-1",
+            BuildSpec::default(),
+            Some("idem-1".to_string()),
+        ))
+        .unwrap_err();
+        let get_error = poll_immediate(backend.get_build("build-1")).unwrap_err();
+        let stream_error =
+            poll_immediate(backend.stream_build_events("build-1", Some(10))).unwrap_err();
+        let cancel_error = poll_immediate(backend.cancel_build("build-1")).unwrap_err();
+
+        for (error, operation) in [
+            (start_error, RuntimeOperation::StartBuild.as_str()),
+            (get_error, RuntimeOperation::GetBuild.as_str()),
+            (stream_error, RuntimeOperation::StreamBuildEvents.as_str()),
+            (cancel_error, RuntimeOperation::CancelBuild.as_str()),
+        ] {
+            match error {
+                RuntimeError::UnsupportedOperation { operation: got, .. } => {
+                    assert_eq!(got, operation);
+                }
+                other => panic!("expected unsupported operation error, got: {other:?}"),
+            }
+        }
     }
 
     #[test]

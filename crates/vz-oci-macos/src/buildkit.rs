@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -10,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::warn;
 use vz::NetworkConfig;
 use vz::SharedDirConfig;
@@ -19,6 +23,7 @@ use vz_linux::{
     EnsureKernelOptions, LinuxError, LinuxVm, LinuxVmConfig, default_linux_dir,
     ensure_kernel_with_options,
 };
+use vz_runtime_contract::{Build, BuildSpec, BuildState, Event, EventScope};
 
 use crate::RuntimeConfig;
 use crate::buildkit_rawjson::BuildkitRawJsonStreamDecoder;
@@ -37,6 +42,7 @@ const BUILD_OUTPUT_ARCHIVE: &str = "image.tar";
 const BUILDKITD_ADDR: &str = "tcp://127.0.0.1:8372";
 const BUILDKIT_SETUP_TIMEOUT: Duration = Duration::from_secs(90);
 const BUILDKIT_BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const BUILDKIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 const BUILDKIT_RUNC_GUEST_PATH: &str = "/tmp/runc";
 const BUILDKIT_AUTH_TAG: &str = "buildkit-auth";
 const BUILDKIT_AUTH_GUEST_DIR: &str = "/mnt/buildkit-auth";
@@ -44,6 +50,8 @@ const BUILDKIT_AUTH_GUEST_CONFIG: &str = "/mnt/buildkit-auth/config.json";
 const BUILDKIT_SNAPSHOTTER: &str = "overlayfs";
 const BUILDKIT_CACHE_KEEP_DURATION: &str = "168h";
 const BUILDKIT_CACHE_KEEP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const BUILDKIT_CACHE_DISK_IMAGE: &str = "cache.img";
+const BUILDKIT_CACHE_DISK_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Destination for built image output.
 #[derive(Debug, Clone, Default)]
@@ -142,6 +150,604 @@ pub struct BuildResult {
     pub output_path: Option<PathBuf>,
     /// Whether the image was pushed to a registry.
     pub pushed: bool,
+}
+
+type BuildPipelineFuture = Pin<Box<dyn Future<Output = Result<BuildResult, BuildkitError>> + Send>>;
+type BuildEventSink = Box<dyn FnMut(BuildEvent) + Send + 'static>;
+
+trait BuildPipeline: Send + Sync {
+    fn run(
+        &self,
+        config: RuntimeConfig,
+        request: BuildRequest,
+        on_event: BuildEventSink,
+    ) -> BuildPipelineFuture;
+}
+
+#[derive(Debug, Default)]
+struct InGuestBuildPipeline;
+
+impl BuildPipeline for InGuestBuildPipeline {
+    fn run(
+        &self,
+        config: RuntimeConfig,
+        request: BuildRequest,
+        mut on_event: BuildEventSink,
+    ) -> BuildPipelineFuture {
+        Box::pin(async move {
+            let (tx, rx) = oneshot::channel();
+            std::thread::spawn(move || {
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(BuildkitError::Io)
+                    .and_then(|runtime| {
+                        runtime.block_on(async move {
+                            build_image_with_events(&config, request, &mut on_event).await
+                        })
+                    });
+                let _ = tx.send(result);
+            });
+
+            match rx.await {
+                Ok(result) => result,
+                Err(_) => Err(BuildkitError::InvalidConfig(
+                    "build worker thread exited before returning a result".to_string(),
+                )),
+            }
+        })
+    }
+}
+
+/// Build manager failures.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildManagerError {
+    /// The requested build is unknown.
+    #[error("build not found: {build_id}")]
+    BuildNotFound {
+        /// Missing build identifier.
+        build_id: String,
+    },
+    /// Idempotency key was reused with a different normalized request.
+    #[error(
+        "idempotency key '{key}' conflicts with existing request (build_id={existing_build_id})"
+    )]
+    IdempotencyConflict {
+        /// Idempotency key provided by caller.
+        key: String,
+        /// Existing build ID associated with the key.
+        existing_build_id: String,
+    },
+    /// Failed to normalize request data used for idempotency matching.
+    #[error("failed to normalize build request: {details}")]
+    RequestNormalization {
+        /// Serialization/normalization details.
+        details: String,
+    },
+    /// Wrapped build pipeline failure.
+    #[error(transparent)]
+    Buildkit(#[from] BuildkitError),
+}
+
+/// Lightweight async manager for background BuildKit jobs.
+#[derive(Clone)]
+pub struct BuildManager {
+    inner: Arc<BuildManagerInner>,
+}
+
+struct BuildManagerInner {
+    config: RuntimeConfig,
+    runner: Arc<dyn BuildPipeline>,
+    state: Mutex<BuildManagerState>,
+}
+
+struct BuildManagerState {
+    next_build_number: u64,
+    builds: BTreeMap<String, BuildRecord>,
+    idempotency: BTreeMap<String, IdempotencyReservation>,
+}
+
+struct IdempotencyReservation {
+    normalized_request: String,
+    build_id: String,
+}
+
+struct BuildRecord {
+    build: Build,
+    events: Vec<Event>,
+    next_event_id: u64,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Debug, Serialize)]
+struct NormalizedStartBuildRequest<'a> {
+    sandbox_id: &'a str,
+    context: String,
+    dockerfile: String,
+    args: &'a BTreeMap<String, String>,
+}
+
+impl Default for BuildManagerState {
+    fn default() -> Self {
+        Self {
+            next_build_number: 1,
+            builds: BTreeMap::new(),
+            idempotency: BTreeMap::new(),
+        }
+    }
+}
+
+impl BuildManager {
+    /// Create a manager that executes builds through the in-guest BuildKit pipeline.
+    pub fn new(config: RuntimeConfig) -> Self {
+        Self::with_pipeline(config, Arc::new(InGuestBuildPipeline))
+    }
+
+    fn with_pipeline(config: RuntimeConfig, runner: Arc<dyn BuildPipeline>) -> Self {
+        Self {
+            inner: Arc::new(BuildManagerInner {
+                config,
+                runner,
+                state: Mutex::new(BuildManagerState::default()),
+            }),
+        }
+    }
+
+    /// Start a build in the background and return the tracked build object.
+    pub async fn start_build(
+        &self,
+        sandbox_id: impl Into<String>,
+        build_spec: BuildSpec,
+        idempotency_key: Option<String>,
+    ) -> Result<Build, BuildManagerError> {
+        let sandbox_id = sandbox_id.into();
+        let normalized_request = normalize_start_build_request(&sandbox_id, &build_spec)?;
+        let idempotency_key = normalize_idempotency_key(idempotency_key);
+
+        let (build_id, build) = {
+            let mut state = self.inner.state.lock().await;
+
+            if let Some(key) = idempotency_key.as_ref() {
+                if let Some(existing) = state.idempotency.get(key) {
+                    if existing.normalized_request == normalized_request {
+                        if let Some(record) = state.builds.get(&existing.build_id) {
+                            return Ok(record.build.clone());
+                        }
+                    } else {
+                        return Err(BuildManagerError::IdempotencyConflict {
+                            key: key.clone(),
+                            existing_build_id: existing.build_id.clone(),
+                        });
+                    }
+                }
+            }
+
+            let build_id = format!("build-{}", state.next_build_number);
+            state.next_build_number = state.next_build_number.saturating_add(1);
+
+            let build = Build {
+                build_id: build_id.clone(),
+                sandbox_id: sandbox_id.clone(),
+                build_spec: build_spec.clone(),
+                state: BuildState::Queued,
+                result_digest: None,
+                started_at: unix_timestamp_secs(),
+                ended_at: None,
+            };
+            let mut record = BuildRecord::new(build.clone());
+            record.append_state_event(BuildState::Queued, None);
+            state.builds.insert(build_id.clone(), record);
+
+            if let Some(key) = idempotency_key {
+                state.idempotency.insert(
+                    key,
+                    IdempotencyReservation {
+                        normalized_request: normalized_request.clone(),
+                        build_id: build_id.clone(),
+                    },
+                );
+            }
+
+            (build_id, build)
+        };
+
+        let manager = self.clone();
+        let build_id_for_task = build_id.clone();
+        let handle = tokio::spawn(async move {
+            manager.run_build(build_id_for_task).await;
+        });
+        self.attach_task_handle(&build_id, handle).await;
+
+        Ok(build)
+    }
+
+    /// Return the latest build snapshot.
+    pub async fn get_build(&self, build_id: &str) -> Result<Build, BuildManagerError> {
+        let state = self.inner.state.lock().await;
+        let record =
+            state
+                .builds
+                .get(build_id)
+                .ok_or_else(|| BuildManagerError::BuildNotFound {
+                    build_id: build_id.to_string(),
+                })?;
+        Ok(record.build.clone())
+    }
+
+    /// Return build events ordered by event ID.
+    pub async fn stream_build_events(
+        &self,
+        build_id: &str,
+        after_event_id: Option<u64>,
+    ) -> Result<Vec<Event>, BuildManagerError> {
+        let state = self.inner.state.lock().await;
+        let record =
+            state
+                .builds
+                .get(build_id)
+                .ok_or_else(|| BuildManagerError::BuildNotFound {
+                    build_id: build_id.to_string(),
+                })?;
+
+        let mut events = record
+            .events
+            .iter()
+            .filter(|event| after_event_id.is_none_or(|id| event.event_id > id))
+            .cloned()
+            .collect::<Vec<_>>();
+        events.sort_by_key(|event| event.event_id);
+        Ok(events)
+    }
+
+    /// Cancel a queued/running build.
+    pub async fn cancel_build(&self, build_id: &str) -> Result<Build, BuildManagerError> {
+        let mut state = self.inner.state.lock().await;
+        let record =
+            state
+                .builds
+                .get_mut(build_id)
+                .ok_or_else(|| BuildManagerError::BuildNotFound {
+                    build_id: build_id.to_string(),
+                })?;
+
+        if record.build.state.is_terminal() {
+            return Ok(record.build.clone());
+        }
+
+        if let Some(task) = record.task.take() {
+            task.abort();
+        }
+
+        record.mark_canceled("canceled by caller");
+        Ok(record.build.clone())
+    }
+
+    async fn attach_task_handle(&self, build_id: &str, task: tokio::task::JoinHandle<()>) {
+        let mut state = self.inner.state.lock().await;
+        if let Some(record) = state.builds.get_mut(build_id) {
+            record.task = Some(task);
+        } else {
+            task.abort();
+        }
+    }
+
+    async fn run_build(&self, build_id: String) {
+        let request = match self.mark_build_running(&build_id).await {
+            Some(request) => request,
+            None => {
+                self.clear_task_handle(&build_id).await;
+                return;
+            }
+        };
+
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<BuildEvent>();
+        let collector = {
+            let manager = self.clone();
+            let build_id = build_id.clone();
+            tokio::spawn(async move {
+                manager.collect_build_events(build_id, event_rx).await;
+            })
+        };
+
+        let run_result = self
+            .inner
+            .runner
+            .run(
+                self.inner.config.clone(),
+                request,
+                Box::new(move |event| {
+                    let _ = event_tx.send(event);
+                }),
+            )
+            .await;
+        let _ = collector.await;
+
+        match run_result {
+            Ok(result) => self.complete_build_success(&build_id, result).await,
+            Err(error) => {
+                self.complete_build_failure(&build_id, error.to_string())
+                    .await
+            }
+        }
+        self.clear_task_handle(&build_id).await;
+    }
+
+    async fn mark_build_running(&self, build_id: &str) -> Option<BuildRequest> {
+        let mut state = self.inner.state.lock().await;
+        let record = state.builds.get_mut(build_id)?;
+        if record.build.state != BuildState::Queued {
+            return None;
+        }
+        if let Err(error) = record.mark_running() {
+            record.mark_failed(format!("failed to mark build running: {error}"));
+            return None;
+        }
+        Some(build_request_from_spec(&record.build))
+    }
+
+    async fn collect_build_events(
+        &self,
+        build_id: String,
+        mut events: mpsc::UnboundedReceiver<BuildEvent>,
+    ) {
+        while let Some(event) = events.recv().await {
+            let mut state = self.inner.state.lock().await;
+            let Some(record) = state.builds.get_mut(&build_id) else {
+                return;
+            };
+            record.append_build_event(event);
+        }
+    }
+
+    async fn complete_build_success(&self, build_id: &str, result: BuildResult) {
+        let mut state = self.inner.state.lock().await;
+        let Some(record) = state.builds.get_mut(build_id) else {
+            return;
+        };
+        if record.build.state.is_terminal() {
+            return;
+        }
+
+        let Some(digest) = result.image_id.map(|image_id| image_id.0) else {
+            record.mark_failed("build completed without a result digest");
+            return;
+        };
+
+        if let Err(error) = record.mark_succeeded(digest) {
+            record.mark_failed(error);
+        }
+    }
+
+    async fn complete_build_failure(&self, build_id: &str, reason: String) {
+        let mut state = self.inner.state.lock().await;
+        let Some(record) = state.builds.get_mut(build_id) else {
+            return;
+        };
+        if record.build.state.is_terminal() {
+            return;
+        }
+        record.mark_failed(reason);
+    }
+
+    async fn clear_task_handle(&self, build_id: &str) {
+        let mut state = self.inner.state.lock().await;
+        if let Some(record) = state.builds.get_mut(build_id) {
+            record.task = None;
+        }
+    }
+}
+
+impl BuildRecord {
+    fn new(build: Build) -> Self {
+        Self {
+            build,
+            events: Vec::new(),
+            next_event_id: 1,
+            task: None,
+        }
+    }
+
+    fn append_event(&mut self, event_type: impl Into<String>, payload: BTreeMap<String, String>) {
+        let event = Event {
+            event_id: self.next_event_id,
+            ts: unix_timestamp_secs(),
+            scope: EventScope::Build,
+            scope_id: self.build.build_id.clone(),
+            event_type: event_type.into(),
+            payload,
+            trace_id: None,
+        };
+        self.events.push(event);
+        self.next_event_id = self.next_event_id.saturating_add(1);
+    }
+
+    fn append_state_event(&mut self, state: BuildState, reason: Option<String>) {
+        let mut payload = BTreeMap::new();
+        payload.insert("state".to_string(), build_state_label(state).to_string());
+        if let Some(reason) = reason {
+            payload.insert("reason".to_string(), reason);
+        }
+        self.append_event(format!("build.state.{}", build_state_label(state)), payload);
+    }
+
+    fn append_build_event(&mut self, event: BuildEvent) {
+        let mut payload = BTreeMap::new();
+        let event_type = match event {
+            BuildEvent::Status { message } => {
+                payload.insert("message".to_string(), message);
+                "build.status".to_string()
+            }
+            BuildEvent::Output { stream, chunk } => {
+                payload.insert(
+                    "stream".to_string(),
+                    match stream {
+                        BuildLogStream::Stdout => "stdout",
+                        BuildLogStream::Stderr => "stderr",
+                    }
+                    .to_string(),
+                );
+                payload.insert(
+                    "chunk".to_string(),
+                    String::from_utf8_lossy(&chunk).into_owned(),
+                );
+                "build.output".to_string()
+            }
+            BuildEvent::SolveStatus { status } => {
+                payload.insert("status".to_string(), format!("{status:?}"));
+                "build.solve_status".to_string()
+            }
+            BuildEvent::RawJsonDecodeError { line, error } => {
+                payload.insert("line".to_string(), line);
+                payload.insert("error".to_string(), error);
+                "build.rawjson_decode_error".to_string()
+            }
+        };
+        self.append_event(event_type, payload);
+    }
+
+    fn mark_running(&mut self) -> Result<(), String> {
+        if self.build.state != BuildState::Queued {
+            return Ok(());
+        }
+        self.build
+            .transition_to(BuildState::Running)
+            .map_err(|error| error.to_string())?;
+        self.build
+            .ensure_lifecycle_consistency()
+            .map_err(|error| error.to_string())?;
+        self.append_state_event(BuildState::Running, None);
+        Ok(())
+    }
+
+    fn mark_succeeded(&mut self, digest: String) -> Result<(), String> {
+        if self.build.state.is_terminal() {
+            return Ok(());
+        }
+        if self.build.state != BuildState::Running {
+            return Err(format!(
+                "cannot mark build succeeded from {} state",
+                build_state_label(self.build.state)
+            ));
+        }
+        ensure_immutable_digest(&digest)?;
+        if let Some(existing) = self.build.result_digest.as_ref()
+            && existing != &digest
+        {
+            return Err(format!("result digest changed from {existing} to {digest}"));
+        }
+
+        self.build.result_digest = Some(digest);
+        self.build
+            .transition_to(BuildState::Succeeded)
+            .map_err(|error| error.to_string())?;
+        self.build.ended_at = Some(unix_timestamp_secs());
+        self.build
+            .ensure_lifecycle_consistency()
+            .map_err(|error| error.to_string())?;
+        self.append_state_event(BuildState::Succeeded, None);
+        Ok(())
+    }
+
+    fn mark_failed(&mut self, reason: impl Into<String>) {
+        if self.build.state.is_terminal() {
+            return;
+        }
+
+        let reason = reason.into();
+        if self.build.transition_to(BuildState::Failed).is_ok() {
+            self.build.ended_at = Some(unix_timestamp_secs());
+        }
+        let _ = self.build.ensure_lifecycle_consistency();
+        self.append_state_event(BuildState::Failed, Some(reason));
+    }
+
+    fn mark_canceled(&mut self, reason: impl Into<String>) {
+        if self.build.state.is_terminal() {
+            return;
+        }
+
+        let reason = reason.into();
+        if self.build.transition_to(BuildState::Canceled).is_ok() {
+            self.build.ended_at = Some(unix_timestamp_secs());
+        }
+        let _ = self.build.ensure_lifecycle_consistency();
+        self.append_state_event(BuildState::Canceled, Some(reason));
+    }
+}
+
+fn normalize_start_build_request(
+    sandbox_id: &str,
+    build_spec: &BuildSpec,
+) -> Result<String, BuildManagerError> {
+    let request = NormalizedStartBuildRequest {
+        sandbox_id: sandbox_id.trim(),
+        context: normalize_request_component(&build_spec.context, "."),
+        dockerfile: normalize_request_component(
+            build_spec.dockerfile.as_deref().unwrap_or("Dockerfile"),
+            "Dockerfile",
+        ),
+        args: &build_spec.args,
+    };
+    serde_json::to_string(&request).map_err(|error| BuildManagerError::RequestNormalization {
+        details: error.to_string(),
+    })
+}
+
+fn normalize_request_component(value: &str, default: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        default.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn normalize_idempotency_key(key: Option<String>) -> Option<String> {
+    key.and_then(|key| {
+        let normalized = key.trim();
+        (!normalized.is_empty()).then(|| normalized.to_string())
+    })
+}
+
+fn build_request_from_spec(build: &Build) -> BuildRequest {
+    BuildRequest {
+        context_dir: PathBuf::from(normalize_request_component(&build.build_spec.context, ".")),
+        dockerfile: PathBuf::from(normalize_request_component(
+            build
+                .build_spec
+                .dockerfile
+                .as_deref()
+                .unwrap_or("Dockerfile"),
+            "Dockerfile",
+        )),
+        tag: format!("vz-build:{}", build.build_id),
+        target: None,
+        build_args: build.build_spec.args.clone(),
+        secrets: Vec::new(),
+        no_cache: false,
+        output: BuildOutput::VzStore,
+        progress: BuildProgress::RawJson,
+    }
+}
+
+fn ensure_immutable_digest(digest: &str) -> Result<(), String> {
+    let Some(bytes) = digest.strip_prefix("sha256:") else {
+        return Err("result digest must use sha256:<hex> format".to_string());
+    };
+    if bytes.is_empty() {
+        return Err("result digest must include digest bytes".to_string());
+    }
+    Ok(())
+}
+
+fn build_state_label(state: BuildState) -> &'static str {
+    match state {
+        BuildState::Queued => "queued",
+        BuildState::Running => "running",
+        BuildState::Succeeded => "succeeded",
+        BuildState::Failed => "failed",
+        BuildState::Canceled => "canceled",
+    }
 }
 
 /// Options for `buildctl prune` cache command.
@@ -245,6 +851,7 @@ pub enum BuildkitError {
 struct BuildkitArtifacts {
     bin_dir: PathBuf,
     cache_dir: PathBuf,
+    disk_image_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -357,6 +964,9 @@ where
             &mut on_event,
         )
         .await;
+        if let Err(error) = shutdown_guest_buildkitd(&vm).await {
+            warn!(%error, "failed to stop buildkitd in guest before VM shutdown");
+        }
         let stop_result = vm.stop().await;
         if let Err(error) = stop_result {
             warn!(%error, "failed to stop BuildKit VM cleanly");
@@ -455,6 +1065,9 @@ pub async fn cache_disk_usage(config: &RuntimeConfig) -> Result<String, Buildkit
         .await
     }
     .await;
+    if let Err(error) = shutdown_guest_buildkitd(&vm).await {
+        warn!(%error, "failed to stop buildkitd in guest before VM shutdown");
+    }
     let stop_result = vm.stop().await;
     if let Err(error) = stop_result {
         warn!(%error, "failed to stop BuildKit VM cleanly");
@@ -497,6 +1110,9 @@ pub async fn cache_prune(
         run_buildctl(&vm, args, BUILDKIT_BUILD_TIMEOUT, None, false).await
     }
     .await;
+    if let Err(error) = shutdown_guest_buildkitd(&vm).await {
+        warn!(%error, "failed to stop buildkitd in guest before VM shutdown");
+    }
     let stop_result = vm.stop().await;
     if let Err(error) = stop_result {
         warn!(%error, "failed to stop BuildKit VM cleanly");
@@ -754,6 +1370,7 @@ async fn start_buildkit_vm(
     let mut vm_config = LinuxVmConfig::new(kernel.kernel, kernel.initramfs);
     vm_config.cpus = 4;
     vm_config.memory_mb = 4096;
+    vm_config.disk_image = Some(artifacts.disk_image_path.clone());
     vm_config.shared_dirs = vec![
         SharedDirConfig {
             tag: "buildkit-bin".to_string(),
@@ -904,15 +1521,66 @@ async fn run_guest_build(
     Ok(())
 }
 
+async fn shutdown_guest_buildkitd(vm: &LinuxVm) -> Result<(), BuildkitError> {
+    let shutdown_script = r#"
+set -eu
+
+if [ ! -f /tmp/buildkitd.pid ]; then
+  exit 0
+fi
+
+pid=$(/bin/busybox cat /tmp/buildkitd.pid 2>/dev/null || true)
+if [ -z "$pid" ]; then
+  exit 0
+fi
+
+if /bin/busybox kill -0 "$pid" 2>/dev/null; then
+  /bin/busybox kill "$pid" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 15 ]; do
+    if ! /bin/busybox kill -0 "$pid" 2>/dev/null; then
+      exit 0
+    fi
+    i=$((i + 1))
+    /bin/busybox sleep 1
+  done
+  /bin/busybox kill -9 "$pid" 2>/dev/null || true
+fi
+exit 0
+"#;
+
+    run_guest_command(
+        vm,
+        "shutdown buildkitd in guest",
+        "/bin/busybox",
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            shutdown_script.to_string(),
+        ],
+        BUILDKIT_SHUTDOWN_TIMEOUT,
+    )
+    .await
+}
+
 async fn ensure_guest_buildkit_ready(vm: &LinuxVm) -> Result<(), BuildkitError> {
     let setup_script = format!(
         r#"
 set -eu
 
-/bin/busybox mkdir -p /mnt/buildkit-bin /mnt/buildkit-cache /mnt/linux-bin /var/lib/buildkit /mnt/build-context /mnt/build-output /mnt/host-ssl {BUILDKIT_AUTH_GUEST_DIR}
+/bin/busybox mkdir -p /mnt/buildkit-bin /mnt/linux-bin /var/lib/buildkit /mnt/build-context /mnt/build-output /mnt/host-ssl {BUILDKIT_AUTH_GUEST_DIR}
 /bin/busybox mkdir -p /etc/buildkit
-/bin/busybox mount -t virtiofs buildkit-bin /mnt/buildkit-bin 2>/dev/null || true
-/bin/busybox mount -t virtiofs buildkit-cache /mnt/buildkit-cache 2>/dev/null || true
+if ! /bin/busybox grep -q " /mnt/buildkit-bin " /proc/mounts; then
+  /bin/busybox mount -t virtiofs buildkit-bin /mnt/buildkit-bin
+fi
+if ! /bin/busybox grep -q " /var/lib/buildkit " /proc/mounts; then
+  if [ ! -b /dev/vda ]; then
+    echo "buildkit cache disk /dev/vda is unavailable" >&2
+    exit 1
+  fi
+  /bin/busybox mke2fs -F /dev/vda >/tmp/buildkit-disk-format.log 2>&1
+  /bin/busybox mount -t ext4 /dev/vda /var/lib/buildkit
+fi
 /bin/busybox mount -t virtiofs linux-bin /mnt/linux-bin 2>/dev/null || true
 /bin/busybox mount -t virtiofs build-context /mnt/build-context 2>/dev/null || true
 /bin/busybox mount -t virtiofs build-output /mnt/build-output 2>/dev/null || true
@@ -973,20 +1641,39 @@ export DOCKER_CONFIG=/root/.docker
   all = true
 CFG
 
-if ! /mnt/buildkit-bin/buildctl --addr {BUILDKITD_ADDR} debug workers >/dev/null 2>&1; then
+start_buildkitd() {{
   /mnt/buildkit-bin/buildkitd \
     --config /etc/buildkit/buildkitd.toml \
     --addr {BUILDKITD_ADDR} \
     --oci-worker-binary {BUILDKIT_RUNC_GUEST_PATH} \
     --oci-worker-snapshotter {BUILDKIT_SNAPSHOTTER} \
     --root /var/lib/buildkit >/tmp/buildkitd.log 2>&1 &
+  /bin/busybox echo "$!" >/tmp/buildkitd.pid
+}}
+
+if ! /mnt/buildkit-bin/buildctl --addr {BUILDKITD_ADDR} debug workers >/dev/null 2>&1; then
+  start_buildkitd
 fi
 
+recovered_bolt=0
 i=0
 while [ "$i" -lt 60 ]; do
   if /mnt/buildkit-bin/buildctl --addr {BUILDKITD_ADDR} debug workers >/dev/null 2>&1; then
     exit 0
   fi
+
+  if [ "$recovered_bolt" -eq 0 ] && [ -f /tmp/buildkitd.log ] && /bin/busybox grep -q "invalid freelist page" /tmp/buildkitd.log; then
+    if [ -f /tmp/buildkitd.pid ]; then
+      pid=$(/bin/busybox cat /tmp/buildkitd.pid 2>/dev/null || true)
+      if [ -n "$pid" ]; then
+        /bin/busybox kill "$pid" 2>/dev/null || true
+      fi
+    fi
+    /bin/busybox rm -f /var/lib/buildkit/cache.db /tmp/buildkitd.log /tmp/buildkitd.pid
+    recovered_bolt=1
+    start_buildkitd
+  fi
+
   i=$((i + 1))
   /bin/busybox sleep 1
 done
@@ -1202,10 +1889,16 @@ async fn ensure_buildkit_artifacts() -> Result<BuildkitArtifacts, BuildkitError>
     let base_dir = default_buildkit_dir()?;
     let bin_dir = base_dir.join("bin");
     let cache_dir = base_dir.join("cache");
+    let disk_image_path = base_dir.join(BUILDKIT_CACHE_DISK_IMAGE);
     tokio::fs::create_dir_all(&cache_dir).await?;
+    ensure_sparse_disk_image(&disk_image_path, BUILDKIT_CACHE_DISK_SIZE_BYTES)?;
 
     if artifacts_are_current(&base_dir, &bin_dir).await? {
-        return Ok(BuildkitArtifacts { bin_dir, cache_dir });
+        return Ok(BuildkitArtifacts {
+            bin_dir,
+            cache_dir,
+            disk_image_path,
+        });
     }
 
     tokio::fs::create_dir_all(&base_dir).await?;
@@ -1254,7 +1947,11 @@ async fn ensure_buildkit_artifacts() -> Result<BuildkitArtifacts, BuildkitError>
         );
     }
 
-    Ok(BuildkitArtifacts { bin_dir, cache_dir })
+    Ok(BuildkitArtifacts {
+        bin_dir,
+        cache_dir,
+        disk_image_path,
+    })
 }
 
 async fn artifacts_are_current(base_dir: &Path, bin_dir: &Path) -> Result<bool, BuildkitError> {
@@ -1309,6 +2006,26 @@ async fn extract_buildkit_archive(
             String::from_utf8_lossy(&output.stderr)
         )));
     }
+    Ok(())
+}
+
+fn ensure_sparse_disk_image(path: &Path, desired_size: u64) -> Result<(), BuildkitError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.len() >= desired_size {
+            return Ok(());
+        }
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    file.set_len(desired_size)?;
     Ok(())
 }
 
@@ -1505,6 +2222,9 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use tempfile::tempdir;
 
@@ -1700,5 +2420,216 @@ mod tests {
         assert!(store.read_manifest_json(&manifest_digest).is_ok());
         assert!(store.read_config_json(&manifest_digest).is_ok());
         assert!(store.has_layer_blob(&layer_digest));
+    }
+
+    #[derive(Debug)]
+    enum ScriptedRunResult {
+        Success(BuildResult),
+    }
+
+    #[derive(Debug)]
+    struct ScriptedRun {
+        events: Vec<BuildEvent>,
+        result: ScriptedRunResult,
+    }
+
+    #[derive(Debug, Default)]
+    struct ScriptedBuildPipeline {
+        runs: AtomicUsize,
+        scripted: Mutex<std::collections::VecDeque<ScriptedRun>>,
+    }
+
+    impl ScriptedBuildPipeline {
+        fn from_runs(runs: Vec<ScriptedRun>) -> Arc<Self> {
+            Arc::new(Self {
+                runs: AtomicUsize::new(0),
+                scripted: Mutex::new(std::collections::VecDeque::from(runs)),
+            })
+        }
+
+        fn run_count(&self) -> usize {
+            self.runs.load(Ordering::SeqCst)
+        }
+    }
+
+    impl BuildPipeline for ScriptedBuildPipeline {
+        fn run(
+            &self,
+            _config: RuntimeConfig,
+            _request: BuildRequest,
+            mut on_event: BuildEventSink,
+        ) -> BuildPipelineFuture {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            let run = self
+                .scripted
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("missing scripted build run");
+
+            Box::pin(async move {
+                for event in run.events {
+                    on_event(event);
+                }
+                match run.result {
+                    ScriptedRunResult::Success(result) => Ok(result),
+                }
+            })
+        }
+    }
+
+    fn scripted_success_run(digest: Option<&str>, events: Vec<BuildEvent>) -> ScriptedRun {
+        ScriptedRun {
+            events,
+            result: ScriptedRunResult::Success(BuildResult {
+                image_id: digest.map(|value| ImageId(value.to_string())),
+                tag: "test:latest".to_string(),
+                output_path: None,
+                pushed: false,
+            }),
+        }
+    }
+
+    fn test_build_spec(arg_value: &str) -> BuildSpec {
+        BuildSpec {
+            context: ".".to_string(),
+            dockerfile: Some("Dockerfile".to_string()),
+            args: BTreeMap::from([("ARG".to_string(), arg_value.to_string())]),
+        }
+    }
+
+    async fn wait_for_terminal_build(manager: &BuildManager, build_id: &str) -> Build {
+        for _ in 0..120 {
+            let build = manager.get_build(build_id).await.unwrap();
+            if build.state.is_terminal() {
+                return build;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("build did not reach terminal state");
+    }
+
+    #[tokio::test]
+    async fn build_manager_idempotency_reuses_existing_build() {
+        let pipeline = ScriptedBuildPipeline::from_runs(vec![scripted_success_run(
+            Some("sha256:abc"),
+            vec![],
+        )]);
+        let manager = BuildManager::with_pipeline(RuntimeConfig::default(), pipeline.clone());
+
+        let first = manager
+            .start_build(
+                "sandbox-1",
+                test_build_spec("same"),
+                Some("idem-same".to_string()),
+            )
+            .await
+            .unwrap();
+        let second = manager
+            .start_build(
+                "sandbox-1",
+                test_build_spec("same"),
+                Some("idem-same".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first.build_id, second.build_id);
+        let finished = wait_for_terminal_build(&manager, &first.build_id).await;
+        assert_eq!(finished.state, BuildState::Succeeded);
+        assert_eq!(pipeline.run_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn build_manager_idempotency_conflict_is_rejected() {
+        let pipeline = ScriptedBuildPipeline::from_runs(vec![scripted_success_run(
+            Some("sha256:abc"),
+            vec![],
+        )]);
+        let manager = BuildManager::with_pipeline(RuntimeConfig::default(), pipeline);
+
+        let _first = manager
+            .start_build(
+                "sandbox-1",
+                test_build_spec("first"),
+                Some("idem-conflict".to_string()),
+            )
+            .await
+            .unwrap();
+        let error = manager
+            .start_build(
+                "sandbox-1",
+                test_build_spec("second"),
+                Some("idem-conflict".to_string()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            BuildManagerError::IdempotencyConflict { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn build_manager_missing_digest_transitions_to_failed() {
+        let pipeline = ScriptedBuildPipeline::from_runs(vec![scripted_success_run(None, vec![])]);
+        let manager = BuildManager::with_pipeline(RuntimeConfig::default(), pipeline);
+
+        let build = manager
+            .start_build("sandbox-1", test_build_spec("digestless"), None)
+            .await
+            .unwrap();
+        let finished = wait_for_terminal_build(&manager, &build.build_id).await;
+
+        assert_eq!(finished.state, BuildState::Failed);
+        assert!(finished.ended_at.is_some());
+        assert!(finished.result_digest.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_manager_streams_events_in_order() {
+        let pipeline = ScriptedBuildPipeline::from_runs(vec![scripted_success_run(
+            Some("sha256:abc"),
+            vec![
+                BuildEvent::Status {
+                    message: "phase-1".to_string(),
+                },
+                BuildEvent::Output {
+                    stream: BuildLogStream::Stdout,
+                    chunk: b"hello".to_vec(),
+                },
+                BuildEvent::Status {
+                    message: "phase-2".to_string(),
+                },
+            ],
+        )]);
+        let manager = BuildManager::with_pipeline(RuntimeConfig::default(), pipeline);
+
+        let build = manager
+            .start_build("sandbox-1", test_build_spec("events"), None)
+            .await
+            .unwrap();
+        let finished = wait_for_terminal_build(&manager, &build.build_id).await;
+        assert_eq!(finished.state, BuildState::Succeeded);
+
+        let events = manager
+            .stream_build_events(&build.build_id, None)
+            .await
+            .unwrap();
+        assert!(events.len() >= 4);
+        assert!(
+            events
+                .windows(2)
+                .all(|pair| pair[0].event_id < pair[1].event_id)
+        );
+
+        let cursor = events[1].event_id;
+        let tail = manager
+            .stream_build_events(&build.build_id, Some(cursor))
+            .await
+            .unwrap();
+        assert!(!tail.is_empty());
+        assert!(tail.iter().all(|event| event.event_id > cursor));
     }
 }
