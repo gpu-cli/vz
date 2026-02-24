@@ -36,6 +36,7 @@ const IMAGE_DELTA_VERSION: u32 = 1;
 const DEFAULT_IMAGE_DELTA_CHUNK_SIZE_MIB: u32 = 4;
 const MIN_IMAGE_DELTA_CHUNK_SIZE_MIB: u32 = 1;
 const MAX_IMAGE_DELTA_CHUNK_SIZE_MIB: u32 = 64;
+const IMAGE_SIDECAR_EXTENSIONS: [&str; 3] = ["aux", "hwmodel", "machineid"];
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1008,7 +1009,7 @@ fn create_delta(args: CreateDeltaArgs) -> anyhow::Result<()> {
     let workspace = TempWorkspace::new("vz-image-delta-create")?;
     let patched_image = workspace.path().join("patched.img");
 
-    clone_or_copy_file(&base_image, &patched_image)?;
+    clone_or_copy_image_with_sidecars(&base_image, &patched_image, true)?;
     let state_path = workspace.path().join("patch-state.json");
     apply_with_state_path(
         ApplyArgs {
@@ -1278,6 +1279,58 @@ fn clone_or_copy_file(source: &Path, destination: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn clone_or_copy_image_with_sidecars(
+    source_image: &Path,
+    destination_image: &Path,
+    require_sidecars: bool,
+) -> anyhow::Result<()> {
+    clone_or_copy_file(source_image, destination_image).with_context(|| {
+        format!(
+            "failed to copy image {} to {}",
+            source_image.display(),
+            destination_image.display()
+        )
+    })?;
+
+    for extension in IMAGE_SIDECAR_EXTENSIONS {
+        let source_sidecar = source_image.with_extension(extension);
+        let destination_sidecar = destination_image.with_extension(extension);
+
+        match fs::symlink_metadata(&source_sidecar) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    bail!(
+                        "image sidecar {} must be a regular file",
+                        source_sidecar.display()
+                    );
+                }
+                clone_or_copy_file(&source_sidecar, &destination_sidecar).with_context(|| {
+                    format!(
+                        "failed to copy sidecar {} to {}",
+                        source_sidecar.display(),
+                        destination_sidecar.display()
+                    )
+                })?;
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                if require_sidecars {
+                    bail!(
+                        "required image sidecar not found: {}",
+                        source_sidecar.display()
+                    );
+                }
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to inspect sidecar {}", source_sidecar.display())
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn create_image_delta_file(
     base_image: &Path,
     target_image: &Path,
@@ -1414,7 +1467,7 @@ fn apply_image_delta_file(
         );
     }
 
-    clone_or_copy_file(base_image, output_image)?;
+    clone_or_copy_image_with_sidecars(base_image, output_image, true)?;
     let mut output = OpenOptions::new()
         .write(true)
         .read(true)
@@ -2947,6 +3000,14 @@ mod tests {
         )
     }
 
+    fn write_test_image_sidecars(image_path: &Path) {
+        fs::write(image_path.with_extension("aux"), b"aux-sidecar").expect("write aux sidecar");
+        fs::write(image_path.with_extension("hwmodel"), b"hwmodel-sidecar")
+            .expect("write hwmodel sidecar");
+        fs::write(image_path.with_extension("machineid"), b"machineid-sidecar")
+            .expect("write machineid sidecar");
+    }
+
     #[test]
     fn verify_bundle_valid_path() {
         let bundle = create_valid_bundle();
@@ -3679,6 +3740,7 @@ mod tests {
 
         fs::write(&base, &base_bytes).expect("write base");
         fs::write(&target, &target_bytes).expect("write target");
+        write_test_image_sidecars(&base);
 
         let header =
             create_image_delta_file(&base, &target, &delta, 128 * 1024).expect("create delta");
@@ -3699,6 +3761,7 @@ mod tests {
 
         fs::write(&base, b"base-original").expect("write base");
         fs::write(&target, b"base-modified").expect("write target");
+        write_test_image_sidecars(&base);
         create_image_delta_file(&base, &target, &delta, 64 * 1024).expect("create delta");
 
         fs::write(&base, b"base-tampered").expect("tamper base");
@@ -3717,11 +3780,31 @@ mod tests {
 
         fs::write(&base, b"abc").expect("write base");
         fs::write(&target, b"abd").expect("write target");
+        write_test_image_sidecars(&base);
         fs::write(&output, b"existing").expect("write existing output");
         create_image_delta_file(&base, &target, &delta, 64 * 1024).expect("create delta");
 
         let err = apply_image_delta_file(&base, &delta, &output)
             .expect_err("existing output should fail");
         assert!(format!("{err:#}").contains("output image already exists"));
+    }
+
+    #[test]
+    fn image_delta_apply_rejects_missing_required_sidecar() {
+        let dir = tempdir().expect("create temp dir");
+        let base = dir.path().join("base.img");
+        let target = dir.path().join("target.img");
+        let delta = dir.path().join("patch.vzdelta");
+        let output = dir.path().join("output.img");
+
+        fs::write(&base, b"abc").expect("write base");
+        fs::write(&target, b"abd").expect("write target");
+        write_test_image_sidecars(&base);
+        fs::remove_file(base.with_extension("machineid")).expect("remove machineid sidecar");
+        create_image_delta_file(&base, &target, &delta, 64 * 1024).expect("create delta");
+
+        let err = apply_image_delta_file(&base, &delta, &output)
+            .expect_err("missing sidecar should fail");
+        assert!(format!("{err:#}").contains("required image sidecar not found"));
     }
 }
