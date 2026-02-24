@@ -137,36 +137,22 @@ sudo vz vm provision --image ~/.vz/images/base.img --allow-unpinned
 # Generate an Ed25519 signing key (PKCS#8 PEM)
 openssl genpkey -algorithm Ed25519 -out /tmp/vz-patch-signing-key.pem
 
-# Prepare operations and payload digests
-cat >/tmp/patch-operations.json <<'JSON'
-[
-  {
-    "type": "write_file",
-    "path": "/usr/local/libexec/vz-agent",
-    "content_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "mode": 493
-  },
-  {
-    "type": "set_mode",
-    "path": "/usr/local/libexec/vz-agent",
-    "mode": 493
-  }
-]
-JSON
-
-mkdir -p /tmp/patch-payload
-cp /path/to/vz-agent /tmp/patch-payload/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-
+# One-command inline patch creation (no operations.json or payload directory required)
 vz vm patch create \
   --bundle /tmp/patch-1.vzpatch \
   --base-id stable \
-  --operations /tmp/patch-operations.json \
-  --payload-dir /tmp/patch-payload \
+  --mkdir /usr/local/libexec:755 \
+  --write-file /path/to/vz-agent:/usr/local/libexec/vz-agent:755 \
+  --symlink /usr/local/bin/vz-agent:/usr/local/libexec/vz-agent \
+  --set-owner /usr/local/libexec/vz-agent:0:0 \
+  --set-mode /usr/local/libexec/vz-agent:755 \
   --signing-key /tmp/vz-patch-signing-key.pem
 
 vz vm patch verify --bundle /tmp/patch-1.vzpatch
 sudo vz vm patch apply --bundle /tmp/patch-1.vzpatch --root /tmp/mounted-root
 ```
+
+For advanced CI workflows, `vz vm patch create` also supports `--operations <json>` + `--payload-dir <dir>`.
 
 ## Command groups
 

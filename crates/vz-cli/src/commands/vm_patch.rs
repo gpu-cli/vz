@@ -62,13 +62,43 @@ pub struct CreateArgs {
     #[arg(long, value_name = "SELECTOR")]
     pub base_id: String,
 
-    /// JSON file containing an ordered array of patch operations.
+    /// Advanced mode: JSON file containing an ordered array of patch operations.
     #[arg(long)]
-    pub operations: PathBuf,
+    pub operations: Option<PathBuf>,
 
-    /// Directory containing payload files named by SHA-256 digest.
+    /// Advanced mode: directory containing payload files named by SHA-256 digest.
     #[arg(long)]
-    pub payload_dir: PathBuf,
+    pub payload_dir: Option<PathBuf>,
+
+    /// Inline mode: add `write_file` operation from host file path to guest path.
+    /// Format: `HOST_PATH:GUEST_PATH[:MODE]` (mode accepts octal like `755` or decimal).
+    #[arg(long = "write-file", value_name = "HOST:GUEST[:MODE]")]
+    pub write_file: Vec<String>,
+
+    /// Inline mode: add `mkdir` operation.
+    /// Format: `GUEST_PATH[:MODE]` (mode accepts octal like `755` or decimal).
+    #[arg(long = "mkdir", value_name = "GUEST[:MODE]")]
+    pub mkdir: Vec<String>,
+
+    /// Inline mode: add `symlink` operation.
+    /// Format: `GUEST_PATH:TARGET`.
+    #[arg(long = "symlink", value_name = "GUEST:TARGET")]
+    pub symlink: Vec<String>,
+
+    /// Inline mode: add `delete_file` operation.
+    /// Format: `GUEST_PATH`.
+    #[arg(long = "delete-file", value_name = "GUEST")]
+    pub delete_file: Vec<String>,
+
+    /// Inline mode: add `set_mode` operation.
+    /// Format: `GUEST_PATH:MODE` (mode accepts octal like `755` or decimal).
+    #[arg(long = "set-mode", value_name = "GUEST:MODE")]
+    pub set_mode: Vec<String>,
+
+    /// Inline mode: add `set_owner` operation.
+    /// Format: `GUEST_PATH:UID:GID`.
+    #[arg(long = "set-owner", value_name = "GUEST:UID:GID")]
+    pub set_owner: Vec<String>,
 
     /// Ed25519 private key path (PKCS#8 DER or PEM).
     #[arg(long)]
@@ -546,8 +576,29 @@ fn create(args: CreateArgs) -> anyhow::Result<()> {
             )
         })?;
 
-    let operations = load_operations_file(&args.operations)?;
-    let payload_entries = load_payload_entries(&args.payload_dir)?;
+    let inline_mode_requested = create_inline_mode_requested(&args);
+    let (operations, payload_entries) = match (
+        args.operations.as_ref(),
+        args.payload_dir.as_ref(),
+        inline_mode_requested,
+    ) {
+        (Some(operations), Some(payload_dir), false) => {
+            let operations = load_operations_file(operations)?;
+            let payload_entries = load_payload_entries(payload_dir)?;
+            (operations, payload_entries)
+        }
+        (None, None, true) => build_inline_create_inputs(&args)?,
+        (Some(_), Some(_), true) => bail!(
+            "choose one create input mode: either (--operations + --payload-dir) or inline flags (--write-file/--mkdir/--symlink/--delete-file/--set-mode/--set-owner)"
+        ),
+        (Some(_), None, _) | (None, Some(_), _) => {
+            bail!("--operations and --payload-dir must be provided together")
+        }
+        (None, None, false) => bail!(
+            "no patch inputs provided. Use either (--operations + --payload-dir) or inline flags (--write-file/--mkdir/--symlink/--delete-file/--set-mode/--set-owner)"
+        ),
+    };
+
     let payload_digest_index = payload_digest_index(&payload_entries);
     let payload = build_payload_archive(&payload_entries)?;
 
@@ -620,6 +671,236 @@ fn create(args: CreateArgs) -> anyhow::Result<()> {
         verified.target_base_id
     );
     Ok(())
+}
+
+fn create_inline_mode_requested(args: &CreateArgs) -> bool {
+    !args.write_file.is_empty()
+        || !args.mkdir.is_empty()
+        || !args.symlink.is_empty()
+        || !args.delete_file.is_empty()
+        || !args.set_mode.is_empty()
+        || !args.set_owner.is_empty()
+}
+
+fn build_inline_create_inputs(
+    args: &CreateArgs,
+) -> anyhow::Result<(Vec<PatchOperation>, Vec<(String, Vec<u8>)>)> {
+    let mut operations = Vec::new();
+    let mut payload_by_digest = BTreeMap::<String, Vec<u8>>::new();
+
+    for spec in &args.mkdir {
+        let (path, mode) = parse_mkdir_spec(spec)?;
+        operations.push(PatchOperation::Mkdir { path, mode });
+    }
+
+    for spec in &args.write_file {
+        let (host_path, guest_path, mode_override) = parse_write_file_spec(spec)?;
+        let metadata = fs::symlink_metadata(&host_path).with_context(|| {
+            format!(
+                "failed to inspect host file in --write-file spec '{}'",
+                host_path.display()
+            )
+        })?;
+        if !metadata.file_type().is_file() {
+            bail!(
+                "host path '{}' from --write-file is not a regular file",
+                host_path.display()
+            );
+        }
+        let bytes = fs::read(&host_path).with_context(|| {
+            format!(
+                "failed to read host file in --write-file spec '{}'",
+                host_path.display()
+            )
+        })?;
+        let digest = sha256_bytes_hex(&bytes);
+        let _ = payload_by_digest.entry(digest.clone()).or_insert(bytes);
+        let mode = mode_override.or(Some(metadata.mode() & 0o7777));
+        operations.push(PatchOperation::WriteFile {
+            path: guest_path,
+            content_digest: digest,
+            mode,
+        });
+    }
+
+    for spec in &args.symlink {
+        let (path, target) = parse_symlink_spec(spec)?;
+        operations.push(PatchOperation::Symlink { path, target });
+    }
+
+    for spec in &args.set_owner {
+        let (path, uid, gid) = parse_set_owner_spec(spec)?;
+        operations.push(PatchOperation::SetOwner { path, uid, gid });
+    }
+
+    for spec in &args.set_mode {
+        let (path, mode) = parse_set_mode_spec(spec)?;
+        operations.push(PatchOperation::SetMode { path, mode });
+    }
+
+    for spec in &args.delete_file {
+        let path = parse_delete_file_spec(spec)?;
+        operations.push(PatchOperation::DeleteFile { path });
+    }
+
+    if operations.is_empty() {
+        bail!("inline create mode produced no operations");
+    }
+
+    let mut payload_entries = Vec::new();
+    for (digest, bytes) in payload_by_digest {
+        payload_entries.push((digest, bytes));
+    }
+
+    Ok((operations, payload_entries))
+}
+
+fn parse_write_file_spec(spec: &str) -> anyhow::Result<(PathBuf, String, Option<u32>)> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if !(2..=3).contains(&parts.len()) {
+        bail!(
+            "invalid --write-file spec '{}'; expected HOST_PATH:GUEST_PATH[:MODE]",
+            spec
+        );
+    }
+
+    let host_path_raw = parts[0].trim();
+    let guest_path = parts[1].trim();
+    if host_path_raw.is_empty() || guest_path.is_empty() {
+        bail!(
+            "invalid --write-file spec '{}'; host path and guest path must be non-empty",
+            spec
+        );
+    }
+
+    let mode = if parts.len() == 3 {
+        Some(parse_mode_value("--write-file MODE", parts[2].trim())?)
+    } else {
+        None
+    };
+
+    Ok((PathBuf::from(host_path_raw), guest_path.to_string(), mode))
+}
+
+fn parse_mkdir_spec(spec: &str) -> anyhow::Result<(String, Option<u32>)> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if !(1..=2).contains(&parts.len()) {
+        bail!(
+            "invalid --mkdir spec '{}'; expected GUEST_PATH[:MODE]",
+            spec
+        );
+    }
+    let path = parts[0].trim();
+    if path.is_empty() {
+        bail!(
+            "invalid --mkdir spec '{}'; guest path must be non-empty",
+            spec
+        );
+    }
+    let mode = if parts.len() == 2 {
+        Some(parse_mode_value("--mkdir MODE", parts[1].trim())?)
+    } else {
+        None
+    };
+    Ok((path.to_string(), mode))
+}
+
+fn parse_symlink_spec(spec: &str) -> anyhow::Result<(String, String)> {
+    let Some((path, target)) = spec.split_once(':') else {
+        bail!(
+            "invalid --symlink spec '{}'; expected GUEST_PATH:TARGET",
+            spec
+        );
+    };
+    let path = path.trim();
+    let target = target.trim();
+    if path.is_empty() || target.is_empty() {
+        bail!(
+            "invalid --symlink spec '{}'; guest path and target must be non-empty",
+            spec
+        );
+    }
+    Ok((path.to_string(), target.to_string()))
+}
+
+fn parse_delete_file_spec(spec: &str) -> anyhow::Result<String> {
+    let path = spec.trim();
+    if path.is_empty() {
+        bail!(
+            "invalid --delete-file spec '{}'; guest path must be non-empty",
+            spec
+        );
+    }
+    Ok(path.to_string())
+}
+
+fn parse_set_mode_spec(spec: &str) -> anyhow::Result<(String, u32)> {
+    let Some((path, mode_raw)) = spec.split_once(':') else {
+        bail!(
+            "invalid --set-mode spec '{}'; expected GUEST_PATH:MODE",
+            spec
+        );
+    };
+    let path = path.trim();
+    if path.is_empty() {
+        bail!(
+            "invalid --set-mode spec '{}'; guest path must be non-empty",
+            spec
+        );
+    }
+    let mode = parse_mode_value("--set-mode MODE", mode_raw.trim())?;
+    Ok((path.to_string(), mode))
+}
+
+fn parse_set_owner_spec(spec: &str) -> anyhow::Result<(String, u32, u32)> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.len() != 3 {
+        bail!(
+            "invalid --set-owner spec '{}'; expected GUEST_PATH:UID:GID",
+            spec
+        );
+    }
+    let path = parts[0].trim();
+    if path.is_empty() {
+        bail!(
+            "invalid --set-owner spec '{}'; guest path must be non-empty",
+            spec
+        );
+    }
+    let uid = parse_u32_value("--set-owner UID", parts[1].trim())?;
+    let gid = parse_u32_value("--set-owner GID", parts[2].trim())?;
+    Ok((path.to_string(), uid, gid))
+}
+
+fn parse_mode_value(field: &str, value: &str) -> anyhow::Result<u32> {
+    if value.is_empty() {
+        bail!("{field} must not be empty");
+    }
+    let parsed = if let Some(stripped) = value.strip_prefix("0o") {
+        u32::from_str_radix(stripped, 8)
+            .with_context(|| format!("{field} must be valid octal, received '{value}'"))?
+    } else if value.len() > 1 && value.starts_with('0') {
+        u32::from_str_radix(value, 8)
+            .with_context(|| format!("{field} must be valid octal, received '{value}'"))?
+    } else if value.len() <= 4 && value.chars().all(|c| matches!(c, '0'..='7')) {
+        u32::from_str_radix(value, 8)
+            .with_context(|| format!("{field} must be valid octal, received '{value}'"))?
+    } else {
+        value
+            .parse::<u32>()
+            .with_context(|| format!("{field} must be valid u32, received '{value}'"))?
+    };
+    validate_mode(field, parsed)?;
+    Ok(parsed)
+}
+
+fn parse_u32_value(field: &str, value: &str) -> anyhow::Result<u32> {
+    if value.is_empty() {
+        bail!("{field} must not be empty");
+    }
+    value
+        .parse::<u32>()
+        .with_context(|| format!("{field} must be valid u32, received '{value}'"))
 }
 
 fn verify(args: VerifyArgs) -> anyhow::Result<()> {
@@ -2025,13 +2306,19 @@ mod tests {
         create(CreateArgs {
             bundle: bundle_dir.clone(),
             base_id: BASE_CHANNEL_STABLE.to_string(),
-            operations: operations_path,
-            payload_dir,
+            operations: Some(operations_path),
+            payload_dir: Some(payload_dir),
             signing_key: signing_key_path,
             post_state_hashes: None,
             patch_version: "2.0.0".to_string(),
             bundle_id: Some("bundle-create-test".to_string()),
             created_at: Some("2026-02-24T19:00:00Z".to_string()),
+            write_file: Vec::new(),
+            mkdir: Vec::new(),
+            symlink: Vec::new(),
+            delete_file: Vec::new(),
+            set_mode: Vec::new(),
+            set_owner: Vec::new(),
         })
         .expect("create should succeed");
 
@@ -2088,16 +2375,124 @@ mod tests {
         let err = create(CreateArgs {
             bundle: bundle_dir,
             base_id: BASE_CHANNEL_STABLE.to_string(),
-            operations: operations_path,
-            payload_dir,
+            operations: Some(operations_path),
+            payload_dir: Some(payload_dir),
             signing_key: signing_key_path,
             post_state_hashes: None,
             patch_version: "2.0.0".to_string(),
             bundle_id: None,
             created_at: None,
+            write_file: Vec::new(),
+            mkdir: Vec::new(),
+            symlink: Vec::new(),
+            delete_file: Vec::new(),
+            set_mode: Vec::new(),
+            set_owner: Vec::new(),
         })
         .expect_err("mismatched payload digest should fail");
         assert!(format!("{err:#}").contains("digest mismatch"));
+    }
+
+    #[test]
+    fn patch_create_inline_mode_builds_bundle_from_write_specs() {
+        let dir = tempdir().expect("create temp dir");
+        let bundle_dir = dir.path().join("created-inline-bundle.vzpatch");
+        let host_file = dir.path().join("vz-agent");
+        fs::write(&host_file, b"inline-agent-bytes").expect("write host file");
+
+        create(CreateArgs {
+            bundle: bundle_dir.clone(),
+            base_id: BASE_CHANNEL_STABLE.to_string(),
+            operations: None,
+            payload_dir: None,
+            signing_key: {
+                let path = dir.path().join("signing-key.pkcs8");
+                write_test_signing_key(&path);
+                path
+            },
+            post_state_hashes: None,
+            patch_version: "2.1.0".to_string(),
+            bundle_id: Some("bundle-inline-test".to_string()),
+            created_at: Some("2026-02-24T19:30:00Z".to_string()),
+            write_file: vec![format!("{}:/opt/vz-agent:755", host_file.display())],
+            mkdir: vec!["/opt:755".to_string()],
+            symlink: vec!["/usr/local/bin/vz-agent:/opt/vz-agent".to_string()],
+            delete_file: Vec::new(),
+            set_mode: vec!["/opt/vz-agent:755".to_string()],
+            set_owner: Vec::new(),
+        })
+        .expect("inline create should succeed");
+
+        let manifest = verify_bundle(&bundle_dir).expect("created bundle should verify");
+        assert_eq!(manifest.bundle_id, "bundle-inline-test");
+        assert_eq!(manifest.patch_version, "2.1.0");
+        assert_eq!(manifest.target_base_id, ACTIVE_BASE_ID);
+        assert!(manifest.operations.iter().any(|operation| matches!(
+            operation,
+            PatchOperation::WriteFile { path, .. } if path == "/opt/vz-agent"
+        )));
+        assert!(manifest.operations.iter().any(|operation| matches!(
+            operation,
+            PatchOperation::Symlink { path, target }
+                if path == "/usr/local/bin/vz-agent" && target == "/opt/vz-agent"
+        )));
+        assert_eq!(
+            manifest
+                .post_state_hashes
+                .get("/usr/local/bin/vz-agent")
+                .expect("symlink hash"),
+            &sha256_bytes_hex(Path::new("/opt/vz-agent").as_os_str().as_bytes())
+        );
+    }
+
+    #[test]
+    fn patch_create_rejects_mixed_input_modes() {
+        let dir = tempdir().expect("create temp dir");
+        let bundle_dir = dir.path().join("mixed-mode-bundle.vzpatch");
+        let payload_dir = dir.path().join("payload");
+        fs::create_dir_all(&payload_dir).expect("create payload dir");
+
+        let payload_bytes = b"tool-bytes".to_vec();
+        let payload_digest = sha256_bytes_hex(&payload_bytes);
+        fs::write(payload_dir.join(&payload_digest), &payload_bytes).expect("write payload entry");
+
+        let operations = vec![PatchOperation::WriteFile {
+            path: "/opt/tool".to_string(),
+            content_digest: payload_digest,
+            mode: Some(0o755),
+        }];
+        let operations_path = dir.path().join("operations.json");
+        fs::write(
+            &operations_path,
+            serde_json::to_vec_pretty(&operations).expect("serialize operations"),
+        )
+        .expect("write operations file");
+
+        let signing_key_path = dir.path().join("signing-key.pkcs8");
+        write_test_signing_key(&signing_key_path);
+
+        let err = create(CreateArgs {
+            bundle: bundle_dir,
+            base_id: BASE_CHANNEL_STABLE.to_string(),
+            operations: Some(operations_path),
+            payload_dir: Some(payload_dir),
+            signing_key: signing_key_path,
+            post_state_hashes: None,
+            patch_version: "2.0.0".to_string(),
+            bundle_id: None,
+            created_at: None,
+            write_file: vec![format!(
+                "{}:/opt/tool:755",
+                dir.path().join("some-file").display()
+            )],
+            mkdir: Vec::new(),
+            symlink: Vec::new(),
+            delete_file: Vec::new(),
+            set_mode: Vec::new(),
+            set_owner: Vec::new(),
+        })
+        .expect_err("mixing input modes should fail");
+        assert!(format!("{err:#}").contains("choose one create input mode"));
     }
 
     #[test]

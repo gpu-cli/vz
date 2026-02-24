@@ -577,13 +577,75 @@ mod tests {
                     commands::vm_patch::VmPatchCommand::Create(create) => {
                         assert_eq!(create.bundle, PathBuf::from("/tmp/patch-bundle.vzpatch"));
                         assert_eq!(create.base_id, "stable");
-                        assert_eq!(create.operations, PathBuf::from("/tmp/operations.json"));
-                        assert_eq!(create.payload_dir, PathBuf::from("/tmp/payload"));
+                        assert_eq!(
+                            create.operations.as_ref(),
+                            Some(&PathBuf::from("/tmp/operations.json"))
+                        );
+                        assert_eq!(
+                            create.payload_dir.as_ref(),
+                            Some(&PathBuf::from("/tmp/payload"))
+                        );
                         assert_eq!(create.signing_key, PathBuf::from("/tmp/signing-key.pem"));
                         assert_eq!(create.patch_version, "1.0.0");
                         assert!(create.post_state_hashes.is_none());
                         assert!(create.bundle_id.is_none());
                         assert!(create.created_at.is_none());
+                        assert!(create.write_file.is_empty());
+                        assert!(create.mkdir.is_empty());
+                        assert!(create.symlink.is_empty());
+                        assert!(create.delete_file.is_empty());
+                        assert!(create.set_mode.is_empty());
+                        assert!(create.set_owner.is_empty());
+                    }
+                    other => panic!("unexpected vm patch action: {other:?}"),
+                },
+                other => panic!("unexpected vm command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_patch_create_inline_specs() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "vm",
+            "patch",
+            "create",
+            "--bundle",
+            "/tmp/patch-bundle.vzpatch",
+            "--base-id",
+            "stable",
+            "--write-file",
+            "/tmp/vz-agent:/usr/local/libexec/vz-agent:755",
+            "--symlink",
+            "/usr/local/bin/vz-agent:/usr/local/libexec/vz-agent",
+            "--set-owner",
+            "/usr/local/libexec/vz-agent:0:0",
+            "--signing-key",
+            "/tmp/signing-key.pem",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Vm(args) => match args.action {
+                commands::vm::VmCommand::Patch(patch_args) => match patch_args.action {
+                    commands::vm_patch::VmPatchCommand::Create(create) => {
+                        assert!(create.operations.is_none());
+                        assert!(create.payload_dir.is_none());
+                        assert_eq!(
+                            create.write_file,
+                            vec!["/tmp/vz-agent:/usr/local/libexec/vz-agent:755".to_string()]
+                        );
+                        assert_eq!(
+                            create.symlink,
+                            vec!["/usr/local/bin/vz-agent:/usr/local/libexec/vz-agent".to_string()]
+                        );
+                        assert_eq!(
+                            create.set_owner,
+                            vec!["/usr/local/libexec/vz-agent:0:0".to_string()]
+                        );
                     }
                     other => panic!("unexpected vm patch action: {other:?}"),
                 },
