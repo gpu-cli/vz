@@ -491,6 +491,7 @@ pub async fn run(args: VmPatchArgs) -> anyhow::Result<()> {
 
 fn verify(args: VerifyArgs) -> anyhow::Result<()> {
     let manifest = verify_bundle(&args.bundle)?;
+    validate_patch_target_base_policy(&manifest)?;
     println!(
         "Patch bundle '{}' verified for target base '{}'",
         manifest.bundle_id, manifest.target_base_id
@@ -509,6 +510,7 @@ fn patch_state_path() -> PathBuf {
 
 fn apply_with_state_path(args: ApplyArgs, patch_state_path: &Path) -> anyhow::Result<()> {
     let manifest = verify_bundle(&args.bundle)?;
+    validate_patch_target_base_policy(&manifest)?;
     let root = fs::canonicalize(&args.root)
         .with_context(|| format!("failed to resolve apply root {}", args.root.display()))?;
     if !root.is_dir() {
@@ -575,6 +577,26 @@ fn verify_bundle(bundle_dir: &Path) -> anyhow::Result<PatchBundleManifest> {
     verify_operations_digest(&manifest)?;
 
     Ok(manifest)
+}
+
+fn validate_patch_target_base_policy(manifest: &PatchBundleManifest) -> anyhow::Result<()> {
+    let matrix = super::vm_base::BaseMatrix::load()?;
+    validate_patch_target_base_policy_with_matrix(manifest, &matrix)
+}
+
+fn validate_patch_target_base_policy_with_matrix(
+    manifest: &PatchBundleManifest,
+    matrix: &super::vm_base::BaseMatrix,
+) -> anyhow::Result<()> {
+    super::vm_base::resolve_base_selector_or_err(matrix, &manifest.target_base_id).with_context(
+        || {
+            format!(
+                "patch bundle '{}' targets unsupported or retired base '{}'",
+                manifest.bundle_id, manifest.target_base_id
+            )
+        },
+    )?;
+    Ok(())
 }
 
 fn validate_apply_preflight(
@@ -1375,9 +1397,14 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+    use crate::commands::vm_base::BASE_CHANNEL_STABLE;
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use tempfile::{TempDir, tempdir};
+
+    const ACTIVE_BASE_ID: &str = "macos-15.3.1-24D70-arm64-64g";
+    const PREVIOUS_BASE_ID: &str = "macos-14.6-23G80-arm64-64g";
+    const RETIRED_BASE_ID: &str = "macos-13.6.7-22H123-arm64-64g";
 
     fn make_signing_key_pair() -> Ed25519KeyPair {
         let rng = SystemRandom::new();
@@ -1417,7 +1444,7 @@ mod tests {
         PatchBundleManifest {
             bundle_id: "vz-cih-2-1-bundle".to_string(),
             patch_version: "1.0.0".to_string(),
-            target_base_id: "macos-15.3.1-24D70-arm64-64g".to_string(),
+            target_base_id: ACTIVE_BASE_ID.to_string(),
             target_base_fingerprint: BundleBaseFingerprint {
                 img_sha256: "1".repeat(64),
                 aux_sha256: "2".repeat(64),
@@ -1535,7 +1562,7 @@ mod tests {
         build_apply_bundle_with_target(
             root,
             "vz-cih-2-2-apply",
-            "macos-15.3.1-24D70-arm64-64g",
+            ACTIVE_BASE_ID,
             default_test_base_fingerprint(),
             operations,
             post_state_hashes,
@@ -1613,6 +1640,60 @@ mod tests {
         let err = verify_bundle(dir.path()).expect_err("malformed metadata should fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("manifest.bundle_id"));
+    }
+
+    #[test]
+    fn patch_verify_rejects_unsupported_target_base_descriptor() {
+        let dir = tempdir().expect("create temp dir");
+        let key_pair = make_signing_key_pair();
+        let payload = b"payload archive bytes";
+        let mut manifest = valid_manifest(&key_pair, payload);
+        manifest.target_base_id = "macos-99.9.9-unknown-arm64-64g".to_string();
+        write_signed_bundle(dir.path(), &key_pair, &manifest, payload);
+
+        let err = verify(VerifyArgs {
+            bundle: dir.path().to_path_buf(),
+        })
+        .expect_err("unsupported target base should fail verify");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unsupported or retired base"));
+        assert!(msg.contains("unknown base selector"));
+        assert!(msg.contains("vz vm init --base stable"));
+    }
+
+    #[test]
+    fn patch_apply_rejects_retired_target_base_descriptor() {
+        let root = tempdir().expect("create root");
+        let patch_state_path = root.path().join("patch-state.json");
+        fs::create_dir_all(root.path().join("opt")).expect("create parent");
+
+        let bytes = b"patched-bytes".to_vec();
+        let digest = sha256_bytes_hex(&bytes);
+        let operations = vec![PatchOperation::WriteFile {
+            path: "/opt/tool".to_string(),
+            content_digest: digest.clone(),
+            mode: Some(0o755),
+        }];
+        let post_state_hashes = BTreeMap::from([("/opt/tool".to_string(), digest.clone())]);
+        let bundle = build_apply_bundle_with_target(
+            root.path(),
+            "vz-cih-2-2-retired",
+            RETIRED_BASE_ID,
+            default_test_base_fingerprint(),
+            operations,
+            post_state_hashes,
+            &[(digest, bytes)],
+        );
+
+        let err = apply_with_test_state(bundle.path(), root.path(), &patch_state_path)
+            .expect_err("retired target base should fail apply");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unsupported or retired base"));
+        assert!(msg.contains("retired base"));
+        assert!(msg.contains(RETIRED_BASE_ID));
+        assert!(msg.contains("vz vm init --base stable"));
+        assert!(msg.contains(BASE_CHANNEL_STABLE));
+        assert!(!root.path().join("opt/tool").exists());
     }
 
     #[test]
@@ -1739,7 +1820,7 @@ mod tests {
         let first_bundle = build_apply_bundle_with_target(
             root.path(),
             "vz-cih-2-2-apply",
-            "macos-15.3.1-24D70-arm64-64g",
+            ACTIVE_BASE_ID,
             default_test_base_fingerprint(),
             operations.clone(),
             post_state_hashes.clone(),
@@ -1751,7 +1832,7 @@ mod tests {
         let second_bundle = build_apply_bundle_with_target(
             root.path(),
             "vz-cih-2-2-apply",
-            "macos-15.4.0-25A64-arm64-64g",
+            PREVIOUS_BASE_ID,
             BundleBaseFingerprint {
                 img_sha256: "a".repeat(64),
                 aux_sha256: "2".repeat(64),
@@ -1768,8 +1849,8 @@ mod tests {
         assert!(message.contains("patch receipt mismatch"));
         assert!(message.contains("expected(existing receipt):"));
         assert!(message.contains("actual(requested apply):"));
-        assert!(message.contains("macos-15.3.1-24D70-arm64-64g"));
-        assert!(message.contains("macos-15.4.0-25A64-arm64-64g"));
+        assert!(message.contains(ACTIVE_BASE_ID));
+        assert!(message.contains(PREVIOUS_BASE_ID));
         assert!(message.contains("img_sha256=aaaaaaaa"));
         assert_eq!(
             fs::read(root.path().join("opt/tool")).expect("file should remain from first apply"),

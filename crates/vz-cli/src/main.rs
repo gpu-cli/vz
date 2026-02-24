@@ -179,6 +179,7 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use std::path::PathBuf;
 
     #[test]
     fn cli_debug_assert() {
@@ -212,6 +213,102 @@ mod tests {
             cli.command,
             Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::Init(_))
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_init_with_pinned_base() {
+        let cli =
+            Cli::try_parse_from(["vz", "vm", "init", "--base", "macos-15.3.1-24D70-arm64-64g"])
+                .expect("parse");
+
+        match cli.command {
+            Commands::Vm(args) => match args.action {
+                commands::vm::VmCommand::Init(init) => {
+                    assert_eq!(init.base.as_deref(), Some("macos-15.3.1-24D70-arm64-64g"));
+                    assert!(!init.allow_unpinned);
+                }
+                other => panic!("unexpected vm command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_init_with_channel_alias() {
+        let cli = Cli::try_parse_from(["vz", "vm", "init", "--base", "stable"]).expect("parse");
+
+        match cli.command {
+            Commands::Vm(args) => match args.action {
+                commands::vm::VmCommand::Init(init) => {
+                    assert_eq!(init.base.as_deref(), Some("stable"));
+                    assert!(!init.allow_unpinned);
+                }
+                other => panic!("unexpected vm command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_init_with_previous_channel_alias() {
+        let cli = Cli::try_parse_from(["vz", "vm", "init", "--base", "previous"]).expect("parse");
+
+        match cli.command {
+            Commands::Vm(args) => match args.action {
+                commands::vm::VmCommand::Init(init) => {
+                    assert_eq!(init.base.as_deref(), Some("previous"));
+                    assert!(!init.allow_unpinned);
+                }
+                other => panic!("unexpected vm command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_init_unpinned_escape_hatch() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "vm",
+            "init",
+            "--allow-unpinned",
+            "--ipsw",
+            "/tmp/restore.ipsw",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Vm(args) => match args.action {
+                commands::vm::VmCommand::Init(init) => {
+                    assert!(init.allow_unpinned);
+                    assert_eq!(init.ipsw, Some("/tmp/restore.ipsw".into()));
+                }
+                other => panic!("unexpected vm command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_init_rejects_base_and_ipsw_together() {
+        let err = Cli::try_parse_from([
+            "vz",
+            "vm",
+            "init",
+            "--base",
+            "macos-15.3.1-24D70-arm64-64g",
+            "--ipsw",
+            "/tmp/restore.ipsw",
+        ])
+        .expect_err("expected clap conflict");
+        let msg = err.to_string();
+        assert!(msg.contains("--base"));
+        assert!(msg.contains("--ipsw"));
     }
 
     #[cfg(target_os = "macos")]
@@ -380,6 +477,138 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn parse_vm_base_list() {
+        let cli = Cli::try_parse_from(["vz", "vm", "base", "list"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Vm(ref args)
+                if matches!(
+                    args.action,
+                    commands::vm::VmCommand::Base(ref base_args)
+                        if matches!(base_args.action, commands::vm_base::VmBaseCommand::List)
+                )
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_base_verify() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "vm",
+            "base",
+            "verify",
+            "--image",
+            "/tmp/base.img",
+            "--base-id",
+            "macos-15.3.1-24D70-arm64-64g",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Vm(args) => match args.action {
+                commands::vm::VmCommand::Base(base_args) => match base_args.action {
+                    commands::vm_base::VmBaseCommand::Verify(verify) => {
+                        assert_eq!(verify.image, PathBuf::from("/tmp/base.img"));
+                        assert_eq!(verify.base_id, "macos-15.3.1-24D70-arm64-64g");
+                    }
+                    other => panic!("unexpected vm base action: {other:?}"),
+                },
+                other => panic!("unexpected vm command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_base_verify_with_channel_alias() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "vm",
+            "base",
+            "verify",
+            "--image",
+            "/tmp/base.img",
+            "--base-id",
+            "previous",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Vm(args) => match args.action {
+                commands::vm::VmCommand::Base(base_args) => match base_args.action {
+                    commands::vm_base::VmBaseCommand::Verify(verify) => {
+                        assert_eq!(verify.image, PathBuf::from("/tmp/base.img"));
+                        assert_eq!(verify.base_id, "previous");
+                    }
+                    other => panic!("unexpected vm base action: {other:?}"),
+                },
+                other => panic!("unexpected vm command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_patch_verify() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "vm",
+            "patch",
+            "verify",
+            "--bundle",
+            "/tmp/patch-bundle.vzpatch",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Vm(args) => match args.action {
+                commands::vm::VmCommand::Patch(patch_args) => match patch_args.action {
+                    commands::vm_patch::VmPatchCommand::Verify(verify) => {
+                        assert_eq!(verify.bundle, PathBuf::from("/tmp/patch-bundle.vzpatch"));
+                    }
+                    other => panic!("unexpected vm patch action: {other:?}"),
+                },
+                other => panic!("unexpected vm command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_patch_apply() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "vm",
+            "patch",
+            "apply",
+            "--bundle",
+            "/tmp/patch-bundle.vzpatch",
+            "--root",
+            "/tmp/mounted-root",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Vm(args) => match args.action {
+                commands::vm::VmCommand::Patch(patch_args) => match patch_args.action {
+                    commands::vm_patch::VmPatchCommand::Apply(apply) => {
+                        assert_eq!(apply.bundle, PathBuf::from("/tmp/patch-bundle.vzpatch"));
+                        assert_eq!(apply.root, PathBuf::from("/tmp/mounted-root"));
+                    }
+                    other => panic!("unexpected vm patch action: {other:?}"),
+                },
+                other => panic!("unexpected vm command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn parse_vm_cleanup() {
         let cli = Cli::try_parse_from(["vz", "vm", "cleanup"]).expect("parse");
         assert!(matches!(
@@ -407,6 +636,8 @@ mod tests {
             "provision",
             "--image",
             "base.img",
+            "--base-id",
+            "macos-15.3.1-24D70-arm64-64g",
             "--agent-mode",
             "user",
         ])
@@ -414,9 +645,44 @@ mod tests {
 
         if let Commands::Vm(ref vm_args) = cli.command {
             if let commands::vm::VmCommand::Provision(ref provision) = vm_args.action {
+                assert_eq!(
+                    provision.base_id.as_deref(),
+                    Some("macos-15.3.1-24D70-arm64-64g")
+                );
+                assert!(!provision.allow_unpinned);
                 assert!(matches!(
                     provision.agent_mode,
                     commands::provision::AgentModeArg::User
+                ));
+            } else {
+                panic!("expected Provision");
+            }
+        } else {
+            panic!("expected Vm");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_provision_with_channel_alias() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "vm",
+            "provision",
+            "--image",
+            "base.img",
+            "--base-id",
+            "stable",
+        ])
+        .expect("parse");
+
+        if let Commands::Vm(ref vm_args) = cli.command {
+            if let commands::vm::VmCommand::Provision(ref provision) = vm_args.action {
+                assert_eq!(provision.base_id.as_deref(), Some("stable"));
+                assert!(!provision.allow_unpinned);
+                assert!(matches!(
+                    provision.agent_mode,
+                    commands::provision::AgentModeArg::System
                 ));
             } else {
                 panic!("expected Provision");
@@ -434,6 +700,8 @@ mod tests {
 
         if let Commands::Vm(ref vm_args) = cli.command {
             if let commands::vm::VmCommand::Provision(ref provision) = vm_args.action {
+                assert_eq!(provision.base_id, None);
+                assert!(!provision.allow_unpinned);
                 assert!(matches!(
                     provision.agent_mode,
                     commands::provision::AgentModeArg::System
@@ -444,6 +712,50 @@ mod tests {
         } else {
             panic!("expected Vm");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_provision_unpinned_escape_hatch() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "vm",
+            "provision",
+            "--image",
+            "base.img",
+            "--allow-unpinned",
+        ])
+        .expect("parse");
+
+        if let Commands::Vm(ref vm_args) = cli.command {
+            if let commands::vm::VmCommand::Provision(ref provision) = vm_args.action {
+                assert_eq!(provision.base_id, None);
+                assert!(provision.allow_unpinned);
+            } else {
+                panic!("expected Provision");
+            }
+        } else {
+            panic!("expected Vm");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_provision_rejects_base_id_with_allow_unpinned() {
+        let err = Cli::try_parse_from([
+            "vz",
+            "vm",
+            "provision",
+            "--image",
+            "base.img",
+            "--base-id",
+            "macos-15.3.1-24D70-arm64-64g",
+            "--allow-unpinned",
+        ])
+        .expect_err("expected clap conflict");
+        let msg = err.to_string();
+        assert!(msg.contains("--base-id"));
+        assert!(msg.contains("--allow-unpinned"));
     }
 
     #[test]

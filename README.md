@@ -90,11 +90,17 @@ vz stack down demo --volumes
 ### 4. Manage macOS VMs (macOS only)
 
 ```bash
-# Create a base image from IPSW
-vz vm init --disk-size 64G
+# Create a pinned base image from the stable channel
+vz vm init --base stable
 
-# Provision account + guest agent (one-time per image)
-sudo vz vm provision --image ~/.vz/images/base.img
+# Provision account + guest agent after fingerprint verification (system mode is default)
+sudo vz vm provision --image ~/.vz/images/base.img --base-id stable
+
+# No-local-sudo local path (opt-in runtime policy)
+vz vm provision --image ~/.vz/images/base.img --base-id stable --agent-mode user
+
+# Verify a local image against the stable channel pin
+vz vm base verify --image ~/.vz/images/base.img --base-id stable
 
 # Start headless VM
 vz vm run --image ~/.vz/images/base.img --name dev --headless &
@@ -107,6 +113,22 @@ vz vm save dev --stop
 
 # Restore fast from saved state
 vz vm run --image ~/.vz/images/base.img --name dev --restore ~/.vz/state/dev.vzsave --headless &
+```
+
+### 5. Pinned-base automation policy (macOS VM flows)
+
+- `vz vm init --base <selector>`, `vz vm provision --base-id <selector>`, and `vz vm base verify --base-id <selector>` accept immutable base IDs plus channel aliases (`stable`, `previous`).
+- Base descriptors include support lifecycle metadata (`active` or `retired`); selecting a retired or unknown base fails with explicit fallback guidance.
+- Retirement guidance always includes `vz vm init --base stable` and, when available, a concrete replacement selector/base.
+- `vz vm patch verify` and `vz vm patch apply` reject bundles targeting retired or unsupported base descriptors.
+- Unpinned flows require explicit `--allow-unpinned`.
+- In CI (`CI=true`), unpinned flows are blocked unless `VZ_ALLOW_UNPINNED_IN_CI=1` is set.
+- Runtime policy: `--agent-mode system` is the default for reliability; `--agent-mode user` is opt-in for no-local-sudo workflows.
+
+```bash
+# Explicit unpinned local flow
+vz vm init --allow-unpinned --ipsw ~/Downloads/restore.ipsw
+sudo vz vm provision --image ~/.vz/images/base.img --allow-unpinned
 ```
 
 ## Command groups

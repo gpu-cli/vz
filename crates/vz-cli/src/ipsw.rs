@@ -6,11 +6,13 @@
 //! 3. vz cache (`~/.vz/cache/*.ipsw`)
 //! 4. Apple CDN download (last resort)
 
-use std::io::Write;
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
 use crate::registry;
@@ -92,6 +94,114 @@ pub async fn resolve(user_path: Option<&Path>) -> anyhow::Result<ResolvedIpsw> {
     })
 }
 
+/// Resolve a pinned IPSW from a matrix URL and expected SHA-256 digest.
+///
+/// Downloads into `~/.vz/cache/` under a content-addressed filename.
+pub async fn resolve_pinned(url: &str, expected_sha256: &str) -> anyhow::Result<ResolvedIpsw> {
+    let expected = normalize_sha256(expected_sha256)?;
+    let cache_dir = registry::vz_home().join("cache");
+    std::fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("failed to create cache directory {}", cache_dir.display()))?;
+
+    let final_path = pinned_cache_path(&expected);
+    let partial_path = final_path.with_extension("ipsw.partial");
+
+    if final_path.exists() {
+        let actual = sha256_file(&final_path).with_context(|| {
+            format!("failed to hash cached pinned IPSW {}", final_path.display())
+        })?;
+        if actual == expected {
+            info!(
+                path = %final_path.display(),
+                sha256 = %actual,
+                "using cached pinned IPSW"
+            );
+            println!("Using pinned IPSW: {}", final_path.display());
+            return Ok(ResolvedIpsw {
+                path: final_path,
+                source: IpswSource::Cached,
+            });
+        }
+
+        println!(
+            "Cached pinned IPSW hash mismatch; re-downloading.\n  expected: {expected}\n  actual:   {actual}"
+        );
+        let _ = std::fs::remove_file(&final_path);
+    }
+
+    println!("Downloading pinned IPSW:");
+    println!("  URL: {url}");
+    println!("  Expected SHA-256: {expected}");
+    download_url_to_path(url, &partial_path, &final_path).await?;
+
+    let actual = sha256_file(&final_path)
+        .with_context(|| format!("failed to hash downloaded IPSW {}", final_path.display()))?;
+    if actual != expected {
+        let _ = std::fs::remove_file(&final_path);
+        bail!(
+            "pinned IPSW hash mismatch after download.\n\
+             expected: {expected}\n\
+             actual:   {actual}\n\
+             file:     {}",
+            final_path.display()
+        );
+    }
+
+    info!(
+        path = %final_path.display(),
+        sha256 = %actual,
+        "downloaded pinned IPSW"
+    );
+    println!("Pinned IPSW cached at {}", final_path.display());
+    Ok(ResolvedIpsw {
+        path: final_path,
+        source: IpswSource::Downloaded,
+    })
+}
+
+/// Check whether a verified pinned IPSW already exists in cache.
+pub fn pinned_cache_available(expected_sha256: &str) -> anyhow::Result<bool> {
+    let expected = normalize_sha256(expected_sha256)?;
+    let path = pinned_cache_path(&expected);
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let actual = sha256_file(&path)
+        .with_context(|| format!("failed to hash cached pinned IPSW {}", path.display()))?;
+    Ok(actual == expected)
+}
+
+/// Compute the SHA-256 digest of a file as lowercase hex.
+pub fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open file {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read file {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Validate and normalize SHA-256 input into lowercase hex.
+pub fn normalize_sha256(value: &str) -> anyhow::Result<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.len() != 64 || !normalized.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("SHA-256 digest must be a 64-character hex string");
+    }
+    Ok(normalized)
+}
+
 // ---------------------------------------------------------------------------
 // Local installer detection
 // ---------------------------------------------------------------------------
@@ -144,6 +254,82 @@ fn find_cached_ipsw() -> Option<PathBuf> {
     }
 
     newest.map(|(path, _)| path)
+}
+
+fn pinned_cache_path(normalized_sha256: &str) -> PathBuf {
+    registry::vz_home()
+        .join("cache")
+        .join(format!("{normalized_sha256}.ipsw"))
+}
+
+async fn download_url_to_path(
+    url: &str,
+    partial_path: &Path,
+    final_path: &Path,
+) -> anyhow::Result<()> {
+    if partial_path.exists() {
+        std::fs::remove_file(partial_path).with_context(|| {
+            format!(
+                "failed to clear previous partial download {}",
+                partial_path.display()
+            )
+        })?;
+    }
+
+    let response = reqwest::Client::new().get(url).send().await?;
+    if !response.status().is_success() {
+        bail!("download failed: HTTP {} from {}", response.status(), url);
+    }
+
+    let total_bytes = response.content_length().unwrap_or(0);
+    let progress = if total_bytes > 0 {
+        let pb = ProgressBar::new(total_bytes);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "  {bar:40.cyan/dim} {percent:>3}%  {bytes}/{total_bytes}  \
+                     {bytes_per_sec}  {eta} remaining",
+                )
+                .unwrap_or_else(|_| ProgressStyle::default_bar()),
+        );
+        pb
+    } else {
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("  {spinner} {bytes} downloaded  {bytes_per_sec}")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        pb
+    };
+
+    let mut file = std::fs::File::create(partial_path)
+        .with_context(|| format!("failed to create {}", partial_path.display()))?;
+    let mut downloaded = 0u64;
+
+    use tokio_stream::StreamExt;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        file.write_all(&chunk)
+            .with_context(|| format!("failed to write {}", partial_path.display()))?;
+        downloaded += chunk.len() as u64;
+        progress.set_position(downloaded);
+    }
+    progress.finish_and_clear();
+    file.flush()
+        .with_context(|| format!("failed to flush {}", partial_path.display()))?;
+    drop(file);
+
+    std::fs::rename(partial_path, final_path).with_context(|| {
+        format!(
+            "failed to move download from {} to {}",
+            partial_path.display(),
+            final_path.display()
+        )
+    })?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -549,6 +735,34 @@ mod tests {
     fn parse_disk_size_invalid() {
         assert!(parse_disk_size("abc").is_err());
         assert!(parse_disk_size("G").is_err());
+    }
+
+    #[test]
+    fn normalize_sha256_accepts_uppercase() {
+        let hash = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789";
+        let normalized = normalize_sha256(hash).unwrap();
+        assert_eq!(
+            normalized,
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        );
+    }
+
+    #[test]
+    fn normalize_sha256_rejects_invalid() {
+        assert!(normalize_sha256("abc123").is_err());
+        assert!(normalize_sha256("z".repeat(64).as_str()).is_err());
+    }
+
+    #[test]
+    fn sha256_file_hashes_known_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ipsw");
+        std::fs::write(&path, b"hello world").unwrap();
+        let digest = sha256_file(&path).unwrap();
+        assert_eq!(
+            digest,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
     }
 
     #[test]

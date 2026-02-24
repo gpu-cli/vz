@@ -50,6 +50,12 @@ pub enum VmCommand {
 
     /// Run validation suites against image cohorts.
     Validate(super::validate::ValidateArgs),
+
+    /// Manage supported base image definitions.
+    Base(super::vm_base::VmBaseArgs),
+
+    /// Verify signed patch bundles before apply.
+    Patch(super::vm_patch::VmPatchArgs),
 }
 
 /// Entry point for `vz vm`.
@@ -68,5 +74,7 @@ pub async fn run(args: VmArgs) -> anyhow::Result<()> {
         VmCommand::Cleanup(a) => super::cleanup::run(a).await,
         VmCommand::SelfSign(a) => super::self_sign::run(a).await,
         VmCommand::Validate(a) => super::validate::run(a).await,
+        VmCommand::Base(a) => super::vm_base::run(a).await,
+        VmCommand::Patch(a) => super::vm_patch::run(a).await,
     }
 }
