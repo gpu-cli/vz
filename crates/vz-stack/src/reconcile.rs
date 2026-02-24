@@ -48,8 +48,15 @@ impl Action {
 #[derive(Debug, Clone, Default)]
 pub struct ApplyResult {
     /// Actions that were planned (and would be executed by a real runtime).
+    ///
+    /// This is the reconciler's explicit convergence claim for the round:
+    /// if this list is empty and no services are deferred, reconcile has no
+    /// further work for the current desired/observed state.
     pub actions: Vec<Action>,
     /// Services deferred because their dependencies are not ready.
+    ///
+    /// Deferred services are part of the convergence claim and must be empty
+    /// before the orchestrator can declare the stack converged.
     pub deferred: Vec<DeferredService>,
 }
 
@@ -74,7 +81,9 @@ pub struct DeferredService {
 ///
 /// Services whose dependencies are not ready are deferred and
 /// reported in [`ApplyResult::deferred`]. Re-applying the same
-/// spec after dependencies become ready will create them.
+/// spec after dependencies become ready will create them. This makes
+/// `apply` idempotent and restart-safe: convergence is driven by the
+/// persisted desired/observed state and deterministic action planning.
 pub fn apply(
     spec: &StackSpec,
     store: &StateStore,

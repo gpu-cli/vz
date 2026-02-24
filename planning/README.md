@@ -110,6 +110,13 @@ vsock (`AF_VSOCK`) provides a socket interface between host and guest without an
 
 stdout/stderr from guest command execution is streamed to the host as vsock frames in real time. The guest agent pushes output as it arrives rather than the host polling for it. Frame format: 4-byte little-endian length prefix followed by a JSON payload containing the stream type (stdout/stderr/exit) and data.
 
+### 8. Measured claims only
+
+Performance and reliability claims must be backed by reproducible benchmark evidence.
+Any headline claim (startup time, restore time, pull speed, convergence latency, or
+density) must include the exact host/software baseline, benchmark method, and raw
+artifacts needed for independent verification.
+
 ## Implementation Phases
 
 ### Phase 1: vz crate — Safe API over objc2-virtualization
@@ -196,7 +203,7 @@ Phase 1 must complete before Phase 2 or Phase 3 can begin. Phase 2 and Phase 3 c
 | `05-sandbox.md` | vz-sandbox crate: SandboxPool lifecycle, SandboxSession acquire/release, Channel typed protocol, **session isolation (RestoreOnAcquire vs Reuse), exec timeouts, network isolation policy** |
 | `06-cli.md` | vz-cli commands, UX design, golden image creation workflow, interactive vs headless modes, **orphaned VM detection, distribution channels** |
 | `07-golden-image.md` | IPSW to bootable macOS VM pipeline, dev tool provisioning, image versioning, **automated first-boot provisioning (skip Setup Assistant, pre-create user), fully unattended vz init flow** |
-| `08-testing.md` | Testing strategy for a virtualization library: unit tests (mock ObjC), integration tests (real VMs), CI on Apple Silicon |
+| `08-testing.md` | Testing strategy for a virtualization library: unit tests (mock ObjC), integration tests (real VMs), CI on Apple Silicon, and measured-claims benchmark requirements |
 | `09-signing.md` | **Entitlements (com.apple.security.virtualization), code signing with Developer ID, notarization, CI signing workflow, distribution (Homebrew, GitHub Releases, cargo install, install script)** |
 | `on-demand-elevation/README.md` | One-command UX with stage-gated elevation: request admin privileges only when offline provisioning requires it; includes security, UX, and rollout plan |
 | `pinned-ipsw-patches/README.md` | Pinned base matrix + signed file-level patch bundle strategy to keep system reliability while enabling no-local-sudo artifact workflows |

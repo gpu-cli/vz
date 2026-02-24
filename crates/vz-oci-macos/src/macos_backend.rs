@@ -32,6 +32,10 @@ impl RuntimeBackend for MacosRuntimeBackend {
         "macos-vz"
     }
 
+    fn capabilities(&self) -> contract::RuntimeCapabilities {
+        contract::RuntimeCapabilities::stack_baseline()
+    }
+
     async fn pull(&self, image: &str) -> Result<String, RuntimeError> {
         let id = self.runtime.pull(image).await.map_err(oci_err)?;
         Ok(id.0)
@@ -219,9 +223,17 @@ impl RuntimeBackend for MacosRuntimeBackend {
 // ── Error mapping ─────────────────────────────────────────────────
 
 fn oci_err(e: crate::error::MacosOciError) -> RuntimeError {
-    RuntimeError::Backend {
-        message: e.to_string(),
-        source: Box::new(e),
+    match e {
+        crate::error::MacosOciError::UnsupportedExecutionMode { mode } => {
+            RuntimeError::UnsupportedOperation {
+                operation: "execution_mode".to_string(),
+                reason: format!("execution mode `{mode}` is not yet supported"),
+            }
+        }
+        other => RuntimeError::Backend {
+            message: other.to_string(),
+            source: Box::new(other),
+        },
     }
 }
 

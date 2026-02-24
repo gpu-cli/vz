@@ -63,7 +63,11 @@ pub struct OrchestrationResult {
 pub struct RoundReport {
     /// Current round number (1-indexed).
     pub round: usize,
-    /// Result of reconciliation (actions planned).
+    /// Result of reconciliation (actions + deferred services).
+    ///
+    /// This is the reconciler-owned convergence claim for the round.
+    /// Consumers should treat this as the source of truth for whether
+    /// additional reconciliation work is still required.
     pub apply_result: ApplyResult,
     /// Result of executing actions (may be empty if no actions).
     pub exec_result: Option<ExecutionResult>,
@@ -226,7 +230,10 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
                 });
             }
 
-            if pending == 0 && apply_result.deferred.is_empty() {
+            // Convergence is reconciler-owned: only declare converged when
+            // observed state has no pending services and reconcile reports no
+            // deferred dependency work for this round.
+            if Self::reconciler_reports_converged(pending, &apply_result) {
                 info!(rounds = round, ready, failed, "stack converged");
                 return Ok(OrchestrationResult {
                     converged: true,
@@ -293,6 +300,10 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
         }
 
         Ok((ready, failed, pending))
+    }
+
+    fn reconciler_reports_converged(pending: usize, apply_result: &ApplyResult) -> bool {
+        pending == 0 && apply_result.deferred.is_empty()
     }
 }
 
@@ -475,6 +486,33 @@ mod tests {
         .unwrap();
 
         assert_eq!(round_count, 1);
+    }
+
+    #[test]
+    fn second_run_reports_no_reconcile_work_when_already_converged() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
+        let (mut orch, _tmp) = make_orchestrator_shared(runtime);
+        let spec = stack("app", vec![svc("web")]);
+
+        let first = orch.run(&spec, None).unwrap();
+        assert!(first.converged);
+
+        let mut reports = Vec::new();
+        let second = orch
+            .run(
+                &spec,
+                Some(&mut |report: &RoundReport| {
+                    reports.push((
+                        report.apply_result.actions.len(),
+                        report.apply_result.deferred.len(),
+                    ));
+                }),
+            )
+            .unwrap();
+
+        assert!(second.converged);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0], (0, 0));
     }
 
     #[test]

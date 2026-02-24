@@ -81,9 +81,17 @@ fn now_unix_secs() -> u64 {
 }
 
 fn native_err(e: crate::error::LinuxNativeError) -> RuntimeError {
-    RuntimeError::Backend {
-        message: e.to_string(),
-        source: Box::new(e),
+    match e {
+        crate::error::LinuxNativeError::RuntimeBinaryNotFound { path } => {
+            RuntimeError::UnsupportedOperation {
+                operation: "oci_runtime_binary".to_string(),
+                reason: format!("runtime binary not found at '{path}'"),
+            }
+        }
+        other => RuntimeError::Backend {
+            message: other.to_string(),
+            source: Box::new(other),
+        },
     }
 }
 
@@ -184,6 +192,10 @@ fn apply_image_config(
 impl RuntimeBackend for LinuxNativeBackend {
     fn name(&self) -> &'static str {
         "linux-native"
+    }
+
+    fn capabilities(&self) -> contract::RuntimeCapabilities {
+        contract::RuntimeCapabilities::stack_baseline()
     }
 
     // ── Image operations ──────────────────────────────────────────

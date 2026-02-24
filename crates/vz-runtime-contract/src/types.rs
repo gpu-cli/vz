@@ -420,6 +420,52 @@ impl SharedVmPhaseTracker {
     }
 }
 
+/// Backend capability flags used by callers to branch behavior deterministically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RuntimeCapabilities {
+    /// Supports fs-focused quick checkpoints.
+    pub fs_quick_checkpoint: bool,
+    /// Supports full VM checkpoints (RAM/CPU/device state).
+    pub vm_full_checkpoint: bool,
+    /// Supports checkpoint fork into a new sandbox lineage.
+    pub checkpoint_fork: bool,
+    /// Supports Docker command compatibility adapter.
+    pub docker_compat: bool,
+    /// Supports Compose adapter semantics.
+    pub compose_adapter: bool,
+    /// Supports build cache export/import semantics.
+    pub build_cache_export: bool,
+    /// Supports GPU passthrough for workloads.
+    pub gpu_passthrough: bool,
+    /// Supports runtime live-resize operations.
+    pub live_resize: bool,
+    /// Supports shared sandbox/VM orchestration for multi-service stacks.
+    pub shared_vm: bool,
+    /// Supports stack network setup/teardown APIs.
+    pub stack_networking: bool,
+    /// Supports runtime log retrieval for created containers.
+    pub container_logs: bool,
+}
+
+impl RuntimeCapabilities {
+    /// Baseline capabilities used by current stack-enabled backends.
+    pub const fn stack_baseline() -> Self {
+        Self {
+            fs_quick_checkpoint: false,
+            vm_full_checkpoint: false,
+            checkpoint_fork: false,
+            docker_compat: false,
+            compose_adapter: true,
+            build_cache_export: false,
+            gpu_passthrough: false,
+            live_resize: false,
+            shared_vm: true,
+            stack_networking: true,
+            container_logs: true,
+        }
+    }
+}
+
 // ── Image types ───────────────────────────────────────────────────
 
 /// Cached image reference and manifest identifier pair.

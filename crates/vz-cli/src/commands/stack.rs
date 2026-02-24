@@ -373,6 +373,26 @@ struct OciContainerRuntime {
     handle: tokio::runtime::Handle,
 }
 
+fn unsupported_operation_error(operation: &str, reason: impl Into<String>) -> StackError {
+    StackError::Network(format!(
+        "unsupported_operation: operation={operation}; reason={}",
+        reason.into()
+    ))
+}
+
+fn map_runtime_error(operation: &str, error: vz_runtime_contract::RuntimeError) -> StackError {
+    match error {
+        vz_runtime_contract::RuntimeError::UnsupportedOperation {
+            operation: backend_operation,
+            reason,
+        } => unsupported_operation_error(
+            operation,
+            format!("backend_operation={backend_operation}; {reason}"),
+        ),
+        other => StackError::Network(format!("{operation} failed: {other}")),
+    }
+}
+
 impl OciContainerRuntime {
     #[cfg(target_os = "macos")]
     fn new(oci_data_dir: &Path, auth: Option<vz_image::Auth>) -> anyhow::Result<Self> {
@@ -402,6 +422,31 @@ impl OciContainerRuntime {
         let handle = tokio::runtime::Handle::current();
         Ok(Self { backend, handle })
     }
+
+    fn capabilities(&self) -> vz_runtime_contract::RuntimeCapabilities {
+        use vz_runtime_contract::RuntimeBackend;
+        self.backend.capabilities()
+    }
+
+    fn ensure_capability(
+        &self,
+        operation: &str,
+        capability_name: &str,
+        enabled: bool,
+    ) -> Result<(), StackError> {
+        if enabled {
+            return Ok(());
+        }
+        use vz_runtime_contract::RuntimeBackend;
+        Err(unsupported_operation_error(
+            operation,
+            format!(
+                "backend={} missing capability {}",
+                self.backend.name(),
+                capability_name
+            ),
+        ))
+    }
 }
 
 impl ContainerRuntime for OciContainerRuntime {
@@ -410,7 +455,7 @@ impl ContainerRuntime for OciContainerRuntime {
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(self.backend.pull(image))
-                .map_err(|e| StackError::Network(format!("pull failed: {e}")))
+                .map_err(|e| map_runtime_error("pull", e))
         })
     }
 
@@ -423,7 +468,7 @@ impl ContainerRuntime for OciContainerRuntime {
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(self.backend.create_container(image, config))
-                .map_err(|e| StackError::Network(format!("create failed: {e}")))
+                .map_err(|e| map_runtime_error("create", e))
         })
     }
 
@@ -441,7 +486,7 @@ impl ContainerRuntime for OciContainerRuntime {
                         .stop_container(container_id, false, signal, grace_period),
                 )
                 .map(|_| ())
-                .map_err(|e| StackError::Network(format!("stop failed: {e}")))
+                .map_err(|e| map_runtime_error("stop", e))
         })
     }
 
@@ -450,7 +495,7 @@ impl ContainerRuntime for OciContainerRuntime {
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(self.backend.remove_container(container_id))
-                .map_err(|e| StackError::Network(format!("remove failed: {e}")))
+                .map_err(|e| map_runtime_error("remove", e))
         })
     }
 
@@ -473,7 +518,7 @@ impl ContainerRuntime for OciContainerRuntime {
             self.handle
                 .block_on(self.backend.exec_container(container_id, exec_config))
                 .map(|output| (output.exit_code, output.stdout, output.stderr))
-                .map_err(|e| StackError::Network(format!("exec failed: {e}")))
+                .map_err(|e| map_runtime_error("exec", e))
         })
     }
 
@@ -484,13 +529,15 @@ impl ContainerRuntime for OciContainerRuntime {
         resources: vz_runtime_contract::StackResourceHint,
     ) -> Result<(), StackError> {
         use vz_runtime_contract::RuntimeBackend;
+        let capabilities = self.capabilities();
+        self.ensure_capability("boot_shared_vm", "shared_vm", capabilities.shared_vm)?;
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(
                     self.backend
                         .boot_shared_vm(stack_id, ports.to_vec(), resources),
                 )
-                .map_err(|e| StackError::Network(format!("boot_shared_vm failed: {e}")))
+                .map_err(|e| map_runtime_error("boot_shared_vm", e))
         })
     }
 
@@ -500,22 +547,36 @@ impl ContainerRuntime for OciContainerRuntime {
         services: &[vz_runtime_contract::NetworkServiceConfig],
     ) -> Result<(), StackError> {
         use vz_runtime_contract::RuntimeBackend;
+        let capabilities = self.capabilities();
+        self.ensure_capability("network_setup", "shared_vm", capabilities.shared_vm)?;
+        self.ensure_capability(
+            "network_setup",
+            "stack_networking",
+            capabilities.stack_networking,
+        )?;
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(self.backend.network_setup(stack_id, services.to_vec()))
-                .map_err(|e| StackError::Network(format!("network_setup failed: {e}")))
+                .map_err(|e| map_runtime_error("network_setup", e))
         })
     }
 
     fn network_teardown(&self, stack_id: &str, service_names: &[String]) -> Result<(), StackError> {
         use vz_runtime_contract::RuntimeBackend;
+        let capabilities = self.capabilities();
+        self.ensure_capability("network_teardown", "shared_vm", capabilities.shared_vm)?;
+        self.ensure_capability(
+            "network_teardown",
+            "stack_networking",
+            capabilities.stack_networking,
+        )?;
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(
                     self.backend
                         .network_teardown(stack_id, service_names.to_vec()),
                 )
-                .map_err(|e| StackError::Network(format!("network_teardown failed: {e}")))
+                .map_err(|e| map_runtime_error("network_teardown", e))
         })
     }
 
@@ -526,36 +587,45 @@ impl ContainerRuntime for OciContainerRuntime {
         config: vz_runtime_contract::RunConfig,
     ) -> Result<String, StackError> {
         use vz_runtime_contract::RuntimeBackend;
+        let capabilities = self.capabilities();
+        self.ensure_capability("create_in_stack", "shared_vm", capabilities.shared_vm)?;
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(
                     self.backend
                         .create_container_in_stack(stack_id, image, config),
                 )
-                .map_err(|e| StackError::Network(format!("create_in_stack failed: {e}")))
+                .map_err(|e| map_runtime_error("create_in_stack", e))
         })
     }
 
     fn shutdown_shared_vm(&self, stack_id: &str) -> Result<(), StackError> {
         use vz_runtime_contract::RuntimeBackend;
+        let capabilities = self.capabilities();
+        self.ensure_capability("shutdown_shared_vm", "shared_vm", capabilities.shared_vm)?;
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(self.backend.shutdown_shared_vm(stack_id))
-                .map_err(|e| StackError::Network(format!("shutdown_shared_vm failed: {e}")))
+                .map_err(|e| map_runtime_error("shutdown_shared_vm", e))
         })
     }
 
     fn has_shared_vm(&self, stack_id: &str) -> bool {
         use vz_runtime_contract::RuntimeBackend;
+        if !self.capabilities().shared_vm {
+            return false;
+        }
         self.backend.has_shared_vm(stack_id)
     }
 
     fn logs(&self, container_id: &str) -> Result<ContainerLogs, StackError> {
         use vz_runtime_contract::RuntimeBackend;
+        let capabilities = self.capabilities();
+        self.ensure_capability("logs", "container_logs", capabilities.container_logs)?;
         let logs = self
             .backend
             .logs(container_id)
-            .map_err(|e| StackError::Network(format!("logs failed: {e}")))?;
+            .map_err(|e| map_runtime_error("logs", e))?;
         Ok(ContainerLogs {
             output: logs.output,
         })
@@ -2486,6 +2556,38 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: ControlResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.error.unwrap(), "service 'web' is not running");
+    }
+
+    #[test]
+    fn map_runtime_error_formats_unsupported_operation_deterministically() {
+        let stack_error = map_runtime_error(
+            "network_setup",
+            vz_runtime_contract::RuntimeError::UnsupportedOperation {
+                operation: "network_setup".to_string(),
+                reason: "missing stack_networking capability".to_string(),
+            },
+        );
+
+        match stack_error {
+            StackError::Network(message) => {
+                assert!(message.contains("unsupported_operation"));
+                assert!(message.contains("operation=network_setup"));
+                assert!(message.contains("missing stack_networking capability"));
+            }
+            other => panic!("expected StackError::Network, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_operation_error_prefix_is_stable() {
+        let err = unsupported_operation_error("logs", "missing container_logs capability");
+        match err {
+            StackError::Network(message) => {
+                assert!(message.starts_with("unsupported_operation:"));
+                assert!(message.contains("operation=logs"));
+            }
+            other => panic!("expected StackError::Network, got {other:?}"),
+        }
     }
 
     #[tokio::test]

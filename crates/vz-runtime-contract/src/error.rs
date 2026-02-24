@@ -50,6 +50,15 @@ pub enum RuntimeError {
         reason: String,
     },
 
+    /// Backend cannot perform the requested operation on this host/backend.
+    #[error("unsupported operation `{operation}`: {reason}")]
+    UnsupportedOperation {
+        /// Operation name, for example `network_setup` or `vm_full_checkpoint`.
+        operation: String,
+        /// Actionable reason this operation is unsupported.
+        reason: String,
+    },
+
     /// Rootfs directory is missing or invalid.
     #[error("invalid rootfs: {path}")]
     InvalidRootfs {

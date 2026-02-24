@@ -14,8 +14,8 @@ pub use selection::{HostBackend, ResolvedBackend};
 pub use types::{
     ContainerInfo, ContainerLogs, ContainerStatus, ContractInvariantError, ExecConfig, ExecOutput,
     ImageInfo, MountAccess, MountSpec, MountType, NetworkServiceConfig, PortMapping, PortProtocol,
-    PruneResult, RunConfig, SharedVmPhase, SharedVmPhaseTracker, StackResourceHint,
-    StackVolumeMount,
+    PruneResult, RunConfig, RuntimeCapabilities, SharedVmPhase, SharedVmPhaseTracker,
+    StackResourceHint, StackVolumeMount,
 };
 
 /// Backend-neutral container runtime trait.
@@ -33,6 +33,14 @@ pub use types::{
 pub trait RuntimeBackend: Send + Sync {
     /// Human-readable backend name for diagnostics.
     fn name(&self) -> &'static str;
+
+    /// Capability flags for this backend/runtime implementation.
+    ///
+    /// Callers must check these flags before invoking capability-gated flows
+    /// and return deterministic `unsupported_operation` diagnostics when false.
+    fn capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities::default()
+    }
 
     // ── Image operations ──────────────────────────────────────────
 
@@ -210,6 +218,8 @@ mod tests {
             network_name: "default".to_string(),
         };
         let _logs = ContainerLogs::default();
+        let _capabilities = RuntimeCapabilities::default();
+        let _stack_capabilities = RuntimeCapabilities::stack_baseline();
     }
 
     #[test]
@@ -280,6 +290,15 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "pull failed for ubuntu:latest: network timeout"
+        );
+
+        let err = RuntimeError::UnsupportedOperation {
+            operation: "network_setup".to_string(),
+            reason: "missing stack_networking capability".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "unsupported operation `network_setup`: missing stack_networking capability"
         );
     }
 }
