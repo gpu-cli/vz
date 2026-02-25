@@ -14,16 +14,18 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 use vz_runtime_contract::{
-    Capability, MachineErrorEnvelope, RequestMetadata, RuntimeCapabilities, RuntimeError, Sandbox,
-    SandboxBackend, SandboxSpec, SandboxState, runtime_error_machine_envelope,
+    Capability, Checkpoint, CheckpointClass, CheckpointState, Execution, ExecutionSpec,
+    ExecutionState, Lease, LeaseState, MachineErrorEnvelope, RequestMetadata, RuntimeCapabilities,
+    RuntimeError, Sandbox, SandboxBackend, SandboxSpec, SandboxState,
+    runtime_error_machine_envelope,
 };
-use vz_stack::{EventRecord, StackError, StateStore};
+use vz_stack::{EventRecord, IDEMPOTENCY_TTL_SECS, IdempotencyRecord, StackError, StateStore};
 
 const DEFAULT_EVENT_PAGE_SIZE: usize = 100;
 const MAX_EVENT_PAGE_SIZE: usize = 1000;
@@ -172,6 +174,159 @@ fn sandbox_to_payload(s: &Sandbox) -> SandboxPayload {
     }
 }
 
+// ── Lease types ──
+
+#[derive(Debug, Deserialize)]
+struct OpenLeaseRequest {
+    sandbox_id: String,
+    #[serde(default)]
+    ttl_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct LeasePayload {
+    lease_id: String,
+    sandbox_id: String,
+    ttl_secs: u64,
+    last_heartbeat_at: u64,
+    state: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LeaseResponse {
+    request_id: String,
+    lease: LeasePayload,
+}
+
+#[derive(Debug, Serialize)]
+struct LeaseListResponse {
+    request_id: String,
+    leases: Vec<LeasePayload>,
+}
+
+fn lease_to_payload(l: &Lease) -> LeasePayload {
+    LeasePayload {
+        lease_id: l.lease_id.clone(),
+        sandbox_id: l.sandbox_id.clone(),
+        ttl_secs: l.ttl_secs,
+        last_heartbeat_at: l.last_heartbeat_at,
+        state: serde_json::to_string(&l.state)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string(),
+    }
+}
+
+// ── Execution types ──
+
+#[derive(Debug, Deserialize)]
+struct CreateExecutionRequest {
+    container_id: String,
+    cmd: Vec<String>,
+    #[serde(default)]
+    args: Option<Vec<String>>,
+    #[serde(default)]
+    env_override: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pty: Option<bool>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecutionPayload {
+    execution_id: String,
+    container_id: String,
+    state: String,
+    exit_code: Option<i32>,
+    started_at: Option<u64>,
+    ended_at: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecutionResponse {
+    request_id: String,
+    execution: ExecutionPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecutionListResponse {
+    request_id: String,
+    executions: Vec<ExecutionPayload>,
+}
+
+fn execution_to_payload(e: &Execution) -> ExecutionPayload {
+    ExecutionPayload {
+        execution_id: e.execution_id.clone(),
+        container_id: e.container_id.clone(),
+        state: serde_json::to_string(&e.state)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string(),
+        exit_code: e.exit_code,
+        started_at: e.started_at,
+        ended_at: e.ended_at,
+    }
+}
+
+// ── Checkpoint types ──
+
+#[derive(Debug, Deserialize)]
+struct CreateCheckpointRequest {
+    sandbox_id: String,
+    #[serde(default)]
+    class: Option<String>,
+    #[serde(default)]
+    compatibility_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForkCheckpointRequest {
+    #[serde(default)]
+    new_sandbox_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CheckpointPayload {
+    checkpoint_id: String,
+    sandbox_id: String,
+    parent_checkpoint_id: Option<String>,
+    class: String,
+    state: String,
+    compatibility_fingerprint: String,
+    created_at: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct CheckpointResponse {
+    request_id: String,
+    checkpoint: CheckpointPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct CheckpointListResponse {
+    request_id: String,
+    checkpoints: Vec<CheckpointPayload>,
+}
+
+fn checkpoint_to_payload(c: &Checkpoint) -> CheckpointPayload {
+    CheckpointPayload {
+        checkpoint_id: c.checkpoint_id.clone(),
+        sandbox_id: c.sandbox_id.clone(),
+        parent_checkpoint_id: c.parent_checkpoint_id.clone(),
+        class: serde_json::to_string(&c.class)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string(),
+        state: serde_json::to_string(&c.state)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string(),
+        compatibility_fingerprint: c.compatibility_fingerprint.clone(),
+        created_at: c.created_at,
+    }
+}
+
 fn json_error_response(
     status: StatusCode,
     code: &str,
@@ -234,6 +389,82 @@ fn unsupported_operation_response(operation: &'static str, request_id: String) -
         },
         request_id,
     )
+}
+
+/// Extract idempotency key from request headers.
+fn extract_idempotency_key(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Compute a hash of the request body for conflict detection.
+fn compute_request_hash(body: &[u8]) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    body.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Check idempotency key, return cached response or `None` to proceed.
+///
+/// When the key matches a prior request with the same body hash, the
+/// original response is replayed. When the key matches but the body
+/// hash differs a 409 Conflict is returned.
+fn check_idempotency(
+    store: &StateStore,
+    key: &str,
+    _operation: &str,
+    request_hash: &str,
+    request_id: &str,
+) -> Option<Response> {
+    match store.find_idempotency_result(key) {
+        Ok(Some(record)) => {
+            if record.request_hash == request_hash {
+                // Return cached response
+                let status = StatusCode::from_u16(record.status_code)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let body: serde_json::Value =
+                    serde_json::from_str(&record.response_json).unwrap_or_default();
+                Some((status, Json(body)).into_response())
+            } else {
+                // Conflict -- same key, different request
+                Some(json_error_response(
+                    StatusCode::CONFLICT,
+                    "idempotency_conflict",
+                    "Idempotency key already used with different request parameters",
+                    request_id,
+                ))
+            }
+        }
+        Ok(None) => None, // Proceed with execution
+        Err(_) => None,   // On error, proceed without idempotency
+    }
+}
+
+/// Persist an idempotency result after a successful operation.
+fn save_idempotency(
+    store: &StateStore,
+    key: &str,
+    operation: &str,
+    request_hash: &str,
+    status_code: u16,
+    response_json: &str,
+) {
+    let now = now_epoch_secs();
+    let record = IdempotencyRecord {
+        key: key.to_string(),
+        operation: operation.to_string(),
+        request_hash: request_hash.to_string(),
+        response_json: response_json.to_string(),
+        status_code,
+        created_at: now,
+        expires_at: now + IDEMPOTENCY_TTL_SECS,
+    };
+    // Best-effort save; failure here does not block the response.
+    let _ = store.save_idempotency_result(&record);
 }
 
 fn read_events(
@@ -393,12 +624,36 @@ async fn ws_event_loop(
 async fn create_sandbox(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<CreateSandboxRequest>,
+    raw_body: axum::body::Bytes,
 ) -> Response {
     let request_id = request_id_from_headers(&headers);
     let store = match StateStore::open(&state.state_store_path) {
         Ok(s) => s,
         Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let idempotency_key = extract_idempotency_key(&headers);
+    let request_hash = compute_request_hash(&raw_body);
+
+    // Check for a cached idempotent response.
+    if let Some(ref key) = idempotency_key {
+        if let Some(cached) =
+            check_idempotency(&store, key, "create_sandbox", &request_hash, &request_id)
+        {
+            return cached;
+        }
+    }
+
+    let body: CreateSandboxRequest = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => {
+            return json_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &format!("invalid JSON body: {e}"),
+                &request_id,
+            );
+        }
     };
 
     let now = now_epoch_secs();
@@ -426,28 +681,46 @@ async fn create_sandbox(
         if let Err(e) = store.save_sandbox(&sandbox) {
             return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
         }
-        return (
-            StatusCode::CREATED,
-            Json(SandboxResponse {
-                request_id,
-                sandbox: sandbox_to_payload(&sandbox),
-            }),
-        )
-            .into_response();
+        let response = SandboxResponse {
+            request_id,
+            sandbox: sandbox_to_payload(&sandbox),
+        };
+        if let Some(ref key) = idempotency_key {
+            if let Ok(json) = serde_json::to_string(&response) {
+                save_idempotency(
+                    &store,
+                    key,
+                    "create_sandbox",
+                    &request_hash,
+                    StatusCode::CREATED.as_u16(),
+                    &json,
+                );
+            }
+        }
+        return (StatusCode::CREATED, Json(response)).into_response();
     }
 
     if let Err(e) = store.save_sandbox(&sandbox) {
         return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
     }
 
-    (
-        StatusCode::CREATED,
-        Json(SandboxResponse {
-            request_id,
-            sandbox: sandbox_to_payload(&sandbox),
-        }),
-    )
-        .into_response()
+    let response = SandboxResponse {
+        request_id,
+        sandbox: sandbox_to_payload(&sandbox),
+    };
+    if let Some(ref key) = idempotency_key {
+        if let Ok(json) = serde_json::to_string(&response) {
+            save_idempotency(
+                &store,
+                key,
+                "create_sandbox",
+                &request_hash,
+                StatusCode::CREATED.as_u16(),
+                &json,
+            );
+        }
+    }
+    (StatusCode::CREATED, Json(response)).into_response()
 }
 
 async fn list_sandboxes(State(state): State<ApiState>, headers: HeaderMap) -> Response {
@@ -513,6 +786,19 @@ async fn terminate_sandbox(
         Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
     };
 
+    let idempotency_key = extract_idempotency_key(&headers);
+    // For DELETE, the sandbox_id is the request identity.
+    let request_hash = compute_request_hash(sandbox_id.as_bytes());
+
+    // Check for a cached idempotent response.
+    if let Some(ref key) = idempotency_key {
+        if let Some(cached) =
+            check_idempotency(&store, key, "terminate_sandbox", &request_hash, &request_id)
+        {
+            return cached;
+        }
+    }
+
     let mut sandbox = match store.load_sandbox(&sandbox_id) {
         Ok(Some(s)) => s,
         Ok(None) => {
@@ -527,14 +813,23 @@ async fn terminate_sandbox(
     };
 
     if sandbox.state.is_terminal() {
-        return (
-            StatusCode::OK,
-            Json(SandboxResponse {
-                request_id,
-                sandbox: sandbox_to_payload(&sandbox),
-            }),
-        )
-            .into_response();
+        let response = SandboxResponse {
+            request_id,
+            sandbox: sandbox_to_payload(&sandbox),
+        };
+        if let Some(ref key) = idempotency_key {
+            if let Ok(json) = serde_json::to_string(&response) {
+                save_idempotency(
+                    &store,
+                    key,
+                    "terminate_sandbox",
+                    &request_hash,
+                    StatusCode::OK.as_u16(),
+                    &json,
+                );
+            }
+        }
+        return (StatusCode::OK, Json(response)).into_response();
     }
 
     // Transition based on current state:
@@ -561,18 +856,623 @@ async fn terminate_sandbox(
         return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
     }
 
+    let response = SandboxResponse {
+        request_id,
+        sandbox: sandbox_to_payload(&sandbox),
+    };
+    if let Some(ref key) = idempotency_key {
+        if let Ok(json) = serde_json::to_string(&response) {
+            save_idempotency(
+                &store,
+                key,
+                "terminate_sandbox",
+                &request_hash,
+                StatusCode::OK.as_u16(),
+                &json,
+            );
+        }
+    }
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+// ── Lease handlers ──
+
+async fn open_lease(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<OpenLeaseRequest>,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let now = now_epoch_secs();
+    let ttl_secs = body.ttl_secs.unwrap_or(300);
+
+    let mut lease = Lease {
+        lease_id: format!("ls-{}", Uuid::new_v4()),
+        sandbox_id: body.sandbox_id,
+        ttl_secs,
+        last_heartbeat_at: now,
+        state: LeaseState::Opening,
+    };
+
+    if let Err(e) = lease.transition_to(LeaseState::Active) {
+        return json_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "state_transition_failed",
+            &e.to_string(),
+            &request_id,
+        );
+    }
+
+    if let Err(e) = store.save_lease(&lease) {
+        return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
+    }
+
     (
-        StatusCode::OK,
-        Json(SandboxResponse {
+        StatusCode::CREATED,
+        Json(LeaseResponse {
             request_id,
-            sandbox: sandbox_to_payload(&sandbox),
+            lease: lease_to_payload(&lease),
         }),
     )
         .into_response()
 }
 
-async fn unsupported_leases(headers: HeaderMap) -> Response {
-    unsupported_operation_response("leases", request_id_from_headers(&headers))
+async fn list_leases(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let leases = match store.list_leases() {
+        Ok(list) => list,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    (
+        StatusCode::OK,
+        Json(LeaseListResponse {
+            request_id,
+            leases: leases.iter().map(lease_to_payload).collect(),
+        }),
+    )
+        .into_response()
+}
+
+async fn get_lease(
+    State(state): State<ApiState>,
+    Path(lease_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    match store.load_lease(&lease_id) {
+        Ok(Some(lease)) => (
+            StatusCode::OK,
+            Json(LeaseResponse {
+                request_id,
+                lease: lease_to_payload(&lease),
+            }),
+        )
+            .into_response(),
+        Ok(None) => json_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("lease {lease_id} not found"),
+            &request_id,
+        ),
+        Err(e) => stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    }
+}
+
+async fn close_lease(
+    State(state): State<ApiState>,
+    Path(lease_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let mut lease = match store.load_lease(&lease_id) {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            return json_error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("lease {lease_id} not found"),
+                &request_id,
+            );
+        }
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    if lease.state == LeaseState::Closed {
+        return (
+            StatusCode::OK,
+            Json(LeaseResponse {
+                request_id,
+                lease: lease_to_payload(&lease),
+            }),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = lease.transition_to(LeaseState::Closed) {
+        return json_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "state_transition_failed",
+            &e.to_string(),
+            &request_id,
+        );
+    }
+
+    if let Err(e) = store.save_lease(&lease) {
+        return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
+    }
+
+    (
+        StatusCode::OK,
+        Json(LeaseResponse {
+            request_id,
+            lease: lease_to_payload(&lease),
+        }),
+    )
+        .into_response()
+}
+
+async fn heartbeat_lease(
+    State(state): State<ApiState>,
+    Path(lease_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let mut lease = match store.load_lease(&lease_id) {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            return json_error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("lease {lease_id} not found"),
+                &request_id,
+            );
+        }
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    if lease.state != LeaseState::Active {
+        return json_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_state",
+            &format!("lease {lease_id} is not active"),
+            &request_id,
+        );
+    }
+
+    lease.last_heartbeat_at = now_epoch_secs();
+
+    if let Err(e) = store.save_lease(&lease) {
+        return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
+    }
+
+    (
+        StatusCode::OK,
+        Json(LeaseResponse {
+            request_id,
+            lease: lease_to_payload(&lease),
+        }),
+    )
+        .into_response()
+}
+
+// ── Execution handlers ──
+
+async fn create_execution(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateExecutionRequest>,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let execution = Execution {
+        execution_id: format!("exec-{}", Uuid::new_v4()),
+        container_id: body.container_id,
+        exec_spec: ExecutionSpec {
+            cmd: body.cmd,
+            args: body.args.unwrap_or_default(),
+            env_override: body.env_override.unwrap_or_default(),
+            pty: body.pty.unwrap_or(false),
+            timeout_secs: body.timeout_secs,
+        },
+        state: ExecutionState::Queued,
+        exit_code: None,
+        started_at: None,
+        ended_at: None,
+    };
+
+    if let Err(e) = store.save_execution(&execution) {
+        return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(ExecutionResponse {
+            request_id,
+            execution: execution_to_payload(&execution),
+        }),
+    )
+        .into_response()
+}
+
+async fn list_executions(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let executions = match store.list_executions() {
+        Ok(list) => list,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    (
+        StatusCode::OK,
+        Json(ExecutionListResponse {
+            request_id,
+            executions: executions.iter().map(execution_to_payload).collect(),
+        }),
+    )
+        .into_response()
+}
+
+async fn get_execution(
+    State(state): State<ApiState>,
+    Path(execution_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    match store.load_execution(&execution_id) {
+        Ok(Some(execution)) => (
+            StatusCode::OK,
+            Json(ExecutionResponse {
+                request_id,
+                execution: execution_to_payload(&execution),
+            }),
+        )
+            .into_response(),
+        Ok(None) => json_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("execution {execution_id} not found"),
+            &request_id,
+        ),
+        Err(e) => stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    }
+}
+
+async fn cancel_execution(
+    State(state): State<ApiState>,
+    Path(execution_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let mut execution = match store.load_execution(&execution_id) {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            return json_error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("execution {execution_id} not found"),
+                &request_id,
+            );
+        }
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    if execution.state.is_terminal() {
+        return (
+            StatusCode::OK,
+            Json(ExecutionResponse {
+                request_id,
+                execution: execution_to_payload(&execution),
+            }),
+        )
+            .into_response();
+    }
+
+    let now = now_epoch_secs();
+    if execution.started_at.is_none() {
+        execution.started_at = Some(now);
+    }
+    execution.ended_at = Some(now);
+    let _ = execution.transition_to(ExecutionState::Canceled);
+
+    if let Err(e) = store.save_execution(&execution) {
+        return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
+    }
+
+    (
+        StatusCode::OK,
+        Json(ExecutionResponse {
+            request_id,
+            execution: execution_to_payload(&execution),
+        }),
+    )
+        .into_response()
+}
+
+// ── Checkpoint handlers ──
+
+async fn create_checkpoint(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateCheckpointRequest>,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let class_str = body.class.as_deref().unwrap_or("fs_quick");
+    let class: CheckpointClass = match class_str {
+        "fs_quick" => CheckpointClass::FsQuick,
+        "vm_full" => CheckpointClass::VmFull,
+        other => {
+            return json_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_checkpoint_class",
+                &format!("unknown checkpoint class: {other}"),
+                &request_id,
+            );
+        }
+    };
+
+    let fingerprint = body
+        .compatibility_fingerprint
+        .unwrap_or_else(|| "unset".to_string());
+
+    let now = now_epoch_secs();
+    let mut checkpoint = Checkpoint {
+        checkpoint_id: format!("ckpt-{}", Uuid::new_v4()),
+        sandbox_id: body.sandbox_id,
+        parent_checkpoint_id: None,
+        class,
+        state: CheckpointState::Creating,
+        created_at: now,
+        compatibility_fingerprint: fingerprint,
+    };
+
+    if let Err(e) = store.save_checkpoint(&checkpoint) {
+        return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
+    }
+
+    // Transition to Ready immediately (in a real implementation this would
+    // happen asynchronously after the checkpoint data is captured).
+    if let Err(_contract_err) = checkpoint.transition_to(CheckpointState::Ready) {
+        return json_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "state_transition_failed",
+            "failed to transition checkpoint to ready",
+            &request_id,
+        );
+    }
+    if let Err(e) = store.save_checkpoint(&checkpoint) {
+        return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(CheckpointResponse {
+            request_id,
+            checkpoint: checkpoint_to_payload(&checkpoint),
+        }),
+    )
+        .into_response()
+}
+
+async fn list_checkpoints(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let checkpoints = match store.list_checkpoints() {
+        Ok(list) => list,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    (
+        StatusCode::OK,
+        Json(CheckpointListResponse {
+            request_id,
+            checkpoints: checkpoints.iter().map(checkpoint_to_payload).collect(),
+        }),
+    )
+        .into_response()
+}
+
+async fn get_checkpoint(
+    State(state): State<ApiState>,
+    Path(checkpoint_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    match store.load_checkpoint(&checkpoint_id) {
+        Ok(Some(checkpoint)) => (
+            StatusCode::OK,
+            Json(CheckpointResponse {
+                request_id,
+                checkpoint: checkpoint_to_payload(&checkpoint),
+            }),
+        )
+            .into_response(),
+        Ok(None) => json_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("checkpoint {checkpoint_id} not found"),
+            &request_id,
+        ),
+        Err(e) => stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    }
+}
+
+async fn restore_checkpoint(
+    State(state): State<ApiState>,
+    Path(checkpoint_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let checkpoint = match store.load_checkpoint(&checkpoint_id) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return json_error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("checkpoint {checkpoint_id} not found"),
+                &request_id,
+            );
+        }
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    if checkpoint.state != CheckpointState::Ready {
+        return json_error_response(
+            StatusCode::CONFLICT,
+            "checkpoint_not_ready",
+            &format!("checkpoint {checkpoint_id} is not in ready state"),
+            &request_id,
+        );
+    }
+
+    // In a real implementation, this would trigger the actual restore operation.
+    // For now, return the checkpoint as acknowledgement.
+    (
+        StatusCode::OK,
+        Json(CheckpointResponse {
+            request_id,
+            checkpoint: checkpoint_to_payload(&checkpoint),
+        }),
+    )
+        .into_response()
+}
+
+async fn fork_checkpoint(
+    State(state): State<ApiState>,
+    Path(checkpoint_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ForkCheckpointRequest>,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let parent = match store.load_checkpoint(&checkpoint_id) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return json_error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("checkpoint {checkpoint_id} not found"),
+                &request_id,
+            );
+        }
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    if parent.state != CheckpointState::Ready {
+        return json_error_response(
+            StatusCode::CONFLICT,
+            "checkpoint_not_ready",
+            &format!("checkpoint {checkpoint_id} is not in ready state"),
+            &request_id,
+        );
+    }
+
+    let new_sandbox_id = body
+        .new_sandbox_id
+        .unwrap_or_else(|| format!("sbx-{}", Uuid::new_v4()));
+    let now = now_epoch_secs();
+
+    let mut forked = Checkpoint {
+        checkpoint_id: format!("ckpt-{}", Uuid::new_v4()),
+        sandbox_id: new_sandbox_id,
+        parent_checkpoint_id: Some(parent.checkpoint_id.clone()),
+        class: parent.class,
+        state: CheckpointState::Creating,
+        created_at: now,
+        compatibility_fingerprint: parent.compatibility_fingerprint.clone(),
+    };
+
+    if let Err(e) = store.save_checkpoint(&forked) {
+        return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
+    }
+
+    // Transition to Ready.
+    if let Err(_contract_err) = forked.transition_to(CheckpointState::Ready) {
+        return json_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "state_transition_failed",
+            "failed to transition forked checkpoint to ready",
+            &request_id,
+        );
+    }
+    if let Err(e) = store.save_checkpoint(&forked) {
+        return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(CheckpointResponse {
+            request_id,
+            checkpoint: checkpoint_to_payload(&forked),
+        }),
+    )
+        .into_response()
 }
 
 async fn unsupported_images(headers: HeaderMap) -> Response {
@@ -585,14 +1485,6 @@ async fn unsupported_builds(headers: HeaderMap) -> Response {
 
 async fn unsupported_containers(headers: HeaderMap) -> Response {
     unsupported_operation_response("containers", request_id_from_headers(&headers))
-}
-
-async fn unsupported_executions(headers: HeaderMap) -> Response {
-    unsupported_operation_response("executions", request_id_from_headers(&headers))
-}
-
-async fn unsupported_checkpoints(headers: HeaderMap) -> Response {
-    unsupported_operation_response("checkpoints", request_id_from_headers(&headers))
 }
 
 async fn unsupported_receipts(headers: HeaderMap) -> Response {
@@ -613,12 +1505,33 @@ pub fn router(config: ApiConfig) -> Router {
             "/v1/sandboxes/{sandbox_id}",
             get(get_sandbox).delete(terminate_sandbox),
         )
-        .route("/v1/leases", any(unsupported_leases))
+        .route("/v1/leases", get(list_leases).post(open_lease))
+        .route("/v1/leases/{lease_id}", get(get_lease).delete(close_lease))
+        .route("/v1/leases/{lease_id}/heartbeat", post(heartbeat_lease))
+        .route(
+            "/v1/executions",
+            get(list_executions).post(create_execution),
+        )
+        .route(
+            "/v1/executions/{execution_id}",
+            get(get_execution).delete(cancel_execution),
+        )
+        .route(
+            "/v1/checkpoints",
+            get(list_checkpoints).post(create_checkpoint),
+        )
+        .route("/v1/checkpoints/{checkpoint_id}", get(get_checkpoint))
+        .route(
+            "/v1/checkpoints/{checkpoint_id}/restore",
+            post(restore_checkpoint),
+        )
+        .route(
+            "/v1/checkpoints/{checkpoint_id}/fork",
+            post(fork_checkpoint),
+        )
         .route("/v1/images", any(unsupported_images))
         .route("/v1/builds", any(unsupported_builds))
         .route("/v1/containers", any(unsupported_containers))
-        .route("/v1/executions", any(unsupported_executions))
-        .route("/v1/checkpoints", any(unsupported_checkpoints))
         .route("/v1/receipts", any(unsupported_receipts))
         .with_state(state)
 }
@@ -936,7 +1849,12 @@ mod tests {
             if status == StatusCode::OK
                 && matches!(
                     surface.path,
-                    "/v1/capabilities" | "/v1/events/{stack_name}" | "/v1/sandboxes"
+                    "/v1/capabilities"
+                        | "/v1/events/{stack_name}"
+                        | "/v1/sandboxes"
+                        | "/v1/leases"
+                        | "/v1/executions"
+                        | "/v1/checkpoints"
                 )
             {
                 continue;

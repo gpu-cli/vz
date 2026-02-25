@@ -19,10 +19,10 @@ use crate::error::StackError;
 use crate::events::StackEvent;
 use crate::executor::{ContainerRuntime, ExecutionResult, StackExecutor};
 use crate::health::{HealthPollResult, HealthPoller};
-use crate::reconcile::{Action, ApplyResult, apply};
+use crate::reconcile::{Action, ApplyResult, apply, compute_actions_hash};
 use crate::restart::{RestartTracker, cleanup_orphaned_reconcile_progress, compute_restarts};
 use crate::spec::StackSpec;
-use crate::state_store::{ServicePhase, StateStore};
+use crate::state_store::{ReconcileSession, ReconcileSessionStatus, ServicePhase, StateStore};
 
 /// Default poll interval when no health checks are defined (seconds).
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 2;
@@ -331,6 +331,33 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
                     0,
                 )?;
 
+                // Create a reconcile session for this action batch.
+                let session_id = Self::next_session_id(&spec.name, round);
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let actions_hash = compute_actions_hash(&apply_result.actions);
+
+                // Supersede any prior active sessions for this stack.
+                let _ = self.reconcile_store.supersede_active_sessions(&spec.name);
+
+                let session = ReconcileSession {
+                    session_id: session_id.clone(),
+                    stack_name: spec.name.clone(),
+                    operation_id: operation_id.clone(),
+                    status: ReconcileSessionStatus::Active,
+                    actions_hash,
+                    next_action_index: 0,
+                    total_actions: apply_result.actions.len(),
+                    started_at: now,
+                    updated_at: now,
+                    completed_at: None,
+                };
+                let _ = self
+                    .reconcile_store
+                    .create_reconcile_session(&session, &apply_result.actions);
+
                 info!(
                     actions = apply_result.actions.len(),
                     deferred = apply_result.deferred.len(),
@@ -344,9 +371,20 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
                     apply_result.actions.len(),
                 )?;
                 self.reconcile_store.clear_reconcile_progress(&spec.name)?;
+
+                // Update session after execution.
                 if result.failed > 0 {
                     debug!(failed = result.failed, "some actions failed");
+                    let _ = self.reconcile_store.fail_reconcile_session(&session_id);
+                } else {
+                    let _ = self.reconcile_store.update_reconcile_session_progress(
+                        &session_id,
+                        apply_result.actions.len(),
+                        &ReconcileSessionStatus::Active,
+                    );
+                    let _ = self.reconcile_store.complete_reconcile_session(&session_id);
                 }
+
                 Some(result)
             } else {
                 self.reconcile_store.clear_reconcile_progress(&spec.name)?;
@@ -505,6 +543,14 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
             .unwrap_or_default()
             .as_nanos();
         format!("{stack_name}-round-{round}-{nanos}")
+    }
+
+    fn next_session_id(stack_name: &str, round: usize) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("rs-{stack_name}-{round}-{nanos}")
     }
 
     fn resume_incomplete_apply(

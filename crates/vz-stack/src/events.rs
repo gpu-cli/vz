@@ -185,6 +185,102 @@ pub enum StackEvent {
         sandbox_id: String,
         error: String,
     },
+    /// A lease is being opened.
+    #[serde(rename = "lease_opened")]
+    LeaseOpened {
+        sandbox_id: String,
+        lease_id: String,
+    },
+    /// A lease heartbeat was received.
+    #[serde(rename = "lease_heartbeat")]
+    LeaseHeartbeat { lease_id: String },
+    /// A lease expired due to missed heartbeat.
+    #[serde(rename = "lease_expired")]
+    LeaseExpired { lease_id: String },
+    /// A lease was explicitly closed.
+    #[serde(rename = "lease_closed")]
+    LeaseClosed { lease_id: String },
+    /// A lease failed.
+    #[serde(rename = "lease_failed")]
+    LeaseFailed { lease_id: String, error: String },
+    /// An execution was queued for a container.
+    #[serde(rename = "execution_queued")]
+    ExecutionQueued {
+        /// Target container identifier.
+        container_id: String,
+        /// Execution identifier.
+        execution_id: String,
+    },
+    /// An execution started running.
+    #[serde(rename = "execution_running")]
+    ExecutionRunning {
+        /// Execution identifier.
+        execution_id: String,
+    },
+    /// An execution exited naturally.
+    #[serde(rename = "execution_exited")]
+    ExecutionExited {
+        /// Execution identifier.
+        execution_id: String,
+        /// Process exit code.
+        exit_code: i32,
+    },
+    /// An execution failed unexpectedly.
+    #[serde(rename = "execution_failed")]
+    ExecutionFailed {
+        /// Execution identifier.
+        execution_id: String,
+        /// Error description.
+        error: String,
+    },
+    /// An execution was canceled by the caller.
+    #[serde(rename = "execution_canceled")]
+    ExecutionCanceled {
+        /// Execution identifier.
+        execution_id: String,
+    },
+    /// A checkpoint is being created for a sandbox.
+    #[serde(rename = "checkpoint_creating")]
+    CheckpointCreating {
+        /// Owning sandbox identifier.
+        sandbox_id: String,
+        /// Checkpoint identifier.
+        checkpoint_id: String,
+        /// Checkpoint class (e.g. "fs_quick", "vm_full").
+        class: String,
+    },
+    /// A checkpoint is ready for restore/fork.
+    #[serde(rename = "checkpoint_ready")]
+    CheckpointReady {
+        /// Checkpoint identifier.
+        checkpoint_id: String,
+    },
+    /// A checkpoint operation failed.
+    #[serde(rename = "checkpoint_failed")]
+    CheckpointFailed {
+        /// Checkpoint identifier.
+        checkpoint_id: String,
+        /// Error description.
+        error: String,
+    },
+    /// A checkpoint was restored to a sandbox.
+    #[serde(rename = "checkpoint_restored")]
+    CheckpointRestored {
+        /// Checkpoint identifier.
+        checkpoint_id: String,
+        /// Sandbox that was restored to.
+        sandbox_id: String,
+    },
+    /// A checkpoint was forked into a new sandbox/checkpoint.
+    #[serde(rename = "checkpoint_forked")]
+    CheckpointForked {
+        /// Source checkpoint identifier.
+        parent_checkpoint_id: String,
+        /// New checkpoint identifier.
+        new_checkpoint_id: String,
+        /// New sandbox identifier.
+        new_sandbox_id: String,
+    },
 }
 
 /// Persisted event record with metadata from the store.
@@ -360,6 +456,62 @@ mod tests {
                 sandbox_id: "sb-1".to_string(),
                 error: "vm crashed".to_string(),
             },
+            StackEvent::LeaseOpened {
+                sandbox_id: "sb-1".to_string(),
+                lease_id: "ls-1".to_string(),
+            },
+            StackEvent::LeaseHeartbeat {
+                lease_id: "ls-1".to_string(),
+            },
+            StackEvent::LeaseExpired {
+                lease_id: "ls-1".to_string(),
+            },
+            StackEvent::LeaseClosed {
+                lease_id: "ls-2".to_string(),
+            },
+            StackEvent::LeaseFailed {
+                lease_id: "ls-3".to_string(),
+                error: "timeout".to_string(),
+            },
+            StackEvent::ExecutionQueued {
+                container_id: "ctr-123".to_string(),
+                execution_id: "exec-1".to_string(),
+            },
+            StackEvent::ExecutionRunning {
+                execution_id: "exec-1".to_string(),
+            },
+            StackEvent::ExecutionExited {
+                execution_id: "exec-1".to_string(),
+                exit_code: 0,
+            },
+            StackEvent::ExecutionFailed {
+                execution_id: "exec-2".to_string(),
+                error: "command not found".to_string(),
+            },
+            StackEvent::ExecutionCanceled {
+                execution_id: "exec-3".to_string(),
+            },
+            StackEvent::CheckpointCreating {
+                sandbox_id: "sb-1".to_string(),
+                checkpoint_id: "ckpt-1".to_string(),
+                class: "fs_quick".to_string(),
+            },
+            StackEvent::CheckpointReady {
+                checkpoint_id: "ckpt-1".to_string(),
+            },
+            StackEvent::CheckpointFailed {
+                checkpoint_id: "ckpt-2".to_string(),
+                error: "disk full".to_string(),
+            },
+            StackEvent::CheckpointRestored {
+                checkpoint_id: "ckpt-1".to_string(),
+                sandbox_id: "sb-1".to_string(),
+            },
+            StackEvent::CheckpointForked {
+                parent_checkpoint_id: "ckpt-1".to_string(),
+                new_checkpoint_id: "ckpt-3".to_string(),
+                new_sandbox_id: "sb-2".to_string(),
+            },
         ]
     }
 
@@ -489,6 +641,107 @@ mod tests {
                     error: "e".to_string(),
                 },
                 "sandbox_failed",
+            ),
+            (
+                StackEvent::LeaseOpened {
+                    sandbox_id: "sb".to_string(),
+                    lease_id: "ls".to_string(),
+                },
+                "lease_opened",
+            ),
+            (
+                StackEvent::LeaseHeartbeat {
+                    lease_id: "ls".to_string(),
+                },
+                "lease_heartbeat",
+            ),
+            (
+                StackEvent::LeaseExpired {
+                    lease_id: "ls".to_string(),
+                },
+                "lease_expired",
+            ),
+            (
+                StackEvent::LeaseClosed {
+                    lease_id: "ls".to_string(),
+                },
+                "lease_closed",
+            ),
+            (
+                StackEvent::LeaseFailed {
+                    lease_id: "ls".to_string(),
+                    error: "e".to_string(),
+                },
+                "lease_failed",
+            ),
+            (
+                StackEvent::ExecutionQueued {
+                    container_id: "ctr".to_string(),
+                    execution_id: "ex".to_string(),
+                },
+                "execution_queued",
+            ),
+            (
+                StackEvent::ExecutionRunning {
+                    execution_id: "ex".to_string(),
+                },
+                "execution_running",
+            ),
+            (
+                StackEvent::ExecutionExited {
+                    execution_id: "ex".to_string(),
+                    exit_code: 0,
+                },
+                "execution_exited",
+            ),
+            (
+                StackEvent::ExecutionFailed {
+                    execution_id: "ex".to_string(),
+                    error: "e".to_string(),
+                },
+                "execution_failed",
+            ),
+            (
+                StackEvent::ExecutionCanceled {
+                    execution_id: "ex".to_string(),
+                },
+                "execution_canceled",
+            ),
+            (
+                StackEvent::CheckpointCreating {
+                    sandbox_id: "sb".to_string(),
+                    checkpoint_id: "ck".to_string(),
+                    class: "fs_quick".to_string(),
+                },
+                "checkpoint_creating",
+            ),
+            (
+                StackEvent::CheckpointReady {
+                    checkpoint_id: "ck".to_string(),
+                },
+                "checkpoint_ready",
+            ),
+            (
+                StackEvent::CheckpointFailed {
+                    checkpoint_id: "ck".to_string(),
+                    error: "e".to_string(),
+                },
+                "checkpoint_failed",
+            ),
+            (
+                StackEvent::CheckpointRestored {
+                    checkpoint_id: "ck".to_string(),
+                    sandbox_id: "sb".to_string(),
+                },
+                "checkpoint_restored",
+            ),
+            (
+                StackEvent::CheckpointForked {
+                    parent_checkpoint_id: "ck".to_string(),
+                    new_checkpoint_id: "ck2".to_string(),
+                    new_sandbox_id: "sb2".to_string(),
+                },
+                "checkpoint_forked",
             ),
         ];
 

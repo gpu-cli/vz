@@ -226,12 +226,89 @@ impl StackOutput {
             }
             StackEvent::StackApplyStarted { .. }
             | StackEvent::StackApplyCompleted { .. }
-            | StackEvent::StackDestroyed { .. }
-            | StackEvent::SandboxCreating { .. }
-            | StackEvent::SandboxReady { .. }
-            | StackEvent::SandboxDraining { .. }
-            | StackEvent::SandboxTerminated { .. }
-            | StackEvent::SandboxFailed { .. } => {}
+            | StackEvent::StackDestroyed { .. } => {}
+            StackEvent::SandboxCreating { sandbox_id, .. } => {
+                self.message(&format!(
+                    " {} sandbox {} creating",
+                    style("+").bold().cyan(),
+                    sandbox_id
+                ));
+            }
+            StackEvent::SandboxReady { sandbox_id, .. } => {
+                self.message(&format!(
+                    " {} sandbox {} ready",
+                    style("+").bold().green(),
+                    sandbox_id
+                ));
+            }
+            StackEvent::SandboxDraining { sandbox_id, .. } => {
+                self.message(&format!(
+                    " {} sandbox {} draining",
+                    style("-").bold().yellow(),
+                    sandbox_id
+                ));
+            }
+            StackEvent::SandboxTerminated { sandbox_id, .. } => {
+                self.message(&format!(
+                    " {} sandbox {} terminated",
+                    style("-").bold().dim(),
+                    sandbox_id
+                ));
+            }
+            StackEvent::SandboxFailed {
+                sandbox_id, error, ..
+            } => {
+                self.message(&format!(
+                    " {} sandbox {} failed: {error}",
+                    style("!").bold().red(),
+                    sandbox_id
+                ));
+            }
+            StackEvent::LeaseOpened { lease_id, .. } => {
+                self.message(&format!(
+                    " {} lease {} opened",
+                    style("+").bold().cyan(),
+                    lease_id
+                ));
+            }
+            StackEvent::LeaseHeartbeat { lease_id } => {
+                self.message(&format!(
+                    " {} lease {} heartbeat",
+                    style(".").bold().blue(),
+                    lease_id
+                ));
+            }
+            StackEvent::LeaseExpired { lease_id } => {
+                self.message(&format!(
+                    " {} lease {} expired",
+                    style("!").bold().yellow(),
+                    lease_id
+                ));
+            }
+            StackEvent::LeaseClosed { lease_id } => {
+                self.message(&format!(
+                    " {} lease {} closed",
+                    style("-").bold().dim(),
+                    lease_id
+                ));
+            }
+            StackEvent::LeaseFailed { lease_id, error } => {
+                self.message(&format!(
+                    " {} lease {} failed: {error}",
+                    style("!").bold().red(),
+                    lease_id
+                ));
+            }
+            StackEvent::ExecutionQueued { .. }
+            | StackEvent::ExecutionRunning { .. }
+            | StackEvent::ExecutionExited { .. }
+            | StackEvent::ExecutionFailed { .. }
+            | StackEvent::ExecutionCanceled { .. }
+            | StackEvent::CheckpointCreating { .. }
+            | StackEvent::CheckpointReady { .. }
+            | StackEvent::CheckpointFailed { .. }
+            | StackEvent::CheckpointRestored { .. }
+            | StackEvent::CheckpointForked { .. } => {}
         }
         self.update_header();
     }

@@ -3242,6 +3242,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "vz",
  "vz-image",
  "vz-linux",

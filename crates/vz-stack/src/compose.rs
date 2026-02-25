@@ -1570,16 +1570,18 @@ fn parse_deploy(svc_name: &str, map: &serde_yml::Mapping) -> Result<ResourcesSpe
 
     let Some(resources_value) = deploy_map.get(val("resources")) else {
         // No resources section, but we might have replicas - return default with replicas
-        let mut spec = ResourcesSpec::default();
-        spec.replicas = replicas;
-        return Ok(spec);
+        return Ok(ResourcesSpec {
+            replicas,
+            ..ResourcesSpec::default()
+        });
     };
 
     if resources_value.is_null() {
         // resources is null, but we might have replicas
-        let mut spec = ResourcesSpec::default();
-        spec.replicas = replicas;
-        return Ok(spec);
+        return Ok(ResourcesSpec {
+            replicas,
+            ..ResourcesSpec::default()
+        });
     }
 
     let resources_map = resources_value.as_mapping().ok_or_else(|| {

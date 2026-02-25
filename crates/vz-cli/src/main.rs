@@ -92,6 +92,15 @@ enum Commands {
     /// Manage sandbox runtime boundaries.
     Sandbox(commands::sandbox::SandboxArgs),
 
+    /// Manage lease access grants.
+    Lease(commands::lease::LeaseArgs),
+
+    /// Manage container executions.
+    Execution(commands::execution::ExecutionArgs),
+
+    /// Manage checkpoint fingerprints and lineage.
+    Checkpoint(commands::checkpoint::CheckpointArgs),
+
     // ── VM management (macOS only) ──
     /// Manage virtual machines.
     #[cfg(target_os = "macos")]
@@ -172,6 +181,15 @@ fn main() -> anyhow::Result<()> {
 
             // Sandbox management
             Commands::Sandbox(args) => commands::sandbox::run(args).await,
+
+            // Lease management
+            Commands::Lease(args) => commands::lease::run(args).await,
+
+            // Execution management
+            Commands::Execution(args) => commands::execution::run(args).await,
+
+            // Checkpoint management
+            Commands::Checkpoint(args) => commands::checkpoint::run(args).await,
 
             // VM management (macOS only)
             #[cfg(target_os = "macos")]

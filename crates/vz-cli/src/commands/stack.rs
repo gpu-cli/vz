@@ -1843,7 +1843,22 @@ fn event_service_name(event: &StackEvent) -> Option<&str> {
         | StackEvent::SandboxReady { .. }
         | StackEvent::SandboxDraining { .. }
         | StackEvent::SandboxTerminated { .. }
-        | StackEvent::SandboxFailed { .. } => None,
+        | StackEvent::SandboxFailed { .. }
+        | StackEvent::LeaseOpened { .. }
+        | StackEvent::LeaseHeartbeat { .. }
+        | StackEvent::LeaseExpired { .. }
+        | StackEvent::LeaseClosed { .. }
+        | StackEvent::LeaseFailed { .. }
+        | StackEvent::ExecutionQueued { .. }
+        | StackEvent::ExecutionRunning { .. }
+        | StackEvent::ExecutionExited { .. }
+        | StackEvent::ExecutionFailed { .. }
+        | StackEvent::ExecutionCanceled { .. }
+        | StackEvent::CheckpointCreating { .. }
+        | StackEvent::CheckpointReady { .. }
+        | StackEvent::CheckpointFailed { .. }
+        | StackEvent::CheckpointRestored { .. }
+        | StackEvent::CheckpointForked { .. } => None,
     }
 }
 
@@ -2454,6 +2469,60 @@ fn format_event_summary(event: &StackEvent) -> String {
         StackEvent::SandboxFailed {
             sandbox_id, error, ..
         } => format!("sandbox failed: {sandbox_id}: {error}"),
+        StackEvent::LeaseOpened { lease_id, .. } => {
+            format!("lease opened: {lease_id}")
+        }
+        StackEvent::LeaseHeartbeat { lease_id } => {
+            format!("lease heartbeat: {lease_id}")
+        }
+        StackEvent::LeaseExpired { lease_id } => {
+            format!("lease expired: {lease_id}")
+        }
+        StackEvent::LeaseClosed { lease_id } => {
+            format!("lease closed: {lease_id}")
+        }
+        StackEvent::LeaseFailed { lease_id, error } => {
+            format!("lease failed: {lease_id}: {error}")
+        }
+        StackEvent::ExecutionQueued {
+            execution_id,
+            container_id,
+        } => format!("execution queued: {execution_id} for {container_id}"),
+        StackEvent::ExecutionRunning { execution_id } => {
+            format!("execution running: {execution_id}")
+        }
+        StackEvent::ExecutionExited {
+            execution_id,
+            exit_code,
+        } => format!("execution exited: {execution_id} (code {exit_code})"),
+        StackEvent::ExecutionFailed {
+            execution_id,
+            error,
+        } => format!("execution failed: {execution_id}: {error}"),
+        StackEvent::ExecutionCanceled { execution_id } => {
+            format!("execution canceled: {execution_id}")
+        }
+        StackEvent::CheckpointCreating {
+            checkpoint_id,
+            class,
+            ..
+        } => format!("checkpoint creating: {checkpoint_id} ({class})"),
+        StackEvent::CheckpointReady { checkpoint_id } => {
+            format!("checkpoint ready: {checkpoint_id}")
+        }
+        StackEvent::CheckpointFailed {
+            checkpoint_id,
+            error,
+        } => format!("checkpoint failed: {checkpoint_id}: {error}"),
+        StackEvent::CheckpointRestored {
+            checkpoint_id,
+            sandbox_id,
+        } => format!("checkpoint restored: {checkpoint_id} -> {sandbox_id}"),
+        StackEvent::CheckpointForked {
+            parent_checkpoint_id,
+            new_checkpoint_id,
+            ..
+        } => format!("checkpoint forked: {parent_checkpoint_id} -> {new_checkpoint_id}"),
     }
 }
 

@@ -39,14 +39,17 @@ pub use network::{
     detect_port_conflicts, locate_gvproxy, ports_changed, resolve_ports,
 };
 pub use orchestrator::{OrchestrationConfig, OrchestrationResult, RoundReport, StackOrchestrator};
-pub use reconcile::{Action, ApplyResult, DeferredService, apply};
+pub use reconcile::{Action, ApplyResult, DeferredService, apply, compute_actions_hash};
 pub use restart::{RestartTracker, compute_restarts};
 pub use spec::{
     DependencyCondition, HealthCheckSpec, MountSpec, NetworkSpec, PortSpec, ResourcesSpec,
     RestartPolicy, SecretDef, ServiceDependency, ServiceKind, ServiceSecretRef, ServiceSpec,
     StackSpec, VolumeSpec,
 };
-pub use state_store::{AllocatorSnapshot, ServiceObservedState, ServicePhase, StateStore};
+pub use state_store::{
+    AllocatorSnapshot, IDEMPOTENCY_TTL_SECS, IdempotencyRecord, ReconcileSession,
+    ReconcileSessionStatus, ServiceObservedState, ServicePhase, StateStore,
+};
 pub use volume::{
     ResolvedMount, ResolvedMountKind, SkippedMount, VolumeManager, mounts_changed,
     orphaned_volumes, referenced_volume_names, resolve_mounts,

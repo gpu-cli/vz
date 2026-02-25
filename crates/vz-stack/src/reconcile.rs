@@ -5,7 +5,9 @@
 //! persists all state transitions. Actions are ordered by service
 //! dependency graph (topological sort with name-based tie-break).
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 
 use crate::error::StackError;
 use crate::events::StackEvent;
@@ -43,6 +45,32 @@ impl Action {
             | Self::ServiceRemove { service_name } => service_name,
         }
     }
+}
+
+/// Compute a deterministic hash of an action list for identity tracking.
+///
+/// Two action lists that contain the same sequence of action kinds and
+/// service names produce the same hash, enabling callers to detect
+/// whether a resumed session matches the original plan.
+pub fn compute_actions_hash(actions: &[Action]) -> String {
+    let mut hasher = DefaultHasher::new();
+    for action in actions {
+        match action {
+            Action::ServiceCreate { service_name } => {
+                "create".hash(&mut hasher);
+                service_name.hash(&mut hasher);
+            }
+            Action::ServiceRecreate { service_name } => {
+                "recreate".hash(&mut hasher);
+                service_name.hash(&mut hasher);
+            }
+            Action::ServiceRemove { service_name } => {
+                "remove".hash(&mut hasher);
+                service_name.hash(&mut hasher);
+            }
+        }
+    }
+    format!("{:016x}", hasher.finish())
 }
 
 /// Result of an [`apply`] call.
@@ -1356,5 +1384,86 @@ mod tests {
         let names: Vec<&str> = actions.iter().map(|a| a.service_name()).collect();
         // Falls back to alphabetical without dependency info.
         assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    // ── Action hash tests ──
+
+    #[test]
+    fn actions_hash_deterministic_same_input() {
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+        ];
+
+        let hash1 = compute_actions_hash(&actions);
+        let hash2 = compute_actions_hash(&actions);
+        assert_eq!(hash1, hash2);
+        assert_eq!(hash1.len(), 16, "hash should be 16 hex characters");
+    }
+
+    #[test]
+    fn actions_hash_differs_for_different_actions() {
+        let a = vec![Action::ServiceCreate {
+            service_name: "db".to_string(),
+        }];
+        let b = vec![Action::ServiceCreate {
+            service_name: "web".to_string(),
+        }];
+
+        assert_ne!(compute_actions_hash(&a), compute_actions_hash(&b));
+    }
+
+    #[test]
+    fn actions_hash_differs_for_different_kinds() {
+        let a = vec![Action::ServiceCreate {
+            service_name: "web".to_string(),
+        }];
+        let b = vec![Action::ServiceRecreate {
+            service_name: "web".to_string(),
+        }];
+        let c = vec![Action::ServiceRemove {
+            service_name: "web".to_string(),
+        }];
+
+        let hash_a = compute_actions_hash(&a);
+        let hash_b = compute_actions_hash(&b);
+        let hash_c = compute_actions_hash(&c);
+
+        assert_ne!(hash_a, hash_b);
+        assert_ne!(hash_b, hash_c);
+        assert_ne!(hash_a, hash_c);
+    }
+
+    #[test]
+    fn actions_hash_order_matters() {
+        let a = vec![
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+        ];
+        let b = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+        ];
+
+        assert_ne!(compute_actions_hash(&a), compute_actions_hash(&b));
+    }
+
+    #[test]
+    fn actions_hash_empty_list() {
+        let hash = compute_actions_hash(&[]);
+        assert_eq!(hash.len(), 16);
+        // Empty list should still produce a valid hash.
     }
 }

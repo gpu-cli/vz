@@ -8,10 +8,14 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use vz_runtime_contract::{Sandbox, SandboxBackend, SandboxSpec, SandboxState};
+use vz_runtime_contract::{
+    Checkpoint, CheckpointClass, CheckpointState, Execution, ExecutionSpec, ExecutionState, Lease,
+    LeaseState, Sandbox, SandboxBackend, SandboxSpec, SandboxState,
+};
 
 use crate::StackSpec;
 use crate::error::StackError;
@@ -78,7 +82,101 @@ pub struct AllocatorSnapshot {
     pub mount_tag_offsets: HashMap<String, usize>,
 }
 
+/// Metadata for a reconciliation session, enabling deterministic resume.
+///
+/// Each apply loop creates a session that tracks the full action plan,
+/// a hash for identity, and a cursor for crash-safe resume.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconcileSession {
+    /// Unique session identifier (e.g. `rs-{timestamp_nanos}`).
+    pub session_id: String,
+    /// Stack this session belongs to.
+    pub stack_name: String,
+    /// Correlates to the orchestrator operation batch.
+    pub operation_id: String,
+    /// Current session lifecycle status.
+    pub status: ReconcileSessionStatus,
+    /// Deterministic hash of the action list for identity comparison.
+    pub actions_hash: String,
+    /// Next action index to execute (resume cursor).
+    pub next_action_index: usize,
+    /// Total number of actions in the plan.
+    pub total_actions: usize,
+    /// Unix epoch seconds when the session was created.
+    pub started_at: u64,
+    /// Unix epoch seconds of the last progress update.
+    pub updated_at: u64,
+    /// Unix epoch seconds when the session completed (if terminal).
+    pub completed_at: Option<u64>,
+}
+
+/// Status of a reconcile session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReconcileSessionStatus {
+    /// Session is actively applying actions.
+    Active,
+    /// All actions completed successfully.
+    Completed,
+    /// Session failed during apply.
+    Failed,
+    /// Session was superseded by a newer session.
+    Superseded,
+}
+
+impl ReconcileSessionStatus {
+    /// Serialize to the string stored in SQLite.
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    /// Deserialize from the string stored in SQLite.
+    fn from_str(s: &str) -> Result<Self, StackError> {
+        match s {
+            "active" => Ok(Self::Active),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "superseded" => Ok(Self::Superseded),
+            other => Err(StackError::InvalidSpec(format!(
+                "unknown reconcile session status: {other}"
+            ))),
+        }
+    }
+}
+
+/// Record of a previously-executed idempotent operation.
+///
+/// Cached responses allow clients to safely retry mutating API calls
+/// without duplicating side effects. Each record includes a hash of
+/// the original request body so that key reuse with different
+/// parameters can be detected and rejected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdempotencyRecord {
+    /// Client-provided idempotency key.
+    pub key: String,
+    /// Name of the API operation (e.g. `"create_sandbox"`).
+    pub operation: String,
+    /// Hash of the original request body for conflict detection.
+    pub request_hash: String,
+    /// JSON-serialized response body returned to the original caller.
+    pub response_json: String,
+    /// HTTP status code of the original response.
+    pub status_code: u16,
+    /// Unix epoch seconds when this record was created.
+    pub created_at: u64,
+    /// Unix epoch seconds after which this record may be garbage-collected.
+    pub expires_at: u64,
+}
+
+/// Idempotency key time-to-live: 24 hours.
+pub const IDEMPOTENCY_TTL_SECS: u64 = 86_400;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)] // serde-serialized names; renaming would break stored data
 #[serde(rename_all = "snake_case")]
 enum StoredActionKind {
     ServiceCreate,
@@ -243,7 +341,71 @@ impl StateStore {
                 service_ips_json TEXT NOT NULL DEFAULT '{}',
                 mount_tag_offsets_json TEXT NOT NULL DEFAULT '{}',
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );",
+            );
+
+            CREATE TABLE IF NOT EXISTS reconcile_sessions (
+                session_id TEXT PRIMARY KEY,
+                stack_name TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                actions_json TEXT NOT NULL,
+                actions_hash TEXT NOT NULL,
+                next_action_index INTEGER NOT NULL DEFAULT 0,
+                total_actions INTEGER NOT NULL,
+                started_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                completed_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_reconcile_session_stack ON reconcile_sessions(stack_name);
+            CREATE INDEX IF NOT EXISTS idx_reconcile_session_status ON reconcile_sessions(status);
+
+            CREATE TABLE IF NOT EXISTS idempotency_keys (
+                key TEXT PRIMARY KEY,
+                operation TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                status_code INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_idempotency_expires ON idempotency_keys(expires_at);
+
+            CREATE TABLE IF NOT EXISTS lease_state (
+                lease_id TEXT PRIMARY KEY,
+                sandbox_id TEXT NOT NULL,
+                ttl_secs INTEGER NOT NULL,
+                last_heartbeat_at INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_lease_sandbox ON lease_state(sandbox_id);
+
+            CREATE TABLE IF NOT EXISTS execution_state (
+                execution_id TEXT PRIMARY KEY,
+                container_id TEXT NOT NULL,
+                spec_json TEXT NOT NULL,
+                state TEXT NOT NULL,
+                exit_code INTEGER,
+                started_at INTEGER,
+                ended_at INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_execution_container ON execution_state(container_id);
+
+            CREATE TABLE IF NOT EXISTS checkpoint_state (
+                checkpoint_id TEXT PRIMARY KEY,
+                sandbox_id TEXT NOT NULL,
+                parent_checkpoint_id TEXT,
+                class TEXT NOT NULL,
+                state TEXT NOT NULL,
+                compatibility_fingerprint TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_checkpoint_sandbox ON checkpoint_state(sandbox_id);
+            CREATE INDEX IF NOT EXISTS idx_checkpoint_parent ON checkpoint_state(parent_checkpoint_id);",
         )?;
         Ok(())
     }
@@ -445,7 +607,8 @@ impl StateStore {
     ///
     /// This captures counters and timing windows required for deterministic restart
     /// of readiness tracking.
-    pub fn save_health_poller_state(
+    #[cfg(test)]
+    pub(crate) fn save_health_poller_state(
         &self,
         stack_name: &str,
         state: &HashMap<String, HealthPollState>,
@@ -465,7 +628,7 @@ impl StateStore {
     /// Load persisted health poller checkpoint state for a stack.
     ///
     /// Missing rows are treated as an empty checkpoint state.
-    pub fn load_health_poller_state(
+    pub(crate) fn load_health_poller_state(
         &self,
         stack_name: &str,
     ) -> Result<HashMap<String, HealthPollState>, StackError> {
@@ -484,7 +647,8 @@ impl StateStore {
     }
 
     /// Clear persisted health poller checkpoint state for a stack.
-    pub fn clear_health_poller_state(&self, stack_name: &str) -> Result<(), StackError> {
+    #[cfg(test)]
+    pub(crate) fn clear_health_poller_state(&self, stack_name: &str) -> Result<(), StackError> {
         self.conn.execute(
             "DELETE FROM health_poller_state WHERE stack_name = ?1",
             params![stack_name],
@@ -808,6 +972,794 @@ impl StateStore {
             service_ips,
             mount_tag_offsets,
         }))
+    }
+
+    // ── Reconcile session tracking ──
+
+    /// Create a new reconcile session.
+    ///
+    /// The `actions` slice is serialized into the `actions_json` column
+    /// for auditability. The session struct carries the hash and cursor.
+    pub fn create_reconcile_session(
+        &self,
+        session: &ReconcileSession,
+        actions: &[Action],
+    ) -> Result<(), StackError> {
+        let stored_actions: Vec<StoredAction> =
+            actions.iter().map(StoredAction::from_action).collect();
+        let actions_json = serde_json::to_string(&stored_actions)?;
+
+        self.conn.execute(
+            "INSERT INTO reconcile_sessions (
+                session_id, stack_name, operation_id, status,
+                actions_json, actions_hash, next_action_index,
+                total_actions, started_at, updated_at, completed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                session.session_id,
+                session.stack_name,
+                session.operation_id,
+                session.status.as_str(),
+                actions_json,
+                session.actions_hash,
+                session.next_action_index as i64,
+                session.total_actions as i64,
+                session.started_at as i64,
+                session.updated_at as i64,
+                session.completed_at.map(|t| t as i64),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load the active reconcile session for a stack, if any.
+    pub fn load_active_reconcile_session(
+        &self,
+        stack_name: &str,
+    ) -> Result<Option<ReconcileSession>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, stack_name, operation_id, status,
+                    actions_hash, next_action_index, total_actions,
+                    started_at, updated_at, completed_at
+             FROM reconcile_sessions
+             WHERE stack_name = ?1 AND status = 'active'
+             ORDER BY started_at DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![stack_name])?;
+
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+
+        let status_str: String = row.get(3)?;
+        let completed_at: Option<i64> = row.get(9)?;
+
+        Ok(Some(ReconcileSession {
+            session_id: row.get(0)?,
+            stack_name: row.get(1)?,
+            operation_id: row.get(2)?,
+            status: ReconcileSessionStatus::from_str(&status_str)?,
+            actions_hash: row.get(4)?,
+            next_action_index: row.get::<_, i64>(5)?.max(0) as usize,
+            total_actions: row.get::<_, i64>(6)?.max(0) as usize,
+            started_at: row.get::<_, i64>(7)?.max(0) as u64,
+            updated_at: row.get::<_, i64>(8)?.max(0) as u64,
+            completed_at: completed_at.map(|t| t.max(0) as u64),
+        }))
+    }
+
+    /// Update session progress (next_action_index, status).
+    pub fn update_reconcile_session_progress(
+        &self,
+        session_id: &str,
+        next_action_index: usize,
+        status: &ReconcileSessionStatus,
+    ) -> Result<(), StackError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        self.conn.execute(
+            "UPDATE reconcile_sessions
+             SET next_action_index = ?1, status = ?2, updated_at = ?3
+             WHERE session_id = ?4",
+            params![
+                next_action_index as i64,
+                status.as_str(),
+                now as i64,
+                session_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a session as completed.
+    pub fn complete_reconcile_session(&self, session_id: &str) -> Result<(), StackError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        self.conn.execute(
+            "UPDATE reconcile_sessions
+             SET status = 'completed', updated_at = ?1, completed_at = ?1
+             WHERE session_id = ?2",
+            params![now as i64, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a session as failed.
+    pub fn fail_reconcile_session(&self, session_id: &str) -> Result<(), StackError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        self.conn.execute(
+            "UPDATE reconcile_sessions
+             SET status = 'failed', updated_at = ?1, completed_at = ?1
+             WHERE session_id = ?2",
+            params![now as i64, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Supersede all active sessions for a stack (called when new apply starts).
+    ///
+    /// Returns the number of sessions superseded.
+    pub fn supersede_active_sessions(&self, stack_name: &str) -> Result<usize, StackError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let count = self.conn.execute(
+            "UPDATE reconcile_sessions
+             SET status = 'superseded', updated_at = ?1, completed_at = ?1
+             WHERE stack_name = ?2 AND status = 'active'",
+            params![now as i64, stack_name],
+        )?;
+        Ok(count)
+    }
+
+    /// Load recent sessions for a stack.
+    pub fn list_reconcile_sessions(
+        &self,
+        stack_name: &str,
+        limit: usize,
+    ) -> Result<Vec<ReconcileSession>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, stack_name, operation_id, status,
+                    actions_hash, next_action_index, total_actions,
+                    started_at, updated_at, completed_at
+             FROM reconcile_sessions
+             WHERE stack_name = ?1
+             ORDER BY started_at DESC
+             LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![stack_name, limit as i64])?;
+
+        let mut sessions = Vec::new();
+        while let Some(row) = rows.next()? {
+            let status_str: String = row.get(3)?;
+            let completed_at: Option<i64> = row.get(9)?;
+            sessions.push(ReconcileSession {
+                session_id: row.get(0)?,
+                stack_name: row.get(1)?,
+                operation_id: row.get(2)?,
+                status: ReconcileSessionStatus::from_str(&status_str)?,
+                actions_hash: row.get(4)?,
+                next_action_index: row.get::<_, i64>(5)?.max(0) as usize,
+                total_actions: row.get::<_, i64>(6)?.max(0) as usize,
+                started_at: row.get::<_, i64>(7)?.max(0) as u64,
+                updated_at: row.get::<_, i64>(8)?.max(0) as u64,
+                completed_at: completed_at.map(|t| t.max(0) as u64),
+            });
+        }
+        Ok(sessions)
+    }
+
+    // ── Idempotency key persistence ──
+
+    /// Check for an existing idempotency key result.
+    ///
+    /// Returns `Ok(Some(record))` when the key has been used before, or
+    /// `Ok(None)` when the key is fresh.
+    pub fn find_idempotency_result(
+        &self,
+        key: &str,
+    ) -> Result<Option<IdempotencyRecord>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT key, operation, request_hash, response_json, status_code, created_at, expires_at
+             FROM idempotency_keys WHERE key = ?1",
+        )?;
+        let mut rows = stmt.query(params![key])?;
+
+        match rows.next()? {
+            Some(row) => {
+                let status_raw: i64 = row.get(4)?;
+                Ok(Some(IdempotencyRecord {
+                    key: row.get(0)?,
+                    operation: row.get(1)?,
+                    request_hash: row.get(2)?,
+                    response_json: row.get(3)?,
+                    status_code: status_raw as u16,
+                    created_at: row.get::<_, i64>(5)? as u64,
+                    expires_at: row.get::<_, i64>(6)? as u64,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Save an idempotency key with its result.
+    ///
+    /// Uses upsert semantics so that concurrent callers racing on the
+    /// same key converge to the first-written response.
+    pub fn save_idempotency_result(&self, record: &IdempotencyRecord) -> Result<(), StackError> {
+        self.conn.execute(
+            "INSERT INTO idempotency_keys (key, operation, request_hash, response_json, status_code, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(key) DO UPDATE SET
+                response_json = excluded.response_json,
+                status_code = excluded.status_code",
+            params![
+                record.key,
+                record.operation,
+                record.request_hash,
+                record.response_json,
+                record.status_code as i64,
+                record.created_at as i64,
+                record.expires_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Clean up expired idempotency keys (24h TTL).
+    ///
+    /// Returns the number of rows removed.
+    pub fn cleanup_expired_idempotency_keys(&self) -> Result<usize, StackError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let deleted = self.conn.execute(
+            "DELETE FROM idempotency_keys WHERE expires_at <= ?1",
+            params![now as i64],
+        )?;
+        Ok(deleted)
+    }
+
+    // ── Lease persistence ──
+
+    /// Persist or update a lease.
+    pub fn save_lease(&self, lease: &Lease) -> Result<(), StackError> {
+        let state_json = serde_json::to_string(&lease.state)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        self.conn.execute(
+            "INSERT INTO lease_state (lease_id, sandbox_id, ttl_secs, last_heartbeat_at, state, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(lease_id) DO UPDATE SET
+                sandbox_id = excluded.sandbox_id,
+                ttl_secs = excluded.ttl_secs,
+                last_heartbeat_at = excluded.last_heartbeat_at,
+                state = excluded.state,
+                updated_at = excluded.updated_at",
+            params![
+                lease.lease_id,
+                lease.sandbox_id,
+                lease.ttl_secs as i64,
+                lease.last_heartbeat_at as i64,
+                state_json,
+                now,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load a lease by ID.
+    pub fn load_lease(&self, lease_id: &str) -> Result<Option<Lease>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT lease_id, sandbox_id, ttl_secs, last_heartbeat_at, state
+             FROM lease_state WHERE lease_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![lease_id])?;
+
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::lease_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all leases for a sandbox.
+    pub fn list_leases_for_sandbox(&self, sandbox_id: &str) -> Result<Vec<Lease>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT lease_id, sandbox_id, ttl_secs, last_heartbeat_at, state
+             FROM lease_state WHERE sandbox_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![sandbox_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+
+        let mut leases = Vec::new();
+        for row_result in rows {
+            let (lease_id, sandbox_id, ttl_secs, last_heartbeat_at, state_str) = row_result?;
+            let state: LeaseState = serde_json::from_str(&state_str)?;
+            leases.push(Lease {
+                lease_id,
+                sandbox_id,
+                ttl_secs: ttl_secs as u64,
+                last_heartbeat_at: last_heartbeat_at as u64,
+                state,
+            });
+        }
+        Ok(leases)
+    }
+
+    /// List all leases.
+    pub fn list_leases(&self) -> Result<Vec<Lease>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT lease_id, sandbox_id, ttl_secs, last_heartbeat_at, state
+             FROM lease_state ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+
+        let mut leases = Vec::new();
+        for row_result in rows {
+            let (lease_id, sandbox_id, ttl_secs, last_heartbeat_at, state_str) = row_result?;
+            let state: LeaseState = serde_json::from_str(&state_str)?;
+            leases.push(Lease {
+                lease_id,
+                sandbox_id,
+                ttl_secs: ttl_secs as u64,
+                last_heartbeat_at: last_heartbeat_at as u64,
+                state,
+            });
+        }
+        Ok(leases)
+    }
+
+    /// Delete a lease.
+    pub fn delete_lease(&self, lease_id: &str) -> Result<(), StackError> {
+        self.conn.execute(
+            "DELETE FROM lease_state WHERE lease_id = ?1",
+            params![lease_id],
+        )?;
+        Ok(())
+    }
+
+    /// Deserialize a lease from a rusqlite row.
+    fn lease_from_row(row: &rusqlite::Row<'_>) -> Result<Lease, StackError> {
+        let lease_id: String = row.get(0)?;
+        let sandbox_id: String = row.get(1)?;
+        let ttl_secs: i64 = row.get(2)?;
+        let last_heartbeat_at: i64 = row.get(3)?;
+        let state_str: String = row.get(4)?;
+
+        let state: LeaseState = serde_json::from_str(&state_str)?;
+
+        Ok(Lease {
+            lease_id,
+            sandbox_id,
+            ttl_secs: ttl_secs as u64,
+            last_heartbeat_at: last_heartbeat_at as u64,
+            state,
+        })
+    }
+
+    // ── Execution persistence ──
+
+    /// Persist an execution, upserting on `execution_id`.
+    pub fn save_execution(&self, execution: &Execution) -> Result<(), StackError> {
+        let spec_json = serde_json::to_string(&execution.exec_spec)?;
+        let state_json = serde_json::to_string(&execution.state)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        self.conn.execute(
+            "INSERT INTO execution_state (execution_id, container_id, spec_json, state, exit_code, started_at, ended_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+             ON CONFLICT(execution_id) DO UPDATE SET
+                container_id = excluded.container_id,
+                spec_json = excluded.spec_json,
+                state = excluded.state,
+                exit_code = excluded.exit_code,
+                started_at = excluded.started_at,
+                ended_at = excluded.ended_at,
+                updated_at = excluded.updated_at",
+            params![
+                execution.execution_id,
+                execution.container_id,
+                spec_json,
+                state_json,
+                execution.exit_code,
+                execution.started_at.map(|v| v as i64),
+                execution.ended_at.map(|v| v as i64),
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load an execution by its identifier.
+    pub fn load_execution(&self, execution_id: &str) -> Result<Option<Execution>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT execution_id, container_id, spec_json, state, exit_code, started_at, ended_at
+             FROM execution_state WHERE execution_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![execution_id])?;
+
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::execution_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all executions ordered by creation time.
+    pub fn list_executions(&self) -> Result<Vec<Execution>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT execution_id, container_id, spec_json, state, exit_code, started_at, ended_at
+             FROM execution_state ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<i32>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })?;
+
+        let mut executions = Vec::new();
+        for row_result in rows {
+            let (execution_id, container_id, spec_str, state_str, exit_code, started_at, ended_at) =
+                row_result?;
+            let exec_spec: ExecutionSpec = serde_json::from_str(&spec_str)?;
+            let state: ExecutionState = serde_json::from_str(&state_str)?;
+
+            executions.push(Execution {
+                execution_id,
+                container_id,
+                exec_spec,
+                state,
+                exit_code,
+                started_at: started_at.map(|v| v as u64),
+                ended_at: ended_at.map(|v| v as u64),
+            });
+        }
+        Ok(executions)
+    }
+
+    /// List all executions for a specific container.
+    pub fn list_executions_for_container(
+        &self,
+        container_id: &str,
+    ) -> Result<Vec<Execution>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT execution_id, container_id, spec_json, state, exit_code, started_at, ended_at
+             FROM execution_state WHERE container_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![container_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<i32>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })?;
+
+        let mut executions = Vec::new();
+        for row_result in rows {
+            let (execution_id, container_id, spec_str, state_str, exit_code, started_at, ended_at) =
+                row_result?;
+            let exec_spec: ExecutionSpec = serde_json::from_str(&spec_str)?;
+            let state: ExecutionState = serde_json::from_str(&state_str)?;
+
+            executions.push(Execution {
+                execution_id,
+                container_id,
+                exec_spec,
+                state,
+                exit_code,
+                started_at: started_at.map(|v| v as u64),
+                ended_at: ended_at.map(|v| v as u64),
+            });
+        }
+        Ok(executions)
+    }
+
+    /// Delete an execution by its identifier.
+    pub fn delete_execution(&self, execution_id: &str) -> Result<(), StackError> {
+        self.conn.execute(
+            "DELETE FROM execution_state WHERE execution_id = ?1",
+            params![execution_id],
+        )?;
+        Ok(())
+    }
+
+    /// Deserialize an execution from a rusqlite row.
+    fn execution_from_row(row: &rusqlite::Row<'_>) -> Result<Execution, StackError> {
+        let execution_id: String = row.get(0)?;
+        let container_id: String = row.get(1)?;
+        let spec_str: String = row.get(2)?;
+        let state_str: String = row.get(3)?;
+        let exit_code: Option<i32> = row.get(4)?;
+        let started_at: Option<i64> = row.get(5)?;
+        let ended_at: Option<i64> = row.get(6)?;
+
+        let exec_spec: ExecutionSpec = serde_json::from_str(&spec_str)?;
+        let state: ExecutionState = serde_json::from_str(&state_str)?;
+
+        Ok(Execution {
+            execution_id,
+            container_id,
+            exec_spec,
+            state,
+            exit_code,
+            started_at: started_at.map(|v| v as u64),
+            ended_at: ended_at.map(|v| v as u64),
+        })
+    }
+
+    // ── Checkpoint persistence ──
+
+    /// Persist a checkpoint, upserting on `checkpoint_id`.
+    pub fn save_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), StackError> {
+        let class_json = serde_json::to_string(&checkpoint.class)?;
+        let state_json = serde_json::to_string(&checkpoint.state)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        self.conn.execute(
+            "INSERT INTO checkpoint_state (checkpoint_id, sandbox_id, parent_checkpoint_id, class, state, compatibility_fingerprint, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(checkpoint_id) DO UPDATE SET
+                sandbox_id = excluded.sandbox_id,
+                parent_checkpoint_id = excluded.parent_checkpoint_id,
+                class = excluded.class,
+                state = excluded.state,
+                compatibility_fingerprint = excluded.compatibility_fingerprint,
+                updated_at = excluded.updated_at",
+            params![
+                checkpoint.checkpoint_id,
+                checkpoint.sandbox_id,
+                checkpoint.parent_checkpoint_id,
+                class_json,
+                state_json,
+                checkpoint.compatibility_fingerprint,
+                checkpoint.created_at as i64,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load a checkpoint by its identifier.
+    pub fn load_checkpoint(&self, checkpoint_id: &str) -> Result<Option<Checkpoint>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT checkpoint_id, sandbox_id, parent_checkpoint_id, class, state, compatibility_fingerprint, created_at, updated_at
+             FROM checkpoint_state WHERE checkpoint_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![checkpoint_id])?;
+
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::checkpoint_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all checkpoints ordered by creation time.
+    pub fn list_checkpoints(&self) -> Result<Vec<Checkpoint>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT checkpoint_id, sandbox_id, parent_checkpoint_id, class, state, compatibility_fingerprint, created_at, updated_at
+             FROM checkpoint_state ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })?;
+
+        let mut checkpoints = Vec::new();
+        for row_result in rows {
+            let (
+                checkpoint_id,
+                sandbox_id,
+                parent_checkpoint_id,
+                class_str,
+                state_str,
+                compatibility_fingerprint,
+                created_at,
+                _updated_at,
+            ) = row_result?;
+            let class: CheckpointClass = serde_json::from_str(&class_str)?;
+            let state: CheckpointState = serde_json::from_str(&state_str)?;
+
+            checkpoints.push(Checkpoint {
+                checkpoint_id,
+                sandbox_id,
+                parent_checkpoint_id,
+                class,
+                state,
+                created_at: created_at as u64,
+                compatibility_fingerprint,
+            });
+        }
+        Ok(checkpoints)
+    }
+
+    /// List checkpoints belonging to a specific sandbox.
+    pub fn list_checkpoints_for_sandbox(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Vec<Checkpoint>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT checkpoint_id, sandbox_id, parent_checkpoint_id, class, state, compatibility_fingerprint, created_at, updated_at
+             FROM checkpoint_state WHERE sandbox_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![sandbox_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })?;
+
+        let mut checkpoints = Vec::new();
+        for row_result in rows {
+            let (
+                checkpoint_id,
+                sandbox_id,
+                parent_checkpoint_id,
+                class_str,
+                state_str,
+                compatibility_fingerprint,
+                created_at,
+                _updated_at,
+            ) = row_result?;
+            let class: CheckpointClass = serde_json::from_str(&class_str)?;
+            let state: CheckpointState = serde_json::from_str(&state_str)?;
+
+            checkpoints.push(Checkpoint {
+                checkpoint_id,
+                sandbox_id,
+                parent_checkpoint_id,
+                class,
+                state,
+                created_at: created_at as u64,
+                compatibility_fingerprint,
+            });
+        }
+        Ok(checkpoints)
+    }
+
+    /// List direct children of a parent checkpoint.
+    pub fn list_checkpoint_children(
+        &self,
+        parent_checkpoint_id: &str,
+    ) -> Result<Vec<Checkpoint>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT checkpoint_id, sandbox_id, parent_checkpoint_id, class, state, compatibility_fingerprint, created_at, updated_at
+             FROM checkpoint_state WHERE parent_checkpoint_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![parent_checkpoint_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })?;
+
+        let mut checkpoints = Vec::new();
+        for row_result in rows {
+            let (
+                checkpoint_id,
+                sandbox_id,
+                parent_checkpoint_id,
+                class_str,
+                state_str,
+                compatibility_fingerprint,
+                created_at,
+                _updated_at,
+            ) = row_result?;
+            let class: CheckpointClass = serde_json::from_str(&class_str)?;
+            let state: CheckpointState = serde_json::from_str(&state_str)?;
+
+            checkpoints.push(Checkpoint {
+                checkpoint_id,
+                sandbox_id,
+                parent_checkpoint_id,
+                class,
+                state,
+                created_at: created_at as u64,
+                compatibility_fingerprint,
+            });
+        }
+        Ok(checkpoints)
+    }
+
+    /// Delete a checkpoint by its identifier.
+    pub fn delete_checkpoint(&self, checkpoint_id: &str) -> Result<(), StackError> {
+        self.conn.execute(
+            "DELETE FROM checkpoint_state WHERE checkpoint_id = ?1",
+            params![checkpoint_id],
+        )?;
+        Ok(())
+    }
+
+    /// Deserialize a checkpoint from a rusqlite row.
+    fn checkpoint_from_row(row: &rusqlite::Row<'_>) -> Result<Checkpoint, StackError> {
+        let checkpoint_id: String = row.get(0)?;
+        let sandbox_id: String = row.get(1)?;
+        let parent_checkpoint_id: Option<String> = row.get(2)?;
+        let class_str: String = row.get(3)?;
+        let state_str: String = row.get(4)?;
+        let compatibility_fingerprint: String = row.get(5)?;
+        let created_at: i64 = row.get(6)?;
+        let _updated_at: i64 = row.get(7)?;
+
+        let class: CheckpointClass = serde_json::from_str(&class_str)?;
+        let state: CheckpointState = serde_json::from_str(&state_str)?;
+
+        Ok(Checkpoint {
+            checkpoint_id,
+            sandbox_id,
+            parent_checkpoint_id,
+            class,
+            state,
+            created_at: created_at as u64,
+            compatibility_fingerprint,
+        })
     }
 }
 
@@ -1584,5 +2536,604 @@ mod tests {
         store.save_allocator_state("myapp", &snapshot).unwrap();
         let loaded = store.load_allocator_state("myapp").unwrap().unwrap();
         assert_eq!(loaded, snapshot);
+    }
+
+    // ── Reconcile session tests ──
+
+    fn sample_session(id: &str, stack: &str) -> ReconcileSession {
+        ReconcileSession {
+            session_id: id.to_string(),
+            stack_name: stack.to_string(),
+            operation_id: "op-1".to_string(),
+            status: ReconcileSessionStatus::Active,
+            actions_hash: "abcdef0123456789".to_string(),
+            next_action_index: 0,
+            total_actions: 2,
+            started_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            completed_at: None,
+        }
+    }
+
+    fn sample_actions() -> Vec<Action> {
+        vec![
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn reconcile_session_create_and_load_active() {
+        let store = StateStore::in_memory().unwrap();
+        let session = sample_session("rs-1", "myapp");
+        let actions = sample_actions();
+
+        store.create_reconcile_session(&session, &actions).unwrap();
+
+        let loaded = store
+            .load_active_reconcile_session("myapp")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.session_id, "rs-1");
+        assert_eq!(loaded.stack_name, "myapp");
+        assert_eq!(loaded.status, ReconcileSessionStatus::Active);
+        assert_eq!(loaded.actions_hash, "abcdef0123456789");
+        assert_eq!(loaded.next_action_index, 0);
+        assert_eq!(loaded.total_actions, 2);
+    }
+
+    #[test]
+    fn reconcile_session_update_progress() {
+        let store = StateStore::in_memory().unwrap();
+        let session = sample_session("rs-2", "myapp");
+        store
+            .create_reconcile_session(&session, &sample_actions())
+            .unwrap();
+
+        store
+            .update_reconcile_session_progress("rs-2", 1, &ReconcileSessionStatus::Active)
+            .unwrap();
+
+        let loaded = store
+            .load_active_reconcile_session("myapp")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.next_action_index, 1);
+        assert_eq!(loaded.status, ReconcileSessionStatus::Active);
+    }
+
+    #[test]
+    fn reconcile_session_complete() {
+        let store = StateStore::in_memory().unwrap();
+        let session = sample_session("rs-3", "myapp");
+        store
+            .create_reconcile_session(&session, &sample_actions())
+            .unwrap();
+
+        store.complete_reconcile_session("rs-3").unwrap();
+
+        // Active load should return None since it's completed now.
+        let active = store.load_active_reconcile_session("myapp").unwrap();
+        assert!(active.is_none());
+
+        // List should show it as completed.
+        let sessions = store.list_reconcile_sessions("myapp", 10).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, ReconcileSessionStatus::Completed);
+        assert!(sessions[0].completed_at.is_some());
+    }
+
+    #[test]
+    fn reconcile_session_fail() {
+        let store = StateStore::in_memory().unwrap();
+        let session = sample_session("rs-4", "myapp");
+        store
+            .create_reconcile_session(&session, &sample_actions())
+            .unwrap();
+
+        store.fail_reconcile_session("rs-4").unwrap();
+
+        let active = store.load_active_reconcile_session("myapp").unwrap();
+        assert!(active.is_none());
+
+        let sessions = store.list_reconcile_sessions("myapp", 10).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, ReconcileSessionStatus::Failed);
+        assert!(sessions[0].completed_at.is_some());
+    }
+
+    #[test]
+    fn reconcile_session_supersede_active() {
+        let store = StateStore::in_memory().unwrap();
+
+        let session1 = sample_session("rs-5", "myapp");
+        store
+            .create_reconcile_session(&session1, &sample_actions())
+            .unwrap();
+
+        let count = store.supersede_active_sessions("myapp").unwrap();
+        assert_eq!(count, 1);
+
+        let active = store.load_active_reconcile_session("myapp").unwrap();
+        assert!(active.is_none());
+
+        let sessions = store.list_reconcile_sessions("myapp", 10).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, ReconcileSessionStatus::Superseded);
+    }
+
+    #[test]
+    fn reconcile_session_list_respects_limit_and_ordering() {
+        let store = StateStore::in_memory().unwrap();
+
+        for i in 0..5 {
+            let mut session = sample_session(&format!("rs-{i}"), "myapp");
+            session.started_at = 1_700_000_000 + i as u64;
+            session.updated_at = session.started_at;
+            store.complete_reconcile_session(&format!("rs-{i}")).ok();
+            store
+                .create_reconcile_session(&session, &sample_actions())
+                .unwrap();
+            store
+                .complete_reconcile_session(&format!("rs-{i}"))
+                .unwrap();
+        }
+
+        let all = store.list_reconcile_sessions("myapp", 10).unwrap();
+        assert_eq!(all.len(), 5);
+        // Ordered by started_at DESC.
+        assert!(all[0].started_at >= all[1].started_at);
+
+        let limited = store.list_reconcile_sessions("myapp", 2).unwrap();
+        assert_eq!(limited.len(), 2);
+    }
+
+    #[test]
+    fn reconcile_session_no_active_returns_none() {
+        let store = StateStore::in_memory().unwrap();
+        let active = store.load_active_reconcile_session("nonexistent").unwrap();
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn reconcile_session_stacks_are_isolated() {
+        let store = StateStore::in_memory().unwrap();
+
+        let s1 = sample_session("rs-a1", "app1");
+        let s2 = sample_session("rs-b1", "app2");
+        store
+            .create_reconcile_session(&s1, &sample_actions())
+            .unwrap();
+        store
+            .create_reconcile_session(&s2, &sample_actions())
+            .unwrap();
+
+        let active1 = store
+            .load_active_reconcile_session("app1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(active1.session_id, "rs-a1");
+
+        let active2 = store
+            .load_active_reconcile_session("app2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(active2.session_id, "rs-b1");
+
+        // Supersede only app1.
+        store.supersede_active_sessions("app1").unwrap();
+        assert!(
+            store
+                .load_active_reconcile_session("app1")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .load_active_reconcile_session("app2")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    // ── Idempotency key persistence tests ──
+
+    fn sample_idempotency_record(key: &str) -> IdempotencyRecord {
+        IdempotencyRecord {
+            key: key.to_string(),
+            operation: "create_sandbox".to_string(),
+            request_hash: "abc123".to_string(),
+            response_json: r#"{"sandbox_id":"sbx-1"}"#.to_string(),
+            status_code: 201,
+            created_at: 1_700_000_000,
+            expires_at: 1_700_000_000 + IDEMPOTENCY_TTL_SECS,
+        }
+    }
+
+    #[test]
+    fn idempotency_save_and_find_round_trip() {
+        let store = StateStore::in_memory().unwrap();
+        let record = sample_idempotency_record("ik-1");
+
+        store.save_idempotency_result(&record).unwrap();
+        let loaded = store.find_idempotency_result("ik-1").unwrap().unwrap();
+        assert_eq!(loaded.key, "ik-1");
+        assert_eq!(loaded.operation, "create_sandbox");
+        assert_eq!(loaded.request_hash, "abc123");
+        assert_eq!(loaded.response_json, r#"{"sandbox_id":"sbx-1"}"#);
+        assert_eq!(loaded.status_code, 201);
+        assert_eq!(loaded.created_at, 1_700_000_000);
+        assert_eq!(loaded.expires_at, 1_700_000_000 + IDEMPOTENCY_TTL_SECS);
+    }
+
+    #[test]
+    fn idempotency_missing_key_returns_none() {
+        let store = StateStore::in_memory().unwrap();
+        let loaded = store.find_idempotency_result("nonexistent").unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn idempotency_cleanup_removes_expired_keys() {
+        let store = StateStore::in_memory().unwrap();
+
+        // Record with expires_at in the past (epoch 0 + TTL = ~1 day).
+        let expired = IdempotencyRecord {
+            key: "ik-expired".to_string(),
+            operation: "create_sandbox".to_string(),
+            request_hash: "hash1".to_string(),
+            response_json: "{}".to_string(),
+            status_code: 201,
+            created_at: 0,
+            expires_at: 1, // Far in the past
+        };
+        store.save_idempotency_result(&expired).unwrap();
+
+        // Record with expires_at far in the future.
+        let fresh = IdempotencyRecord {
+            key: "ik-fresh".to_string(),
+            operation: "create_sandbox".to_string(),
+            request_hash: "hash2".to_string(),
+            response_json: "{}".to_string(),
+            status_code: 201,
+            created_at: 1_700_000_000,
+            expires_at: u64::MAX / 2, // Far in the future
+        };
+        store.save_idempotency_result(&fresh).unwrap();
+
+        let deleted = store.cleanup_expired_idempotency_keys().unwrap();
+        assert_eq!(deleted, 1);
+
+        // Expired key is gone.
+        assert!(
+            store
+                .find_idempotency_result("ik-expired")
+                .unwrap()
+                .is_none()
+        );
+        // Fresh key is still present.
+        assert!(store.find_idempotency_result("ik-fresh").unwrap().is_some());
+    }
+
+    // ── Lease persistence tests ──
+
+    fn sample_lease(id: &str, sandbox_id: &str) -> Lease {
+        Lease {
+            lease_id: id.to_string(),
+            sandbox_id: sandbox_id.to_string(),
+            ttl_secs: 300,
+            last_heartbeat_at: 1_700_000_000,
+            state: LeaseState::Opening,
+        }
+    }
+
+    #[test]
+    fn lease_round_trip() {
+        let store = StateStore::in_memory().unwrap();
+        let lease = sample_lease("ls-1", "sb-1");
+
+        store.save_lease(&lease).unwrap();
+        let loaded = store.load_lease("ls-1").unwrap().unwrap();
+        assert_eq!(loaded, lease);
+    }
+
+    #[test]
+    fn lease_list_for_sandbox() {
+        let store = StateStore::in_memory().unwrap();
+        let lease1 = sample_lease("ls-a", "sb-1");
+        let lease2 = sample_lease("ls-b", "sb-1");
+        let lease3 = sample_lease("ls-c", "sb-2");
+
+        store.save_lease(&lease1).unwrap();
+        store.save_lease(&lease2).unwrap();
+        store.save_lease(&lease3).unwrap();
+
+        let sb1_leases = store.list_leases_for_sandbox("sb-1").unwrap();
+        assert_eq!(sb1_leases.len(), 2);
+
+        let sb2_leases = store.list_leases_for_sandbox("sb-2").unwrap();
+        assert_eq!(sb2_leases.len(), 1);
+    }
+
+    #[test]
+    fn lease_list_returns_all() {
+        let store = StateStore::in_memory().unwrap();
+        let lease1 = sample_lease("ls-x", "sb-1");
+        let lease2 = sample_lease("ls-y", "sb-2");
+
+        store.save_lease(&lease1).unwrap();
+        store.save_lease(&lease2).unwrap();
+
+        let all = store.list_leases().unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn lease_delete_removes() {
+        let store = StateStore::in_memory().unwrap();
+        let lease = sample_lease("ls-del", "sb-1");
+
+        store.save_lease(&lease).unwrap();
+        store.delete_lease("ls-del").unwrap();
+        let loaded = store.load_lease("ls-del").unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn lease_upsert_updates_state() {
+        let store = StateStore::in_memory().unwrap();
+        let mut lease = sample_lease("ls-up", "sb-1");
+
+        store.save_lease(&lease).unwrap();
+
+        lease.state = LeaseState::Active;
+        lease.last_heartbeat_at = 1_700_000_100;
+        store.save_lease(&lease).unwrap();
+
+        let loaded = store.load_lease("ls-up").unwrap().unwrap();
+        assert_eq!(loaded.state, LeaseState::Active);
+        assert_eq!(loaded.last_heartbeat_at, 1_700_000_100);
+    }
+
+    // ── Execution persistence tests ──
+
+    fn sample_execution(id: &str, container_id: &str) -> Execution {
+        Execution {
+            execution_id: id.to_string(),
+            container_id: container_id.to_string(),
+            exec_spec: ExecutionSpec {
+                cmd: vec!["echo".to_string(), "hello".to_string()],
+                args: vec![],
+                env_override: std::collections::BTreeMap::new(),
+                pty: false,
+                timeout_secs: None,
+            },
+            state: ExecutionState::Queued,
+            exit_code: None,
+            started_at: None,
+            ended_at: None,
+        }
+    }
+
+    #[test]
+    fn execution_round_trip() {
+        let store = StateStore::in_memory().unwrap();
+        let execution = sample_execution("exec-1", "ctr-abc");
+
+        store.save_execution(&execution).unwrap();
+        let loaded = store.load_execution("exec-1").unwrap().unwrap();
+        assert_eq!(loaded.execution_id, "exec-1");
+        assert_eq!(loaded.container_id, "ctr-abc");
+        assert_eq!(loaded.state, ExecutionState::Queued);
+        assert_eq!(loaded.exec_spec.cmd, vec!["echo", "hello"]);
+    }
+
+    #[test]
+    fn execution_list_returns_all() {
+        let store = StateStore::in_memory().unwrap();
+        store
+            .save_execution(&sample_execution("exec-a", "ctr-1"))
+            .unwrap();
+        store
+            .save_execution(&sample_execution("exec-b", "ctr-2"))
+            .unwrap();
+
+        let all = store.list_executions().unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn execution_list_for_container() {
+        let store = StateStore::in_memory().unwrap();
+        store
+            .save_execution(&sample_execution("exec-a", "ctr-1"))
+            .unwrap();
+        store
+            .save_execution(&sample_execution("exec-b", "ctr-1"))
+            .unwrap();
+        store
+            .save_execution(&sample_execution("exec-c", "ctr-2"))
+            .unwrap();
+
+        let for_ctr1 = store.list_executions_for_container("ctr-1").unwrap();
+        assert_eq!(for_ctr1.len(), 2);
+        assert!(for_ctr1.iter().all(|e| e.container_id == "ctr-1"));
+
+        let for_ctr2 = store.list_executions_for_container("ctr-2").unwrap();
+        assert_eq!(for_ctr2.len(), 1);
+    }
+
+    #[test]
+    fn execution_delete_removes() {
+        let store = StateStore::in_memory().unwrap();
+        store
+            .save_execution(&sample_execution("exec-del", "ctr-1"))
+            .unwrap();
+        store.delete_execution("exec-del").unwrap();
+        let loaded = store.load_execution("exec-del").unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn execution_upsert_updates_state() {
+        let store = StateStore::in_memory().unwrap();
+        let mut execution = sample_execution("exec-up", "ctr-1");
+
+        store.save_execution(&execution).unwrap();
+
+        execution.state = ExecutionState::Running;
+        execution.started_at = Some(1_700_000_000);
+        store.save_execution(&execution).unwrap();
+
+        let loaded = store.load_execution("exec-up").unwrap().unwrap();
+        assert_eq!(loaded.state, ExecutionState::Running);
+        assert_eq!(loaded.started_at, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn execution_missing_returns_none() {
+        let store = StateStore::in_memory().unwrap();
+        let loaded = store.load_execution("nonexistent").unwrap();
+        assert!(loaded.is_none());
+    }
+
+    // ── Checkpoint persistence tests ──
+
+    fn sample_checkpoint(id: &str, sandbox_id: &str) -> Checkpoint {
+        Checkpoint {
+            checkpoint_id: id.to_string(),
+            sandbox_id: sandbox_id.to_string(),
+            parent_checkpoint_id: None,
+            class: CheckpointClass::FsQuick,
+            state: CheckpointState::Creating,
+            created_at: 1_700_000_000,
+            compatibility_fingerprint: "fp-abc123".to_string(),
+        }
+    }
+
+    #[test]
+    fn checkpoint_round_trip() {
+        let store = StateStore::in_memory().unwrap();
+        let checkpoint = sample_checkpoint("ckpt-1", "sb-1");
+
+        store.save_checkpoint(&checkpoint).unwrap();
+        let loaded = store.load_checkpoint("ckpt-1").unwrap().unwrap();
+        assert_eq!(loaded, checkpoint);
+    }
+
+    #[test]
+    fn checkpoint_missing_returns_none() {
+        let store = StateStore::in_memory().unwrap();
+        let loaded = store.load_checkpoint("nonexistent").unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn checkpoint_upsert_updates_state() {
+        let store = StateStore::in_memory().unwrap();
+        let mut checkpoint = sample_checkpoint("ckpt-up", "sb-1");
+
+        store.save_checkpoint(&checkpoint).unwrap();
+
+        checkpoint.state = CheckpointState::Ready;
+        store.save_checkpoint(&checkpoint).unwrap();
+
+        let loaded = store.load_checkpoint("ckpt-up").unwrap().unwrap();
+        assert_eq!(loaded.state, CheckpointState::Ready);
+    }
+
+    #[test]
+    fn checkpoint_list_returns_all_ordered() {
+        let store = StateStore::in_memory().unwrap();
+        let ckpt1 = sample_checkpoint("ckpt-a", "sb-1");
+        let mut ckpt2 = sample_checkpoint("ckpt-b", "sb-2");
+        ckpt2.created_at = 1_700_000_001;
+
+        store.save_checkpoint(&ckpt1).unwrap();
+        store.save_checkpoint(&ckpt2).unwrap();
+
+        let all = store.list_checkpoints().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].checkpoint_id, "ckpt-a");
+        assert_eq!(all[1].checkpoint_id, "ckpt-b");
+    }
+
+    #[test]
+    fn checkpoint_list_for_sandbox_filters() {
+        let store = StateStore::in_memory().unwrap();
+        let ckpt1 = sample_checkpoint("ckpt-1", "sb-1");
+        let ckpt2 = sample_checkpoint("ckpt-2", "sb-2");
+        let mut ckpt3 = sample_checkpoint("ckpt-3", "sb-1");
+        ckpt3.created_at = 1_700_000_001;
+
+        store.save_checkpoint(&ckpt1).unwrap();
+        store.save_checkpoint(&ckpt2).unwrap();
+        store.save_checkpoint(&ckpt3).unwrap();
+
+        let sb1 = store.list_checkpoints_for_sandbox("sb-1").unwrap();
+        assert_eq!(sb1.len(), 2);
+        assert!(sb1.iter().all(|c| c.sandbox_id == "sb-1"));
+    }
+
+    #[test]
+    fn checkpoint_children_returns_direct_children() {
+        let store = StateStore::in_memory().unwrap();
+        let parent = sample_checkpoint("ckpt-parent", "sb-1");
+        let mut child1 = sample_checkpoint("ckpt-child1", "sb-2");
+        child1.parent_checkpoint_id = Some("ckpt-parent".to_string());
+        let mut child2 = sample_checkpoint("ckpt-child2", "sb-3");
+        child2.parent_checkpoint_id = Some("ckpt-parent".to_string());
+        child2.created_at = 1_700_000_001;
+        let unrelated = sample_checkpoint("ckpt-other", "sb-4");
+
+        store.save_checkpoint(&parent).unwrap();
+        store.save_checkpoint(&child1).unwrap();
+        store.save_checkpoint(&child2).unwrap();
+        store.save_checkpoint(&unrelated).unwrap();
+
+        let children = store.list_checkpoint_children("ckpt-parent").unwrap();
+        assert_eq!(children.len(), 2);
+        assert!(
+            children
+                .iter()
+                .all(|c| c.parent_checkpoint_id.as_deref() == Some("ckpt-parent"))
+        );
+    }
+
+    #[test]
+    fn checkpoint_delete_removes() {
+        let store = StateStore::in_memory().unwrap();
+        let checkpoint = sample_checkpoint("ckpt-del", "sb-1");
+
+        store.save_checkpoint(&checkpoint).unwrap();
+        store.delete_checkpoint("ckpt-del").unwrap();
+        let loaded = store.load_checkpoint("ckpt-del").unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn checkpoint_null_parent_round_trips() {
+        let store = StateStore::in_memory().unwrap();
+        let checkpoint = sample_checkpoint("ckpt-null-parent", "sb-1");
+        assert!(checkpoint.parent_checkpoint_id.is_none());
+
+        store.save_checkpoint(&checkpoint).unwrap();
+        let loaded = store.load_checkpoint("ckpt-null-parent").unwrap().unwrap();
+        assert!(loaded.parent_checkpoint_id.is_none());
+    }
+
+    #[test]
+    fn checkpoint_vm_full_class_persists() {
+        let store = StateStore::in_memory().unwrap();
+        let mut checkpoint = sample_checkpoint("ckpt-vm", "sb-1");
+        checkpoint.class = CheckpointClass::VmFull;
+
+        store.save_checkpoint(&checkpoint).unwrap();
+        let loaded = store.load_checkpoint("ckpt-vm").unwrap().unwrap();
+        assert_eq!(loaded.class, CheckpointClass::VmFull);
     }
 }

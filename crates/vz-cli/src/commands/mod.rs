@@ -4,13 +4,16 @@
 pub mod build;
 #[cfg(target_os = "macos")]
 pub mod cache;
+pub mod checkpoint;
 #[cfg(target_os = "macos")]
 pub mod cleanup;
 pub mod docker;
 #[cfg(target_os = "macos")]
 pub mod exec;
+pub mod execution;
 #[cfg(target_os = "macos")]
 pub mod init;
+pub mod lease;
 #[cfg(target_os = "macos")]
 pub mod list;
 pub mod oci;
