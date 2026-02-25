@@ -14,6 +14,7 @@ mod error;
 mod events;
 mod executor;
 mod health;
+mod image_policy;
 mod network;
 mod orchestrator;
 mod reconcile;
@@ -31,10 +32,17 @@ pub use events::{
     EventRecord, FnStackEventSink, StackEvent, StackEventSink, StackEventSinkError,
     emit_event_to_sink,
 };
-pub use executor::{ContainerLogs, ContainerRuntime, ExecutionResult, PortTracker, StackExecutor};
+pub use executor::{
+    ContainerLogs, ContainerRuntime, ExecutionResult, LogLine, LogStream, PortTracker,
+    StackExecutor,
+};
 pub use health::{
     DependencyCheck, HealthPollResult, HealthPoller, HealthStatus, check_dependencies,
     is_service_ready,
+};
+pub use image_policy::{
+    ImagePolicy, ImageRefKind, PolicyViolation, ViolationKind, classify_image_ref,
+    validate_image_reference, validate_stack_images,
 };
 pub use network::{
     GvproxyBackend, GvproxyConfig, NetworkBackend, NetworkHandle, PortConflict, PublishedPort,
@@ -44,9 +52,9 @@ pub use orchestrator::{OrchestrationConfig, OrchestrationResult, RoundReport, St
 pub use reconcile::{Action, ApplyResult, DeferredService, apply, compute_actions_hash};
 pub use restart::{RestartTracker, compute_restarts};
 pub use spec::{
-    DependencyCondition, HealthCheckSpec, MountSpec, NetworkSpec, PortSpec, ResourcesSpec,
-    RestartPolicy, SecretDef, ServiceDependency, ServiceKind, ServiceSecretRef, ServiceSpec,
-    StackSpec, VolumeSpec,
+    DependencyCondition, HealthCheckSpec, LoggingConfig, MountSpec, NetworkSpec, PortSpec,
+    ResourcesSpec, RestartPolicy, SecretDef, SecretSource, ServiceDependency, ServiceKind,
+    ServiceSecretRef, ServiceSpec, StackSpec, VolumeSpec,
 };
 pub use state_store::{
     AllocatorSnapshot, DriftFinding, DriftSeverity, IDEMPOTENCY_TTL_SECS, IdempotencyRecord,

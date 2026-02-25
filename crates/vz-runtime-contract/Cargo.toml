@@ -11,5 +11,8 @@ description = "Backend-neutral runtime contract for vz container backends"
 serde = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

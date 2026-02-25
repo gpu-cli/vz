@@ -24,9 +24,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 use vz_stack::{
-    ContainerLogs, ContainerRuntime, EventRecord, OrchestrationConfig, RoundReport,
-    ServiceObservedState, ServicePhase, StackError, StackEvent, StackExecutor, StackOrchestrator,
-    StackSpec, StateStore, VolumeManager, parse_compose_with_dir,
+    ContainerLogs, ContainerRuntime, EventRecord, LogLine, LogStream, OrchestrationConfig,
+    RoundReport, ServiceObservedState, ServicePhase, StackError, StackEvent, StackExecutor,
+    StackOrchestrator, StackSpec, StateStore, VolumeManager, parse_compose_with_dir,
 };
 
 use super::stack_output::{self, StackOutput};
@@ -1704,12 +1704,50 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
     let log_file = CONTAINER_LOG_FILE;
     let multi = services.len() > 1;
 
-    // Initial fetch: bounded tail -n <count>.
-    for service in &services {
-        let tail_n = args.tail.to_string();
+    if args.follow {
+        // Follow mode: stream logs from each service in parallel, printing
+        // lines as they arrive with colored service prefixes.
+        cmd_logs_follow(&sock_path, &args.name, &services, args.tail, log_file).await
+    } else {
+        // One-shot fetch: bounded tail -n <count>.
+        for service in &services {
+            let tail_n = args.tail.to_string();
+            let output = exec_via_socket(
+                &sock_path,
+                &args.name,
+                service,
+                &["tail", "-n", &tail_n, log_file],
+            )
+            .await?;
+            print_log_output(&output, service, multi);
+        }
+        Ok(())
+    }
+}
+
+/// Follow log output from multiple services in parallel.
+///
+/// Each service gets its own polling thread that sends lines through a
+/// shared channel. The main thread reads from the channel and prints
+/// each line with a colored service prefix.
+async fn cmd_logs_follow(
+    sock_path: &Path,
+    stack_name: &str,
+    services: &[String],
+    tail: usize,
+    log_file: &str,
+) -> anyhow::Result<()> {
+    use console::style;
+
+    let multi = services.len() > 1;
+    let (tx, rx) = std::sync::mpsc::channel::<LogLine>();
+
+    // Print initial tail for each service.
+    for service in services {
+        let tail_n = tail.to_string();
         let output = exec_via_socket(
-            &sock_path,
-            &args.name,
+            sock_path,
+            stack_name,
             service,
             &["tail", "-n", &tail_n, log_file],
         )
@@ -1717,36 +1755,100 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
         print_log_output(&output, service, multi);
     }
 
-    if !args.follow {
-        return Ok(());
+    // Spawn a polling thread per service that reads new content and sends
+    // LogLines through the channel.
+    for (i, service) in services.iter().enumerate() {
+        let service_name = service.clone();
+        let sock = sock_path.to_path_buf();
+        let name = stack_name.to_string();
+        let log_path = log_file.to_string();
+        let sender = tx.clone();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            let Ok(rt) = rt else { return };
+            rt.block_on(async {
+                let mut offset = get_file_size(&sock, &name, &service_name, &log_path)
+                    .await
+                    .unwrap_or(0);
+
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    let offset_arg = format!("+{}", offset + 1);
+                    let output = exec_via_socket(
+                        &sock,
+                        &name,
+                        &service_name,
+                        &["tail", "-c", &offset_arg, &log_path],
+                    )
+                    .await;
+
+                    let Ok(output) = output else {
+                        break;
+                    };
+
+                    if !output.is_empty() {
+                        offset += output.len() as u64;
+                        for line in output.lines() {
+                            let log_line = LogLine {
+                                timestamp: None,
+                                service: service_name.clone(),
+                                line: line.to_string(),
+                            };
+                            if sender.send(log_line).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+            let _ = i; // suppress unused warning
+        });
     }
 
-    // Follow mode: track byte offsets per service, poll with tail -c +<offset>.
-    // Use 200ms poll interval for near-real-time feel.
-    let mut offsets: Vec<u64> = Vec::with_capacity(services.len());
-    for service in &services {
-        let size = get_file_size(&sock_path, &args.name, service, log_file).await?;
-        offsets.push(size);
-    }
+    // Drop the original sender so the channel closes when all threads exit.
+    drop(tx);
 
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Build a color palette for service prefixes.
+    let color_palette = build_service_color_palette(services);
 
-        for (i, service) in services.iter().enumerate() {
-            let offset_arg = format!("+{}", offsets[i] + 1);
-            let output = exec_via_socket(
-                &sock_path,
-                &args.name,
-                service,
-                &["tail", "-c", &offset_arg, log_file],
-            )
-            .await?;
-
-            if !output.is_empty() {
-                print_log_output(&output, service, multi);
-                offsets[i] += output.len() as u64;
-            }
+    // Print streamed lines with colored prefixes.
+    for log_line in rx {
+        let color_idx = color_palette.get(&log_line.service).copied().unwrap_or(0);
+        let prefix = color_service_prefix(&log_line.service, color_idx);
+        if let Some(ts) = &log_line.timestamp {
+            println!("{prefix} {ts} {}", log_line.line);
+        } else {
+            println!("{prefix} {}", log_line.line);
         }
+    }
+
+    Ok(())
+}
+
+/// Build a mapping from service name to color palette index.
+fn build_service_color_palette(services: &[String]) -> HashMap<String, usize> {
+    services
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.clone(), i))
+        .collect()
+}
+
+/// Render a colored `[service]` prefix using a rotating palette.
+fn color_service_prefix(service: &str, color_idx: usize) -> String {
+    use console::style;
+
+    let label = format!("[{service}]");
+    match color_idx % 6 {
+        0 => style(label).cyan().to_string(),
+        1 => style(label).green().to_string(),
+        2 => style(label).yellow().to_string(),
+        3 => style(label).magenta().to_string(),
+        4 => style(label).blue().to_string(),
+        _ => style(label).red().to_string(),
     }
 }
 

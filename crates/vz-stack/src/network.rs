@@ -414,6 +414,10 @@ mod tests {
             labels: HashMap::new(),
             stop_signal: None,
             stop_grace_period_secs: None,
+            expose: vec![],
+            stdin_open: false,
+            tty: false,
+            logging: None,
         }
     }
 

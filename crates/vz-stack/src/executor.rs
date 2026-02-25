@@ -79,6 +79,24 @@ pub trait ContainerRuntime: Send + Sync {
         Ok(ContainerLogs::default())
     }
 
+    /// Stream log output from a container.
+    ///
+    /// Returns a [`LogStream`] that yields [`LogLine`]s as they become
+    /// available. When `follow` is `true`, the stream stays open and
+    /// delivers new lines as they are written; when `false`, only existing
+    /// log content is replayed and the channel is then closed.
+    ///
+    /// The default implementation returns an immediately-closed stream.
+    fn stream_logs(
+        &self,
+        _container_id: &str,
+        _service_name: &str,
+        _follow: bool,
+    ) -> Result<LogStream, StackError> {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        Ok(rx)
+    }
+
     /// Create a sandbox for multi-container isolation.
     ///
     /// After calling this, containers for the stack should be created via
@@ -154,6 +172,23 @@ pub struct ContainerLogs {
     /// Combined stdout/stderr output.
     pub output: String,
 }
+
+/// A single line of container log output.
+#[derive(Debug, Clone)]
+pub struct LogLine {
+    /// Optional RFC 3339 timestamp from the container log driver.
+    pub timestamp: Option<String>,
+    /// Service that produced this line.
+    pub service: String,
+    /// The log line content (without trailing newline).
+    pub line: String,
+}
+
+/// A receiver for streaming log lines from a container.
+///
+/// Consumers should call `recv()` in a loop until `None` is returned
+/// (indicating the stream has ended).
+pub type LogStream = std::sync::mpsc::Receiver<LogLine>;
 
 /// Tracks host port allocations across services within a stack.
 ///
@@ -592,18 +627,20 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     if let Some(def) = secret_def {
                         let secret_path = secrets_dir.join(&secret_ref.source);
                         if !secret_path.exists() {
-                            if let Ok(content) = std::fs::read(&def.file) {
-                                let _ = std::fs::create_dir_all(&secrets_dir);
-                                let _ = std::fs::write(&secret_path, content);
+                            if let Some(file_path) = def.file() {
+                                if let Ok(content) = std::fs::read(file_path) {
+                                    let _ = std::fs::create_dir_all(&secrets_dir);
+                                    let _ = std::fs::write(&secret_path, content);
 
-                                // Add secret to volume mounts for VirtioFS sharing.
-                                // Use "vz-mount-" prefix so OCI runtime translates to /mnt/vz-mount-X.
-                                let idx = all_volume_mounts.len();
-                                all_volume_mounts.push(vz_runtime_contract::StackVolumeMount {
-                                    tag: format!("vz-mount-{idx}"),
-                                    host_path: secret_path,
-                                    read_only: true,
-                                });
+                                    // Add secret to volume mounts for VirtioFS sharing.
+                                    // Use "vz-mount-" prefix so OCI runtime translates to /mnt/vz-mount-X.
+                                    let idx = all_volume_mounts.len();
+                                    all_volume_mounts.push(vz_runtime_contract::StackVolumeMount {
+                                        tag: format!("vz-mount-{idx}"),
+                                        host_path: secret_path,
+                                        read_only: true,
+                                    });
+                                }
                             }
                         }
                     }
@@ -985,10 +1022,16 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                             secret_ref.source, service_name,
                         ))
                     })?;
-                let content = std::fs::read(&secret_def.file).map_err(|e| {
+                let file_path = secret_def.file().ok_or_else(|| {
+                    StackError::InvalidSpec(format!(
+                        "secret '{}' has no file source",
+                        secret_ref.source,
+                    ))
+                })?;
+                let content = std::fs::read(file_path).map_err(|e| {
                     StackError::InvalidSpec(format!(
                         "failed to read secret file '{}': {}",
-                        secret_def.file, e,
+                        file_path, e,
                     ))
                 })?;
                 std::fs::write(secrets_dir.join(&secret_ref.source), content)?;
@@ -1277,6 +1320,8 @@ pub(crate) mod tests_support {
             Mutex<Vec<(String, Vec<vz_runtime_contract::NetworkServiceConfig>)>>,
         /// Container IDs to return from `list_containers`.
         pub listed_containers: Mutex<Vec<String>>,
+        /// Pre-configured log lines returned by `stream_logs`.
+        pub mock_log_lines: Mutex<Vec<LogLine>>,
     }
 
     impl MockContainerRuntime {
@@ -1295,6 +1340,7 @@ pub(crate) mod tests_support {
                 captured_configs: Mutex::new(Vec::new()),
                 captured_network_services: Mutex::new(Vec::new()),
                 listed_containers: Mutex::new(Vec::new()),
+                mock_log_lines: Mutex::new(Vec::new()),
             }
         }
 
@@ -1394,6 +1440,26 @@ pub(crate) mod tests_support {
                 return Err(StackError::InvalidSpec("mock exec failure".to_string()));
             }
             Ok(self.exec_exit_code)
+        }
+
+        fn stream_logs(
+            &self,
+            container_id: &str,
+            service_name: &str,
+            follow: bool,
+        ) -> Result<LogStream, StackError> {
+            self.calls.lock().unwrap().push((
+                "stream_logs".to_string(),
+                format!("{container_id}:{service_name}:follow={follow}"),
+            ));
+            let (tx, rx) = std::sync::mpsc::channel();
+            // Send any pre-configured mock lines, then drop the sender.
+            let mock_lines = self.mock_log_lines.lock().unwrap().clone();
+            for line in mock_lines {
+                let _ = tx.send(line);
+            }
+            // Sender is dropped here, closing the stream.
+            Ok(rx)
         }
 
         fn create_sandbox(
@@ -1542,6 +1608,10 @@ mod tests {
             labels: HashMap::new(),
             stop_signal: None,
             stop_grace_period_secs: None,
+            expose: vec![],
+            stdin_open: false,
+            tty: false,
+            logging: None,
         }
     }
 
@@ -3073,5 +3143,66 @@ mod tests {
             tracker2.restore(name.clone(), ports.clone());
         }
         assert_eq!(tracker2.allocated_snapshot().get("web").unwrap(), &ports);
+    }
+
+    #[test]
+    fn stream_logs_default_returns_empty_stream() {
+        let runtime = MockContainerRuntime::new();
+        let rx = runtime.stream_logs("ctr-001", "web", false).unwrap();
+
+        // Default mock has no pre-configured lines, so channel closes immediately.
+        let lines: Vec<LogLine> = rx.iter().collect();
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn stream_logs_mock_returns_configured_lines() {
+        let runtime = MockContainerRuntime::new();
+        {
+            let mut mock_lines = runtime.mock_log_lines.lock().unwrap();
+            mock_lines.push(LogLine {
+                timestamp: Some("2025-01-15T10:00:00Z".to_string()),
+                service: "api".to_string(),
+                line: "server started on :8080".to_string(),
+            });
+            mock_lines.push(LogLine {
+                timestamp: None,
+                service: "api".to_string(),
+                line: "ready to accept connections".to_string(),
+            });
+        }
+
+        let rx = runtime.stream_logs("ctr-api", "api", true).unwrap();
+        let lines: Vec<LogLine> = rx.iter().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].service, "api");
+        assert_eq!(lines[0].line, "server started on :8080");
+        assert!(lines[0].timestamp.is_some());
+        assert_eq!(lines[1].line, "ready to accept connections");
+        assert!(lines[1].timestamp.is_none());
+    }
+
+    #[test]
+    fn stream_logs_records_call_in_mock() {
+        let runtime = MockContainerRuntime::new();
+        let _rx = runtime.stream_logs("ctr-db", "postgres", true).unwrap();
+
+        let calls = runtime.call_log();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "stream_logs");
+        assert_eq!(calls[0].1, "ctr-db:postgres:follow=true");
+    }
+
+    #[test]
+    fn log_line_clone_and_debug() {
+        let line = LogLine {
+            timestamp: Some("2025-01-15T10:00:00Z".to_string()),
+            service: "web".to_string(),
+            line: "hello world".to_string(),
+        };
+        let cloned = line.clone();
+        assert_eq!(cloned.service, "web");
+        // Ensure Debug is derived.
+        let _debug = format!("{:?}", cloned);
     }
 }

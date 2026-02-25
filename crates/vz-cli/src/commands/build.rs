@@ -936,6 +936,227 @@ fn expand_home_dir(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+// ── BuildKit stderr JSON parser ───────────────────────────────────
+//
+// Extracts meaningful progress information from BuildKit rawjson
+// stderr lines, filtering out noise and presenting clean status.
+
+/// Status of an individual build step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildStepStatus {
+    /// Step is currently executing.
+    Running,
+    /// Step completed successfully.
+    Complete,
+    /// Step was satisfied from cache.
+    Cached,
+    /// Step failed with an error.
+    Error,
+}
+
+/// Parsed progress information from a BuildKit rawjson line.
+///
+/// Each line of BuildKit `--progress=rawjson` output is a JSON object
+/// containing vertex, status, log, and warning arrays. This struct
+/// distills that into the most relevant progress information.
+#[derive(Debug, Clone)]
+pub struct BuildProgressInfo {
+    /// Human-readable step name (e.g. "[1/3] FROM docker.io/library/alpine:3.20").
+    pub step: String,
+    /// Current status of the step.
+    pub status: BuildStepStatus,
+    /// Elapsed duration of the step, if start and completion times are available.
+    pub duration: Option<Duration>,
+    /// Error message, if the step failed.
+    pub error: Option<String>,
+}
+
+/// Parse a single line of BuildKit rawjson stderr output into build progress.
+///
+/// Returns `None` if the line is not valid BuildKit JSON or contains no
+/// meaningful progress information (e.g. only log data, empty vertices).
+///
+/// # Examples
+///
+/// ```ignore
+/// let line = r#"{"vertexes":[{"digest":"sha256:abc","name":"[1/2] FROM alpine","cached":true}]}"#;
+/// if let Some(progress) = parse_buildkit_output(line) {
+///     assert_eq!(progress.status, BuildStepStatus::Cached);
+/// }
+/// ```
+pub fn parse_buildkit_output(line: &str) -> Option<BuildProgressInfo> {
+    let status: vz_oci_macos::buildkit::BuildkitSolveStatus = serde_json::from_str(line).ok()?;
+
+    // Find the most informative vertex in this line.
+    // Prefer vertices with names (build steps) over anonymous ones.
+    let vertex = status
+        .vertexes
+        .iter()
+        .filter(|v| !v.name.trim().is_empty())
+        .last()
+        .or_else(|| status.vertexes.last())?;
+
+    let step_name = if vertex.name.trim().is_empty() {
+        vertex.digest.clone()
+    } else {
+        vertex.name.trim().to_string()
+    };
+
+    let step_status = if !vertex.error.is_empty() {
+        BuildStepStatus::Error
+    } else if vertex.cached {
+        BuildStepStatus::Cached
+    } else if vertex.completed.is_some() {
+        BuildStepStatus::Complete
+    } else {
+        BuildStepStatus::Running
+    };
+
+    let duration = match (&vertex.started, &vertex.completed) {
+        (Some(start), Some(end)) => parse_duration_between(start, end),
+        _ => None,
+    };
+
+    let error = if vertex.error.is_empty() {
+        None
+    } else {
+        Some(vertex.error.trim().to_string())
+    };
+
+    Some(BuildProgressInfo {
+        step: step_name,
+        status: step_status,
+        duration,
+        error,
+    })
+}
+
+/// Try to compute the duration between two RFC 3339 timestamps.
+///
+/// Returns `None` if either timestamp cannot be parsed. This is best-effort
+/// since BuildKit timestamps may use varying precision.
+fn parse_duration_between(start: &str, end: &str) -> Option<Duration> {
+    // Simple ISO 8601 / RFC 3339 parsing. BuildKit emits timestamps like
+    // "2026-02-23T13:00:00.123456789Z". We use string parsing rather than
+    // pulling in chrono to keep dependencies minimal.
+    let start_nanos = parse_rfc3339_nanos(start)?;
+    let end_nanos = parse_rfc3339_nanos(end)?;
+    let elapsed = end_nanos.checked_sub(start_nanos)?;
+    Some(Duration::from_nanos(elapsed as u64))
+}
+
+/// Parse an RFC 3339 timestamp to nanoseconds since epoch.
+///
+/// Handles timestamps with or without fractional seconds.
+fn parse_rfc3339_nanos(ts: &str) -> Option<u128> {
+    // Strip trailing 'Z' or timezone offset for simplicity.
+    let ts = ts.trim();
+    let (datetime_part, _tz) = if let Some(pos) = ts.rfind('Z') {
+        (&ts[..pos], "Z")
+    } else if let Some(pos) = ts.rfind('+') {
+        // Skip the '+' in the fractional part
+        if pos > 10 {
+            (&ts[..pos], &ts[pos..])
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    // Split on 'T' to get date and time.
+    let (date_str, time_str) = datetime_part.split_once('T')?;
+
+    // Parse date: YYYY-MM-DD
+    let date_parts: Vec<&str> = date_str.split('-').collect();
+    if date_parts.len() != 3 {
+        return None;
+    }
+    let year: i64 = date_parts[0].parse().ok()?;
+    let month: i64 = date_parts[1].parse().ok()?;
+    let day: i64 = date_parts[2].parse().ok()?;
+
+    // Approximate days since epoch (good enough for duration computation).
+    let days_since_epoch = (year - 1970) * 365 + (year - 1969) / 4 + day_of_year(month, day) - 1;
+
+    // Parse time: HH:MM:SS[.fractional]
+    let (time_main, frac) = if let Some((main, frac)) = time_str.split_once('.') {
+        (main, Some(frac))
+    } else {
+        (time_str, None)
+    };
+
+    let time_parts: Vec<&str> = time_main.split(':').collect();
+    if time_parts.len() != 3 {
+        return None;
+    }
+    let hours: i64 = time_parts[0].parse().ok()?;
+    let minutes: i64 = time_parts[1].parse().ok()?;
+    let seconds: i64 = time_parts[2].parse().ok()?;
+
+    let total_secs = days_since_epoch * 86400 + hours * 3600 + minutes * 60 + seconds;
+
+    let frac_nanos: u64 = if let Some(frac_str) = frac {
+        // Pad or truncate to 9 digits.
+        let padded = format!("{:0<9}", frac_str);
+        padded[..9].parse().unwrap_or(0)
+    } else {
+        0
+    };
+
+    Some(total_secs as u128 * 1_000_000_000 + frac_nanos as u128)
+}
+
+/// Approximate day-of-year (1-indexed) for duration computation.
+fn day_of_year(month: i64, day: i64) -> i64 {
+    let days_before_month = match month {
+        1 => 0,
+        2 => 31,
+        3 => 59,
+        4 => 90,
+        5 => 120,
+        6 => 151,
+        7 => 181,
+        8 => 212,
+        9 => 243,
+        10 => 273,
+        11 => 304,
+        12 => 334,
+        _ => 0,
+    };
+    days_before_month + day
+}
+
+/// Format a [`BuildProgressInfo`] as a single clean line suitable for stderr.
+///
+/// Example output:
+/// ```text
+/// [CACHED] [1/3] FROM alpine:3.20
+/// [OK 1.2s] [2/3] RUN apt-get update
+/// [ERROR] [3/3] COPY . /app -- file not found
+/// [RUN] [1/1] Building application
+/// ```
+pub fn format_build_progress(info: &BuildProgressInfo) -> String {
+    let prefix = match info.status {
+        BuildStepStatus::Running => "[RUN]".to_string(),
+        BuildStepStatus::Complete => {
+            if let Some(dur) = info.duration {
+                format!("[OK {:.1}s]", dur.as_secs_f64())
+            } else {
+                "[OK]".to_string()
+            }
+        }
+        BuildStepStatus::Cached => "[CACHED]".to_string(),
+        BuildStepStatus::Error => "[ERROR]".to_string(),
+    };
+
+    if let Some(err) = &info.error {
+        format!("{prefix} {} -- {err}", info.step)
+    } else {
+        format!("{prefix} {}", info.step)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -1049,5 +1270,131 @@ mod tests {
             vz_oci_macos::buildkit::BuildProgress::Plain
         ));
         assert!(matches!(mode, BuildUiMode::PlainText));
+    }
+
+    // ── parse_buildkit_output tests ───────────────────────────────
+
+    #[test]
+    fn parse_buildkit_output_cached_vertex() {
+        let line = r#"{"vertexes":[{"digest":"sha256:abc","name":"[1/2] FROM docker.io/library/alpine:3.20","cached":true,"started":"2026-02-23T13:00:00Z","completed":"2026-02-23T13:00:00Z"}]}"#;
+        let info = parse_buildkit_output(line).unwrap();
+        assert_eq!(info.step, "[1/2] FROM docker.io/library/alpine:3.20");
+        assert_eq!(info.status, BuildStepStatus::Cached);
+        assert!(info.error.is_none());
+    }
+
+    #[test]
+    fn parse_buildkit_output_completed_vertex_with_duration() {
+        let line = r#"{"vertexes":[{"digest":"sha256:def","name":"[2/2] RUN apt-get update","started":"2026-02-23T13:00:00Z","completed":"2026-02-23T13:00:02.5Z"}]}"#;
+        let info = parse_buildkit_output(line).unwrap();
+        assert_eq!(info.step, "[2/2] RUN apt-get update");
+        assert_eq!(info.status, BuildStepStatus::Complete);
+        let duration = info.duration.unwrap();
+        assert!((duration.as_secs_f64() - 2.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_buildkit_output_running_vertex() {
+        let line = r#"{"vertexes":[{"digest":"sha256:ghi","name":"[1/1] RUN make build","started":"2026-02-23T13:00:00Z"}]}"#;
+        let info = parse_buildkit_output(line).unwrap();
+        assert_eq!(info.status, BuildStepStatus::Running);
+        assert!(info.duration.is_none());
+    }
+
+    #[test]
+    fn parse_buildkit_output_error_vertex() {
+        let line = r#"{"vertexes":[{"digest":"sha256:jkl","name":"[3/3] COPY . /app","error":"file not found","started":"2026-02-23T13:00:00Z"}]}"#;
+        let info = parse_buildkit_output(line).unwrap();
+        assert_eq!(info.status, BuildStepStatus::Error);
+        assert_eq!(info.error.as_deref(), Some("file not found"));
+    }
+
+    #[test]
+    fn parse_buildkit_output_invalid_json_returns_none() {
+        assert!(parse_buildkit_output("not json at all").is_none());
+        assert!(parse_buildkit_output("").is_none());
+        assert!(parse_buildkit_output("{}").is_none()); // empty vertexes
+    }
+
+    #[test]
+    fn parse_buildkit_output_logs_only_returns_none() {
+        // Lines with only logs and no vertices should return None.
+        let line = r#"{"logs":[{"vertex":"sha256:abc","stream":1,"data":"aGVsbG8K"}]}"#;
+        assert!(parse_buildkit_output(line).is_none());
+    }
+
+    #[test]
+    fn parse_buildkit_output_prefers_named_vertex() {
+        let line = r#"{"vertexes":[{"digest":"sha256:anon","name":""},{"digest":"sha256:named","name":"[1/1] RUN echo hello"}]}"#;
+        let info = parse_buildkit_output(line).unwrap();
+        assert_eq!(info.step, "[1/1] RUN echo hello");
+    }
+
+    #[test]
+    fn format_build_progress_running() {
+        let info = BuildProgressInfo {
+            step: "[1/1] Building".to_string(),
+            status: BuildStepStatus::Running,
+            duration: None,
+            error: None,
+        };
+        assert_eq!(format_build_progress(&info), "[RUN] [1/1] Building");
+    }
+
+    #[test]
+    fn format_build_progress_complete_with_duration() {
+        let info = BuildProgressInfo {
+            step: "[1/1] RUN make".to_string(),
+            status: BuildStepStatus::Complete,
+            duration: Some(Duration::from_secs_f64(3.45)),
+            error: None,
+        };
+        assert_eq!(format_build_progress(&info), "[OK 3.5s] [1/1] RUN make");
+    }
+
+    #[test]
+    fn format_build_progress_cached() {
+        let info = BuildProgressInfo {
+            step: "FROM alpine".to_string(),
+            status: BuildStepStatus::Cached,
+            duration: None,
+            error: None,
+        };
+        assert_eq!(format_build_progress(&info), "[CACHED] FROM alpine");
+    }
+
+    #[test]
+    fn format_build_progress_error() {
+        let info = BuildProgressInfo {
+            step: "COPY . /app".to_string(),
+            status: BuildStepStatus::Error,
+            duration: None,
+            error: Some("file not found".to_string()),
+        };
+        assert_eq!(
+            format_build_progress(&info),
+            "[ERROR] COPY . /app -- file not found"
+        );
+    }
+
+    #[test]
+    fn build_step_status_debug_and_clone() {
+        let status = BuildStepStatus::Running;
+        let cloned = status;
+        assert_eq!(cloned, BuildStepStatus::Running);
+        let _debug = format!("{:?}", status);
+    }
+
+    #[test]
+    fn build_progress_info_clone() {
+        let info = BuildProgressInfo {
+            step: "test".to_string(),
+            status: BuildStepStatus::Complete,
+            duration: Some(Duration::from_secs(1)),
+            error: None,
+        };
+        let cloned = info.clone();
+        assert_eq!(cloned.step, "test");
+        assert_eq!(cloned.status, BuildStepStatus::Complete);
     }
 }

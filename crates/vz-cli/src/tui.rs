@@ -1342,6 +1342,10 @@ mod tests {
                     stop_signal: None,
                     stop_grace_period_secs: None,
                     container_name: None,
+                    expose: vec![],
+                    stdin_open: false,
+                    tty: false,
+                    logging: None,
                 },
                 vz_stack::ServiceSpec {
                     name: "db".into(),

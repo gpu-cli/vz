@@ -29,4 +29,7 @@ pub use scenario::{
     s1_entrypoint_scenarios, s1_env_cwd_scenarios, s2_user_scenarios, s3_mount_scenarios,
     s4_signal_scenarios, s5_service_scenarios, s6_compose_scenarios,
 };
-pub use stress::{ScenarioStressResult, StressConfig, StressReport, stress_scenario};
+pub use stress::{
+    ScenarioStressResult, StressConfig, StressReport, SweepConfig, SweepMode, stress_scenario,
+    sweep_scenario,
+};

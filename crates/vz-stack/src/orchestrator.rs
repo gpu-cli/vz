@@ -19,6 +19,7 @@ use crate::error::StackError;
 use crate::events::StackEvent;
 use crate::executor::{ContainerRuntime, ExecutionResult, StackExecutor};
 use crate::health::{HealthPollResult, HealthPoller};
+use crate::image_policy::{ImagePolicy, validate_stack_images};
 use crate::reconcile::{Action, ApplyResult, apply, compute_actions_hash};
 use crate::restart::{RestartTracker, cleanup_orphaned_reconcile_progress, compute_restarts};
 use crate::spec::StackSpec;
@@ -38,6 +39,10 @@ pub struct OrchestrationConfig {
     pub poll_interval: Option<u64>,
     /// Maximum number of reconciliation rounds. Default: [`MAX_ROUNDS`].
     pub max_rounds: usize,
+    /// Image reference policy enforced before pulling/creating containers.
+    ///
+    /// Default: [`ImagePolicy::AllowAll`] (non-breaking).
+    pub image_policy: ImagePolicy,
 }
 
 impl Default for OrchestrationConfig {
@@ -45,6 +50,7 @@ impl Default for OrchestrationConfig {
         Self {
             poll_interval: None,
             max_rounds: MAX_ROUNDS,
+            image_policy: ImagePolicy::AllowAll,
         }
     }
 }
@@ -359,6 +365,11 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
         spec: &StackSpec,
         mut on_round: Option<&mut dyn FnMut(&RoundReport)>,
     ) -> Result<OrchestrationResult, StackError> {
+        // Enforce image reference policy before any container operations.
+        if let Err(violation) = validate_stack_images(&spec.services, &self.config.image_policy) {
+            return Err(StackError::ComposeValidation(violation.to_string()));
+        }
+
         let poll_interval = Duration::from_secs(
             self.config
                 .poll_interval
@@ -718,6 +729,10 @@ mod tests {
             labels: HashMap::new(),
             stop_signal: None,
             stop_grace_period_secs: None,
+            expose: vec![],
+            stdin_open: false,
+            tty: false,
+            logging: None,
         }
     }
 
@@ -768,6 +783,7 @@ mod tests {
             OrchestrationConfig {
                 poll_interval: Some(0),
                 max_rounds: 10,
+                image_policy: crate::image_policy::ImagePolicy::AllowAll,
             },
         );
         (orch, tmp)

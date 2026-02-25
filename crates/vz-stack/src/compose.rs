@@ -12,9 +12,9 @@ use serde_yml::Value;
 
 use crate::error::StackError;
 use crate::spec::{
-    DependencyCondition, HealthCheckSpec, MountSpec, NetworkSpec, PortSpec, ResourcesSpec,
-    RestartPolicy, SecretDef, ServiceDependency, ServiceKind, ServiceSecretRef, ServiceSpec,
-    StackSpec, UlimitSpec, VolumeSpec,
+    DependencyCondition, HealthCheckSpec, LoggingConfig, MountSpec, NetworkSpec, PortSpec,
+    ResourcesSpec, RestartPolicy, SecretDef, SecretSource, ServiceDependency, ServiceKind,
+    ServiceSecretRef, ServiceSpec, StackSpec, UlimitSpec, VolumeSpec,
 };
 
 // ── Accepted key sets ──────────────────────────────────────────────
@@ -62,6 +62,12 @@ const ACCEPTED_SERVICE: &[&str] = &[
     // Stop lifecycle
     "stop_signal",
     "stop_grace_period",
+    // Interactive mode
+    "expose",
+    "stdin_open",
+    "tty",
+    // Logging
+    "logging",
     // Service-level extensions
     "x-vz",
 ];
@@ -544,6 +550,20 @@ fn parse_service(
         ..resources
     };
 
+    // Interactive mode
+    let expose = parse_expose(name, svc_map)?;
+    let stdin_open = svc_map
+        .get(val("stdin_open"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let tty = svc_map
+        .get(val("tty"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Logging
+    let logging = parse_logging(name, svc_map)?;
+
     Ok(ServiceSpec {
         name: name.to_string(),
         kind,
@@ -574,6 +594,10 @@ fn parse_service(
         labels,
         stop_signal,
         stop_grace_period_secs,
+        expose,
+        stdin_open,
+        tty,
+        logging,
     })
 }
 
@@ -1951,7 +1975,8 @@ fn load_env_file_entries(
 
 /// Parse top-level `secrets` definitions.
 ///
-/// Each secret must have a `file:` key pointing to a host file path.
+/// Each secret must have either a `file:` key pointing to a host file path
+/// or an `environment:` key naming an environment variable as the source.
 /// External secrets (`external: true`) are rejected.
 fn parse_secrets_top_level(root: &serde_yml::Mapping) -> Result<Vec<SecretDef>, StackError> {
     let Some(value) = root.get(val("secrets")) else {
@@ -1970,7 +1995,7 @@ fn parse_secrets_top_level(root: &serde_yml::Mapping) -> Result<Vec<SecretDef>, 
 
         let secret_map = secret_value.as_mapping().ok_or_else(|| {
             StackError::ComposeParse(format!(
-                "secret `{secret_name}` must be a mapping with a `file` key"
+                "secret `{secret_name}` must be a mapping with a `file` or `environment` key"
             ))
         })?;
 
@@ -1982,23 +2007,33 @@ fn parse_secrets_top_level(root: &serde_yml::Mapping) -> Result<Vec<SecretDef>, 
         {
             return Err(StackError::ComposeUnsupportedFeature {
                 feature: format!("secrets.{secret_name}.external"),
-                reason: "external secrets are not supported; use file-based secrets".to_string(),
+                reason: "external secrets are not supported; use file-based or environment-based secrets".to_string(),
             });
         }
 
         let file = secret_map
             .get(val("file"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                StackError::ComposeValidation(format!(
-                    "secret `{secret_name}` is missing required `file` key"
-                ))
-            })?
-            .to_string();
+            .map(String::from);
+
+        let environment = secret_map
+            .get(val("environment"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let source = match (file, environment) {
+            (Some(f), _) => SecretSource::File(f),
+            (None, Some(env_var)) => SecretSource::Environment(env_var),
+            (None, None) => {
+                return Err(StackError::ComposeValidation(format!(
+                    "secret `{secret_name}` must define either `file` or `environment`"
+                )));
+            }
+        };
 
         secrets.push(SecretDef {
             name: secret_name.to_string(),
-            file,
+            source,
         });
     }
 
@@ -2007,13 +2042,18 @@ fn parse_secrets_top_level(root: &serde_yml::Mapping) -> Result<Vec<SecretDef>, 
     Ok(secrets)
 }
 
+/// Default file mode for secret mounts: read-only for all (0o444 = 292 decimal).
+const DEFAULT_SECRET_MODE: u32 = 0o444;
+
 /// Parse service-level `secrets` references.
 ///
 /// Supports:
-/// - Short form: just a string name (source and target both set to the name)
-/// - Long form: mapping with `source` and optional `target` keys
+/// - Short form: just a string name (source and target both set to the name,
+///   mode defaults to 0o444, uid/gid default to 0)
+/// - Long form: mapping with `source`, optional `target`, `mode`, `uid`, `gid`
 ///
 /// Each referenced secret must be defined in the top-level `secrets` section.
+/// Secrets are always mounted read-only with lifecycle scoped to the container.
 fn parse_service_secrets(
     svc_name: &str,
     map: &serde_yml::Mapping,
@@ -2039,9 +2079,12 @@ fn parse_service_secrets(
             ServiceSecretRef {
                 source: s.to_string(),
                 target: s.to_string(),
+                mode: DEFAULT_SECRET_MODE,
+                uid: 0,
+                gid: 0,
             }
         } else if let Some(obj) = item.as_mapping() {
-            // Long form: { source: ..., target: ... }
+            // Long form: { source: ..., target: ..., mode: ..., uid: ..., gid: ... }
             let source = obj
                 .get(val("source"))
                 .and_then(|v| v.as_str())
@@ -2064,7 +2107,51 @@ fn parse_service_secrets(
                 .map(String::from)
                 .unwrap_or_else(|| source.clone());
 
-            ServiceSecretRef { source, target }
+            // Mode can be specified as an integer (octal or decimal in YAML).
+            // Compose convention: `0444` in YAML is parsed as decimal 444 by
+            // some parsers, but serde_yml treats unquoted `0444` as octal 292.
+            // We accept the raw integer value from YAML as-is.
+            let mode = obj
+                .get(val("mode"))
+                .map(|v| {
+                    // Accept both integer and string forms.
+                    if let Some(n) = v.as_u64() {
+                        Ok(n as u32)
+                    } else if let Some(s) = v.as_str() {
+                        // Parse octal string like "0444".
+                        u32::from_str_radix(s.trim_start_matches('0'), 8).map_err(|_| {
+                            StackError::ComposeParse(format!(
+                                "service `{svc_name}`: invalid secret mode `{s}`"
+                            ))
+                        })
+                    } else {
+                        Err(StackError::ComposeParse(format!(
+                            "service `{svc_name}`: secret `mode` must be an integer or octal string"
+                        )))
+                    }
+                })
+                .transpose()?
+                .unwrap_or(DEFAULT_SECRET_MODE);
+
+            let uid = obj
+                .get(val("uid"))
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+                .unwrap_or(0);
+
+            let gid = obj
+                .get(val("gid"))
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+                .unwrap_or(0);
+
+            ServiceSecretRef {
+                source,
+                target,
+                mode,
+                uid,
+                gid,
+            }
         } else {
             return Err(StackError::ComposeParse(format!(
                 "service `{svc_name}`: secret entry must be a string or mapping"
@@ -2599,6 +2686,124 @@ fn parse_labels(
     map: &serde_yml::Mapping,
 ) -> Result<HashMap<String, String>, StackError> {
     parse_string_map(svc_name, map, "labels")
+}
+
+// ── Interactive mode & logging parsers ──────────────────────────────
+
+/// Parse the `expose` field — a list of ports to expose without host binding.
+///
+/// Supports both integer and string forms:
+/// ```yaml
+/// expose:
+///   - 3000
+///   - "8000"
+/// ```
+fn parse_expose(svc_name: &str, map: &serde_yml::Mapping) -> Result<Vec<u16>, StackError> {
+    let Some(value) = map.get(val("expose")) else {
+        return Ok(vec![]);
+    };
+
+    let seq = value.as_sequence().ok_or_else(|| {
+        StackError::ComposeParse(format!("service `{svc_name}`: `expose` must be a list"))
+    })?;
+
+    let mut ports = Vec::new();
+    for item in seq {
+        let port = if let Some(n) = item.as_u64() {
+            u16::try_from(n).map_err(|_| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `expose` port {n} is out of range (1-65535)"
+                ))
+            })?
+        } else if let Some(s) = item.as_str() {
+            s.parse::<u16>().map_err(|_| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `expose` port `{s}` is not a valid port number"
+                ))
+            })?
+        } else {
+            return Err(StackError::ComposeParse(format!(
+                "service `{svc_name}`: `expose` items must be port numbers"
+            )));
+        };
+        ports.push(port);
+    }
+    Ok(ports)
+}
+
+/// Parse the `logging` configuration block.
+///
+/// ```yaml
+/// logging:
+///   driver: json-file
+///   options:
+///     max-size: "10m"
+///     max-file: "3"
+/// ```
+fn parse_logging(
+    svc_name: &str,
+    map: &serde_yml::Mapping,
+) -> Result<Option<LoggingConfig>, StackError> {
+    let Some(value) = map.get(val("logging")) else {
+        return Ok(None);
+    };
+
+    let log_map = value.as_mapping().ok_or_else(|| {
+        StackError::ComposeParse(format!("service `{svc_name}`: `logging` must be a mapping"))
+    })?;
+
+    let driver = log_map
+        .get(val("driver"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            StackError::ComposeParse(format!(
+                "service `{svc_name}`: `logging.driver` is required and must be a string"
+            ))
+        })?
+        .to_string();
+
+    let options = if let Some(opts_value) = log_map.get(val("options")) {
+        let opts_map = opts_value.as_mapping().ok_or_else(|| {
+            StackError::ComposeParse(format!(
+                "service `{svc_name}`: `logging.options` must be a mapping"
+            ))
+        })?;
+        let mut result = HashMap::new();
+        for (k, v) in opts_map {
+            let key = k.as_str().ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `logging.options` keys must be strings"
+                ))
+            })?;
+            let value_str = match v {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                _ => {
+                    return Err(StackError::ComposeParse(format!(
+                        "service `{svc_name}`: `logging.options` values must be scalars"
+                    )));
+                }
+            };
+            result.insert(key.to_string(), value_str);
+        }
+        result
+    } else {
+        HashMap::new()
+    };
+
+    // Reject unknown keys inside logging.
+    for key in log_map.keys() {
+        let key_str = key.as_str().unwrap_or("");
+        if key_str != "driver" && key_str != "options" {
+            return Err(StackError::ComposeUnsupportedFeature {
+                feature: format!("services.{svc_name}.logging.{key_str}"),
+                reason: "only `driver` and `options` are supported inside `logging`".to_string(),
+            });
+        }
+    }
+
+    Ok(Some(LoggingConfig { driver, options }))
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -3647,7 +3852,7 @@ secrets:
         let spec = parse_compose(yaml, "myapp").unwrap();
         assert_eq!(spec.secrets.len(), 1);
         assert_eq!(spec.secrets[0].name, "mysecret");
-        assert_eq!(spec.secrets[0].file, "./secret.txt");
+        assert_eq!(spec.secrets[0].file(), Some("./secret.txt"));
         assert_eq!(spec.services[0].secrets.len(), 1);
         assert_eq!(spec.services[0].secrets[0].source, "mysecret");
         assert_eq!(spec.services[0].secrets[0].target, "mysecret");
@@ -3893,10 +4098,10 @@ x-custom:
 services:
   web:
     image: nginx:latest
-    stdin_open: true
+    ipc: host
 "#;
         let err = parse_compose(yaml, "myapp").unwrap_err();
-        assert!(err.to_string().contains("stdin_open"));
+        assert!(err.to_string().contains("ipc"));
     }
 
     #[test]

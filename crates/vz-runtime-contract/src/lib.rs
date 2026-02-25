@@ -20,12 +20,13 @@ pub use types::{
     CheckpointCompatibilityMetadata, CheckpointLineageStore, CheckpointMetadata, CheckpointState,
     Container, ContainerInfo, ContainerLogs, ContainerMount, ContainerResources, ContainerSpec,
     ContainerState, ContainerStatus, ContractInvariantError, Event, EventRange, EventScope,
-    ExecConfig, ExecOutput, Execution, ExecutionSpec, ExecutionState, Image, ImageInfo, Lease,
-    LeaseState, MountAccess, MountSpec, MountType, NetworkDomain, NetworkDomainState,
-    NetworkServiceConfig, PortMapping, PortProtocol, PruneResult, PublishedPort, Receipt,
-    ReceiptResultClassification, RunConfig, RuntimeCapabilities, RuntimeOperation, Sandbox,
-    SandboxBackend, SandboxSpec, SandboxState, SandboxVolumeMount, SharedVmPhase,
-    SharedVmPhaseTracker, StackResourceHint, StackVolumeMount, Volume, VolumeType,
+    ExecConfig, ExecOutput, Execution, ExecutionSpec, ExecutionState, Image, ImageInfo,
+    IsolationLevel, Lease, LeaseState, MountAccess, MountSpec, MountType, NamespaceConfig,
+    NetworkDomain, NetworkDomainState, NetworkServiceConfig, PortMapping, PortProtocol,
+    PruneResult, PublishedPort, Receipt, ReceiptResultClassification, RunConfig,
+    RuntimeCapabilities, RuntimeOperation, Sandbox, SandboxBackend, SandboxSpec, SandboxState,
+    SandboxVolumeMount, SharedVmPhase, SharedVmPhaseTracker, StackResourceHint, StackVolumeMount,
+    Volume, VolumeType, default_namespace_config,
 };
 
 /// Canonical Runtime V2 operation surface expected from implementations.
@@ -1538,6 +1539,14 @@ pub trait RuntimeBackend: Send + Sync {
     /// and return deterministic `unsupported_operation` diagnostics when false.
     fn capabilities(&self) -> RuntimeCapabilities {
         RuntimeCapabilities::default()
+    }
+
+    /// Isolation level provided by this backend.
+    ///
+    /// Defaults to [`IsolationLevel::Full`] (VM-based isolation). Override
+    /// in backends that offer lighter-weight isolation modes.
+    fn isolation_level(&self) -> IsolationLevel {
+        IsolationLevel::Full
     }
 
     // ── Image operations ──────────────────────────────────────────
@@ -3914,5 +3923,145 @@ mod tests {
                 "expected UnsupportedOperation machine code for error: {error}"
             );
         }
+    }
+
+    // ── IsolationLevel tests ────────────────────────────────────────
+
+    #[test]
+    fn isolation_level_default_is_full() {
+        assert_eq!(IsolationLevel::default(), IsolationLevel::Full);
+    }
+
+    #[test]
+    fn isolation_level_labels() {
+        assert_eq!(IsolationLevel::Full.label(), "full");
+        assert_eq!(IsolationLevel::Container.label(), "container");
+        assert_eq!(IsolationLevel::Namespace.label(), "namespace");
+        assert_eq!(IsolationLevel::None.label(), "none");
+    }
+
+    #[test]
+    fn isolation_level_display() {
+        assert_eq!(format!("{}", IsolationLevel::Full), "full");
+        assert_eq!(format!("{}", IsolationLevel::Container), "container");
+        assert_eq!(format!("{}", IsolationLevel::Namespace), "namespace");
+        assert_eq!(format!("{}", IsolationLevel::None), "none");
+    }
+
+    #[test]
+    fn isolation_level_hierarchy_full() {
+        let level = IsolationLevel::Full;
+        assert!(level.has_vm_isolation());
+        assert!(level.has_container_isolation());
+        assert!(level.has_namespace_isolation());
+    }
+
+    #[test]
+    fn isolation_level_hierarchy_container() {
+        let level = IsolationLevel::Container;
+        assert!(!level.has_vm_isolation());
+        assert!(level.has_container_isolation());
+        assert!(level.has_namespace_isolation());
+    }
+
+    #[test]
+    fn isolation_level_hierarchy_namespace() {
+        let level = IsolationLevel::Namespace;
+        assert!(!level.has_vm_isolation());
+        assert!(!level.has_container_isolation());
+        assert!(level.has_namespace_isolation());
+    }
+
+    #[test]
+    fn isolation_level_hierarchy_none() {
+        let level = IsolationLevel::None;
+        assert!(!level.has_vm_isolation());
+        assert!(!level.has_container_isolation());
+        assert!(!level.has_namespace_isolation());
+    }
+
+    #[test]
+    fn isolation_level_round_trip() {
+        for level in [
+            IsolationLevel::Full,
+            IsolationLevel::Container,
+            IsolationLevel::Namespace,
+            IsolationLevel::None,
+        ] {
+            let json = serde_json::to_string(&level).unwrap();
+            let deserialized: IsolationLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, level);
+        }
+    }
+
+    // ── NamespaceConfig tests ───────────────────────────────────────
+
+    #[test]
+    fn namespace_config_default_sensible() {
+        let config = NamespaceConfig::default();
+        // Default: PID, mount, IPC, UTS enabled; user and net disabled.
+        assert!(!config.user);
+        assert!(!config.net);
+        assert!(config.pid);
+        assert!(config.mnt);
+        assert!(config.ipc);
+        assert!(config.uts);
+    }
+
+    #[test]
+    fn namespace_config_default_matches_free_fn() {
+        assert_eq!(NamespaceConfig::default(), default_namespace_config());
+    }
+
+    #[test]
+    fn namespace_config_all() {
+        let config = NamespaceConfig::ALL;
+        assert!(config.user);
+        assert!(config.net);
+        assert!(config.pid);
+        assert!(config.mnt);
+        assert!(config.ipc);
+        assert!(config.uts);
+        assert_eq!(config.enabled_count(), 6);
+    }
+
+    #[test]
+    fn namespace_config_none() {
+        let config = NamespaceConfig::NONE;
+        assert!(!config.user);
+        assert!(!config.net);
+        assert!(!config.pid);
+        assert!(!config.mnt);
+        assert!(!config.ipc);
+        assert!(!config.uts);
+        assert_eq!(config.enabled_count(), 0);
+    }
+
+    #[test]
+    fn namespace_config_enabled_count() {
+        let config = default_namespace_config();
+        // pid + mnt + ipc + uts = 4
+        assert_eq!(config.enabled_count(), 4);
+    }
+
+    #[test]
+    fn namespace_config_round_trip() {
+        let config = NamespaceConfig {
+            user: true,
+            net: true,
+            pid: true,
+            mnt: true,
+            ipc: false,
+            uts: false,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: NamespaceConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, config);
+    }
+
+    #[test]
+    fn stub_backend_default_isolation_level_is_full() {
+        let backend = StubBackend;
+        assert_eq!(backend.isolation_level(), IsolationLevel::Full);
     }
 }

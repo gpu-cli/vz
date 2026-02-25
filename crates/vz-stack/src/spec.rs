@@ -209,6 +209,30 @@ pub struct ServiceSpec {
     /// Seconds to wait after stop signal before SIGKILL. Default: 10.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_grace_period_secs: Option<u64>,
+    // ── Interactive mode ─────────────────────────────────────────────
+    /// Ports to expose without host binding (Compose `expose`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expose: Vec<u16>,
+    /// Keep stdin open even if not attached (Compose `stdin_open`).
+    #[serde(default)]
+    pub stdin_open: bool,
+    /// Allocate a pseudo-TTY (Compose `tty`).
+    #[serde(default)]
+    pub tty: bool,
+    // ── Logging ──────────────────────────────────────────────────────
+    /// Logging driver and options for the service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logging: Option<LoggingConfig>,
+}
+
+/// Logging driver configuration for a service.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoggingConfig {
+    /// Logging driver name (e.g., `"json-file"`, `"syslog"`, `"none"`).
+    pub driver: String,
+    /// Driver-specific options.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub options: HashMap<String, String>,
 }
 
 /// Mount specification for container volumes.
@@ -377,22 +401,66 @@ fn default_volume_driver() -> String {
     "local".to_string()
 }
 
+/// Source of a top-level secret value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretSource {
+    /// Secret value is read from a host file path.
+    File(String),
+    /// Secret value is read from an environment variable.
+    Environment(String),
+}
+
 /// A top-level secret definition.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SecretDef {
     /// Secret name (referenced by services).
     pub name: String,
-    /// Host file path containing the secret value.
-    pub file: String,
+    /// Source of the secret value (file path or environment variable).
+    pub source: SecretSource,
 }
 
+impl SecretDef {
+    /// Return the file path if this secret is file-sourced.
+    pub fn file(&self) -> Option<&str> {
+        match &self.source {
+            SecretSource::File(path) => Some(path.as_str()),
+            SecretSource::Environment(_) => None,
+        }
+    }
+}
+
+/// Default file mode for secrets: read-only for all (0o444).
+const DEFAULT_SECRET_MODE: u32 = 0o444;
+
 /// A service-level reference to a defined secret.
+///
+/// Secrets are mounted read-only inside `/run/secrets/` with a
+/// lifecycle scoped to the container. When the container stops, the
+/// secret mount is removed — no secret data persists on disk between
+/// container runs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServiceSecretRef {
     /// Name of the top-level secret to mount.
     pub source: String,
     /// Mount target filename inside `/run/secrets/`. Defaults to source name.
     pub target: String,
+    /// File permission mode for the mounted secret.
+    ///
+    /// Default: `0o444` (read-only for owner, group, and others).
+    /// Compose accepts this as a decimal integer (e.g., `0444`).
+    #[serde(default = "default_secret_mode")]
+    pub mode: u32,
+    /// UID of the mounted secret file. Default: `0` (root).
+    #[serde(default)]
+    pub uid: u32,
+    /// GID of the mounted secret file. Default: `0` (root).
+    #[serde(default)]
+    pub gid: u32,
+}
+
+fn default_secret_mode() -> u32 {
+    DEFAULT_SECRET_MODE
 }
 
 #[cfg(test)]
@@ -462,6 +530,10 @@ mod tests {
                 labels: HashMap::new(),
                 stop_signal: None,
                 stop_grace_period_secs: None,
+                expose: vec![],
+                stdin_open: false,
+                tty: false,
+                logging: None,
             }],
             networks: vec![NetworkSpec {
                 name: "frontend".to_string(),

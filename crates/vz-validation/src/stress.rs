@@ -3,7 +3,7 @@
 //! Provides repeated scenario execution with flake rate tracking,
 //! hard failure detection, and structured stress reports.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -132,21 +132,84 @@ impl StressReport {
     }
 }
 
+/// Controls which test results contribute to duration accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SweepMode {
+    /// Account durations from all iterations (pass and fail).
+    All,
+    /// Account durations only from failed iterations.
+    ///
+    /// Useful for diagnosing slow failure paths without pass-iteration
+    /// noise diluting the timing signal.
+    FailOnly,
+}
+
+impl Default for SweepMode {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+/// Configuration for a sweep run (parameterised stress with duration
+/// accounting control).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SweepConfig {
+    /// Number of iterations per scenario.
+    pub iterations: usize,
+    /// Maximum allowed flake rate (0.0-1.0). Exceeding this fails the run.
+    pub max_flake_rate: f64,
+    /// Which iterations contribute to duration accounting.
+    pub sweep_mode: SweepMode,
+}
+
+impl Default for SweepConfig {
+    fn default() -> Self {
+        Self {
+            iterations: 100,
+            max_flake_rate: 0.05,
+            sweep_mode: SweepMode::All,
+        }
+    }
+}
+
 /// Run stress iterations for a single scenario against a single image.
+///
+/// Duration accounting uses the per-test `Duration` from each
+/// `TestResult` (measured inside `run_one`) rather than wall-clock
+/// elapsed time, so overhead between iterations does not inflate the
+/// reported execution durations.
 pub fn stress_scenario<R: RuntimeAdapter>(
     runner: &ScenarioRunner<R>,
     image: &ImageRef,
     scenario: &Scenario,
     iterations: usize,
 ) -> ScenarioStressResult {
-    let start = Instant::now();
+    sweep_scenario(runner, image, scenario, iterations, SweepMode::All)
+}
+
+/// Run a sweep (parameterised stress) for a single scenario.
+///
+/// When `mode` is [`SweepMode::FailOnly`], only failed iterations
+/// contribute to `total_duration` and `avg_duration`. This isolates
+/// the timing signal for the failure path without pass-iteration noise.
+pub fn sweep_scenario<R: RuntimeAdapter>(
+    runner: &ScenarioRunner<R>,
+    image: &ImageRef,
+    scenario: &Scenario,
+    iterations: usize,
+    mode: SweepMode,
+) -> ScenarioStressResult {
     let mut passed = 0usize;
     let mut failed = 0usize;
     let mut first_failure: Option<String> = None;
+    let mut accounted_duration = Duration::ZERO;
+    let mut accounted_count = 0usize;
 
     for _ in 0..iterations {
         let result: TestResult = runner.run_one(image, scenario);
-        if result.outcome.is_pass() {
+        let is_pass = result.outcome.is_pass();
+
+        if is_pass {
             passed += 1;
         } else {
             failed += 1;
@@ -154,11 +217,22 @@ pub fn stress_scenario<R: RuntimeAdapter>(
                 first_failure = Some(describe_failure(&result.outcome));
             }
         }
+
+        // Accumulate per-test duration from the TestResult (measured
+        // inside run_one) rather than wall-clock elapsed. This avoids
+        // inter-iteration overhead inflating reported durations.
+        let include = match mode {
+            SweepMode::All => true,
+            SweepMode::FailOnly => !is_pass,
+        };
+        if include {
+            accounted_duration += result.duration;
+            accounted_count += 1;
+        }
     }
 
-    let total_duration = start.elapsed();
-    let avg_duration = if iterations > 0 {
-        total_duration / iterations as u32
+    let avg_duration = if accounted_count > 0 {
+        accounted_duration / accounted_count as u32
     } else {
         Duration::ZERO
     };
@@ -177,7 +251,7 @@ pub fn stress_scenario<R: RuntimeAdapter>(
         failed,
         flake_rate,
         hard_failure: passed == 0 && iterations > 0,
-        total_duration,
+        total_duration: accounted_duration,
         avg_duration,
         first_failure,
     }
@@ -400,5 +474,157 @@ mod tests {
         assert_eq!(result.passed, 0);
         assert_eq!(result.failed, 0);
         assert!(!result.hard_failure);
+    }
+
+    // ── Sweep mode tests ────────────────────────────────────────────
+
+    #[test]
+    fn sweep_mode_default_is_all() {
+        assert_eq!(SweepMode::default(), SweepMode::All);
+    }
+
+    #[test]
+    fn sweep_config_default() {
+        let config = SweepConfig::default();
+        assert_eq!(config.iterations, 100);
+        assert!((config.max_flake_rate - 0.05).abs() < f64::EPSILON);
+        assert_eq!(config.sweep_mode, SweepMode::All);
+    }
+
+    #[test]
+    fn sweep_all_mode_uses_per_test_durations() {
+        // With SweepMode::All, total_duration should be the sum of
+        // per-test durations from TestResult (not wall-clock).
+        let adapter = MockAdapter {
+            output: ExecOutput {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                lifecycle_events: Vec::new(),
+            },
+        };
+        let runner = ScenarioRunner::new(adapter);
+        let scenario = &s1_entrypoint_scenarios()[0];
+
+        let result = sweep_scenario(&runner, &alpine(), scenario, 5, SweepMode::All);
+        assert_eq!(result.iterations, 5);
+        assert_eq!(result.passed, 5);
+        assert_eq!(result.failed, 0);
+        // total_duration is the sum of 5 per-test durations (very fast
+        // for mock adapter), avg_duration = total / 5.
+        assert!(result.avg_duration <= result.total_duration);
+    }
+
+    #[test]
+    fn sweep_fail_only_excludes_pass_durations() {
+        // All tests pass -> in FailOnly mode, no durations are accounted.
+        let adapter = MockAdapter {
+            output: ExecOutput {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                lifecycle_events: Vec::new(),
+            },
+        };
+        let runner = ScenarioRunner::new(adapter);
+        let scenario = &s1_entrypoint_scenarios()[0];
+
+        let result = sweep_scenario(&runner, &alpine(), scenario, 5, SweepMode::FailOnly);
+        assert_eq!(result.passed, 5);
+        assert_eq!(result.failed, 0);
+        // No failures => zero accounted duration
+        assert_eq!(result.total_duration, Duration::ZERO);
+        assert_eq!(result.avg_duration, Duration::ZERO);
+    }
+
+    #[test]
+    fn sweep_fail_only_accounts_only_failure_durations() {
+        // All tests fail -> in FailOnly mode, all durations are accounted.
+        let adapter = MockAdapter {
+            output: ExecOutput {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: String::new(),
+                lifecycle_events: Vec::new(),
+            },
+        };
+        let runner = ScenarioRunner::new(adapter);
+        let scenario = &s1_entrypoint_scenarios()[0]; // expects exit 0
+
+        let result = sweep_scenario(&runner, &alpine(), scenario, 5, SweepMode::FailOnly);
+        assert_eq!(result.passed, 0);
+        assert_eq!(result.failed, 5);
+        // All 5 failed iterations contribute their per-test durations.
+        assert!(result.total_duration > Duration::ZERO || result.iterations == 0);
+        assert!(result.avg_duration <= result.total_duration);
+    }
+
+    #[test]
+    fn sweep_mode_round_trip() {
+        let config = SweepConfig {
+            iterations: 20,
+            max_flake_rate: 0.10,
+            sweep_mode: SweepMode::FailOnly,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: SweepConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.iterations, 20);
+        assert_eq!(deserialized.sweep_mode, SweepMode::FailOnly);
+    }
+
+    #[test]
+    fn sweep_zero_iterations() {
+        let adapter = MockAdapter {
+            output: ExecOutput {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                lifecycle_events: Vec::new(),
+            },
+        };
+        let runner = ScenarioRunner::new(adapter);
+        let scenario = &s1_entrypoint_scenarios()[0];
+
+        let result = sweep_scenario(&runner, &alpine(), scenario, 0, SweepMode::FailOnly);
+        assert_eq!(result.iterations, 0);
+        assert_eq!(result.total_duration, Duration::ZERO);
+        assert_eq!(result.avg_duration, Duration::ZERO);
+    }
+
+    #[test]
+    fn stress_scenario_uses_per_test_durations_not_wall_clock() {
+        // Verify that stress_scenario (which delegates to sweep_scenario
+        // with SweepMode::All) accumulates per-test durations from
+        // TestResult rather than wall-clock elapsed.
+        let adapter = MockAdapter {
+            output: ExecOutput {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                lifecycle_events: Vec::new(),
+            },
+        };
+        let runner = ScenarioRunner::new(adapter);
+        let scenario = &s1_entrypoint_scenarios()[0];
+
+        let result = stress_scenario(&runner, &alpine(), scenario, 10);
+        // With a mock adapter, per-test durations are very small
+        // (microseconds). The total should equal roughly 10x the avg.
+        // The key property: avg_duration * iterations ~= total_duration.
+        let reconstructed = result.avg_duration * result.iterations as u32;
+        // Allow small rounding difference from integer division.
+        let diff = if reconstructed > result.total_duration {
+            reconstructed - result.total_duration
+        } else {
+            result.total_duration - reconstructed
+        };
+        // Rounding error at most 1 tick per iteration.
+        assert!(
+            diff < Duration::from_nanos(result.iterations as u64 + 1),
+            "duration accounting mismatch: total={:?} avg={:?} iters={}",
+            result.total_duration,
+            result.avg_duration,
+            result.iterations
+        );
     }
 }

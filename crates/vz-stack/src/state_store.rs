@@ -2862,6 +2862,10 @@ mod tests {
                     labels: HashMap::new(),
                     stop_signal: None,
                     stop_grace_period_secs: None,
+                    expose: vec![],
+                    stdin_open: false,
+                    tty: false,
+                    logging: None,
                 },
                 ServiceSpec {
                     name: "db".to_string(),
@@ -2896,6 +2900,10 @@ mod tests {
                     labels: HashMap::new(),
                     stop_signal: None,
                     stop_grace_period_secs: None,
+                    expose: vec![],
+                    stdin_open: false,
+                    tty: false,
+                    logging: None,
                 },
             ],
             networks: vec![],
@@ -5653,6 +5661,10 @@ mod tests {
                     labels: HashMap::new(),
                     stop_signal: None,
                     stop_grace_period_secs: None,
+                    expose: vec![],
+                    stdin_open: false,
+                    tty: false,
+                    logging: None,
                 },
                 ServiceSpec {
                     name: "db".to_string(),
@@ -5684,6 +5696,10 @@ mod tests {
                     labels: HashMap::new(),
                     stop_signal: None,
                     stop_grace_period_secs: None,
+                    expose: vec![],
+                    stdin_open: false,
+                    tty: false,
+                    logging: None,
                 },
             ],
             networks: vec![],
@@ -6078,6 +6094,10 @@ mod tests {
             labels: HashMap::new(),
             stop_signal: None,
             stop_grace_period_secs: None,
+            expose: vec![],
+            stdin_open: false,
+            tty: false,
+            logging: None,
         }
     }
 
@@ -6348,5 +6368,263 @@ mod tests {
             elapsed.as_millis() < 200,
             "20 observed state save+load took {elapsed:?} — exceeds 200ms regression gate"
         );
+    }
+
+    // ── Migration compatibility tests (vz-4g0) ──
+
+    /// Verify that the `control_metadata` table stores a detectable schema version
+    /// on first init, and that it can be read back as the expected v1 value.
+    #[test]
+    fn migration_v1_schema_detectable() {
+        let store = StateStore::in_memory().unwrap();
+
+        // Schema version must be present and equal to "1" after initial init.
+        let version_str = store
+            .get_control_metadata("schema_version")
+            .unwrap()
+            .expect("schema_version should be set on first init");
+        assert_eq!(version_str, "1");
+
+        // The typed accessor must agree.
+        assert_eq!(store.schema_version().unwrap(), 1);
+
+        // created_at must also be set.
+        assert!(
+            store.get_control_metadata("created_at").unwrap().is_some(),
+            "created_at should be populated on first init"
+        );
+    }
+
+    /// Pre-populate a database with v1 format data, then re-run `init_schema`
+    /// (which would add any new tables in a migration scenario). Verify that
+    /// previously-stored data is still readable.
+    #[test]
+    fn migration_old_data_readable_after_schema_update() {
+        // Open an in-memory store — this runs init_schema once.
+        let store = StateStore::in_memory().unwrap();
+
+        // Pre-populate with v1 data: desired_state, observed_state, events.
+        let spec = sample_spec();
+        store.save_desired_state("myapp", &spec).unwrap();
+
+        let obs = ServiceObservedState {
+            service_name: "web".to_string(),
+            phase: ServicePhase::Running,
+            container_id: Some("ctr-web-001".to_string()),
+            last_error: None,
+            ready: true,
+        };
+        store.save_observed_state("myapp", &obs).unwrap();
+
+        store
+            .emit_event(
+                "myapp",
+                &StackEvent::ServiceCreating {
+                    stack_name: "myapp".to_string(),
+                    service_name: "web".to_string(),
+                },
+            )
+            .unwrap();
+
+        // Simulate a "migration" by running init_schema again — this calls
+        // CREATE TABLE IF NOT EXISTS for every table, including any new ones.
+        store.init_schema().unwrap();
+
+        // Verify old data is still readable after the schema re-init.
+        let loaded_spec = store.load_desired_state("myapp").unwrap().unwrap();
+        assert_eq!(loaded_spec, spec);
+
+        let loaded_obs = store.load_observed_state("myapp").unwrap();
+        assert_eq!(loaded_obs.len(), 1);
+        assert_eq!(loaded_obs[0].service_name, "web");
+        assert_eq!(loaded_obs[0].phase, ServicePhase::Running);
+
+        let loaded_events = store.load_events("myapp").unwrap();
+        assert_eq!(loaded_events.len(), 1);
+
+        // Schema version must not have been overwritten by re-init
+        // (INSERT OR IGNORE preserves original value).
+        assert_eq!(store.schema_version().unwrap(), 1);
+    }
+
+    /// Verify that all existing queries continue to work correctly after new
+    /// tables are added to the schema. This exercises the full query surface
+    /// against a freshly-initialized store.
+    #[test]
+    fn migration_new_tables_dont_break_old_queries() {
+        let store = StateStore::in_memory().unwrap();
+
+        // Exercise every major query path to ensure none are broken.
+        // Desired state
+        assert!(store.load_desired_state("nonexistent").unwrap().is_none());
+        store.save_desired_state("s1", &sample_spec()).unwrap();
+        assert!(store.load_desired_state("s1").unwrap().is_some());
+
+        // Observed state
+        assert!(store.load_observed_state("s1").unwrap().is_empty());
+        let obs = ServiceObservedState {
+            service_name: "svc".to_string(),
+            phase: ServicePhase::Pending,
+            container_id: None,
+            last_error: None,
+            ready: false,
+        };
+        store.save_observed_state("s1", &obs).unwrap();
+        assert_eq!(store.load_observed_state("s1").unwrap().len(), 1);
+
+        // Events
+        store
+            .emit_event(
+                "s1",
+                &StackEvent::StackApplyStarted {
+                    stack_name: "s1".to_string(),
+                    services_count: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(store.load_events("s1").unwrap().len(), 1);
+
+        // Control metadata
+        store.set_control_metadata("test_k", "test_v").unwrap();
+        assert_eq!(
+            store.get_control_metadata("test_k").unwrap().unwrap(),
+            "test_v"
+        );
+
+        // Mount digests
+        store
+            .save_service_mount_digest("s1", "svc", "abc123")
+            .unwrap();
+        let digests = store.load_service_mount_digests("s1").unwrap();
+        assert_eq!(digests.get("svc").unwrap(), "abc123");
+
+        // Reconcile progress
+        let actions = vec![Action::ServiceCreate {
+            service_name: "svc".to_string(),
+        }];
+        store
+            .save_reconcile_progress("s1", "op-1", &actions, 0)
+            .unwrap();
+        let progress = store.load_reconcile_progress("s1").unwrap().unwrap();
+        assert_eq!(progress.operation_id, "op-1");
+
+        // Checkpoint state (via entity CRUD)
+        let checkpoint = Checkpoint {
+            checkpoint_id: "ckpt-1".to_string(),
+            sandbox_id: "sbx-1".to_string(),
+            parent_checkpoint_id: None,
+            class: CheckpointClass::FsQuick,
+            state: CheckpointState::Ready,
+            created_at: 1_700_000_000,
+            compatibility_fingerprint: "fp-abc".to_string(),
+        };
+        store.save_checkpoint(&checkpoint).unwrap();
+        let loaded = store.load_checkpoint("ckpt-1").unwrap().unwrap();
+        assert_eq!(loaded.checkpoint_id, "ckpt-1");
+
+        // Schema version still intact.
+        assert_eq!(store.schema_version().unwrap(), 1);
+    }
+
+    /// Serialize and deserialize a checkpoint through the state store,
+    /// verifying no data loss in the round trip.
+    #[test]
+    fn checkpoint_format_round_trip_stability() {
+        let store = StateStore::in_memory().unwrap();
+
+        let original = Checkpoint {
+            checkpoint_id: "ckpt-roundtrip-001".to_string(),
+            sandbox_id: "sbx-roundtrip".to_string(),
+            parent_checkpoint_id: Some("ckpt-parent-000".to_string()),
+            class: CheckpointClass::VmFull,
+            state: CheckpointState::Ready,
+            created_at: 1_700_100_200,
+            compatibility_fingerprint: "fp-sha256-deadbeef".to_string(),
+        };
+
+        store.save_checkpoint(&original).unwrap();
+        let loaded = store
+            .load_checkpoint("ckpt-roundtrip-001")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(loaded.checkpoint_id, original.checkpoint_id);
+        assert_eq!(loaded.sandbox_id, original.sandbox_id);
+        assert_eq!(loaded.parent_checkpoint_id, original.parent_checkpoint_id);
+        assert_eq!(loaded.class, original.class);
+        assert_eq!(loaded.state, original.state);
+        assert_eq!(loaded.created_at, original.created_at);
+        assert_eq!(
+            loaded.compatibility_fingerprint,
+            original.compatibility_fingerprint
+        );
+
+        // Also test FsQuick class with no parent.
+        let original_fs = Checkpoint {
+            checkpoint_id: "ckpt-fs-001".to_string(),
+            sandbox_id: "sbx-fs".to_string(),
+            parent_checkpoint_id: None,
+            class: CheckpointClass::FsQuick,
+            state: CheckpointState::Creating,
+            created_at: 1_700_200_300,
+            compatibility_fingerprint: "fp-sha256-cafebabe".to_string(),
+        };
+        store.save_checkpoint(&original_fs).unwrap();
+        let loaded_fs = store.load_checkpoint("ckpt-fs-001").unwrap().unwrap();
+
+        assert_eq!(loaded_fs.checkpoint_id, original_fs.checkpoint_id);
+        assert_eq!(loaded_fs.sandbox_id, original_fs.sandbox_id);
+        assert_eq!(loaded_fs.parent_checkpoint_id, None);
+        assert_eq!(loaded_fs.class, CheckpointClass::FsQuick);
+        assert_eq!(loaded_fs.state, CheckpointState::Creating);
+    }
+
+    /// Verify that old event JSON formats (v1 tagged enums) can still be
+    /// deserialized after code evolution. This guards against accidental
+    /// serde tag or field renames.
+    #[test]
+    fn event_format_backward_compat() {
+        // These are the canonical v1 JSON shapes — if serde(rename) or
+        // serde(tag) attributes change, this test will catch it.
+        let v1_event_jsons = vec![
+            r#"{"type":"stack_apply_started","stack_name":"app","services_count":2}"#,
+            r#"{"type":"stack_apply_completed","stack_name":"app","succeeded":2,"failed":0}"#,
+            r#"{"type":"stack_apply_failed","stack_name":"app","error":"boom"}"#,
+            r#"{"type":"service_creating","stack_name":"app","service_name":"web"}"#,
+            r#"{"type":"service_ready","stack_name":"app","service_name":"web","runtime_id":"ctr-001"}"#,
+            r#"{"type":"service_stopped","stack_name":"app","service_name":"web","exit_code":0}"#,
+            r#"{"type":"service_failed","stack_name":"app","service_name":"web","error":"crash"}"#,
+            r#"{"type":"stack_destroyed","stack_name":"app"}"#,
+        ];
+
+        for (i, json_str) in v1_event_jsons.iter().enumerate() {
+            let parsed: Result<StackEvent, _> = serde_json::from_str(json_str);
+            assert!(
+                parsed.is_ok(),
+                "v1 event JSON at index {i} failed to deserialize: {} — input: {json_str}",
+                parsed.unwrap_err()
+            );
+
+            // Re-serialize and re-deserialize to verify stability.
+            let re_serialized = serde_json::to_string(&parsed.unwrap()).unwrap();
+            let re_parsed: StackEvent = serde_json::from_str(&re_serialized).unwrap();
+            let _ = re_parsed; // Just verify it doesn't panic.
+        }
+
+        // Also verify that events stored in the DB can be loaded back.
+        let store = StateStore::in_memory().unwrap();
+        for json_str in &v1_event_jsons {
+            // Directly insert raw JSON into the events table to simulate
+            // events written by an older version.
+            store
+                .conn
+                .execute(
+                    "INSERT INTO events (stack_name, event_json) VALUES ('compat', ?1)",
+                    params![*json_str],
+                )
+                .unwrap();
+        }
+        let loaded = store.load_events("compat").unwrap();
+        assert_eq!(loaded.len(), v1_event_jsons.len());
     }
 }
