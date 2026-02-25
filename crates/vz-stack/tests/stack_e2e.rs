@@ -26,8 +26,8 @@ use vz_runtime_contract::{
     SandboxBackend, SandboxSpec, SandboxState,
 };
 use vz_stack::{
-    Action, ContainerRuntime, OrchestrationConfig, StackError, StackEvent, StackExecutor,
-    StackOrchestrator, StateStore, apply, parse_compose,
+    Action, ContainerRuntime, ImagePolicy, OrchestrationConfig, StackError, StackEvent,
+    StackExecutor, StackOrchestrator, StateStore, apply, parse_compose,
 };
 
 fn has_virtualization_entitlement() -> bool {
@@ -701,6 +701,7 @@ services:
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
         max_rounds: 30,
+        image_policy: ImagePolicy::AllowAll,
     };
     let mut orchestrator = StackOrchestrator::new(executor, reconcile_store, orch_config);
 
@@ -834,6 +835,7 @@ services:
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
         max_rounds: 20,
+        image_policy: ImagePolicy::AllowAll,
     };
     let mut orchestrator = StackOrchestrator::new(executor, reconcile_store, orch_config);
     let result = orchestrator.run(&spec, None).unwrap();
@@ -995,6 +997,7 @@ services:
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
         max_rounds: 20,
+        image_policy: ImagePolicy::AllowAll,
     };
     let mut orchestrator = StackOrchestrator::new(executor, reconcile_store, orch_config);
 
@@ -1124,6 +1127,7 @@ services:
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
         max_rounds: 30,
+        image_policy: ImagePolicy::AllowAll,
     };
     let mut orchestrator = StackOrchestrator::new(executor, reconcile_store, orch_config);
     let result = orchestrator.run(&spec, None).unwrap();
@@ -1325,6 +1329,8 @@ services:
     command: ["sh", "-c", "while true; do sleep 1; done"]
     volumes:
       - journey-data:/journey
+volumes:
+  journey-data:
 "#;
 
     let home = std::env::var("HOME").unwrap();
@@ -1341,19 +1347,14 @@ services:
     let reconcile_store = StateStore::open(&db_path).unwrap();
     let executor = StackExecutor::new(bridge, exec_store, tmp.path());
 
-    // Create the persistent volume
-    let data_img = tmp.path().join("data.img");
-    create_sparse_disk(&data_img, 10 * 1024 * 1024 * 1024);
-    let vol_spec = vz_stack::VolumeSpec {
-        name: "journey-data".to_string(),
-        driver: None,
-        driver_opts: HashMap::new(),
-    };
-    executor.ensure_volume(&vol_spec, &data_img).unwrap();
+    // Ensure the named volume directory exists
+    let vol_dir = tmp.path().join("volumes").join("journey-data");
+    std::fs::create_dir_all(&vol_dir).unwrap();
 
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
         max_rounds: 40,
+        image_policy: ImagePolicy::AllowAll,
     };
     let mut orchestrator = StackOrchestrator::new(executor, reconcile_store, orch_config);
 
