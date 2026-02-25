@@ -199,6 +199,16 @@ impl PortTracker {
         self.allocated.remove(service_name);
     }
 
+    /// Snapshot of all allocated ports (for persistence).
+    pub fn allocated_snapshot(&self) -> &HashMap<String, Vec<PublishedPort>> {
+        &self.allocated
+    }
+
+    /// Restore a previous port allocation from a crash-recovery snapshot.
+    pub fn restore(&mut self, service_name: String, ports: Vec<PublishedPort>) {
+        self.allocated.insert(service_name, ports);
+    }
+
     /// Get the published ports for a service (if any).
     pub fn ports_for(&self, service_name: &str) -> Option<&[PublishedPort]> {
         self.allocated.get(service_name).map(|v| v.as_slice())
@@ -678,6 +688,9 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
             // Store primary IPs for use in prepare_create.
             self.service_ips = service_primary_ip;
+
+            // Persist allocator state after VM boot + network setup.
+            self.persist_allocator_state(&spec.name)?;
         }
 
         let service_map: HashMap<&str, &ServiceSpec> =
@@ -1146,6 +1159,29 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         )?;
 
         info!(service = %service_name, "service stopped");
+        Ok(())
+    }
+
+    /// Persist current allocator state for crash recovery.
+    pub fn persist_allocator_state(&self, stack_name: &str) -> Result<(), StackError> {
+        use crate::state_store::AllocatorSnapshot;
+        let snapshot = AllocatorSnapshot {
+            ports: self.ports.allocated_snapshot().clone(),
+            service_ips: self.service_ips.clone(),
+            mount_tag_offsets: self.mount_tag_offsets.clone(),
+        };
+        self.store.save_allocator_state(stack_name, &snapshot)
+    }
+
+    /// Restore allocator state from a previous crash-recovery snapshot.
+    pub fn restore_allocator_state(&mut self, stack_name: &str) -> Result<(), StackError> {
+        if let Some(snapshot) = self.store.load_allocator_state(stack_name)? {
+            self.service_ips = snapshot.service_ips;
+            self.mount_tag_offsets = snapshot.mount_tag_offsets;
+            for (name, ports) in snapshot.ports {
+                self.ports.restore(name, ports);
+            }
+        }
         Ok(())
     }
 
@@ -2985,5 +3021,25 @@ mod tests {
         assert_eq!(parse_subnet_base("10.0.0.0/16"), [10, 0, 0, 0]);
         assert_eq!(parse_subnet_prefix("172.20.1.0/24"), 24);
         assert_eq!(parse_subnet_prefix("10.0.0.0/16"), 16);
+    }
+
+    #[test]
+    fn port_tracker_snapshot_and_restore() {
+        let mut tracker = PortTracker::new();
+        let ports = vec![PublishedPort {
+            host_port: 8080,
+            container_port: 80,
+            protocol: "tcp".to_string(),
+        }];
+        tracker.restore("web".to_string(), ports.clone());
+
+        let snapshot = tracker.allocated_snapshot();
+        assert_eq!(snapshot.get("web").unwrap(), &ports);
+
+        let mut tracker2 = PortTracker::new();
+        for (name, ports) in snapshot {
+            tracker2.restore(name.clone(), ports.clone());
+        }
+        assert_eq!(tracker2.allocated_snapshot().get("web").unwrap(), &ports);
     }
 }

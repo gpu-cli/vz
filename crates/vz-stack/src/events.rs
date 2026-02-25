@@ -154,6 +154,37 @@ pub enum StackEvent {
         /// Desired mount digest from the current spec.
         desired_digest: String,
     },
+    /// A sandbox is being created for a stack.
+    #[serde(rename = "sandbox_creating")]
+    SandboxCreating {
+        stack_name: String,
+        sandbox_id: String,
+    },
+    /// A sandbox is ready and accepting workloads.
+    #[serde(rename = "sandbox_ready")]
+    SandboxReady {
+        stack_name: String,
+        sandbox_id: String,
+    },
+    /// A sandbox is draining (no new work accepted).
+    #[serde(rename = "sandbox_draining")]
+    SandboxDraining {
+        stack_name: String,
+        sandbox_id: String,
+    },
+    /// A sandbox has been terminated.
+    #[serde(rename = "sandbox_terminated")]
+    SandboxTerminated {
+        stack_name: String,
+        sandbox_id: String,
+    },
+    /// A sandbox failed irrecoverably.
+    #[serde(rename = "sandbox_failed")]
+    SandboxFailed {
+        stack_name: String,
+        sandbox_id: String,
+        error: String,
+    },
 }
 
 /// Persisted event record with metadata from the store.
@@ -308,6 +339,27 @@ mod tests {
                 previous_digest: Some("old".to_string()),
                 desired_digest: "new".to_string(),
             },
+            StackEvent::SandboxCreating {
+                stack_name: "myapp".to_string(),
+                sandbox_id: "sb-1".to_string(),
+            },
+            StackEvent::SandboxReady {
+                stack_name: "myapp".to_string(),
+                sandbox_id: "sb-1".to_string(),
+            },
+            StackEvent::SandboxDraining {
+                stack_name: "myapp".to_string(),
+                sandbox_id: "sb-1".to_string(),
+            },
+            StackEvent::SandboxTerminated {
+                stack_name: "myapp".to_string(),
+                sandbox_id: "sb-1".to_string(),
+            },
+            StackEvent::SandboxFailed {
+                stack_name: "myapp".to_string(),
+                sandbox_id: "sb-1".to_string(),
+                error: "vm crashed".to_string(),
+            },
         ]
     }
 
@@ -401,6 +453,42 @@ mod tests {
                     desired_digest: "new".to_string(),
                 },
                 "mount_topology_recreate_required",
+            ),
+            (
+                StackEvent::SandboxCreating {
+                    stack_name: "t".to_string(),
+                    sandbox_id: "sb".to_string(),
+                },
+                "sandbox_creating",
+            ),
+            (
+                StackEvent::SandboxReady {
+                    stack_name: "t".to_string(),
+                    sandbox_id: "sb".to_string(),
+                },
+                "sandbox_ready",
+            ),
+            (
+                StackEvent::SandboxDraining {
+                    stack_name: "t".to_string(),
+                    sandbox_id: "sb".to_string(),
+                },
+                "sandbox_draining",
+            ),
+            (
+                StackEvent::SandboxTerminated {
+                    stack_name: "t".to_string(),
+                    sandbox_id: "sb".to_string(),
+                },
+                "sandbox_terminated",
+            ),
+            (
+                StackEvent::SandboxFailed {
+                    stack_name: "t".to_string(),
+                    sandbox_id: "sb".to_string(),
+                    error: "e".to_string(),
+                },
+                "sandbox_failed",
             ),
         ];
 

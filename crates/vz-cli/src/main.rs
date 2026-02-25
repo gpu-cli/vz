@@ -89,6 +89,9 @@ enum Commands {
     /// Manage multi-service stacks from Compose files.
     Stack(commands::stack::StackArgs),
 
+    /// Manage sandbox runtime boundaries.
+    Sandbox(commands::sandbox::SandboxArgs),
+
     // ── VM management (macOS only) ──
     /// Manage virtual machines.
     #[cfg(target_os = "macos")]
@@ -166,6 +169,9 @@ fn main() -> anyhow::Result<()> {
 
             // Stack orchestration
             Commands::Stack(args) => commands::stack::run(args).await,
+
+            // Sandbox management
+            Commands::Sandbox(args) => commands::sandbox::run(args).await,
 
             // VM management (macOS only)
             #[cfg(target_os = "macos")]
@@ -665,6 +671,24 @@ mod tests {
         } else {
             panic!("expected Stack");
         }
+    }
+
+    #[test]
+    fn parse_sandbox_list() {
+        let cli = Cli::try_parse_from(["vz", "sandbox", "list"]).expect("parse");
+        assert!(matches!(cli.command, Commands::Sandbox(_)));
+    }
+
+    #[test]
+    fn parse_sandbox_inspect() {
+        let cli = Cli::try_parse_from(["vz", "sandbox", "inspect", "sbx-123"]).expect("parse");
+        assert!(matches!(cli.command, Commands::Sandbox(_)));
+    }
+
+    #[test]
+    fn parse_sandbox_terminate() {
+        let cli = Cli::try_parse_from(["vz", "sandbox", "terminate", "sbx-123"]).expect("parse");
+        assert!(matches!(cli.command, Commands::Sandbox(_)));
     }
 
     #[cfg(target_os = "macos")]

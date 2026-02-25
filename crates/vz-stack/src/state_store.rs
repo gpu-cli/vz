@@ -11,10 +11,12 @@ use std::sync::mpsc;
 
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use vz_runtime_contract::{Sandbox, SandboxBackend, SandboxSpec, SandboxState};
 
 use crate::StackSpec;
 use crate::error::StackError;
 use crate::events::{EventRecord, StackEvent};
+use crate::network::PublishedPort;
 use crate::reconcile::Action;
 
 /// Observable phase of a service within a stack.
@@ -50,6 +52,30 @@ pub struct ServiceObservedState {
     /// Whether the service is ready (health checks passing or no check defined).
     #[serde(default)]
     pub ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct HealthPollState {
+    pub service_name: String,
+    pub consecutive_passes: u32,
+    pub consecutive_failures: u32,
+    pub last_check_millis: Option<i64>,
+    pub start_time_millis: Option<i64>,
+}
+
+/// Snapshot of ephemeral allocator state for crash recovery.
+///
+/// The executor tracks port allocations, service IPs, and mount tag
+/// offsets in memory. This snapshot captures that state so it can
+/// be restored after a daemon restart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AllocatorSnapshot {
+    /// Per-service allocated ports.
+    pub ports: HashMap<String, Vec<PublishedPort>>,
+    /// Per-service IP addresses within the stack network.
+    pub service_ips: HashMap<String, String>,
+    /// Per-service VirtioFS mount tag offsets.
+    pub mount_tag_offsets: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -185,11 +211,38 @@ impl StateStore {
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS health_poller_state (
+                stack_name TEXT NOT NULL UNIQUE,
+                state_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 stack_name TEXT NOT NULL,
                 event_json TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS sandbox_state (
+                sandbox_id TEXT PRIMARY KEY,
+                stack_name TEXT NOT NULL,
+                state TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                spec_json TEXT NOT NULL,
+                labels_json TEXT NOT NULL DEFAULT '{}',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(stack_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sandbox_stack ON sandbox_state(stack_name);
+
+            CREATE TABLE IF NOT EXISTS allocator_state (
+                stack_name TEXT PRIMARY KEY,
+                ports_json TEXT NOT NULL DEFAULT '{}',
+                service_ips_json TEXT NOT NULL DEFAULT '{}',
+                mount_tag_offsets_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );",
         )?;
         Ok(())
@@ -388,6 +441,57 @@ impl StateStore {
         Ok(states)
     }
 
+    /// Persist health poller checkpoint state for a stack.
+    ///
+    /// This captures counters and timing windows required for deterministic restart
+    /// of readiness tracking.
+    pub fn save_health_poller_state(
+        &self,
+        stack_name: &str,
+        state: &HashMap<String, HealthPollState>,
+    ) -> Result<(), StackError> {
+        let json = serde_json::to_string(state)?;
+        self.conn.execute(
+            "INSERT INTO health_poller_state (stack_name, state_json)
+             VALUES (?1, ?2)
+             ON CONFLICT(stack_name) DO UPDATE SET
+                state_json = excluded.state_json,
+                updated_at = datetime('now')",
+            params![stack_name, json],
+        )?;
+        Ok(())
+    }
+
+    /// Load persisted health poller checkpoint state for a stack.
+    ///
+    /// Missing rows are treated as an empty checkpoint state.
+    pub fn load_health_poller_state(
+        &self,
+        stack_name: &str,
+    ) -> Result<HashMap<String, HealthPollState>, StackError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT state_json FROM health_poller_state WHERE stack_name = ?1")?;
+
+        let mut rows = stmt.query(params![stack_name])?;
+        let Some(row) = rows.next()? else {
+            return Ok(HashMap::new());
+        };
+
+        let state_json: String = row.get(0)?;
+        let state: HashMap<String, HealthPollState> = serde_json::from_str(&state_json)?;
+        Ok(state)
+    }
+
+    /// Clear persisted health poller checkpoint state for a stack.
+    pub fn clear_health_poller_state(&self, stack_name: &str) -> Result<(), StackError> {
+        self.conn.execute(
+            "DELETE FROM health_poller_state WHERE stack_name = ?1",
+            params![stack_name],
+        )?;
+        Ok(())
+    }
+
     /// Append a structured event to the event log.
     ///
     /// The event is always persisted to SQLite. If a real-time event
@@ -496,6 +600,214 @@ impl StateStore {
             });
         }
         Ok(records)
+    }
+
+    // ── Sandbox persistence ──
+
+    /// Persist a sandbox, upserting on `sandbox_id`.
+    pub fn save_sandbox(&self, sandbox: &Sandbox) -> Result<(), StackError> {
+        let stack_name = sandbox
+            .labels
+            .get("stack_name")
+            .cloned()
+            .unwrap_or_default();
+        let state_json = serde_json::to_string(&sandbox.state)?;
+        let backend_json = serde_json::to_string(&sandbox.backend)?;
+        let spec_json = serde_json::to_string(&sandbox.spec)?;
+        let labels_json = serde_json::to_string(&sandbox.labels)?;
+
+        self.conn.execute(
+            "INSERT INTO sandbox_state (sandbox_id, stack_name, state, backend, spec_json, labels_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(sandbox_id) DO UPDATE SET
+                stack_name = excluded.stack_name,
+                state = excluded.state,
+                backend = excluded.backend,
+                spec_json = excluded.spec_json,
+                labels_json = excluded.labels_json,
+                updated_at = excluded.updated_at",
+            params![
+                sandbox.sandbox_id,
+                stack_name,
+                state_json,
+                backend_json,
+                spec_json,
+                labels_json,
+                sandbox.created_at as i64,
+                sandbox.updated_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load a sandbox by its identifier.
+    pub fn load_sandbox(&self, sandbox_id: &str) -> Result<Option<Sandbox>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sandbox_id, stack_name, state, backend, spec_json, labels_json, created_at, updated_at
+             FROM sandbox_state WHERE sandbox_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![sandbox_id])?;
+
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::sandbox_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Load the sandbox associated with a given stack name.
+    pub fn load_sandbox_for_stack(&self, stack_name: &str) -> Result<Option<Sandbox>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sandbox_id, stack_name, state, backend, spec_json, labels_json, created_at, updated_at
+             FROM sandbox_state WHERE stack_name = ?1",
+        )?;
+        let mut rows = stmt.query(params![stack_name])?;
+
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::sandbox_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all sandboxes ordered by creation time.
+    pub fn list_sandboxes(&self) -> Result<Vec<Sandbox>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sandbox_id, stack_name, state, backend, spec_json, labels_json, created_at, updated_at
+             FROM sandbox_state ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })?;
+
+        let mut sandboxes = Vec::new();
+        for row_result in rows {
+            let (
+                sandbox_id,
+                _stack_name,
+                state_str,
+                backend_str,
+                spec_str,
+                labels_str,
+                created_at,
+                updated_at,
+            ) = row_result?;
+            let state: SandboxState = serde_json::from_str(&state_str)?;
+            let backend: SandboxBackend = serde_json::from_str(&backend_str)?;
+            let spec: SandboxSpec = serde_json::from_str(&spec_str)?;
+            let labels: std::collections::BTreeMap<String, String> =
+                serde_json::from_str(&labels_str)?;
+
+            sandboxes.push(Sandbox {
+                sandbox_id,
+                backend,
+                spec,
+                state,
+                created_at: created_at as u64,
+                updated_at: updated_at as u64,
+                labels,
+            });
+        }
+        Ok(sandboxes)
+    }
+
+    /// Delete a sandbox by its identifier.
+    pub fn delete_sandbox(&self, sandbox_id: &str) -> Result<(), StackError> {
+        self.conn.execute(
+            "DELETE FROM sandbox_state WHERE sandbox_id = ?1",
+            params![sandbox_id],
+        )?;
+        Ok(())
+    }
+
+    /// Deserialize a sandbox from a rusqlite row.
+    fn sandbox_from_row(row: &rusqlite::Row<'_>) -> Result<Sandbox, StackError> {
+        let sandbox_id: String = row.get(0)?;
+        let _stack_name: String = row.get(1)?;
+        let state_str: String = row.get(2)?;
+        let backend_str: String = row.get(3)?;
+        let spec_str: String = row.get(4)?;
+        let labels_str: String = row.get(5)?;
+        let created_at: i64 = row.get(6)?;
+        let updated_at: i64 = row.get(7)?;
+
+        let state: SandboxState = serde_json::from_str(&state_str)?;
+        let backend: SandboxBackend = serde_json::from_str(&backend_str)?;
+        let spec: SandboxSpec = serde_json::from_str(&spec_str)?;
+        let labels: std::collections::BTreeMap<String, String> = serde_json::from_str(&labels_str)?;
+
+        Ok(Sandbox {
+            sandbox_id,
+            backend,
+            spec,
+            state,
+            created_at: created_at as u64,
+            updated_at: updated_at as u64,
+            labels,
+        })
+    }
+
+    // ── Allocator state persistence ──
+
+    /// Persist allocator snapshot for a stack.
+    pub fn save_allocator_state(
+        &self,
+        stack_name: &str,
+        snapshot: &AllocatorSnapshot,
+    ) -> Result<(), StackError> {
+        let ports_json = serde_json::to_string(&snapshot.ports)?;
+        let service_ips_json = serde_json::to_string(&snapshot.service_ips)?;
+        let mount_tag_offsets_json = serde_json::to_string(&snapshot.mount_tag_offsets)?;
+
+        self.conn.execute(
+            "INSERT INTO allocator_state (stack_name, ports_json, service_ips_json, mount_tag_offsets_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(stack_name) DO UPDATE SET
+                ports_json = excluded.ports_json,
+                service_ips_json = excluded.service_ips_json,
+                mount_tag_offsets_json = excluded.mount_tag_offsets_json,
+                updated_at = datetime('now')",
+            params![stack_name, ports_json, service_ips_json, mount_tag_offsets_json],
+        )?;
+        Ok(())
+    }
+
+    /// Load allocator snapshot for a stack.
+    pub fn load_allocator_state(
+        &self,
+        stack_name: &str,
+    ) -> Result<Option<AllocatorSnapshot>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ports_json, service_ips_json, mount_tag_offsets_json
+             FROM allocator_state WHERE stack_name = ?1",
+        )?;
+        let mut rows = stmt.query(params![stack_name])?;
+
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+
+        let ports_json: String = row.get(0)?;
+        let service_ips_json: String = row.get(1)?;
+        let mount_tag_offsets_json: String = row.get(2)?;
+
+        let ports: HashMap<String, Vec<PublishedPort>> = serde_json::from_str(&ports_json)?;
+        let service_ips: HashMap<String, String> = serde_json::from_str(&service_ips_json)?;
+        let mount_tag_offsets: HashMap<String, usize> =
+            serde_json::from_str(&mount_tag_offsets_json)?;
+
+        Ok(Some(AllocatorSnapshot {
+            ports,
+            service_ips,
+            mount_tag_offsets,
+        }))
     }
 }
 
@@ -755,6 +1067,30 @@ mod tests {
         let store = StateStore::in_memory().unwrap();
         let states = store.load_observed_state("empty").unwrap();
         assert!(states.is_empty());
+    }
+
+    #[test]
+    fn health_poller_state_round_trip_and_clear() {
+        let store = StateStore::in_memory().unwrap();
+        let mut state = HashMap::new();
+        state.insert(
+            "web".to_string(),
+            HealthPollState {
+                service_name: "web".to_string(),
+                consecutive_passes: 2,
+                consecutive_failures: 1,
+                last_check_millis: Some(1_700_000_000_000),
+                start_time_millis: Some(1_700_000_000_123),
+            },
+        );
+
+        store.save_health_poller_state("myapp", &state).unwrap();
+        let loaded = store.load_health_poller_state("myapp").unwrap();
+        assert_eq!(loaded.get("web").unwrap(), state.get("web").unwrap());
+
+        store.clear_health_poller_state("myapp").unwrap();
+        let cleared = store.load_health_poller_state("myapp").unwrap();
+        assert!(cleared.is_empty());
     }
 
     #[test]
@@ -1148,5 +1484,105 @@ mod tests {
         // Event should still be persisted to SQLite.
         let events = store.load_events("test").unwrap();
         assert_eq!(events.len(), 1);
+    }
+
+    // ── Sandbox persistence tests ──
+
+    fn sample_sandbox(id: &str, stack_name: &str) -> Sandbox {
+        use std::collections::BTreeMap;
+        let mut labels = BTreeMap::new();
+        labels.insert("stack_name".to_string(), stack_name.to_string());
+        Sandbox {
+            sandbox_id: id.to_string(),
+            backend: SandboxBackend::MacosVz,
+            spec: SandboxSpec::default(),
+            state: SandboxState::Creating,
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            labels,
+        }
+    }
+
+    #[test]
+    fn sandbox_round_trip() {
+        let store = StateStore::in_memory().unwrap();
+        let sandbox = sample_sandbox("sb-1", "myapp");
+
+        store.save_sandbox(&sandbox).unwrap();
+        let loaded = store.load_sandbox("sb-1").unwrap().unwrap();
+        assert_eq!(loaded, sandbox);
+    }
+
+    #[test]
+    fn sandbox_for_stack_lookup() {
+        let store = StateStore::in_memory().unwrap();
+        let sandbox = sample_sandbox("sb-2", "myapp");
+
+        store.save_sandbox(&sandbox).unwrap();
+        let loaded = store.load_sandbox_for_stack("myapp").unwrap().unwrap();
+        assert_eq!(loaded.sandbox_id, "sb-2");
+    }
+
+    #[test]
+    fn sandbox_list_returns_all() {
+        let store = StateStore::in_memory().unwrap();
+        let sb1 = sample_sandbox("sb-a", "app1");
+        let mut sb2 = sample_sandbox("sb-b", "app2");
+        sb2.created_at = 1_700_000_001;
+
+        store.save_sandbox(&sb1).unwrap();
+        store.save_sandbox(&sb2).unwrap();
+
+        let all = store.list_sandboxes().unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn sandbox_delete_removes() {
+        let store = StateStore::in_memory().unwrap();
+        let sandbox = sample_sandbox("sb-del", "myapp");
+
+        store.save_sandbox(&sandbox).unwrap();
+        store.delete_sandbox("sb-del").unwrap();
+        let loaded = store.load_sandbox("sb-del").unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn sandbox_upsert_updates_state() {
+        let store = StateStore::in_memory().unwrap();
+        let mut sandbox = sample_sandbox("sb-up", "myapp");
+
+        store.save_sandbox(&sandbox).unwrap();
+
+        sandbox.state = SandboxState::Ready;
+        sandbox.updated_at = 1_700_000_100;
+        store.save_sandbox(&sandbox).unwrap();
+
+        let loaded = store.load_sandbox("sb-up").unwrap().unwrap();
+        assert_eq!(loaded.state, SandboxState::Ready);
+        assert_eq!(loaded.updated_at, 1_700_000_100);
+    }
+
+    #[test]
+    fn allocator_state_round_trip() {
+        let store = StateStore::in_memory().unwrap();
+
+        let snapshot = AllocatorSnapshot {
+            ports: HashMap::from([(
+                "web".to_string(),
+                vec![PublishedPort {
+                    protocol: "tcp".to_string(),
+                    container_port: 80,
+                    host_port: 8080,
+                }],
+            )]),
+            service_ips: HashMap::from([("web".to_string(), "10.0.0.2".to_string())]),
+            mount_tag_offsets: HashMap::from([("web".to_string(), 3)]),
+        };
+
+        store.save_allocator_state("myapp", &snapshot).unwrap();
+        let loaded = store.load_allocator_state("myapp").unwrap().unwrap();
+        assert_eq!(loaded, snapshot);
     }
 }

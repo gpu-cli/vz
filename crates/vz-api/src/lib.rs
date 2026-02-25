@@ -2,10 +2,11 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_stream::stream;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -17,9 +18,10 @@ use axum::routing::{any, get};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use uuid::Uuid;
 use vz_runtime_contract::{
-    Capability, MachineErrorEnvelope, RequestMetadata, RuntimeCapabilities, RuntimeError,
-    runtime_error_machine_envelope,
+    Capability, MachineErrorEnvelope, RequestMetadata, RuntimeCapabilities, RuntimeError, Sandbox,
+    SandboxBackend, SandboxSpec, SandboxState, runtime_error_machine_envelope,
 };
 use vz_stack::{EventRecord, StackError, StateStore};
 
@@ -113,6 +115,87 @@ struct EventsResponse {
 struct CapabilitiesResponse {
     request_id: String,
     capabilities: Vec<Capability>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateSandboxRequest {
+    #[serde(default)]
+    stack_name: Option<String>,
+    #[serde(default)]
+    cpus: Option<u8>,
+    #[serde(default)]
+    memory_mb: Option<u64>,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SandboxPayload {
+    sandbox_id: String,
+    backend: String,
+    state: String,
+    cpus: Option<u8>,
+    memory_mb: Option<u64>,
+    created_at: u64,
+    updated_at: u64,
+    labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SandboxResponse {
+    request_id: String,
+    sandbox: SandboxPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct SandboxListResponse {
+    request_id: String,
+    sandboxes: Vec<SandboxPayload>,
+}
+
+fn sandbox_to_payload(s: &Sandbox) -> SandboxPayload {
+    SandboxPayload {
+        sandbox_id: s.sandbox_id.clone(),
+        backend: serde_json::to_string(&s.backend)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string(),
+        state: serde_json::to_string(&s.state)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string(),
+        cpus: s.spec.cpus,
+        memory_mb: s.spec.memory_mb,
+        created_at: s.created_at,
+        updated_at: s.updated_at,
+        labels: s.labels.clone(),
+    }
+}
+
+fn json_error_response(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    request_id: &str,
+) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": {
+                "code": code,
+                "message": message,
+                "request_id": request_id
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn generated_request_id() -> String {
@@ -307,8 +390,185 @@ async fn ws_event_loop(
     }
 }
 
-async fn unsupported_sandboxes(headers: HeaderMap) -> Response {
-    unsupported_operation_response("sandboxes", request_id_from_headers(&headers))
+async fn create_sandbox(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateSandboxRequest>,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let now = now_epoch_secs();
+    let sandbox = Sandbox {
+        sandbox_id: format!("sbx-{}", Uuid::new_v4()),
+        backend: SandboxBackend::MacosVz,
+        spec: SandboxSpec {
+            cpus: body.cpus,
+            memory_mb: body.memory_mb,
+            ..SandboxSpec::default()
+        },
+        state: SandboxState::Creating,
+        created_at: now,
+        updated_at: now,
+        labels: body.labels,
+    };
+
+    if let Some(ref stack_name) = body.stack_name {
+        let mut labels = sandbox.labels.clone();
+        labels.insert("stack_name".to_string(), stack_name.clone());
+        let sandbox = Sandbox {
+            labels,
+            ..sandbox.clone()
+        };
+        if let Err(e) = store.save_sandbox(&sandbox) {
+            return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
+        }
+        return (
+            StatusCode::CREATED,
+            Json(SandboxResponse {
+                request_id,
+                sandbox: sandbox_to_payload(&sandbox),
+            }),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = store.save_sandbox(&sandbox) {
+        return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(SandboxResponse {
+            request_id,
+            sandbox: sandbox_to_payload(&sandbox),
+        }),
+    )
+        .into_response()
+}
+
+async fn list_sandboxes(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let sandboxes = match store.list_sandboxes() {
+        Ok(list) => list,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    (
+        StatusCode::OK,
+        Json(SandboxListResponse {
+            request_id,
+            sandboxes: sandboxes.iter().map(sandbox_to_payload).collect(),
+        }),
+    )
+        .into_response()
+}
+
+async fn get_sandbox(
+    State(state): State<ApiState>,
+    Path(sandbox_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    match store.load_sandbox(&sandbox_id) {
+        Ok(Some(sandbox)) => (
+            StatusCode::OK,
+            Json(SandboxResponse {
+                request_id,
+                sandbox: sandbox_to_payload(&sandbox),
+            }),
+        )
+            .into_response(),
+        Ok(None) => json_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("sandbox {sandbox_id} not found"),
+            &request_id,
+        ),
+        Err(e) => stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    }
+}
+
+async fn terminate_sandbox(
+    State(state): State<ApiState>,
+    Path(sandbox_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let mut sandbox = match store.load_sandbox(&sandbox_id) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return json_error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("sandbox {sandbox_id} not found"),
+                &request_id,
+            );
+        }
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    if sandbox.state.is_terminal() {
+        return (
+            StatusCode::OK,
+            Json(SandboxResponse {
+                request_id,
+                sandbox: sandbox_to_payload(&sandbox),
+            }),
+        )
+            .into_response();
+    }
+
+    // Transition based on current state:
+    // Creating -> Failed (can't go directly to Terminated)
+    // Ready -> Draining -> Terminated
+    // Draining -> Terminated
+    match sandbox.state {
+        SandboxState::Creating => {
+            let _ = sandbox.transition_to(SandboxState::Failed);
+        }
+        SandboxState::Ready => {
+            let _ = sandbox.transition_to(SandboxState::Draining);
+            let _ = sandbox.transition_to(SandboxState::Terminated);
+        }
+        SandboxState::Draining => {
+            let _ = sandbox.transition_to(SandboxState::Terminated);
+        }
+        _ => {}
+    }
+
+    sandbox.updated_at = now_epoch_secs();
+
+    if let Err(e) = store.save_sandbox(&sandbox) {
+        return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
+    }
+
+    (
+        StatusCode::OK,
+        Json(SandboxResponse {
+            request_id,
+            sandbox: sandbox_to_payload(&sandbox),
+        }),
+    )
+        .into_response()
 }
 
 async fn unsupported_leases(headers: HeaderMap) -> Response {
@@ -348,7 +608,11 @@ pub fn router(config: ApiConfig) -> Router {
         .route("/v1/events/{stack_name}", get(list_events))
         .route("/v1/events/{stack_name}/stream", get(stream_events_sse))
         .route("/v1/events/{stack_name}/ws", get(stream_events_ws))
-        .route("/v1/sandboxes", any(unsupported_sandboxes))
+        .route("/v1/sandboxes", get(list_sandboxes).post(create_sandbox))
+        .route(
+            "/v1/sandboxes/{sandbox_id}",
+            get(get_sandbox).delete(terminate_sandbox),
+        )
         .route("/v1/leases", any(unsupported_leases))
         .route("/v1/images", any(unsupported_images))
         .route("/v1/builds", any(unsupported_builds))
@@ -670,7 +934,10 @@ mod tests {
             }
 
             if status == StatusCode::OK
-                && matches!(surface.path, "/v1/capabilities" | "/v1/events/{stack_name}")
+                && matches!(
+                    surface.path,
+                    "/v1/capabilities" | "/v1/events/{stack_name}" | "/v1/sandboxes"
+                )
             {
                 continue;
             }
@@ -681,5 +948,197 @@ mod tests {
                 surface.path
             );
         }
+    }
+
+    fn test_router() -> (Router, tempfile::TempDir) {
+        let temp_dir = tempdir().unwrap();
+        let state_path = temp_dir.path().join("state.db");
+        StateStore::open(&state_path).unwrap();
+        let app = router(test_config(state_path));
+        (app, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn sandbox_create_returns_201() {
+        let (app, _dir) = test_router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sandboxes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"cpus": 2, "memory_mb": 1024}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sandbox_id = payload["sandbox"]["sandbox_id"].as_str().unwrap();
+        assert!(sandbox_id.starts_with("sbx-"), "id should start with sbx-");
+        assert_eq!(payload["sandbox"]["state"].as_str().unwrap(), "creating");
+        assert_eq!(payload["sandbox"]["cpus"].as_u64().unwrap(), 2);
+        assert_eq!(payload["sandbox"]["memory_mb"].as_u64().unwrap(), 1024);
+    }
+
+    #[tokio::test]
+    async fn sandbox_list_empty() {
+        let (app, _dir) = test_router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/sandboxes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sandboxes = payload["sandboxes"].as_array().unwrap();
+        assert!(sandboxes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sandbox_get_404() {
+        let (app, _dir) = test_router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/sandboxes/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn sandbox_create_then_get() {
+        let (app, _dir) = test_router();
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sandboxes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"cpus": 4}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+
+        let create_body = to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_payload: serde_json::Value = serde_json::from_slice(&create_body).unwrap();
+        let sandbox_id = create_payload["sandbox"]["sandbox_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let get_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/sandboxes/{sandbox_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+
+        let get_body = to_bytes(get_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let get_payload: serde_json::Value = serde_json::from_slice(&get_body).unwrap();
+        assert_eq!(
+            get_payload["sandbox"]["sandbox_id"].as_str().unwrap(),
+            sandbox_id
+        );
+        assert_eq!(get_payload["sandbox"]["cpus"].as_u64().unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn sandbox_terminate() {
+        let (app, _dir) = test_router();
+
+        // Create a sandbox
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sandboxes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+
+        let create_body = to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_payload: serde_json::Value = serde_json::from_slice(&create_body).unwrap();
+        let sandbox_id = create_payload["sandbox"]["sandbox_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Terminate sandbox (Creating -> Failed since can't go directly to Terminated)
+        let delete_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/sandboxes/{sandbox_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_response.status(), StatusCode::OK);
+
+        let delete_body = to_bytes(delete_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let delete_payload: serde_json::Value = serde_json::from_slice(&delete_body).unwrap();
+        let state = delete_payload["sandbox"]["state"].as_str().unwrap();
+        assert!(
+            state == "failed" || state == "terminated",
+            "expected terminal state, got {state}"
+        );
+
+        // GET should still return it in terminal state
+        let get_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/sandboxes/{sandbox_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+
+        let get_body = to_bytes(get_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let get_payload: serde_json::Value = serde_json::from_slice(&get_body).unwrap();
+        let final_state = get_payload["sandbox"]["state"].as_str().unwrap();
+        assert!(
+            final_state == "failed" || final_state == "terminated",
+            "expected terminal state after GET, got {final_state}"
+        );
     }
 }

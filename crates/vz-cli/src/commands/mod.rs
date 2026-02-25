@@ -22,6 +22,7 @@ pub mod restore;
 pub mod rm;
 #[cfg(target_os = "macos")]
 pub mod run;
+pub mod sandbox;
 #[cfg(target_os = "macos")]
 pub mod save;
 #[cfg(target_os = "macos")]

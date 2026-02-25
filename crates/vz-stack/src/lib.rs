@@ -46,7 +46,7 @@ pub use spec::{
     RestartPolicy, SecretDef, ServiceDependency, ServiceKind, ServiceSecretRef, ServiceSpec,
     StackSpec, VolumeSpec,
 };
-pub use state_store::{ServiceObservedState, ServicePhase, StateStore};
+pub use state_store::{AllocatorSnapshot, ServiceObservedState, ServicePhase, StateStore};
 pub use volume::{
     ResolvedMount, ResolvedMountKind, SkippedMount, VolumeManager, mounts_changed,
     orphaned_volumes, referenced_volume_names, resolve_mounts,

@@ -7,18 +7,20 @@
 //! 4. Re-apply when health status changes (unblocking deferred services).
 //! 5. Exit when all services are converged (running+ready or permanently failed).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info, warn};
 
+use vz_runtime_contract::{Sandbox, SandboxBackend, SandboxSpec, SandboxState};
+
 use crate::error::StackError;
 use crate::events::StackEvent;
 use crate::executor::{ContainerRuntime, ExecutionResult, StackExecutor};
 use crate::health::{HealthPollResult, HealthPoller};
-use crate::reconcile::{ApplyResult, apply};
-use crate::restart::cleanup_orphaned_reconcile_progress;
+use crate::reconcile::{Action, ApplyResult, apply};
+use crate::restart::{RestartTracker, cleanup_orphaned_reconcile_progress, compute_restarts};
 use crate::spec::StackSpec;
 use crate::state_store::{ServicePhase, StateStore};
 
@@ -91,6 +93,7 @@ pub struct StackOrchestrator<R: ContainerRuntime> {
     executor: StackExecutor<R>,
     reconcile_store: StateStore,
     health_poller: HealthPoller,
+    restart_tracker: RestartTracker,
     config: OrchestrationConfig,
 }
 
@@ -108,6 +111,7 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
             executor,
             reconcile_store,
             health_poller: HealthPoller::new(),
+            restart_tracker: RestartTracker::new(),
             config,
         }
     }
@@ -147,6 +151,135 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
         rx
     }
 
+    /// Ensure a sandbox exists for the given stack, creating one if needed.
+    ///
+    /// If a non-terminal sandbox already exists for this stack, it is
+    /// reused. Terminal sandboxes are cleaned up and replaced.
+    fn ensure_sandbox(&self, spec: &StackSpec) -> Result<Sandbox, StackError> {
+        if let Some(existing) = self.reconcile_store.load_sandbox_for_stack(&spec.name)? {
+            if !existing.state.is_terminal() {
+                return Ok(existing);
+            }
+            // Terminal sandbox — clean up and create fresh.
+            self.reconcile_store.delete_sandbox(&existing.sandbox_id)?;
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let sandbox_id = format!("sbx-{:016x}", now);
+        let mut labels = BTreeMap::new();
+        labels.insert("stack_name".to_string(), spec.name.clone());
+
+        let sandbox = Sandbox {
+            sandbox_id: sandbox_id.clone(),
+            backend: SandboxBackend::MacosVz,
+            spec: SandboxSpec::default(),
+            state: SandboxState::Creating,
+            created_at: now,
+            updated_at: now,
+            labels,
+        };
+
+        self.reconcile_store.save_sandbox(&sandbox)?;
+
+        self.reconcile_store.emit_event(
+            &spec.name,
+            &StackEvent::SandboxCreating {
+                stack_name: spec.name.clone(),
+                sandbox_id,
+            },
+        )?;
+
+        Ok(sandbox)
+    }
+
+    /// Transition a sandbox from Creating to Ready.
+    fn transition_sandbox_ready(
+        &self,
+        spec: &StackSpec,
+        sandbox_id: &str,
+    ) -> Result<(), StackError> {
+        let Some(mut sandbox) = self.reconcile_store.load_sandbox(sandbox_id)? else {
+            return Ok(());
+        };
+        if sandbox.state != SandboxState::Creating {
+            return Ok(());
+        }
+
+        sandbox
+            .transition_to(SandboxState::Ready)
+            .map_err(|e| StackError::InvalidSpec(e.to_string()))?;
+        sandbox.updated_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        self.reconcile_store.save_sandbox(&sandbox)?;
+
+        self.reconcile_store.emit_event(
+            &spec.name,
+            &StackEvent::SandboxReady {
+                stack_name: spec.name.clone(),
+                sandbox_id: sandbox_id.to_string(),
+            },
+        )?;
+
+        Ok(())
+    }
+
+    /// Tear down the sandbox for a stack, transitioning through Draining to Terminated.
+    pub fn teardown_sandbox(&self, spec: &StackSpec) -> Result<(), StackError> {
+        let Some(mut sandbox) = self.reconcile_store.load_sandbox_for_stack(&spec.name)? else {
+            return Ok(());
+        };
+        if sandbox.state.is_terminal() {
+            return Ok(());
+        }
+
+        let sandbox_id = sandbox.sandbox_id.clone();
+
+        // If Ready, transition to Draining first.
+        if sandbox.state == SandboxState::Ready {
+            sandbox
+                .transition_to(SandboxState::Draining)
+                .map_err(|e| StackError::InvalidSpec(e.to_string()))?;
+            sandbox.updated_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            self.reconcile_store.save_sandbox(&sandbox)?;
+            self.reconcile_store.emit_event(
+                &spec.name,
+                &StackEvent::SandboxDraining {
+                    stack_name: spec.name.clone(),
+                    sandbox_id: sandbox_id.clone(),
+                },
+            )?;
+        }
+
+        // Transition to Terminated.
+        sandbox
+            .transition_to(SandboxState::Terminated)
+            .map_err(|e| StackError::InvalidSpec(e.to_string()))?;
+        sandbox.updated_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.reconcile_store.save_sandbox(&sandbox)?;
+        self.reconcile_store.emit_event(
+            &spec.name,
+            &StackEvent::SandboxTerminated {
+                stack_name: spec.name.clone(),
+                sandbox_id,
+            },
+        )?;
+
+        Ok(())
+    }
+
     /// Run the orchestration loop until convergence or max rounds.
     ///
     /// The optional `on_round` callback is invoked after each round with
@@ -169,6 +302,17 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
         let _ = cleanup_orphaned_reconcile_progress(&self.reconcile_store, &spec.name)?;
         // Resume any incomplete action batch before starting new planning rounds.
         let _ = self.resume_incomplete_apply(spec)?;
+        // Rehydrate persisted health poll state so restart recovery preserves debounce context.
+        self.health_poller
+            .restore_from_store(&self.reconcile_store, &spec.name)?;
+
+        // Ensure a sandbox exists for this stack.
+        let sandbox = self.ensure_sandbox(spec)?;
+        let sandbox_id = sandbox.sandbox_id.clone();
+        let mut sandbox_marked_ready = sandbox.state != SandboxState::Creating;
+
+        // Restore allocator state from a prior run (crash recovery).
+        self.executor.restore_allocator_state(&spec.name)?;
 
         for round in 1..=self.config.max_rounds {
             info!(round, "orchestration round");
@@ -209,6 +353,16 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
                 None
             };
 
+            // 2b. Mark sandbox ready once first successful execution.
+            if !sandbox_marked_ready {
+                if let Some(ref result) = exec_result {
+                    if result.succeeded > 0 {
+                        self.transition_sandbox_ready(spec, &sandbox_id)?;
+                        sandbox_marked_ready = true;
+                    }
+                }
+            }
+
             // 3. Poll health checks (if any services have them).
             let health_result = if has_health_checks {
                 let result = self.health_poller.poll_all(
@@ -226,6 +380,23 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
             } else {
                 None
             };
+
+            // 3b. Check for services needing restart based on restart policies.
+            let observed_for_restart = self.executor.store().load_observed_state(&spec.name)?;
+            let restart_actions =
+                compute_restarts(spec, &observed_for_restart, &self.restart_tracker);
+            if !restart_actions.is_empty() {
+                info!(
+                    restarts = restart_actions.len(),
+                    "executing restart actions"
+                );
+                let _restart_result = self.executor.execute(spec, &restart_actions)?;
+                for action in &restart_actions {
+                    if let Action::ServiceCreate { service_name } = action {
+                        self.restart_tracker.record_restart(service_name);
+                    }
+                }
+            }
 
             // 4. Check convergence.
             let (ready, failed, pending) = self.check_convergence(spec)?;
@@ -752,5 +923,41 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    // ── Sandbox lifecycle tests ──
+
+    #[test]
+    fn orchestrator_creates_sandbox_on_run() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
+        let (mut orch, _tmp) = make_orchestrator_shared(runtime);
+        let spec = stack("app", vec![svc("web")]);
+
+        let result = orch.run(&spec, None).unwrap();
+        assert!(result.converged);
+
+        // Sandbox should exist and be Ready (single service converged).
+        let sandbox = orch.reconcile_store.load_sandbox_for_stack("app").unwrap();
+        assert!(sandbox.is_some());
+        let sandbox = sandbox.unwrap();
+        assert_eq!(sandbox.state, SandboxState::Ready);
+    }
+
+    #[test]
+    fn orchestrator_teardown_transitions_to_terminated() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
+        let (mut orch, _tmp) = make_orchestrator_shared(runtime);
+        let spec = stack("app", vec![svc("web")]);
+
+        orch.run(&spec, None).unwrap();
+
+        orch.teardown_sandbox(&spec).unwrap();
+
+        let sandbox = orch
+            .reconcile_store
+            .load_sandbox_for_stack("app")
+            .unwrap()
+            .unwrap();
+        assert_eq!(sandbox.state, SandboxState::Terminated);
     }
 }
