@@ -1854,6 +1854,8 @@ fn event_service_name(event: &StackEvent) -> Option<&str> {
         | StackEvent::ExecutionExited { .. }
         | StackEvent::ExecutionFailed { .. }
         | StackEvent::ExecutionCanceled { .. }
+        | StackEvent::ExecutionResized { .. }
+        | StackEvent::ExecutionSignaled { .. }
         | StackEvent::CheckpointCreating { .. }
         | StackEvent::CheckpointReady { .. }
         | StackEvent::CheckpointFailed { .. }
@@ -2515,6 +2517,15 @@ fn format_event_summary(event: &StackEvent) -> String {
         StackEvent::ExecutionCanceled { execution_id } => {
             format!("execution canceled: {execution_id}")
         }
+        StackEvent::ExecutionResized {
+            execution_id,
+            cols,
+            rows,
+        } => format!("execution resized: {execution_id} ({cols}x{rows})"),
+        StackEvent::ExecutionSignaled {
+            execution_id,
+            signal,
+        } => format!("execution signaled: {execution_id} ({signal})"),
         StackEvent::CheckpointCreating {
             checkpoint_id,
             class,

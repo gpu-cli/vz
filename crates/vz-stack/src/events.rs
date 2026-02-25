@@ -275,6 +275,24 @@ pub enum StackEvent {
         /// Execution identifier.
         execution_id: String,
     },
+    /// An execution PTY was resized.
+    #[serde(rename = "execution_resized")]
+    ExecutionResized {
+        /// Execution identifier.
+        execution_id: String,
+        /// New column count.
+        cols: u16,
+        /// New row count.
+        rows: u16,
+    },
+    /// A signal was sent to an execution.
+    #[serde(rename = "execution_signaled")]
+    ExecutionSignaled {
+        /// Execution identifier.
+        execution_id: String,
+        /// Signal name or number (e.g., "SIGTERM", "9").
+        signal: String,
+    },
     /// A checkpoint is being created for a sandbox.
     #[serde(rename = "checkpoint_creating")]
     CheckpointCreating {
@@ -587,6 +605,15 @@ mod tests {
             StackEvent::ExecutionCanceled {
                 execution_id: "exec-3".to_string(),
             },
+            StackEvent::ExecutionResized {
+                execution_id: "exec-1".to_string(),
+                cols: 120,
+                rows: 40,
+            },
+            StackEvent::ExecutionSignaled {
+                execution_id: "exec-1".to_string(),
+                signal: "SIGTERM".to_string(),
+            },
             StackEvent::CheckpointCreating {
                 sandbox_id: "sb-1".to_string(),
                 checkpoint_id: "ckpt-1".to_string(),
@@ -850,6 +877,21 @@ mod tests {
                     execution_id: "ex".to_string(),
                 },
                 "execution_canceled",
+            ),
+            (
+                StackEvent::ExecutionResized {
+                    execution_id: "ex".to_string(),
+                    cols: 80,
+                    rows: 24,
+                },
+                "execution_resized",
+            ),
+            (
+                StackEvent::ExecutionSignaled {
+                    execution_id: "ex".to_string(),
+                    signal: "SIGTERM".to_string(),
+                },
+                "execution_signaled",
             ),
             (
                 StackEvent::CheckpointCreating {

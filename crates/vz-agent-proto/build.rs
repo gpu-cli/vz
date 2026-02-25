@@ -1,9 +1,11 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proto_path = "proto/agent.proto";
+    let proto_paths = &["proto/agent.proto", "proto/runtime_v2.proto"];
     let out_dir = "src/generated";
 
-    // Re-run generation if the proto changes.
-    println!("cargo:rerun-if-changed={proto_path}");
+    // Re-run generation if any proto changes.
+    for path in proto_paths {
+        println!("cargo:rerun-if-changed={path}");
+    }
 
     // Only regenerate when explicitly requested; default builds use
     // checked-in output.
@@ -24,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .out_dir(out_dir)
-        .compile_protos(&[proto_path], &["proto"])?;
+        .compile_protos(proto_paths, &["proto"])?;
 
     Ok(())
 }

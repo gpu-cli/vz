@@ -80,7 +80,7 @@ pub const PRIMITIVE_CONFORMANCE_MATRIX: &[PrimitiveConformanceEntry] = &[
             path: "/v1/sandboxes",
             surface: "sandboxes",
         }),
-        manager: false,
+        manager: true,
         grpc_metadata: false,
         cli: false,
     },
@@ -90,7 +90,7 @@ pub const PRIMITIVE_CONFORMANCE_MATRIX: &[PrimitiveConformanceEntry] = &[
             path: "/v1/sandboxes",
             surface: "sandboxes",
         }),
-        manager: false,
+        manager: true,
         grpc_metadata: false,
         cli: false,
     },
@@ -100,7 +100,7 @@ pub const PRIMITIVE_CONFORMANCE_MATRIX: &[PrimitiveConformanceEntry] = &[
             path: "/v1/sandboxes",
             surface: "sandboxes",
         }),
-        manager: false,
+        manager: true,
         grpc_metadata: false,
         cli: false,
     },
@@ -1292,6 +1292,97 @@ impl<B: RuntimeBackend> WorkspaceRuntimeManager<B> {
         }
         self.backend.has_shared_vm(stack_id)
     }
+
+    /// List all tracked containers.
+    pub fn list_containers(&self) -> Result<Vec<ContainerInfo>, RuntimeError> {
+        self.backend.list_containers()
+    }
+
+    /// List locally cached images.
+    pub fn list_images(&self) -> Result<Vec<ImageInfo>, RuntimeError> {
+        self.backend.images()
+    }
+
+    /// Remove unreferenced images and layers.
+    pub fn prune_images(&self) -> Result<PruneResult, RuntimeError> {
+        self.backend.prune_images()
+    }
+
+    // ── Sandbox-scoped operations ──────────────────────────────────
+    //
+    // These methods provide sandbox-oriented terminology for operations
+    // that delegate to the underlying shared-VM / stack primitives on
+    // `RuntimeBackend`.  They are intentionally thin wrappers that
+    // align the manager surface with the Runtime V2 sandbox entity
+    // model.
+
+    /// Create a sandbox, delegating to the backend's `boot_shared_vm`.
+    ///
+    /// This is the sandbox-scoped entry point for provisioning an
+    /// isolated runtime environment. The sandbox owns all containers,
+    /// networking, and volumes created within its scope.
+    pub async fn create_sandbox(
+        &self,
+        sandbox_id: &str,
+        spec: &SandboxSpec,
+        ports: Vec<PortMapping>,
+    ) -> Result<(), RuntimeError> {
+        let resources = StackResourceHint {
+            cpus: spec.cpus,
+            memory_mb: spec.memory_mb,
+            volume_mounts: Vec::new(),
+            disk_image_path: None,
+        };
+        self.backend
+            .boot_shared_vm(sandbox_id, ports, resources)
+            .await
+    }
+
+    /// Terminate a sandbox, delegating to `shutdown_shared_vm`.
+    pub async fn terminate_sandbox(&self, sandbox_id: &str) -> Result<(), RuntimeError> {
+        self.backend.shutdown_shared_vm(sandbox_id).await
+    }
+
+    /// Check if a sandbox is active.
+    pub fn has_sandbox(&self, sandbox_id: &str) -> bool {
+        self.backend.has_shared_vm(sandbox_id)
+    }
+
+    /// Create a container within a sandbox scope.
+    ///
+    /// Routes through the backend's `create_container_in_stack` path
+    /// so that the container is created inside the sandbox's shared
+    /// runtime environment.
+    pub async fn create_container_in_sandbox(
+        &self,
+        sandbox_id: &str,
+        image: &str,
+        config: RunConfig,
+    ) -> Result<String, RuntimeError> {
+        self.backend
+            .create_container_in_stack(sandbox_id, image, config)
+            .await
+    }
+
+    /// Set up networking for services within a sandbox.
+    pub async fn setup_sandbox_network(
+        &self,
+        sandbox_id: &str,
+        services: Vec<NetworkServiceConfig>,
+    ) -> Result<(), RuntimeError> {
+        self.backend.network_setup(sandbox_id, services).await
+    }
+
+    /// Tear down networking for services within a sandbox.
+    pub async fn teardown_sandbox_network(
+        &self,
+        sandbox_id: &str,
+        service_names: Vec<String>,
+    ) -> Result<(), RuntimeError> {
+        self.backend
+            .network_teardown(sandbox_id, service_names)
+            .await
+    }
 }
 
 /// Backend-neutral container runtime trait.
@@ -1757,6 +1848,28 @@ mod tests {
             self.record("network_setup");
             ready(Ok(()))
         }
+
+        fn network_teardown(
+            &self,
+            _stack_id: &str,
+            _service_names: Vec<String>,
+        ) -> impl Future<Output = Result<(), RuntimeError>> {
+            self.record("network_teardown");
+            ready(Ok(()))
+        }
+
+        fn shutdown_shared_vm(
+            &self,
+            _stack_id: &str,
+        ) -> impl Future<Output = Result<(), RuntimeError>> {
+            self.record("shutdown_shared_vm");
+            ready(Ok(()))
+        }
+
+        fn has_shared_vm(&self, _stack_id: &str) -> bool {
+            self.record("has_shared_vm");
+            true
+        }
     }
 
     /// Verify the trait is object-safe enough for our usage pattern.
@@ -2040,6 +2153,111 @@ mod tests {
         poll_immediate(manager.setup_stack_network("stack-1", Vec::new())).unwrap();
 
         assert!(manager.backend().calls().is_empty());
+    }
+
+    #[test]
+    fn manager_create_sandbox_delegates_to_boot_shared_vm() {
+        let backend = ManagerRoutingBackend::new(RuntimeCapabilities::stack_baseline());
+        let manager = WorkspaceRuntimeManager::new(backend);
+        let spec = SandboxSpec {
+            cpus: Some(4),
+            memory_mb: Some(8192),
+            ..SandboxSpec::default()
+        };
+
+        poll_immediate(manager.create_sandbox("sbx-1", &spec, vec![])).unwrap();
+
+        assert_eq!(manager.backend().calls(), vec!["boot_shared_vm"]);
+    }
+
+    #[test]
+    fn manager_terminate_sandbox_delegates_to_shutdown_shared_vm() {
+        let backend = ManagerRoutingBackend::new(RuntimeCapabilities::stack_baseline());
+        let manager = WorkspaceRuntimeManager::new(backend);
+
+        poll_immediate(manager.terminate_sandbox("sbx-1")).unwrap();
+
+        assert_eq!(manager.backend().calls(), vec!["shutdown_shared_vm"]);
+    }
+
+    #[test]
+    fn manager_has_sandbox_delegates_to_has_shared_vm() {
+        let backend = ManagerRoutingBackend::new(RuntimeCapabilities::stack_baseline());
+        let manager = WorkspaceRuntimeManager::new(backend);
+
+        assert!(manager.has_sandbox("sbx-1"));
+        assert_eq!(manager.backend().calls(), vec!["has_shared_vm"]);
+    }
+
+    #[test]
+    fn manager_create_container_in_sandbox_delegates_to_create_container_in_stack() {
+        let backend = ManagerRoutingBackend::new(RuntimeCapabilities::stack_baseline());
+        let manager = WorkspaceRuntimeManager::new(backend);
+
+        let id = poll_immediate(manager.create_container_in_sandbox(
+            "sbx-1",
+            "alpine:latest",
+            RunConfig::default(),
+        ))
+        .unwrap();
+
+        assert_eq!(id, "ctr-stack");
+        assert_eq!(manager.backend().calls(), vec!["create_container_in_stack"]);
+    }
+
+    #[test]
+    fn manager_setup_sandbox_network_delegates_to_network_setup() {
+        let backend = ManagerRoutingBackend::new(RuntimeCapabilities::stack_baseline());
+        let manager = WorkspaceRuntimeManager::new(backend);
+
+        poll_immediate(manager.setup_sandbox_network(
+            "sbx-1",
+            vec![NetworkServiceConfig {
+                name: "web".to_string(),
+                addr: "172.20.0.2".to_string(),
+                network_name: "default".to_string(),
+            }],
+        ))
+        .unwrap();
+
+        assert_eq!(manager.backend().calls(), vec!["network_setup"]);
+    }
+
+    #[test]
+    fn manager_teardown_sandbox_network_delegates_to_network_teardown() {
+        let backend = ManagerRoutingBackend::new(RuntimeCapabilities::stack_baseline());
+        let manager = WorkspaceRuntimeManager::new(backend);
+
+        poll_immediate(manager.teardown_sandbox_network("sbx-1", vec!["web".to_string()])).unwrap();
+
+        assert_eq!(manager.backend().calls(), vec!["network_teardown"]);
+    }
+
+    #[test]
+    fn manager_list_containers_delegates_to_backend() {
+        let backend = ManagerRoutingBackend::new(RuntimeCapabilities::stack_baseline());
+        let manager = WorkspaceRuntimeManager::new(backend);
+
+        let containers = manager.list_containers().unwrap();
+        assert!(containers.is_empty());
+    }
+
+    #[test]
+    fn manager_list_images_delegates_to_backend() {
+        let backend = ManagerRoutingBackend::new(RuntimeCapabilities::stack_baseline());
+        let manager = WorkspaceRuntimeManager::new(backend);
+
+        let images = manager.list_images().unwrap();
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn manager_prune_images_delegates_to_backend() {
+        let backend = ManagerRoutingBackend::new(RuntimeCapabilities::stack_baseline());
+        let manager = WorkspaceRuntimeManager::new(backend);
+
+        let result = manager.prune_images().unwrap();
+        assert_eq!(result.removed_refs, 0);
     }
 
     #[test]
@@ -2683,6 +2901,9 @@ mod tests {
 
     fn expected_manager_surface_operations() -> HashSet<RuntimeOperation> {
         [
+            RuntimeOperation::CreateSandbox,
+            RuntimeOperation::GetSandbox,
+            RuntimeOperation::TerminateSandbox,
             RuntimeOperation::PullImage,
             RuntimeOperation::CreateContainer,
             RuntimeOperation::ExecContainer,

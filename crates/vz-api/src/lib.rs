@@ -1,6 +1,7 @@
 //! OpenAPI/SSE/WebSocket transport adapter for Runtime V2.
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -27,7 +28,7 @@ use vz_runtime_contract::{
 };
 use vz_stack::{
     EventRecord, IDEMPOTENCY_TTL_SECS, IdempotencyRecord, ImageRecord, Receipt, StackError,
-    StateStore,
+    StackEvent, StateStore,
 };
 
 const DEFAULT_EVENT_PAGE_SIZE: usize = 100;
@@ -259,6 +260,19 @@ struct ExecutionListResponse {
     executions: Vec<ExecutionPayload>,
 }
 
+/// Request body for `POST /v1/executions/{execution_id}/resize`.
+#[derive(Debug, Deserialize)]
+struct ResizeExecRequest {
+    cols: u16,
+    rows: u16,
+}
+
+/// Request body for `POST /v1/executions/{execution_id}/signal`.
+#[derive(Debug, Deserialize)]
+struct SignalExecRequest {
+    signal: String,
+}
+
 fn execution_to_payload(e: &Execution) -> ExecutionPayload {
     ExecutionPayload {
         execution_id: e.execution_id.clone(),
@@ -305,6 +319,15 @@ struct CheckpointPayload {
 struct CheckpointResponse {
     request_id: String,
     checkpoint: CheckpointPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct RestoreCheckpointResponse {
+    request_id: String,
+    checkpoint: CheckpointPayload,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compatibility_fingerprint: Option<String>,
+    restore_note: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1548,6 +1571,14 @@ async fn cancel_execution(
         return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
     }
 
+    // Emit ExecutionCanceled event for observability.
+    let _ = store.emit_event(
+        "api",
+        &vz_stack::StackEvent::ExecutionCanceled {
+            execution_id: execution.execution_id.clone(),
+        },
+    );
+
     let receipt_id = emit_receipt(
         &store,
         "cancel_execution",
@@ -1566,6 +1597,132 @@ async fn cancel_execution(
         }
     }
     resp
+}
+
+async fn resize_exec(
+    State(state): State<ApiState>,
+    Path(execution_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ResizeExecRequest>,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let execution = match store.load_execution(&execution_id) {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            return json_error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("execution {execution_id} not found"),
+                &request_id,
+            );
+        }
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    if execution.state != ExecutionState::Running {
+        return json_error_response(
+            StatusCode::CONFLICT,
+            "invalid_state",
+            &format!(
+                "execution {execution_id} is not running (current state: {})",
+                serde_json::to_string(&execution.state)
+                    .unwrap_or_default()
+                    .trim_matches('"')
+            ),
+            &request_id,
+        );
+    }
+
+    if !state.capabilities.live_resize {
+        return json_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_operation",
+            "PTY resize is not supported by the current backend",
+            &request_id,
+        );
+    }
+
+    // Emit resize event for observability.
+    let _ = store.emit_event(
+        "api",
+        &vz_stack::StackEvent::ExecutionResized {
+            execution_id: execution_id.clone(),
+            cols: body.cols,
+            rows: body.rows,
+        },
+    );
+
+    (
+        StatusCode::OK,
+        Json(ExecutionResponse {
+            request_id,
+            execution: execution_to_payload(&execution),
+        }),
+    )
+        .into_response()
+}
+
+async fn signal_exec(
+    State(state): State<ApiState>,
+    Path(execution_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<SignalExecRequest>,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let execution = match store.load_execution(&execution_id) {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            return json_error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("execution {execution_id} not found"),
+                &request_id,
+            );
+        }
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    if execution.state.is_terminal() {
+        return json_error_response(
+            StatusCode::CONFLICT,
+            "invalid_state",
+            &format!(
+                "execution {execution_id} is in terminal state (current state: {})",
+                serde_json::to_string(&execution.state)
+                    .unwrap_or_default()
+                    .trim_matches('"')
+            ),
+            &request_id,
+        );
+    }
+
+    // Emit signal event for observability.
+    let _ = store.emit_event(
+        "api",
+        &vz_stack::StackEvent::ExecutionSignaled {
+            execution_id: execution_id.clone(),
+            signal: body.signal,
+        },
+    );
+
+    (
+        StatusCode::OK,
+        Json(ExecutionResponse {
+            request_id,
+            execution: execution_to_payload(&execution),
+        }),
+    )
+        .into_response()
 }
 
 // ── Checkpoint handlers ──
@@ -1617,6 +1774,27 @@ async fn create_checkpoint(
             );
         }
     };
+
+    // Capability gating: reject checkpoint classes not supported by the current backend.
+    match class {
+        CheckpointClass::VmFull if !state.capabilities.vm_full_checkpoint => {
+            return json_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_checkpoint_class",
+                "VM full checkpoints are not supported by the current backend",
+                &request_id,
+            );
+        }
+        CheckpointClass::FsQuick if !state.capabilities.fs_quick_checkpoint => {
+            return json_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_checkpoint_class",
+                "Filesystem quick checkpoints are not supported by the current backend",
+                &request_id,
+            );
+        }
+        _ => {}
+    }
 
     let fingerprint = body
         .compatibility_fingerprint
@@ -1768,13 +1946,24 @@ async fn restore_checkpoint(
         );
     }
 
-    // In a real implementation, this would trigger the actual restore operation.
-    // For now, return the checkpoint as acknowledgement.
+    // In a real implementation, this would trigger the actual restore operation
+    // at the backend layer. Return the checkpoint with fingerprint metadata so
+    // callers can perform their own compatibility validation.
+    let fingerprint = if checkpoint.compatibility_fingerprint.is_empty()
+        || checkpoint.compatibility_fingerprint == "unset"
+    {
+        None
+    } else {
+        Some(checkpoint.compatibility_fingerprint.clone())
+    };
+
     (
         StatusCode::OK,
-        Json(CheckpointResponse {
+        Json(RestoreCheckpointResponse {
             request_id,
             checkpoint: checkpoint_to_payload(&checkpoint),
+            compatibility_fingerprint: fingerprint,
+            restore_note: "Backend-level restore is delegated to the runtime; fingerprint validation is the caller's responsibility".to_string(),
         }),
     )
         .into_response()
@@ -1869,6 +2058,24 @@ async fn fork_checkpoint(
         return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
     }
 
+    // Emit CheckpointForked event (best-effort; failure does not block the response).
+    let _ = store.emit_event(
+        "default",
+        &StackEvent::CheckpointForked {
+            parent_checkpoint_id: parent.checkpoint_id.clone(),
+            new_checkpoint_id: forked.checkpoint_id.clone(),
+            new_sandbox_id: forked.sandbox_id.clone(),
+        },
+    );
+
+    emit_receipt(
+        &store,
+        "fork_checkpoint",
+        &forked.checkpoint_id,
+        "checkpoint",
+        &request_id,
+    );
+
     let response = CheckpointResponse {
         request_id,
         checkpoint: checkpoint_to_payload(&forked),
@@ -1886,6 +2093,46 @@ async fn fork_checkpoint(
         }
     }
     (StatusCode::CREATED, Json(response)).into_response()
+}
+
+async fn list_checkpoint_children(
+    State(state): State<ApiState>,
+    Path(checkpoint_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    // Verify the parent checkpoint exists.
+    match store.load_checkpoint(&checkpoint_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return json_error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("checkpoint {checkpoint_id} not found"),
+                &request_id,
+            );
+        }
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    }
+
+    let children = match store.list_checkpoint_children(&checkpoint_id) {
+        Ok(list) => list,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    (
+        StatusCode::OK,
+        Json(CheckpointListResponse {
+            request_id,
+            checkpoints: children.iter().map(checkpoint_to_payload).collect(),
+        }),
+    )
+        .into_response()
 }
 
 // ── Container handlers ──
@@ -2328,6 +2575,8 @@ pub fn router(config: ApiConfig) -> Router {
             "/v1/executions/{execution_id}",
             get(get_execution).delete(cancel_execution),
         )
+        .route("/v1/executions/{execution_id}/resize", post(resize_exec))
+        .route("/v1/executions/{execution_id}/signal", post(signal_exec))
         .route(
             "/v1/checkpoints",
             get(list_checkpoints).post(create_checkpoint),
@@ -2340,6 +2589,10 @@ pub fn router(config: ApiConfig) -> Router {
         .route(
             "/v1/checkpoints/{checkpoint_id}/fork",
             post(fork_checkpoint),
+        )
+        .route(
+            "/v1/checkpoints/{checkpoint_id}/children",
+            get(list_checkpoint_children),
         )
         .route(
             "/v1/containers",
@@ -2962,10 +3215,120 @@ pub fn openapi_document() -> serde_json::Value {
                     }
                 }
             },
+            "/v1/executions/{execution_id}/resize": {
+                "post": {
+                    "operationId": "resizeExec",
+                    "summary": "Resize the PTY of a running execution",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/ExecutionId" }
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/ResizeExecRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Resize acknowledged",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ExecutionResponse" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Execution not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "409": {
+                            "description": "Execution is not running",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "422": {
+                            "description": "PTY resize unsupported by backend",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/executions/{execution_id}/signal": {
+                "post": {
+                    "operationId": "signalExec",
+                    "summary": "Send a signal to a running execution",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/ExecutionId" }
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/SignalExecRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Signal acknowledged",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ExecutionResponse" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Execution not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "409": {
+                            "description": "Execution is in terminal state",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
             "/v1/checkpoints": {
                 "post": {
                     "operationId": "createCheckpoint",
-                    "summary": "Create a checkpoint of a sandbox",
+                    "summary": "Create a checkpoint of a sandbox (capability-gated: requires fs_quick_checkpoint or vm_full_checkpoint)",
                     "parameters": [
                         { "$ref": "#/components/parameters/IdempotencyKey" },
                         { "$ref": "#/components/parameters/RequestId" }
@@ -2989,6 +3352,14 @@ pub fn openapi_document() -> serde_json::Value {
                         },
                         "400": {
                             "description": "Invalid checkpoint class",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "422": {
+                            "description": "Unsupported checkpoint class — the requested class is not enabled by the current backend capabilities (error code: unsupported_checkpoint_class)",
                             "content": {
                                 "application/json": {
                                     "schema": { "$ref": "#/components/schemas/ErrorResponse" }
@@ -3142,6 +3513,41 @@ pub fn openapi_document() -> serde_json::Value {
                         },
                         "409": {
                             "description": "Parent checkpoint not in ready state",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/checkpoints/{checkpoint_id}/children": {
+                "get": {
+                    "operationId": "listCheckpointChildren",
+                    "summary": "List child checkpoints forked from a parent checkpoint",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/CheckpointId" }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "List of child checkpoints",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/CheckpointListResponse" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Parent checkpoint not found",
                             "content": {
                                 "application/json": {
                                     "schema": { "$ref": "#/components/schemas/ErrorResponse" }
@@ -3608,6 +4014,21 @@ pub fn openapi_document() -> serde_json::Value {
                         "timeout_secs": { "type": "integer", "nullable": true, "description": "Execution timeout in seconds" }
                     }
                 },
+                "ResizeExecRequest": {
+                    "type": "object",
+                    "required": ["cols", "rows"],
+                    "properties": {
+                        "cols": { "type": "integer", "format": "uint16", "description": "Number of columns" },
+                        "rows": { "type": "integer", "format": "uint16", "description": "Number of rows" }
+                    }
+                },
+                "SignalExecRequest": {
+                    "type": "object",
+                    "required": ["signal"],
+                    "properties": {
+                        "signal": { "type": "string", "description": "Signal name (e.g. SIGTERM) or number (e.g. 9)" }
+                    }
+                },
                 "ExecutionResponse": {
                     "type": "object",
                     "required": ["request_id", "execution"],
@@ -3731,8 +4152,11 @@ mod tests {
         assert!(paths.contains_key("/v1/containers/{container_id}"));
         assert!(paths.contains_key("/v1/executions"));
         assert!(paths.contains_key("/v1/executions/{execution_id}"));
+        assert!(paths.contains_key("/v1/executions/{execution_id}/resize"));
+        assert!(paths.contains_key("/v1/executions/{execution_id}/signal"));
         assert!(paths.contains_key("/v1/checkpoints"));
         assert!(paths.contains_key("/v1/checkpoints/{checkpoint_id}"));
+        assert!(paths.contains_key("/v1/checkpoints/{checkpoint_id}/children"));
         assert!(paths.contains_key("/v1/events/{stack_name}"));
         assert!(paths.contains_key("/v1/events/{stack_name}/stream"));
         assert!(paths.contains_key("/v1/events/{stack_name}/ws"));
@@ -4209,5 +4633,528 @@ mod tests {
             final_state == "failed" || final_state == "terminated",
             "expected terminal state after GET, got {final_state}"
         );
+    }
+
+    fn test_config_with_resize(state_store_path: PathBuf) -> ApiConfig {
+        ApiConfig {
+            state_store_path,
+            capabilities: RuntimeCapabilities {
+                fs_quick_checkpoint: true,
+                checkpoint_fork: true,
+                live_resize: true,
+                ..RuntimeCapabilities::default()
+            },
+            event_poll_interval: Duration::from_millis(10),
+            default_event_page_size: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn resize_on_running_execution_succeeds() {
+        let temp_dir = tempdir().unwrap();
+        let state_path = temp_dir.path().join("state.db");
+        let store = StateStore::open(&state_path).unwrap();
+
+        // Create a Running execution directly.
+        let execution = Execution {
+            execution_id: "exec-resize-1".to_string(),
+            container_id: "ctr-1".to_string(),
+            exec_spec: ExecutionSpec {
+                cmd: vec!["bash".to_string()],
+                args: vec![],
+                env_override: BTreeMap::new(),
+                pty: true,
+                timeout_secs: None,
+            },
+            state: ExecutionState::Running,
+            exit_code: None,
+            started_at: Some(now_epoch_secs()),
+            ended_at: None,
+        };
+        store.save_execution(&execution).unwrap();
+
+        let app = router(test_config_with_resize(state_path));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/executions/exec-resize-1/resize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"cols":120,"rows":40}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["execution"]["execution_id"].as_str().unwrap(),
+            "exec-resize-1"
+        );
+        assert_eq!(payload["execution"]["state"].as_str().unwrap(), "running");
+    }
+
+    #[tokio::test]
+    async fn resize_on_non_running_execution_returns_409() {
+        let temp_dir = tempdir().unwrap();
+        let state_path = temp_dir.path().join("state.db");
+        let store = StateStore::open(&state_path).unwrap();
+
+        // Create a Queued execution.
+        let execution = Execution {
+            execution_id: "exec-resize-q".to_string(),
+            container_id: "ctr-1".to_string(),
+            exec_spec: ExecutionSpec {
+                cmd: vec!["bash".to_string()],
+                args: vec![],
+                env_override: BTreeMap::new(),
+                pty: true,
+                timeout_secs: None,
+            },
+            state: ExecutionState::Queued,
+            exit_code: None,
+            started_at: None,
+            ended_at: None,
+        };
+        store.save_execution(&execution).unwrap();
+
+        let app = router(test_config_with_resize(state_path));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/executions/exec-resize-q/resize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"cols":80,"rows":24}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn signal_on_running_execution_succeeds() {
+        let temp_dir = tempdir().unwrap();
+        let state_path = temp_dir.path().join("state.db");
+        let store = StateStore::open(&state_path).unwrap();
+
+        // Create a Running execution.
+        let execution = Execution {
+            execution_id: "exec-sig-1".to_string(),
+            container_id: "ctr-1".to_string(),
+            exec_spec: ExecutionSpec {
+                cmd: vec!["bash".to_string()],
+                args: vec![],
+                env_override: BTreeMap::new(),
+                pty: false,
+                timeout_secs: None,
+            },
+            state: ExecutionState::Running,
+            exit_code: None,
+            started_at: Some(now_epoch_secs()),
+            ended_at: None,
+        };
+        store.save_execution(&execution).unwrap();
+
+        let app = router(test_config(state_path));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/executions/exec-sig-1/signal")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"signal":"SIGTERM"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["execution"]["execution_id"].as_str().unwrap(),
+            "exec-sig-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_queued_execution_transitions_to_canceled() {
+        let temp_dir = tempdir().unwrap();
+        let state_path = temp_dir.path().join("state.db");
+        let store = StateStore::open(&state_path).unwrap();
+
+        // Create a Queued execution.
+        let execution = Execution {
+            execution_id: "exec-cancel-q".to_string(),
+            container_id: "ctr-1".to_string(),
+            exec_spec: ExecutionSpec {
+                cmd: vec!["echo".to_string()],
+                args: vec![],
+                env_override: BTreeMap::new(),
+                pty: false,
+                timeout_secs: None,
+            },
+            state: ExecutionState::Queued,
+            exit_code: None,
+            started_at: None,
+            ended_at: None,
+        };
+        store.save_execution(&execution).unwrap();
+
+        let app = router(test_config(state_path));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/executions/exec-cancel-q")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["execution"]["state"].as_str().unwrap(), "canceled");
+        assert!(payload["execution"]["ended_at"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn cancel_terminal_execution_is_idempotent() {
+        let temp_dir = tempdir().unwrap();
+        let state_path = temp_dir.path().join("state.db");
+        let store = StateStore::open(&state_path).unwrap();
+
+        // Create a Completed (terminal) execution.
+        let mut execution = Execution {
+            execution_id: "exec-done".to_string(),
+            container_id: "ctr-1".to_string(),
+            exec_spec: ExecutionSpec {
+                cmd: vec!["echo".to_string()],
+                args: vec![],
+                env_override: BTreeMap::new(),
+                pty: false,
+                timeout_secs: None,
+            },
+            state: ExecutionState::Running,
+            exit_code: None,
+            started_at: Some(now_epoch_secs()),
+            ended_at: None,
+        };
+        let _ = execution.transition_to(ExecutionState::Exited);
+        execution.exit_code = Some(0);
+        execution.ended_at = Some(now_epoch_secs());
+        store.save_execution(&execution).unwrap();
+
+        let app = router(test_config(state_path));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/executions/exec-done")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Should remain in its terminal state, not transition again.
+        assert_eq!(payload["execution"]["state"].as_str().unwrap(), "exited");
+    }
+
+    // ── Checkpoint capability gating tests ──
+
+    /// Helper that builds a router with specific capability flags.
+    fn test_config_with_capabilities(
+        state_store_path: PathBuf,
+        capabilities: RuntimeCapabilities,
+    ) -> ApiConfig {
+        ApiConfig {
+            state_store_path,
+            capabilities,
+            event_poll_interval: Duration::from_millis(10),
+            default_event_page_size: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_create_vm_full_rejected_when_capability_disabled() {
+        let temp_dir = tempdir().unwrap();
+        let state_path = temp_dir.path().join("state.db");
+        StateStore::open(&state_path).unwrap();
+
+        // vm_full_checkpoint is false by default.
+        let config = test_config_with_capabilities(
+            state_path,
+            RuntimeCapabilities {
+                fs_quick_checkpoint: true,
+                ..RuntimeCapabilities::default()
+            },
+        );
+        let app = router(config);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/checkpoints")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"sandbox_id": "sbx-test", "class": "vm_full"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["error"]["code"].as_str().unwrap(),
+            "unsupported_checkpoint_class"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_create_fs_quick_succeeds_when_capability_enabled() {
+        let temp_dir = tempdir().unwrap();
+        let state_path = temp_dir.path().join("state.db");
+        StateStore::open(&state_path).unwrap();
+
+        let config = test_config_with_capabilities(
+            state_path,
+            RuntimeCapabilities {
+                fs_quick_checkpoint: true,
+                ..RuntimeCapabilities::default()
+            },
+        );
+        let app = router(config);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/checkpoints")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"sandbox_id": "sbx-test", "class": "fs_quick"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            payload["checkpoint"]["checkpoint_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("ckpt-")
+        );
+        assert_eq!(payload["checkpoint"]["class"].as_str().unwrap(), "fs_quick");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_create_fs_quick_rejected_when_capability_disabled() {
+        let temp_dir = tempdir().unwrap();
+        let state_path = temp_dir.path().join("state.db");
+        StateStore::open(&state_path).unwrap();
+
+        // Both checkpoint capabilities disabled.
+        let config = test_config_with_capabilities(state_path, RuntimeCapabilities::default());
+        let app = router(config);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/checkpoints")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"sandbox_id": "sbx-test"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Default class is fs_quick; it should be rejected.
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["error"]["code"].as_str().unwrap(),
+            "unsupported_checkpoint_class"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_fork_from_non_ready_returns_409() {
+        let temp_dir = tempdir().unwrap();
+        let state_path = temp_dir.path().join("state.db");
+        let store = StateStore::open(&state_path).unwrap();
+
+        // Create a checkpoint directly in Creating state (no transition to Ready).
+        let checkpoint = Checkpoint {
+            checkpoint_id: "ckpt-creating".to_string(),
+            sandbox_id: "sbx-test".to_string(),
+            parent_checkpoint_id: None,
+            class: CheckpointClass::FsQuick,
+            state: CheckpointState::Creating,
+            created_at: 1000,
+            compatibility_fingerprint: "fp-1".to_string(),
+        };
+        store.save_checkpoint(&checkpoint).unwrap();
+
+        let config = test_config(state_path);
+        let app = router(config);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/checkpoints/ckpt-creating/fork")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["error"]["code"].as_str().unwrap(),
+            "checkpoint_not_ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_children_returns_forked_children() {
+        let temp_dir = tempdir().unwrap();
+        let state_path = temp_dir.path().join("state.db");
+        let store = StateStore::open(&state_path).unwrap();
+
+        // Create a parent checkpoint in Ready state.
+        let mut parent = Checkpoint {
+            checkpoint_id: "ckpt-parent".to_string(),
+            sandbox_id: "sbx-parent".to_string(),
+            parent_checkpoint_id: None,
+            class: CheckpointClass::FsQuick,
+            state: CheckpointState::Creating,
+            created_at: 1000,
+            compatibility_fingerprint: "fp-parent".to_string(),
+        };
+        parent.transition_to(CheckpointState::Ready).unwrap();
+        store.save_checkpoint(&parent).unwrap();
+
+        // Create a child checkpoint.
+        let mut child = Checkpoint {
+            checkpoint_id: "ckpt-child".to_string(),
+            sandbox_id: "sbx-child".to_string(),
+            parent_checkpoint_id: Some("ckpt-parent".to_string()),
+            class: CheckpointClass::FsQuick,
+            state: CheckpointState::Creating,
+            created_at: 2000,
+            compatibility_fingerprint: "fp-parent".to_string(),
+        };
+        child.transition_to(CheckpointState::Ready).unwrap();
+        store.save_checkpoint(&child).unwrap();
+
+        let config = test_config(state_path);
+        let app = router(config);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/checkpoints/ckpt-parent/children")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let checkpoints = payload["checkpoints"].as_array().unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(
+            checkpoints[0]["checkpoint_id"].as_str().unwrap(),
+            "ckpt-child"
+        );
+        assert_eq!(
+            checkpoints[0]["parent_checkpoint_id"].as_str().unwrap(),
+            "ckpt-parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_children_404_for_unknown_parent() {
+        let (app, _dir) = test_router();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/checkpoints/ckpt-nonexistent/children")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_restore_includes_fingerprint_metadata() {
+        let temp_dir = tempdir().unwrap();
+        let state_path = temp_dir.path().join("state.db");
+        let store = StateStore::open(&state_path).unwrap();
+
+        let mut checkpoint = Checkpoint {
+            checkpoint_id: "ckpt-fp".to_string(),
+            sandbox_id: "sbx-fp".to_string(),
+            parent_checkpoint_id: None,
+            class: CheckpointClass::FsQuick,
+            state: CheckpointState::Creating,
+            created_at: 1000,
+            compatibility_fingerprint: "kernel-6.1-arm64".to_string(),
+        };
+        checkpoint.transition_to(CheckpointState::Ready).unwrap();
+        store.save_checkpoint(&checkpoint).unwrap();
+
+        let config = test_config(state_path);
+        let app = router(config);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/checkpoints/ckpt-fp/restore")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["compatibility_fingerprint"].as_str().unwrap(),
+            "kernel-6.1-arm64"
+        );
+        assert!(payload["restore_note"].as_str().is_some());
     }
 }

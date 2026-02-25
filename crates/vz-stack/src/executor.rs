@@ -221,7 +221,13 @@ impl Default for PortTracker {
     }
 }
 
-/// Executes reconciler actions through an OCI container runtime.
+/// Stack executor for orchestrating multi-container stacks.
+///
+/// # Runtime Integration
+///
+/// Currently uses the transitional `boot_shared_vm` / `create_container_in_stack`
+/// path on [`ContainerRuntime`]. Will be migrated to [`WorkspaceRuntimeManager`]
+/// sandbox-scoped operations in a future iteration (vz-l56).
 pub struct StackExecutor<R: ContainerRuntime> {
     runtime: R,
     store: StateStore,
@@ -405,17 +411,22 @@ impl<R: ContainerRuntime> StackExecutor<R> {
     /// Services at the same topological level (no dependency edges
     /// between them) are created in parallel using [`std::thread::scope`],
     /// while services at different levels execute sequentially to respect
-    /// `depends_on` ordering. This gives up to N× speedup for stacks
+    /// `depends_on` ordering. This gives up to N x speedup for stacks
     /// with N independent services.
     ///
     /// Port allocation is tracked across services: explicit host ports
     /// are validated for conflicts, and `None` host ports get ephemeral
     /// assignments. Ports are released on service removal.
     ///
-    /// For multi-service stacks, a shared VM is booted before creating
-    /// containers, and per-service network namespaces are set up so
-    /// that containers can communicate using real IP addresses (Docker
-    /// Compose style networking).
+    /// For multi-service stacks, a sandbox (shared VM) is booted before
+    /// creating containers, and per-service network namespaces are set up
+    /// so that containers can communicate using real IP addresses (Docker
+    /// Compose style networking). The sandbox owns the lifecycle of all
+    /// containers and networking within the stack.
+    ///
+    /// Note: uses the transitional `boot_shared_vm` / `create_in_stack`
+    /// path; will migrate to `WorkspaceRuntimeManager` sandbox operations
+    /// in vz-l56.
     pub fn execute(
         &mut self,
         spec: &StackSpec,

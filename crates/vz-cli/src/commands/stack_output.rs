@@ -309,6 +309,8 @@ impl StackOutput {
             | StackEvent::ExecutionExited { .. }
             | StackEvent::ExecutionFailed { .. }
             | StackEvent::ExecutionCanceled { .. }
+            | StackEvent::ExecutionResized { .. }
+            | StackEvent::ExecutionSignaled { .. }
             | StackEvent::CheckpointCreating { .. }
             | StackEvent::CheckpointReady { .. }
             | StackEvent::CheckpointFailed { .. }

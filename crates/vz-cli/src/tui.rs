@@ -374,6 +374,8 @@ fn event_color(event: &StackEvent) -> Color {
         StackEvent::ExecutionExited { .. } => Color::Green,
         StackEvent::ExecutionFailed { .. } => Color::Red,
         StackEvent::ExecutionCanceled { .. } => Color::Yellow,
+        StackEvent::ExecutionResized { .. } => Color::Blue,
+        StackEvent::ExecutionSignaled { .. } => Color::Yellow,
         StackEvent::CheckpointCreating { .. } => Color::Cyan,
         StackEvent::CheckpointReady { .. } => Color::Green,
         StackEvent::CheckpointFailed { .. } => Color::Red,
@@ -509,6 +511,15 @@ fn format_event_summary(event: &StackEvent) -> String {
         StackEvent::ExecutionCanceled { execution_id } => {
             format!("ExecCanceled     {execution_id}")
         }
+        StackEvent::ExecutionResized {
+            execution_id,
+            cols,
+            rows,
+        } => format!("ExecResized      {execution_id} ({cols}x{rows})"),
+        StackEvent::ExecutionSignaled {
+            execution_id,
+            signal,
+        } => format!("ExecSignaled     {execution_id} ({signal})"),
         StackEvent::CheckpointCreating {
             checkpoint_id,
             class,

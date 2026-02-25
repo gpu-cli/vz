@@ -1,0 +1,453 @@
+// Runtime V2 gRPC service definitions for the vz control plane.
+//
+// Eight service groups covering the full runtime API:
+//   - SandboxService:    sandbox lifecycle (create, get, list, terminate)
+//   - LeaseService:      lease management (open, heartbeat, close)
+//   - ContainerService:  container lifecycle (create, get, list, remove)
+//   - ExecutionService:  exec lifecycle (create, stream, cancel, pty, signal)
+//   - CheckpointService: checkpoint/restore (create, restore, fork)
+//   - BuildService:      image builds (start, stream events, cancel)
+//   - EventService:      event log (list, stream)
+//   - CapabilityService: runtime capabilities discovery
+//
+// Separate from agent.proto (which is guest-agent communication over vsock).
+
+syntax = "proto3";
+
+package vz.runtime.v2;
+
+// ── Shared request metadata ────────────────────────────────────────
+
+message RequestMetadata {
+  // Correlated request identifier.
+  string request_id = 1;
+  // Idempotency key for retry-safe mutation calls.
+  string idempotency_key = 2;
+  // Distributed trace identifier.
+  string trace_id = 3;
+}
+
+// ── Error envelope ─────────────────────────────────────────────────
+
+message ErrorDetail {
+  string code = 1;
+  string message = 2;
+  string request_id = 3;
+}
+
+// ── 1. SandboxService ──────────────────────────────────────────────
+
+service SandboxService {
+  rpc CreateSandbox(CreateSandboxRequest) returns (SandboxResponse);
+  rpc GetSandbox(GetSandboxRequest) returns (SandboxResponse);
+  rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
+  rpc TerminateSandbox(TerminateSandboxRequest) returns (SandboxResponse);
+}
+
+message CreateSandboxRequest {
+  RequestMetadata metadata = 1;
+  string stack_name = 2;
+  uint32 cpus = 3;
+  uint64 memory_mb = 4;
+  map<string, string> labels = 5;
+}
+
+message SandboxPayload {
+  string sandbox_id = 1;
+  string backend = 2;
+  string state = 3;
+  uint32 cpus = 4;
+  uint64 memory_mb = 5;
+  uint64 created_at = 6;
+  uint64 updated_at = 7;
+  map<string, string> labels = 8;
+}
+
+message SandboxResponse {
+  string request_id = 1;
+  SandboxPayload sandbox = 2;
+}
+
+message GetSandboxRequest {
+  string sandbox_id = 1;
+  RequestMetadata metadata = 2;
+}
+
+message ListSandboxesRequest {
+  RequestMetadata metadata = 1;
+}
+
+message ListSandboxesResponse {
+  string request_id = 1;
+  repeated SandboxPayload sandboxes = 2;
+}
+
+message TerminateSandboxRequest {
+  string sandbox_id = 1;
+  RequestMetadata metadata = 2;
+}
+
+// ── 2. LeaseService ────────────────────────────────────────────────
+
+service LeaseService {
+  rpc OpenLease(OpenLeaseRequest) returns (LeaseResponse);
+  rpc GetLease(GetLeaseRequest) returns (LeaseResponse);
+  rpc ListLeases(ListLeasesRequest) returns (ListLeasesResponse);
+  rpc HeartbeatLease(HeartbeatLeaseRequest) returns (LeaseResponse);
+  rpc CloseLease(CloseLeaseRequest) returns (LeaseResponse);
+}
+
+message OpenLeaseRequest {
+  RequestMetadata metadata = 1;
+  string sandbox_id = 2;
+  uint64 ttl_secs = 3;
+}
+
+message LeasePayload {
+  string lease_id = 1;
+  string sandbox_id = 2;
+  uint64 ttl_secs = 3;
+  uint64 last_heartbeat_at = 4;
+  string state = 5;
+}
+
+message LeaseResponse {
+  string request_id = 1;
+  LeasePayload lease = 2;
+}
+
+message GetLeaseRequest {
+  string lease_id = 1;
+  RequestMetadata metadata = 2;
+}
+
+message ListLeasesRequest {
+  RequestMetadata metadata = 1;
+}
+
+message ListLeasesResponse {
+  string request_id = 1;
+  repeated LeasePayload leases = 2;
+}
+
+message HeartbeatLeaseRequest {
+  string lease_id = 1;
+  RequestMetadata metadata = 2;
+}
+
+message CloseLeaseRequest {
+  string lease_id = 1;
+  RequestMetadata metadata = 2;
+}
+
+// ── 3. ContainerService ────────────────────────────────────────────
+
+service ContainerService {
+  rpc CreateContainer(CreateContainerRequest) returns (ContainerResponse);
+  rpc GetContainer(GetContainerRequest) returns (ContainerResponse);
+  rpc ListContainers(ListContainersRequest) returns (ListContainersResponse);
+  rpc RemoveContainer(RemoveContainerRequest) returns (ContainerResponse);
+}
+
+message CreateContainerRequest {
+  RequestMetadata metadata = 1;
+  string sandbox_id = 2;
+  string image_digest = 3;
+  repeated string cmd = 4;
+  map<string, string> env = 5;
+  string cwd = 6;
+  string user = 7;
+}
+
+message ContainerPayload {
+  string container_id = 1;
+  string sandbox_id = 2;
+  string image_digest = 3;
+  string state = 4;
+  uint64 created_at = 5;
+  uint64 started_at = 6;
+  uint64 ended_at = 7;
+}
+
+message ContainerResponse {
+  string request_id = 1;
+  ContainerPayload container = 2;
+}
+
+message GetContainerRequest {
+  string container_id = 1;
+  RequestMetadata metadata = 2;
+}
+
+message ListContainersRequest {
+  RequestMetadata metadata = 1;
+}
+
+message ListContainersResponse {
+  string request_id = 1;
+  repeated ContainerPayload containers = 2;
+}
+
+message RemoveContainerRequest {
+  string container_id = 1;
+  RequestMetadata metadata = 2;
+}
+
+// ── 4. ExecutionService ────────────────────────────────────────────
+
+service ExecutionService {
+  rpc CreateExecution(CreateExecutionRequest) returns (ExecutionResponse);
+  rpc GetExecution(GetExecutionRequest) returns (ExecutionResponse);
+  rpc ListExecutions(ListExecutionsRequest) returns (ListExecutionsResponse);
+  rpc CancelExecution(CancelExecutionRequest) returns (ExecutionResponse);
+  rpc StreamExecOutput(StreamExecOutputRequest) returns (stream ExecOutputEvent);
+  rpc ResizeExecPty(ResizeExecPtyRequest) returns (ExecutionResponse);
+  rpc SignalExec(SignalExecRequest) returns (ExecutionResponse);
+}
+
+message CreateExecutionRequest {
+  RequestMetadata metadata = 1;
+  string container_id = 2;
+  repeated string cmd = 3;
+  repeated string args = 4;
+  map<string, string> env_override = 5;
+  bool pty = 6;
+  uint64 timeout_secs = 7;
+}
+
+message ExecutionPayload {
+  string execution_id = 1;
+  string container_id = 2;
+  string state = 3;
+  int32 exit_code = 4;
+  uint64 started_at = 5;
+  uint64 ended_at = 6;
+}
+
+message ExecutionResponse {
+  string request_id = 1;
+  ExecutionPayload execution = 2;
+}
+
+message GetExecutionRequest {
+  string execution_id = 1;
+  RequestMetadata metadata = 2;
+}
+
+message ListExecutionsRequest {
+  RequestMetadata metadata = 1;
+}
+
+message ListExecutionsResponse {
+  string request_id = 1;
+  repeated ExecutionPayload executions = 2;
+}
+
+message CancelExecutionRequest {
+  string execution_id = 1;
+  RequestMetadata metadata = 2;
+}
+
+message StreamExecOutputRequest {
+  string execution_id = 1;
+  RequestMetadata metadata = 2;
+}
+
+message ExecOutputEvent {
+  oneof payload {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    int32 exit_code = 3;
+    string error = 4;
+  }
+  uint64 sequence = 5;
+}
+
+message ResizeExecPtyRequest {
+  string execution_id = 1;
+  uint32 cols = 2;
+  uint32 rows = 3;
+  RequestMetadata metadata = 4;
+}
+
+message SignalExecRequest {
+  string execution_id = 1;
+  string signal = 2;
+  RequestMetadata metadata = 3;
+}
+
+// ── 5. CheckpointService ──────────────────────────────────────────
+
+service CheckpointService {
+  rpc CreateCheckpoint(CreateCheckpointRequest) returns (CheckpointResponse);
+  rpc GetCheckpoint(GetCheckpointRequest) returns (CheckpointResponse);
+  rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
+  rpc RestoreCheckpoint(RestoreCheckpointRequest) returns (CheckpointResponse);
+  rpc ForkCheckpoint(ForkCheckpointRequest) returns (CheckpointResponse);
+}
+
+message CreateCheckpointRequest {
+  RequestMetadata metadata = 1;
+  string sandbox_id = 2;
+  // Checkpoint class: "fs_quick" or "vm_full".
+  string checkpoint_class = 3;
+  string compatibility_fingerprint = 4;
+}
+
+message CheckpointPayload {
+  string checkpoint_id = 1;
+  string sandbox_id = 2;
+  string parent_checkpoint_id = 3;
+  // Checkpoint class: "fs_quick" or "vm_full".
+  string checkpoint_class = 4;
+  string state = 5;
+  string compatibility_fingerprint = 6;
+  uint64 created_at = 7;
+}
+
+message CheckpointResponse {
+  string request_id = 1;
+  CheckpointPayload checkpoint = 2;
+}
+
+message GetCheckpointRequest {
+  string checkpoint_id = 1;
+  RequestMetadata metadata = 2;
+}
+
+message ListCheckpointsRequest {
+  RequestMetadata metadata = 1;
+}
+
+message ListCheckpointsResponse {
+  string request_id = 1;
+  repeated CheckpointPayload checkpoints = 2;
+}
+
+message RestoreCheckpointRequest {
+  string checkpoint_id = 1;
+  RequestMetadata metadata = 2;
+}
+
+message ForkCheckpointRequest {
+  string checkpoint_id = 1;
+  string new_sandbox_id = 2;
+  RequestMetadata metadata = 3;
+}
+
+// ── 6. BuildService ───────────────────────────────────────────────
+
+service BuildService {
+  rpc StartBuild(StartBuildRequest) returns (BuildResponse);
+  rpc GetBuild(GetBuildRequest) returns (BuildResponse);
+  rpc ListBuilds(ListBuildsRequest) returns (ListBuildsResponse);
+  rpc CancelBuild(CancelBuildRequest) returns (BuildResponse);
+  rpc StreamBuildEvents(StreamBuildEventsRequest) returns (stream BuildEvent);
+}
+
+message StartBuildRequest {
+  RequestMetadata metadata = 1;
+  string sandbox_id = 2;
+  string context = 3;
+  string dockerfile = 4;
+  map<string, string> args = 5;
+}
+
+message BuildPayload {
+  string build_id = 1;
+  string sandbox_id = 2;
+  string state = 3;
+  string result_digest = 4;
+  uint64 started_at = 5;
+  uint64 ended_at = 6;
+}
+
+message BuildResponse {
+  string request_id = 1;
+  BuildPayload build = 2;
+}
+
+message GetBuildRequest {
+  string build_id = 1;
+  RequestMetadata metadata = 2;
+}
+
+message ListBuildsRequest {
+  RequestMetadata metadata = 1;
+}
+
+message ListBuildsResponse {
+  string request_id = 1;
+  repeated BuildPayload builds = 2;
+}
+
+message CancelBuildRequest {
+  string build_id = 1;
+  RequestMetadata metadata = 2;
+}
+
+message StreamBuildEventsRequest {
+  string build_id = 1;
+  RequestMetadata metadata = 2;
+}
+
+message BuildEvent {
+  string event_type = 1;
+  string message = 2;
+  uint64 timestamp = 3;
+}
+
+// ── 7. EventService ───────────────────────────────────────────────
+
+service EventService {
+  rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
+  rpc StreamEvents(StreamEventsRequest) returns (stream RuntimeEvent);
+}
+
+message ListEventsRequest {
+  string stack_name = 1;
+  int64 after = 2;
+  uint32 limit = 3;
+  string scope = 4;
+  RequestMetadata metadata = 5;
+}
+
+message RuntimeEvent {
+  int64 id = 1;
+  string stack_name = 2;
+  string created_at = 3;
+  string event_json = 4;
+}
+
+message ListEventsResponse {
+  string request_id = 1;
+  repeated RuntimeEvent events = 2;
+  int64 next_cursor = 3;
+}
+
+message StreamEventsRequest {
+  string stack_name = 1;
+  int64 after = 2;
+  string scope = 3;
+  RequestMetadata metadata = 4;
+}
+
+// ── 8. CapabilityService ──────────────────────────────────────────
+
+service CapabilityService {
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+}
+
+message GetCapabilitiesRequest {
+  RequestMetadata metadata = 1;
+}
+
+message Capability {
+  string name = 1;
+  bool enabled = 2;
+}
+
+message GetCapabilitiesResponse {
+  string request_id = 1;
+  repeated Capability capabilities = 2;
+}

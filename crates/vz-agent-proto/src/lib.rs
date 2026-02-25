@@ -9,10 +9,26 @@ pub mod vz {
             include!("generated/vz.agent.v1.rs");
         }
     }
+
+    /// Runtime V2 control-plane gRPC service definitions.
+    pub mod runtime {
+        pub mod v2 {
+            #![allow(clippy::disallowed_methods)]
+            #![allow(clippy::missing_docs_in_private_items)]
+            #![allow(clippy::large_enum_variant)]
+            #![allow(clippy::doc_markdown)]
+            include!("generated/vz.runtime.v2.rs");
+        }
+    }
 }
 
 /// Convenience re-export so consumers can write `use vz_agent_proto::*`.
 pub use vz::agent::v1::*;
+
+/// Convenience re-export for runtime V2 types under a dedicated namespace.
+pub mod runtime_v2 {
+    pub use crate::vz::runtime::v2::*;
+}
 
 #[cfg(test)]
 mod tests {
