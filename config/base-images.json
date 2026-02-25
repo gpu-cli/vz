@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "default_base": "macos-15.3.1-24D70-arm64-64g",
+  "channels": {
+    "stable": "macos-15.3.1-24D70-arm64-64g",
+    "previous": "macos-14.6-23G80-arm64-64g"
+  },
+  "bases": [
+    {
+      "base_id": "macos-15.3.1-24D70-arm64-64g",
+      "macos_version": "15.3.1",
+      "macos_build": "24D70",
+      "ipsw_url": "https://updates.cdn-apple.com/2025WinterFCS/fullrestores/052-77521/UniversalMac_15.3.1_24D70_Restore.ipsw",
+      "ipsw_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "disk_size_gb": 64,
+      "fingerprint": {
+        "img_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aux_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "hwmodel_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "machineid_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "support": {
+        "status": "active"
+      }
+    },
+    {
+      "base_id": "macos-14.6-23G80-arm64-64g",
+      "macos_version": "14.6",
+      "macos_build": "23G80",
+      "ipsw_url": "https://updates.cdn-apple.com/2024SummerFCS/fullrestores/042-15372/UniversalMac_14.6_23G80_Restore.ipsw",
+      "ipsw_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "disk_size_gb": 64,
+      "fingerprint": {
+        "img_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "aux_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "hwmodel_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "machineid_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "support": {
+        "status": "active"
+      }
+    },
+    {
+      "base_id": "macos-13.6.7-22H123-arm64-64g",
+      "macos_version": "13.6.7",
+      "macos_build": "22H123",
+      "ipsw_url": "https://updates.cdn-apple.com/2024SpringFCS/fullrestores/032-12345/UniversalMac_13.6.7_22H123_Restore.ipsw",
+      "ipsw_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "disk_size_gb": 64,
+      "fingerprint": {
+        "img_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+        "aux_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+        "hwmodel_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+        "machineid_sha256": "8888888888888888888888888888888888888888888888888888888888888888"
+      },
+      "support": {
+        "status": "retired",
+        "retired_at": "2026-01-31",
+        "replacement_selector": "previous",
+        "replacement_base_id": "macos-14.6-23G80-arm64-64g"
+      }
+    }
+  ]
+}

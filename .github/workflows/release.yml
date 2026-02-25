@@ -149,3 +149,75 @@ jobs:
           if [[ -n "${KEYCHAIN_PATH:-}" ]]; then
             security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
           fi
+
+  publish-pinned-artifacts:
+    name: Publish Pinned Base + Patch Metadata
+    runs-on: macos-14
+    needs: build-sign-release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+
+      - name: Build vz-cli
+        working-directory: crates
+        run: cargo build --release -p vz-cli
+
+      - name: Validate pinned base matrix and patch bundles
+        run: |
+          set -euo pipefail
+
+          mkdir -p release/pinned-artifacts
+
+          cp config/base-images.json release/pinned-artifacts/base-images.json
+          shasum -a 256 config/base-images.json > release/pinned-artifacts/base-images.json.sha256
+
+          crates/target/release/vz vm base list | tee release/pinned-artifacts/base-list.txt
+
+          bundle_count=0
+          if [[ -d release/patch-bundles ]]; then
+            shopt -s nullglob
+            for bundle in release/patch-bundles/*.vzpatch; do
+              if [[ -d "$bundle" ]]; then
+                echo "Verifying patch bundle: $bundle"
+                crates/target/release/vz vm patch verify --bundle "$bundle"
+                bundle_count=$((bundle_count + 1))
+              fi
+            done
+            shopt -u nullglob
+          fi
+
+          if [[ -d release/patch-bundles ]]; then
+            tar -czf release/pinned-artifacts/pinned-patch-bundles.tar.gz -C release patch-bundles
+            shasum -a 256 release/pinned-artifacts/pinned-patch-bundles.tar.gz > release/pinned-artifacts/pinned-patch-bundles.tar.gz.sha256
+          fi
+
+          generated_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          matrix_sha256="$(shasum -a 256 config/base-images.json | awk '{print $1}')"
+          cat > release/pinned-artifacts/pinned-release-metadata.json <<EOF
+          {
+            "release_tag": "${GITHUB_REF_NAME}",
+            "generated_at": "${generated_at}",
+            "base_matrix_path": "config/base-images.json",
+            "base_matrix_sha256": "${matrix_sha256}",
+            "verified_patch_bundle_count": ${bundle_count}
+          }
+          EOF
+          shasum -a 256 release/pinned-artifacts/pinned-release-metadata.json > release/pinned-artifacts/pinned-release-metadata.json.sha256
+
+      - name: Attach pinned artifacts to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: false
+          files: |
+            release/pinned-artifacts/base-images.json
+            release/pinned-artifacts/base-images.json.sha256
+            release/pinned-artifacts/base-list.txt
+            release/pinned-artifacts/pinned-release-metadata.json
+            release/pinned-artifacts/pinned-release-metadata.json.sha256
+            release/pinned-artifacts/pinned-patch-bundles.tar.gz
+            release/pinned-artifacts/pinned-patch-bundles.tar.gz.sha256

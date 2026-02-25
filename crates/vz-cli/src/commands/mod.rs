@@ -39,3 +39,7 @@ pub mod stop;
 pub mod validate;
 #[cfg(target_os = "macos")]
 pub mod vm;
+#[cfg(target_os = "macos")]
+pub mod vm_base;
+#[cfg(target_os = "macos")]
+pub mod vm_patch;

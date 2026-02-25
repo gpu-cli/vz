@@ -1,7 +1,8 @@
-//! `vz provision` -- Provision a VM disk image offline.
+//! `vz vm provision` -- Provision a VM disk image offline.
 
 use std::path::PathBuf;
 
+use anyhow::Context;
 use clap::{Args, ValueEnum};
 use tracing::info;
 
@@ -32,6 +33,14 @@ pub struct ProvisionArgs {
     #[arg(long)]
     pub image: PathBuf,
 
+    /// Pinned base selector: immutable base ID, `stable`, or `previous`.
+    #[arg(long, value_name = "SELECTOR", conflicts_with = "allow_unpinned")]
+    pub base_id: Option<String>,
+
+    /// Explicitly allow unpinned provisioning flow (skip base fingerprint verification).
+    #[arg(long, default_value_t = false, conflicts_with = "base_id")]
+    pub allow_unpinned: bool,
+
     /// Username for the dev account.
     #[arg(long, default_value = "dev")]
     pub user: String,
@@ -47,9 +56,29 @@ pub struct ProvisionArgs {
 
 pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
     let image = expand_home(&args.image);
+    let mut resolved_base: Option<super::vm_base::ResolvedBase> = None;
 
     if !image.exists() {
         anyhow::bail!("disk image not found: {}", image.display());
+    }
+
+    if let Some(base_selector) = args.base_id.as_deref() {
+        let resolved = super::vm_base::verify_image_for_base_id(&image, base_selector)
+            .with_context(|| {
+                format!(
+                    "pinned base verification failed before provisioning image {}",
+                    image.display()
+                )
+            })?;
+        print_base_resolution(&resolved);
+        resolved_base = Some(resolved);
+    } else {
+        super::vm_base::require_unpinned_policy(
+            args.allow_unpinned,
+            "provision",
+            "vz vm provision --base-id <id> --image <path>",
+        )?;
+        print_unpinned_warning();
     }
 
     let user_config = crate::provision::UserConfig {
@@ -84,6 +113,9 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
 
     info!(
         image = %image.display(),
+        base_selector = ?args.base_id,
+        resolved_base_id = ?resolved_base.as_ref().map(|resolved| resolved.base.base_id.as_str()),
+        allow_unpinned = args.allow_unpinned,
         user = %user_config.username,
         agent = ?agent_path,
         mode = ?args.agent_mode,
@@ -95,6 +127,7 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
         AgentModeArg::System => "system",
         AgentModeArg::User => "user",
     };
+    print_runtime_policy_message(args.agent_mode);
     let result = crate::provision::provision_image(
         &image,
         &user_config,
@@ -114,9 +147,17 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
     }
 
     if result.needs_ownership_fix {
+        let rerun_policy = match resolved_base.as_ref() {
+            Some(resolved) => format!(" --base-id {}", resolved.base.base_id),
+            None => " --allow-unpinned".to_string(),
+        };
         println!("\nWARNING: LaunchDaemon files need root ownership to work.");
         println!("Run this to fix:");
-        println!("  sudo vz provision --image {}", image.display());
+        println!(
+            "  sudo vz vm provision --image {}{}",
+            image.display(),
+            rerun_policy
+        );
         println!("Or fix manually after mounting:");
         println!(
             "  hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount {}",
@@ -127,16 +168,69 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
             "  sudo chown 0:0 /tmp/vz-provision/Library/LaunchDaemons/com.vz.guest-agent.plist"
         );
         println!("  sudo chown 0:0 /tmp/vz-provision/usr/local/bin/vz-guest-agent");
+        println!("\nNo-local-sudo alternative (opt-in user runtime policy):");
+        println!(
+            "  vz vm provision --image {}{} --agent-mode user",
+            image.display(),
+            rerun_policy
+        );
+        println!(
+            "  user mode avoids local sudo but is login/session dependent; system mode remains the default for reliability."
+        );
+        println!(
+            "  For channel workflows ({}, {}), prefer CI-published pre-provisioned artifacts when available.",
+            super::vm_base::BASE_CHANNEL_STABLE,
+            super::vm_base::BASE_CHANNEL_PREVIOUS
+        );
     }
 
     println!("\nNext steps:");
     println!(
-        "  vz run --image {} --name my-vm --headless",
+        "  vz vm run --image {} --name my-vm --headless",
         image.display()
     );
-    println!("  vz exec my-vm -- whoami");
+    println!("  vz vm exec my-vm -- whoami");
 
     Ok(())
+}
+
+fn print_unpinned_warning() {
+    eprintln!(
+        "Warning: running unpinned provision mode. This image is not validated against the supported base matrix."
+    );
+}
+
+fn print_base_resolution(resolved: &super::vm_base::ResolvedBase) {
+    if let Some(channel) = resolved.channel.as_deref() {
+        println!(
+            "Verified channel '{}' -> pinned base {}  macOS {} ({})",
+            channel, resolved.base.base_id, resolved.base.macos_version, resolved.base.macos_build
+        );
+    } else {
+        println!(
+            "Verified pinned base: {}  macOS {} ({})",
+            resolved.base.base_id, resolved.base.macos_version, resolved.base.macos_build
+        );
+    }
+}
+
+fn print_runtime_policy_message(agent_mode: AgentModeArg) {
+    match agent_mode {
+        AgentModeArg::System => {
+            println!(
+                "Runtime policy: system mode (default) is selected for reliable unattended startup."
+            );
+            println!(
+                "No-local-sudo option: use --agent-mode user as an explicit opt-in (login/session dependent)."
+            );
+        }
+        AgentModeArg::User => {
+            println!(
+                "Runtime policy: user mode selected (explicit opt-in). System mode remains the default for reliability."
+            );
+            println!("Note: user mode depends on guest login/session state.");
+        }
+    }
 }
 
 fn expand_home(path: &std::path::Path) -> std::path::PathBuf {
