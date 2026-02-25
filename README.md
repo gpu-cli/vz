@@ -146,6 +146,21 @@ cargo clippy --workspace -- -D warnings
 cargo nextest run --workspace
 ```
 
+Runtime API adapter local smoke test:
+
+```bash
+cd crates
+cargo run -p vz-api -- \
+  --bind 127.0.0.1:8181 \
+  --state-store-path /tmp/vz-api-state.db \
+  --stack-baseline \
+  --capability fs_quick_checkpoint
+
+# in another shell
+curl -s http://127.0.0.1:8181/v1/capabilities
+curl -s http://127.0.0.1:8181/openapi.json
+```
+
 Sandbox-specific real VM integration validation (macOS ARM64):
 
 ```bash

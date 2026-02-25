@@ -359,6 +359,11 @@ fn event_color(event: &StackEvent) -> Color {
         StackEvent::HealthCheckFailed { .. } => Color::Yellow,
         StackEvent::DependencyBlocked { .. } => Color::Magenta,
         StackEvent::MountTopologyRecreateRequired { .. } => Color::Yellow,
+        StackEvent::SandboxCreating { .. } => Color::Cyan,
+        StackEvent::SandboxReady { .. } => Color::Green,
+        StackEvent::SandboxDraining { .. } => Color::Yellow,
+        StackEvent::SandboxTerminated { .. } => Color::DarkGray,
+        StackEvent::SandboxFailed { .. } => Color::Red,
     }
 }
 
@@ -428,6 +433,21 @@ fn format_event_summary(event: &StackEvent) -> String {
             "MountRecreate   {service_name} ({:?} -> {desired_digest})",
             previous_digest.as_deref().unwrap_or("<none>")
         ),
+        StackEvent::SandboxCreating { sandbox_id, .. } => {
+            format!("SandboxCreating  {sandbox_id}")
+        }
+        StackEvent::SandboxReady { sandbox_id, .. } => {
+            format!("SandboxReady     {sandbox_id}")
+        }
+        StackEvent::SandboxDraining { sandbox_id, .. } => {
+            format!("SandboxDraining  {sandbox_id}")
+        }
+        StackEvent::SandboxTerminated { sandbox_id, .. } => {
+            format!("SandboxTerminated {sandbox_id}")
+        }
+        StackEvent::SandboxFailed {
+            sandbox_id, error, ..
+        } => format!("SandboxFailed    {sandbox_id}: {error}"),
     }
 }
 

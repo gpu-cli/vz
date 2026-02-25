@@ -40,7 +40,7 @@ Options:
                                 runtime-smoke, runtime-lifecycle, runtime-port-forwarding,
                                 runtime-shared-vm-net, stack-real-services,
                                 stack-control-socket, stack-port-forwarding,
-                                stack-snapshot-restore, buildkit-roundtrip,
+                                stack-snapshot-restore, stack-user-journey-checkpoint, buildkit-roundtrip,
                                 sandbox-usecases, all-usecases
                               note: when set, suite selection is derived from scenarios
   --output-dir <path>         Artifacts/log root (default: .artifacts/sandbox-vm-e2e)
@@ -132,7 +132,7 @@ expand_scenario_token() {
         case "$part" in
             "")
                 ;;
-            runtime-smoke|runtime-lifecycle|runtime-port-forwarding|runtime-shared-vm-net|stack-real-services|stack-control-socket|stack-port-forwarding|stack-snapshot-restore|buildkit-roundtrip)
+            runtime-smoke|runtime-lifecycle|runtime-port-forwarding|runtime-shared-vm-net|stack-real-services|stack-control-socket|stack-port-forwarding|stack-snapshot-restore|stack-user-journey-checkpoint|buildkit-roundtrip)
                 append_unique_scenario "$part"
                 ;;
             sandbox-usecases)
@@ -143,6 +143,7 @@ expand_scenario_token() {
                 append_unique_scenario "stack-control-socket"
                 append_unique_scenario "stack-port-forwarding"
                 append_unique_scenario "stack-snapshot-restore"
+                append_unique_scenario "stack-user-journey-checkpoint"
                 ;;
             all-usecases)
                 append_unique_scenario "runtime-smoke"
@@ -153,6 +154,7 @@ expand_scenario_token() {
                 append_unique_scenario "stack-control-socket"
                 append_unique_scenario "stack-port-forwarding"
                 append_unique_scenario "stack-snapshot-restore"
+                append_unique_scenario "stack-user-journey-checkpoint"
                 append_unique_scenario "buildkit-roundtrip"
                 ;;
             *)
@@ -167,7 +169,7 @@ scenario_suite() {
         runtime-smoke|runtime-lifecycle|runtime-port-forwarding|runtime-shared-vm-net)
             echo "runtime"
             ;;
-        stack-real-services|stack-control-socket|stack-port-forwarding|stack-snapshot-restore)
+        stack-real-services|stack-control-socket|stack-port-forwarding|stack-snapshot-restore|stack-user-journey-checkpoint)
             echo "stack"
             ;;
         buildkit-roundtrip)
@@ -204,6 +206,9 @@ scenario_test_filter() {
             ;;
         stack-snapshot-restore)
             echo "complex_stack_snapshot_restore_rewinds_shared_vm_state"
+            ;;
+        stack-user-journey-checkpoint)
+            echo "complex_stack_user_journey_with_named_volume_checkpoint"
             ;;
         buildkit-roundtrip)
             echo "buildkit_builds_dockerfile_and_run_uses_built_image"

@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tracing::warn;
 use tonic::transport::server::Connected;
+use tracing::warn;
 
 /// AF_VSOCK listener that accepts connections from the host.
 pub struct VsockListener {
@@ -171,8 +171,8 @@ impl VsockListener {
         loop {
             // Use tokio's blocking task pool for the accept() syscall since
             // we can't easily register a vsock fd with epoll/kqueue through tokio.
-            let (conn_fd, source_cid) = tokio::task::spawn_blocking(
-                move || -> io::Result<(RawFd, u32)> {
+            let (conn_fd, source_cid) =
+                tokio::task::spawn_blocking(move || -> io::Result<(RawFd, u32)> {
                     let mut addr: SockaddrVm = unsafe { std::mem::zeroed() };
                     let mut addr_len = std::mem::size_of::<SockaddrVm>() as libc::socklen_t;
 
@@ -189,10 +189,9 @@ impl VsockListener {
                     }
 
                     Ok((fd, source_cid_from_addr(&addr)))
-                },
-            )
-            .await
-            .map_err(io::Error::other)??;
+                })
+                .await
+                .map_err(io::Error::other)??;
 
             if !is_host_peer(source_cid) {
                 // SAFETY: close accepted fd on explicit rejection.

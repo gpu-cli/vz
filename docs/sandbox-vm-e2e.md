@@ -41,6 +41,7 @@ Capability matrix:
 - `stack-control-socket` → `exec_via_control_socket`
 - `stack-port-forwarding` → `stack_port_forwarding`
 - `stack-snapshot-restore` → `complex_stack_snapshot_restore_rewinds_shared_vm_state`
+- `stack-user-journey-checkpoint` → `complex_stack_user_journey_with_named_volume_checkpoint`
 - `buildkit-roundtrip` → `buildkit_builds_dockerfile_and_run_uses_built_image`
 
 Scenario groups:

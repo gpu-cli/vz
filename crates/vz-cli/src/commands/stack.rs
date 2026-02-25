@@ -1838,7 +1838,12 @@ fn event_service_name(event: &StackEvent) -> Option<&str> {
         | StackEvent::StackApplyCompleted { .. }
         | StackEvent::StackApplyFailed { .. }
         | StackEvent::VolumeCreated { .. }
-        | StackEvent::StackDestroyed { .. } => None,
+        | StackEvent::StackDestroyed { .. }
+        | StackEvent::SandboxCreating { .. }
+        | StackEvent::SandboxReady { .. }
+        | StackEvent::SandboxDraining { .. }
+        | StackEvent::SandboxTerminated { .. }
+        | StackEvent::SandboxFailed { .. } => None,
     }
 }
 
@@ -2434,6 +2439,21 @@ fn format_event_summary(event: &StackEvent) -> String {
             "mount recreate: {service_name} ({:?} -> {desired_digest})",
             previous_digest.as_deref().unwrap_or("<none>")
         ),
+        StackEvent::SandboxCreating { sandbox_id, .. } => {
+            format!("sandbox creating: {sandbox_id}")
+        }
+        StackEvent::SandboxReady { sandbox_id, .. } => {
+            format!("sandbox ready: {sandbox_id}")
+        }
+        StackEvent::SandboxDraining { sandbox_id, .. } => {
+            format!("sandbox draining: {sandbox_id}")
+        }
+        StackEvent::SandboxTerminated { sandbox_id, .. } => {
+            format!("sandbox terminated: {sandbox_id}")
+        }
+        StackEvent::SandboxFailed {
+            sandbox_id, error, ..
+        } => format!("sandbox failed: {sandbox_id}: {error}"),
     }
 }
 

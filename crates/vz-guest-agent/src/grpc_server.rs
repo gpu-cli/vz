@@ -662,38 +662,37 @@ impl oci_service_server::OciService for OciServiceImpl {
             .ok_or_else(|| Status::internal("youki state missing pid field"))?;
 
         let mut nsenter_args: Vec<String> = vec![
-            "nsenter".into(),
-            "--mount".into(),
-            "--net".into(),
+            format!("--mount=/proc/{pid}/ns/mnt"),
+            format!("--net=/proc/{pid}/ns/net"),
+            format!("--pid=/proc/{pid}/ns/pid"),
+            format!("--ipc=/proc/{pid}/ns/ipc"),
+            format!("--uts=/proc/{pid}/ns/uts"),
             format!("--root=/proc/{pid}/root"),
-            format!("--target={pid}"),
-            "--".into(),
-            "env".into(),
         ];
-
-        // Always set a standard PATH so commands like pg_isready are found.
-        let has_path = req.env.keys().any(|k| k == "PATH");
-        if !has_path {
-            nsenter_args
-                .push("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+        if !req.working_dir.is_empty() {
+            nsenter_args.push(format!("--wd={}", req.working_dir));
         }
+        nsenter_args.push("--".into());
 
-        for (key, value) in &req.env {
-            nsenter_args.push(format!("{key}={value}"));
-        }
-
-        nsenter_args.push(req.command);
-        nsenter_args.extend(req.args);
+        nsenter_args.push(req.command.clone());
+        nsenter_args.extend(req.args.clone());
 
         info!(pid = pid, args = ?nsenter_args, "oci: exec via nsenter");
 
-        let mut cmd = tokio::process::Command::new(&nsenter_args[0]);
-        for arg in &nsenter_args[1..] {
+        let mut cmd = tokio::process::Command::new("nsenter");
+        for arg in nsenter_args {
             cmd.arg(arg);
         }
-        if !req.working_dir.is_empty() {
-            cmd.current_dir(&req.working_dir);
+
+        cmd.env_clear();
+        let has_path = req.env.keys().any(|k| k == "PATH");
+        if !has_path {
+            cmd.env(
+                "PATH",
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            );
         }
+        cmd.envs(&req.env);
         cmd.kill_on_drop(true);
 
         let output = match tokio::time::timeout(YOUKI_EXEC_TIMEOUT, cmd.output()).await {

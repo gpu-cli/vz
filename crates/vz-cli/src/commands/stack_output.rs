@@ -226,7 +226,12 @@ impl StackOutput {
             }
             StackEvent::StackApplyStarted { .. }
             | StackEvent::StackApplyCompleted { .. }
-            | StackEvent::StackDestroyed { .. } => {}
+            | StackEvent::StackDestroyed { .. }
+            | StackEvent::SandboxCreating { .. }
+            | StackEvent::SandboxReady { .. }
+            | StackEvent::SandboxDraining { .. }
+            | StackEvent::SandboxTerminated { .. }
+            | StackEvent::SandboxFailed { .. } => {}
         }
         self.update_header();
     }

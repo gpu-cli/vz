@@ -9,7 +9,7 @@
 //! running services, updating observed state and emitting events.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info};
 
@@ -17,7 +17,7 @@ use crate::error::StackError;
 use crate::events::StackEvent;
 use crate::executor::ContainerRuntime;
 use crate::spec::{DependencyCondition, HealthCheckSpec, ServiceSpec, StackSpec};
-use crate::state_store::{ServiceObservedState, ServicePhase, StateStore};
+use crate::state_store::{HealthPollState, ServiceObservedState, ServicePhase, StateStore};
 
 /// Result of checking whether a service's dependencies are satisfied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +41,7 @@ pub struct HealthStatus {
     /// Number of consecutive failed health checks.
     pub consecutive_failures: u32,
     /// When the last health check was executed.
-    pub last_check: Option<Instant>,
+    pub last_check: Option<SystemTime>,
 }
 
 impl HealthStatus {
@@ -197,6 +197,17 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Default health check retries threshold when not specified.
 const DEFAULT_RETRIES: u32 = 3;
 
+fn system_time_to_millis(ts: SystemTime) -> i64 {
+    ts.duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn millis_to_system_time(millis: i64) -> Option<SystemTime> {
+    let millis = u64::try_from(millis).ok()?;
+    UNIX_EPOCH.checked_add(Duration::from_millis(millis))
+}
+
 /// Polls health checks for running services in a stack.
 ///
 /// Call [`poll_all`](HealthPoller::poll_all) periodically (at the
@@ -208,7 +219,7 @@ pub struct HealthPoller {
     /// Health status per service name.
     statuses: HashMap<String, HealthStatus>,
     /// When each service was first observed as Running (for start_period grace).
-    start_times: HashMap<String, Instant>,
+    start_times: HashMap<String, SystemTime>,
 }
 
 /// Result of a single health poll cycle.
@@ -234,6 +245,84 @@ impl HealthPoller {
     /// Access the current health statuses (keyed by service name).
     pub fn statuses(&self) -> &HashMap<String, HealthStatus> {
         &self.statuses
+    }
+
+    /// Restore health poll state from SQLite for the given stack.
+    ///
+    /// This rehydrates readiness counters and timing windows so readiness
+    /// decisions can continue after daemon restart.
+    pub fn restore_from_store(
+        &mut self,
+        store: &StateStore,
+        stack_name: &str,
+    ) -> Result<(), StackError> {
+        let persisted = store.load_health_poller_state(stack_name)?;
+        self.statuses.clear();
+        self.start_times.clear();
+
+        for (_, state) in persisted {
+            let service_name = state.service_name.clone();
+
+            self.statuses.insert(
+                service_name.clone(),
+                HealthStatus {
+                    service_name: service_name.clone(),
+                    consecutive_passes: state.consecutive_passes,
+                    consecutive_failures: state.consecutive_failures,
+                    last_check: state.last_check_millis.and_then(millis_to_system_time),
+                },
+            );
+
+            if let Some(start_time_millis) = state.start_time_millis {
+                if let Some(start_time) = millis_to_system_time(start_time_millis) {
+                    self.start_times.insert(service_name, start_time);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn persist_to_store(&self, store: &StateStore, stack_name: &str) -> Result<(), StackError> {
+        if self.statuses.is_empty() && self.start_times.is_empty() {
+            store.clear_health_poller_state(stack_name)?;
+            return Ok(());
+        }
+
+        let mut state = HashMap::new();
+        for (service_name, status) in &self.statuses {
+            let last_check_millis = status.last_check.map(system_time_to_millis);
+            let start_time_millis = self
+                .start_times
+                .get(service_name)
+                .copied()
+                .map(system_time_to_millis);
+
+            state.insert(
+                service_name.clone(),
+                HealthPollState {
+                    service_name: service_name.clone(),
+                    consecutive_passes: status.consecutive_passes,
+                    consecutive_failures: status.consecutive_failures,
+                    last_check_millis,
+                    start_time_millis,
+                },
+            );
+        }
+
+        for (service_name, start_time) in &self.start_times {
+            state
+                .entry(service_name.clone())
+                .or_insert_with(|| HealthPollState {
+                    service_name: service_name.clone(),
+                    consecutive_passes: 0,
+                    consecutive_failures: 0,
+                    last_check_millis: None,
+                    start_time_millis: Some(system_time_to_millis(*start_time)),
+                });
+        }
+
+        store.save_health_poller_state(stack_name, &state)
     }
 
     /// Compute the minimum poll interval across all health-checked
@@ -271,7 +360,7 @@ impl HealthPoller {
             .collect();
 
         let mut result = HealthPollResult::default();
-        let now = Instant::now();
+        let now = SystemTime::now();
 
         for svc in &spec.services {
             let Some(hc) = &svc.healthcheck else {
@@ -296,7 +385,7 @@ impl HealthPoller {
 
             // Respect start_period grace.
             let start_period = hc.start_period_secs.unwrap_or(0);
-            let elapsed = now.duration_since(start_time).as_secs();
+            let elapsed = now.duration_since(start_time).map_or(0, |d| d.as_secs());
             if elapsed < start_period {
                 debug!(
                     service = %svc.name,
@@ -315,7 +404,7 @@ impl HealthPoller {
                     .entry(svc.name.clone())
                     .or_insert_with(|| HealthStatus::new(&svc.name));
                 if let Some(last) = status.last_check {
-                    if now.duration_since(last) < interval {
+                    if now.duration_since(last).map_or(Duration::ZERO, |d| d) < interval {
                         continue;
                     }
                 }
@@ -450,6 +539,8 @@ impl HealthPoller {
                 }
             }
         }
+
+        self.persist_to_store(store, &spec.name)?;
 
         Ok(result)
     }
@@ -1169,11 +1260,42 @@ mod tests {
         poller
             .statuses
             .insert("web".to_string(), HealthStatus::new("web"));
-        poller.start_times.insert("web".to_string(), Instant::now());
+        poller
+            .start_times
+            .insert("web".to_string(), SystemTime::now());
 
         poller.clear("web");
         assert!(!poller.statuses().contains_key("web"));
         assert!(!poller.start_times.contains_key("web"));
+    }
+
+    #[test]
+    fn poller_restore_rehydrates_counters_from_store() {
+        let runtime = MockContainerRuntime::new();
+        let store = StateStore::in_memory().unwrap();
+        let spec = stack_with_hc(
+            "app",
+            vec![ServiceSpec {
+                healthcheck: Some(make_hc_spec(Some(1))),
+                ..svc("web")
+            }],
+        );
+
+        store
+            .save_observed_state("app", &running_obs("web", "ctr-1"))
+            .unwrap();
+
+        let mut poller = HealthPoller::new();
+        let result = poller.poll_all(&runtime, &store, &spec).unwrap();
+        assert_eq!(result.newly_ready, vec!["web".to_string()]);
+        assert_eq!(poller.statuses()["web"].consecutive_passes, 1);
+
+        let mut restored = HealthPoller::new();
+        restored.restore_from_store(&store, "app").unwrap();
+        let restored_status = restored.statuses().get("web").unwrap();
+        assert_eq!(restored_status.consecutive_passes, 1);
+        assert!(restored_status.last_check.is_some());
+        assert_eq!(restored_status.consecutive_failures, 0);
     }
 
     #[test]
