@@ -319,7 +319,6 @@ struct PreparedCreate {
     replica_index: u32,
     image: String,
     run_config: vz_runtime_contract::RunConfig,
-    use_shared_vm: bool,
 }
 
 impl PreparedCreate {
@@ -495,7 +494,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             )
         });
 
-        if has_creates && !self.runtime.has_sandbox(&spec.name) && spec.services.len() > 1 {
+        if has_creates && !self.runtime.has_sandbox(&spec.name) {
             // ── Compute per-network subnets ─────────────────────────────
             //
             // Each distinct network gets its own subnet. Explicit subnets
@@ -538,27 +537,37 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     if !svc.networks.contains(&net.name) {
                         continue;
                     }
-                    let ip = format!(
-                        "{}.{}.{}.{}/{}",
-                        base_octets[0], base_octets[1], base_octets[2], host_offset, prefix
-                    );
-                    let ip_no_prefix = format!(
-                        "{}.{}.{}.{}",
-                        base_octets[0], base_octets[1], base_octets[2], host_offset
-                    );
 
-                    // First IP assigned becomes the primary (for port forwarding).
-                    service_primary_ip
-                        .entry(svc.name.clone())
-                        .or_insert(ip_no_prefix);
+                    let replicas = svc.resources.replicas.max(1);
+                    for r in 1..=replicas {
+                        let replica_name = if r == 1 {
+                            svc.name.clone()
+                        } else {
+                            format!("{}-{r}", svc.name)
+                        };
 
-                    network_services.push(vz_runtime_contract::NetworkServiceConfig {
-                        name: svc.name.clone(),
-                        addr: ip,
-                        network_name: net.name.clone(),
-                    });
+                        let ip = format!(
+                            "{}.{}.{}.{}/{}",
+                            base_octets[0], base_octets[1], base_octets[2], host_offset, prefix
+                        );
+                        let ip_no_prefix = format!(
+                            "{}.{}.{}.{}",
+                            base_octets[0], base_octets[1], base_octets[2], host_offset
+                        );
 
-                    host_offset = host_offset.saturating_add(1);
+                        // First IP assigned becomes the primary (for port forwarding).
+                        service_primary_ip
+                            .entry(replica_name.clone())
+                            .or_insert(ip_no_prefix);
+
+                        network_services.push(vz_runtime_contract::NetworkServiceConfig {
+                            name: replica_name,
+                            addr: ip,
+                            network_name: net.name.clone(),
+                        });
+
+                        host_offset = host_offset.saturating_add(1);
+                    }
                 }
             }
 
@@ -770,7 +779,6 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
         // Group creates by topo level for parallel execution.
         let levels = compute_topo_levels(&creates, spec);
-        let use_shared_vm = self.runtime.has_sandbox(&spec.name);
 
         for level in &levels {
             // Clean up old containers before creating new ones.
@@ -813,13 +821,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
                 // Create one PreparedCreate per replica
                 for replica_index in 1..=replicas {
-                    match self.prepare_create(
-                        spec,
-                        &service_map,
-                        service_name,
-                        replica_index,
-                        use_shared_vm,
-                    ) {
+                    match self.prepare_create(spec, &service_map, service_name, replica_index) {
                         Ok(prep) => prepared.push(prep),
                         Err(e) => {
                             result.failed += 1;
@@ -845,12 +847,9 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                         result.errors.push((full_name, e.to_string()));
                         continue;
                     }
-                    let create_result = if prep.use_shared_vm {
+                    let create_result =
                         self.runtime
-                            .create_in_sandbox(&spec.name, &prep.image, prep.run_config)
-                    } else {
-                        self.runtime.create(&prep.image, prep.run_config)
-                    };
+                            .create_in_sandbox(&spec.name, &prep.image, prep.run_config);
                     match create_result {
                         Ok(container_id) => {
                             self.finalize_create(spec, &full_name, &container_id)?;
@@ -884,15 +883,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                                 info!(service = %full_name, image = %prep.image, "pulling image");
                                 runtime.pull(&prep.image)?;
                                 info!(service = %full_name, image = %prep.image, "creating container");
-                                if prep.use_shared_vm {
-                                    runtime.create_in_sandbox(
-                                        stack_name,
-                                        &prep.image,
-                                        prep.run_config,
-                                    )
-                                } else {
-                                    runtime.create(&prep.image, prep.run_config)
-                                }
+                                runtime.create_in_sandbox(
+                                    stack_name,
+                                    &prep.image,
+                                    prep.run_config,
+                                )
                             })
                         })
                         .collect();
@@ -951,7 +946,6 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         service_map: &HashMap<&str, &ServiceSpec>,
         service_name: &str,
         replica_index: u32,
-        use_shared_vm: bool,
     ) -> Result<PreparedCreate, StackError> {
         let svc_spec = service_map.get(service_name).ok_or_else(|| {
             StackError::InvalidSpec(format!("service '{service_name}' not found in stack spec"))
@@ -1042,29 +1036,30 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         // Convert ServiceSpec → RunConfig.
         let mut run_config = service_to_run_config(svc_spec, &resolved_mounts, &secret_mounts)?;
 
-        // Generate container_id, including replica index if replicas > 1
-        let replicas = svc_spec.resources.replicas;
+        // Generate container_id: replica 1 = base name, replica N = "{base}-{N}".
+        let replicas = svc_spec.resources.replicas.max(1);
         let base_name = svc_spec.container_name.as_deref().unwrap_or(service_name);
-        let container_id = if replicas > 1 {
+        let container_id = if replicas > 1 && replica_index > 1 {
             format!("{}-{}", base_name, replica_index)
         } else {
             base_name.to_string()
         };
         run_config.container_id = Some(container_id);
 
-        // Set the VirtioFS mount tag offset for this service in shared VM mode.
-        if use_shared_vm {
-            if let Some(&offset) = self.mount_tag_offsets.get(service_name) {
-                run_config.mount_tag_offset = offset;
-            }
+        // Set the VirtioFS mount tag offset for this service in sandbox mode.
+        if let Some(&offset) = self.mount_tag_offsets.get(service_name) {
+            run_config.mount_tag_offset = offset;
         }
 
-        // Override ports with resolved allocations.
-        let service_target_host = if use_shared_vm {
-            self.service_ips.get(service_name).cloned()
+        // Compute the replica-qualified name for IP/netns lookup.
+        let replica_qualified_name = if replicas > 1 && replica_index > 1 {
+            format!("{service_name}-{replica_index}")
         } else {
-            None
+            service_name.to_string()
         };
+
+        // Override ports with resolved allocations.
+        let service_target_host = self.service_ips.get(&replica_qualified_name).cloned();
         run_config.ports = published
             .iter()
             .map(|p| {
@@ -1082,47 +1077,35 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             .collect();
 
         // Auto-inject sibling service hostnames for inter-service resolution.
-        // Issue 4: only inject hosts for services that share at least one network.
-        if use_shared_vm {
-            let my_networks: HashSet<&str> = svc_spec.networks.iter().map(|n| n.as_str()).collect();
+        // Only inject hosts for services that share at least one network.
+        let my_networks: HashSet<&str> = svc_spec.networks.iter().map(|n| n.as_str()).collect();
 
-            for svc in &spec.services {
-                if svc.name == service_name {
-                    continue;
-                }
-                if run_config.extra_hosts.iter().any(|(h, _)| h == &svc.name) {
-                    continue;
-                }
-                // Only add if the sibling shares at least one network.
-                let shares_network = svc
-                    .networks
-                    .iter()
-                    .any(|n| my_networks.contains(n.as_str()));
-                if shares_network {
-                    if let Some(ip) = self.service_ips.get(&svc.name) {
-                        run_config.extra_hosts.push((svc.name.clone(), ip.clone()));
-                    }
-                }
+        for svc in &spec.services {
+            if svc.name == service_name {
+                continue;
             }
-            run_config.network_namespace_path = Some(format!("/var/run/netns/{service_name}"));
-        } else {
-            for svc in &spec.services {
-                if svc.name != service_name
-                    && !run_config.extra_hosts.iter().any(|(h, _)| h == &svc.name)
-                {
-                    run_config
-                        .extra_hosts
-                        .push((svc.name.clone(), "127.0.0.1".to_string()));
+            if run_config.extra_hosts.iter().any(|(h, _)| h == &svc.name) {
+                continue;
+            }
+            // Only add if the sibling shares at least one network.
+            let shares_network = svc
+                .networks
+                .iter()
+                .any(|n| my_networks.contains(n.as_str()));
+            if shares_network {
+                if let Some(ip) = self.service_ips.get(&svc.name) {
+                    run_config.extra_hosts.push((svc.name.clone(), ip.clone()));
                 }
             }
         }
+        run_config.network_namespace_path =
+            Some(format!("/var/run/netns/{replica_qualified_name}"));
 
         Ok(PreparedCreate {
             service_name: service_name.to_string(),
             replica_index,
             image: svc_spec.image.clone(),
             run_config,
-            use_shared_vm,
         })
     }
 
@@ -1777,10 +1760,20 @@ mod tests {
         let result = executor.execute(&spec, &actions).unwrap();
         assert!(result.all_succeeded());
 
-        // Verify stop+remove of old, then pull+create of new.
+        // Verify sandbox setup, then stop+remove of old, then pull+create_in_sandbox of new.
         let calls = executor.runtime.call_log();
         let ops: Vec<&str> = calls.iter().map(|(op, _)| op.as_str()).collect();
-        assert_eq!(ops, vec!["stop", "remove", "pull", "create"]);
+        assert_eq!(
+            ops,
+            vec![
+                "create_sandbox",
+                "setup_sandbox_network",
+                "stop",
+                "remove",
+                "pull",
+                "create_in_sandbox",
+            ]
+        );
 
         // New container.
         let observed = executor.store().load_observed_state("myapp").unwrap();
@@ -1968,9 +1961,18 @@ mod tests {
         let result = executor.execute(&spec, &actions).unwrap();
         assert!(result.all_succeeded());
 
-        // Verify pull and create were called.
+        // Verify sandbox setup + pull + create_in_sandbox were called.
         let calls = executor.runtime.call_log();
-        assert_eq!(calls.len(), 2); // pull + create
+        let ops: Vec<&str> = calls.iter().map(|(op, _)| op.as_str()).collect();
+        assert_eq!(
+            ops,
+            vec![
+                "create_sandbox",
+                "setup_sandbox_network",
+                "pull",
+                "create_in_sandbox"
+            ]
+        );
     }
 
     #[test]
@@ -2570,7 +2572,7 @@ mod tests {
     }
 
     #[test]
-    fn single_service_stack_skips_shared_vm() {
+    fn single_service_stack_uses_sandbox() {
         let runtime = MockContainerRuntime::new();
         let mut executor = make_executor(runtime);
         let spec = stack("solo", vec![svc("web", "nginx:latest")]);
@@ -2582,20 +2584,22 @@ mod tests {
         let result = executor.execute(&spec, &actions).unwrap();
         assert!(result.all_succeeded());
 
-        // Should use create, not create_in_sandbox.
+        // Single-service stacks use sandbox mode (same as multi-service).
         let call_log = executor.runtime.call_log();
         let ops: Vec<&str> = call_log.iter().map(|(op, _)| op.as_str()).collect();
-        assert!(!ops.contains(&"create_sandbox"));
-        assert!(!ops.contains(&"setup_sandbox_network"));
-        assert!(ops.contains(&"create"));
-        assert!(!ops.contains(&"create_in_sandbox"));
+        assert!(ops.contains(&"create_sandbox"));
+        assert!(ops.contains(&"setup_sandbox_network"));
+        assert!(ops.contains(&"create_in_sandbox"));
+        assert!(
+            !ops.contains(&"create"),
+            "should use create_in_sandbox, not create"
+        );
     }
 
     #[test]
-    fn single_service_uses_localhost_hosts() {
-        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-db"]);
+    fn single_service_gets_sandbox_network() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
         let mut executor = make_executor(runtime);
-        // Single service — no shared VM.
         let spec = stack("solo", vec![svc("web", "nginx:latest")]);
 
         let actions = vec![Action::ServiceCreate {
@@ -2604,11 +2608,13 @@ mod tests {
 
         executor.execute(&spec, &actions).unwrap();
 
-        // No extra_hosts since there's only one service.
+        // Single service gets sandbox networking (netns path assigned).
         let configs = executor.runtime.captured_configs.lock().unwrap();
         let web_config = configs.iter().find(|(id, _)| id == "ctr-web").unwrap();
-        assert!(web_config.1.extra_hosts.is_empty());
-        assert!(web_config.1.network_namespace_path.is_none());
+        assert!(
+            web_config.1.network_namespace_path.is_some(),
+            "single service should get a network namespace"
+        );
     }
 
     #[test]

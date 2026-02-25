@@ -16,6 +16,61 @@ use crate::spec::{ServiceSpec, StackSpec};
 use crate::state_store::{ServiceObservedState, ServicePhase, StateStore};
 use crate::volume;
 
+/// Compute a deterministic digest of all config-affecting fields for a service.
+///
+/// Any change to image, command, entrypoint, environment, working_dir, user,
+/// ports, capabilities, privileged mode, sysctls, hostname, or mounts will
+/// produce a different digest, triggering a `ServiceRecreate`.
+fn service_config_digest(svc: &ServiceSpec) -> String {
+    let mut hasher = DefaultHasher::new();
+
+    svc.image.hash(&mut hasher);
+    svc.command.hash(&mut hasher);
+    svc.entrypoint.hash(&mut hasher);
+    svc.working_dir.hash(&mut hasher);
+    svc.user.hash(&mut hasher);
+    svc.hostname.hash(&mut hasher);
+    svc.privileged.hash(&mut hasher);
+    svc.read_only.hash(&mut hasher);
+    svc.container_name.hash(&mut hasher);
+
+    // Sort env for determinism (HashMap iteration order is random).
+    let mut env: Vec<(&String, &String)> = svc.environment.iter().collect();
+    env.sort();
+    for (k, v) in &env {
+        k.hash(&mut hasher);
+        v.hash(&mut hasher);
+    }
+
+    // Sort sysctls for determinism.
+    let mut sysctls: Vec<(&String, &String)> = svc.sysctls.iter().collect();
+    sysctls.sort();
+    for (k, v) in &sysctls {
+        k.hash(&mut hasher);
+        v.hash(&mut hasher);
+    }
+
+    // Ports (order-sensitive).
+    for p in &svc.ports {
+        p.container_port.hash(&mut hasher);
+        p.host_port.hash(&mut hasher);
+        p.protocol.hash(&mut hasher);
+    }
+
+    // Capabilities.
+    let mut cap_add = svc.cap_add.clone();
+    cap_add.sort();
+    cap_add.hash(&mut hasher);
+    let mut cap_drop = svc.cap_drop.clone();
+    cap_drop.sort();
+    cap_drop.hash(&mut hasher);
+
+    // Mount topology (reuse existing digest for consistency).
+    volume::mount_plan_digest(&svc.mounts).hash(&mut hasher);
+
+    format!("{:016x}", hasher.finish())
+}
+
 /// A reconciliation action to converge observed state toward desired state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -120,13 +175,13 @@ pub fn apply(
 ) -> Result<ApplyResult, StackError> {
     // 1. Load previous desired state (for reverse-dep teardown ordering).
     let previous_desired = store.load_desired_state(&spec.name)?;
-    let previous_mount_digests: HashMap<String, String> = previous_desired
+    let previous_config_digests: HashMap<String, String> = previous_desired
         .as_ref()
         .map(|stack| {
             stack
                 .services
                 .iter()
-                .map(|svc| (svc.name.clone(), volume::mount_plan_digest(&svc.mounts)))
+                .map(|svc| (svc.name.clone(), service_config_digest(svc)))
                 .collect()
         })
         .unwrap_or_default();
@@ -180,7 +235,7 @@ pub fn apply(
         match action {
             Action::ServiceCreate { service_name } => {
                 if let Some(service) = desired_service_map.get(service_name.as_str()) {
-                    let digest = volume::mount_plan_digest(&service.mounts);
+                    let digest = service_config_digest(service);
                     store.save_service_mount_digest(&spec.name, service_name, &digest)?;
                 }
                 store.save_observed_state(
@@ -205,12 +260,12 @@ pub fn apply(
             Action::ServiceRecreate { service_name } => {
                 let desired_digest = desired_service_map
                     .get(service_name.as_str())
-                    .map(|service| volume::mount_plan_digest(&service.mounts))
+                    .map(|service| service_config_digest(service))
                     .unwrap_or_default();
                 let previous_digest = stored_mount_digests
                     .get(service_name)
                     .cloned()
-                    .or_else(|| previous_mount_digests.get(service_name).cloned());
+                    .or_else(|| previous_config_digests.get(service_name).cloned());
                 store.emit_event(
                     &spec.name,
                     &StackEvent::MountTopologyRecreateRequired {
@@ -220,12 +275,18 @@ pub fn apply(
                         desired_digest: desired_digest.clone(),
                     },
                 )?;
+                // Preserve the existing container_id so the executor can
+                // stop + remove the old container before creating the new one.
+                let existing_cid = observed
+                    .iter()
+                    .find(|o| o.service_name == *service_name)
+                    .and_then(|o| o.container_id.clone());
                 store.save_observed_state(
                     &spec.name,
                     &ServiceObservedState {
                         service_name: service_name.clone(),
                         phase: ServicePhase::Pending,
-                        container_id: None,
+                        container_id: existing_cid,
                         last_error: None,
                         ready: false,
                     },
@@ -278,6 +339,24 @@ pub fn apply(
     Ok(ApplyResult { actions, deferred })
 }
 
+/// Compute all expected replica container names for a service.
+///
+/// Replica 1 uses the base name (container_name or service name).
+/// Replicas 2+ use `{base}-{N}`. Returns exactly `replicas` entries.
+fn replica_names(svc: &ServiceSpec) -> Vec<String> {
+    let base = svc.container_name.as_deref().unwrap_or(&svc.name);
+    let count = svc.resources.replicas.max(1);
+    (1..=count)
+        .map(|i| {
+            if i == 1 {
+                base.to_string()
+            } else {
+                format!("{base}-{i}")
+            }
+        })
+        .collect()
+}
+
 /// Compute a deterministic, dependency-ordered action plan.
 ///
 /// Compares desired services against observed state and generates actions:
@@ -328,40 +407,50 @@ fn compute_actions_with_mount_digests(
         .map(|svc| (svc.name.as_str(), svc))
         .collect();
 
-    let desired_names: HashSet<&str> = desired_services.iter().map(|s| s.name.as_str()).collect();
+    // Build the full set of expected replica names across all desired services.
+    // This is used for removal filtering so that replica-qualified names
+    // (e.g., "web-2", "web-3") are not mistakenly removed.
+    let all_desired_replica_names: HashSet<String> =
+        desired_services.iter().flat_map(replica_names).collect();
 
     let mut actions = Vec::new();
     let mut deferred = Vec::new();
 
     // Services to create or recreate.
     for svc in desired_services {
-        let desired_mount_digest = volume::mount_plan_digest(&svc.mounts);
-        let previous_mount_digest = observed_mount_digests
+        let expected_replicas = replica_names(svc);
+
+        // Check full config digest (image, env, command, ports, mounts, etc.).
+        let desired_digest = service_config_digest(svc);
+        let previous_digest = observed_mount_digests
             .get(svc.name.as_str())
             .cloned()
             .or_else(|| {
                 previous_service_map
                     .get(svc.name.as_str())
-                    .map(|previous| volume::mount_plan_digest(&previous.mounts))
+                    .map(|previous| service_config_digest(previous))
             });
-        let mount_topology_changed = previous_mount_digest
+        let config_changed = previous_digest
             .as_ref()
-            .is_some_and(|previous| previous != &desired_mount_digest);
-        let needs_recreate = mount_topology_changed
+            .is_some_and(|previous| previous != &desired_digest);
+
+        // Recreate if config changed and the base replica is Running.
+        let needs_recreate = config_changed
             && observed_map
                 .get(svc.name.as_str())
                 .is_some_and(|obs| matches!(obs.phase, ServicePhase::Running));
 
-        let needs_create = match observed_map.get(svc.name.as_str()) {
-            None => true,
-            Some(obs) => {
-                // If observed state is Pending/Failed/Stopped, treat as needing creation.
-                matches!(
-                    obs.phase,
-                    ServicePhase::Pending | ServicePhase::Failed | ServicePhase::Stopped
-                )
-            }
-        };
+        // Create if any expected replica is missing, pending, failed, or stopped.
+        let needs_create =
+            expected_replicas
+                .iter()
+                .any(|name| match observed_map.get(name.as_str()) {
+                    None => true,
+                    Some(obs) => matches!(
+                        obs.phase,
+                        ServicePhase::Pending | ServicePhase::Failed | ServicePhase::Stopped
+                    ),
+                });
 
         if needs_recreate || needs_create {
             // Check dependency readiness before allowing creation.
@@ -385,12 +474,40 @@ fn compute_actions_with_mount_digests(
                 }
             }
         }
+
+        // Scale-down: remove excess replicas beyond the desired count.
+        // Check observed for replica names that exceed current replica count.
+        let desired_set: HashSet<&str> = expected_replicas.iter().map(|s| s.as_str()).collect();
+        let base = svc.container_name.as_deref().unwrap_or(&svc.name);
+        for o in observed {
+            // Match observed entries that belong to this service but are excess.
+            // A replica belongs to this service if it equals the base name or
+            // matches the pattern "{base}-{N}" where N > 1.
+            let belongs = o.service_name == base
+                || o.service_name.strip_prefix(base).is_some_and(|suffix| {
+                    suffix
+                        .strip_prefix('-')
+                        .and_then(|n| n.parse::<u32>().ok())
+                        .is_some_and(|n| n > 1)
+                });
+            if belongs && !desired_set.contains(o.service_name.as_str()) {
+                actions.push(Action::ServiceRemove {
+                    service_name: o.service_name.clone(),
+                });
+            }
+        }
     }
 
-    // Services to remove (in observed but not in desired).
+    // Remove observed entries that aren't in any desired service's replica set.
     let mut removals: Vec<String> = observed
         .iter()
-        .filter(|o| !desired_names.contains(o.service_name.as_str()))
+        .filter(|o| !all_desired_replica_names.contains(&o.service_name))
+        .filter(|o| {
+            // Don't double-add scale-down removals already handled above.
+            !actions.iter().any(|a| {
+                matches!(a, Action::ServiceRemove { service_name } if service_name == &o.service_name)
+            })
+        })
         .map(|o| o.service_name.clone())
         .collect();
     removals.sort();
@@ -718,14 +835,19 @@ mod tests {
             ..svc("web", "nginx:latest")
         }];
         let observed = vec![obs_running("web")];
-        let mut observed_mount_digests = HashMap::new();
-        observed_mount_digests.insert(
-            "web".to_string(),
-            volume::mount_plan_digest(&[MountSpec::Bind {
+        // The stored digest is the full config digest of the old service.
+        let old_service = ServiceSpec {
+            mounts: vec![MountSpec::Bind {
                 source: "/workspace/old".to_string(),
                 target: "/workspace".to_string(),
                 read_only: false,
-            }]),
+            }],
+            ..svc("web", "nginx:latest")
+        };
+        let mut observed_config_digests = HashMap::new();
+        observed_config_digests.insert(
+            "web".to_string(),
+            super::service_config_digest(&old_service),
         );
 
         let (actions, deferred) = compute_actions_with_mount_digests(
@@ -733,7 +855,7 @@ mod tests {
             &observed,
             &no_health(),
             None,
-            &observed_mount_digests,
+            &observed_config_digests,
         );
         assert_eq!(
             actions,
@@ -1195,7 +1317,7 @@ mod tests {
         let digests = store.load_service_mount_digests("myapp").unwrap();
         assert_eq!(
             digests.get("web"),
-            Some(&volume::mount_plan_digest(&s2.services[0].mounts))
+            Some(&super::service_config_digest(&s2.services[0]))
         );
     }
 
@@ -1469,5 +1591,130 @@ mod tests {
         let hash = compute_actions_hash(&[]);
         assert_eq!(hash.len(), 16);
         // Empty list should still produce a valid hash.
+    }
+
+    // ── Replica-aware reconciliation tests ──
+
+    fn svc_with_replicas(name: &str, image: &str, replicas: u32) -> ServiceSpec {
+        use crate::spec::ResourcesSpec;
+        ServiceSpec {
+            resources: ResourcesSpec {
+                replicas,
+                ..Default::default()
+            },
+            ..svc(name, image)
+        }
+    }
+
+    #[test]
+    fn compute_actions_creates_replicated_service() {
+        // replicas=3, no observed → ServiceCreate for the base name.
+        let desired = vec![svc_with_replicas("web", "nginx:latest", 3)];
+        let observed = vec![];
+
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0],
+            Action::ServiceCreate {
+                service_name: "web".to_string()
+            }
+        );
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn compute_actions_noop_for_converged_replicas() {
+        // replicas=3, all 3 Running → no actions.
+        let desired = vec![svc_with_replicas("web", "nginx:latest", 3)];
+        let observed = vec![
+            obs_running("web"),
+            obs_running("web-2"),
+            obs_running("web-3"),
+        ];
+
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
+        assert!(actions.is_empty());
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn compute_actions_scale_up() {
+        // observed has only "web" Running, desired replicas=3 → ServiceCreate.
+        let desired = vec![svc_with_replicas("web", "nginx:latest", 3)];
+        let observed = vec![obs_running("web")];
+
+        let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0],
+            Action::ServiceCreate {
+                service_name: "web".to_string()
+            }
+        );
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn compute_actions_scale_down() {
+        // observed has "web"+"web-2"+"web-3", desired replicas=1 → remove web-2, web-3.
+        let desired = vec![svc_with_replicas("web", "nginx:latest", 1)];
+        let observed = vec![
+            obs_running("web"),
+            obs_running("web-2"),
+            obs_running("web-3"),
+        ];
+
+        let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
+        let mut remove_names: Vec<&str> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::ServiceRemove { service_name } => Some(service_name.as_str()),
+                _ => None,
+            })
+            .collect();
+        remove_names.sort();
+        assert_eq!(remove_names, vec!["web-2", "web-3"]);
+    }
+
+    #[test]
+    fn compute_actions_removes_all_replicas() {
+        // desired empty, observed has all 3 replicas → remove all.
+        let desired: Vec<ServiceSpec> = vec![];
+        let observed = vec![
+            obs_running("web"),
+            obs_running("web-2"),
+            obs_running("web-3"),
+        ];
+
+        let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
+        assert_eq!(actions.len(), 3);
+        assert!(
+            actions
+                .iter()
+                .all(|a| matches!(a, Action::ServiceRemove { .. }))
+        );
+    }
+
+    #[test]
+    fn compute_actions_does_not_remove_replicas_of_running_service() {
+        // Replica names like "web-2" should NOT be removed when the service
+        // specifies replicas >= 2. This was the original bug.
+        let desired = vec![svc_with_replicas("web", "nginx:latest", 3)];
+        let observed = vec![
+            obs_running("web"),
+            obs_running("web-2"),
+            obs_running("web-3"),
+        ];
+
+        let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
+        let removes: Vec<&str> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::ServiceRemove { service_name } => Some(service_name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(removes.is_empty(), "should not remove any running replicas");
     }
 }
