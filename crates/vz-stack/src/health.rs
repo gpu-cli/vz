@@ -1444,4 +1444,187 @@ mod tests {
         let msg = build_health_check_error("cmd", 1, None, "", &long_stderr, 1, 3);
         assert!(msg.contains("..."));
     }
+
+    // ── Concurrent health check timeout/failure cascade tests ──
+
+    #[test]
+    fn multiple_services_timeout_simultaneously() {
+        use std::time::Duration;
+
+        let mut runtime = MockContainerRuntime::new();
+        // Both services will time out (exec sleeps 2s, timeout is 1s).
+        runtime.exec_delay = Some(Duration::from_secs(2));
+        let store = StateStore::in_memory().unwrap();
+
+        let hc = || HealthCheckSpec {
+            test: vec!["CMD".to_string(), "slow-cmd".to_string()],
+            interval_secs: Some(0),
+            timeout_secs: Some(1),
+            retries: Some(3),
+            start_period_secs: None,
+        };
+
+        let spec = stack_with_hc(
+            "app",
+            vec![
+                ServiceSpec {
+                    healthcheck: Some(hc()),
+                    ..svc("web")
+                },
+                ServiceSpec {
+                    healthcheck: Some(hc()),
+                    ..svc("api")
+                },
+            ],
+        );
+
+        store
+            .save_observed_state("app", &running_obs("web", "ctr-web"))
+            .unwrap();
+        store
+            .save_observed_state("app", &running_obs("api", "ctr-api"))
+            .unwrap();
+
+        let mut poller = HealthPoller::new();
+        let result = poller.poll_all(&runtime, &store, &spec).unwrap();
+
+        // Both services should have been checked (not blocked by each other).
+        assert_eq!(result.checks_run, 2, "both services should be polled");
+        assert!(result.newly_ready.is_empty());
+
+        // Both should have 1 consecutive failure each.
+        assert_eq!(poller.statuses()["web"].consecutive_failures, 1);
+        assert_eq!(poller.statuses()["api"].consecutive_failures, 1);
+    }
+
+    #[test]
+    fn timeouts_count_toward_retry_exhaustion() {
+        use std::time::Duration;
+
+        let mut runtime = MockContainerRuntime::new();
+        runtime.exec_delay = Some(Duration::from_secs(2));
+        let store = StateStore::in_memory().unwrap();
+
+        let spec = stack_with_hc(
+            "app",
+            vec![ServiceSpec {
+                healthcheck: Some(HealthCheckSpec {
+                    test: vec!["CMD".to_string(), "slow-cmd".to_string()],
+                    interval_secs: Some(0),
+                    timeout_secs: Some(1),
+                    retries: Some(2), // Exhausts after 2 failures.
+                    start_period_secs: None,
+                }),
+                ..svc("web")
+            }],
+        );
+
+        store
+            .save_observed_state("app", &running_obs("web", "ctr-web"))
+            .unwrap();
+
+        let mut poller = HealthPoller::new();
+
+        // Round 1: first timeout failure.
+        let r1 = poller.poll_all(&runtime, &store, &spec).unwrap();
+        assert_eq!(r1.checks_run, 1);
+        assert!(r1.newly_failed.is_empty(), "not yet exhausted retries");
+        assert_eq!(poller.statuses()["web"].consecutive_failures, 1);
+
+        // Round 2: second timeout failure — retries exhausted.
+        let r2 = poller.poll_all(&runtime, &store, &spec).unwrap();
+        assert_eq!(r2.checks_run, 1);
+        assert_eq!(
+            r2.newly_failed.len(),
+            1,
+            "should report web as newly failed after 2 consecutive timeouts"
+        );
+        assert_eq!(r2.newly_failed[0], "web");
+
+        // Consecutive failures counter resets after exhaustion (Docker semantics:
+        // service keeps running, health checks continue).
+        assert_eq!(poller.statuses()["web"].consecutive_failures, 0);
+    }
+
+    #[test]
+    fn exec_error_counted_as_failure_toward_exhaustion() {
+        let mut runtime = MockContainerRuntime::new();
+        runtime.fail_exec = true;
+        let store = StateStore::in_memory().unwrap();
+
+        let spec = stack_with_hc(
+            "app",
+            vec![ServiceSpec {
+                healthcheck: Some(HealthCheckSpec {
+                    test: vec!["CMD".to_string(), "check".to_string()],
+                    interval_secs: Some(0),
+                    timeout_secs: Some(3),
+                    retries: Some(2),
+                    start_period_secs: None,
+                }),
+                ..svc("web")
+            }],
+        );
+
+        store
+            .save_observed_state("app", &running_obs("web", "ctr-web"))
+            .unwrap();
+
+        let mut poller = HealthPoller::new();
+
+        // Round 1: exec error.
+        let r1 = poller.poll_all(&runtime, &store, &spec).unwrap();
+        assert_eq!(poller.statuses()["web"].consecutive_failures, 1);
+        assert!(r1.newly_failed.is_empty());
+
+        // Round 2: exec error again — retries exhausted.
+        let r2 = poller.poll_all(&runtime, &store, &spec).unwrap();
+        assert_eq!(r2.newly_failed.len(), 1);
+        assert_eq!(r2.newly_failed[0], "web");
+    }
+
+    #[test]
+    fn service_recovers_after_retry_exhaustion() {
+        let mut runtime = MockContainerRuntime::new();
+        runtime.exec_exit_code = 1; // Health check fails.
+        let store = StateStore::in_memory().unwrap();
+
+        let spec = stack_with_hc(
+            "app",
+            vec![ServiceSpec {
+                healthcheck: Some(HealthCheckSpec {
+                    test: vec!["CMD".to_string(), "check".to_string()],
+                    interval_secs: Some(0),
+                    timeout_secs: Some(3),
+                    retries: Some(1), // Exhausts after 1 failure.
+                    start_period_secs: None,
+                }),
+                ..svc("web")
+            }],
+        );
+
+        store
+            .save_observed_state("app", &running_obs("web", "ctr-web"))
+            .unwrap();
+
+        let mut poller = HealthPoller::new();
+
+        // Round 1: health check fails → retries exhausted.
+        let r1 = poller.poll_all(&runtime, &store, &spec).unwrap();
+        assert_eq!(r1.newly_failed.len(), 1);
+
+        // Now health check passes.
+        runtime.exec_exit_code = 0;
+
+        // Round 2: should recover and mark service ready.
+        let r2 = poller.poll_all(&runtime, &store, &spec).unwrap();
+        assert_eq!(
+            r2.newly_ready.len(),
+            1,
+            "service should recover after retries exhaustion"
+        );
+        assert_eq!(r2.newly_ready[0], "web");
+        assert_eq!(poller.statuses()["web"].consecutive_passes, 1);
+        assert_eq!(poller.statuses()["web"].consecutive_failures, 0);
+    }
 }

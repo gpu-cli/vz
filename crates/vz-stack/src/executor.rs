@@ -445,9 +445,21 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         &self.ports
     }
 
+    /// Mutable access to the port tracker (for test reallocation checks).
+    #[cfg(test)]
+    pub fn ports_mut(&mut self) -> &mut PortTracker {
+        &mut self.ports
+    }
+
     /// Access the underlying container runtime.
     pub fn runtime(&self) -> &R {
         &self.runtime
+    }
+
+    /// Mutable access to the underlying container runtime (for test failure injection).
+    #[cfg(test)]
+    pub fn runtime_mut(&mut self) -> &mut R {
+        &mut self.runtime
     }
 
     /// Execute a batch of reconciler actions for the given stack spec.
@@ -1307,6 +1319,8 @@ pub(crate) mod tests_support {
         pub fail_create: bool,
         /// Whether stop should fail.
         pub fail_stop: bool,
+        /// Whether remove should fail.
+        pub fail_remove: bool,
         /// Exit code to return from exec calls.
         pub exec_exit_code: i32,
         /// Whether exec should fail with an error (not just non-zero exit).
@@ -1337,6 +1351,7 @@ pub(crate) mod tests_support {
                 fail_pull: false,
                 fail_create: false,
                 fail_stop: false,
+                fail_remove: false,
                 exec_exit_code: 0,
                 fail_exec: false,
                 exec_delay: None,
@@ -1431,6 +1446,9 @@ pub(crate) mod tests_support {
                 .lock()
                 .unwrap()
                 .push(("remove".to_string(), container_id.to_string()));
+            if self.fail_remove {
+                return Err(StackError::InvalidSpec("mock remove failure".to_string()));
+            }
             Ok(())
         }
 
@@ -1579,6 +1597,7 @@ mod tests {
 
     use super::tests_support::MockContainerRuntime;
     use super::*;
+    use crate::reconcile::apply;
     use crate::spec::MountSpec as StackMountSpec;
     use crate::spec::{PortSpec, ResourcesSpec, ServiceKind, StackSpec, VolumeSpec};
     use std::collections::HashMap;
@@ -3233,5 +3252,249 @@ mod tests {
         assert_eq!(cloned.service, "web");
         // Ensure Debug is derived.
         let _debug = format!("{:?}", cloned);
+    }
+
+    // ── Stop/remove failure cascade tests ──
+
+    #[test]
+    fn stop_failure_still_attempts_remove() {
+        let mut runtime = MockContainerRuntime::new();
+        runtime.fail_stop = true;
+        let mut executor = make_executor(runtime);
+        let spec = stack("myapp", vec![]);
+
+        // Simulate existing running container.
+        executor
+            .store()
+            .save_observed_state(
+                "myapp",
+                &ServiceObservedState {
+                    service_name: "web".to_string(),
+                    phase: ServicePhase::Running,
+                    container_id: Some("ctr-web".to_string()),
+                    last_error: None,
+                    ready: false,
+                },
+            )
+            .unwrap();
+
+        let actions = vec![Action::ServiceRemove {
+            service_name: "web".to_string(),
+        }];
+
+        let result = executor.execute(&spec, &actions).unwrap();
+        assert!(result.all_succeeded(), "remove should succeed despite stop failure");
+
+        // Verify both stop AND remove were attempted.
+        let calls = executor.runtime().call_log();
+        assert!(calls.iter().any(|(op, _)| op == "stop"), "stop should be attempted");
+        assert!(
+            calls.iter().any(|(op, _)| op == "remove"),
+            "remove should still be called after stop failure"
+        );
+
+        // State should be Stopped (not stuck in Running).
+        let observed = executor.store().load_observed_state("myapp").unwrap();
+        let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+        assert_eq!(web.phase, ServicePhase::Stopped);
+        assert!(web.container_id.is_none());
+    }
+
+    #[test]
+    fn remove_failure_still_updates_state_to_stopped() {
+        let mut runtime = MockContainerRuntime::new();
+        runtime.fail_remove = true;
+        let mut executor = make_executor(runtime);
+        let spec = stack("myapp", vec![]);
+
+        // Simulate existing running container.
+        executor
+            .store()
+            .save_observed_state(
+                "myapp",
+                &ServiceObservedState {
+                    service_name: "web".to_string(),
+                    phase: ServicePhase::Running,
+                    container_id: Some("ctr-web".to_string()),
+                    last_error: None,
+                    ready: false,
+                },
+            )
+            .unwrap();
+
+        let actions = vec![Action::ServiceRemove {
+            service_name: "web".to_string(),
+        }];
+
+        let result = executor.execute(&spec, &actions).unwrap();
+        assert!(result.all_succeeded(), "remove should succeed even when runtime remove fails");
+
+        // State should be Stopped (not stuck in Running).
+        let observed = executor.store().load_observed_state("myapp").unwrap();
+        let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+        assert_eq!(web.phase, ServicePhase::Stopped);
+        assert!(web.container_id.is_none());
+    }
+
+    #[test]
+    fn stop_and_remove_both_fail_still_updates_state() {
+        let mut runtime = MockContainerRuntime::new();
+        runtime.fail_stop = true;
+        runtime.fail_remove = true;
+        let mut executor = make_executor(runtime);
+        let spec = stack("myapp", vec![]);
+
+        executor
+            .store()
+            .save_observed_state(
+                "myapp",
+                &ServiceObservedState {
+                    service_name: "web".to_string(),
+                    phase: ServicePhase::Running,
+                    container_id: Some("ctr-web".to_string()),
+                    last_error: None,
+                    ready: false,
+                },
+            )
+            .unwrap();
+
+        let actions = vec![Action::ServiceRemove {
+            service_name: "web".to_string(),
+        }];
+
+        let result = executor.execute(&spec, &actions).unwrap();
+        // Executor marks result as succeeded because state is updated
+        // regardless of stop/remove runtime errors (best-effort cleanup).
+        assert!(result.all_succeeded());
+
+        let observed = executor.store().load_observed_state("myapp").unwrap();
+        let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+        assert_eq!(web.phase, ServicePhase::Stopped);
+    }
+
+    #[test]
+    fn ports_released_on_remove_even_when_stop_fails() {
+        let mut runtime = MockContainerRuntime::new();
+        runtime.fail_stop = true;
+        let mut executor = make_executor(runtime);
+
+        let mut web = svc("web", "nginx:latest");
+        web.ports = vec![PortSpec {
+            protocol: "tcp".to_string(),
+            container_port: 80,
+            host_port: Some(8080),
+        }];
+        let spec = stack("myapp", vec![web.clone()]);
+
+        // Create the service first.
+        let actions = vec![Action::ServiceCreate {
+            service_name: "web".to_string(),
+        }];
+        let result = executor.execute(&spec, &actions).unwrap();
+        assert!(result.all_succeeded());
+        assert!(executor.ports().in_use().contains(&8080));
+
+        // Now remove — stop will fail but ports should still be released.
+        let remove_spec = stack("myapp", vec![]);
+        let remove_actions = vec![Action::ServiceRemove {
+            service_name: "web".to_string(),
+        }];
+        let result = executor.execute(&remove_spec, &remove_actions).unwrap();
+        assert!(result.all_succeeded());
+        assert!(
+            !executor.ports().in_use().contains(&8080),
+            "port 8080 should be released even when stop fails"
+        );
+    }
+
+    #[test]
+    fn ports_released_when_create_fails_on_retry() {
+        let mut runtime = MockContainerRuntime::new();
+        runtime.fail_create = true;
+        let mut executor = make_executor(runtime);
+
+        let mut web = svc("web", "nginx:latest");
+        web.ports = vec![PortSpec {
+            protocol: "tcp".to_string(),
+            container_port: 80,
+            host_port: Some(8080),
+        }];
+        let spec = stack("myapp", vec![web.clone()]);
+
+        // Create fails — ports were allocated during prepare_create but
+        // service is marked Failed. Verify port state is usable for retry.
+        let actions = vec![Action::ServiceCreate {
+            service_name: "web".to_string(),
+        }];
+        let result = executor.execute(&spec, &actions).unwrap();
+        assert_eq!(result.failed, 1);
+
+        // Port should still be allocated (not released) because the service
+        // will be retried — release only happens on ServiceRemove.
+        // But crucially, a second create attempt should not conflict.
+        let mut retry_runtime = MockContainerRuntime::new();
+        retry_runtime.fail_create = false;
+        // We can't swap the runtime, but we can verify port tracker state
+        // allows reallocation for the same service.
+        let reallocated = executor.ports_mut().allocate("web", &web.ports);
+        assert!(
+            reallocated.is_ok(),
+            "same service should be able to reallocate its ports on retry: {:?}",
+            reallocated.err()
+        );
+    }
+
+    // ── Partial replica scale-down failure tests ──
+
+    #[test]
+    fn replica_scale_down_removes_excess_replicas() {
+        let runtime = MockContainerRuntime::new();
+        let mut executor = make_executor(runtime);
+        let spec_name = "replica-sd";
+
+        // Simulate 3 running replicas.
+        for (name, cid) in [("web", "ctr-web"), ("web-2", "ctr-web-2"), ("web-3", "ctr-web-3")] {
+            executor
+                .store()
+                .save_observed_state(
+                    spec_name,
+                    &ServiceObservedState {
+                        service_name: name.to_string(),
+                        phase: ServicePhase::Running,
+                        container_id: Some(cid.to_string()),
+                        last_error: None,
+                        ready: false,
+                    },
+                )
+                .unwrap();
+        }
+
+        // Scale down to 1 replica.
+        let mut web = svc("web", "nginx:latest");
+        web.resources.replicas = 1;
+        let spec = stack(spec_name, vec![web]);
+
+        let health = HashMap::new();
+        let reconcile = apply(&spec, executor.store(), &health).unwrap();
+
+        // Should generate 2 remove actions (for web-2 and web-3).
+        let remove_count = reconcile
+            .actions
+            .iter()
+            .filter(|a| matches!(a, Action::ServiceRemove { .. }))
+            .count();
+        assert_eq!(remove_count, 2, "should remove 2 excess replicas");
+
+        let result = executor.execute(&spec, &reconcile.actions).unwrap();
+        assert_eq!(result.failed, 0, "all removals should succeed");
+
+        // Only web (base replica) should remain running.
+        let observed = executor.store().load_observed_state(spec_name).unwrap();
+        let running: Vec<&str> = observed
+            .iter()
+            .filter(|o| matches!(o.phase, ServicePhase::Running))
+            .map(|o| o.service_name.as_str())
+            .collect();
+        assert_eq!(running, vec!["web"]);
     }
 }

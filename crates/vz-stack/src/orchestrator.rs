@@ -1202,4 +1202,166 @@ mod tests {
             "should emit OrphanCleaned event"
         );
     }
+
+    // ── Max rounds exhaustion leaves services in terminal state ──
+
+    #[test]
+    fn max_rounds_exhaustion_reports_pending_services() {
+        // Health check always fails → service stays Running but not ready.
+        let mut runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
+        runtime.exec_exit_code = 1;
+        let (mut orch, _tmp) = make_orchestrator_shared(runtime);
+        orch.config.max_rounds = 3;
+
+        let spec = stack(
+            "app",
+            vec![ServiceSpec {
+                healthcheck: Some(HealthCheckSpec {
+                    test: vec!["CMD".to_string(), "false".to_string()],
+                    interval_secs: Some(1),
+                    timeout_secs: Some(1),
+                    retries: Some(100), // Never exhausts retries within max_rounds.
+                    start_period_secs: None,
+                }),
+                ..svc("web")
+            }],
+        );
+
+        let result = orch.run(&spec, None).unwrap();
+        assert!(!result.converged);
+        assert_eq!(result.rounds, 3);
+        // Service is Running but not ready (health check failing).
+        assert_eq!(result.services_ready, 0);
+        assert_eq!(result.services_failed, 0);
+
+        // Service phase in state store should be Running (not Creating or Stopping).
+        let observed = orch
+            .executor()
+            .store()
+            .load_observed_state("app")
+            .unwrap();
+        let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+        assert_eq!(
+            web.phase,
+            ServicePhase::Running,
+            "service should be Running, not stuck in a transient state"
+        );
+        assert!(
+            web.container_id.is_some(),
+            "container ID should still be present"
+        );
+    }
+
+    #[test]
+    fn max_rounds_exhaustion_with_create_failure_leaves_failed_state() {
+        let mut runtime = MockContainerRuntime::new();
+        runtime.fail_create = true;
+        let (mut orch, _tmp) = make_orchestrator_shared(runtime);
+        orch.config.max_rounds = 3;
+
+        let spec = stack("app", vec![svc("web")]);
+
+        let result = orch.run(&spec, None).unwrap();
+        // Create fails every round → service stays Failed → reconciler
+        // keeps retrying → hits max_rounds.
+        assert_eq!(result.services_failed, 1);
+
+        let observed = orch
+            .executor()
+            .store()
+            .load_observed_state("app")
+            .unwrap();
+        let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+        assert_eq!(
+            web.phase,
+            ServicePhase::Failed,
+            "service should be Failed, not stuck in Creating"
+        );
+    }
+
+    #[test]
+    fn orchestrator_resumes_cleanly_after_max_rounds() {
+        // First run: health check always fails → max_rounds hit.
+        let mut runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
+        runtime.exec_exit_code = 1;
+        let (mut orch, _tmp) = make_orchestrator_shared(runtime);
+        orch.config.max_rounds = 2;
+
+        let spec = stack(
+            "app",
+            vec![ServiceSpec {
+                healthcheck: Some(HealthCheckSpec {
+                    test: vec!["CMD".to_string(), "check".to_string()],
+                    interval_secs: Some(0), // No throttle.
+                    timeout_secs: Some(1),
+                    retries: Some(100),
+                    start_period_secs: None,
+                }),
+                ..svc("web")
+            }],
+        );
+
+        let r1 = orch.run(&spec, None).unwrap();
+        assert!(!r1.converged);
+        assert_eq!(r1.rounds, 2);
+
+        // Second run: health check now passes → should converge.
+        orch.executor.runtime_mut().exec_exit_code = 0;
+        orch.config.max_rounds = 10;
+        let r2 = orch.run(&spec, None).unwrap();
+        assert!(
+            r2.converged,
+            "should converge on second run when health checks pass"
+        );
+        assert_eq!(r2.services_ready, 1);
+    }
+
+    #[test]
+    fn concurrent_health_check_failures_dont_block_convergence() {
+        // Two services with health checks. Both fail initially,
+        // then both pass. Verify orchestrator doesn't get stuck.
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-api"]);
+        let (mut orch, _tmp) = make_orchestrator_shared(runtime);
+
+        // Start with exec_exit_code = 1 (health check fails).
+        orch.executor.runtime_mut().exec_exit_code = 1;
+
+        let spec = stack(
+            "app",
+            vec![
+                ServiceSpec {
+                    healthcheck: Some(HealthCheckSpec {
+                        test: vec!["CMD".to_string(), "check".to_string()],
+                        interval_secs: Some(0), // No throttle.
+                        timeout_secs: Some(1),
+                        retries: Some(100),
+                        start_period_secs: None,
+                    }),
+                    ..svc("web")
+                },
+                ServiceSpec {
+                    healthcheck: Some(HealthCheckSpec {
+                        test: vec!["CMD".to_string(), "check".to_string()],
+                        interval_secs: Some(0), // No throttle.
+                        timeout_secs: Some(1),
+                        retries: Some(100),
+                        start_period_secs: None,
+                    }),
+                    ..svc("api")
+                },
+            ],
+        );
+
+        // Run once to create services and fail health checks.
+        orch.config.max_rounds = 2;
+        let r1 = orch.run(&spec, None).unwrap();
+        assert!(!r1.converged);
+
+        // Now make health checks pass.
+        orch.executor.runtime_mut().exec_exit_code = 0;
+        orch.config.max_rounds = 10;
+        let r2 = orch.run(&spec, None).unwrap();
+        assert!(r2.converged, "both services should converge");
+        assert_eq!(r2.services_ready, 2);
+    }
 }
