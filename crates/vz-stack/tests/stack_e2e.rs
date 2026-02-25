@@ -28,6 +28,7 @@ use vz_runtime_contract::{
 use vz_stack::{
     Action, ContainerRuntime, ImagePolicy, OrchestrationConfig, ServicePhase, StackError,
     StackEvent, StackExecutor, StackOrchestrator, StateStore, apply, parse_compose,
+    parse_compose_with_dir,
 };
 
 fn has_virtualization_entitlement() -> bool {
@@ -2530,4 +2531,574 @@ services:
     let down_result = apply(&down_spec, executor.store(), &health).unwrap();
     let _ = executor.execute(&down_spec, &down_result.actions);
     let _ = executor.runtime().shutdown_sandbox("scale-e2e");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Sandbox real-world scenario tests: volumes, secrets, env_file, multi-network
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Verify bind mounts and named volumes work inside sandbox containers.
+///
+/// 1. Bind mount: a host file is visible inside the container.
+/// 2. Named volume: data written by one container survives a recreate.
+/// 3. Shared named volume: two services can read each other's writes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn sandbox_bind_mount_and_named_volume() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,vz_oci_macos=debug,vz_linux=debug,vz_stack=debug")
+        .with_test_writer()
+        .try_init();
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Create a host file for bind mounting.
+    let bind_dir = tmp.path().join("bind-src");
+    std::fs::create_dir_all(&bind_dir).unwrap();
+    std::fs::write(bind_dir.join("hello.txt"), "bind-mount-works").unwrap();
+
+    let bind_dir_str = bind_dir.to_str().unwrap();
+
+    let yaml = format!(
+        r#"
+services:
+  writer:
+    image: alpine:latest
+    command: ["sleep", "300"]
+    volumes:
+      - {bind_dir}:/mnt/host:ro
+      - shared:/mnt/shared
+
+  reader:
+    image: alpine:latest
+    command: ["sleep", "300"]
+    volumes:
+      - shared:/mnt/shared
+    depends_on:
+      - writer
+
+volumes:
+  shared:
+"#,
+        bind_dir = bind_dir_str
+    );
+
+    let home = std::env::var("HOME").unwrap();
+    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    std::fs::create_dir_all(&oci_data).unwrap();
+
+    let db_path = tmp.path().join("state.db");
+    let spec = parse_compose(&yaml, "vol-e2e").unwrap();
+    let bridge = OciContainerRuntime::new(&oci_data);
+    let exec_store = StateStore::open(&db_path).unwrap();
+    let reconcile_store = StateStore::open(&db_path).unwrap();
+    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+
+    let orch_config = OrchestrationConfig {
+        poll_interval: Some(2),
+        max_rounds: 20,
+        image_policy: ImagePolicy::AllowAll,
+    };
+    let mut orchestrator = StackOrchestrator::new(executor, reconcile_store, orch_config);
+
+    let result = orchestrator.run(&spec, None).unwrap();
+    assert!(result.converged, "stack should converge");
+    assert_eq!(result.services_ready, 2);
+
+    let observed = orchestrator
+        .executor()
+        .store()
+        .load_observed_state("vol-e2e")
+        .unwrap();
+
+    let writer_cid = observed
+        .iter()
+        .find(|o| o.service_name == "writer")
+        .unwrap()
+        .container_id
+        .as_ref()
+        .unwrap();
+    let reader_cid = observed
+        .iter()
+        .find(|o| o.service_name == "reader")
+        .unwrap()
+        .container_id
+        .as_ref()
+        .unwrap();
+
+    // 1. Verify bind mount: host file visible inside writer container.
+    let (exit_code, stdout, stderr) = orchestrator
+        .executor()
+        .runtime()
+        .exec_with_output(writer_cid, vec!["cat".into(), "/mnt/host/hello.txt".into()]);
+    assert_eq!(
+        exit_code, 0,
+        "reading bind-mounted file should succeed: stderr={stderr}"
+    );
+    assert_eq!(stdout.trim(), "bind-mount-works");
+
+    // 2. Write data to the shared named volume from writer.
+    let (exit_code, _, stderr) = orchestrator.executor().runtime().exec_with_output(
+        writer_cid,
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "echo volume-data-from-writer > /mnt/shared/data.txt".into(),
+        ],
+    );
+    assert_eq!(
+        exit_code, 0,
+        "writing to shared volume should succeed: stderr={stderr}"
+    );
+
+    // 3. Read the shared data from reader container.
+    let (exit_code, stdout, stderr) = orchestrator
+        .executor()
+        .runtime()
+        .exec_with_output(reader_cid, vec!["cat".into(), "/mnt/shared/data.txt".into()]);
+    assert_eq!(
+        exit_code, 0,
+        "reader should see writer's data: stderr={stderr}"
+    );
+    assert_eq!(stdout.trim(), "volume-data-from-writer");
+
+    // Teardown.
+    let down_spec = vz_stack::StackSpec {
+        name: "vol-e2e".to_string(),
+        services: vec![],
+        networks: vec![],
+        volumes: vec![],
+        secrets: vec![],
+        disk_size_mb: None,
+    };
+    let _ = orchestrator.run(&down_spec, None);
+    let _ = orchestrator
+        .executor()
+        .runtime()
+        .shutdown_sandbox("vol-e2e");
+}
+
+/// Verify file-based secrets are injected at /run/secrets/<name> inside sandbox containers.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn sandbox_secret_injection() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,vz_oci_macos=debug,vz_linux=debug,vz_stack=debug")
+        .with_test_writer()
+        .try_init();
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Stage secret files on the host.
+    let secrets_src = tmp.path().join("secret-files");
+    std::fs::create_dir_all(&secrets_src).unwrap();
+    std::fs::write(secrets_src.join("db_password"), "s3cret-p@ss!").unwrap();
+    std::fs::write(secrets_src.join("api_key"), "ak-1234567890").unwrap();
+
+    let db_pw_path = secrets_src.join("db_password");
+    let api_key_path = secrets_src.join("api_key");
+
+    let yaml = format!(
+        r#"
+services:
+  app:
+    image: alpine:latest
+    command: ["sleep", "300"]
+    secrets:
+      - db_password
+      - api_key
+
+secrets:
+  db_password:
+    file: {db_pw}
+  api_key:
+    file: {api_key}
+"#,
+        db_pw = db_pw_path.to_str().unwrap(),
+        api_key = api_key_path.to_str().unwrap(),
+    );
+
+    let home = std::env::var("HOME").unwrap();
+    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    std::fs::create_dir_all(&oci_data).unwrap();
+
+    let db_path = tmp.path().join("state.db");
+    let spec = parse_compose(&yaml, "secret-e2e").unwrap();
+    let bridge = OciContainerRuntime::new(&oci_data);
+    let exec_store = StateStore::open(&db_path).unwrap();
+    let reconcile_store = StateStore::open(&db_path).unwrap();
+    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+
+    let orch_config = OrchestrationConfig {
+        poll_interval: Some(2),
+        max_rounds: 20,
+        image_policy: ImagePolicy::AllowAll,
+    };
+    let mut orchestrator = StackOrchestrator::new(executor, reconcile_store, orch_config);
+
+    let result = orchestrator.run(&spec, None).unwrap();
+    assert!(result.converged, "stack should converge");
+    assert_eq!(result.services_ready, 1);
+
+    let observed = orchestrator
+        .executor()
+        .store()
+        .load_observed_state("secret-e2e")
+        .unwrap();
+
+    let app_cid = observed
+        .iter()
+        .find(|o| o.service_name == "app")
+        .unwrap()
+        .container_id
+        .as_ref()
+        .unwrap();
+
+    // Verify db_password secret is readable inside the container.
+    let (exit_code, stdout, stderr) = orchestrator.executor().runtime().exec_with_output(
+        app_cid,
+        vec!["cat".into(), "/run/secrets/db_password".into()],
+    );
+    assert_eq!(
+        exit_code, 0,
+        "reading /run/secrets/db_password should succeed: stderr={stderr}"
+    );
+    assert_eq!(stdout.trim(), "s3cret-p@ss!");
+
+    // Verify api_key secret.
+    let (exit_code, stdout, stderr) = orchestrator
+        .executor()
+        .runtime()
+        .exec_with_output(app_cid, vec!["cat".into(), "/run/secrets/api_key".into()]);
+    assert_eq!(
+        exit_code, 0,
+        "reading /run/secrets/api_key should succeed: stderr={stderr}"
+    );
+    assert_eq!(stdout.trim(), "ak-1234567890");
+
+    // Teardown.
+    let down_spec = vz_stack::StackSpec {
+        name: "secret-e2e".to_string(),
+        services: vec![],
+        networks: vec![],
+        volumes: vec![],
+        secrets: vec![],
+        disk_size_mb: None,
+    };
+    let _ = orchestrator.run(&down_spec, None);
+    let _ = orchestrator
+        .executor()
+        .runtime()
+        .shutdown_sandbox("secret-e2e");
+}
+
+/// Verify env_file variables are loaded and inline environment takes precedence.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn sandbox_env_file_loading() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,vz_oci_macos=debug,vz_linux=debug,vz_stack=debug")
+        .with_test_writer()
+        .try_init();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let compose_dir = tmp.path().join("compose");
+    std::fs::create_dir_all(&compose_dir).unwrap();
+
+    // Write env file with base values.
+    std::fs::write(
+        compose_dir.join("app.env"),
+        "DB_HOST=db.internal\nDB_PORT=5432\nLOG_LEVEL=info\n",
+    )
+    .unwrap();
+
+    let yaml = r#"
+services:
+  app:
+    image: alpine:latest
+    command: ["sleep", "300"]
+    env_file:
+      - app.env
+    environment:
+      LOG_LEVEL: debug
+      CUSTOM_VAR: injected
+"#;
+
+    let home = std::env::var("HOME").unwrap();
+    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    std::fs::create_dir_all(&oci_data).unwrap();
+
+    let db_path = tmp.path().join("state.db");
+    // Use parse_compose_with_dir so env_file paths are resolved.
+    let spec = parse_compose_with_dir(yaml, "envfile-e2e", &compose_dir).unwrap();
+
+    // Verify the parsed spec merged env_file + inline environment.
+    let app_spec = &spec.services[0];
+    assert_eq!(
+        app_spec.environment.get("DB_HOST").map(String::as_str),
+        Some("db.internal"),
+        "DB_HOST should come from env_file"
+    );
+    assert_eq!(
+        app_spec.environment.get("LOG_LEVEL").map(String::as_str),
+        Some("debug"),
+        "inline environment should override env_file"
+    );
+
+    let bridge = OciContainerRuntime::new(&oci_data);
+    let exec_store = StateStore::open(&db_path).unwrap();
+    let reconcile_store = StateStore::open(&db_path).unwrap();
+    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+
+    let orch_config = OrchestrationConfig {
+        poll_interval: Some(2),
+        max_rounds: 20,
+        image_policy: ImagePolicy::AllowAll,
+    };
+    let mut orchestrator = StackOrchestrator::new(executor, reconcile_store, orch_config);
+
+    let result = orchestrator.run(&spec, None).unwrap();
+    assert!(result.converged, "stack should converge");
+    assert_eq!(result.services_ready, 1);
+
+    let observed = orchestrator
+        .executor()
+        .store()
+        .load_observed_state("envfile-e2e")
+        .unwrap();
+
+    let app_cid = observed
+        .iter()
+        .find(|o| o.service_name == "app")
+        .unwrap()
+        .container_id
+        .as_ref()
+        .unwrap();
+
+    // Verify env_file variable is present inside the running container.
+    let (exit_code, stdout, stderr) = orchestrator.executor().runtime().exec_with_output(
+        app_cid,
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "echo $DB_HOST".into(),
+        ],
+    );
+    assert_eq!(exit_code, 0, "echo DB_HOST should succeed: stderr={stderr}");
+    assert_eq!(stdout.trim(), "db.internal");
+
+    // Verify inline env overrides env_file.
+    let (exit_code, stdout, _) = orchestrator.executor().runtime().exec_with_output(
+        app_cid,
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "echo $LOG_LEVEL".into(),
+        ],
+    );
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        stdout.trim(),
+        "debug",
+        "inline environment should override env_file value"
+    );
+
+    // Verify purely-inline variable.
+    let (exit_code, stdout, _) = orchestrator.executor().runtime().exec_with_output(
+        app_cid,
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "echo $CUSTOM_VAR".into(),
+        ],
+    );
+    assert_eq!(exit_code, 0);
+    assert_eq!(stdout.trim(), "injected");
+
+    // Teardown.
+    let down_spec = vz_stack::StackSpec {
+        name: "envfile-e2e".to_string(),
+        services: vec![],
+        networks: vec![],
+        volumes: vec![],
+        secrets: vec![],
+        disk_size_mb: None,
+    };
+    let _ = orchestrator.run(&down_spec, None);
+    let _ = orchestrator
+        .executor()
+        .runtime()
+        .shutdown_sandbox("envfile-e2e");
+}
+
+/// Verify multi-network isolation: services on different networks cannot reach each other.
+///
+/// Topology:
+///   - frontend network: service `web`
+///   - backend network: service `api`, service `db`
+///   - `api` is on both networks (bridge between frontend and backend)
+///
+/// Expected:
+///   - `web` can ping `api` (both on frontend)
+///   - `api` can ping `db` (both on backend)
+///   - `web` CANNOT ping `db` (different networks, no shared membership)
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn sandbox_multi_network_isolation() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,vz_oci_macos=debug,vz_linux=debug,vz_stack=debug")
+        .with_test_writer()
+        .try_init();
+
+    let yaml = r#"
+services:
+  web:
+    image: alpine:latest
+    command: ["sleep", "300"]
+    networks:
+      - frontend
+
+  api:
+    image: alpine:latest
+    command: ["sleep", "300"]
+    networks:
+      - frontend
+      - backend
+
+  db:
+    image: alpine:latest
+    command: ["sleep", "300"]
+    networks:
+      - backend
+
+networks:
+  frontend:
+  backend:
+"#;
+
+    let home = std::env::var("HOME").unwrap();
+    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    std::fs::create_dir_all(&oci_data).unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("state.db");
+
+    let spec = parse_compose(yaml, "multinet-e2e").unwrap();
+    assert_eq!(spec.networks.len(), 2, "should have 2 networks");
+
+    let bridge = OciContainerRuntime::new(&oci_data);
+    let exec_store = StateStore::open(&db_path).unwrap();
+    let reconcile_store = StateStore::open(&db_path).unwrap();
+    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+
+    let orch_config = OrchestrationConfig {
+        poll_interval: Some(2),
+        max_rounds: 20,
+        image_policy: ImagePolicy::AllowAll,
+    };
+    let mut orchestrator = StackOrchestrator::new(executor, reconcile_store, orch_config);
+
+    let result = orchestrator.run(&spec, None).unwrap();
+    assert!(result.converged, "stack should converge");
+    assert_eq!(result.services_ready, 3);
+
+    let observed = orchestrator
+        .executor()
+        .store()
+        .load_observed_state("multinet-e2e")
+        .unwrap();
+
+    let cid_of = |name: &str| -> String {
+        observed
+            .iter()
+            .find(|o| o.service_name == name)
+            .unwrap()
+            .container_id
+            .clone()
+            .unwrap()
+    };
+    let web_cid = cid_of("web");
+    let api_cid = cid_of("api");
+
+    // web → api should succeed (both on frontend network).
+    let (exit_code, stdout, stderr) = orchestrator.executor().runtime().exec_with_output(
+        &web_cid,
+        vec![
+            "/bin/busybox".into(),
+            "ping".into(),
+            "-c".into(),
+            "1".into(),
+            "-W".into(),
+            "5".into(),
+            "api".into(),
+        ],
+    );
+    assert_eq!(
+        exit_code, 0,
+        "web should reach api (same frontend network): stdout={stdout}, stderr={stderr}"
+    );
+
+    // api → db should succeed (both on backend network).
+    let (exit_code, stdout, stderr) = orchestrator.executor().runtime().exec_with_output(
+        &api_cid,
+        vec![
+            "/bin/busybox".into(),
+            "ping".into(),
+            "-c".into(),
+            "1".into(),
+            "-W".into(),
+            "5".into(),
+            "db".into(),
+        ],
+    );
+    assert_eq!(
+        exit_code, 0,
+        "api should reach db (same backend network): stdout={stdout}, stderr={stderr}"
+    );
+
+    // web → db should FAIL (different networks, no shared membership).
+    // ping with a short timeout; non-zero exit means no connectivity.
+    let (exit_code, _, _) = orchestrator.executor().runtime().exec_with_output(
+        &web_cid,
+        vec![
+            "/bin/busybox".into(),
+            "ping".into(),
+            "-c".into(),
+            "1".into(),
+            "-W".into(),
+            "2".into(),
+            "db".into(),
+        ],
+    );
+    assert_ne!(
+        exit_code, 0,
+        "web should NOT reach db (different networks)"
+    );
+
+    // Teardown.
+    let down_spec = vz_stack::StackSpec {
+        name: "multinet-e2e".to_string(),
+        services: vec![],
+        networks: vec![],
+        volumes: vec![],
+        secrets: vec![],
+        disk_size_mb: None,
+    };
+    let _ = orchestrator.run(&down_spec, None);
+    let _ = orchestrator
+        .executor()
+        .runtime()
+        .shutdown_sandbox("multinet-e2e");
 }
