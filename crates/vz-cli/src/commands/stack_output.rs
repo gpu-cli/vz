@@ -299,7 +299,12 @@ impl StackOutput {
                     lease_id
                 ));
             }
-            StackEvent::ExecutionQueued { .. }
+            StackEvent::BuildQueued { .. }
+            | StackEvent::BuildRunning { .. }
+            | StackEvent::BuildSucceeded { .. }
+            | StackEvent::BuildFailed { .. }
+            | StackEvent::BuildCanceled { .. }
+            | StackEvent::ExecutionQueued { .. }
             | StackEvent::ExecutionRunning { .. }
             | StackEvent::ExecutionExited { .. }
             | StackEvent::ExecutionFailed { .. }
@@ -308,7 +313,15 @@ impl StackOutput {
             | StackEvent::CheckpointReady { .. }
             | StackEvent::CheckpointFailed { .. }
             | StackEvent::CheckpointRestored { .. }
-            | StackEvent::CheckpointForked { .. } => {}
+            | StackEvent::CheckpointForked { .. }
+            | StackEvent::ContainerCreated { .. }
+            | StackEvent::ContainerStarting { .. }
+            | StackEvent::ContainerRunning { .. }
+            | StackEvent::ContainerStopping { .. }
+            | StackEvent::ContainerExited { .. }
+            | StackEvent::ContainerFailed { .. }
+            | StackEvent::ContainerRemoved { .. }
+            | StackEvent::DriftDetected { .. } => {}
         }
         self.update_header();
     }

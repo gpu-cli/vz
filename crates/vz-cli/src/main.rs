@@ -101,6 +101,9 @@ enum Commands {
     /// Manage checkpoint fingerprints and lineage.
     Checkpoint(commands::checkpoint::CheckpointArgs),
 
+    /// Manage asynchronous build operations.
+    BuildMgmt(commands::build_mgmt::BuildMgmtArgs),
+
     // ── VM management (macOS only) ──
     /// Manage virtual machines.
     #[cfg(target_os = "macos")]
@@ -190,6 +193,9 @@ fn main() -> anyhow::Result<()> {
 
             // Checkpoint management
             Commands::Checkpoint(args) => commands::checkpoint::run(args).await,
+
+            // Build management
+            Commands::BuildMgmt(args) => commands::build_mgmt::run(args).await,
 
             // VM management (macOS only)
             #[cfg(target_os = "macos")]

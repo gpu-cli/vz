@@ -2,6 +2,7 @@
 
 #[cfg(target_os = "macos")]
 pub mod build;
+pub mod build_mgmt;
 #[cfg(target_os = "macos")]
 pub mod cache;
 pub mod checkpoint;

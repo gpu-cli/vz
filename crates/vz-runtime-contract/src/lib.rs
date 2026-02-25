@@ -379,7 +379,7 @@ pub const PRIMITIVE_CONFORMANCE_MATRIX: &[PrimitiveConformanceEntry] = &[
     PrimitiveConformanceEntry {
         operation: RuntimeOperation::GetReceipt,
         openapi: Some(OpenApiPrimitiveSurface {
-            path: "/v1/receipts",
+            path: "/v1/receipts/{receipt_id}",
             surface: "receipts",
         }),
         manager: false,

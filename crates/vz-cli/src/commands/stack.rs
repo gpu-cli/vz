@@ -1858,7 +1858,20 @@ fn event_service_name(event: &StackEvent) -> Option<&str> {
         | StackEvent::CheckpointReady { .. }
         | StackEvent::CheckpointFailed { .. }
         | StackEvent::CheckpointRestored { .. }
-        | StackEvent::CheckpointForked { .. } => None,
+        | StackEvent::CheckpointForked { .. }
+        | StackEvent::BuildQueued { .. }
+        | StackEvent::BuildRunning { .. }
+        | StackEvent::BuildSucceeded { .. }
+        | StackEvent::BuildFailed { .. }
+        | StackEvent::BuildCanceled { .. }
+        | StackEvent::ContainerCreated { .. }
+        | StackEvent::ContainerStarting { .. }
+        | StackEvent::ContainerRunning { .. }
+        | StackEvent::ContainerStopping { .. }
+        | StackEvent::ContainerExited { .. }
+        | StackEvent::ContainerFailed { .. }
+        | StackEvent::ContainerRemoved { .. }
+        | StackEvent::DriftDetected { .. } => None,
     }
 }
 
@@ -2523,6 +2536,53 @@ fn format_event_summary(event: &StackEvent) -> String {
             new_checkpoint_id,
             ..
         } => format!("checkpoint forked: {parent_checkpoint_id} -> {new_checkpoint_id}"),
+        StackEvent::BuildQueued {
+            sandbox_id,
+            build_id,
+        } => format!("build queued: {build_id} for {sandbox_id}"),
+        StackEvent::BuildRunning { build_id } => {
+            format!("build running: {build_id}")
+        }
+        StackEvent::BuildSucceeded {
+            build_id,
+            result_digest,
+        } => format!("build succeeded: {build_id} ({result_digest})"),
+        StackEvent::BuildFailed { build_id, error } => {
+            format!("build failed: {build_id}: {error}")
+        }
+        StackEvent::BuildCanceled { build_id } => {
+            format!("build canceled: {build_id}")
+        }
+        StackEvent::ContainerCreated {
+            container_id,
+            sandbox_id,
+        } => format!("container created: {container_id} in {sandbox_id}"),
+        StackEvent::ContainerStarting { container_id } => {
+            format!("container starting: {container_id}")
+        }
+        StackEvent::ContainerRunning { container_id } => {
+            format!("container running: {container_id}")
+        }
+        StackEvent::ContainerStopping { container_id } => {
+            format!("container stopping: {container_id}")
+        }
+        StackEvent::ContainerExited {
+            container_id,
+            exit_code,
+        } => format!("container exited: {container_id} (code {exit_code})"),
+        StackEvent::ContainerFailed {
+            container_id,
+            error,
+        } => format!("container failed: {container_id}: {error}"),
+        StackEvent::ContainerRemoved { container_id } => {
+            format!("container removed: {container_id}")
+        }
+        StackEvent::DriftDetected {
+            category,
+            description,
+            severity,
+            ..
+        } => format!("drift [{severity}] {category}: {description}"),
     }
 }
 

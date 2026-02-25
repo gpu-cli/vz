@@ -13,8 +13,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use vz_runtime_contract::{
-    Checkpoint, CheckpointClass, CheckpointState, Execution, ExecutionSpec, ExecutionState, Lease,
-    LeaseState, Sandbox, SandboxBackend, SandboxSpec, SandboxState,
+    Build, BuildSpec, BuildState, Checkpoint, CheckpointClass, CheckpointState, Container,
+    ContainerSpec, ContainerState, Execution, ExecutionSpec, ExecutionState, Lease, LeaseState,
+    Sandbox, SandboxBackend, SandboxSpec, SandboxState,
 };
 
 use crate::StackSpec;
@@ -22,6 +23,39 @@ use crate::error::StackError;
 use crate::events::{EventRecord, StackEvent};
 use crate::network::PublishedPort;
 use crate::reconcile::Action;
+
+/// Severity level for a drift finding detected during startup verification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DriftSeverity {
+    /// Informational: no action required.
+    Info,
+    /// Warning: possible inconsistency that may need attention.
+    Warning,
+    /// Error: critical inconsistency requiring intervention.
+    Error,
+}
+
+impl DriftSeverity {
+    /// Serialize to the lowercase string used in events.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// A single drift finding discovered during startup state verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriftFinding {
+    /// Category of the drift (e.g. "desired_state", "observed_state", "health", "reconcile").
+    pub category: String,
+    /// Human-readable description of the inconsistency.
+    pub description: String,
+    /// Severity level of the finding.
+    pub severity: DriftSeverity,
+}
 
 /// Observable phase of a service within a stack.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -174,6 +208,46 @@ pub struct IdempotencyRecord {
 
 /// Idempotency key time-to-live: 24 hours.
 pub const IDEMPOTENCY_TTL_SECS: u64 = 86_400;
+
+/// Persisted record of a resolved OCI image reference.
+///
+/// Stores the result of a pull/resolve operation so that subsequent
+/// lookups can avoid redundant registry roundtrips.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageRecord {
+    /// Original image reference (e.g. `nginx:latest`).
+    pub image_ref: String,
+    /// Resolved content-addressable digest.
+    pub resolved_digest: String,
+    /// Target platform string (e.g. `linux/arm64`).
+    pub platform: String,
+    /// Source registry where the image was pulled from.
+    pub source_registry: String,
+    /// Unix epoch seconds when the image was pulled.
+    pub pulled_at: u64,
+}
+
+/// Record of a completed mutating operation, providing a durable receipt
+/// that clients can retrieve for auditability and idempotent retry verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Receipt {
+    /// Unique receipt identifier (e.g. `rcp-{uuid}`).
+    pub receipt_id: String,
+    /// Name of the operation that produced this receipt (e.g. `"create_sandbox"`).
+    pub operation: String,
+    /// Identifier of the entity acted upon.
+    pub entity_id: String,
+    /// Type of the entity (e.g. `"sandbox"`, `"lease"`, `"execution"`, `"checkpoint"`).
+    pub entity_type: String,
+    /// Correlating request identifier.
+    pub request_id: String,
+    /// Completion status (e.g. `"completed"`, `"failed"`).
+    pub status: String,
+    /// Unix epoch seconds when the receipt was created.
+    pub created_at: u64,
+    /// Arbitrary JSON metadata associated with the operation.
+    pub metadata: serde_json::Value,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)] // serde-serialized names; renaming would break stored data
@@ -405,8 +479,75 @@ impl StateStore {
                 updated_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_checkpoint_sandbox ON checkpoint_state(sandbox_id);
-            CREATE INDEX IF NOT EXISTS idx_checkpoint_parent ON checkpoint_state(parent_checkpoint_id);",
+            CREATE INDEX IF NOT EXISTS idx_checkpoint_parent ON checkpoint_state(parent_checkpoint_id);
+
+            CREATE TABLE IF NOT EXISTS container_state (
+                container_id TEXT PRIMARY KEY,
+                sandbox_id TEXT NOT NULL,
+                image_digest TEXT NOT NULL,
+                spec_json TEXT NOT NULL,
+                state TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                ended_at INTEGER,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_container_sandbox ON container_state(sandbox_id);
+
+            CREATE TABLE IF NOT EXISTS image_state (
+                image_ref TEXT PRIMARY KEY,
+                resolved_digest TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                source_registry TEXT NOT NULL,
+                pulled_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS receipt_state (
+                receipt_id TEXT PRIMARY KEY,
+                operation TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_receipt_entity ON receipt_state(entity_type, entity_id);
+            CREATE INDEX IF NOT EXISTS idx_receipt_request ON receipt_state(request_id);
+
+            CREATE TABLE IF NOT EXISTS build_state (
+                build_id TEXT PRIMARY KEY,
+                sandbox_id TEXT NOT NULL,
+                spec_json TEXT NOT NULL,
+                state TEXT NOT NULL,
+                result_digest TEXT,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_build_sandbox ON build_state(sandbox_id);
+
+            CREATE TABLE IF NOT EXISTS control_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
         )?;
+
+        // Bootstrap initial metadata if not yet set.
+        self.set_control_metadata("schema_version", "1")?;
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Only set created_at on first init (ignore conflict).
+        self.conn.execute(
+            "INSERT OR IGNORE INTO control_metadata (key, value) VALUES ('created_at', ?1)",
+            params![format!("{now_secs}")],
+        )?;
+
         Ok(())
     }
 
@@ -1760,6 +1901,663 @@ impl StateStore {
             created_at: created_at as u64,
             compatibility_fingerprint,
         })
+    }
+
+    // ── Container persistence ──
+
+    /// Persist a container, upserting on `container_id`.
+    pub fn save_container(&self, container: &Container) -> Result<(), StackError> {
+        let spec_json = serde_json::to_string(&container.container_spec)?;
+        let state_json = serde_json::to_string(&container.state)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        self.conn.execute(
+            "INSERT INTO container_state (container_id, sandbox_id, image_digest, spec_json, state, created_at, started_at, ended_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(container_id) DO UPDATE SET
+                sandbox_id = excluded.sandbox_id,
+                image_digest = excluded.image_digest,
+                spec_json = excluded.spec_json,
+                state = excluded.state,
+                started_at = excluded.started_at,
+                ended_at = excluded.ended_at,
+                updated_at = excluded.updated_at",
+            params![
+                container.container_id,
+                container.sandbox_id,
+                container.image_digest,
+                spec_json,
+                state_json,
+                container.created_at as i64,
+                container.started_at.map(|v| v as i64),
+                container.ended_at.map(|v| v as i64),
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load a container by its identifier.
+    pub fn load_container(&self, container_id: &str) -> Result<Option<Container>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT container_id, sandbox_id, image_digest, spec_json, state, created_at, started_at, ended_at
+             FROM container_state WHERE container_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![container_id])?;
+
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::container_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all containers ordered by creation time.
+    pub fn list_containers(&self) -> Result<Vec<Container>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT container_id, sandbox_id, image_digest, spec_json, state, created_at, started_at, ended_at
+             FROM container_state ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+            ))
+        })?;
+
+        let mut containers = Vec::new();
+        for row_result in rows {
+            let (
+                container_id,
+                sandbox_id,
+                image_digest,
+                spec_str,
+                state_str,
+                created_at,
+                started_at,
+                ended_at,
+            ) = row_result?;
+            let container_spec: ContainerSpec = serde_json::from_str(&spec_str)?;
+            let state: ContainerState = serde_json::from_str(&state_str)?;
+
+            containers.push(Container {
+                container_id,
+                sandbox_id,
+                image_digest,
+                container_spec,
+                state,
+                created_at: created_at as u64,
+                started_at: started_at.map(|v| v as u64),
+                ended_at: ended_at.map(|v| v as u64),
+            });
+        }
+        Ok(containers)
+    }
+
+    /// Delete a container by its identifier.
+    pub fn delete_container(&self, container_id: &str) -> Result<(), StackError> {
+        self.conn.execute(
+            "DELETE FROM container_state WHERE container_id = ?1",
+            params![container_id],
+        )?;
+        Ok(())
+    }
+
+    /// Deserialize a container from a rusqlite row.
+    fn container_from_row(row: &rusqlite::Row<'_>) -> Result<Container, StackError> {
+        let container_id: String = row.get(0)?;
+        let sandbox_id: String = row.get(1)?;
+        let image_digest: String = row.get(2)?;
+        let spec_str: String = row.get(3)?;
+        let state_str: String = row.get(4)?;
+        let created_at: i64 = row.get(5)?;
+        let started_at: Option<i64> = row.get(6)?;
+        let ended_at: Option<i64> = row.get(7)?;
+
+        let container_spec: ContainerSpec = serde_json::from_str(&spec_str)?;
+        let state: ContainerState = serde_json::from_str(&state_str)?;
+
+        Ok(Container {
+            container_id,
+            sandbox_id,
+            image_digest,
+            container_spec,
+            state,
+            created_at: created_at as u64,
+            started_at: started_at.map(|v| v as u64),
+            ended_at: ended_at.map(|v| v as u64),
+        })
+    }
+
+    // ── Image persistence ──
+
+    /// Persist an image record, upserting on `image_ref`.
+    pub fn save_image(&self, image: &ImageRecord) -> Result<(), StackError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        self.conn.execute(
+            "INSERT INTO image_state (image_ref, resolved_digest, platform, source_registry, pulled_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(image_ref) DO UPDATE SET
+                resolved_digest = excluded.resolved_digest,
+                platform = excluded.platform,
+                source_registry = excluded.source_registry,
+                pulled_at = excluded.pulled_at,
+                updated_at = excluded.updated_at",
+            params![
+                image.image_ref,
+                image.resolved_digest,
+                image.platform,
+                image.source_registry,
+                image.pulled_at as i64,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load an image by its reference string.
+    pub fn load_image(&self, image_ref: &str) -> Result<Option<ImageRecord>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT image_ref, resolved_digest, platform, source_registry, pulled_at
+             FROM image_state WHERE image_ref = ?1",
+        )?;
+        let mut rows = stmt.query(params![image_ref])?;
+
+        match rows.next()? {
+            Some(row) => Ok(Some(ImageRecord {
+                image_ref: row.get(0)?,
+                resolved_digest: row.get(1)?,
+                platform: row.get(2)?,
+                source_registry: row.get(3)?,
+                pulled_at: row.get::<_, i64>(4)? as u64,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// List all images ordered by pull time.
+    pub fn list_images(&self) -> Result<Vec<ImageRecord>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT image_ref, resolved_digest, platform, source_registry, pulled_at
+             FROM image_state ORDER BY pulled_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+
+        let mut images = Vec::new();
+        for row_result in rows {
+            let (image_ref, resolved_digest, platform, source_registry, pulled_at) = row_result?;
+            images.push(ImageRecord {
+                image_ref,
+                resolved_digest,
+                platform,
+                source_registry,
+                pulled_at: pulled_at as u64,
+            });
+        }
+        Ok(images)
+    }
+
+    // ── Receipt persistence (agent-a03881b1's complete version) ──
+
+    /// Persist a receipt for a completed mutating operation.
+    pub fn save_receipt(&self, receipt: &Receipt) -> Result<(), StackError> {
+        let metadata_json = serde_json::to_string(&receipt.metadata)?;
+        self.conn.execute(
+            "INSERT INTO receipt_state (receipt_id, operation, entity_id, entity_type, request_id, status, created_at, metadata_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(receipt_id) DO UPDATE SET
+                operation = excluded.operation,
+                entity_id = excluded.entity_id,
+                entity_type = excluded.entity_type,
+                request_id = excluded.request_id,
+                status = excluded.status,
+                metadata_json = excluded.metadata_json",
+            params![
+                receipt.receipt_id,
+                receipt.operation,
+                receipt.entity_id,
+                receipt.entity_type,
+                receipt.request_id,
+                receipt.status,
+                receipt.created_at as i64,
+                metadata_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load a receipt by its identifier.
+    pub fn load_receipt(&self, receipt_id: &str) -> Result<Option<Receipt>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT receipt_id, operation, entity_id, entity_type, request_id, status, created_at, metadata_json
+             FROM receipt_state WHERE receipt_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![receipt_id])?;
+
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::receipt_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Load a receipt by its correlating request identifier.
+    pub fn load_receipt_by_request_id(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<Receipt>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT receipt_id, operation, entity_id, entity_type, request_id, status, created_at, metadata_json
+             FROM receipt_state WHERE request_id = ?1
+             ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![request_id])?;
+
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::receipt_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all receipts for a given entity type and entity identifier.
+    pub fn list_receipts_for_entity(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<Vec<Receipt>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT receipt_id, operation, entity_id, entity_type, request_id, status, created_at, metadata_json
+             FROM receipt_state WHERE entity_type = ?1 AND entity_id = ?2
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![entity_type, entity_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+
+        let mut receipts = Vec::new();
+        for row_result in rows {
+            let (
+                receipt_id,
+                operation,
+                entity_id,
+                entity_type,
+                request_id,
+                status,
+                created_at,
+                metadata_str,
+            ) = row_result?;
+            let metadata: serde_json::Value = serde_json::from_str(&metadata_str)?;
+            receipts.push(Receipt {
+                receipt_id,
+                operation,
+                entity_id,
+                entity_type,
+                request_id,
+                status,
+                created_at: created_at as u64,
+                metadata,
+            });
+        }
+        Ok(receipts)
+    }
+
+    /// Deserialize a receipt from a rusqlite row.
+    fn receipt_from_row(row: &rusqlite::Row<'_>) -> Result<Receipt, StackError> {
+        let receipt_id: String = row.get(0)?;
+        let operation: String = row.get(1)?;
+        let entity_id: String = row.get(2)?;
+        let entity_type: String = row.get(3)?;
+        let request_id: String = row.get(4)?;
+        let status: String = row.get(5)?;
+        let created_at: i64 = row.get(6)?;
+        let metadata_str: String = row.get(7)?;
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_str)?;
+
+        Ok(Receipt {
+            receipt_id,
+            operation,
+            entity_id,
+            entity_type,
+            request_id,
+            status,
+            created_at: created_at as u64,
+            metadata,
+        })
+    }
+
+    // ── Scoped event listing ──
+
+    /// Load events filtered by scope (entity type prefix in event type).
+    ///
+    /// The `scope` parameter filters events whose JSON `type` field starts
+    /// with the given prefix (e.g. `"sandbox_"`, `"lease_"`, `"execution_"`,
+    /// `"checkpoint_"`). Uses SQL `LIKE` on the serialized event JSON.
+    pub fn load_events_by_scope(
+        &self,
+        stack_name: &str,
+        scope: &str,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>, StackError> {
+        let clamped_limit = limit.clamp(1, 1000) as i64;
+        let cursor = after_id.unwrap_or(0);
+        let like_pattern = format!("%\"type\":\"{scope}%");
+        let mut stmt = self.conn.prepare(
+            "SELECT id, stack_name, event_json, created_at
+             FROM events
+             WHERE stack_name = ?1 AND id > ?2 AND event_json LIKE ?3
+             ORDER BY id ASC
+             LIMIT ?4",
+        )?;
+        Self::collect_event_records(
+            &mut stmt,
+            params![stack_name, cursor, like_pattern, clamped_limit],
+        )
+    }
+
+    // ── Build persistence ──
+
+    /// Persist a build, upserting on `build_id`.
+    pub fn save_build(&self, build: &Build) -> Result<(), StackError> {
+        let spec_json = serde_json::to_string(&build.build_spec)?;
+        let state_json = serde_json::to_string(&build.state)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        self.conn.execute(
+            "INSERT INTO build_state (build_id, sandbox_id, spec_json, state, result_digest, started_at, ended_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+             ON CONFLICT(build_id) DO UPDATE SET
+                sandbox_id = excluded.sandbox_id,
+                spec_json = excluded.spec_json,
+                state = excluded.state,
+                result_digest = excluded.result_digest,
+                started_at = excluded.started_at,
+                ended_at = excluded.ended_at,
+                updated_at = excluded.updated_at",
+            params![
+                build.build_id,
+                build.sandbox_id,
+                spec_json,
+                state_json,
+                build.result_digest,
+                build.started_at as i64,
+                build.ended_at.map(|v| v as i64),
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load a build by its identifier.
+    pub fn load_build(&self, build_id: &str) -> Result<Option<Build>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT build_id, sandbox_id, spec_json, state, result_digest, started_at, ended_at
+             FROM build_state WHERE build_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![build_id])?;
+
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::build_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all builds ordered by creation time.
+    pub fn list_builds(&self) -> Result<Vec<Build>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT build_id, sandbox_id, spec_json, state, result_digest, started_at, ended_at
+             FROM build_state ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })?;
+
+        let mut builds = Vec::new();
+        for row_result in rows {
+            let (build_id, sandbox_id, spec_str, state_str, result_digest, started_at, ended_at) =
+                row_result?;
+            let build_spec: BuildSpec = serde_json::from_str(&spec_str)?;
+            let state: BuildState = serde_json::from_str(&state_str)?;
+
+            builds.push(Build {
+                build_id,
+                sandbox_id,
+                build_spec,
+                state,
+                result_digest,
+                started_at: started_at as u64,
+                ended_at: ended_at.map(|v| v as u64),
+            });
+        }
+        Ok(builds)
+    }
+
+    /// List all builds for a specific sandbox.
+    pub fn list_builds_for_sandbox(&self, sandbox_id: &str) -> Result<Vec<Build>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT build_id, sandbox_id, spec_json, state, result_digest, started_at, ended_at
+             FROM build_state WHERE sandbox_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![sandbox_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })?;
+
+        let mut builds = Vec::new();
+        for row_result in rows {
+            let (build_id, sandbox_id, spec_str, state_str, result_digest, started_at, ended_at) =
+                row_result?;
+            let build_spec: BuildSpec = serde_json::from_str(&spec_str)?;
+            let state: BuildState = serde_json::from_str(&state_str)?;
+
+            builds.push(Build {
+                build_id,
+                sandbox_id,
+                build_spec,
+                state,
+                result_digest,
+                started_at: started_at as u64,
+                ended_at: ended_at.map(|v| v as u64),
+            });
+        }
+        Ok(builds)
+    }
+
+    /// Delete a build by its identifier.
+    pub fn delete_build(&self, build_id: &str) -> Result<(), StackError> {
+        self.conn.execute(
+            "DELETE FROM build_state WHERE build_id = ?1",
+            params![build_id],
+        )?;
+        Ok(())
+    }
+
+    /// Deserialize a build from a rusqlite row.
+    fn build_from_row(row: &rusqlite::Row<'_>) -> Result<Build, StackError> {
+        let build_id: String = row.get(0)?;
+        let sandbox_id: String = row.get(1)?;
+        let spec_str: String = row.get(2)?;
+        let state_str: String = row.get(3)?;
+        let result_digest: Option<String> = row.get(4)?;
+        let started_at: i64 = row.get(5)?;
+        let ended_at: Option<i64> = row.get(6)?;
+
+        let build_spec: BuildSpec = serde_json::from_str(&spec_str)?;
+        let state: BuildState = serde_json::from_str(&state_str)?;
+
+        Ok(Build {
+            build_id,
+            sandbox_id,
+            build_spec,
+            state,
+            result_digest,
+            started_at: started_at as u64,
+            ended_at: ended_at.map(|v| v as u64),
+        })
+    }
+
+    // ── Control metadata ──
+
+    /// Get a control metadata value by key.
+    pub fn get_control_metadata(&self, key: &str) -> Result<Option<String>, StackError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM control_metadata WHERE key = ?1")?;
+        let mut rows = stmt.query(params![key])?;
+
+        match rows.next()? {
+            Some(row) => {
+                let value: String = row.get(0)?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Set a control metadata value, upserting on key.
+    pub fn set_control_metadata(&self, key: &str, value: &str) -> Result<(), StackError> {
+        self.conn.execute(
+            "INSERT INTO control_metadata (key, value)
+             VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = datetime('now')",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Get the current schema version from control metadata.
+    ///
+    /// Returns `1` if no schema version has been recorded.
+    pub fn schema_version(&self) -> Result<u32, StackError> {
+        self.get_control_metadata("schema_version")
+            .map(|v| v.and_then(|s| s.parse().ok()).unwrap_or(1))
+    }
+
+    /// Set the schema version in control metadata.
+    pub fn set_schema_version(&self, version: u32) -> Result<(), StackError> {
+        self.set_control_metadata("schema_version", &version.to_string())
+    }
+
+    // ── Startup drift verification ──
+
+    /// Verify persisted state consistency on startup.
+    ///
+    /// Returns a list of drift findings describing any inconsistencies
+    /// between desired state, observed state, health poller state, and
+    /// reconcile sessions. Callers should emit events for each finding
+    /// and log appropriately.
+    pub fn verify_startup_drift(&self, stack_name: &str) -> Result<Vec<DriftFinding>, StackError> {
+        let mut findings = Vec::new();
+
+        let desired = self.load_desired_state(stack_name)?;
+        let observed = self.load_observed_state(stack_name)?;
+        let health_state = self.load_health_poller_state(stack_name)?;
+        let active_session = self.load_active_reconcile_session(stack_name)?;
+
+        // 1. Desired state exists but no observed state.
+        if desired.is_some() && observed.is_empty() {
+            findings.push(DriftFinding {
+                category: "desired_state".to_string(),
+                description: "desired state without observations".to_string(),
+                severity: DriftSeverity::Warning,
+            });
+        }
+
+        // 2. Observed state has services not in desired state.
+        if let Some(ref spec) = desired {
+            let desired_names: std::collections::HashSet<&str> =
+                spec.services.iter().map(|s| s.name.as_str()).collect();
+            for obs in &observed {
+                if !desired_names.contains(obs.service_name.as_str()) {
+                    findings.push(DriftFinding {
+                        category: "observed_state".to_string(),
+                        description: format!(
+                            "orphaned observed state for service '{}'",
+                            obs.service_name
+                        ),
+                        severity: DriftSeverity::Warning,
+                    });
+                }
+            }
+        }
+
+        // 3. Active reconcile session older than 5 minutes.
+        if let Some(ref session) = active_session {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let age_secs = now.saturating_sub(session.updated_at);
+            if age_secs > 300 {
+                findings.push(DriftFinding {
+                    category: "reconcile".to_string(),
+                    description: format!(
+                        "stale reconcile session '{}' ({}s since last update)",
+                        session.session_id, age_secs
+                    ),
+                    severity: DriftSeverity::Warning,
+                });
+            }
+        }
+
+        // 4. Health poller state exists but desired state is missing.
+        if !health_state.is_empty() && desired.is_none() {
+            findings.push(DriftFinding {
+                category: "health".to_string(),
+                description: "orphaned health state".to_string(),
+                severity: DriftSeverity::Info,
+            });
+        }
+
+        Ok(findings)
     }
 }
 
@@ -3135,5 +3933,935 @@ mod tests {
         store.save_checkpoint(&checkpoint).unwrap();
         let loaded = store.load_checkpoint("ckpt-vm").unwrap().unwrap();
         assert_eq!(loaded.class, CheckpointClass::VmFull);
+    }
+
+    // ── Receipt persistence tests (from agent-a03881b1) ──
+
+    fn sample_receipt(receipt_id: &str, entity_id: &str) -> Receipt {
+        Receipt {
+            receipt_id: receipt_id.to_string(),
+            operation: "create_sandbox".to_string(),
+            entity_id: entity_id.to_string(),
+            entity_type: "sandbox".to_string(),
+            request_id: "req-1".to_string(),
+            status: "completed".to_string(),
+            created_at: 1_700_000_000,
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+
+    #[test]
+    fn receipt_save_and_load() {
+        let store = StateStore::in_memory().unwrap();
+        let receipt = sample_receipt("rcp-1", "sbx-1");
+
+        store.save_receipt(&receipt).unwrap();
+        let loaded = store.load_receipt("rcp-1").unwrap().unwrap();
+        assert_eq!(loaded.receipt_id, "rcp-1");
+        assert_eq!(loaded.operation, "create_sandbox");
+        assert_eq!(loaded.entity_id, "sbx-1");
+        assert_eq!(loaded.entity_type, "sandbox");
+        assert_eq!(loaded.request_id, "req-1");
+        assert_eq!(loaded.status, "completed");
+        assert_eq!(loaded.created_at, 1_700_000_000);
+    }
+
+    #[test]
+    fn receipt_load_missing_returns_none() {
+        let store = StateStore::in_memory().unwrap();
+        let loaded = store.load_receipt("nonexistent").unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn receipt_load_by_request_id() {
+        let store = StateStore::in_memory().unwrap();
+        let receipt = sample_receipt("rcp-2", "sbx-2");
+
+        store.save_receipt(&receipt).unwrap();
+        let loaded = store.load_receipt_by_request_id("req-1").unwrap().unwrap();
+        assert_eq!(loaded.receipt_id, "rcp-2");
+    }
+
+    #[test]
+    fn receipt_load_by_request_id_missing_returns_none() {
+        let store = StateStore::in_memory().unwrap();
+        let loaded = store.load_receipt_by_request_id("nonexistent").unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn receipt_list_for_entity() {
+        let store = StateStore::in_memory().unwrap();
+
+        let r1 = Receipt {
+            receipt_id: "rcp-a".to_string(),
+            operation: "create_sandbox".to_string(),
+            entity_id: "sbx-1".to_string(),
+            entity_type: "sandbox".to_string(),
+            request_id: "req-a".to_string(),
+            status: "completed".to_string(),
+            created_at: 1_700_000_000,
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+        };
+        let r2 = Receipt {
+            receipt_id: "rcp-b".to_string(),
+            operation: "terminate_sandbox".to_string(),
+            entity_id: "sbx-1".to_string(),
+            entity_type: "sandbox".to_string(),
+            request_id: "req-b".to_string(),
+            status: "completed".to_string(),
+            created_at: 1_700_000_001,
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+        };
+        let r3 = Receipt {
+            receipt_id: "rcp-c".to_string(),
+            operation: "create_sandbox".to_string(),
+            entity_id: "sbx-2".to_string(),
+            entity_type: "sandbox".to_string(),
+            request_id: "req-c".to_string(),
+            status: "completed".to_string(),
+            created_at: 1_700_000_002,
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+        };
+
+        store.save_receipt(&r1).unwrap();
+        store.save_receipt(&r2).unwrap();
+        store.save_receipt(&r3).unwrap();
+
+        let sbx1_receipts = store.list_receipts_for_entity("sandbox", "sbx-1").unwrap();
+        assert_eq!(sbx1_receipts.len(), 2);
+        assert_eq!(sbx1_receipts[0].receipt_id, "rcp-a");
+        assert_eq!(sbx1_receipts[1].receipt_id, "rcp-b");
+
+        let sbx2_receipts = store.list_receipts_for_entity("sandbox", "sbx-2").unwrap();
+        assert_eq!(sbx2_receipts.len(), 1);
+        assert_eq!(sbx2_receipts[0].receipt_id, "rcp-c");
+
+        let empty = store.list_receipts_for_entity("lease", "ls-1").unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn receipt_upsert_updates() {
+        let store = StateStore::in_memory().unwrap();
+        let mut receipt = sample_receipt("rcp-upsert", "sbx-1");
+        receipt.status = "pending".to_string();
+        store.save_receipt(&receipt).unwrap();
+
+        receipt.status = "completed".to_string();
+        store.save_receipt(&receipt).unwrap();
+
+        let loaded = store.load_receipt("rcp-upsert").unwrap().unwrap();
+        assert_eq!(loaded.status, "completed");
+    }
+
+    // ── Scoped event listing tests (from agent-a03881b1) ──
+
+    #[test]
+    fn events_by_scope_filters_on_type_prefix() {
+        let store = StateStore::in_memory().unwrap();
+
+        store
+            .emit_event(
+                "myapp",
+                &StackEvent::SandboxCreating {
+                    stack_name: "myapp".to_string(),
+                    sandbox_id: "sb-1".to_string(),
+                },
+            )
+            .unwrap();
+        store
+            .emit_event(
+                "myapp",
+                &StackEvent::LeaseOpened {
+                    sandbox_id: "sb-1".to_string(),
+                    lease_id: "ls-1".to_string(),
+                },
+            )
+            .unwrap();
+        store
+            .emit_event(
+                "myapp",
+                &StackEvent::SandboxReady {
+                    stack_name: "myapp".to_string(),
+                    sandbox_id: "sb-1".to_string(),
+                },
+            )
+            .unwrap();
+        store
+            .emit_event(
+                "myapp",
+                &StackEvent::ExecutionQueued {
+                    container_id: "ctr-1".to_string(),
+                    execution_id: "exec-1".to_string(),
+                },
+            )
+            .unwrap();
+
+        let sandbox_events = store
+            .load_events_by_scope("myapp", "sandbox_", None, 100)
+            .unwrap();
+        assert_eq!(sandbox_events.len(), 2);
+
+        let lease_events = store
+            .load_events_by_scope("myapp", "lease_", None, 100)
+            .unwrap();
+        assert_eq!(lease_events.len(), 1);
+
+        let exec_events = store
+            .load_events_by_scope("myapp", "execution_", None, 100)
+            .unwrap();
+        assert_eq!(exec_events.len(), 1);
+    }
+
+    #[test]
+    fn events_by_scope_respects_cursor_and_limit() {
+        let store = StateStore::in_memory().unwrap();
+
+        for i in 0..5 {
+            store
+                .emit_event(
+                    "myapp",
+                    &StackEvent::SandboxCreating {
+                        stack_name: "myapp".to_string(),
+                        sandbox_id: format!("sb-{i}"),
+                    },
+                )
+                .unwrap();
+        }
+
+        let first_page = store
+            .load_events_by_scope("myapp", "sandbox_", None, 2)
+            .unwrap();
+        assert_eq!(first_page.len(), 2);
+
+        let cursor = first_page.last().map(|r| r.id);
+        let second_page = store
+            .load_events_by_scope("myapp", "sandbox_", cursor, 2)
+            .unwrap();
+        assert_eq!(second_page.len(), 2);
+
+        // IDs should be strictly greater than the cursor
+        assert!(second_page[0].id > first_page[1].id);
+    }
+
+    #[test]
+    fn events_by_scope_empty_scope_returns_nothing() {
+        let store = StateStore::in_memory().unwrap();
+        store
+            .emit_event(
+                "myapp",
+                &StackEvent::SandboxCreating {
+                    stack_name: "myapp".to_string(),
+                    sandbox_id: "sb-1".to_string(),
+                },
+            )
+            .unwrap();
+
+        let events = store
+            .load_events_by_scope("myapp", "nonexistent_", None, 100)
+            .unwrap();
+        assert!(events.is_empty());
+    }
+
+    // ── Build persistence tests (from agent-af0c4a41) ──
+
+    fn sample_build(id: &str, sandbox_id: &str) -> Build {
+        Build {
+            build_id: id.to_string(),
+            sandbox_id: sandbox_id.to_string(),
+            build_spec: BuildSpec {
+                context: "/tmp/ctx".to_string(),
+                dockerfile: Some("Dockerfile".to_string()),
+                args: std::collections::BTreeMap::new(),
+            },
+            state: BuildState::Queued,
+            result_digest: None,
+            started_at: 1_700_000_000,
+            ended_at: None,
+        }
+    }
+
+    #[test]
+    fn build_round_trip() {
+        let store = StateStore::in_memory().unwrap();
+        let build = sample_build("bld-1", "sb-1");
+
+        store.save_build(&build).unwrap();
+        let loaded = store.load_build("bld-1").unwrap().unwrap();
+        assert_eq!(loaded.build_id, "bld-1");
+        assert_eq!(loaded.sandbox_id, "sb-1");
+        assert_eq!(loaded.state, BuildState::Queued);
+        assert_eq!(loaded.build_spec.context, "/tmp/ctx");
+    }
+
+    #[test]
+    fn build_list_returns_all() {
+        let store = StateStore::in_memory().unwrap();
+        store.save_build(&sample_build("bld-a", "sb-1")).unwrap();
+        store.save_build(&sample_build("bld-b", "sb-2")).unwrap();
+
+        let all = store.list_builds().unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn build_list_for_sandbox() {
+        let store = StateStore::in_memory().unwrap();
+        store.save_build(&sample_build("bld-a", "sb-1")).unwrap();
+        store.save_build(&sample_build("bld-b", "sb-1")).unwrap();
+        store.save_build(&sample_build("bld-c", "sb-2")).unwrap();
+
+        let for_sb1 = store.list_builds_for_sandbox("sb-1").unwrap();
+        assert_eq!(for_sb1.len(), 2);
+        assert!(for_sb1.iter().all(|b| b.sandbox_id == "sb-1"));
+
+        let for_sb2 = store.list_builds_for_sandbox("sb-2").unwrap();
+        assert_eq!(for_sb2.len(), 1);
+    }
+
+    #[test]
+    fn build_delete_removes() {
+        let store = StateStore::in_memory().unwrap();
+        store.save_build(&sample_build("bld-del", "sb-1")).unwrap();
+        store.delete_build("bld-del").unwrap();
+        let loaded = store.load_build("bld-del").unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn build_upsert_updates_state() {
+        let store = StateStore::in_memory().unwrap();
+        let mut build = sample_build("bld-up", "sb-1");
+
+        store.save_build(&build).unwrap();
+
+        build.state = BuildState::Running;
+        store.save_build(&build).unwrap();
+
+        let loaded = store.load_build("bld-up").unwrap().unwrap();
+        assert_eq!(loaded.state, BuildState::Running);
+    }
+
+    #[test]
+    fn build_missing_returns_none() {
+        let store = StateStore::in_memory().unwrap();
+        let loaded = store.load_build("nonexistent").unwrap();
+        assert!(loaded.is_none());
+    }
+
+    // ── Phase 1 validation tests (from agent-a80ffa89) ──
+
+    #[test]
+    fn phase1_validation_health_state_persistence_round_trip() {
+        let store = StateStore::in_memory().unwrap();
+
+        let mut original_state = HashMap::new();
+        original_state.insert(
+            "web".to_string(),
+            HealthPollState {
+                service_name: "web".to_string(),
+                consecutive_passes: 5,
+                consecutive_failures: 0,
+                last_check_millis: Some(1_700_000_000_000),
+                start_time_millis: Some(1_700_000_000_123),
+            },
+        );
+        original_state.insert(
+            "db".to_string(),
+            HealthPollState {
+                service_name: "db".to_string(),
+                consecutive_passes: 0,
+                consecutive_failures: 3,
+                last_check_millis: Some(1_700_000_001_000),
+                start_time_millis: Some(1_700_000_000_456),
+            },
+        );
+
+        // Save to store.
+        store
+            .save_health_poller_state("myapp", &original_state)
+            .unwrap();
+
+        // Load from a fresh perspective (same store, simulating reload).
+        let loaded = store.load_health_poller_state("myapp").unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded.get("web").unwrap(),
+            original_state.get("web").unwrap()
+        );
+        assert_eq!(loaded.get("db").unwrap(), original_state.get("db").unwrap());
+
+        // Verify counters survived the round-trip.
+        let web = loaded.get("web").unwrap();
+        assert_eq!(web.consecutive_passes, 5);
+        assert_eq!(web.consecutive_failures, 0);
+
+        let db = loaded.get("db").unwrap();
+        assert_eq!(db.consecutive_passes, 0);
+        assert_eq!(db.consecutive_failures, 3);
+    }
+
+    #[test]
+    fn phase1_validation_allocator_state_persistence_round_trip() {
+        let store = StateStore::in_memory().unwrap();
+
+        let mut ports = HashMap::new();
+        ports.insert(
+            "web".to_string(),
+            vec![PublishedPort {
+                host_port: 8080,
+                container_port: 80,
+                protocol: "tcp".to_string(),
+            }],
+        );
+        ports.insert(
+            "db".to_string(),
+            vec![PublishedPort {
+                host_port: 5432,
+                container_port: 5432,
+                protocol: "tcp".to_string(),
+            }],
+        );
+
+        let mut service_ips = HashMap::new();
+        service_ips.insert("web".to_string(), "10.0.0.2".to_string());
+        service_ips.insert("db".to_string(), "10.0.0.3".to_string());
+
+        let mut mount_tag_offsets = HashMap::new();
+        mount_tag_offsets.insert("web".to_string(), 0);
+        mount_tag_offsets.insert("db".to_string(), 3);
+
+        let snapshot = AllocatorSnapshot {
+            ports: ports.clone(),
+            service_ips: service_ips.clone(),
+            mount_tag_offsets: mount_tag_offsets.clone(),
+        };
+
+        store.save_allocator_state("myapp", &snapshot).unwrap();
+
+        // Reload and verify all fields.
+        let loaded = store.load_allocator_state("myapp").unwrap().unwrap();
+        assert_eq!(loaded.ports, ports);
+        assert_eq!(loaded.service_ips, service_ips);
+        assert_eq!(loaded.mount_tag_offsets, mount_tag_offsets);
+
+        // Verify specific port allocations survived.
+        let web_ports = loaded.ports.get("web").unwrap();
+        assert_eq!(web_ports.len(), 1);
+        assert_eq!(web_ports[0].host_port, 8080);
+        assert_eq!(web_ports[0].container_port, 80);
+
+        // Verify IPs survived.
+        assert_eq!(loaded.service_ips.get("web"), Some(&"10.0.0.2".to_string()));
+        assert_eq!(loaded.service_ips.get("db"), Some(&"10.0.0.3".to_string()));
+
+        // Verify mount tag offsets survived.
+        assert_eq!(loaded.mount_tag_offsets.get("web"), Some(&0));
+        assert_eq!(loaded.mount_tag_offsets.get("db"), Some(&3));
+    }
+
+    #[test]
+    fn phase1_validation_reconcile_session_lifecycle() {
+        let store = StateStore::in_memory().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+        ];
+
+        let session = ReconcileSession {
+            session_id: "rs-1000".to_string(),
+            stack_name: "myapp".to_string(),
+            operation_id: "op-1".to_string(),
+            status: ReconcileSessionStatus::Active,
+            actions_hash: "hash-abc".to_string(),
+            next_action_index: 0,
+            total_actions: 2,
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+
+        // Create session.
+        store.create_reconcile_session(&session, &actions).unwrap();
+
+        // Load active session.
+        let loaded = store
+            .load_active_reconcile_session("myapp")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.session_id, "rs-1000");
+        assert_eq!(loaded.status, ReconcileSessionStatus::Active);
+        assert_eq!(loaded.next_action_index, 0);
+
+        // Update progress.
+        store
+            .update_reconcile_session_progress("rs-1000", 1, &ReconcileSessionStatus::Active)
+            .unwrap();
+
+        let updated = store
+            .load_active_reconcile_session("myapp")
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.next_action_index, 1);
+        assert_eq!(updated.status, ReconcileSessionStatus::Active);
+
+        // Complete session.
+        store.complete_reconcile_session("rs-1000").unwrap();
+
+        // Active session should now be gone.
+        let none = store.load_active_reconcile_session("myapp").unwrap();
+        assert!(none.is_none());
+
+        // List sessions should show completed.
+        let sessions = store.list_reconcile_sessions("myapp", 10).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, ReconcileSessionStatus::Completed);
+        assert!(sessions[0].completed_at.is_some());
+    }
+
+    #[test]
+    fn phase1_validation_reconcile_session_supersession() {
+        let store = StateStore::in_memory().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let actions = vec![Action::ServiceCreate {
+            service_name: "web".to_string(),
+        }];
+
+        // Create first session.
+        let session1 = ReconcileSession {
+            session_id: "rs-first".to_string(),
+            stack_name: "myapp".to_string(),
+            operation_id: "op-1".to_string(),
+            status: ReconcileSessionStatus::Active,
+            actions_hash: "hash-1".to_string(),
+            next_action_index: 0,
+            total_actions: 1,
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        store.create_reconcile_session(&session1, &actions).unwrap();
+
+        // Supersede active sessions for the stack.
+        let superseded_count = store.supersede_active_sessions("myapp").unwrap();
+        assert_eq!(superseded_count, 1);
+
+        // Old session should be superseded.
+        let old_active = store.load_active_reconcile_session("myapp").unwrap();
+        assert!(old_active.is_none());
+
+        let sessions = store.list_reconcile_sessions("myapp", 10).unwrap();
+        assert_eq!(sessions[0].status, ReconcileSessionStatus::Superseded);
+
+        // Create new session for same stack.
+        let session2 = ReconcileSession {
+            session_id: "rs-second".to_string(),
+            stack_name: "myapp".to_string(),
+            operation_id: "op-2".to_string(),
+            status: ReconcileSessionStatus::Active,
+            actions_hash: "hash-2".to_string(),
+            next_action_index: 0,
+            total_actions: 1,
+            started_at: now + 1,
+            updated_at: now + 1,
+            completed_at: None,
+        };
+        store.create_reconcile_session(&session2, &actions).unwrap();
+
+        // New session is active.
+        let active = store
+            .load_active_reconcile_session("myapp")
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.session_id, "rs-second");
+    }
+
+    #[test]
+    fn phase1_validation_event_cursor_coherence_after_simulated_restart() {
+        let store = StateStore::in_memory().unwrap();
+
+        // Emit a batch of events (simulating pre-restart state).
+        let events_batch1 = vec![
+            StackEvent::StackApplyStarted {
+                stack_name: "myapp".to_string(),
+                services_count: 2,
+            },
+            StackEvent::ServiceCreating {
+                stack_name: "myapp".to_string(),
+                service_name: "web".to_string(),
+            },
+            StackEvent::ServiceReady {
+                stack_name: "myapp".to_string(),
+                service_name: "web".to_string(),
+                runtime_id: "ctr-1".to_string(),
+            },
+        ];
+
+        for event in &events_batch1 {
+            store.emit_event("myapp", event).unwrap();
+        }
+
+        // Record the cursor (simulating what a consumer would save before restart).
+        let all_records = store.load_event_records("myapp").unwrap();
+        assert_eq!(all_records.len(), 3);
+        let cursor = all_records[1].id; // After ServiceCreating
+
+        // Emit more events (simulating post-restart activity).
+        let events_batch2 = vec![
+            StackEvent::ServiceCreating {
+                stack_name: "myapp".to_string(),
+                service_name: "db".to_string(),
+            },
+            StackEvent::ServiceReady {
+                stack_name: "myapp".to_string(),
+                service_name: "db".to_string(),
+                runtime_id: "ctr-2".to_string(),
+            },
+            StackEvent::StackApplyCompleted {
+                stack_name: "myapp".to_string(),
+                succeeded: 2,
+                failed: 0,
+            },
+        ];
+
+        for event in &events_batch2 {
+            store.emit_event("myapp", event).unwrap();
+        }
+
+        // Load events since cursor (simulating restart recovery).
+        let since_cursor = store.load_events_since("myapp", cursor).unwrap();
+
+        // Should get: ServiceReady(web), ServiceCreating(db), ServiceReady(db), StackApplyCompleted
+        assert_eq!(since_cursor.len(), 4);
+
+        // Verify ordering: IDs must be strictly monotonically increasing.
+        for window in since_cursor.windows(2) {
+            assert!(
+                window[1].id > window[0].id,
+                "event IDs must be monotonically increasing"
+            );
+        }
+
+        // All events since cursor must have id > cursor.
+        for record in &since_cursor {
+            assert!(record.id > cursor);
+        }
+
+        // Verify completeness: total events = batch1 + batch2.
+        let total = store.load_event_records("myapp").unwrap();
+        assert_eq!(total.len(), 6);
+
+        // Verify cursor-based loading gives exact complement.
+        let from_start = store.load_events_since("myapp", 0).unwrap();
+        assert_eq!(from_start.len(), 6);
+    }
+
+    // ── Phase 2: Schema/version migration tests (from agent-a80ffa89) ──
+
+    #[test]
+    fn phase2_control_metadata_crud() {
+        let store = StateStore::in_memory().unwrap();
+
+        // Read non-existent key.
+        assert!(store.get_control_metadata("nonexistent").unwrap().is_none());
+
+        // Set and read.
+        store
+            .set_control_metadata("test_key", "test_value")
+            .unwrap();
+        let value = store.get_control_metadata("test_key").unwrap().unwrap();
+        assert_eq!(value, "test_value");
+
+        // Update (upsert).
+        store
+            .set_control_metadata("test_key", "updated_value")
+            .unwrap();
+        let value = store.get_control_metadata("test_key").unwrap().unwrap();
+        assert_eq!(value, "updated_value");
+    }
+
+    #[test]
+    fn phase2_schema_version_defaults_to_1() {
+        let store = StateStore::in_memory().unwrap();
+        let version = store.schema_version().unwrap();
+        assert_eq!(version, 1);
+    }
+
+    #[test]
+    fn phase2_schema_version_set_and_get() {
+        let store = StateStore::in_memory().unwrap();
+
+        store.set_schema_version(2).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 2);
+
+        store.set_schema_version(42).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 42);
+    }
+
+    #[test]
+    fn phase2_created_at_metadata_set_on_init() {
+        let store = StateStore::in_memory().unwrap();
+        let created_at = store.get_control_metadata("created_at").unwrap();
+        assert!(created_at.is_some());
+        // Should be a parseable integer.
+        let secs: u64 = created_at.unwrap().parse().unwrap();
+        assert!(secs > 0);
+    }
+
+    #[test]
+    fn phase2_multiple_metadata_keys_independent() {
+        let store = StateStore::in_memory().unwrap();
+
+        store.set_control_metadata("key_a", "value_a").unwrap();
+        store.set_control_metadata("key_b", "value_b").unwrap();
+
+        assert_eq!(
+            store.get_control_metadata("key_a").unwrap().unwrap(),
+            "value_a"
+        );
+        assert_eq!(
+            store.get_control_metadata("key_b").unwrap().unwrap(),
+            "value_b"
+        );
+
+        // Updating one doesn't affect the other.
+        store.set_control_metadata("key_a", "new_a").unwrap();
+        assert_eq!(
+            store.get_control_metadata("key_a").unwrap().unwrap(),
+            "new_a"
+        );
+        assert_eq!(
+            store.get_control_metadata("key_b").unwrap().unwrap(),
+            "value_b"
+        );
+    }
+
+    // ── Phase 3: Startup drift verification tests (from agent-a80ffa89) ──
+
+    #[test]
+    fn phase3_drift_desired_without_observed() {
+        let store = StateStore::in_memory().unwrap();
+
+        // Save desired state but no observed state.
+        store.save_desired_state("myapp", &sample_spec()).unwrap();
+
+        let findings = store.verify_startup_drift("myapp").unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.category == "desired_state"
+                    && f.description.contains("without observations")),
+            "expected desired_state drift finding, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn phase3_drift_orphaned_observed_state() {
+        let store = StateStore::in_memory().unwrap();
+
+        // Save desired state with only "web" service.
+        let mut spec = sample_spec();
+        spec.services.retain(|s| s.name == "web");
+        store.save_desired_state("myapp", &spec).unwrap();
+
+        // Save observed state for "web" (expected) and "cache" (orphaned).
+        store
+            .save_observed_state(
+                "myapp",
+                &ServiceObservedState {
+                    service_name: "web".to_string(),
+                    phase: ServicePhase::Running,
+                    container_id: Some("ctr-1".to_string()),
+                    last_error: None,
+                    ready: true,
+                },
+            )
+            .unwrap();
+        store
+            .save_observed_state(
+                "myapp",
+                &ServiceObservedState {
+                    service_name: "cache".to_string(),
+                    phase: ServicePhase::Running,
+                    container_id: Some("ctr-2".to_string()),
+                    last_error: None,
+                    ready: true,
+                },
+            )
+            .unwrap();
+
+        let findings = store.verify_startup_drift("myapp").unwrap();
+        let orphaned: Vec<_> = findings
+            .iter()
+            .filter(|f| f.category == "observed_state" && f.description.contains("cache"))
+            .collect();
+        assert_eq!(orphaned.len(), 1);
+        assert!(matches!(orphaned[0].severity, DriftSeverity::Warning));
+    }
+
+    #[test]
+    fn phase3_drift_stale_reconcile_session() {
+        let store = StateStore::in_memory().unwrap();
+
+        // Create an active session with updated_at far in the past (> 5 min ago).
+        let old_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 600; // 10 minutes ago
+
+        let actions = vec![Action::ServiceCreate {
+            service_name: "web".to_string(),
+        }];
+
+        let session = ReconcileSession {
+            session_id: "rs-stale".to_string(),
+            stack_name: "myapp".to_string(),
+            operation_id: "op-stale".to_string(),
+            status: ReconcileSessionStatus::Active,
+            actions_hash: "hash-stale".to_string(),
+            next_action_index: 0,
+            total_actions: 1,
+            started_at: old_time,
+            updated_at: old_time,
+            completed_at: None,
+        };
+        store.create_reconcile_session(&session, &actions).unwrap();
+
+        let findings = store.verify_startup_drift("myapp").unwrap();
+        let stale: Vec<_> = findings
+            .iter()
+            .filter(|f| f.category == "reconcile" && f.description.contains("stale"))
+            .collect();
+        assert_eq!(stale.len(), 1);
+        assert!(matches!(stale[0].severity, DriftSeverity::Warning));
+    }
+
+    #[test]
+    fn phase3_drift_orphaned_health_state() {
+        let store = StateStore::in_memory().unwrap();
+
+        // Save health state but no desired state.
+        let mut health = HashMap::new();
+        health.insert(
+            "web".to_string(),
+            HealthPollState {
+                service_name: "web".to_string(),
+                consecutive_passes: 1,
+                consecutive_failures: 0,
+                last_check_millis: Some(1_700_000_000_000),
+                start_time_millis: None,
+            },
+        );
+        store.save_health_poller_state("myapp", &health).unwrap();
+
+        let findings = store.verify_startup_drift("myapp").unwrap();
+        let orphaned: Vec<_> = findings
+            .iter()
+            .filter(|f| f.category == "health" && f.description.contains("orphaned"))
+            .collect();
+        assert_eq!(orphaned.len(), 1);
+        assert!(matches!(orphaned[0].severity, DriftSeverity::Info));
+    }
+
+    #[test]
+    fn phase3_drift_clean_state_returns_no_findings() {
+        let store = StateStore::in_memory().unwrap();
+
+        // Save desired state with matching observed state.
+        store.save_desired_state("myapp", &sample_spec()).unwrap();
+        store
+            .save_observed_state(
+                "myapp",
+                &ServiceObservedState {
+                    service_name: "web".to_string(),
+                    phase: ServicePhase::Running,
+                    container_id: Some("ctr-1".to_string()),
+                    last_error: None,
+                    ready: true,
+                },
+            )
+            .unwrap();
+        store
+            .save_observed_state(
+                "myapp",
+                &ServiceObservedState {
+                    service_name: "db".to_string(),
+                    phase: ServicePhase::Running,
+                    container_id: Some("ctr-2".to_string()),
+                    last_error: None,
+                    ready: true,
+                },
+            )
+            .unwrap();
+
+        let findings = store.verify_startup_drift("myapp").unwrap();
+        assert!(
+            findings.is_empty(),
+            "expected no drift findings in clean state, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn phase3_drift_nonexistent_stack_returns_no_findings() {
+        let store = StateStore::in_memory().unwrap();
+        let findings = store.verify_startup_drift("nonexistent").unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn phase3_drift_finding_serialization_round_trip() {
+        let finding = DriftFinding {
+            category: "observed_state".to_string(),
+            description: "orphaned service".to_string(),
+            severity: DriftSeverity::Warning,
+        };
+
+        let json = serde_json::to_string(&finding).unwrap();
+        let loaded: DriftFinding = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.category, "observed_state");
+        assert_eq!(loaded.description, "orphaned service");
+        assert!(matches!(loaded.severity, DriftSeverity::Warning));
+    }
+
+    #[test]
+    fn phase3_drift_event_emission() {
+        let store = StateStore::in_memory().unwrap();
+
+        // Create a drift finding and emit as event.
+        let finding = DriftFinding {
+            category: "desired_state".to_string(),
+            description: "desired state without observations".to_string(),
+            severity: DriftSeverity::Warning,
+        };
+
+        let event = StackEvent::DriftDetected {
+            stack_name: "myapp".to_string(),
+            category: finding.category.clone(),
+            description: finding.description.clone(),
+            severity: finding.severity.as_str().to_string(),
+        };
+
+        store.emit_event("myapp", &event).unwrap();
+
+        let events = store.load_events("myapp").unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], StackEvent::DriftDetected { .. }));
     }
 }

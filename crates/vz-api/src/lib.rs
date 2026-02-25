@@ -14,18 +14,21 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 use vz_runtime_contract::{
-    Capability, Checkpoint, CheckpointClass, CheckpointState, Execution, ExecutionSpec,
-    ExecutionState, Lease, LeaseState, MachineErrorEnvelope, RequestMetadata, RuntimeCapabilities,
-    RuntimeError, Sandbox, SandboxBackend, SandboxSpec, SandboxState,
-    runtime_error_machine_envelope,
+    Build, BuildSpec, BuildState, Capability, Checkpoint, CheckpointClass, CheckpointState,
+    Container, ContainerSpec, ContainerState, Execution, ExecutionSpec, ExecutionState, Lease,
+    LeaseState, MachineErrorEnvelope, RequestMetadata, RuntimeCapabilities, Sandbox,
+    SandboxBackend, SandboxSpec, SandboxState,
 };
-use vz_stack::{EventRecord, IDEMPOTENCY_TTL_SECS, IdempotencyRecord, StackError, StateStore};
+use vz_stack::{
+    EventRecord, IDEMPOTENCY_TTL_SECS, IdempotencyRecord, ImageRecord, Receipt, StackError,
+    StateStore,
+};
 
 const DEFAULT_EVENT_PAGE_SIZE: usize = 100;
 const MAX_EVENT_PAGE_SIZE: usize = 1000;
@@ -76,10 +79,11 @@ impl From<ApiConfig> for ApiState {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Copy)]
+#[derive(Debug, Deserialize, Clone)]
 struct EventsQuery {
     after: Option<i64>,
     limit: Option<usize>,
+    scope: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -327,6 +331,174 @@ fn checkpoint_to_payload(c: &Checkpoint) -> CheckpointPayload {
     }
 }
 
+// ── Container types ──
+
+#[derive(Debug, Deserialize)]
+struct CreateContainerRequest {
+    sandbox_id: String,
+    image_digest: String,
+    #[serde(default)]
+    cmd: Option<Vec<String>>,
+    #[serde(default)]
+    env: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ContainerPayload {
+    container_id: String,
+    sandbox_id: String,
+    image_digest: String,
+    state: String,
+    created_at: u64,
+    started_at: Option<u64>,
+    ended_at: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ContainerResponse {
+    request_id: String,
+    container: ContainerPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct ContainerListResponse {
+    request_id: String,
+    containers: Vec<ContainerPayload>,
+}
+
+fn container_to_payload(c: &Container) -> ContainerPayload {
+    ContainerPayload {
+        container_id: c.container_id.clone(),
+        sandbox_id: c.sandbox_id.clone(),
+        image_digest: c.image_digest.clone(),
+        state: serde_json::to_string(&c.state)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string(),
+        created_at: c.created_at,
+        started_at: c.started_at,
+        ended_at: c.ended_at,
+    }
+}
+
+// ── Image types ──
+
+#[derive(Debug, Serialize)]
+struct ImagePayload {
+    image_ref: String,
+    resolved_digest: String,
+    platform: String,
+    source_registry: String,
+    pulled_at: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ImageResponse {
+    request_id: String,
+    image: ImagePayload,
+}
+
+#[derive(Debug, Serialize)]
+struct ImageListResponse {
+    request_id: String,
+    images: Vec<ImagePayload>,
+}
+
+fn image_to_payload(i: &ImageRecord) -> ImagePayload {
+    ImagePayload {
+        image_ref: i.image_ref.clone(),
+        resolved_digest: i.resolved_digest.clone(),
+        platform: i.platform.clone(),
+        source_registry: i.source_registry.clone(),
+        pulled_at: i.pulled_at,
+    }
+}
+
+// ── Receipt types ──
+
+#[derive(Debug, Serialize)]
+struct ReceiptPayload {
+    receipt_id: String,
+    operation: String,
+    entity_id: String,
+    entity_type: String,
+    request_id: String,
+    status: String,
+    created_at: u64,
+    metadata: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct ReceiptResponse {
+    request_id: String,
+    receipt: ReceiptPayload,
+}
+
+fn receipt_to_payload(r: &Receipt) -> ReceiptPayload {
+    ReceiptPayload {
+        receipt_id: r.receipt_id.clone(),
+        operation: r.operation.clone(),
+        entity_id: r.entity_id.clone(),
+        entity_type: r.entity_type.clone(),
+        request_id: r.request_id.clone(),
+        status: r.status.clone(),
+        created_at: r.created_at,
+        metadata: r.metadata.clone(),
+    }
+}
+
+// ── Build types ──
+
+#[derive(Debug, Deserialize)]
+struct StartBuildRequest {
+    sandbox_id: String,
+    context: String,
+    #[serde(default)]
+    dockerfile: Option<String>,
+    #[serde(default)]
+    args: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Serialize)]
+struct BuildPayload {
+    build_id: String,
+    sandbox_id: String,
+    state: String,
+    result_digest: Option<String>,
+    started_at: u64,
+    ended_at: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct BuildResponse {
+    request_id: String,
+    build: BuildPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct BuildListResponse {
+    request_id: String,
+    builds: Vec<BuildPayload>,
+}
+
+fn build_to_payload(b: &Build) -> BuildPayload {
+    BuildPayload {
+        build_id: b.build_id.clone(),
+        sandbox_id: b.sandbox_id.clone(),
+        state: serde_json::to_string(&b.state)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string(),
+        result_digest: b.result_digest.clone(),
+        started_at: b.started_at,
+        ended_at: b.ended_at,
+    }
+}
+
 fn json_error_response(
     status: StatusCode,
     code: &str,
@@ -372,23 +544,6 @@ fn stack_error_response(status: StatusCode, error: StackError, request_id: Strin
     let metadata = RequestMetadata::from_optional_refs(Some(request_id.as_str()), None);
     let envelope = MachineErrorEnvelope::new(error.to_machine_error(&metadata));
     (status, Json(envelope)).into_response()
-}
-
-fn runtime_error_response(status: StatusCode, error: RuntimeError, request_id: String) -> Response {
-    let metadata = RequestMetadata::from_optional_refs(Some(request_id.as_str()), None);
-    let envelope = runtime_error_machine_envelope(&error, &metadata);
-    (status, Json(envelope)).into_response()
-}
-
-fn unsupported_operation_response(operation: &'static str, request_id: String) -> Response {
-    runtime_error_response(
-        StatusCode::NOT_IMPLEMENTED,
-        RuntimeError::UnsupportedOperation {
-            operation: operation.to_string(),
-            reason: "openapi adapter path not wired yet".to_string(),
-        },
-        request_id,
-    )
 }
 
 /// Extract idempotency key from request headers.
@@ -467,6 +622,33 @@ fn save_idempotency(
     let _ = store.save_idempotency_result(&record);
 }
 
+/// Create and save a receipt for a completed mutating operation, returning the receipt ID.
+///
+/// Failures are best-effort; the caller should not block the response on receipt persistence.
+fn emit_receipt(
+    store: &StateStore,
+    operation: &str,
+    entity_id: &str,
+    entity_type: &str,
+    request_id: &str,
+) -> Option<String> {
+    let receipt_id = format!("rcp-{}", Uuid::new_v4());
+    let receipt = Receipt {
+        receipt_id: receipt_id.clone(),
+        operation: operation.to_string(),
+        entity_id: entity_id.to_string(),
+        entity_type: entity_type.to_string(),
+        request_id: request_id.to_string(),
+        status: "completed".to_string(),
+        created_at: now_epoch_secs(),
+        metadata: serde_json::Value::Object(serde_json::Map::new()),
+    };
+    match store.save_receipt(&receipt) {
+        Ok(()) => Some(receipt_id),
+        Err(_) => None,
+    }
+}
+
 fn read_events(
     state: &ApiState,
     stack_name: &str,
@@ -475,6 +657,17 @@ fn read_events(
 ) -> Result<Vec<EventRecord>, StackError> {
     let store = StateStore::open(&state.state_store_path)?;
     store.load_events_since_limited(stack_name, after, limit)
+}
+
+fn read_events_scoped(
+    state: &ApiState,
+    stack_name: &str,
+    scope: &str,
+    after: i64,
+    limit: usize,
+) -> Result<Vec<EventRecord>, StackError> {
+    let store = StateStore::open(&state.state_store_path)?;
+    store.load_events_by_scope(stack_name, scope, Some(after), limit)
 }
 
 async fn openapi_json() -> Json<serde_json::Value> {
@@ -503,7 +696,13 @@ async fn list_events(
         .unwrap_or(state.default_event_page_size)
         .clamp(1, MAX_EVENT_PAGE_SIZE);
 
-    let records = match read_events(&state, &stack_name, after, limit) {
+    let records = if let Some(ref scope) = query.scope {
+        read_events_scoped(&state, &stack_name, scope, after, limit)
+    } else {
+        read_events(&state, &stack_name, after, limit)
+    };
+
+    let records = match records {
         Ok(records) => records,
         Err(error) => {
             return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, error, request_id);
@@ -681,6 +880,13 @@ async fn create_sandbox(
         if let Err(e) = store.save_sandbox(&sandbox) {
             return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
         }
+        let receipt_id = emit_receipt(
+            &store,
+            "create_sandbox",
+            &sandbox.sandbox_id,
+            "sandbox",
+            &request_id,
+        );
         let response = SandboxResponse {
             request_id,
             sandbox: sandbox_to_payload(&sandbox),
@@ -697,13 +903,26 @@ async fn create_sandbox(
                 );
             }
         }
-        return (StatusCode::CREATED, Json(response)).into_response();
+        let mut resp = (StatusCode::CREATED, Json(response)).into_response();
+        if let Some(ref rid) = receipt_id {
+            if let Ok(val) = axum::http::HeaderValue::from_str(rid) {
+                resp.headers_mut().insert("x-receipt-id", val);
+            }
+        }
+        return resp;
     }
 
     if let Err(e) = store.save_sandbox(&sandbox) {
         return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
     }
 
+    let receipt_id = emit_receipt(
+        &store,
+        "create_sandbox",
+        &sandbox.sandbox_id,
+        "sandbox",
+        &request_id,
+    );
     let response = SandboxResponse {
         request_id,
         sandbox: sandbox_to_payload(&sandbox),
@@ -720,7 +939,13 @@ async fn create_sandbox(
             );
         }
     }
-    (StatusCode::CREATED, Json(response)).into_response()
+    let mut resp = (StatusCode::CREATED, Json(response)).into_response();
+    if let Some(ref rid) = receipt_id {
+        if let Ok(val) = axum::http::HeaderValue::from_str(rid) {
+            resp.headers_mut().insert("x-receipt-id", val);
+        }
+    }
+    resp
 }
 
 async fn list_sandboxes(State(state): State<ApiState>, headers: HeaderMap) -> Response {
@@ -856,6 +1081,13 @@ async fn terminate_sandbox(
         return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
     }
 
+    let receipt_id = emit_receipt(
+        &store,
+        "terminate_sandbox",
+        &sandbox.sandbox_id,
+        "sandbox",
+        &request_id,
+    );
     let response = SandboxResponse {
         request_id,
         sandbox: sandbox_to_payload(&sandbox),
@@ -872,7 +1104,13 @@ async fn terminate_sandbox(
             );
         }
     }
-    (StatusCode::OK, Json(response)).into_response()
+    let mut resp = (StatusCode::OK, Json(response)).into_response();
+    if let Some(ref rid) = receipt_id {
+        if let Ok(val) = axum::http::HeaderValue::from_str(rid) {
+            resp.headers_mut().insert("x-receipt-id", val);
+        }
+    }
+    resp
 }
 
 // ── Lease handlers ──
@@ -880,12 +1118,35 @@ async fn terminate_sandbox(
 async fn open_lease(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<OpenLeaseRequest>,
+    raw_body: axum::body::Bytes,
 ) -> Response {
     let request_id = request_id_from_headers(&headers);
     let store = match StateStore::open(&state.state_store_path) {
         Ok(s) => s,
         Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let idempotency_key = extract_idempotency_key(&headers);
+    let request_hash = compute_request_hash(&raw_body);
+
+    if let Some(ref key) = idempotency_key {
+        if let Some(cached) =
+            check_idempotency(&store, key, "open_lease", &request_hash, &request_id)
+        {
+            return cached;
+        }
+    }
+
+    let body: OpenLeaseRequest = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => {
+            return json_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &format!("invalid JSON body: {e}"),
+                &request_id,
+            );
+        }
     };
 
     let now = now_epoch_secs();
@@ -912,14 +1173,30 @@ async fn open_lease(
         return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
     }
 
-    (
-        StatusCode::CREATED,
-        Json(LeaseResponse {
-            request_id,
-            lease: lease_to_payload(&lease),
-        }),
-    )
-        .into_response()
+    let receipt_id = emit_receipt(&store, "open_lease", &lease.lease_id, "lease", &request_id);
+    let response = LeaseResponse {
+        request_id,
+        lease: lease_to_payload(&lease),
+    };
+    if let Some(ref key) = idempotency_key {
+        if let Ok(json) = serde_json::to_string(&response) {
+            save_idempotency(
+                &store,
+                key,
+                "open_lease",
+                &request_hash,
+                StatusCode::CREATED.as_u16(),
+                &json,
+            );
+        }
+    }
+    let mut resp = (StatusCode::CREATED, Json(response)).into_response();
+    if let Some(ref rid) = receipt_id {
+        if let Ok(val) = axum::http::HeaderValue::from_str(rid) {
+            resp.headers_mut().insert("x-receipt-id", val);
+        }
+    }
+    resp
 }
 
 async fn list_leases(State(state): State<ApiState>, headers: HeaderMap) -> Response {
@@ -1022,14 +1299,18 @@ async fn close_lease(
         return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
     }
 
-    (
-        StatusCode::OK,
-        Json(LeaseResponse {
-            request_id,
-            lease: lease_to_payload(&lease),
-        }),
-    )
-        .into_response()
+    let receipt_id = emit_receipt(&store, "close_lease", &lease.lease_id, "lease", &request_id);
+    let response = LeaseResponse {
+        request_id,
+        lease: lease_to_payload(&lease),
+    };
+    let mut resp = (StatusCode::OK, Json(response)).into_response();
+    if let Some(ref rid) = receipt_id {
+        if let Ok(val) = axum::http::HeaderValue::from_str(rid) {
+            resp.headers_mut().insert("x-receipt-id", val);
+        }
+    }
+    resp
 }
 
 async fn heartbeat_lease(
@@ -1086,12 +1367,35 @@ async fn heartbeat_lease(
 async fn create_execution(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<CreateExecutionRequest>,
+    raw_body: axum::body::Bytes,
 ) -> Response {
     let request_id = request_id_from_headers(&headers);
     let store = match StateStore::open(&state.state_store_path) {
         Ok(s) => s,
         Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let idempotency_key = extract_idempotency_key(&headers);
+    let request_hash = compute_request_hash(&raw_body);
+
+    if let Some(ref key) = idempotency_key {
+        if let Some(cached) =
+            check_idempotency(&store, key, "create_execution", &request_hash, &request_id)
+        {
+            return cached;
+        }
+    }
+
+    let body: CreateExecutionRequest = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => {
+            return json_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &format!("invalid JSON body: {e}"),
+                &request_id,
+            );
+        }
     };
 
     let execution = Execution {
@@ -1114,14 +1418,36 @@ async fn create_execution(
         return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
     }
 
-    (
-        StatusCode::CREATED,
-        Json(ExecutionResponse {
-            request_id,
-            execution: execution_to_payload(&execution),
-        }),
-    )
-        .into_response()
+    let receipt_id = emit_receipt(
+        &store,
+        "create_execution",
+        &execution.execution_id,
+        "execution",
+        &request_id,
+    );
+    let response = ExecutionResponse {
+        request_id,
+        execution: execution_to_payload(&execution),
+    };
+    if let Some(ref key) = idempotency_key {
+        if let Ok(json) = serde_json::to_string(&response) {
+            save_idempotency(
+                &store,
+                key,
+                "create_execution",
+                &request_hash,
+                StatusCode::CREATED.as_u16(),
+                &json,
+            );
+        }
+    }
+    let mut resp = (StatusCode::CREATED, Json(response)).into_response();
+    if let Some(ref rid) = receipt_id {
+        if let Ok(val) = axum::http::HeaderValue::from_str(rid) {
+            resp.headers_mut().insert("x-receipt-id", val);
+        }
+    }
+    resp
 }
 
 async fn list_executions(State(state): State<ApiState>, headers: HeaderMap) -> Response {
@@ -1222,14 +1548,24 @@ async fn cancel_execution(
         return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
     }
 
-    (
-        StatusCode::OK,
-        Json(ExecutionResponse {
-            request_id,
-            execution: execution_to_payload(&execution),
-        }),
-    )
-        .into_response()
+    let receipt_id = emit_receipt(
+        &store,
+        "cancel_execution",
+        &execution.execution_id,
+        "execution",
+        &request_id,
+    );
+    let response = ExecutionResponse {
+        request_id,
+        execution: execution_to_payload(&execution),
+    };
+    let mut resp = (StatusCode::OK, Json(response)).into_response();
+    if let Some(ref rid) = receipt_id {
+        if let Ok(val) = axum::http::HeaderValue::from_str(rid) {
+            resp.headers_mut().insert("x-receipt-id", val);
+        }
+    }
+    resp
 }
 
 // ── Checkpoint handlers ──
@@ -1237,12 +1573,35 @@ async fn cancel_execution(
 async fn create_checkpoint(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(body): Json<CreateCheckpointRequest>,
+    raw_body: axum::body::Bytes,
 ) -> Response {
     let request_id = request_id_from_headers(&headers);
     let store = match StateStore::open(&state.state_store_path) {
         Ok(s) => s,
         Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let idempotency_key = extract_idempotency_key(&headers);
+    let request_hash = compute_request_hash(&raw_body);
+
+    if let Some(ref key) = idempotency_key {
+        if let Some(cached) =
+            check_idempotency(&store, key, "create_checkpoint", &request_hash, &request_id)
+        {
+            return cached;
+        }
+    }
+
+    let body: CreateCheckpointRequest = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => {
+            return json_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &format!("invalid JSON body: {e}"),
+                &request_id,
+            );
+        }
     };
 
     let class_str = body.class.as_deref().unwrap_or("fs_quick");
@@ -1292,14 +1651,36 @@ async fn create_checkpoint(
         return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
     }
 
-    (
-        StatusCode::CREATED,
-        Json(CheckpointResponse {
-            request_id,
-            checkpoint: checkpoint_to_payload(&checkpoint),
-        }),
-    )
-        .into_response()
+    let receipt_id = emit_receipt(
+        &store,
+        "create_checkpoint",
+        &checkpoint.checkpoint_id,
+        "checkpoint",
+        &request_id,
+    );
+    let response = CheckpointResponse {
+        request_id,
+        checkpoint: checkpoint_to_payload(&checkpoint),
+    };
+    if let Some(ref key) = idempotency_key {
+        if let Ok(json) = serde_json::to_string(&response) {
+            save_idempotency(
+                &store,
+                key,
+                "create_checkpoint",
+                &request_hash,
+                StatusCode::CREATED.as_u16(),
+                &json,
+            );
+        }
+    }
+    let mut resp = (StatusCode::CREATED, Json(response)).into_response();
+    if let Some(ref rid) = receipt_id {
+        if let Ok(val) = axum::http::HeaderValue::from_str(rid) {
+            resp.headers_mut().insert("x-receipt-id", val);
+        }
+    }
+    resp
 }
 
 async fn list_checkpoints(State(state): State<ApiState>, headers: HeaderMap) -> Response {
@@ -1403,12 +1784,35 @@ async fn fork_checkpoint(
     State(state): State<ApiState>,
     Path(checkpoint_id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<ForkCheckpointRequest>,
+    raw_body: axum::body::Bytes,
 ) -> Response {
     let request_id = request_id_from_headers(&headers);
     let store = match StateStore::open(&state.state_store_path) {
         Ok(s) => s,
         Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let idempotency_key = extract_idempotency_key(&headers);
+    let request_hash = compute_request_hash(&raw_body);
+
+    if let Some(ref key) = idempotency_key {
+        if let Some(cached) =
+            check_idempotency(&store, key, "fork_checkpoint", &request_hash, &request_id)
+        {
+            return cached;
+        }
+    }
+
+    let body: ForkCheckpointRequest = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => {
+            return json_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &format!("invalid JSON body: {e}"),
+                &request_id,
+            );
+        }
     };
 
     let parent = match store.load_checkpoint(&checkpoint_id) {
@@ -1465,30 +1869,438 @@ async fn fork_checkpoint(
         return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
     }
 
+    let response = CheckpointResponse {
+        request_id,
+        checkpoint: checkpoint_to_payload(&forked),
+    };
+    if let Some(ref key) = idempotency_key {
+        if let Ok(json) = serde_json::to_string(&response) {
+            save_idempotency(
+                &store,
+                key,
+                "fork_checkpoint",
+                &request_hash,
+                StatusCode::CREATED.as_u16(),
+                &json,
+            );
+        }
+    }
+    (StatusCode::CREATED, Json(response)).into_response()
+}
+
+// ── Container handlers ──
+
+async fn create_container(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let idempotency_key = extract_idempotency_key(&headers);
+    let request_hash = compute_request_hash(&raw_body);
+
+    if let Some(ref key) = idempotency_key {
+        if let Some(cached) =
+            check_idempotency(&store, key, "create_container", &request_hash, &request_id)
+        {
+            return cached;
+        }
+    }
+
+    let body: CreateContainerRequest = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => {
+            return json_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &format!("invalid JSON body: {e}"),
+                &request_id,
+            );
+        }
+    };
+
+    let now = now_epoch_secs();
+    let container = Container {
+        container_id: format!("ctr-{}", Uuid::new_v4()),
+        sandbox_id: body.sandbox_id,
+        image_digest: body.image_digest,
+        container_spec: ContainerSpec {
+            cmd: body.cmd.unwrap_or_default(),
+            env: body.env.unwrap_or_default(),
+            cwd: body.cwd,
+            user: body.user,
+            ..ContainerSpec::default()
+        },
+        state: ContainerState::Created,
+        created_at: now,
+        started_at: None,
+        ended_at: None,
+    };
+
+    if let Err(e) = store.save_container(&container) {
+        return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
+    }
+
+    let response = ContainerResponse {
+        request_id,
+        container: container_to_payload(&container),
+    };
+    if let Some(ref key) = idempotency_key {
+        if let Ok(json) = serde_json::to_string(&response) {
+            save_idempotency(
+                &store,
+                key,
+                "create_container",
+                &request_hash,
+                StatusCode::CREATED.as_u16(),
+                &json,
+            );
+        }
+    }
+    (StatusCode::CREATED, Json(response)).into_response()
+}
+
+async fn list_containers(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let containers = match store.list_containers() {
+        Ok(list) => list,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
     (
-        StatusCode::CREATED,
-        Json(CheckpointResponse {
+        StatusCode::OK,
+        Json(ContainerListResponse {
             request_id,
-            checkpoint: checkpoint_to_payload(&forked),
+            containers: containers.iter().map(container_to_payload).collect(),
         }),
     )
         .into_response()
 }
 
-async fn unsupported_images(headers: HeaderMap) -> Response {
-    unsupported_operation_response("images", request_id_from_headers(&headers))
+async fn get_container(
+    State(state): State<ApiState>,
+    Path(container_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    match store.load_container(&container_id) {
+        Ok(Some(container)) => (
+            StatusCode::OK,
+            Json(ContainerResponse {
+                request_id,
+                container: container_to_payload(&container),
+            }),
+        )
+            .into_response(),
+        Ok(None) => json_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("container {container_id} not found"),
+            &request_id,
+        ),
+        Err(e) => stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    }
 }
 
-async fn unsupported_builds(headers: HeaderMap) -> Response {
-    unsupported_operation_response("builds", request_id_from_headers(&headers))
+async fn remove_container(
+    State(state): State<ApiState>,
+    Path(container_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let mut container = match store.load_container(&container_id) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return json_error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("container {container_id} not found"),
+                &request_id,
+            );
+        }
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    if container.state == ContainerState::Removed {
+        return (
+            StatusCode::OK,
+            Json(ContainerResponse {
+                request_id,
+                container: container_to_payload(&container),
+            }),
+        )
+            .into_response();
+    }
+
+    // Transition to Removed, going through intermediary states if needed.
+    let _ = container.transition_to(ContainerState::Removed);
+
+    if let Err(e) = store.save_container(&container) {
+        return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
+    }
+
+    (
+        StatusCode::OK,
+        Json(ContainerResponse {
+            request_id,
+            container: container_to_payload(&container),
+        }),
+    )
+        .into_response()
 }
 
-async fn unsupported_containers(headers: HeaderMap) -> Response {
-    unsupported_operation_response("containers", request_id_from_headers(&headers))
+// ── Image handlers ──
+
+async fn list_images(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let images = match store.list_images() {
+        Ok(list) => list,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    (
+        StatusCode::OK,
+        Json(ImageListResponse {
+            request_id,
+            images: images.iter().map(image_to_payload).collect(),
+        }),
+    )
+        .into_response()
 }
 
-async fn unsupported_receipts(headers: HeaderMap) -> Response {
-    unsupported_operation_response("receipts", request_id_from_headers(&headers))
+async fn get_image(
+    State(state): State<ApiState>,
+    Path(image_ref): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    // axum's Path extractor already percent-decodes the parameter.
+    match store.load_image(&image_ref) {
+        Ok(Some(image)) => (
+            StatusCode::OK,
+            Json(ImageResponse {
+                request_id,
+                image: image_to_payload(&image),
+            }),
+        )
+            .into_response(),
+        Ok(None) => json_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("image {image_ref} not found"),
+            &request_id,
+        ),
+        Err(e) => stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    }
+}
+
+// ── Build handlers ──
+
+async fn start_build(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<StartBuildRequest>,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let now = now_epoch_secs();
+    let build = Build {
+        build_id: format!("bld-{}", Uuid::new_v4()),
+        sandbox_id: body.sandbox_id,
+        build_spec: BuildSpec {
+            context: body.context,
+            dockerfile: body.dockerfile,
+            args: body.args.unwrap_or_default(),
+        },
+        state: BuildState::Queued,
+        result_digest: None,
+        started_at: now,
+        ended_at: None,
+    };
+
+    if let Err(e) = store.save_build(&build) {
+        return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(BuildResponse {
+            request_id,
+            build: build_to_payload(&build),
+        }),
+    )
+        .into_response()
+}
+
+async fn list_builds(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let builds = match store.list_builds() {
+        Ok(list) => list,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    (
+        StatusCode::OK,
+        Json(BuildListResponse {
+            request_id,
+            builds: builds.iter().map(build_to_payload).collect(),
+        }),
+    )
+        .into_response()
+}
+
+async fn get_build(
+    State(state): State<ApiState>,
+    Path(build_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    match store.load_build(&build_id) {
+        Ok(Some(build)) => (
+            StatusCode::OK,
+            Json(BuildResponse {
+                request_id,
+                build: build_to_payload(&build),
+            }),
+        )
+            .into_response(),
+        Ok(None) => json_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("build {build_id} not found"),
+            &request_id,
+        ),
+        Err(e) => stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    }
+}
+
+async fn cancel_build(
+    State(state): State<ApiState>,
+    Path(build_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    let mut build = match store.load_build(&build_id) {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            return json_error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("build {build_id} not found"),
+                &request_id,
+            );
+        }
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    if build.state.is_terminal() {
+        return (
+            StatusCode::OK,
+            Json(BuildResponse {
+                request_id,
+                build: build_to_payload(&build),
+            }),
+        )
+            .into_response();
+    }
+
+    let now = now_epoch_secs();
+    build.ended_at = Some(now);
+    let _ = build.transition_to(BuildState::Canceled);
+
+    if let Err(e) = store.save_build(&build) {
+        return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id);
+    }
+
+    (
+        StatusCode::OK,
+        Json(BuildResponse {
+            request_id,
+            build: build_to_payload(&build),
+        }),
+    )
+        .into_response()
+}
+
+// ── Receipt handler ──
+
+async fn get_receipt(
+    State(state): State<ApiState>,
+    Path(receipt_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let store = match StateStore::open(&state.state_store_path) {
+        Ok(s) => s,
+        Err(e) => return stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    };
+
+    match store.load_receipt(&receipt_id) {
+        Ok(Some(receipt)) => (
+            StatusCode::OK,
+            Json(ReceiptResponse {
+                request_id,
+                receipt: receipt_to_payload(&receipt),
+            }),
+        )
+            .into_response(),
+        Ok(None) => json_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("receipt {receipt_id} not found"),
+            &request_id,
+        ),
+        Err(e) => stack_error_response(StatusCode::INTERNAL_SERVER_ERROR, e, request_id),
+    }
 }
 
 /// Build the Runtime V2 API router.
@@ -1529,10 +2341,19 @@ pub fn router(config: ApiConfig) -> Router {
             "/v1/checkpoints/{checkpoint_id}/fork",
             post(fork_checkpoint),
         )
-        .route("/v1/images", any(unsupported_images))
-        .route("/v1/builds", any(unsupported_builds))
-        .route("/v1/containers", any(unsupported_containers))
-        .route("/v1/receipts", any(unsupported_receipts))
+        .route(
+            "/v1/containers",
+            get(list_containers).post(create_container),
+        )
+        .route(
+            "/v1/containers/{container_id}",
+            get(get_container).delete(remove_container),
+        )
+        .route("/v1/images", get(list_images))
+        .route("/v1/images/{image_ref}", get(get_image))
+        .route("/v1/builds", get(list_builds).post(start_build))
+        .route("/v1/builds/{build_id}", get(get_build).delete(cancel_build))
+        .route("/v1/receipts/{receipt_id}", get(get_receipt))
         .with_state(state)
 }
 
@@ -1541,23 +2362,1319 @@ pub fn openapi_document() -> serde_json::Value {
     json!({
         "openapi": "3.1.0",
         "info": {
-            "title": "vz Runtime API",
-            "version": "v1",
-            "description": "Runtime V2 OpenAPI surface with SSE/WebSocket event adapters."
+            "title": "vz Runtime V2 API",
+            "version": "2.0.0-alpha",
+            "description": "Container runtime API with sandbox lifecycle, lease management, execution dispatch, checkpoint/restore, and real-time event streaming via SSE and WebSocket."
         },
         "paths": {
-            "/v1/sandboxes": {},
-            "/v1/leases": {},
-            "/v1/images": {},
-            "/v1/builds": {},
-            "/v1/containers": {},
-            "/v1/executions": {},
-            "/v1/checkpoints": {},
-            "/v1/events/{stack_name}": {},
-            "/v1/events/{stack_name}/stream": {},
-            "/v1/events/{stack_name}/ws": {},
-            "/v1/receipts": {},
-            "/v1/capabilities": {}
+            "/openapi.json": {
+                "get": {
+                    "operationId": "getOpenApiDocument",
+                    "summary": "Return this OpenAPI 3.1 schema document",
+                    "responses": {
+                        "200": {
+                            "description": "OpenAPI 3.1 JSON document",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/capabilities": {
+                "get": {
+                    "operationId": "getCapabilities",
+                    "summary": "List runtime capabilities advertised by this API surface",
+                    "responses": {
+                        "200": {
+                            "description": "Capabilities list",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/CapabilitiesResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/events/{stack_name}": {
+                "get": {
+                    "operationId": "listEvents",
+                    "summary": "Paginated event log for a stack",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/StackName" },
+                        {
+                            "name": "after",
+                            "in": "query",
+                            "description": "Return events with id strictly greater than this cursor",
+                            "required": false,
+                            "schema": { "type": "integer", "format": "int64", "default": 0 }
+                        },
+                        {
+                            "name": "limit",
+                            "in": "query",
+                            "description": "Maximum number of events to return (1..1000)",
+                            "required": false,
+                            "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Paginated event list",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/EventsResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/events/{stack_name}/stream": {
+                "get": {
+                    "operationId": "streamEventsSse",
+                    "summary": "Server-Sent Events stream of stack events",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/StackName" },
+                        {
+                            "name": "after",
+                            "in": "query",
+                            "required": false,
+                            "schema": { "type": "integer", "format": "int64", "default": 0 }
+                        },
+                        {
+                            "name": "limit",
+                            "in": "query",
+                            "required": false,
+                            "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "SSE event stream",
+                            "content": {
+                                "text/event-stream": {
+                                    "schema": { "type": "string" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/events/{stack_name}/ws": {
+                "get": {
+                    "operationId": "streamEventsWs",
+                    "summary": "WebSocket stream of stack events",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/StackName" },
+                        {
+                            "name": "after",
+                            "in": "query",
+                            "required": false,
+                            "schema": { "type": "integer", "format": "int64", "default": 0 }
+                        },
+                        {
+                            "name": "limit",
+                            "in": "query",
+                            "required": false,
+                            "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 }
+                        }
+                    ],
+                    "responses": {
+                        "101": {
+                            "description": "WebSocket upgrade"
+                        }
+                    }
+                }
+            },
+            "/v1/sandboxes": {
+                "post": {
+                    "operationId": "createSandbox",
+                    "summary": "Create a new sandbox",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/IdempotencyKey" },
+                        { "$ref": "#/components/parameters/RequestId" }
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/CreateSandboxRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Sandbox created",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/SandboxResponse" }
+                                }
+                            }
+                        },
+                        "400": {
+                            "description": "Invalid request body",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "409": {
+                            "description": "Idempotency conflict",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                },
+                "get": {
+                    "operationId": "listSandboxes",
+                    "summary": "List all sandboxes",
+                    "responses": {
+                        "200": {
+                            "description": "Sandbox list",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/SandboxListResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/sandboxes/{sandbox_id}": {
+                "get": {
+                    "operationId": "getSandbox",
+                    "summary": "Get a sandbox by ID",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/SandboxId" }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Sandbox details",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/SandboxResponse" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Sandbox not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                },
+                "delete": {
+                    "operationId": "terminateSandbox",
+                    "summary": "Terminate a sandbox",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/SandboxId" },
+                        { "$ref": "#/components/parameters/IdempotencyKey" }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Sandbox terminated",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/SandboxResponse" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Sandbox not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "409": {
+                            "description": "Idempotency conflict",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/leases": {
+                "post": {
+                    "operationId": "openLease",
+                    "summary": "Open a new lease on a sandbox",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/IdempotencyKey" },
+                        { "$ref": "#/components/parameters/RequestId" }
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/OpenLeaseRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Lease opened",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/LeaseResponse" }
+                                }
+                            }
+                        },
+                        "422": {
+                            "description": "State transition failed",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                },
+                "get": {
+                    "operationId": "listLeases",
+                    "summary": "List all leases",
+                    "responses": {
+                        "200": {
+                            "description": "Lease list",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/LeaseListResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/leases/{lease_id}": {
+                "get": {
+                    "operationId": "getLease",
+                    "summary": "Get a lease by ID",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/LeaseId" }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Lease details",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/LeaseResponse" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Lease not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                },
+                "delete": {
+                    "operationId": "closeLease",
+                    "summary": "Close a lease",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/LeaseId" },
+                        { "$ref": "#/components/parameters/IdempotencyKey" }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Lease closed",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/LeaseResponse" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Lease not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "422": {
+                            "description": "State transition failed",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/leases/{lease_id}/heartbeat": {
+                "post": {
+                    "operationId": "heartbeatLease",
+                    "summary": "Send a heartbeat to keep a lease active",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/LeaseId" },
+                        { "$ref": "#/components/parameters/IdempotencyKey" }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Heartbeat acknowledged",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/LeaseResponse" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Lease not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "422": {
+                            "description": "Lease is not active",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/executions": {
+                "post": {
+                    "operationId": "createExecution",
+                    "summary": "Create a new execution in a container",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/IdempotencyKey" },
+                        { "$ref": "#/components/parameters/RequestId" }
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/CreateExecutionRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Execution created",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ExecutionResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                },
+                "get": {
+                    "operationId": "listExecutions",
+                    "summary": "List all executions",
+                    "responses": {
+                        "200": {
+                            "description": "Execution list",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ExecutionListResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/executions/{execution_id}": {
+                "get": {
+                    "operationId": "getExecution",
+                    "summary": "Get an execution by ID",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/ExecutionId" }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Execution details",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ExecutionResponse" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Execution not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                },
+                "delete": {
+                    "operationId": "cancelExecution",
+                    "summary": "Cancel a running execution",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/ExecutionId" },
+                        { "$ref": "#/components/parameters/IdempotencyKey" }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Execution canceled",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ExecutionResponse" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Execution not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/checkpoints": {
+                "post": {
+                    "operationId": "createCheckpoint",
+                    "summary": "Create a checkpoint of a sandbox",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/IdempotencyKey" },
+                        { "$ref": "#/components/parameters/RequestId" }
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/CreateCheckpointRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Checkpoint created",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/CheckpointResponse" }
+                                }
+                            }
+                        },
+                        "400": {
+                            "description": "Invalid checkpoint class",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                },
+                "get": {
+                    "operationId": "listCheckpoints",
+                    "summary": "List all checkpoints",
+                    "responses": {
+                        "200": {
+                            "description": "Checkpoint list",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/CheckpointListResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/checkpoints/{checkpoint_id}": {
+                "get": {
+                    "operationId": "getCheckpoint",
+                    "summary": "Get a checkpoint by ID",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/CheckpointId" }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Checkpoint details",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/CheckpointResponse" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Checkpoint not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/checkpoints/{checkpoint_id}/restore": {
+                "post": {
+                    "operationId": "restoreCheckpoint",
+                    "summary": "Restore a sandbox from a checkpoint",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/CheckpointId" },
+                        { "$ref": "#/components/parameters/IdempotencyKey" }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Checkpoint restore initiated",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/CheckpointResponse" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Checkpoint not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "409": {
+                            "description": "Checkpoint not in ready state",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/checkpoints/{checkpoint_id}/fork": {
+                "post": {
+                    "operationId": "forkCheckpoint",
+                    "summary": "Fork a checkpoint into a new sandbox",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/CheckpointId" },
+                        { "$ref": "#/components/parameters/IdempotencyKey" }
+                    ],
+                    "requestBody": {
+                        "required": false,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/ForkCheckpointRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Forked checkpoint created",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/CheckpointResponse" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Parent checkpoint not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "409": {
+                            "description": "Parent checkpoint not in ready state",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/images": {
+                "get": {
+                    "operationId": "listImages",
+                    "summary": "List all cached images",
+                    "responses": {
+                        "200": {
+                            "description": "List of images",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/images/{image_ref}": {
+                "get": {
+                    "operationId": "getImage",
+                    "summary": "Get image details by reference",
+                    "parameters": [
+                        { "name": "image_ref", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Image details",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Image not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/builds": {
+                "get": {
+                    "operationId": "listBuilds",
+                    "summary": "List all builds",
+                    "responses": {
+                        "200": {
+                            "description": "List of builds",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object" }
+                                }
+                            }
+                        }
+                    }
+                },
+                "post": {
+                    "operationId": "startBuild",
+                    "summary": "Start a new build",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "type": "object" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Build started",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/builds/{build_id}": {
+                "get": {
+                    "operationId": "getBuild",
+                    "summary": "Get build details",
+                    "parameters": [
+                        { "name": "build_id", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Build details",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Build not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/containers": {
+                "get": {
+                    "operationId": "listContainers",
+                    "summary": "List all containers",
+                    "responses": {
+                        "200": {
+                            "description": "List of containers",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object" }
+                                }
+                            }
+                        }
+                    }
+                },
+                "post": {
+                    "operationId": "createContainer",
+                    "summary": "Create a new container",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "type": "object" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Container created",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/containers/{container_id}": {
+                "get": {
+                    "operationId": "getContainer",
+                    "summary": "Get container details",
+                    "parameters": [
+                        { "name": "container_id", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Container details",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Container not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                },
+                "delete": {
+                    "operationId": "removeContainer",
+                    "summary": "Remove a container",
+                    "parameters": [
+                        { "name": "container_id", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "204": {
+                            "description": "Container removed"
+                        },
+                        "404": {
+                            "description": "Container not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/receipts/{receipt_id}": {
+                "get": {
+                    "operationId": "getReceipt",
+                    "summary": "Get receipt details",
+                    "parameters": [
+                        { "name": "receipt_id", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Receipt details",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Receipt not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "components": {
+            "parameters": {
+                "StackName": {
+                    "name": "stack_name",
+                    "in": "path",
+                    "required": true,
+                    "description": "Stack identifier for event filtering",
+                    "schema": { "type": "string" }
+                },
+                "SandboxId": {
+                    "name": "sandbox_id",
+                    "in": "path",
+                    "required": true,
+                    "description": "Unique sandbox identifier (sbx-...)",
+                    "schema": { "type": "string" }
+                },
+                "LeaseId": {
+                    "name": "lease_id",
+                    "in": "path",
+                    "required": true,
+                    "description": "Unique lease identifier (ls-...)",
+                    "schema": { "type": "string" }
+                },
+                "ExecutionId": {
+                    "name": "execution_id",
+                    "in": "path",
+                    "required": true,
+                    "description": "Unique execution identifier (exec-...)",
+                    "schema": { "type": "string" }
+                },
+                "CheckpointId": {
+                    "name": "checkpoint_id",
+                    "in": "path",
+                    "required": true,
+                    "description": "Unique checkpoint identifier (ckpt-...)",
+                    "schema": { "type": "string" }
+                },
+                "IdempotencyKey": {
+                    "name": "Idempotency-Key",
+                    "in": "header",
+                    "required": false,
+                    "description": "Client-supplied idempotency key. Repeated requests with the same key and body return the cached response. Same key with a different body returns 409 Conflict.",
+                    "schema": { "type": "string" }
+                },
+                "RequestId": {
+                    "name": "X-Request-Id",
+                    "in": "header",
+                    "required": false,
+                    "description": "Client-supplied request identifier echoed back in every response. Auto-generated when absent.",
+                    "schema": { "type": "string" }
+                }
+            },
+            "schemas": {
+                "ErrorResponse": {
+                    "type": "object",
+                    "required": ["error"],
+                    "properties": {
+                        "error": {
+                            "type": "object",
+                            "required": ["code", "message"],
+                            "properties": {
+                                "code": { "type": "string", "description": "Machine-readable error code" },
+                                "message": { "type": "string", "description": "Human-readable error description" },
+                                "request_id": { "type": "string", "description": "Request identifier for tracing" }
+                            }
+                        }
+                    }
+                },
+                "CapabilitiesResponse": {
+                    "type": "object",
+                    "required": ["request_id", "capabilities"],
+                    "properties": {
+                        "request_id": { "type": "string" },
+                        "capabilities": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "List of capability identifiers supported by this runtime"
+                        }
+                    }
+                },
+                "EventRecord": {
+                    "type": "object",
+                    "required": ["id", "stack_name", "created_at", "event"],
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64", "description": "Monotonic cursor value" },
+                        "stack_name": { "type": "string" },
+                        "created_at": { "type": "string", "description": "SQLite event timestamp" },
+                        "event": { "type": "object", "description": "Serialized stack event payload" }
+                    }
+                },
+                "EventsResponse": {
+                    "type": "object",
+                    "required": ["request_id", "events", "next_cursor"],
+                    "properties": {
+                        "request_id": { "type": "string" },
+                        "events": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/EventRecord" }
+                        },
+                        "next_cursor": { "type": "integer", "format": "int64", "description": "Cursor for the next page; use as ?after= value" }
+                    }
+                },
+                "SandboxPayload": {
+                    "type": "object",
+                    "required": ["sandbox_id", "backend", "state", "created_at", "updated_at", "labels"],
+                    "properties": {
+                        "sandbox_id": { "type": "string", "description": "Unique sandbox identifier (sbx-...)" },
+                        "backend": { "type": "string", "enum": ["macos_vz", "linux_native"], "description": "Runtime backend" },
+                        "state": { "type": "string", "enum": ["creating", "ready", "draining", "terminated", "failed"], "description": "Current lifecycle state" },
+                        "cpus": { "type": "integer", "nullable": true, "description": "Allocated vCPU count" },
+                        "memory_mb": { "type": "integer", "nullable": true, "description": "Allocated memory in MiB" },
+                        "created_at": { "type": "integer", "format": "uint64", "description": "Unix epoch seconds" },
+                        "updated_at": { "type": "integer", "format": "uint64", "description": "Unix epoch seconds" },
+                        "labels": {
+                            "type": "object",
+                            "additionalProperties": { "type": "string" },
+                            "description": "Arbitrary key-value labels"
+                        }
+                    }
+                },
+                "CreateSandboxRequest": {
+                    "type": "object",
+                    "properties": {
+                        "stack_name": { "type": "string", "nullable": true, "description": "Optional stack to associate" },
+                        "cpus": { "type": "integer", "nullable": true, "description": "vCPU count" },
+                        "memory_mb": { "type": "integer", "nullable": true, "description": "Memory in MiB" },
+                        "labels": {
+                            "type": "object",
+                            "additionalProperties": { "type": "string" },
+                            "default": {}
+                        }
+                    }
+                },
+                "SandboxResponse": {
+                    "type": "object",
+                    "required": ["request_id", "sandbox"],
+                    "properties": {
+                        "request_id": { "type": "string" },
+                        "sandbox": { "$ref": "#/components/schemas/SandboxPayload" }
+                    }
+                },
+                "SandboxListResponse": {
+                    "type": "object",
+                    "required": ["request_id", "sandboxes"],
+                    "properties": {
+                        "request_id": { "type": "string" },
+                        "sandboxes": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/SandboxPayload" }
+                        }
+                    }
+                },
+                "LeasePayload": {
+                    "type": "object",
+                    "required": ["lease_id", "sandbox_id", "ttl_secs", "last_heartbeat_at", "state"],
+                    "properties": {
+                        "lease_id": { "type": "string", "description": "Unique lease identifier (ls-...)" },
+                        "sandbox_id": { "type": "string", "description": "Sandbox this lease belongs to" },
+                        "ttl_secs": { "type": "integer", "format": "uint64", "description": "Time-to-live in seconds" },
+                        "last_heartbeat_at": { "type": "integer", "format": "uint64", "description": "Unix epoch seconds of last heartbeat" },
+                        "state": { "type": "string", "enum": ["opening", "active", "closed", "expired"], "description": "Current lease state" }
+                    }
+                },
+                "OpenLeaseRequest": {
+                    "type": "object",
+                    "required": ["sandbox_id"],
+                    "properties": {
+                        "sandbox_id": { "type": "string", "description": "Sandbox to lease" },
+                        "ttl_secs": { "type": "integer", "nullable": true, "description": "Lease TTL in seconds (default 300)" }
+                    }
+                },
+                "LeaseResponse": {
+                    "type": "object",
+                    "required": ["request_id", "lease"],
+                    "properties": {
+                        "request_id": { "type": "string" },
+                        "lease": { "$ref": "#/components/schemas/LeasePayload" }
+                    }
+                },
+                "LeaseListResponse": {
+                    "type": "object",
+                    "required": ["request_id", "leases"],
+                    "properties": {
+                        "request_id": { "type": "string" },
+                        "leases": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/LeasePayload" }
+                        }
+                    }
+                },
+                "ExecutionPayload": {
+                    "type": "object",
+                    "required": ["execution_id", "container_id", "state"],
+                    "properties": {
+                        "execution_id": { "type": "string", "description": "Unique execution identifier (exec-...)" },
+                        "container_id": { "type": "string", "description": "Container that owns this execution" },
+                        "state": { "type": "string", "enum": ["queued", "running", "completed", "failed", "canceled"], "description": "Current execution state" },
+                        "exit_code": { "type": "integer", "nullable": true, "description": "Process exit code (set on completion)" },
+                        "started_at": { "type": "integer", "format": "uint64", "nullable": true, "description": "Unix epoch seconds" },
+                        "ended_at": { "type": "integer", "format": "uint64", "nullable": true, "description": "Unix epoch seconds" }
+                    }
+                },
+                "CreateExecutionRequest": {
+                    "type": "object",
+                    "required": ["container_id", "cmd"],
+                    "properties": {
+                        "container_id": { "type": "string", "description": "Target container" },
+                        "cmd": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Command to execute"
+                        },
+                        "args": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "nullable": true,
+                            "description": "Additional arguments"
+                        },
+                        "env_override": {
+                            "type": "object",
+                            "additionalProperties": { "type": "string" },
+                            "nullable": true,
+                            "description": "Environment variable overrides"
+                        },
+                        "pty": { "type": "boolean", "nullable": true, "description": "Allocate a pseudo-TTY" },
+                        "timeout_secs": { "type": "integer", "nullable": true, "description": "Execution timeout in seconds" }
+                    }
+                },
+                "ExecutionResponse": {
+                    "type": "object",
+                    "required": ["request_id", "execution"],
+                    "properties": {
+                        "request_id": { "type": "string" },
+                        "execution": { "$ref": "#/components/schemas/ExecutionPayload" }
+                    }
+                },
+                "ExecutionListResponse": {
+                    "type": "object",
+                    "required": ["request_id", "executions"],
+                    "properties": {
+                        "request_id": { "type": "string" },
+                        "executions": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/ExecutionPayload" }
+                        }
+                    }
+                },
+                "CheckpointPayload": {
+                    "type": "object",
+                    "required": ["checkpoint_id", "sandbox_id", "class", "state", "compatibility_fingerprint", "created_at"],
+                    "properties": {
+                        "checkpoint_id": { "type": "string", "description": "Unique checkpoint identifier (ckpt-...)" },
+                        "sandbox_id": { "type": "string", "description": "Sandbox this checkpoint belongs to" },
+                        "parent_checkpoint_id": { "type": "string", "nullable": true, "description": "Parent checkpoint if forked" },
+                        "class": { "type": "string", "enum": ["fs_quick", "vm_full"], "description": "Checkpoint class" },
+                        "state": { "type": "string", "enum": ["creating", "ready", "restoring", "deleted"], "description": "Current checkpoint state" },
+                        "compatibility_fingerprint": { "type": "string", "description": "Opaque fingerprint for restore compatibility checks" },
+                        "created_at": { "type": "integer", "format": "uint64", "description": "Unix epoch seconds" }
+                    }
+                },
+                "CreateCheckpointRequest": {
+                    "type": "object",
+                    "required": ["sandbox_id"],
+                    "properties": {
+                        "sandbox_id": { "type": "string", "description": "Sandbox to checkpoint" },
+                        "class": { "type": "string", "enum": ["fs_quick", "vm_full"], "nullable": true, "description": "Checkpoint class (default fs_quick)" },
+                        "compatibility_fingerprint": { "type": "string", "nullable": true, "description": "Opaque fingerprint for restore compatibility" }
+                    }
+                },
+                "ForkCheckpointRequest": {
+                    "type": "object",
+                    "properties": {
+                        "new_sandbox_id": { "type": "string", "nullable": true, "description": "Sandbox ID for the fork target (auto-generated if omitted)" }
+                    }
+                },
+                "CheckpointResponse": {
+                    "type": "object",
+                    "required": ["request_id", "checkpoint"],
+                    "properties": {
+                        "request_id": { "type": "string" },
+                        "checkpoint": { "$ref": "#/components/schemas/CheckpointPayload" }
+                    }
+                },
+                "CheckpointListResponse": {
+                    "type": "object",
+                    "required": ["request_id", "checkpoints"],
+                    "properties": {
+                        "request_id": { "type": "string" },
+                        "checkpoints": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/CheckpointPayload" }
+                        }
+                    }
+                }
+            }
         }
     })
 }
@@ -1590,6 +3707,10 @@ mod tests {
     fn sample_openapi_path(path: &str) -> String {
         match path {
             "/v1/events/{stack_name}" => "/v1/events/runtime-conformance-stack".to_string(),
+            "/v1/containers/{container_id}" => "/v1/containers/ctr-nonexistent".to_string(),
+            "/v1/images/{image_ref}" => "/v1/images/nginx:latest".to_string(),
+            "/v1/receipts/{receipt_id}" => "/v1/receipts/rcp-nonexistent".to_string(),
+            "/v1/builds/{build_id}" => "/v1/builds/bld-nonexistent".to_string(),
             _ => path.to_string(),
         }
     }
@@ -1599,16 +3720,23 @@ mod tests {
         let document = openapi_document();
         let paths = document["paths"].as_object().unwrap();
         assert!(paths.contains_key("/v1/sandboxes"));
+        assert!(paths.contains_key("/v1/sandboxes/{sandbox_id}"));
         assert!(paths.contains_key("/v1/leases"));
+        assert!(paths.contains_key("/v1/leases/{lease_id}"));
         assert!(paths.contains_key("/v1/images"));
+        assert!(paths.contains_key("/v1/images/{image_ref}"));
         assert!(paths.contains_key("/v1/builds"));
+        assert!(paths.contains_key("/v1/builds/{build_id}"));
         assert!(paths.contains_key("/v1/containers"));
+        assert!(paths.contains_key("/v1/containers/{container_id}"));
         assert!(paths.contains_key("/v1/executions"));
+        assert!(paths.contains_key("/v1/executions/{execution_id}"));
         assert!(paths.contains_key("/v1/checkpoints"));
+        assert!(paths.contains_key("/v1/checkpoints/{checkpoint_id}"));
         assert!(paths.contains_key("/v1/events/{stack_name}"));
         assert!(paths.contains_key("/v1/events/{stack_name}/stream"));
         assert!(paths.contains_key("/v1/events/{stack_name}/ws"));
-        assert!(paths.contains_key("/v1/receipts"));
+        assert!(paths.contains_key("/v1/receipts/{receipt_id}"));
         assert!(paths.contains_key("/v1/capabilities"));
     }
 
@@ -1704,7 +3832,8 @@ mod tests {
         let state_path = temp_dir.path().join("state.db");
         StateStore::open(&state_path).unwrap();
 
-        let app = router(test_config(state_path));
+        // Containers are now implemented, so GET /v1/containers returns 200.
+        let app = router(test_config(state_path.clone()));
         let response = app
             .oneshot(
                 Request::builder()
@@ -1714,14 +3843,20 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::OK);
 
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let envelope: MachineErrorEnvelope = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            envelope.error.code,
-            vz_runtime_contract::MachineErrorCode::UnsupportedOperation
-        );
+        // GET for a non-existent container returns 404 with proper error envelope.
+        let app = router(test_config(state_path));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/containers/nonexistent-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1855,6 +3990,22 @@ mod tests {
                         | "/v1/leases"
                         | "/v1/executions"
                         | "/v1/checkpoints"
+                        | "/v1/containers"
+                        | "/v1/images"
+                        | "/v1/builds"
+                )
+            {
+                continue;
+            }
+
+            // 404 is valid for parameterized GET endpoints where no entity exists.
+            if status == StatusCode::NOT_FOUND
+                && matches!(
+                    surface.path,
+                    "/v1/receipts/{receipt_id}"
+                        | "/v1/containers/{container_id}"
+                        | "/v1/images/{image_ref}"
+                        | "/v1/builds/{build_id}"
                 )
             {
                 continue;

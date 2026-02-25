@@ -203,6 +203,42 @@ pub enum StackEvent {
     /// A lease failed.
     #[serde(rename = "lease_failed")]
     LeaseFailed { lease_id: String, error: String },
+    /// A build was queued for a sandbox.
+    #[serde(rename = "build_queued")]
+    BuildQueued {
+        /// Owning sandbox identifier.
+        sandbox_id: String,
+        /// Build identifier.
+        build_id: String,
+    },
+    /// A build started running.
+    #[serde(rename = "build_running")]
+    BuildRunning {
+        /// Build identifier.
+        build_id: String,
+    },
+    /// A build completed successfully.
+    #[serde(rename = "build_succeeded")]
+    BuildSucceeded {
+        /// Build identifier.
+        build_id: String,
+        /// Resulting image digest.
+        result_digest: String,
+    },
+    /// A build failed.
+    #[serde(rename = "build_failed")]
+    BuildFailed {
+        /// Build identifier.
+        build_id: String,
+        /// Error description.
+        error: String,
+    },
+    /// A build was canceled.
+    #[serde(rename = "build_canceled")]
+    BuildCanceled {
+        /// Build identifier.
+        build_id: String,
+    },
     /// An execution was queued for a container.
     #[serde(rename = "execution_queued")]
     ExecutionQueued {
@@ -280,6 +316,66 @@ pub enum StackEvent {
         new_checkpoint_id: String,
         /// New sandbox identifier.
         new_sandbox_id: String,
+    },
+    /// A container was created inside a sandbox.
+    #[serde(rename = "container_created")]
+    ContainerCreated {
+        /// Owning sandbox identifier.
+        sandbox_id: String,
+        /// Container identifier.
+        container_id: String,
+    },
+    /// A container is transitioning to running.
+    #[serde(rename = "container_starting")]
+    ContainerStarting {
+        /// Container identifier.
+        container_id: String,
+    },
+    /// A container is actively running.
+    #[serde(rename = "container_running")]
+    ContainerRunning {
+        /// Container identifier.
+        container_id: String,
+    },
+    /// A container is being gracefully stopped.
+    #[serde(rename = "container_stopping")]
+    ContainerStopping {
+        /// Container identifier.
+        container_id: String,
+    },
+    /// A container exited with a status code.
+    #[serde(rename = "container_exited")]
+    ContainerExited {
+        /// Container identifier.
+        container_id: String,
+        /// Process exit code.
+        exit_code: i32,
+    },
+    /// A container failed before clean exit.
+    #[serde(rename = "container_failed")]
+    ContainerFailed {
+        /// Container identifier.
+        container_id: String,
+        /// Error description.
+        error: String,
+    },
+    /// A container was removed and is no longer addressable.
+    #[serde(rename = "container_removed")]
+    ContainerRemoved {
+        /// Container identifier.
+        container_id: String,
+    },
+    /// A drift finding was detected during startup verification.
+    #[serde(rename = "drift_detected")]
+    DriftDetected {
+        /// Stack name.
+        stack_name: String,
+        /// Drift category (e.g. "desired_state", "observed_state").
+        category: String,
+        /// Human-readable description of the drift.
+        description: String,
+        /// Severity level ("info", "warning", "error").
+        severity: String,
     },
 }
 
@@ -512,6 +608,54 @@ mod tests {
                 new_checkpoint_id: "ckpt-3".to_string(),
                 new_sandbox_id: "sb-2".to_string(),
             },
+            StackEvent::BuildQueued {
+                sandbox_id: "sb-1".to_string(),
+                build_id: "bld-1".to_string(),
+            },
+            StackEvent::BuildRunning {
+                build_id: "bld-1".to_string(),
+            },
+            StackEvent::BuildSucceeded {
+                build_id: "bld-1".to_string(),
+                result_digest: "sha256:abc123".to_string(),
+            },
+            StackEvent::BuildFailed {
+                build_id: "bld-2".to_string(),
+                error: "dockerfile syntax error".to_string(),
+            },
+            StackEvent::BuildCanceled {
+                build_id: "bld-3".to_string(),
+            },
+            StackEvent::ContainerCreated {
+                sandbox_id: "sb-1".to_string(),
+                container_id: "ctr-1".to_string(),
+            },
+            StackEvent::ContainerStarting {
+                container_id: "ctr-1".to_string(),
+            },
+            StackEvent::ContainerRunning {
+                container_id: "ctr-1".to_string(),
+            },
+            StackEvent::ContainerStopping {
+                container_id: "ctr-1".to_string(),
+            },
+            StackEvent::ContainerExited {
+                container_id: "ctr-1".to_string(),
+                exit_code: 0,
+            },
+            StackEvent::ContainerFailed {
+                container_id: "ctr-2".to_string(),
+                error: "oom killed".to_string(),
+            },
+            StackEvent::ContainerRemoved {
+                container_id: "ctr-3".to_string(),
+            },
+            StackEvent::DriftDetected {
+                stack_name: "myapp".to_string(),
+                category: "desired_state".to_string(),
+                description: "desired state without observations".to_string(),
+                severity: "warning".to_string(),
+            },
         ]
     }
 
@@ -742,6 +886,93 @@ mod tests {
                     new_sandbox_id: "sb2".to_string(),
                 },
                 "checkpoint_forked",
+            ),
+            (
+                StackEvent::BuildQueued {
+                    sandbox_id: "sb".to_string(),
+                    build_id: "bld".to_string(),
+                },
+                "build_queued",
+            ),
+            (
+                StackEvent::BuildRunning {
+                    build_id: "bld".to_string(),
+                },
+                "build_running",
+            ),
+            (
+                StackEvent::BuildSucceeded {
+                    build_id: "bld".to_string(),
+                    result_digest: "sha256:abc".to_string(),
+                },
+                "build_succeeded",
+            ),
+            (
+                StackEvent::BuildFailed {
+                    build_id: "bld".to_string(),
+                    error: "e".to_string(),
+                },
+                "build_failed",
+            ),
+            (
+                StackEvent::BuildCanceled {
+                    build_id: "bld".to_string(),
+                },
+                "build_canceled",
+            ),
+            (
+                StackEvent::ContainerCreated {
+                    sandbox_id: "sb".to_string(),
+                    container_id: "ctr".to_string(),
+                },
+                "container_created",
+            ),
+            (
+                StackEvent::ContainerStarting {
+                    container_id: "ctr".to_string(),
+                },
+                "container_starting",
+            ),
+            (
+                StackEvent::ContainerRunning {
+                    container_id: "ctr".to_string(),
+                },
+                "container_running",
+            ),
+            (
+                StackEvent::ContainerStopping {
+                    container_id: "ctr".to_string(),
+                },
+                "container_stopping",
+            ),
+            (
+                StackEvent::ContainerExited {
+                    container_id: "ctr".to_string(),
+                    exit_code: 0,
+                },
+                "container_exited",
+            ),
+            (
+                StackEvent::ContainerFailed {
+                    container_id: "ctr".to_string(),
+                    error: "e".to_string(),
+                },
+                "container_failed",
+            ),
+            (
+                StackEvent::ContainerRemoved {
+                    container_id: "ctr".to_string(),
+                },
+                "container_removed",
+            ),
+            (
+                StackEvent::DriftDetected {
+                    stack_name: "t".to_string(),
+                    category: "desired_state".to_string(),
+                    description: "drift".to_string(),
+                    severity: "warning".to_string(),
+                },
+                "drift_detected",
             ),
         ];
 

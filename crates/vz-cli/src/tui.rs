@@ -379,6 +379,19 @@ fn event_color(event: &StackEvent) -> Color {
         StackEvent::CheckpointFailed { .. } => Color::Red,
         StackEvent::CheckpointRestored { .. } => Color::Blue,
         StackEvent::CheckpointForked { .. } => Color::Blue,
+        StackEvent::BuildQueued { .. } => Color::Cyan,
+        StackEvent::BuildRunning { .. } => Color::Blue,
+        StackEvent::BuildSucceeded { .. } => Color::Green,
+        StackEvent::BuildFailed { .. } => Color::Red,
+        StackEvent::BuildCanceled { .. } => Color::Yellow,
+        StackEvent::ContainerCreated { .. } => Color::Cyan,
+        StackEvent::ContainerStarting { .. } => Color::Cyan,
+        StackEvent::ContainerRunning { .. } => Color::Green,
+        StackEvent::ContainerStopping { .. } => Color::Yellow,
+        StackEvent::ContainerExited { .. } => Color::DarkGray,
+        StackEvent::ContainerFailed { .. } => Color::Red,
+        StackEvent::ContainerRemoved { .. } => Color::DarkGray,
+        StackEvent::DriftDetected { .. } => Color::Yellow,
     }
 }
 
@@ -517,6 +530,53 @@ fn format_event_summary(event: &StackEvent) -> String {
             new_checkpoint_id,
             ..
         } => format!("CkptForked       {parent_checkpoint_id} -> {new_checkpoint_id}"),
+        StackEvent::BuildQueued {
+            sandbox_id,
+            build_id,
+        } => format!("BuildQueued      {build_id} -> {sandbox_id}"),
+        StackEvent::BuildRunning { build_id } => {
+            format!("BuildRunning     {build_id}")
+        }
+        StackEvent::BuildSucceeded {
+            build_id,
+            result_digest,
+        } => format!("BuildSucceeded   {build_id} ({result_digest})"),
+        StackEvent::BuildFailed { build_id, error } => {
+            format!("BuildFailed      {build_id}: {error}")
+        }
+        StackEvent::BuildCanceled { build_id } => {
+            format!("BuildCanceled    {build_id}")
+        }
+        StackEvent::ContainerCreated {
+            container_id,
+            sandbox_id,
+        } => format!("CtrCreated       {container_id} in {sandbox_id}"),
+        StackEvent::ContainerStarting { container_id } => {
+            format!("CtrStarting      {container_id}")
+        }
+        StackEvent::ContainerRunning { container_id } => {
+            format!("CtrRunning       {container_id}")
+        }
+        StackEvent::ContainerStopping { container_id } => {
+            format!("CtrStopping      {container_id}")
+        }
+        StackEvent::ContainerExited {
+            container_id,
+            exit_code,
+        } => format!("CtrExited        {container_id} (code {exit_code})"),
+        StackEvent::ContainerFailed {
+            container_id,
+            error,
+        } => format!("CtrFailed        {container_id}: {error}"),
+        StackEvent::ContainerRemoved { container_id } => {
+            format!("CtrRemoved       {container_id}")
+        }
+        StackEvent::DriftDetected {
+            category,
+            description,
+            severity,
+            ..
+        } => format!("Drift [{severity}]  {category}: {description}"),
     }
 }
 
