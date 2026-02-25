@@ -836,17 +836,42 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 }
             }
 
-            if prepared.len() <= 1 {
-                // Single service — execute inline, no thread overhead.
-                for prep in prepared {
+            // Deduplicate image pulls: pull each unique image once serially
+            // before entering the parallel container creation phase. This avoids
+            // concurrent layer extraction races when multiple replicas share an image.
+            let mut pulled_images: HashSet<String> = HashSet::new();
+            let mut pull_failed: HashSet<String> = HashSet::new();
+            for prep in &prepared {
+                if pulled_images.contains(&prep.image) || pull_failed.contains(&prep.image) {
+                    continue;
+                }
+                info!(image = %prep.image, "pulling image (deduplicated)");
+                if let Err(e) = self.runtime.pull(&prep.image) {
+                    error!(image = %prep.image, error = %e, "image pull failed");
+                    pull_failed.insert(prep.image.clone());
+                } else {
+                    pulled_images.insert(prep.image.clone());
+                }
+            }
+
+            // Partition prepared creates: those whose image pull failed go straight
+            // to the error path; the rest proceed to parallel container creation.
+            let (ok_prepared, failed_prepared): (Vec<_>, Vec<_>) =
+                prepared.into_iter().partition(|p| pulled_images.contains(&p.image));
+
+            for prep in failed_prepared {
+                let full_name = prep.full_name();
+                let msg = format!("image pull failed for {}", prep.image);
+                self.mark_failed(spec, &full_name, &msg)?;
+                result.failed += 1;
+                result.errors.push((full_name, msg));
+            }
+
+            if ok_prepared.len() <= 1 {
+                // Single container — execute inline, no thread overhead.
+                for prep in ok_prepared {
                     let full_name = prep.full_name();
                     info!(service = %full_name, image = %prep.image, "creating container");
-                    if let Err(e) = self.runtime.pull(&prep.image) {
-                        self.mark_failed(spec, &full_name, &e.to_string())?;
-                        result.failed += 1;
-                        result.errors.push((full_name, e.to_string()));
-                        continue;
-                    }
                     let create_result =
                         self.runtime
                             .create_in_sandbox(&spec.name, &prep.image, prep.run_config);
@@ -863,9 +888,9 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     }
                 }
             } else {
-                // Parallel pull + create for multiple services at the same level.
-                // Extract full names (with replica index) before moving prepared.
-                let full_names: Vec<String> = prepared.iter().map(|p| p.full_name()).collect();
+                // Parallel create for multiple containers at the same level.
+                // Images are already pulled; only create_in_sandbox runs in threads.
+                let full_names: Vec<String> = ok_prepared.iter().map(|p| p.full_name()).collect();
                 info!(
                     services = ?full_names,
                     "creating {} containers in parallel",
@@ -875,13 +900,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 let runtime = &self.runtime;
                 let stack_name = &spec.name;
                 let outcomes: Vec<Result<String, StackError>> = std::thread::scope(|s| {
-                    let handles: Vec<_> = prepared
+                    let handles: Vec<_> = ok_prepared
                         .into_iter()
                         .map(|prep| {
                             let full_name = prep.full_name();
                             s.spawn(move || -> Result<String, StackError> {
-                                info!(service = %full_name, image = %prep.image, "pulling image");
-                                runtime.pull(&prep.image)?;
                                 info!(service = %full_name, image = %prep.image, "creating container");
                                 runtime.create_in_sandbox(
                                     stack_name,
@@ -2025,7 +2048,7 @@ mod tests {
         let result = executor.execute(&spec, &actions).unwrap();
         assert_eq!(result.errors.len(), 1);
         assert_eq!(result.errors[0].0, "web");
-        assert!(result.errors[0].1.contains("mock pull failure"));
+        assert!(result.errors[0].1.contains("image pull failed"));
     }
 
     // ── Port tracking tests ──

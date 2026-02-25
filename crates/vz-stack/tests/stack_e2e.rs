@@ -2339,7 +2339,6 @@ services:
 
 /// Deploy a service with replicas=3 and verify 3 running containers with distinct IDs.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn replicated_service_creates_multiple_containers() {
     if !require_virtualization_entitlement() {
         return;
@@ -2364,6 +2363,10 @@ services:
     assert_eq!(spec.services[0].resources.replicas, 3);
 
     let bridge = OciContainerRuntime::new(&oci_data);
+
+    // Pre-pull image so parallel replica creation doesn't race on layer extraction.
+    bridge.pull("alpine:latest").unwrap();
+
     let store = StateStore::open(&db_path).unwrap();
     let mut executor = StackExecutor::new(bridge, store, tmp.path());
 
@@ -2427,7 +2430,6 @@ services:
 
 /// Deploy replicas=3, then redeploy with replicas=1 and verify scale-down.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn replicated_service_scale_down() {
     if !require_virtualization_entitlement() {
         return;
@@ -2449,6 +2451,10 @@ services:
 
     let spec3 = parse_compose(yaml_3, "scale-e2e").unwrap();
     let bridge = OciContainerRuntime::new(&oci_data);
+
+    // Pre-pull image so parallel replica creation doesn't race on layer extraction.
+    bridge.pull("alpine:latest").unwrap();
+
     let store = StateStore::open(&db_path).unwrap();
     let mut executor = StackExecutor::new(bridge, store, tmp.path());
 

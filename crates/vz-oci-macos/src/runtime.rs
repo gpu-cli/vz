@@ -208,10 +208,35 @@ impl Runtime {
         }
 
         // Best-effort OCI delete via guest runtime if VM is still up.
-        if let Some(vm) = self.vm_handles.lock().await.remove(id) {
-            let _ = vm.oci_delete(id.to_string(), true).await;
+        // Try the per-container handle first; fall back to the shared stack VM
+        // (the per-container handle may have been removed by stop_container).
+        let vm = self.vm_handles.lock().await.remove(id);
+        let stack_id = self.container_stack.lock().await.remove(id);
+        if let Some(vm) = vm {
+            match vm.oci_delete(id.to_string(), true).await {
+                Ok(_) => {
+                    tracing::debug!(container_id = %id, "remove_container: oci_delete via vm_handle succeeded")
+                }
+                Err(e) => {
+                    tracing::warn!(container_id = %id, error = %e, "remove_container: oci_delete via vm_handle failed")
+                }
+            }
+        } else if let Some(sid) = &stack_id {
+            if let Some(vm) = self.stack_vms.lock().await.get(sid) {
+                match vm.oci_delete(id.to_string(), true).await {
+                    Ok(_) => {
+                        tracing::debug!(container_id = %id, stack_id = %sid, "remove_container: oci_delete via stack_vm succeeded")
+                    }
+                    Err(e) => {
+                        tracing::warn!(container_id = %id, stack_id = %sid, error = %e, "remove_container: oci_delete via stack_vm failed")
+                    }
+                }
+            } else {
+                tracing::warn!(container_id = %id, stack_id = %sid, "remove_container: stack_vm not found");
+            }
+        } else {
+            tracing::debug!(container_id = %id, "remove_container: no vm_handle or stack_id, skipping oci_delete");
         }
-        self.container_stack.lock().await.remove(id);
         self.active_lifecycle.lock().await.remove(id);
 
         self.container_store.remove(id).map_err(OciError::from)?;
@@ -272,7 +297,12 @@ impl Runtime {
         let lifecycle = self.active_lifecycle.lock().await.remove(id);
 
         // Best-effort OCI delete.
-        let _ = vm.oci_delete(id.to_string(), true).await;
+        match vm.oci_delete(id.to_string(), true).await {
+            Ok(_) => tracing::debug!(container_id = %id, "stop_container: oci_delete succeeded"),
+            Err(e) => {
+                tracing::warn!(container_id = %id, error = %e, "stop_container: oci_delete failed (best-effort)")
+            }
+        }
 
         // Only tear down the VM if the container does NOT belong to a shared stack VM.
         let is_stack_container = self.container_stack.lock().await.contains_key(id);
@@ -280,15 +310,22 @@ impl Runtime {
             let _ = vm.stop().await;
         }
         self.vm_handles.lock().await.remove(id);
-        self.container_stack.lock().await.remove(id);
+        // Keep container_stack entry so remove_container can find the stack VM
+        // for a retry oci_delete if the best-effort delete above failed.
 
         // Shut down port forwarding for this container.
         if let Some(pf) = self.port_forwards.lock().await.remove(id) {
             pf.shutdown().await;
         }
 
-        if let Some(rootfs_path) = container.rootfs_path.take() {
-            let _ = fs::remove_dir_all(rootfs_path);
+        // Only remove rootfs for non-stack containers. For stack containers the
+        // shared VM's VirtioFS cache holds stale metadata after host-side deletion,
+        // causing recreates to fail (overlay sees empty lowerdir). The rootfs will
+        // be cleaned up by remove_container or overwritten by a subsequent create.
+        if !is_stack_container {
+            if let Some(rootfs_path) = container.rootfs_path.take() {
+                let _ = fs::remove_dir_all(rootfs_path);
+            }
         }
 
         container.host_pid = None;
@@ -1010,6 +1047,11 @@ impl Runtime {
             .oci_create(oci_container_id.clone(), bundle_guest_path.clone())
             .await
         {
+            tracing::error!(
+                container_id = %oci_container_id,
+                error = %err,
+                "step 4 FAILED: oci_create"
+            );
             container.status = ContainerStatus::Stopped { exit_code: -1 };
             container.stopped_unix_secs = Some(current_unix_secs());
             container.host_pid = None;
@@ -2558,6 +2600,25 @@ async fn setup_guest_container_overlay(
     let container_overlay = format!("/run/vz-oci/containers/{container_id}");
     let guest_rootfs_path = format!("{container_overlay}/merged");
     let log_dir = container_log_dir(container_id);
+
+    // Clean up any stale overlay from a previous container with the same ID
+    // (e.g. during recreate). Best-effort: unmount merged overlay, then the
+    // tmpfs backing, then remove the directory tree.  Invalidate the VirtioFS
+    // dcache so the kernel re-reads host-side changes (the rootfs may have
+    // been deleted + reassembled on the host during recreate).
+    let cleanup_cmd = format!(
+        "umount {container_overlay}/merged 2>/dev/null; \
+         umount {container_overlay} 2>/dev/null; \
+         rm -rf {container_overlay}; \
+         echo 2 > /proc/sys/vm/drop_caches 2>/dev/null || true"
+    );
+    let _ = vm
+        .exec_capture(
+            "sh".to_string(),
+            vec!["-c".to_string(), cleanup_cmd],
+            Duration::from_secs(5),
+        )
+        .await;
 
     let overlay_cmd = format!(
         "mkdir -p {container_overlay} && \
