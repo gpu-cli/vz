@@ -48,8 +48,8 @@ pub use spec::{
 };
 pub use state_store::{
     AllocatorSnapshot, DriftFinding, DriftSeverity, IDEMPOTENCY_TTL_SECS, IdempotencyRecord,
-    ImageRecord, Receipt, ReconcileSession, ReconcileSessionStatus, ServiceObservedState,
-    ServicePhase, StateStore,
+    ImageRecord, Receipt, ReconcileAuditEntry, ReconcileSession, ReconcileSessionStatus,
+    ServiceObservedState, ServicePhase, StateStore,
 };
 pub use volume::{
     ResolvedMount, ResolvedMountKind, SkippedMount, VolumeManager, mounts_changed,

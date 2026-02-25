@@ -904,7 +904,7 @@ fn set_failed(svc: &mut ServiceBar, name: &str, error: &str, is_tty: bool) {
 /// - Caps total length at 100 characters.
 fn truncate_error(msg: &str) -> String {
     // Extract the last meaningful segment from error chains like
-    // "network error: create_in_stack failed: storage operation failed: unable to unpack layer..."
+    // "network error: create_in_sandbox failed: storage operation failed: unable to unpack layer..."
     let leaf = msg.rsplit(": ").next().unwrap_or(msg).trim();
 
     // Truncate sha256 digests: sha256:e54bc7400b8c... → sha256:e54bc74…
@@ -1023,7 +1023,7 @@ mod tests {
 
     #[test]
     fn truncate_error_extracts_leaf() {
-        let msg = "network error: create_in_stack failed: storage operation failed: unable to unpack layer";
+        let msg = "network error: create_in_sandbox failed: storage operation failed: unable to unpack layer";
         assert_eq!(truncate_error(msg), "unable to unpack layer");
     }
 
@@ -1037,7 +1037,7 @@ mod tests {
 
     #[test]
     fn truncate_error_chain_and_sha256() {
-        let msg = "network error: create_in_stack failed: storage operation failed: unable to unpack layer sha256:e54bc7400b8c60e1d6cea4d86bfcd3725b446856ebdf665cfd6581b861931f66 using media type application/vnd.oci.image.layer.v1.tar+gzip";
+        let msg = "network error: create_in_sandbox failed: storage operation failed: unable to unpack layer sha256:e54bc7400b8c60e1d6cea4d86bfcd3725b446856ebdf665cfd6581b861931f66 using media type application/vnd.oci.image.layer.v1.tar+gzip";
         let result = truncate_error(msg);
         assert!(result.starts_with("unable to unpack layer sha256:e54bc74\u{2026}"));
         assert!(result.chars().count() <= 100);

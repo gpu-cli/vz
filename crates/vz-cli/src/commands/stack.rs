@@ -615,82 +615,42 @@ impl ContainerRuntime for OciContainerRuntime {
         })
     }
 
-    fn boot_shared_vm(
+    fn create_sandbox(
         &self,
-        stack_id: &str,
-        ports: &[vz_runtime_contract::PortMapping],
+        sandbox_id: &str,
+        ports: Vec<vz_runtime_contract::PortMapping>,
         resources: vz_runtime_contract::StackResourceHint,
     ) -> Result<(), StackError> {
         let capabilities = self.capabilities();
-        self.ensure_capability("boot_shared_vm", "shared_vm", capabilities.shared_vm)?;
+        self.ensure_capability("create_sandbox", "shared_vm", capabilities.shared_vm)?;
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(
                     self.manager
-                        .ensure_stack_runtime(stack_id, ports.to_vec(), resources),
+                        .ensure_stack_runtime(sandbox_id, ports, resources),
                 )
-                .map_err(|e| map_runtime_error("boot_shared_vm", e))
+                .map_err(|e| map_runtime_error("create_sandbox", e))
         })
     }
 
-    fn network_setup(
+    fn create_in_sandbox(
         &self,
-        stack_id: &str,
-        services: &[vz_runtime_contract::NetworkServiceConfig],
-    ) -> Result<(), StackError> {
-        let capabilities = self.capabilities();
-        self.ensure_capability("network_setup", "shared_vm", capabilities.shared_vm)?;
-        self.ensure_capability(
-            "network_setup",
-            "stack_networking",
-            capabilities.stack_networking,
-        )?;
-        tokio::task::block_in_place(|| {
-            self.handle
-                .block_on(
-                    self.manager
-                        .setup_stack_network(stack_id, services.to_vec()),
-                )
-                .map_err(|e| map_runtime_error("network_setup", e))
-        })
-    }
-
-    fn network_teardown(&self, stack_id: &str, service_names: &[String]) -> Result<(), StackError> {
-        let capabilities = self.capabilities();
-        self.ensure_capability("network_teardown", "shared_vm", capabilities.shared_vm)?;
-        self.ensure_capability(
-            "network_teardown",
-            "stack_networking",
-            capabilities.stack_networking,
-        )?;
-        tokio::task::block_in_place(|| {
-            self.handle
-                .block_on(
-                    self.manager
-                        .teardown_stack_network(stack_id, service_names.to_vec()),
-                )
-                .map_err(|e| map_runtime_error("network_teardown", e))
-        })
-    }
-
-    fn create_in_stack(
-        &self,
-        stack_id: &str,
+        sandbox_id: &str,
         image: &str,
         config: vz_runtime_contract::RunConfig,
     ) -> Result<String, StackError> {
         let capabilities = self.capabilities();
-        self.ensure_capability("create_in_stack", "shared_vm", capabilities.shared_vm)?;
+        self.ensure_capability("create_in_sandbox", "shared_vm", capabilities.shared_vm)?;
         let id_hint = config.container_id.as_deref().unwrap_or("auto");
         let idempotency_key = runtime_idempotency_key(
             vz_runtime_contract::RuntimeOperation::CreateContainer,
-            &[stack_id, image, id_hint],
+            &[sandbox_id, image, id_hint],
         );
         if let Some(key) = idempotency_key.as_deref() {
             debug!(
                 operation = vz_runtime_contract::RuntimeOperation::CreateContainer.as_str(),
                 idempotency_key = %key,
-                stack = %stack_id,
+                sandbox = %sandbox_id,
                 image = %image,
                 container_hint = %id_hint,
                 "runtime mutation idempotency key"
@@ -698,26 +658,74 @@ impl ContainerRuntime for OciContainerRuntime {
         }
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.manager.create_stack_container(stack_id, image, config))
-                .map_err(|e| map_runtime_error("create_in_stack", e))
+                .block_on(
+                    self.manager
+                        .create_stack_container(sandbox_id, image, config),
+                )
+                .map_err(|e| map_runtime_error("create_in_sandbox", e))
         })
     }
 
-    fn shutdown_shared_vm(&self, stack_id: &str) -> Result<(), StackError> {
+    fn setup_sandbox_network(
+        &self,
+        sandbox_id: &str,
+        services: Vec<vz_runtime_contract::NetworkServiceConfig>,
+    ) -> Result<(), StackError> {
         let capabilities = self.capabilities();
-        self.ensure_capability("shutdown_shared_vm", "shared_vm", capabilities.shared_vm)?;
+        self.ensure_capability("setup_sandbox_network", "shared_vm", capabilities.shared_vm)?;
+        self.ensure_capability(
+            "setup_sandbox_network",
+            "stack_networking",
+            capabilities.stack_networking,
+        )?;
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.manager.shutdown_stack_runtime(stack_id))
-                .map_err(|e| map_runtime_error("shutdown_shared_vm", e))
+                .block_on(self.manager.setup_sandbox_network(sandbox_id, services))
+                .map_err(|e| map_runtime_error("setup_sandbox_network", e))
         })
     }
 
-    fn has_shared_vm(&self, stack_id: &str) -> bool {
+    fn teardown_sandbox_network(
+        &self,
+        sandbox_id: &str,
+        service_names: Vec<String>,
+    ) -> Result<(), StackError> {
+        let capabilities = self.capabilities();
+        self.ensure_capability(
+            "teardown_sandbox_network",
+            "shared_vm",
+            capabilities.shared_vm,
+        )?;
+        self.ensure_capability(
+            "teardown_sandbox_network",
+            "stack_networking",
+            capabilities.stack_networking,
+        )?;
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(
+                    self.manager
+                        .teardown_sandbox_network(sandbox_id, service_names),
+                )
+                .map_err(|e| map_runtime_error("teardown_sandbox_network", e))
+        })
+    }
+
+    fn shutdown_sandbox(&self, sandbox_id: &str) -> Result<(), StackError> {
+        let capabilities = self.capabilities();
+        self.ensure_capability("shutdown_sandbox", "shared_vm", capabilities.shared_vm)?;
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.manager.terminate_sandbox(sandbox_id))
+                .map_err(|e| map_runtime_error("shutdown_sandbox", e))
+        })
+    }
+
+    fn has_sandbox(&self, sandbox_id: &str) -> bool {
         if !self.capabilities().shared_vm {
             return false;
         }
-        self.manager.has_stack_runtime(stack_id)
+        self.manager.has_sandbox(sandbox_id)
     }
 
     fn logs(&self, container_id: &str) -> Result<ContainerLogs, StackError> {
@@ -2922,9 +2930,9 @@ mod tests {
     #[test]
     fn map_runtime_error_formats_unsupported_operation_deterministically() {
         let stack_error = map_runtime_error(
-            "network_setup",
+            "setup_sandbox_network",
             vz_runtime_contract::RuntimeError::UnsupportedOperation {
-                operation: "network_setup".to_string(),
+                operation: "setup_sandbox_network".to_string(),
                 reason: "missing stack_networking capability".to_string(),
             },
         );
@@ -2933,7 +2941,7 @@ mod tests {
             StackError::Network(message) => {
                 assert!(message.contains("unsupported_operation"));
                 assert!(message.contains("surface=stack"));
-                assert!(message.contains("operation=network_setup"));
+                assert!(message.contains("operation=setup_sandbox_network"));
                 assert!(message.contains("missing stack_networking capability"));
             }
             other => panic!("expected StackError::Network, got {other:?}"),

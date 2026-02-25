@@ -260,7 +260,7 @@ pub const PRIMITIVE_CONFORMANCE_MATRIX: &[PrimitiveConformanceEntry] = &[
             path: "/v1/executions",
             surface: "executions",
         }),
-        manager: false,
+        manager: true,
         grpc_metadata: false,
         cli: false,
     },
@@ -270,7 +270,7 @@ pub const PRIMITIVE_CONFORMANCE_MATRIX: &[PrimitiveConformanceEntry] = &[
             path: "/v1/executions",
             surface: "executions",
         }),
-        manager: false,
+        manager: true,
         grpc_metadata: false,
         cli: false,
     },
@@ -280,7 +280,7 @@ pub const PRIMITIVE_CONFORMANCE_MATRIX: &[PrimitiveConformanceEntry] = &[
             path: "/v1/executions",
             surface: "executions",
         }),
-        manager: false,
+        manager: true,
         grpc_metadata: false,
         cli: false,
     },
@@ -290,7 +290,7 @@ pub const PRIMITIVE_CONFORMANCE_MATRIX: &[PrimitiveConformanceEntry] = &[
             path: "/v1/executions",
             surface: "executions",
         }),
-        manager: false,
+        manager: true,
         grpc_metadata: false,
         cli: false,
     },
@@ -300,7 +300,7 @@ pub const PRIMITIVE_CONFORMANCE_MATRIX: &[PrimitiveConformanceEntry] = &[
             path: "/v1/checkpoints",
             surface: "checkpoints",
         }),
-        manager: false,
+        manager: true,
         grpc_metadata: false,
         cli: false,
     },
@@ -310,7 +310,7 @@ pub const PRIMITIVE_CONFORMANCE_MATRIX: &[PrimitiveConformanceEntry] = &[
             path: "/v1/checkpoints",
             surface: "checkpoints",
         }),
-        manager: false,
+        manager: true,
         grpc_metadata: false,
         cli: false,
     },
@@ -320,49 +320,49 @@ pub const PRIMITIVE_CONFORMANCE_MATRIX: &[PrimitiveConformanceEntry] = &[
             path: "/v1/checkpoints",
             surface: "checkpoints",
         }),
-        manager: false,
+        manager: true,
         grpc_metadata: false,
         cli: false,
     },
     PrimitiveConformanceEntry {
         operation: RuntimeOperation::CreateVolume,
         openapi: None,
-        manager: false,
+        manager: true,
         grpc_metadata: false,
         cli: false,
     },
     PrimitiveConformanceEntry {
         operation: RuntimeOperation::AttachVolume,
         openapi: None,
-        manager: false,
+        manager: true,
         grpc_metadata: false,
         cli: false,
     },
     PrimitiveConformanceEntry {
         operation: RuntimeOperation::DetachVolume,
         openapi: None,
-        manager: false,
+        manager: true,
         grpc_metadata: false,
         cli: false,
     },
     PrimitiveConformanceEntry {
         operation: RuntimeOperation::CreateNetworkDomain,
         openapi: None,
-        manager: false,
+        manager: true,
         grpc_metadata: true,
         cli: false,
     },
     PrimitiveConformanceEntry {
         operation: RuntimeOperation::PublishPort,
         openapi: None,
-        manager: false,
+        manager: true,
         grpc_metadata: false,
         cli: false,
     },
     PrimitiveConformanceEntry {
         operation: RuntimeOperation::ConnectContainer,
         openapi: None,
-        manager: false,
+        manager: true,
         grpc_metadata: false,
         cli: false,
     },
@@ -1383,6 +1383,137 @@ impl<B: RuntimeBackend> WorkspaceRuntimeManager<B> {
             .network_teardown(sandbox_id, service_names)
             .await
     }
+
+    // ── Execution control ───────────────────────────────────────────
+
+    /// Write data to a running execution's stdin stream.
+    pub async fn write_exec_stdin(
+        &self,
+        execution_id: &str,
+        data: &[u8],
+    ) -> Result<(), RuntimeError> {
+        self.backend.write_exec_stdin(execution_id, data).await
+    }
+
+    /// Send a signal to a running execution.
+    pub async fn signal_exec(&self, execution_id: &str, signal: &str) -> Result<(), RuntimeError> {
+        self.backend.signal_exec(execution_id, signal).await
+    }
+
+    /// Resize the PTY dimensions for a running execution.
+    pub async fn resize_exec_pty(
+        &self,
+        execution_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), RuntimeError> {
+        self.backend.resize_exec_pty(execution_id, cols, rows).await
+    }
+
+    /// Cancel a running execution.
+    pub async fn cancel_exec(&self, execution_id: &str) -> Result<(), RuntimeError> {
+        self.backend.cancel_exec(execution_id).await
+    }
+
+    // ── Checkpoint operations ───────────────────────────────────────
+
+    /// Create a checkpoint for a sandbox with the given class and fingerprint.
+    pub async fn create_checkpoint(
+        &self,
+        sandbox_id: &str,
+        class: &str,
+        fingerprint: &str,
+    ) -> Result<String, RuntimeError> {
+        self.backend
+            .create_checkpoint(sandbox_id, class, fingerprint)
+            .await
+    }
+
+    /// Restore a sandbox from a previously created checkpoint.
+    pub async fn restore_checkpoint(&self, checkpoint_id: &str) -> Result<(), RuntimeError> {
+        self.backend.restore_checkpoint(checkpoint_id).await
+    }
+
+    /// Fork a checkpoint into a new sandbox lineage.
+    pub async fn fork_checkpoint(
+        &self,
+        checkpoint_id: &str,
+        new_sandbox_id: &str,
+    ) -> Result<String, RuntimeError> {
+        self.backend
+            .fork_checkpoint(checkpoint_id, new_sandbox_id)
+            .await
+    }
+
+    // ── Volume operations ───────────────────────────────────────────
+
+    /// Create a named volume.
+    pub async fn create_volume(&self, name: &str) -> Result<(), RuntimeError> {
+        self.backend.create_volume(name).await
+    }
+
+    /// Attach a volume to a container at the given mount path.
+    pub async fn attach_volume(
+        &self,
+        container_id: &str,
+        volume_name: &str,
+        mount_path: &str,
+    ) -> Result<(), RuntimeError> {
+        self.backend
+            .attach_volume(container_id, volume_name, mount_path)
+            .await
+    }
+
+    /// Detach a volume from a container.
+    pub async fn detach_volume(
+        &self,
+        container_id: &str,
+        volume_name: &str,
+    ) -> Result<(), RuntimeError> {
+        self.backend.detach_volume(container_id, volume_name).await
+    }
+
+    // ── Network domain operations ───────────────────────────────────
+
+    /// Create an isolated network domain for a sandbox.
+    pub async fn create_network_domain(
+        &self,
+        network_id: &str,
+        sandbox_id: &str,
+    ) -> Result<(), RuntimeError> {
+        self.backend
+            .create_network_domain(network_id, sandbox_id)
+            .await
+    }
+
+    /// Destroy a network domain and release its resources.
+    pub async fn destroy_network_domain(&self, network_id: &str) -> Result<(), RuntimeError> {
+        self.backend.destroy_network_domain(network_id).await
+    }
+
+    /// Publish an ingress port on a network domain.
+    pub async fn publish_port(
+        &self,
+        network_id: &str,
+        host_port: u16,
+        container_port: u16,
+        protocol: &str,
+    ) -> Result<(), RuntimeError> {
+        self.backend
+            .publish_port(network_id, host_port, container_port, protocol)
+            .await
+    }
+
+    /// Connect a container to a network domain.
+    pub async fn connect_container_to_network(
+        &self,
+        container_id: &str,
+        network_id: &str,
+    ) -> Result<(), RuntimeError> {
+        self.backend
+            .connect_container_to_network(container_id, network_id)
+            .await
+    }
 }
 
 /// Backend-neutral container runtime trait.
@@ -1575,6 +1706,209 @@ pub trait RuntimeBackend: Send + Sync {
             Err(RuntimeError::UnsupportedOperation {
                 operation: RuntimeOperation::CancelBuild.as_str().to_string(),
                 reason: "build operations are not supported by this backend".to_string(),
+            })
+        }
+    }
+
+    // ── Execution control ───────────────────────────────────────────
+
+    /// Write data to a running execution's stdin stream.
+    fn write_exec_stdin(
+        &self,
+        _execution_id: &str,
+        _data: &[u8],
+    ) -> impl Future<Output = Result<(), RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::WriteExecStdin.as_str().to_string(),
+                reason: "execution stdin control is not supported by this backend".to_string(),
+            })
+        }
+    }
+
+    /// Send a signal to a running execution.
+    fn signal_exec(
+        &self,
+        _execution_id: &str,
+        _signal: &str,
+    ) -> impl Future<Output = Result<(), RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::SignalExec.as_str().to_string(),
+                reason: "execution signal control is not supported by this backend".to_string(),
+            })
+        }
+    }
+
+    /// Resize the PTY dimensions for a running execution.
+    fn resize_exec_pty(
+        &self,
+        _execution_id: &str,
+        _cols: u16,
+        _rows: u16,
+    ) -> impl Future<Output = Result<(), RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::ResizeExecPty.as_str().to_string(),
+                reason: "execution PTY resize is not supported by this backend".to_string(),
+            })
+        }
+    }
+
+    /// Cancel a running execution.
+    fn cancel_exec(&self, _execution_id: &str) -> impl Future<Output = Result<(), RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::CancelExec.as_str().to_string(),
+                reason: "execution cancellation is not supported by this backend".to_string(),
+            })
+        }
+    }
+
+    // ── Checkpoint operations ───────────────────────────────────────
+
+    /// Create a checkpoint for a sandbox with the given class and fingerprint.
+    ///
+    /// Returns the checkpoint identifier on success.
+    fn create_checkpoint(
+        &self,
+        _sandbox_id: &str,
+        _class: &str,
+        _fingerprint: &str,
+    ) -> impl Future<Output = Result<String, RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::CreateCheckpoint.as_str().to_string(),
+                reason: "checkpoint operations are not supported by this backend".to_string(),
+            })
+        }
+    }
+
+    /// Restore a sandbox from a previously created checkpoint.
+    fn restore_checkpoint(
+        &self,
+        _checkpoint_id: &str,
+    ) -> impl Future<Output = Result<(), RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::RestoreCheckpoint.as_str().to_string(),
+                reason: "checkpoint operations are not supported by this backend".to_string(),
+            })
+        }
+    }
+
+    /// Fork a checkpoint into a new sandbox lineage.
+    ///
+    /// Returns the new checkpoint identifier on success.
+    fn fork_checkpoint(
+        &self,
+        _checkpoint_id: &str,
+        _new_sandbox_id: &str,
+    ) -> impl Future<Output = Result<String, RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::ForkCheckpoint.as_str().to_string(),
+                reason: "checkpoint operations are not supported by this backend".to_string(),
+            })
+        }
+    }
+
+    // ── Volume operations ───────────────────────────────────────────
+
+    /// Create a named volume.
+    fn create_volume(&self, _name: &str) -> impl Future<Output = Result<(), RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::CreateVolume.as_str().to_string(),
+                reason: "volume operations are not supported by this backend".to_string(),
+            })
+        }
+    }
+
+    /// Attach a volume to a container at the given mount path.
+    fn attach_volume(
+        &self,
+        _container_id: &str,
+        _volume_name: &str,
+        _mount_path: &str,
+    ) -> impl Future<Output = Result<(), RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::AttachVolume.as_str().to_string(),
+                reason: "volume operations are not supported by this backend".to_string(),
+            })
+        }
+    }
+
+    /// Detach a volume from a container.
+    fn detach_volume(
+        &self,
+        _container_id: &str,
+        _volume_name: &str,
+    ) -> impl Future<Output = Result<(), RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::DetachVolume.as_str().to_string(),
+                reason: "volume operations are not supported by this backend".to_string(),
+            })
+        }
+    }
+
+    // ── Network domain operations ───────────────────────────────────
+
+    /// Create an isolated network domain for a sandbox.
+    fn create_network_domain(
+        &self,
+        _network_id: &str,
+        _sandbox_id: &str,
+    ) -> impl Future<Output = Result<(), RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::CreateNetworkDomain.as_str().to_string(),
+                reason: "network domain operations are not supported by this backend".to_string(),
+            })
+        }
+    }
+
+    /// Destroy a network domain and release its resources.
+    fn destroy_network_domain(
+        &self,
+        _network_id: &str,
+    ) -> impl Future<Output = Result<(), RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: "destroy_network_domain".to_string(),
+                reason: "network domain operations are not supported by this backend".to_string(),
+            })
+        }
+    }
+
+    /// Publish an ingress port on a network domain.
+    fn publish_port(
+        &self,
+        _network_id: &str,
+        _host_port: u16,
+        _container_port: u16,
+        _protocol: &str,
+    ) -> impl Future<Output = Result<(), RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::PublishPort.as_str().to_string(),
+                reason: "network domain operations are not supported by this backend".to_string(),
+            })
+        }
+    }
+
+    /// Connect a container to a network domain.
+    fn connect_container_to_network(
+        &self,
+        _container_id: &str,
+        _network_id: &str,
+    ) -> impl Future<Output = Result<(), RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::ConnectContainer.as_str().to_string(),
+                reason: "network domain operations are not supported by this backend".to_string(),
             })
         }
     }
@@ -2910,6 +3244,19 @@ mod tests {
             RuntimeOperation::StopContainer,
             RuntimeOperation::RemoveContainer,
             RuntimeOperation::GetContainerLogs,
+            RuntimeOperation::WriteExecStdin,
+            RuntimeOperation::SignalExec,
+            RuntimeOperation::ResizeExecPty,
+            RuntimeOperation::CancelExec,
+            RuntimeOperation::CreateCheckpoint,
+            RuntimeOperation::RestoreCheckpoint,
+            RuntimeOperation::ForkCheckpoint,
+            RuntimeOperation::CreateVolume,
+            RuntimeOperation::AttachVolume,
+            RuntimeOperation::DetachVolume,
+            RuntimeOperation::CreateNetworkDomain,
+            RuntimeOperation::PublishPort,
+            RuntimeOperation::ConnectContainer,
         ]
         .into_iter()
         .collect()
@@ -3325,5 +3672,247 @@ mod tests {
             err.to_string(),
             "unsupported operation `network_setup`: missing stack_networking capability"
         );
+    }
+
+    // ── Backend conformance test suite ──────────────────────────────
+
+    #[test]
+    fn default_execution_control_operations_return_unsupported() {
+        let backend = StubBackend;
+
+        let write_err = poll_immediate(backend.write_exec_stdin("exec-1", b"hello")).unwrap_err();
+        let signal_err = poll_immediate(backend.signal_exec("exec-1", "SIGTERM")).unwrap_err();
+        let resize_err = poll_immediate(backend.resize_exec_pty("exec-1", 80, 24)).unwrap_err();
+        let cancel_err = poll_immediate(backend.cancel_exec("exec-1")).unwrap_err();
+
+        for (error, expected_op) in [
+            (write_err, RuntimeOperation::WriteExecStdin.as_str()),
+            (signal_err, RuntimeOperation::SignalExec.as_str()),
+            (resize_err, RuntimeOperation::ResizeExecPty.as_str()),
+            (cancel_err, RuntimeOperation::CancelExec.as_str()),
+        ] {
+            match error {
+                RuntimeError::UnsupportedOperation { operation, .. } => {
+                    assert_eq!(operation, expected_op);
+                }
+                other => panic!("expected unsupported operation error, got: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn default_checkpoint_operations_return_unsupported() {
+        let backend = StubBackend;
+
+        let create_err =
+            poll_immediate(backend.create_checkpoint("sbx-1", "fs_quick", "fp-1")).unwrap_err();
+        let restore_err = poll_immediate(backend.restore_checkpoint("ckpt-1")).unwrap_err();
+        let fork_err = poll_immediate(backend.fork_checkpoint("ckpt-1", "sbx-2")).unwrap_err();
+
+        for (error, expected_op) in [
+            (create_err, RuntimeOperation::CreateCheckpoint.as_str()),
+            (restore_err, RuntimeOperation::RestoreCheckpoint.as_str()),
+            (fork_err, RuntimeOperation::ForkCheckpoint.as_str()),
+        ] {
+            match error {
+                RuntimeError::UnsupportedOperation { operation, .. } => {
+                    assert_eq!(operation, expected_op);
+                }
+                other => panic!("expected unsupported operation error, got: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn default_volume_operations_return_unsupported() {
+        let backend = StubBackend;
+
+        let create_err = poll_immediate(backend.create_volume("vol-1")).unwrap_err();
+        let attach_err =
+            poll_immediate(backend.attach_volume("ctr-1", "vol-1", "/data")).unwrap_err();
+        let detach_err = poll_immediate(backend.detach_volume("ctr-1", "vol-1")).unwrap_err();
+
+        for (error, expected_op) in [
+            (create_err, RuntimeOperation::CreateVolume.as_str()),
+            (attach_err, RuntimeOperation::AttachVolume.as_str()),
+            (detach_err, RuntimeOperation::DetachVolume.as_str()),
+        ] {
+            match error {
+                RuntimeError::UnsupportedOperation { operation, .. } => {
+                    assert_eq!(operation, expected_op);
+                }
+                other => panic!("expected unsupported operation error, got: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn default_network_domain_operations_return_unsupported() {
+        let backend = StubBackend;
+
+        let create_err =
+            poll_immediate(backend.create_network_domain("net-1", "sbx-1")).unwrap_err();
+        let destroy_err = poll_immediate(backend.destroy_network_domain("net-1")).unwrap_err();
+        let publish_err =
+            poll_immediate(backend.publish_port("net-1", 8080, 80, "tcp")).unwrap_err();
+        let connect_err =
+            poll_immediate(backend.connect_container_to_network("ctr-1", "net-1")).unwrap_err();
+
+        for (error, expected_op) in [
+            (create_err, RuntimeOperation::CreateNetworkDomain.as_str()),
+            (destroy_err, "destroy_network_domain"),
+            (publish_err, RuntimeOperation::PublishPort.as_str()),
+            (connect_err, RuntimeOperation::ConnectContainer.as_str()),
+        ] {
+            match error {
+                RuntimeError::UnsupportedOperation { operation, .. } => {
+                    assert_eq!(operation, expected_op);
+                }
+                other => panic!("expected unsupported operation error, got: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn manager_passthrough_for_execution_control_operations() {
+        let backend = StubBackend;
+        let manager = WorkspaceRuntimeManager::new(backend);
+
+        let write_err = poll_immediate(manager.write_exec_stdin("exec-1", b"data")).unwrap_err();
+        assert!(matches!(
+            write_err,
+            RuntimeError::UnsupportedOperation { .. }
+        ));
+
+        let signal_err = poll_immediate(manager.signal_exec("exec-1", "SIGINT")).unwrap_err();
+        assert!(matches!(
+            signal_err,
+            RuntimeError::UnsupportedOperation { .. }
+        ));
+
+        let resize_err = poll_immediate(manager.resize_exec_pty("exec-1", 120, 40)).unwrap_err();
+        assert!(matches!(
+            resize_err,
+            RuntimeError::UnsupportedOperation { .. }
+        ));
+
+        let cancel_err = poll_immediate(manager.cancel_exec("exec-1")).unwrap_err();
+        assert!(matches!(
+            cancel_err,
+            RuntimeError::UnsupportedOperation { .. }
+        ));
+    }
+
+    #[test]
+    fn manager_passthrough_for_checkpoint_operations() {
+        let backend = StubBackend;
+        let manager = WorkspaceRuntimeManager::new(backend);
+
+        let create_err =
+            poll_immediate(manager.create_checkpoint("sbx-1", "fs_quick", "fp-1")).unwrap_err();
+        assert!(matches!(
+            create_err,
+            RuntimeError::UnsupportedOperation { .. }
+        ));
+
+        let restore_err = poll_immediate(manager.restore_checkpoint("ckpt-1")).unwrap_err();
+        assert!(matches!(
+            restore_err,
+            RuntimeError::UnsupportedOperation { .. }
+        ));
+
+        let fork_err = poll_immediate(manager.fork_checkpoint("ckpt-1", "sbx-2")).unwrap_err();
+        assert!(matches!(
+            fork_err,
+            RuntimeError::UnsupportedOperation { .. }
+        ));
+    }
+
+    #[test]
+    fn manager_passthrough_for_volume_operations() {
+        let backend = StubBackend;
+        let manager = WorkspaceRuntimeManager::new(backend);
+
+        let create_err = poll_immediate(manager.create_volume("vol-1")).unwrap_err();
+        assert!(matches!(
+            create_err,
+            RuntimeError::UnsupportedOperation { .. }
+        ));
+
+        let attach_err =
+            poll_immediate(manager.attach_volume("ctr-1", "vol-1", "/data")).unwrap_err();
+        assert!(matches!(
+            attach_err,
+            RuntimeError::UnsupportedOperation { .. }
+        ));
+
+        let detach_err = poll_immediate(manager.detach_volume("ctr-1", "vol-1")).unwrap_err();
+        assert!(matches!(
+            detach_err,
+            RuntimeError::UnsupportedOperation { .. }
+        ));
+    }
+
+    #[test]
+    fn manager_passthrough_for_network_domain_operations() {
+        let backend = StubBackend;
+        let manager = WorkspaceRuntimeManager::new(backend);
+
+        let create_err =
+            poll_immediate(manager.create_network_domain("net-1", "sbx-1")).unwrap_err();
+        assert!(matches!(
+            create_err,
+            RuntimeError::UnsupportedOperation { .. }
+        ));
+
+        let destroy_err = poll_immediate(manager.destroy_network_domain("net-1")).unwrap_err();
+        assert!(matches!(
+            destroy_err,
+            RuntimeError::UnsupportedOperation { .. }
+        ));
+
+        let publish_err =
+            poll_immediate(manager.publish_port("net-1", 8080, 80, "tcp")).unwrap_err();
+        assert!(matches!(
+            publish_err,
+            RuntimeError::UnsupportedOperation { .. }
+        ));
+
+        let connect_err =
+            poll_immediate(manager.connect_container_to_network("ctr-1", "net-1")).unwrap_err();
+        assert!(matches!(
+            connect_err,
+            RuntimeError::UnsupportedOperation { .. }
+        ));
+    }
+
+    #[test]
+    fn conformance_all_new_backend_trait_default_stubs_return_unsupported_machine_code() {
+        let backend = StubBackend;
+
+        let errors: Vec<RuntimeError> = vec![
+            poll_immediate(backend.write_exec_stdin("e", b"")).unwrap_err(),
+            poll_immediate(backend.signal_exec("e", "SIGTERM")).unwrap_err(),
+            poll_immediate(backend.resize_exec_pty("e", 80, 24)).unwrap_err(),
+            poll_immediate(backend.cancel_exec("e")).unwrap_err(),
+            poll_immediate(backend.create_checkpoint("s", "c", "f")).unwrap_err(),
+            poll_immediate(backend.restore_checkpoint("c")).unwrap_err(),
+            poll_immediate(backend.fork_checkpoint("c", "s2")).unwrap_err(),
+            poll_immediate(backend.create_volume("v")).unwrap_err(),
+            poll_immediate(backend.attach_volume("c", "v", "/m")).unwrap_err(),
+            poll_immediate(backend.detach_volume("c", "v")).unwrap_err(),
+            poll_immediate(backend.create_network_domain("n", "s")).unwrap_err(),
+            poll_immediate(backend.destroy_network_domain("n")).unwrap_err(),
+            poll_immediate(backend.publish_port("n", 80, 80, "tcp")).unwrap_err(),
+            poll_immediate(backend.connect_container_to_network("c", "n")).unwrap_err(),
+        ];
+
+        for error in &errors {
+            assert_eq!(
+                error.machine_code(),
+                MachineErrorCode::UnsupportedOperation,
+                "expected UnsupportedOperation machine code for error: {error}"
+            );
+        }
     }
 }

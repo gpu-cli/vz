@@ -3671,6 +3671,40 @@ pub fn openapi_document() -> serde_json::Value {
                             }
                         }
                     }
+                },
+                "delete": {
+                    "operationId": "cancelBuild",
+                    "summary": "Cancel a running build",
+                    "parameters": [
+                        { "name": "build_id", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "$ref": "#/components/parameters/IdempotencyKey" }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Build canceled",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Build not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
                 }
             },
             "/v1/containers": {
@@ -5156,5 +5190,358 @@ mod tests {
             "kernel-6.1-arm64"
         );
         assert!(payload["restore_note"].as_str().is_some());
+    }
+
+    // ── Cross-transport behavior parity tests ──────────────────────
+
+    #[test]
+    fn transport_parity_openapi_operations_match_grpc_rpcs() {
+        let doc = openapi_document();
+        let paths = doc["paths"].as_object().unwrap();
+
+        // Extract all operationIds from OpenAPI.
+        let mut openapi_operations: Vec<String> = Vec::new();
+        for (_path, methods) in paths {
+            let methods_obj = match methods.as_object() {
+                Some(obj) => obj,
+                None => continue,
+            };
+            for (_method, op) in methods_obj {
+                if let Some(op_id) = op.get("operationId").and_then(|v| v.as_str()) {
+                    openapi_operations.push(op_id.to_string());
+                }
+            }
+        }
+        openapi_operations.sort();
+
+        // Define expected gRPC RPC names (from runtime_v2.proto).
+        let grpc_rpcs = [
+            // SandboxService
+            "CreateSandbox",
+            "GetSandbox",
+            "ListSandboxes",
+            "TerminateSandbox",
+            // LeaseService
+            "OpenLease",
+            "GetLease",
+            "ListLeases",
+            "HeartbeatLease",
+            "CloseLease",
+            // ContainerService
+            "CreateContainer",
+            "GetContainer",
+            "ListContainers",
+            "RemoveContainer",
+            // ExecutionService
+            "CreateExecution",
+            "GetExecution",
+            "ListExecutions",
+            "CancelExecution",
+            "StreamExecOutput",
+            "ResizeExecPty",
+            "SignalExec",
+            // CheckpointService
+            "CreateCheckpoint",
+            "GetCheckpoint",
+            "ListCheckpoints",
+            "RestoreCheckpoint",
+            "ForkCheckpoint",
+            // BuildService
+            "StartBuild",
+            "GetBuild",
+            "ListBuilds",
+            "CancelBuild",
+            "StreamBuildEvents",
+            // EventService
+            "ListEvents",
+            "StreamEvents",
+            // CapabilityService
+            "GetCapabilities",
+        ];
+
+        // Streaming RPCs use SSE/WS, not REST — they have separate
+        // OpenAPI operations (streamEventsSse, streamEventsWs) rather
+        // than a direct camelCase mapping.
+        let streaming_rpcs = ["StreamExecOutput", "StreamBuildEvents", "StreamEvents"];
+
+        for rpc in &grpc_rpcs {
+            if streaming_rpcs.contains(rpc) {
+                continue;
+            }
+            // Map PascalCase to camelCase: "CreateSandbox" -> "createSandbox"
+            let camel = rpc[..1].to_lowercase() + &rpc[1..];
+            // ResizeExecPty maps to "resizeExec" in OpenAPI (shorter form)
+            let aliases: Vec<String> = if *rpc == "ResizeExecPty" {
+                vec![camel.clone(), "resizeExec".to_string()]
+            } else {
+                vec![camel.clone()]
+            };
+            assert!(
+                aliases
+                    .iter()
+                    .any(|alias| openapi_operations.iter().any(|op| op == alias)),
+                "gRPC RPC '{}' has no matching OpenAPI operationId (tried {:?}). Available: {:?}",
+                rpc,
+                aliases,
+                openapi_operations
+            );
+        }
+    }
+
+    #[test]
+    fn transport_parity_shared_error_codes() {
+        let doc = openapi_document();
+        let error_schema = &doc["components"]["schemas"]["ErrorResponse"];
+        assert!(
+            error_schema.is_object(),
+            "ErrorResponse schema must exist in components/schemas"
+        );
+
+        // Verify error response has the required 'error' field with code and message.
+        let properties = &error_schema["properties"];
+        assert!(
+            properties["error"].is_object(),
+            "ErrorResponse must have an 'error' property"
+        );
+        let error_properties = &properties["error"]["properties"];
+        assert!(
+            error_properties["code"].is_object(),
+            "error.code must be defined"
+        );
+        assert!(
+            error_properties["message"].is_object(),
+            "error.message must be defined"
+        );
+        assert!(
+            error_properties["request_id"].is_object(),
+            "error.request_id must be defined"
+        );
+    }
+
+    #[test]
+    fn transport_parity_request_metadata_fields_present() {
+        let doc = openapi_document();
+        let params = doc["components"]["parameters"].as_object().unwrap();
+
+        assert!(
+            params.contains_key("IdempotencyKey"),
+            "IdempotencyKey parameter must exist in components/parameters"
+        );
+        assert!(
+            params.contains_key("RequestId"),
+            "RequestId parameter must exist in components/parameters"
+        );
+
+        // Verify IdempotencyKey is a header parameter.
+        let idem = &params["IdempotencyKey"];
+        assert_eq!(idem["in"].as_str().unwrap(), "header");
+        assert_eq!(idem["name"].as_str().unwrap(), "Idempotency-Key");
+
+        // Verify RequestId is a header parameter.
+        let req_id = &params["RequestId"];
+        assert_eq!(req_id["in"].as_str().unwrap(), "header");
+        assert_eq!(req_id["name"].as_str().unwrap(), "X-Request-Id");
+    }
+
+    #[test]
+    fn transport_parity_entity_payload_field_consistency() {
+        let doc = openapi_document();
+        let schemas = doc["components"]["schemas"].as_object().unwrap();
+
+        // SandboxPayload fields: sandbox_id, backend, state, cpus, memory_mb,
+        // created_at, updated_at, labels.
+        let sandbox = &schemas["SandboxPayload"]["properties"];
+        assert!(
+            sandbox["sandbox_id"].is_object(),
+            "SandboxPayload.sandbox_id missing"
+        );
+        assert!(
+            sandbox["backend"].is_object(),
+            "SandboxPayload.backend missing"
+        );
+        assert!(sandbox["state"].is_object(), "SandboxPayload.state missing");
+        assert!(sandbox["cpus"].is_object(), "SandboxPayload.cpus missing");
+        assert!(
+            sandbox["memory_mb"].is_object(),
+            "SandboxPayload.memory_mb missing"
+        );
+        assert!(
+            sandbox["created_at"].is_object(),
+            "SandboxPayload.created_at missing"
+        );
+        assert!(
+            sandbox["updated_at"].is_object(),
+            "SandboxPayload.updated_at missing"
+        );
+        assert!(
+            sandbox["labels"].is_object(),
+            "SandboxPayload.labels missing"
+        );
+
+        // LeasePayload fields: lease_id, sandbox_id, ttl_secs, last_heartbeat_at, state.
+        let lease = &schemas["LeasePayload"]["properties"];
+        assert!(
+            lease["lease_id"].is_object(),
+            "LeasePayload.lease_id missing"
+        );
+        assert!(
+            lease["sandbox_id"].is_object(),
+            "LeasePayload.sandbox_id missing"
+        );
+        assert!(
+            lease["ttl_secs"].is_object(),
+            "LeasePayload.ttl_secs missing"
+        );
+        assert!(
+            lease["last_heartbeat_at"].is_object(),
+            "LeasePayload.last_heartbeat_at missing"
+        );
+        assert!(lease["state"].is_object(), "LeasePayload.state missing");
+
+        // ExecutionPayload fields: execution_id, container_id, state, exit_code,
+        // started_at, ended_at.
+        let exec = &schemas["ExecutionPayload"]["properties"];
+        assert!(
+            exec["execution_id"].is_object(),
+            "ExecutionPayload.execution_id missing"
+        );
+        assert!(
+            exec["container_id"].is_object(),
+            "ExecutionPayload.container_id missing"
+        );
+        assert!(exec["state"].is_object(), "ExecutionPayload.state missing");
+        assert!(
+            exec["exit_code"].is_object(),
+            "ExecutionPayload.exit_code missing"
+        );
+        assert!(
+            exec["started_at"].is_object(),
+            "ExecutionPayload.started_at missing"
+        );
+        assert!(
+            exec["ended_at"].is_object(),
+            "ExecutionPayload.ended_at missing"
+        );
+
+        // CheckpointPayload fields: checkpoint_id, sandbox_id, parent_checkpoint_id,
+        // class, state, compatibility_fingerprint, created_at.
+        let ckpt = &schemas["CheckpointPayload"]["properties"];
+        assert!(
+            ckpt["checkpoint_id"].is_object(),
+            "CheckpointPayload.checkpoint_id missing"
+        );
+        assert!(
+            ckpt["sandbox_id"].is_object(),
+            "CheckpointPayload.sandbox_id missing"
+        );
+        assert!(
+            ckpt["parent_checkpoint_id"].is_object(),
+            "CheckpointPayload.parent_checkpoint_id missing"
+        );
+        assert!(ckpt["class"].is_object(), "CheckpointPayload.class missing");
+        assert!(ckpt["state"].is_object(), "CheckpointPayload.state missing");
+        assert!(
+            ckpt["compatibility_fingerprint"].is_object(),
+            "CheckpointPayload.compatibility_fingerprint missing"
+        );
+        assert!(
+            ckpt["created_at"].is_object(),
+            "CheckpointPayload.created_at missing"
+        );
+    }
+
+    #[test]
+    fn transport_parity_idempotency_on_mutating_operations() {
+        let doc = openapi_document();
+        let paths = doc["paths"].as_object().unwrap();
+
+        let mut mutating_without_idempotency = Vec::new();
+
+        for (path, methods) in paths {
+            let methods_obj = match methods.as_object() {
+                Some(obj) => obj,
+                None => continue,
+            };
+            // Check POST operations.
+            if let Some(post_op) = methods_obj.get("post") {
+                let op_id = post_op
+                    .get("operationId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+
+                // Check if parameters reference IdempotencyKey.
+                let has_idempotency = post_op
+                    .get("parameters")
+                    .and_then(|p| p.as_array())
+                    .map(|params| {
+                        params.iter().any(|p| {
+                            p.get("$ref")
+                                .and_then(|r| r.as_str())
+                                .map(|r| r.contains("IdempotencyKey"))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+
+                // Heartbeat, restore, resize, signal are POST but may not
+                // need idempotency.
+                let exempt = [
+                    "heartbeatLease",
+                    "restoreCheckpoint",
+                    "resizeExec",
+                    "signalExec",
+                ];
+                if !has_idempotency && !exempt.contains(&op_id) {
+                    mutating_without_idempotency.push(format!("{} ({})", path, op_id));
+                }
+            }
+
+            // Check DELETE operations (which are also mutating).
+            if let Some(delete_op) = methods_obj.get("delete") {
+                let op_id = delete_op
+                    .get("operationId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+
+                let has_idempotency = delete_op
+                    .get("parameters")
+                    .and_then(|p| p.as_array())
+                    .map(|params| {
+                        params.iter().any(|p| {
+                            p.get("$ref")
+                                .and_then(|r| r.as_str())
+                                .map(|r| r.contains("IdempotencyKey"))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+
+                let exempt_delete = ["removeContainer", "cancelExecution"];
+                if !has_idempotency && !exempt_delete.contains(&op_id) {
+                    mutating_without_idempotency.push(format!("{} DELETE ({})", path, op_id));
+                }
+            }
+        }
+
+        // All major create/terminate/close operations should have idempotency.
+        // We assert that none of the critical mutating POST operations lack it.
+        let critical_missing: Vec<&str> = mutating_without_idempotency
+            .iter()
+            .filter(|s| {
+                s.contains("createSandbox")
+                    || s.contains("openLease")
+                    || s.contains("createExecution")
+                    || s.contains("createCheckpoint")
+                    || s.contains("terminateSandbox")
+                    || s.contains("closeLease")
+                    || s.contains("forkCheckpoint")
+            })
+            .map(|s| s.as_str())
+            .collect();
+        assert!(
+            critical_missing.is_empty(),
+            "Critical mutating operations missing IdempotencyKey: {:?}",
+            critical_missing
+        );
     }
 }

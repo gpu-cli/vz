@@ -216,48 +216,22 @@ impl ContainerRuntime for OciContainerRuntime {
         })
     }
 
-    fn boot_shared_vm(
+    fn create_sandbox(
         &self,
-        stack_id: &str,
-        ports: &[PortMapping],
+        sandbox_id: &str,
+        ports: Vec<PortMapping>,
         resources: vz_runtime_contract::StackResourceHint,
     ) -> Result<(), StackError> {
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(
-                    self.backend
-                        .boot_shared_vm(stack_id, ports.to_vec(), resources),
-                )
-                .map_err(|e| StackError::Network(format!("boot_shared_vm failed: {e}")))
+                .block_on(self.backend.boot_shared_vm(sandbox_id, ports, resources))
+                .map_err(|e| StackError::Network(format!("create_sandbox failed: {e}")))
         })
     }
 
-    fn network_setup(
+    fn create_in_sandbox(
         &self,
-        stack_id: &str,
-        services: &[NetworkServiceConfig],
-    ) -> Result<(), StackError> {
-        tokio::task::block_in_place(|| {
-            self.handle
-                .block_on(self.backend.network_setup(stack_id, services.to_vec()))
-                .map_err(|e| StackError::Network(format!("network_setup failed: {e}")))
-        })
-    }
-
-    fn network_teardown(&self, stack_id: &str, service_names: &[String]) -> Result<(), StackError> {
-        tokio::task::block_in_place(|| {
-            self.handle
-                .block_on(
-                    self.backend
-                        .network_teardown(stack_id, service_names.to_vec()),
-                )
-                .map_err(|e| StackError::Network(format!("network_teardown failed: {e}")))
-        })
-    }
-
-    fn create_in_stack(
-        &self,
-        stack_id: &str,
+        sandbox_id: &str,
         image: &str,
         config: RunConfig,
     ) -> Result<String, StackError> {
@@ -265,22 +239,46 @@ impl ContainerRuntime for OciContainerRuntime {
             self.handle
                 .block_on(
                     self.backend
-                        .create_container_in_stack(stack_id, image, config),
+                        .create_container_in_stack(sandbox_id, image, config),
                 )
-                .map_err(|e| StackError::Network(format!("create_in_stack failed: {e}")))
+                .map_err(|e| StackError::Network(format!("create_in_sandbox failed: {e}")))
         })
     }
 
-    fn shutdown_shared_vm(&self, stack_id: &str) -> Result<(), StackError> {
+    fn setup_sandbox_network(
+        &self,
+        sandbox_id: &str,
+        services: Vec<NetworkServiceConfig>,
+    ) -> Result<(), StackError> {
         tokio::task::block_in_place(|| {
             self.handle
-                .block_on(self.backend.shutdown_shared_vm(stack_id))
-                .map_err(|e| StackError::Network(format!("shutdown_shared_vm failed: {e}")))
+                .block_on(self.backend.network_setup(sandbox_id, services))
+                .map_err(|e| StackError::Network(format!("setup_sandbox_network failed: {e}")))
         })
     }
 
-    fn has_shared_vm(&self, stack_id: &str) -> bool {
-        self.backend.has_shared_vm(stack_id)
+    fn teardown_sandbox_network(
+        &self,
+        sandbox_id: &str,
+        service_names: Vec<String>,
+    ) -> Result<(), StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.backend.network_teardown(sandbox_id, service_names))
+                .map_err(|e| StackError::Network(format!("teardown_sandbox_network failed: {e}")))
+        })
+    }
+
+    fn shutdown_sandbox(&self, sandbox_id: &str) -> Result<(), StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.backend.shutdown_shared_vm(sandbox_id))
+                .map_err(|e| StackError::Network(format!("shutdown_sandbox failed: {e}")))
+        })
+    }
+
+    fn has_sandbox(&self, sandbox_id: &str) -> bool {
+        self.backend.has_shared_vm(sandbox_id)
     }
 }
 
@@ -783,7 +781,7 @@ services:
     let _ = orchestrator
         .executor()
         .runtime()
-        .shutdown_shared_vm("real-svc");
+        .shutdown_sandbox("real-svc");
 }
 
 /// End-to-end test for exec via Unix control socket.
@@ -944,7 +942,7 @@ services:
     let _ = orchestrator
         .executor()
         .runtime()
-        .shutdown_shared_vm("exec-sock");
+        .shutdown_sandbox("exec-sock");
 }
 
 /// Boot a 2-service stack with port forwarding, then connect from the host
@@ -1055,7 +1053,7 @@ services:
     let _ = orchestrator
         .executor()
         .runtime()
-        .shutdown_shared_vm("port-fwd");
+        .shutdown_sandbox("port-fwd");
 }
 
 /// Use-case scenario:
@@ -1301,7 +1299,7 @@ services:
     let _ = orchestrator
         .executor()
         .runtime()
-        .shutdown_shared_vm("snapshot-stack");
+        .shutdown_sandbox("snapshot-stack");
 }
 
 /// Use-case scenario:
@@ -1426,5 +1424,5 @@ services:
     let _ = orchestrator
         .executor()
         .runtime()
-        .shutdown_shared_vm("journey-stack");
+        .shutdown_sandbox("journey-stack");
 }

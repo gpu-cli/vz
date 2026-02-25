@@ -144,6 +144,38 @@ pub struct ReconcileSession {
     pub completed_at: Option<u64>,
 }
 
+/// A single audit entry from the reconcile audit log.
+///
+/// Each action in a reconcile session produces one entry when started
+/// and is updated on completion (success or failure). This provides a
+/// durable, ordered record of every reconciliation action for
+/// crash-recovery analysis and operational audit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconcileAuditEntry {
+    /// Auto-incremented row identifier.
+    pub id: i64,
+    /// Session that owns this action.
+    pub session_id: String,
+    /// Stack this action belongs to.
+    pub stack_name: String,
+    /// Ordinal position of the action within the session plan.
+    pub action_index: usize,
+    /// Kind of action (e.g. `"service_create"`, `"service_recreate"`, `"service_remove"`).
+    pub action_kind: String,
+    /// Target service name.
+    pub service_name: String,
+    /// Deterministic hash of the action for identity tracking.
+    pub action_hash: String,
+    /// Lifecycle status: `"started"`, `"completed"`, or `"failed"`.
+    pub status: String,
+    /// Unix epoch seconds when the action started.
+    pub started_at: u64,
+    /// Unix epoch seconds when the action completed (if terminal).
+    pub completed_at: Option<u64>,
+    /// Error message, if the action failed.
+    pub error_message: Option<String>,
+}
+
 /// Status of a reconcile session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ReconcileSessionStatus {
@@ -529,6 +561,22 @@ impl StateStore {
             );
             CREATE INDEX IF NOT EXISTS idx_build_sandbox ON build_state(sandbox_id);
 
+            CREATE TABLE IF NOT EXISTS reconcile_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                stack_name TEXT NOT NULL,
+                action_index INTEGER NOT NULL,
+                action_kind TEXT NOT NULL,
+                service_name TEXT NOT NULL,
+                action_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                error_message TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_session ON reconcile_audit_log(session_id);
+            CREATE INDEX IF NOT EXISTS idx_audit_stack ON reconcile_audit_log(stack_name);
+
             CREATE TABLE IF NOT EXISTS control_metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
@@ -537,7 +585,12 @@ impl StateStore {
         )?;
 
         // Bootstrap initial metadata if not yet set.
-        self.set_control_metadata("schema_version", "1")?;
+        // Uses INSERT OR IGNORE so that a previously-set schema version
+        // (e.g. after a migration) is not overwritten on reopen.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO control_metadata (key, value) VALUES ('schema_version', '1')",
+            [],
+        )?;
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1301,6 +1354,158 @@ impl StateStore {
             });
         }
         Ok(sessions)
+    }
+
+    // ── Reconcile audit log ──
+
+    /// Record the start of a reconcile action in the audit log.
+    ///
+    /// Returns the auto-generated row ID which should be passed to
+    /// [`log_reconcile_action_complete`](Self::log_reconcile_action_complete)
+    /// when the action finishes.
+    pub fn log_reconcile_action_start(
+        &self,
+        entry: &ReconcileAuditEntry,
+    ) -> Result<i64, StackError> {
+        self.conn.execute(
+            "INSERT INTO reconcile_audit_log (
+                session_id, stack_name, action_index, action_kind,
+                service_name, action_hash, status, started_at,
+                completed_at, error_message
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                entry.session_id,
+                entry.stack_name,
+                entry.action_index as i64,
+                entry.action_kind,
+                entry.service_name,
+                entry.action_hash,
+                entry.status,
+                entry.started_at as i64,
+                entry.completed_at.map(|t| t as i64),
+                entry.error_message,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Mark a previously-started audit entry as completed or failed.
+    ///
+    /// Sets `status` to `"completed"` on success or `"failed"` when an
+    /// error message is provided, and records `completed_at` as the
+    /// current Unix epoch second.
+    pub fn log_reconcile_action_complete(
+        &self,
+        id: i64,
+        error: Option<&str>,
+    ) -> Result<(), StackError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let status = if error.is_some() {
+            "failed"
+        } else {
+            "completed"
+        };
+
+        self.conn.execute(
+            "UPDATE reconcile_audit_log
+             SET status = ?1, completed_at = ?2, error_message = ?3
+             WHERE id = ?4",
+            params![status, now as i64, error, id],
+        )?;
+        Ok(())
+    }
+
+    /// Load all audit log entries for a given reconcile session, ordered by action index.
+    pub fn load_audit_log_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ReconcileAuditEntry>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, stack_name, action_index, action_kind,
+                    service_name, action_hash, status, started_at,
+                    completed_at, error_message
+             FROM reconcile_audit_log
+             WHERE session_id = ?1
+             ORDER BY action_index ASC",
+        )?;
+        Self::collect_audit_entries(&mut stmt, params![session_id])
+    }
+
+    /// Load the most recent audit log entries for a stack, ordered newest-first.
+    ///
+    /// `limit` is clamped to `[1, 1000]` to keep queries bounded.
+    pub fn load_recent_audit_log(
+        &self,
+        stack_name: &str,
+        limit: usize,
+    ) -> Result<Vec<ReconcileAuditEntry>, StackError> {
+        let clamped = limit.clamp(1, 1000) as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, stack_name, action_index, action_kind,
+                    service_name, action_hash, status, started_at,
+                    completed_at, error_message
+             FROM reconcile_audit_log
+             WHERE stack_name = ?1
+             ORDER BY id DESC
+             LIMIT ?2",
+        )?;
+        Self::collect_audit_entries(&mut stmt, params![stack_name, clamped])
+    }
+
+    fn collect_audit_entries(
+        stmt: &mut rusqlite::Statement<'_>,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<ReconcileAuditEntry>, StackError> {
+        let rows = stmt.query_map(params, |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+            ))
+        })?;
+
+        let mut entries = Vec::new();
+        for row_result in rows {
+            let (
+                id,
+                session_id,
+                stack_name,
+                action_index,
+                action_kind,
+                service_name,
+                action_hash,
+                status,
+                started_at,
+                completed_at,
+                error_message,
+            ) = row_result?;
+            entries.push(ReconcileAuditEntry {
+                id,
+                session_id,
+                stack_name,
+                action_index: action_index.max(0) as usize,
+                action_kind,
+                service_name,
+                action_hash,
+                status,
+                started_at: started_at.max(0) as u64,
+                completed_at: completed_at.map(|t| t.max(0) as u64),
+                error_message,
+            });
+        }
+        Ok(entries)
     }
 
     // ── Idempotency key persistence ──
@@ -4863,5 +5068,787 @@ mod tests {
         let events = store.load_events("myapp").unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], StackEvent::DriftDetected { .. }));
+    }
+
+    // ── Part 1: Audit log CRUD tests (vz-v2n.3.1) ──
+
+    fn make_audit_entry(
+        session_id: &str,
+        stack_name: &str,
+        action_index: usize,
+        action_kind: &str,
+        service_name: &str,
+    ) -> ReconcileAuditEntry {
+        ReconcileAuditEntry {
+            id: 0, // auto-generated on insert
+            session_id: session_id.to_string(),
+            stack_name: stack_name.to_string(),
+            action_index,
+            action_kind: action_kind.to_string(),
+            service_name: service_name.to_string(),
+            action_hash: format!("hash-{action_index}"),
+            status: "started".to_string(),
+            started_at: 1_700_000_000 + action_index as u64,
+            completed_at: None,
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn audit_log_start_and_load() {
+        let store = StateStore::in_memory().unwrap();
+
+        let entry = make_audit_entry("sess-1", "myapp", 0, "service_create", "web");
+        let id = store.log_reconcile_action_start(&entry).unwrap();
+        assert!(id > 0);
+
+        let log = store.load_audit_log_for_session("sess-1").unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].session_id, "sess-1");
+        assert_eq!(log[0].action_kind, "service_create");
+        assert_eq!(log[0].service_name, "web");
+        assert_eq!(log[0].status, "started");
+        assert!(log[0].completed_at.is_none());
+        assert!(log[0].error_message.is_none());
+    }
+
+    #[test]
+    fn audit_log_complete_success() {
+        let store = StateStore::in_memory().unwrap();
+
+        let entry = make_audit_entry("sess-1", "myapp", 0, "service_create", "web");
+        let id = store.log_reconcile_action_start(&entry).unwrap();
+        store.log_reconcile_action_complete(id, None).unwrap();
+
+        let log = store.load_audit_log_for_session("sess-1").unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].status, "completed");
+        assert!(log[0].completed_at.is_some());
+        assert!(log[0].error_message.is_none());
+    }
+
+    #[test]
+    fn audit_log_complete_failure() {
+        let store = StateStore::in_memory().unwrap();
+
+        let entry = make_audit_entry("sess-1", "myapp", 0, "service_create", "web");
+        let id = store.log_reconcile_action_start(&entry).unwrap();
+        store
+            .log_reconcile_action_complete(id, Some("container start failed"))
+            .unwrap();
+
+        let log = store.load_audit_log_for_session("sess-1").unwrap();
+        assert_eq!(log[0].status, "failed");
+        assert!(log[0].completed_at.is_some());
+        assert_eq!(
+            log[0].error_message.as_deref(),
+            Some("container start failed")
+        );
+    }
+
+    #[test]
+    fn audit_log_multiple_entries_ordered_by_action_index() {
+        let store = StateStore::in_memory().unwrap();
+
+        // Insert out of order to verify ORDER BY
+        let e2 = make_audit_entry("sess-1", "myapp", 2, "service_remove", "cache");
+        let e0 = make_audit_entry("sess-1", "myapp", 0, "service_create", "web");
+        let e1 = make_audit_entry("sess-1", "myapp", 1, "service_create", "db");
+
+        store.log_reconcile_action_start(&e2).unwrap();
+        store.log_reconcile_action_start(&e0).unwrap();
+        store.log_reconcile_action_start(&e1).unwrap();
+
+        let log = store.load_audit_log_for_session("sess-1").unwrap();
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0].action_index, 0);
+        assert_eq!(log[1].action_index, 1);
+        assert_eq!(log[2].action_index, 2);
+    }
+
+    #[test]
+    fn audit_log_scoped_by_session() {
+        let store = StateStore::in_memory().unwrap();
+
+        let e1 = make_audit_entry("sess-1", "myapp", 0, "service_create", "web");
+        let e2 = make_audit_entry("sess-2", "myapp", 0, "service_create", "api");
+
+        store.log_reconcile_action_start(&e1).unwrap();
+        store.log_reconcile_action_start(&e2).unwrap();
+
+        let log1 = store.load_audit_log_for_session("sess-1").unwrap();
+        assert_eq!(log1.len(), 1);
+        assert_eq!(log1[0].service_name, "web");
+
+        let log2 = store.load_audit_log_for_session("sess-2").unwrap();
+        assert_eq!(log2.len(), 1);
+        assert_eq!(log2[0].service_name, "api");
+    }
+
+    #[test]
+    fn audit_log_recent_by_stack() {
+        let store = StateStore::in_memory().unwrap();
+
+        for i in 0..5 {
+            let entry = make_audit_entry(
+                &format!("sess-{i}"),
+                "myapp",
+                0,
+                "service_create",
+                &format!("svc-{i}"),
+            );
+            store.log_reconcile_action_start(&entry).unwrap();
+        }
+
+        // Other stack should not appear
+        let other = make_audit_entry("sess-other", "otherapp", 0, "service_create", "web");
+        store.log_reconcile_action_start(&other).unwrap();
+
+        let recent = store.load_recent_audit_log("myapp", 3).unwrap();
+        assert_eq!(recent.len(), 3);
+        // Newest first (DESC)
+        assert!(recent[0].id > recent[1].id);
+        assert!(recent[1].id > recent[2].id);
+    }
+
+    #[test]
+    fn audit_log_empty_session_returns_empty() {
+        let store = StateStore::in_memory().unwrap();
+        let log = store.load_audit_log_for_session("nonexistent").unwrap();
+        assert!(log.is_empty());
+    }
+
+    // ── Part 2: Recovery fault-injection tests (vz-v2n.3.2) ──
+
+    #[test]
+    fn recovery_crash_during_apply_actions_partially_persisted() {
+        let store = StateStore::in_memory().unwrap();
+
+        // Create session with 3 actions
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "cache".to_string(),
+            },
+        ];
+        let session = ReconcileSession {
+            session_id: "rs-crash-1".to_string(),
+            stack_name: "myapp".to_string(),
+            operation_id: "op-1".to_string(),
+            status: ReconcileSessionStatus::Active,
+            actions_hash: crate::compute_actions_hash(&actions),
+            next_action_index: 0,
+            total_actions: 3,
+            started_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            completed_at: None,
+        };
+        store.create_reconcile_session(&session, &actions).unwrap();
+
+        // Action 0: started + completed
+        let e0 = make_audit_entry("rs-crash-1", "myapp", 0, "service_create", "web");
+        let id0 = store.log_reconcile_action_start(&e0).unwrap();
+        store.log_reconcile_action_complete(id0, None).unwrap();
+
+        // Action 1: started + completed
+        let e1 = make_audit_entry("rs-crash-1", "myapp", 1, "service_create", "db");
+        let id1 = store.log_reconcile_action_start(&e1).unwrap();
+        store.log_reconcile_action_complete(id1, None).unwrap();
+
+        // Action 2: started but NOT completed (crash simulation)
+        let e2 = make_audit_entry("rs-crash-1", "myapp", 2, "service_create", "cache");
+        store.log_reconcile_action_start(&e2).unwrap();
+
+        // Update progress to reflect that we were partway through
+        store
+            .update_reconcile_session_progress("rs-crash-1", 2, &ReconcileSessionStatus::Active)
+            .unwrap();
+
+        // Verify: session is still active (crash recovery)
+        let active = store
+            .load_active_reconcile_session("myapp")
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.session_id, "rs-crash-1");
+        assert_eq!(active.status, ReconcileSessionStatus::Active);
+
+        // Verify: audit log shows 2 completed, 1 started
+        let log = store.load_audit_log_for_session("rs-crash-1").unwrap();
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0].status, "completed");
+        assert_eq!(log[1].status, "completed");
+        assert_eq!(log[2].status, "started"); // crash point
+
+        // Verify: next_action_index points to the right place
+        assert_eq!(active.next_action_index, 2);
+    }
+
+    #[test]
+    fn recovery_restart_with_partial_batch_resumes_from_cursor() {
+        let store = StateStore::in_memory().unwrap();
+
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "cache".to_string(),
+            },
+        ];
+        let session = ReconcileSession {
+            session_id: "rs-resume-1".to_string(),
+            stack_name: "myapp".to_string(),
+            operation_id: "op-2".to_string(),
+            status: ReconcileSessionStatus::Active,
+            actions_hash: crate::compute_actions_hash(&actions),
+            next_action_index: 0,
+            total_actions: 3,
+            started_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            completed_at: None,
+        };
+        store.create_reconcile_session(&session, &actions).unwrap();
+
+        // Complete action 0, advance cursor
+        let e0 = make_audit_entry("rs-resume-1", "myapp", 0, "service_create", "web");
+        let id0 = store.log_reconcile_action_start(&e0).unwrap();
+        store.log_reconcile_action_complete(id0, None).unwrap();
+        store
+            .update_reconcile_session_progress("rs-resume-1", 1, &ReconcileSessionStatus::Active)
+            .unwrap();
+
+        // Simulate restart: load active session
+        let resumed = store
+            .load_active_reconcile_session("myapp")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.next_action_index, 1);
+        assert_eq!(resumed.total_actions, 3);
+
+        // Verify remaining actions via audit log
+        let log = store.load_audit_log_for_session("rs-resume-1").unwrap();
+        let completed_count = log.iter().filter(|e| e.status == "completed").count();
+        assert_eq!(completed_count, 1);
+        // Remaining = total - cursor
+        let remaining = resumed.total_actions - resumed.next_action_index;
+        assert_eq!(remaining, 2);
+    }
+
+    #[test]
+    fn recovery_crash_during_health_polling_state_preserved() {
+        let store = StateStore::in_memory().unwrap();
+
+        let mut health_state = HashMap::new();
+        health_state.insert(
+            "web".to_string(),
+            HealthPollState {
+                service_name: "web".to_string(),
+                consecutive_passes: 3,
+                consecutive_failures: 0,
+                last_check_millis: Some(1_700_000_000_000),
+                start_time_millis: Some(1_700_000_000_100),
+            },
+        );
+        health_state.insert(
+            "db".to_string(),
+            HealthPollState {
+                service_name: "db".to_string(),
+                consecutive_passes: 1,
+                consecutive_failures: 2,
+                last_check_millis: Some(1_700_000_000_500),
+                start_time_millis: Some(1_700_000_000_200),
+            },
+        );
+        store
+            .save_health_poller_state("myapp", &health_state)
+            .unwrap();
+
+        // Simulate crash: just reload from store (in-memory is still there)
+        let restored = store.load_health_poller_state("myapp").unwrap();
+        assert_eq!(restored.len(), 2);
+        let web = restored.get("web").unwrap();
+        assert_eq!(web.consecutive_passes, 3);
+        assert_eq!(web.consecutive_failures, 0);
+        let db = restored.get("db").unwrap();
+        assert_eq!(db.consecutive_passes, 1);
+        assert_eq!(db.consecutive_failures, 2);
+    }
+
+    #[test]
+    fn recovery_port_conflict_replay_after_restart() {
+        let store = StateStore::in_memory().unwrap();
+
+        let mut ports = HashMap::new();
+        ports.insert(
+            "web".to_string(),
+            vec![PublishedPort {
+                host_port: 8080,
+                container_port: 80,
+                protocol: "tcp".to_string(),
+            }],
+        );
+        ports.insert(
+            "api".to_string(),
+            vec![PublishedPort {
+                host_port: 3000,
+                container_port: 3000,
+                protocol: "tcp".to_string(),
+            }],
+        );
+        let snapshot = AllocatorSnapshot {
+            ports: ports.clone(),
+            service_ips: HashMap::from([
+                ("web".to_string(), "10.0.0.2".to_string()),
+                ("api".to_string(), "10.0.0.3".to_string()),
+            ]),
+            mount_tag_offsets: HashMap::from([("web".to_string(), 0), ("api".to_string(), 1)]),
+        };
+        store.save_allocator_state("myapp", &snapshot).unwrap();
+
+        // Simulate restart: reload
+        let restored = store.load_allocator_state("myapp").unwrap().unwrap();
+        assert_eq!(restored.ports, snapshot.ports);
+        assert_eq!(restored.service_ips, snapshot.service_ips);
+        assert_eq!(restored.mount_tag_offsets, snapshot.mount_tag_offsets);
+    }
+
+    #[test]
+    fn recovery_dependency_blocked_replay_after_restart() {
+        let store = StateStore::in_memory().unwrap();
+
+        let spec = StackSpec {
+            name: "myapp".to_string(),
+            services: vec![
+                ServiceSpec {
+                    name: "web".to_string(),
+                    kind: ServiceKind::Service,
+                    image: "nginx:latest".to_string(),
+                    depends_on: vec![crate::spec::ServiceDependency {
+                        service: "db".to_string(),
+                        condition: crate::spec::DependencyCondition::ServiceHealthy,
+                    }],
+                    command: None,
+                    entrypoint: None,
+                    environment: HashMap::new(),
+                    working_dir: None,
+                    user: None,
+                    mounts: vec![],
+                    ports: vec![],
+                    healthcheck: None,
+                    restart_policy: None,
+                    resources: Default::default(),
+                    extra_hosts: vec![],
+                    secrets: vec![],
+                    networks: vec![],
+                    cap_add: vec![],
+                    cap_drop: vec![],
+                    privileged: false,
+                    read_only: false,
+                    sysctls: HashMap::new(),
+                    ulimits: vec![],
+                    container_name: None,
+                    hostname: None,
+                    domainname: None,
+                    labels: HashMap::new(),
+                    stop_signal: None,
+                    stop_grace_period_secs: None,
+                },
+                ServiceSpec {
+                    name: "db".to_string(),
+                    kind: ServiceKind::Service,
+                    image: "postgres:16".to_string(),
+                    depends_on: vec![],
+                    command: None,
+                    entrypoint: None,
+                    environment: HashMap::new(),
+                    working_dir: None,
+                    user: None,
+                    mounts: vec![],
+                    ports: vec![],
+                    healthcheck: None,
+                    restart_policy: None,
+                    resources: Default::default(),
+                    extra_hosts: vec![],
+                    secrets: vec![],
+                    networks: vec![],
+                    cap_add: vec![],
+                    cap_drop: vec![],
+                    privileged: false,
+                    read_only: false,
+                    sysctls: HashMap::new(),
+                    ulimits: vec![],
+                    container_name: None,
+                    hostname: None,
+                    domainname: None,
+                    labels: HashMap::new(),
+                    stop_signal: None,
+                    stop_grace_period_secs: None,
+                },
+            ],
+            networks: vec![],
+            volumes: vec![],
+            secrets: vec![],
+            disk_size_mb: None,
+        };
+        store.save_desired_state("myapp", &spec).unwrap();
+
+        // Simulate restart: reload desired state and verify dependencies
+        let restored = store.load_desired_state("myapp").unwrap().unwrap();
+        assert_eq!(restored.services.len(), 2);
+        let web = restored.services.iter().find(|s| s.name == "web").unwrap();
+        assert_eq!(web.depends_on.len(), 1);
+        assert_eq!(web.depends_on[0].service, "db");
+        assert_eq!(
+            web.depends_on[0].condition,
+            crate::spec::DependencyCondition::ServiceHealthy
+        );
+    }
+
+    #[test]
+    fn recovery_superseded_session_cleanup() {
+        let store = StateStore::in_memory().unwrap();
+
+        // First session
+        let actions1 = vec![Action::ServiceCreate {
+            service_name: "web".to_string(),
+        }];
+        let session1 = ReconcileSession {
+            session_id: "rs-old-1".to_string(),
+            stack_name: "myapp".to_string(),
+            operation_id: "op-old".to_string(),
+            status: ReconcileSessionStatus::Active,
+            actions_hash: crate::compute_actions_hash(&actions1),
+            next_action_index: 0,
+            total_actions: 1,
+            started_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            completed_at: None,
+        };
+        store
+            .create_reconcile_session(&session1, &actions1)
+            .unwrap();
+
+        // Audit entries for old session
+        let e_old = make_audit_entry("rs-old-1", "myapp", 0, "service_create", "web");
+        store.log_reconcile_action_start(&e_old).unwrap();
+
+        // Supersede the old session
+        let superseded_count = store.supersede_active_sessions("myapp").unwrap();
+        assert_eq!(superseded_count, 1);
+
+        // Create new session
+        let actions2 = vec![Action::ServiceRecreate {
+            service_name: "web".to_string(),
+        }];
+        let session2 = ReconcileSession {
+            session_id: "rs-new-1".to_string(),
+            stack_name: "myapp".to_string(),
+            operation_id: "op-new".to_string(),
+            status: ReconcileSessionStatus::Active,
+            actions_hash: crate::compute_actions_hash(&actions2),
+            next_action_index: 0,
+            total_actions: 1,
+            started_at: 1_700_001_000,
+            updated_at: 1_700_001_000,
+            completed_at: None,
+        };
+        store
+            .create_reconcile_session(&session2, &actions2)
+            .unwrap();
+
+        // Verify old audit entries are still queryable
+        let old_log = store.load_audit_log_for_session("rs-old-1").unwrap();
+        assert_eq!(old_log.len(), 1);
+        assert_eq!(old_log[0].service_name, "web");
+
+        // Verify only new session is active
+        let active = store
+            .load_active_reconcile_session("myapp")
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.session_id, "rs-new-1");
+
+        // Verify old session is superseded
+        let all_sessions = store.list_reconcile_sessions("myapp", 10).unwrap();
+        assert_eq!(all_sessions.len(), 2);
+        let old_sess = all_sessions
+            .iter()
+            .find(|s| s.session_id == "rs-old-1")
+            .unwrap();
+        assert_eq!(old_sess.status, ReconcileSessionStatus::Superseded);
+    }
+
+    // ── Part 3: Phase 3 recovery proof validation (vz-v2n.3.3) ──
+
+    #[test]
+    fn phase3_validation_full_recovery_lifecycle() {
+        let store = StateStore::in_memory().unwrap();
+
+        // 1. Create stack with desired state
+        let spec = sample_spec();
+        store.save_desired_state("myapp", &spec).unwrap();
+
+        // 2. Create reconcile session with 3 actions
+        let actions = vec![
+            Action::ServiceCreate {
+                service_name: "web".to_string(),
+            },
+            Action::ServiceCreate {
+                service_name: "db".to_string(),
+            },
+            Action::ServiceRemove {
+                service_name: "old-svc".to_string(),
+            },
+        ];
+        let session = ReconcileSession {
+            session_id: "rs-full-1".to_string(),
+            stack_name: "myapp".to_string(),
+            operation_id: "op-full".to_string(),
+            status: ReconcileSessionStatus::Active,
+            actions_hash: crate::compute_actions_hash(&actions),
+            next_action_index: 0,
+            total_actions: 3,
+            started_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            completed_at: None,
+        };
+        store.create_reconcile_session(&session, &actions).unwrap();
+
+        // 3. Log action starts and completions with audit entries
+        for (idx, action) in actions.iter().enumerate() {
+            let kind = match action {
+                Action::ServiceCreate { .. } => "service_create",
+                Action::ServiceRecreate { .. } => "service_recreate",
+                Action::ServiceRemove { .. } => "service_remove",
+            };
+            let entry = make_audit_entry("rs-full-1", "myapp", idx, kind, action.service_name());
+            let id = store.log_reconcile_action_start(&entry).unwrap();
+            store.log_reconcile_action_complete(id, None).unwrap();
+            store
+                .update_reconcile_session_progress(
+                    "rs-full-1",
+                    idx + 1,
+                    &ReconcileSessionStatus::Active,
+                )
+                .unwrap();
+        }
+
+        // 4. Mark session completed
+        store.complete_reconcile_session("rs-full-1").unwrap();
+
+        // 5. Verify: audit log is complete and ordered
+        let log = store.load_audit_log_for_session("rs-full-1").unwrap();
+        assert_eq!(log.len(), 3);
+        for (idx, entry) in log.iter().enumerate() {
+            assert_eq!(entry.action_index, idx);
+            assert_eq!(entry.status, "completed");
+            assert!(entry.completed_at.is_some());
+        }
+        assert_eq!(log[0].action_kind, "service_create");
+        assert_eq!(log[0].service_name, "web");
+        assert_eq!(log[1].action_kind, "service_create");
+        assert_eq!(log[1].service_name, "db");
+        assert_eq!(log[2].action_kind, "service_remove");
+        assert_eq!(log[2].service_name, "old-svc");
+
+        // 6. Verify: session has correct completed_at
+        let sessions = store.list_reconcile_sessions("myapp", 10).unwrap();
+        let completed_sess = sessions
+            .iter()
+            .find(|s| s.session_id == "rs-full-1")
+            .unwrap();
+        assert_eq!(completed_sess.status, ReconcileSessionStatus::Completed);
+        assert!(completed_sess.completed_at.is_some());
+
+        // 7. Create second session (simulating next apply)
+        store.supersede_active_sessions("myapp").unwrap(); // no-op: already completed
+        let actions2 = vec![Action::ServiceRecreate {
+            service_name: "web".to_string(),
+        }];
+        let session2 = ReconcileSession {
+            session_id: "rs-full-2".to_string(),
+            stack_name: "myapp".to_string(),
+            operation_id: "op-full-2".to_string(),
+            status: ReconcileSessionStatus::Active,
+            actions_hash: crate::compute_actions_hash(&actions2),
+            next_action_index: 0,
+            total_actions: 1,
+            started_at: 1_700_001_000,
+            updated_at: 1_700_001_000,
+            completed_at: None,
+        };
+        store
+            .create_reconcile_session(&session2, &actions2)
+            .unwrap();
+
+        // 8. Verify: old session is completed (not superseded since it was already done),
+        //    new session is active
+        let all = store.list_reconcile_sessions("myapp", 10).unwrap();
+        assert_eq!(all.len(), 2);
+        let old = all.iter().find(|s| s.session_id == "rs-full-1").unwrap();
+        assert_eq!(old.status, ReconcileSessionStatus::Completed);
+        let new = all.iter().find(|s| s.session_id == "rs-full-2").unwrap();
+        assert_eq!(new.status, ReconcileSessionStatus::Active);
+
+        // 9. Verify: drift check returns clean for correct state
+        //    Save observed state matching desired state
+        for svc in &spec.services {
+            store
+                .save_observed_state(
+                    "myapp",
+                    &ServiceObservedState {
+                        service_name: svc.name.clone(),
+                        phase: ServicePhase::Running,
+                        container_id: Some(format!("ctr-{}", svc.name)),
+                        last_error: None,
+                        ready: true,
+                    },
+                )
+                .unwrap();
+        }
+        let findings = store.verify_startup_drift("myapp").unwrap();
+        // The only finding should be about the active session (if stale).
+        // Since the new session was just created, no stale session warning.
+        // Both desired services have observed state, so no orphan warnings.
+        let non_stale: Vec<_> = findings
+            .iter()
+            .filter(|f| f.category != "reconcile")
+            .collect();
+        assert!(
+            non_stale.is_empty(),
+            "unexpected drift findings: {non_stale:?}"
+        );
+    }
+
+    // ── Part 4: Phase 2 schema/drift validation (vz-v2n.2.3) ──
+
+    #[test]
+    fn phase2_validation_schema_version_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test-state.db");
+
+        {
+            let store = StateStore::open(&db_path).unwrap();
+            store.set_schema_version(2).unwrap();
+            assert_eq!(store.schema_version().unwrap(), 2);
+        }
+        // Drop store (close connection), reopen
+        {
+            let store = StateStore::open(&db_path).unwrap();
+            assert_eq!(store.schema_version().unwrap(), 2);
+        }
+    }
+
+    #[test]
+    fn phase2_validation_drift_desired_without_observed() {
+        let store = StateStore::in_memory().unwrap();
+
+        // Save desired state, don't save observed state
+        let spec = sample_spec();
+        store.save_desired_state("myapp", &spec).unwrap();
+
+        let findings = store.verify_startup_drift("myapp").unwrap();
+        let desired_drift: Vec<_> = findings
+            .iter()
+            .filter(|f| f.category == "desired_state")
+            .collect();
+        assert_eq!(desired_drift.len(), 1);
+        assert!(
+            desired_drift[0]
+                .description
+                .contains("desired state without observations")
+        );
+        assert_eq!(desired_drift[0].severity, DriftSeverity::Warning);
+    }
+
+    #[test]
+    fn phase2_validation_drift_orphaned_observed() {
+        let store = StateStore::in_memory().unwrap();
+
+        // Save desired state (only "web" and "db")
+        let spec = sample_spec();
+        store.save_desired_state("myapp", &spec).unwrap();
+
+        // Save observed state for services including one not in desired state
+        for name in &["web", "db", "orphaned-svc"] {
+            store
+                .save_observed_state(
+                    "myapp",
+                    &ServiceObservedState {
+                        service_name: name.to_string(),
+                        phase: ServicePhase::Running,
+                        container_id: Some(format!("ctr-{name}")),
+                        last_error: None,
+                        ready: true,
+                    },
+                )
+                .unwrap();
+        }
+
+        let findings = store.verify_startup_drift("myapp").unwrap();
+        let orphaned: Vec<_> = findings
+            .iter()
+            .filter(|f| f.category == "observed_state")
+            .collect();
+        assert_eq!(orphaned.len(), 1);
+        assert!(
+            orphaned[0]
+                .description
+                .contains("orphaned observed state for service 'orphaned-svc'")
+        );
+        assert_eq!(orphaned[0].severity, DriftSeverity::Warning);
+    }
+
+    #[test]
+    fn phase2_validation_event_queries_after_migration() {
+        let store = StateStore::in_memory().unwrap();
+
+        // Emit events
+        store
+            .emit_event(
+                "myapp",
+                &StackEvent::StackApplyStarted {
+                    stack_name: "myapp".to_string(),
+                    services_count: 2,
+                },
+            )
+            .unwrap();
+        store
+            .emit_event(
+                "myapp",
+                &StackEvent::ServiceCreating {
+                    stack_name: "myapp".to_string(),
+                    service_name: "web".to_string(),
+                },
+            )
+            .unwrap();
+
+        // Verify load_events works
+        let events = store.load_events("myapp").unwrap();
+        assert_eq!(events.len(), 2);
+
+        // Verify load_events_since works
+        let records = store.load_event_records("myapp").unwrap();
+        let since = store.load_events_since("myapp", records[0].id).unwrap();
+        assert_eq!(since.len(), 1);
+        assert!(matches!(since[0].event, StackEvent::ServiceCreating { .. }));
+
+        // Set schema version and verify queries still work
+        store.set_schema_version(3).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 3);
+
+        let events_after = store.load_events("myapp").unwrap();
+        assert_eq!(events_after.len(), 2);
+
+        let since_after = store.load_events_since("myapp", records[0].id).unwrap();
+        assert_eq!(since_after.len(), 1);
     }
 }

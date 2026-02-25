@@ -79,62 +79,62 @@ pub trait ContainerRuntime: Send + Sync {
         Ok(ContainerLogs::default())
     }
 
-    /// Boot a shared VM for a multi-service stack.
+    /// Create a sandbox for multi-container isolation.
     ///
     /// After calling this, containers for the stack should be created via
-    /// [`create_in_stack`](Self::create_in_stack) instead of [`create`](Self::create).
-    fn boot_shared_vm(
+    /// [`create_in_sandbox`](Self::create_in_sandbox) instead of [`create`](Self::create).
+    fn create_sandbox(
         &self,
-        _stack_id: &str,
-        _ports: &[vz_runtime_contract::PortMapping],
+        _sandbox_id: &str,
+        _ports: Vec<vz_runtime_contract::PortMapping>,
         _resources: vz_runtime_contract::StackResourceHint,
     ) -> Result<(), StackError> {
         Ok(())
     }
 
-    /// Set up per-service network namespaces inside the shared VM.
+    /// Create a container within a sandbox scope.
+    ///
+    /// The sandbox must have been created via [`create_sandbox`](Self::create_sandbox).
+    fn create_in_sandbox(
+        &self,
+        sandbox_id: &str,
+        image: &str,
+        config: vz_runtime_contract::RunConfig,
+    ) -> Result<String, StackError> {
+        let _ = sandbox_id;
+        // Default: fall back to individual container create.
+        self.create(image, config)
+    }
+
+    /// Set up networking for services within a sandbox.
     ///
     /// Creates a bridge and per-service netns with veth pairs so that
     /// containers can communicate using real IP addresses (Docker Compose
     /// style networking).
-    fn network_setup(
+    fn setup_sandbox_network(
         &self,
-        _stack_id: &str,
-        _services: &[vz_runtime_contract::NetworkServiceConfig],
+        _sandbox_id: &str,
+        _services: Vec<vz_runtime_contract::NetworkServiceConfig>,
     ) -> Result<(), StackError> {
         Ok(())
     }
 
-    /// Tear down network namespaces for a stack.
-    fn network_teardown(
+    /// Tear down networking within a sandbox.
+    fn teardown_sandbox_network(
         &self,
-        _stack_id: &str,
-        _service_names: &[String],
+        _sandbox_id: &str,
+        _service_names: Vec<String>,
     ) -> Result<(), StackError> {
         Ok(())
     }
 
-    /// Create and start a container inside a shared stack VM.
-    ///
-    /// The VM must have been booted via [`boot_shared_vm`](Self::boot_shared_vm).
-    fn create_in_stack(
-        &self,
-        stack_id: &str,
-        image: &str,
-        config: vz_runtime_contract::RunConfig,
-    ) -> Result<String, StackError> {
-        let _ = stack_id;
-        // Default: fall back to individual VM per container.
-        self.create(image, config)
-    }
-
-    /// Shut down the shared VM for a stack, stopping all its containers.
-    fn shutdown_shared_vm(&self, _stack_id: &str) -> Result<(), StackError> {
+    /// Shut down a sandbox.
+    fn shutdown_sandbox(&self, _sandbox_id: &str) -> Result<(), StackError> {
         Ok(())
     }
 
-    /// Check whether a shared VM is running for the given stack.
-    fn has_shared_vm(&self, _stack_id: &str) -> bool {
+    /// Check if a sandbox is active.
+    fn has_sandbox(&self, _sandbox_id: &str) -> bool {
         false
     }
 }
@@ -225,9 +225,10 @@ impl Default for PortTracker {
 ///
 /// # Runtime Integration
 ///
-/// Currently uses the transitional `boot_shared_vm` / `create_container_in_stack`
-/// path on [`ContainerRuntime`]. Will be migrated to [`WorkspaceRuntimeManager`]
-/// sandbox-scoped operations in a future iteration (vz-l56).
+/// Uses sandbox-scoped operations on [`ContainerRuntime`]:
+/// `create_sandbox`, `create_in_sandbox`, `setup_sandbox_network`,
+/// `teardown_sandbox_network`, `shutdown_sandbox`, and `has_sandbox`.
+/// The CLI layer bridges these to [`WorkspaceRuntimeManager`] sandbox methods.
 pub struct StackExecutor<R: ContainerRuntime> {
     runtime: R,
     store: StateStore,
@@ -418,15 +419,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
     /// are validated for conflicts, and `None` host ports get ephemeral
     /// assignments. Ports are released on service removal.
     ///
-    /// For multi-service stacks, a sandbox (shared VM) is booted before
-    /// creating containers, and per-service network namespaces are set up
-    /// so that containers can communicate using real IP addresses (Docker
-    /// Compose style networking). The sandbox owns the lifecycle of all
-    /// containers and networking within the stack.
-    ///
-    /// Note: uses the transitional `boot_shared_vm` / `create_in_stack`
-    /// path; will migrate to `WorkspaceRuntimeManager` sandbox operations
-    /// in vz-l56.
+    /// For multi-service stacks, a sandbox is created before spawning
+    /// containers, and per-service network namespaces are set up so that
+    /// containers can communicate using real IP addresses (Docker Compose
+    /// style networking). The sandbox owns the lifecycle of all containers
+    /// and networking within the stack.
     pub fn execute(
         &mut self,
         spec: &StackSpec,
@@ -454,7 +451,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             )
         });
 
-        if has_creates && !self.runtime.has_shared_vm(&spec.name) && spec.services.len() > 1 {
+        if has_creates && !self.runtime.has_sandbox(&spec.name) && spec.services.len() > 1 {
             // ── Compute per-network subnets ─────────────────────────────
             //
             // Each distinct network gets its own subnet. Explicit subnets
@@ -690,12 +687,13 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 }
             };
 
-            info!(stack = %spec.name, services = spec.services.len(), "booting shared VM");
+            info!(stack = %spec.name, services = spec.services.len(), "creating sandbox");
             self.runtime
-                .boot_shared_vm(&spec.name, &all_ports, resources)?;
+                .create_sandbox(&spec.name, all_ports, resources)?;
 
             info!(stack = %spec.name, "setting up per-service network namespaces");
-            self.runtime.network_setup(&spec.name, &network_services)?;
+            self.runtime
+                .setup_sandbox_network(&spec.name, network_services)?;
 
             // Store primary IPs for use in prepare_create.
             self.service_ips = service_primary_ip;
@@ -726,7 +724,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
         // Group creates by topo level for parallel execution.
         let levels = compute_topo_levels(&creates, spec);
-        let use_shared_vm = self.runtime.has_shared_vm(&spec.name);
+        let use_shared_vm = self.runtime.has_sandbox(&spec.name);
 
         for level in &levels {
             // Clean up old containers before creating new ones.
@@ -803,7 +801,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     }
                     let create_result = if prep.use_shared_vm {
                         self.runtime
-                            .create_in_stack(&spec.name, &prep.image, prep.run_config)
+                            .create_in_sandbox(&spec.name, &prep.image, prep.run_config)
                     } else {
                         self.runtime.create(&prep.image, prep.run_config)
                     };
@@ -841,7 +839,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                                 runtime.pull(&prep.image)?;
                                 info!(service = %full_name, image = %prep.image, "creating container");
                                 if prep.use_shared_vm {
-                                    runtime.create_in_stack(
+                                    runtime.create_in_sandbox(
                                         stack_name,
                                         &prep.image,
                                         prep.run_config,
@@ -1261,11 +1259,11 @@ pub(crate) mod tests_support {
         pub calls: Mutex<Vec<(String, String)>>,
         /// Counter for create calls (fallback ID generation).
         create_counter: AtomicUsize,
-        /// Tracks which stacks have a shared VM running.
-        shared_vms: Mutex<HashSet<String>>,
-        /// Captured RunConfigs from create/create_in_stack calls, keyed by container_id.
+        /// Tracks which stacks have an active sandbox.
+        sandboxes: Mutex<HashSet<String>>,
+        /// Captured RunConfigs from create/create_in_sandbox calls, keyed by container_id.
         pub captured_configs: Mutex<Vec<(String, vz_runtime_contract::RunConfig)>>,
-        /// Captured NetworkServiceConfigs from network_setup calls.
+        /// Captured NetworkServiceConfigs from setup_sandbox_network calls.
         pub captured_network_services:
             Mutex<Vec<(String, Vec<vz_runtime_contract::NetworkServiceConfig>)>>,
     }
@@ -1282,7 +1280,7 @@ pub(crate) mod tests_support {
                 exec_delay: None,
                 calls: Mutex::new(Vec::new()),
                 create_counter: AtomicUsize::new(0),
-                shared_vms: Mutex::new(HashSet::new()),
+                sandboxes: Mutex::new(HashSet::new()),
                 captured_configs: Mutex::new(Vec::new()),
                 captured_network_services: Mutex::new(Vec::new()),
             }
@@ -1386,17 +1384,17 @@ pub(crate) mod tests_support {
             Ok(self.exec_exit_code)
         }
 
-        fn boot_shared_vm(
+        fn create_sandbox(
             &self,
-            stack_id: &str,
-            ports: &[vz_runtime_contract::PortMapping],
+            sandbox_id: &str,
+            ports: Vec<vz_runtime_contract::PortMapping>,
             _resources: vz_runtime_contract::StackResourceHint,
         ) -> Result<(), StackError> {
             self.calls.lock().unwrap().push((
-                "boot_shared_vm".to_string(),
+                "create_sandbox".to_string(),
                 format!(
                     "{}:{}",
-                    stack_id,
+                    sandbox_id,
                     ports
                         .iter()
                         .map(|p| format!("{}:{}", p.host, p.container))
@@ -1404,56 +1402,23 @@ pub(crate) mod tests_support {
                         .join(",")
                 ),
             ));
-            self.shared_vms.lock().unwrap().insert(stack_id.to_string());
-            Ok(())
-        }
-
-        fn network_setup(
-            &self,
-            stack_id: &str,
-            services: &[vz_runtime_contract::NetworkServiceConfig],
-        ) -> Result<(), StackError> {
-            self.calls.lock().unwrap().push((
-                "network_setup".to_string(),
-                format!(
-                    "{}:{}",
-                    stack_id,
-                    services
-                        .iter()
-                        .map(|s| format!("{}={}@{}", s.name, s.addr, s.network_name))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                ),
-            ));
-            self.captured_network_services
+            self.sandboxes
                 .lock()
                 .unwrap()
-                .push((stack_id.to_string(), services.to_vec()));
+                .insert(sandbox_id.to_string());
             Ok(())
         }
 
-        fn network_teardown(
+        fn create_in_sandbox(
             &self,
-            stack_id: &str,
-            service_names: &[String],
-        ) -> Result<(), StackError> {
-            self.calls.lock().unwrap().push((
-                "network_teardown".to_string(),
-                format!("{}:{}", stack_id, service_names.join(",")),
-            ));
-            Ok(())
-        }
-
-        fn create_in_stack(
-            &self,
-            stack_id: &str,
+            sandbox_id: &str,
             image: &str,
             config: vz_runtime_contract::RunConfig,
         ) -> Result<String, StackError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(("create_in_stack".to_string(), format!("{stack_id}:{image}")));
+            self.calls.lock().unwrap().push((
+                "create_in_sandbox".to_string(),
+                format!("{sandbox_id}:{image}"),
+            ));
             if self.fail_create {
                 return Err(StackError::InvalidSpec("mock create failure".to_string()));
             }
@@ -1465,17 +1430,53 @@ pub(crate) mod tests_support {
             Ok(id)
         }
 
-        fn shutdown_shared_vm(&self, stack_id: &str) -> Result<(), StackError> {
-            self.calls
+        fn setup_sandbox_network(
+            &self,
+            sandbox_id: &str,
+            services: Vec<vz_runtime_contract::NetworkServiceConfig>,
+        ) -> Result<(), StackError> {
+            self.calls.lock().unwrap().push((
+                "setup_sandbox_network".to_string(),
+                format!(
+                    "{}:{}",
+                    sandbox_id,
+                    services
+                        .iter()
+                        .map(|s| format!("{}={}@{}", s.name, s.addr, s.network_name))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            ));
+            self.captured_network_services
                 .lock()
                 .unwrap()
-                .push(("shutdown_shared_vm".to_string(), stack_id.to_string()));
-            self.shared_vms.lock().unwrap().remove(stack_id);
+                .push((sandbox_id.to_string(), services));
             Ok(())
         }
 
-        fn has_shared_vm(&self, stack_id: &str) -> bool {
-            self.shared_vms.lock().unwrap().contains(stack_id)
+        fn teardown_sandbox_network(
+            &self,
+            sandbox_id: &str,
+            service_names: Vec<String>,
+        ) -> Result<(), StackError> {
+            self.calls.lock().unwrap().push((
+                "teardown_sandbox_network".to_string(),
+                format!("{}:{}", sandbox_id, service_names.join(",")),
+            ));
+            Ok(())
+        }
+
+        fn shutdown_sandbox(&self, sandbox_id: &str) -> Result<(), StackError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("shutdown_sandbox".to_string(), sandbox_id.to_string()));
+            self.sandboxes.lock().unwrap().remove(sandbox_id);
+            Ok(())
+        }
+
+        fn has_sandbox(&self, sandbox_id: &str) -> bool {
+            self.sandboxes.lock().unwrap().contains(sandbox_id)
         }
     }
 }
@@ -2271,21 +2272,21 @@ mod tests {
         let result = executor.execute(&spec, &actions).unwrap();
         assert!(result.all_succeeded());
 
-        // Verify ordering: boot_shared_vm → network_setup → create_in_stack × 2.
+        // Verify ordering: create_sandbox → setup_sandbox_network → create_in_sandbox × 2.
         let call_log = executor.runtime.call_log();
         let ops: Vec<&str> = call_log.iter().map(|(op, _)| op.as_str()).collect();
-        assert_eq!(ops[0], "boot_shared_vm");
-        assert_eq!(ops[1], "network_setup");
-        // Remaining: pull + create_in_stack for each service.
-        assert!(ops.contains(&"create_in_stack"));
+        assert_eq!(ops[0], "create_sandbox");
+        assert_eq!(ops[1], "setup_sandbox_network");
+        // Remaining: pull + create_in_sandbox for each service.
+        assert!(ops.contains(&"create_in_sandbox"));
         assert!(
             !ops.contains(&"create"),
-            "should use create_in_stack, not create"
+            "should use create_in_sandbox, not create"
         );
     }
 
     #[test]
-    fn network_setup_assigns_correct_ips() {
+    fn setup_sandbox_network_assigns_correct_ips() {
         let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-db"]);
         let mut executor = make_executor(runtime);
         let spec = network_stack();
@@ -2301,7 +2302,7 @@ mod tests {
 
         executor.execute(&spec, &actions).unwrap();
 
-        // Verify network_setup was called with correct service configs.
+        // Verify setup_sandbox_network was called with correct service configs.
         let captured = executor.runtime.captured_network_services.lock().unwrap();
         assert_eq!(captured.len(), 1);
         let (stack_id, services) = &captured[0];
@@ -2491,13 +2492,13 @@ mod tests {
         let result = executor.execute(&spec, &actions).unwrap();
         assert!(result.all_succeeded());
 
-        // Should use create, not create_in_stack.
+        // Should use create, not create_in_sandbox.
         let call_log = executor.runtime.call_log();
         let ops: Vec<&str> = call_log.iter().map(|(op, _)| op.as_str()).collect();
-        assert!(!ops.contains(&"boot_shared_vm"));
-        assert!(!ops.contains(&"network_setup"));
+        assert!(!ops.contains(&"create_sandbox"));
+        assert!(!ops.contains(&"setup_sandbox_network"));
         assert!(ops.contains(&"create"));
-        assert!(!ops.contains(&"create_in_stack"));
+        assert!(!ops.contains(&"create_in_sandbox"));
     }
 
     #[test]
@@ -2543,14 +2544,14 @@ mod tests {
         }];
         executor.execute(&spec, &actions2).unwrap();
 
-        // boot_shared_vm should only appear once.
+        // create_sandbox should only appear once.
         let boot_count = executor
             .runtime
             .call_log()
             .iter()
-            .filter(|(op, _)| op == "boot_shared_vm")
+            .filter(|(op, _)| op == "create_sandbox")
             .count();
-        assert_eq!(boot_count, 1, "shared VM should not be rebooted");
+        assert_eq!(boot_count, 1, "sandbox should not be recreated");
     }
 
     // ── Parallel execution tests ──
@@ -2725,11 +2726,11 @@ mod tests {
         // web depends on db, so web's create must come after db's.
         // api is independent, so it can be in any order relative to db.
         // With 3 services the executor boots a shared VM, so creates go
-        // through create_in_stack (arg = "stack_name:image").
+        // through create_in_sandbox (arg = "stack_name:image").
         let calls = executor.runtime.call_log();
         let create_calls: Vec<&str> = calls
             .iter()
-            .filter(|(op, _)| op == "create" || op == "create_in_stack")
+            .filter(|(op, _)| op == "create" || op == "create_in_sandbox")
             .map(|(_, arg)| arg.as_str())
             .collect();
         // db and api images are both at level 0.
@@ -2749,7 +2750,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_hints_passed_to_boot_shared_vm() {
+    fn resource_hints_passed_to_create_sandbox() {
         let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-db"]);
         let mut executor = make_executor(runtime);
 
@@ -2786,9 +2787,9 @@ mod tests {
 
         let result = executor.execute(&spec, &actions).unwrap();
         assert!(result.all_succeeded());
-        // Verify boot_shared_vm was called (indicating shared VM was used).
+        // Verify create_sandbox was called (indicating sandbox was used).
         let calls = executor.runtime.call_log();
-        assert!(calls.iter().any(|(op, _)| op == "boot_shared_vm"));
+        assert!(calls.iter().any(|(op, _)| op == "create_sandbox"));
     }
 
     // ── Custom network tests ──
