@@ -156,7 +156,7 @@ pub async fn run(args: BuildArgs) -> anyhow::Result<()> {
             progress: request_progress,
         };
 
-        let mut streamer = BuildEventStreamer::new(ui_mode, display_tag);
+        let mut streamer = BuildEventStreamer::new(ui_mode, display_tag)?;
         let result = vz_oci_macos::buildkit::build_image_with_events(&config, request, |event| {
             streamer.handle(event)
         })
@@ -176,7 +176,7 @@ pub async fn run(args: BuildArgs) -> anyhow::Result<()> {
             _ => println!("Built {}", result.tag),
         }
 
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -231,18 +231,18 @@ struct BuildEventStreamer {
 
 #[cfg(target_os = "macos")]
 impl BuildEventStreamer {
-    fn new(mode: BuildUiMode, tag: String) -> Self {
+    fn new(mode: BuildUiMode, tag: String) -> anyhow::Result<Self> {
         let tui = if matches!(mode, BuildUiMode::FancyTui) {
-            Some(BuildTui::new(tag))
+            Some(BuildTui::new(tag)?)
         } else {
             None
         };
-        Self {
+        Ok(Self {
             mode,
             stdout: std::io::stdout(),
             stderr: std::io::stderr(),
             tui,
-        }
+        })
     }
 
     fn handle(&mut self, event: vz_oci_macos::buildkit::BuildEvent) {
@@ -351,7 +351,7 @@ struct BuildTui {
 impl BuildTui {
     const MAX_LOG_LINES: usize = 400;
 
-    fn new(tag: String) -> Self {
+    fn new(tag: String) -> anyhow::Result<Self> {
         let multi = MultiProgress::new();
         multi.set_draw_target(ProgressDrawTarget::stderr());
 
@@ -361,18 +361,14 @@ impl BuildTui {
         header.set_style(
             ProgressStyle::default_spinner()
                 .tick_strings(tick_frames)
-                .template("{spinner:.cyan} {msg}")
-                .expect("valid template"),
+                .template("{spinner:.cyan} {msg}")?,
         );
         header.enable_steady_tick(Duration::from_millis(90));
 
         let running_style = ProgressStyle::default_spinner()
             .tick_strings(tick_frames)
-            .template("   {spinner:.cyan} {msg}")
-            .expect("valid template");
-        let static_style = ProgressStyle::default_spinner()
-            .template("   {msg}")
-            .expect("valid template");
+            .template("   {spinner:.cyan} {msg}")?;
+        let static_style = ProgressStyle::default_spinner().template("   {msg}")?;
 
         let tui = Self {
             multi,
@@ -391,7 +387,7 @@ impl BuildTui {
             truncated_logs_notice_emitted: false,
         };
         tui.update_header();
-        tui
+        Ok(tui)
     }
 
     fn on_status_message(&mut self, message: &str) {

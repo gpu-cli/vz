@@ -4831,4 +4831,538 @@ x-vz: {}
         assert_eq!(super::parse_size_to_mb("100"), Some(100));
         assert_eq!(super::parse_size_to_mb(""), None);
     }
+
+    // ── Docker Compose shim entrypoint parity (vz-20i) ──────────────
+
+    #[test]
+    fn entrypoint_list_form() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    entrypoint: ["/docker-entrypoint.sh", "--flag"]
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert_eq!(
+            spec.services[0].entrypoint,
+            Some(vec![
+                "/docker-entrypoint.sh".to_string(),
+                "--flag".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn entrypoint_string_form() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    entrypoint: /docker-entrypoint.sh --flag
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert_eq!(
+            spec.services[0].entrypoint,
+            Some(vec![
+                "/docker-entrypoint.sh".to_string(),
+                "--flag".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn entrypoint_absent_is_none() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert!(spec.services[0].entrypoint.is_none());
+    }
+
+    #[test]
+    fn command_list_form() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    command: ["nginx", "-g", "daemon off;"]
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert_eq!(
+            spec.services[0].command,
+            Some(vec![
+                "nginx".to_string(),
+                "-g".to_string(),
+                "daemon off;".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn command_absent_is_none() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert!(spec.services[0].command.is_none());
+    }
+
+    #[test]
+    fn working_dir_parsed() {
+        let yaml = r#"
+services:
+  web:
+    image: node:18
+    working_dir: /app/src
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert_eq!(spec.services[0].working_dir, Some("/app/src".to_string()));
+    }
+
+    #[test]
+    fn working_dir_absent_is_none() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert!(spec.services[0].working_dir.is_none());
+    }
+
+    #[test]
+    fn user_string_parsed() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    user: "1000:1000"
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert_eq!(spec.services[0].user, Some("1000:1000".to_string()));
+    }
+
+    #[test]
+    fn user_name_parsed() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    user: "nginx"
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert_eq!(spec.services[0].user, Some("nginx".to_string()));
+    }
+
+    #[test]
+    fn user_absent_is_none() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert!(spec.services[0].user.is_none());
+    }
+
+    #[test]
+    fn env_file_string_accepted() {
+        // Without a compose_dir, env_file is accepted but entries are empty.
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    env_file: .env
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        // Without compose_dir, env_file entries are not loaded.
+        assert!(spec.services[0].environment.is_empty());
+    }
+
+    #[test]
+    fn env_file_list_accepted() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    env_file:
+      - .env
+      - .env.production
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert!(spec.services[0].environment.is_empty());
+    }
+
+    #[test]
+    fn env_file_with_dir_loads_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("app.env");
+        std::fs::write(&env_path, "DB_HOST=localhost\nDB_PORT=5432\n").unwrap();
+
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    env_file: app.env
+"#;
+        let spec = parse_compose_with_dir(yaml, "test", dir.path()).unwrap();
+        assert_eq!(
+            spec.services[0].environment.get("DB_HOST").unwrap(),
+            "localhost"
+        );
+        assert_eq!(spec.services[0].environment.get("DB_PORT").unwrap(), "5432");
+    }
+
+    #[test]
+    fn env_file_overridden_by_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("base.env");
+        std::fs::write(&env_path, "PORT=3000\nDEBUG=false\n").unwrap();
+
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    env_file: base.env
+    environment:
+      PORT: "8080"
+"#;
+        let spec = parse_compose_with_dir(yaml, "test", dir.path()).unwrap();
+        // Explicit environment overrides env_file.
+        assert_eq!(spec.services[0].environment.get("PORT").unwrap(), "8080");
+        // Non-overridden env_file value is preserved.
+        assert_eq!(spec.services[0].environment.get("DEBUG").unwrap(), "false");
+    }
+
+    #[test]
+    fn labels_mapping_parsed() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    labels:
+      com.example.team: backend
+      com.example.version: "1.2.3"
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert_eq!(
+            spec.services[0].labels.get("com.example.team").unwrap(),
+            "backend"
+        );
+        assert_eq!(
+            spec.services[0].labels.get("com.example.version").unwrap(),
+            "1.2.3"
+        );
+    }
+
+    #[test]
+    fn labels_list_parsed() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    labels:
+      - com.example.team=backend
+      - com.example.version=1.2.3
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert_eq!(
+            spec.services[0].labels.get("com.example.team").unwrap(),
+            "backend"
+        );
+        assert_eq!(
+            spec.services[0].labels.get("com.example.version").unwrap(),
+            "1.2.3"
+        );
+    }
+
+    #[test]
+    fn labels_absent_is_empty() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert!(spec.services[0].labels.is_empty());
+    }
+
+    #[test]
+    fn restart_no_policy() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    restart: "no"
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert_eq!(spec.services[0].restart_policy, Some(RestartPolicy::No));
+    }
+
+    #[test]
+    fn restart_always_policy() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    restart: always
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert_eq!(spec.services[0].restart_policy, Some(RestartPolicy::Always));
+    }
+
+    #[test]
+    fn restart_on_failure_with_retries() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    restart: "on-failure:3"
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert_eq!(
+            spec.services[0].restart_policy,
+            Some(RestartPolicy::OnFailure {
+                max_retries: Some(3)
+            })
+        );
+    }
+
+    #[test]
+    fn restart_on_failure_no_retries() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    restart: on-failure
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert_eq!(
+            spec.services[0].restart_policy,
+            Some(RestartPolicy::OnFailure { max_retries: None })
+        );
+    }
+
+    #[test]
+    fn restart_unless_stopped() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    restart: unless-stopped
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert_eq!(
+            spec.services[0].restart_policy,
+            Some(RestartPolicy::UnlessStopped)
+        );
+    }
+
+    #[test]
+    fn restart_absent_is_none() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert!(spec.services[0].restart_policy.is_none());
+    }
+
+    #[test]
+    fn depends_on_condition_service_healthy() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    depends_on:
+      db:
+        condition: service_healthy
+  db:
+    image: postgres:16
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        let web = spec.services.iter().find(|s| s.name == "web").unwrap();
+        assert_eq!(web.depends_on.len(), 1);
+        assert_eq!(web.depends_on[0].service, "db");
+        assert_eq!(
+            web.depends_on[0].condition,
+            DependencyCondition::ServiceHealthy
+        );
+    }
+
+    #[test]
+    fn depends_on_condition_service_started() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    depends_on:
+      db:
+        condition: service_started
+  db:
+    image: postgres:16
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        let web = spec.services.iter().find(|s| s.name == "web").unwrap();
+        assert_eq!(
+            web.depends_on[0].condition,
+            DependencyCondition::ServiceStarted
+        );
+    }
+
+    #[test]
+    fn depends_on_condition_service_completed_successfully() {
+        let yaml = r#"
+services:
+  app:
+    image: myapp:latest
+    depends_on:
+      init:
+        condition: service_completed_successfully
+  init:
+    image: myinit:latest
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        let app = spec.services.iter().find(|s| s.name == "app").unwrap();
+        assert_eq!(
+            app.depends_on[0].condition,
+            DependencyCondition::ServiceCompletedSuccessfully
+        );
+    }
+
+    #[test]
+    fn depends_on_simple_list_defaults_to_started() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    depends_on:
+      - db
+      - cache
+  db:
+    image: postgres:16
+  cache:
+    image: redis:7
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        let web = spec.services.iter().find(|s| s.name == "web").unwrap();
+        assert_eq!(web.depends_on.len(), 2);
+        assert!(
+            web.depends_on
+                .iter()
+                .all(|d| d.condition == DependencyCondition::ServiceStarted)
+        );
+    }
+
+    #[test]
+    fn depends_on_absent_is_empty() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        assert!(spec.services[0].depends_on.is_empty());
+    }
+
+    /// Comprehensive compose file exercising all vz-20i parity fields at once.
+    #[test]
+    fn full_parity_compose_all_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("app.env");
+        std::fs::write(&env_path, "CACHE_TTL=300\n").unwrap();
+
+        let yaml = r#"
+name: parity-test
+services:
+  web:
+    image: myapp:v2
+    entrypoint: ["/entrypoint.sh", "--init"]
+    command: ["serve", "--port", "8080"]
+    working_dir: /app
+    user: "1001:1001"
+    env_file: app.env
+    environment:
+      NODE_ENV: production
+    labels:
+      com.example.tier: frontend
+      com.example.managed-by: vz
+    restart: on-failure:5
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_started
+  db:
+    image: postgres:16
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+  cache:
+    image: redis:7
+    restart: always
+"#;
+
+        let spec = parse_compose_with_dir(yaml, "fallback", dir.path()).unwrap();
+        assert_eq!(spec.name, "parity-test");
+        assert_eq!(spec.services.len(), 3);
+
+        // Find services by name (sorted).
+        let cache = spec.services.iter().find(|s| s.name == "cache").unwrap();
+        let db = spec.services.iter().find(|s| s.name == "db").unwrap();
+        let web = spec.services.iter().find(|s| s.name == "web").unwrap();
+
+        // web assertions
+        assert_eq!(
+            web.entrypoint,
+            Some(vec!["/entrypoint.sh".to_string(), "--init".to_string()])
+        );
+        assert_eq!(
+            web.command,
+            Some(vec![
+                "serve".to_string(),
+                "--port".to_string(),
+                "8080".to_string()
+            ])
+        );
+        assert_eq!(web.working_dir, Some("/app".to_string()));
+        assert_eq!(web.user, Some("1001:1001".to_string()));
+        assert_eq!(web.environment.get("NODE_ENV").unwrap(), "production");
+        assert_eq!(web.environment.get("CACHE_TTL").unwrap(), "300");
+        assert_eq!(web.labels.get("com.example.tier").unwrap(), "frontend");
+        assert_eq!(web.labels.get("com.example.managed-by").unwrap(), "vz");
+        assert_eq!(
+            web.restart_policy,
+            Some(RestartPolicy::OnFailure {
+                max_retries: Some(5)
+            })
+        );
+        assert_eq!(web.depends_on.len(), 2);
+        let db_dep = web.depends_on.iter().find(|d| d.service == "db").unwrap();
+        assert_eq!(db_dep.condition, DependencyCondition::ServiceHealthy);
+        let cache_dep = web
+            .depends_on
+            .iter()
+            .find(|d| d.service == "cache")
+            .unwrap();
+        assert_eq!(cache_dep.condition, DependencyCondition::ServiceStarted);
+
+        // db assertions
+        assert!(db.healthcheck.is_some());
+        let hc = db.healthcheck.as_ref().unwrap();
+        assert_eq!(hc.test, vec!["CMD-SHELL", "pg_isready"]);
+        assert_eq!(hc.interval_secs, Some(10));
+        assert_eq!(hc.timeout_secs, Some(5));
+        assert_eq!(hc.retries, Some(3));
+
+        // cache assertions
+        assert_eq!(cache.restart_policy, Some(RestartPolicy::Always));
+    }
 }

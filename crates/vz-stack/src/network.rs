@@ -290,7 +290,9 @@ pub fn resolve_ports(
             Some(hp) => {
                 if in_use.contains(&hp) || newly_assigned.contains(&hp) {
                     return Err(StackError::Network(format!(
-                        "host port {hp} is already in use"
+                        "port conflict: host port {hp} is already in use. \
+                         Another service or stack may be bound to this port. \
+                         Try 'vz stack ls' to check running stacks, or use a different host port"
                     )));
                 }
                 hp

@@ -197,6 +197,52 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Default health check retries threshold when not specified.
 const DEFAULT_RETRIES: u32 = 3;
 
+/// Build a detailed health check error message including the command,
+/// exit code, stdout/stderr output, and retry progress.
+fn build_health_check_error(
+    cmd_display: &str,
+    exit_code: i32,
+    exec_error: Option<&str>,
+    stdout: &str,
+    stderr: &str,
+    attempt: u32,
+    retries: u32,
+) -> String {
+    let mut msg = String::new();
+
+    // Command and exit status.
+    if let Some(err) = exec_error {
+        msg.push_str(&format!("{cmd_display} \u{2192} {err}"));
+    } else {
+        msg.push_str(&format!("{cmd_display} \u{2192} exit code {exit_code}"));
+    }
+
+    // Append stderr/stdout snippets if available.
+    let stderr_trimmed = stderr.trim();
+    let stdout_trimmed = stdout.trim();
+    if !stderr_trimmed.is_empty() {
+        // Truncate to last line to keep event payload manageable.
+        let last_line = stderr_trimmed.lines().last().unwrap_or(stderr_trimmed);
+        if last_line.len() > 120 {
+            msg.push_str(&format!(" (stderr: {}...)", &last_line[..117]));
+        } else {
+            msg.push_str(&format!(" (stderr: {last_line})"));
+        }
+    } else if !stdout_trimmed.is_empty() {
+        let last_line = stdout_trimmed.lines().last().unwrap_or(stdout_trimmed);
+        if last_line.len() > 120 {
+            msg.push_str(&format!(" (stdout: {}...)", &last_line[..117]));
+        } else {
+            msg.push_str(&format!(" (stdout: {last_line})"));
+        }
+    }
+
+    // Retry progress.
+    msg.push_str(&format!(" [{attempt}/{retries}]"));
+
+    msg
+}
+
 /// Polls health checks for running services in a stack.
 ///
 /// Call [`poll_all`](HealthPoller::poll_all) periodically (at the
@@ -366,23 +412,40 @@ impl HealthPoller {
                 let cmd_clone = cmd.clone();
                 std::thread::scope(|s| {
                     s.spawn(|| {
-                        let result = runtime.exec(&cid, &cmd_clone);
+                        let result = runtime.exec_with_output(&cid, &cmd_clone);
                         let _ = tx.send(result);
                     });
                     match rx.recv_timeout(timeout) {
-                        Ok(Ok(code)) => {
+                        Ok(Ok((code, stdout, stderr))) => {
                             if code != 0 {
-                                debug!(service = %svc.name, exit_code = code, cmd = ?cmd, "health check returned non-zero");
+                                debug!(
+                                    service = %svc.name,
+                                    exit_code = code,
+                                    cmd = ?cmd,
+                                    stdout = %stdout,
+                                    stderr = %stderr,
+                                    "health check returned non-zero"
+                                );
                             }
-                            (code, None)
+                            (code, None, stdout, stderr)
                         }
                         Ok(Err(e)) => {
                             debug!(service = %svc.name, error = %e, "health check exec failed");
-                            (1, Some(format!("exec error: {e}")))
+                            (
+                                1,
+                                Some(format!("exec error: {e}")),
+                                String::new(),
+                                String::new(),
+                            )
                         }
                         Err(_) => {
                             debug!(service = %svc.name, timeout_secs = timeout.as_secs(), "health check timed out");
-                            (1, Some("timed out".to_string()))
+                            (
+                                1,
+                                Some(format!("timed out after {}s", timeout.as_secs())),
+                                String::new(),
+                                String::new(),
+                            )
                         }
                     }
                 })
@@ -396,7 +459,7 @@ impl HealthPoller {
 
             result.checks_run += 1;
 
-            let (code, exec_error) = exit_code;
+            let (code, exec_error, hc_stdout, hc_stderr) = exit_code;
             if code == 0 {
                 let was_ready = status.consecutive_passes >= 1;
                 status.record_pass();
@@ -428,12 +491,17 @@ impl HealthPoller {
 
                 let retries = hc.retries.unwrap_or(DEFAULT_RETRIES);
 
-                // Build error message with command and exit code or error
-                let error_msg = if let Some(err) = exec_error {
-                    format!("{} → {}", cmd.join(" "), err)
-                } else {
-                    format!("{} → exit code {}", cmd.join(" "), code)
-                };
+                // Build detailed error message with command, exit code, and output.
+                let cmd_display = cmd.join(" ");
+                let error_msg = build_health_check_error(
+                    &cmd_display,
+                    code,
+                    exec_error.as_deref(),
+                    &hc_stdout,
+                    &hc_stderr,
+                    status.consecutive_failures,
+                    retries,
+                );
 
                 // Emit event for every failure.
                 store.emit_event(
@@ -462,12 +530,15 @@ impl HealthPoller {
                         Ok(_) => "(no output captured)".to_string(),
                         Err(e) => format!("(logs error: {e})"),
                     };
-                    debug!(
+                    info!(
                         service = %svc.name,
                         failures = status.consecutive_failures,
                         retries,
                         container_output = %log_output,
-                        "health check retries exhausted, service unhealthy (will keep checking)"
+                        "health check retries exhausted, service unhealthy (will keep checking). \
+                         Suggestions: ensure the service is listening on the configured port, \
+                         verify the health check command is correct, check service logs with \
+                         'vz stack logs <stack> -s {}'", svc.name
                     );
                     result.newly_failed.push(svc.name.clone());
                     // Reset counter so we keep polling on subsequent cycles.
@@ -1313,5 +1384,60 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, StackEvent::HealthCheckFailed { .. }))
         );
+    }
+
+    // ── build_health_check_error tests ──
+
+    #[test]
+    fn build_health_check_error_basic_exit_code() {
+        let msg = build_health_check_error("curl localhost:8080", 1, None, "", "", 1, 3);
+        assert!(msg.contains("curl localhost:8080"));
+        assert!(msg.contains("exit code 1"));
+        assert!(msg.contains("[1/3]"));
+    }
+
+    #[test]
+    fn build_health_check_error_with_exec_error() {
+        let msg = build_health_check_error(
+            "curl localhost:8080",
+            1,
+            Some("exec error: foo"),
+            "",
+            "",
+            2,
+            3,
+        );
+        assert!(msg.contains("exec error: foo"));
+        assert!(!msg.contains("exit code"));
+        assert!(msg.contains("[2/3]"));
+    }
+
+    #[test]
+    fn build_health_check_error_with_stderr() {
+        let msg = build_health_check_error("pg_isready", 2, None, "", "connection refused\n", 1, 5);
+        assert!(msg.contains("exit code 2"));
+        assert!(msg.contains("(stderr: connection refused)"));
+        assert!(msg.contains("[1/5]"));
+    }
+
+    #[test]
+    fn build_health_check_error_with_stdout_when_no_stderr() {
+        let msg = build_health_check_error("check.sh", 1, None, "NOT OK\n", "", 1, 3);
+        assert!(msg.contains("(stdout: NOT OK)"));
+    }
+
+    #[test]
+    fn build_health_check_error_prefers_stderr_over_stdout() {
+        let msg =
+            build_health_check_error("check.sh", 1, None, "stdout stuff", "stderr stuff", 1, 3);
+        assert!(msg.contains("stderr: stderr stuff"));
+        assert!(!msg.contains("stdout stuff"));
+    }
+
+    #[test]
+    fn build_health_check_error_truncates_long_stderr() {
+        let long_stderr = "x".repeat(200);
+        let msg = build_health_check_error("cmd", 1, None, "", &long_stderr, 1, 3);
+        assert!(msg.contains("..."));
     }
 }

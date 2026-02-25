@@ -933,6 +933,60 @@ impl StateStore {
         Ok(count as usize)
     }
 
+    /// Delete events older than `max_age_secs` seconds for a stack.
+    ///
+    /// Returns the number of events deleted. The `created_at` column stores
+    /// an ISO 8601 datetime from SQLite's `datetime('now')`, so the comparison
+    /// uses `datetime('now', '-N seconds')`.
+    pub fn compact_events(&self, stack_name: &str, max_age_secs: u64) -> Result<usize, StackError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM events
+             WHERE stack_name = ?1
+               AND created_at < datetime('now', ?2)",
+            params![stack_name, format!("-{max_age_secs} seconds")],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Keep only the most recent `max_count` events for a stack, deleting older ones.
+    ///
+    /// Returns the number of events deleted.
+    pub fn compact_events_by_count(
+        &self,
+        stack_name: &str,
+        max_count: usize,
+    ) -> Result<usize, StackError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM events
+             WHERE stack_name = ?1
+               AND id NOT IN (
+                   SELECT id FROM events
+                   WHERE stack_name = ?1
+                   ORDER BY id DESC
+                   LIMIT ?2
+               )",
+            params![stack_name, max_count as i64],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Default maximum number of events retained per stack.
+    pub const DEFAULT_MAX_EVENTS: usize = 10_000;
+
+    /// Default maximum age of events in seconds (7 days).
+    pub const DEFAULT_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+
+    /// Run both age-based and count-based compaction with default retention policy.
+    ///
+    /// Deletes events older than [`DEFAULT_MAX_AGE_SECS`](Self::DEFAULT_MAX_AGE_SECS)
+    /// and trims to at most [`DEFAULT_MAX_EVENTS`](Self::DEFAULT_MAX_EVENTS) per stack.
+    /// Returns the total number of events deleted.
+    pub fn compact_events_default(&self, stack_name: &str) -> Result<usize, StackError> {
+        let age_deleted = self.compact_events(stack_name, Self::DEFAULT_MAX_AGE_SECS)?;
+        let count_deleted = self.compact_events_by_count(stack_name, Self::DEFAULT_MAX_EVENTS)?;
+        Ok(age_deleted + count_deleted)
+    }
+
     fn collect_event_records(
         stmt: &mut rusqlite::Statement<'_>,
         params: impl rusqlite::Params,
@@ -3441,6 +3495,145 @@ mod tests {
         assert_eq!(events.len(), 1);
     }
 
+    // ── Event compaction tests ──
+
+    fn emit_n_events(store: &StateStore, stack_name: &str, n: usize) {
+        for i in 0..n {
+            store
+                .emit_event(
+                    stack_name,
+                    &StackEvent::ServiceCreating {
+                        stack_name: stack_name.to_string(),
+                        service_name: format!("svc-{i}"),
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn compact_events_by_count_keeps_recent() {
+        let store = StateStore::in_memory().unwrap();
+        emit_n_events(&store, "myapp", 20);
+
+        assert_eq!(store.event_count("myapp").unwrap(), 20);
+
+        let deleted = store.compact_events_by_count("myapp", 10).unwrap();
+        assert_eq!(deleted, 10);
+        assert_eq!(store.event_count("myapp").unwrap(), 10);
+
+        // The kept events should be the most recent 10 (IDs 11..=20).
+        let records = store.load_event_records("myapp").unwrap();
+        assert_eq!(records.len(), 10);
+        // Verify ordering is ascending by id and that the oldest kept is > 10.
+        assert!(records[0].id > 10);
+    }
+
+    #[test]
+    fn compact_events_by_count_noop_when_under_limit() {
+        let store = StateStore::in_memory().unwrap();
+        emit_n_events(&store, "myapp", 5);
+
+        let deleted = store.compact_events_by_count("myapp", 10).unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(store.event_count("myapp").unwrap(), 5);
+    }
+
+    #[test]
+    fn compact_events_by_count_scoped_to_stack() {
+        let store = StateStore::in_memory().unwrap();
+        emit_n_events(&store, "app-a", 15);
+        emit_n_events(&store, "app-b", 5);
+
+        let deleted = store.compact_events_by_count("app-a", 10).unwrap();
+        assert_eq!(deleted, 5);
+        assert_eq!(store.event_count("app-a").unwrap(), 10);
+        // app-b is untouched.
+        assert_eq!(store.event_count("app-b").unwrap(), 5);
+    }
+
+    #[test]
+    fn compact_events_by_age_deletes_old() {
+        let store = StateStore::in_memory().unwrap();
+        emit_n_events(&store, "myapp", 5);
+
+        // Back-date all events to 2 hours ago so they are clearly old.
+        store
+            .conn
+            .execute(
+                "UPDATE events SET created_at = datetime('now', '-7200 seconds') WHERE stack_name = 'myapp'",
+                [],
+            )
+            .unwrap();
+
+        // Delete events older than 1 hour (3600 seconds). All 5 should be removed.
+        let deleted = store.compact_events("myapp", 3600).unwrap();
+        assert_eq!(deleted, 5);
+        assert_eq!(store.event_count("myapp").unwrap(), 0);
+    }
+
+    #[test]
+    fn compact_events_by_age_keeps_recent() {
+        let store = StateStore::in_memory().unwrap();
+        emit_n_events(&store, "myapp", 5);
+
+        // With a generous window (1 hour), nothing should be deleted
+        // because the events were just created.
+        let deleted = store.compact_events("myapp", 3600).unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(store.event_count("myapp").unwrap(), 5);
+    }
+
+    #[test]
+    fn compact_events_by_age_partial_delete() {
+        let store = StateStore::in_memory().unwrap();
+        emit_n_events(&store, "myapp", 5);
+
+        // Back-date 3 events to 2 hours ago, leave 2 at current time.
+        store
+            .conn
+            .execute(
+                "UPDATE events SET created_at = datetime('now', '-7200 seconds')
+                 WHERE stack_name = 'myapp' AND id IN (
+                     SELECT id FROM events WHERE stack_name = 'myapp' ORDER BY id ASC LIMIT 3
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let deleted = store.compact_events("myapp", 3600).unwrap();
+        assert_eq!(deleted, 3);
+        assert_eq!(store.event_count("myapp").unwrap(), 2);
+    }
+
+    #[test]
+    fn compact_events_default_applies_both_policies() {
+        let store = StateStore::in_memory().unwrap();
+        // Emit more than the default max (10,000).
+        emit_n_events(&store, "myapp", 10_050);
+        assert_eq!(store.event_count("myapp").unwrap(), 10_050);
+
+        let deleted = store.compact_events_default("myapp").unwrap();
+        // Age-based deletes 0 (all recent), count-based deletes 50.
+        assert_eq!(deleted, 50);
+        assert_eq!(store.event_count("myapp").unwrap(), 10_000);
+    }
+
+    #[test]
+    fn event_count_empty_stack() {
+        let store = StateStore::in_memory().unwrap();
+        assert_eq!(store.event_count("nonexistent").unwrap(), 0);
+    }
+
+    #[test]
+    fn compact_events_empty_stack() {
+        let store = StateStore::in_memory().unwrap();
+        let deleted = store.compact_events("nonexistent", 0).unwrap();
+        assert_eq!(deleted, 0);
+        let deleted = store.compact_events_by_count("nonexistent", 10).unwrap();
+        assert_eq!(deleted, 0);
+    }
+
     // ── Sandbox persistence tests ──
 
     fn sample_sandbox(id: &str, stack_name: &str) -> Sandbox {
@@ -5850,5 +6043,310 @@ mod tests {
 
         let since_after = store.load_events_since("myapp", records[0].id).unwrap();
         assert_eq!(since_after.len(), 1);
+    }
+
+    // ── Capacity and regression tests (vz-lbg) ─────────────────────
+
+    fn make_service(name: &str) -> ServiceSpec {
+        ServiceSpec {
+            name: name.to_string(),
+            kind: ServiceKind::Service,
+            image: format!("{name}:latest"),
+            command: None,
+            entrypoint: None,
+            environment: HashMap::from([("PORT".to_string(), "80".to_string())]),
+            working_dir: None,
+            user: None,
+            mounts: vec![],
+            ports: vec![],
+            depends_on: vec![],
+            healthcheck: None,
+            restart_policy: None,
+            resources: Default::default(),
+            extra_hosts: vec![],
+            secrets: vec![],
+            networks: vec![],
+            cap_add: vec![],
+            cap_drop: vec![],
+            privileged: false,
+            read_only: false,
+            sysctls: HashMap::new(),
+            ulimits: vec![],
+            container_name: None,
+            hostname: None,
+            domainname: None,
+            labels: HashMap::new(),
+            stop_signal: None,
+            stop_grace_period_secs: None,
+        }
+    }
+
+    /// Insert 10,000 events into a single stack and verify that cursor-based
+    /// queries remain performant (complete within a generous wall-clock bound).
+    #[test]
+    fn capacity_10k_events_query_performance() {
+        let store = StateStore::in_memory().unwrap();
+
+        // Insert 10,000 events.
+        let start_insert = std::time::Instant::now();
+        for i in 0..10_000 {
+            store
+                .emit_event(
+                    "perf-app",
+                    &StackEvent::ServiceCreating {
+                        stack_name: "perf-app".to_string(),
+                        service_name: format!("svc-{i}"),
+                    },
+                )
+                .unwrap();
+        }
+        let insert_elapsed = start_insert.elapsed();
+        // Generous bound: 10,000 inserts should complete within 10 seconds on CI.
+        assert!(
+            insert_elapsed.as_secs() < 10,
+            "10,000 event inserts took {insert_elapsed:?} (>10s budget)"
+        );
+
+        // Count should be exact.
+        assert_eq!(store.event_count("perf-app").unwrap(), 10_000);
+
+        // Cursor-based query from midpoint should be fast.
+        let start_query = std::time::Instant::now();
+        let page = store
+            .load_events_since_limited("perf-app", 5000, 100)
+            .unwrap();
+        let query_elapsed = start_query.elapsed();
+        assert_eq!(page.len(), 100);
+        // Query should complete in well under 1 second.
+        assert!(
+            query_elapsed.as_millis() < 1000,
+            "cursor query after 10k events took {query_elapsed:?} (>1s budget)"
+        );
+
+        // Full-table scan should also be bounded.
+        let start_all = std::time::Instant::now();
+        let _all_records = store.load_event_records("perf-app").unwrap();
+        let all_elapsed = start_all.elapsed();
+        assert!(
+            all_elapsed.as_secs() < 5,
+            "full load of 10k event records took {all_elapsed:?} (>5s budget)"
+        );
+    }
+
+    /// Verify that 100 concurrent stacks maintain isolation and perform
+    /// adequately for save/load operations.
+    #[test]
+    fn capacity_100_concurrent_stacks_isolation() {
+        let store = StateStore::in_memory().unwrap();
+
+        let start = std::time::Instant::now();
+
+        // Create 100 stacks, each with a unique spec.
+        for i in 0..100 {
+            let name = format!("stack-{i}");
+            let spec = StackSpec {
+                name: name.clone(),
+                services: vec![make_service(&format!("svc-{i}"))],
+                networks: vec![],
+                volumes: vec![],
+                secrets: vec![],
+                disk_size_mb: None,
+            };
+            store.save_desired_state(&name, &spec).unwrap();
+
+            // Emit a couple events per stack.
+            store
+                .emit_event(
+                    &name,
+                    &StackEvent::StackApplyStarted {
+                        stack_name: name.clone(),
+                        services_count: 1,
+                    },
+                )
+                .unwrap();
+            store
+                .emit_event(
+                    &name,
+                    &StackEvent::StackApplyCompleted {
+                        stack_name: name.clone(),
+                        succeeded: 1,
+                        failed: 0,
+                    },
+                )
+                .unwrap();
+
+            // Save observed state.
+            store
+                .save_observed_state(
+                    &name,
+                    &ServiceObservedState {
+                        service_name: format!("svc-{i}"),
+                        phase: ServicePhase::Running,
+                        container_id: Some(format!("ctr-{i}")),
+                        last_error: None,
+                        ready: true,
+                    },
+                )
+                .unwrap();
+        }
+
+        let setup_elapsed = start.elapsed();
+        assert!(
+            setup_elapsed.as_secs() < 10,
+            "setting up 100 stacks took {setup_elapsed:?} (>10s budget)"
+        );
+
+        // Verify isolation: each stack has its own events.
+        for i in 0..100 {
+            let name = format!("stack-{i}");
+            let events = store.load_events(&name).unwrap();
+            assert_eq!(events.len(), 2, "stack-{i} should have exactly 2 events");
+
+            let observed = store.load_observed_state(&name).unwrap();
+            assert_eq!(
+                observed.len(),
+                1,
+                "stack-{i} should have exactly 1 observed state"
+            );
+            assert_eq!(observed[0].service_name, format!("svc-{i}"));
+        }
+
+        // Verify load for a random stack in the middle is fast.
+        let start_load = std::time::Instant::now();
+        let loaded = store.load_desired_state("stack-50").unwrap().unwrap();
+        let load_elapsed = start_load.elapsed();
+        assert_eq!(loaded.name, "stack-50");
+        assert!(
+            load_elapsed.as_millis() < 100,
+            "loading stack-50 among 100 stacks took {load_elapsed:?} (>100ms budget)"
+        );
+    }
+
+    /// Verify that a large desired state (50+ services) round-trips
+    /// correctly through save/load with acceptable performance.
+    #[test]
+    fn capacity_large_desired_state_50_services() {
+        let store = StateStore::in_memory().unwrap();
+
+        let services: Vec<ServiceSpec> =
+            (0..50).map(|i| make_service(&format!("svc-{i}"))).collect();
+        let spec = StackSpec {
+            name: "large-app".to_string(),
+            services,
+            networks: vec![NetworkSpec {
+                name: "default".to_string(),
+                driver: "bridge".to_string(),
+                subnet: None,
+            }],
+            volumes: vec![VolumeSpec {
+                name: "data".to_string(),
+                driver: "local".to_string(),
+                driver_opts: None,
+            }],
+            secrets: vec![],
+            disk_size_mb: Some(20480),
+        };
+
+        let start = std::time::Instant::now();
+        store.save_desired_state("large-app", &spec).unwrap();
+        let loaded = store.load_desired_state("large-app").unwrap().unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(loaded, spec);
+        assert_eq!(loaded.services.len(), 50);
+        assert!(
+            elapsed.as_millis() < 500,
+            "large spec (50 services) save+load took {elapsed:?} (>500ms budget)"
+        );
+
+        // Upsert to verify update path is also performant.
+        let start_upsert = std::time::Instant::now();
+        store.save_desired_state("large-app", &spec).unwrap();
+        let upsert_elapsed = start_upsert.elapsed();
+        assert!(
+            upsert_elapsed.as_millis() < 500,
+            "large spec upsert took {upsert_elapsed:?} (>500ms budget)"
+        );
+    }
+
+    /// Regression: 1,000 event inserts must complete within 500ms.
+    #[test]
+    fn regression_1000_event_inserts_under_500ms() {
+        let store = StateStore::in_memory().unwrap();
+
+        let start = std::time::Instant::now();
+        for i in 0..1_000 {
+            store
+                .emit_event(
+                    "regression-app",
+                    &StackEvent::ServiceCreating {
+                        stack_name: "regression-app".to_string(),
+                        service_name: format!("svc-{i}"),
+                    },
+                )
+                .unwrap();
+        }
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed.as_millis() < 500,
+            "1,000 event inserts took {elapsed:?} — exceeds 500ms regression gate"
+        );
+    }
+
+    /// Regression: idempotency key lookup among 500 keys must be under 50ms.
+    #[test]
+    fn regression_idempotency_lookup_under_50ms() {
+        let store = StateStore::in_memory().unwrap();
+
+        for i in 0..500 {
+            let record = IdempotencyRecord {
+                key: format!("idem-key-{i}"),
+                operation: "create_sandbox".to_string(),
+                request_hash: format!("hash-{i}"),
+                response_json: r#"{"sandbox_id":"sb-1"}"#.to_string(),
+                status_code: 201,
+                created_at: 1_700_000_000,
+                expires_at: 1_700_000_000 + IDEMPOTENCY_TTL_SECS,
+            };
+            store.save_idempotency_result(&record).unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        let result = store.find_idempotency_result("idem-key-250").unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(result.is_some());
+        assert!(
+            elapsed.as_millis() < 50,
+            "idempotency lookup among 500 keys took {elapsed:?} — exceeds 50ms regression gate"
+        );
+    }
+
+    /// Regression: saving and loading observed state for 20 services
+    /// must complete within 200ms.
+    #[test]
+    fn regression_observed_state_20_services_under_200ms() {
+        let store = StateStore::in_memory().unwrap();
+
+        let start = std::time::Instant::now();
+        for i in 0..20 {
+            let state = ServiceObservedState {
+                service_name: format!("svc-{i}"),
+                phase: ServicePhase::Running,
+                container_id: Some(format!("ctr-{i}")),
+                last_error: None,
+                ready: true,
+            };
+            store.save_observed_state("regression-app", &state).unwrap();
+        }
+        let loaded = store.load_observed_state("regression-app").unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(loaded.len(), 20);
+        assert!(
+            elapsed.as_millis() < 200,
+            "20 observed state save+load took {elapsed:?} — exceeds 200ms regression gate"
+        );
     }
 }

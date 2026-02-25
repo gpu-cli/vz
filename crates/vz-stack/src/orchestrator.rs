@@ -280,6 +280,76 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
         Ok(())
     }
 
+    /// Detect and clean up orphaned containers on startup recovery.
+    ///
+    /// When the daemon crashes mid-apply, containers from the partial run
+    /// may be left running with no reconciliation ownership. This method
+    /// queries the runtime for all running containers in the sandbox,
+    /// compares them against observed state in the [`StateStore`], and
+    /// removes any containers not tracked in observed state.
+    ///
+    /// Returns the list of orphaned container IDs that were cleaned up.
+    pub fn cleanup_orphans(
+        &self,
+        spec: &StackSpec,
+        sandbox_id: &str,
+    ) -> Result<Vec<String>, StackError> {
+        let running = self.executor.runtime().list_containers(sandbox_id)?;
+        if running.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let observed = self.reconcile_store.load_observed_state(&spec.name)?;
+        let known_ids: std::collections::HashSet<String> = observed
+            .iter()
+            .filter_map(|o| o.container_id.clone())
+            .collect();
+
+        let mut cleaned = Vec::new();
+        for container_id in &running {
+            if !known_ids.contains(container_id) {
+                info!(
+                    stack = %spec.name,
+                    container_id = %container_id,
+                    "cleaning up orphaned container"
+                );
+                if let Err(e) = self.executor.runtime().stop(container_id, None, None) {
+                    warn!(
+                        container_id = %container_id,
+                        error = %e,
+                        "failed to stop orphaned container, attempting remove"
+                    );
+                }
+                if let Err(e) = self.executor.runtime().remove(container_id) {
+                    warn!(
+                        container_id = %container_id,
+                        error = %e,
+                        "failed to remove orphaned container"
+                    );
+                    continue;
+                }
+                self.reconcile_store.emit_event(
+                    &spec.name,
+                    &StackEvent::OrphanCleaned {
+                        stack_name: spec.name.clone(),
+                        container_id: container_id.clone(),
+                    },
+                )?;
+                cleaned.push(container_id.clone());
+            }
+        }
+
+        if !cleaned.is_empty() {
+            info!(
+                stack = %spec.name,
+                count = cleaned.len(),
+                "cleaned up orphaned containers"
+            );
+        }
+
+        Ok(cleaned)
+    }
+
     /// Run the orchestration loop until convergence or max rounds.
     ///
     /// The optional `on_round` callback is invoked after each round with
@@ -466,6 +536,7 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
             // deferred dependency work for this round.
             if Self::reconciler_reports_converged(pending, &apply_result) {
                 info!(rounds = round, ready, failed, "stack converged");
+                self.compact_events(&spec.name);
                 return Ok(OrchestrationResult {
                     converged: true,
                     rounds: round,
@@ -484,6 +555,8 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
             max_rounds = self.config.max_rounds,
             ready, failed, "orchestration did not converge within max rounds"
         );
+
+        self.compact_events(&spec.name);
 
         Ok(OrchestrationResult {
             converged: false,
@@ -551,6 +624,23 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
             .unwrap_or_default()
             .as_nanos();
         format!("rs-{stack_name}-{round}-{nanos}")
+    }
+
+    /// Run best-effort event compaction after reconciliation.
+    ///
+    /// Applies both age-based and count-based retention policies using
+    /// [`StateStore::compact_events_default`]. Failures are logged but
+    /// do not fail the orchestration.
+    fn compact_events(&self, stack_name: &str) {
+        match self.reconcile_store.compact_events_default(stack_name) {
+            Ok(0) => {}
+            Ok(deleted) => {
+                debug!(deleted, stack = %stack_name, "compacted stale events");
+            }
+            Err(e) => {
+                warn!(error = %e, stack = %stack_name, "event compaction failed");
+            }
+        }
     }
 
     fn resume_incomplete_apply(
@@ -1005,5 +1095,95 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(sandbox.state, SandboxState::Terminated);
+    }
+
+    // ── Orphan cleanup tests ──
+
+    #[test]
+    fn cleanup_orphans_removes_unknown_containers() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
+        // Simulate orphaned containers visible to the runtime.
+        *runtime.listed_containers.lock().unwrap() =
+            vec!["ctr-orphan-1".to_string(), "ctr-orphan-2".to_string()];
+        let (orch, _tmp) = make_orchestrator_shared(runtime);
+        let spec = stack("app", vec![svc("web")]);
+        // No observed state → everything listed is an orphan.
+        let cleaned = orch.cleanup_orphans(&spec, "sbx-test").unwrap();
+        assert_eq!(cleaned.len(), 2);
+        assert!(cleaned.contains(&"ctr-orphan-1".to_string()));
+        assert!(cleaned.contains(&"ctr-orphan-2".to_string()));
+
+        // Verify stop + remove were called for each orphan.
+        let calls = orch.executor.runtime().call_log();
+        let stop_calls: Vec<&str> = calls
+            .iter()
+            .filter(|(op, _)| op == "stop")
+            .map(|(_, arg)| arg.as_str())
+            .collect();
+        assert_eq!(stop_calls.len(), 2);
+        let remove_calls: Vec<&str> = calls
+            .iter()
+            .filter(|(op, _)| op == "remove")
+            .map(|(_, arg)| arg.as_str())
+            .collect();
+        assert_eq!(remove_calls.len(), 2);
+    }
+
+    #[test]
+    fn cleanup_orphans_skips_known_containers() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
+        let (mut orch, _tmp) = make_orchestrator_shared(runtime);
+        let spec = stack("app", vec![svc("web")]);
+
+        // Run once to create observed state with container_id.
+        let result = orch.run(&spec, None).unwrap();
+        assert!(result.converged);
+
+        // Now simulate the same container as "running" plus one orphan.
+        let observed = orch.executor.store().load_observed_state("app").unwrap();
+        let known_id = observed[0].container_id.as_ref().unwrap().clone();
+        *orch.executor.runtime().listed_containers.lock().unwrap() =
+            vec![known_id.clone(), "ctr-orphan".to_string()];
+
+        let cleaned = orch.cleanup_orphans(&spec, "sbx-test").unwrap();
+        assert_eq!(cleaned.len(), 1);
+        assert_eq!(cleaned[0], "ctr-orphan");
+    }
+
+    #[test]
+    fn cleanup_orphans_noop_when_no_running_containers() {
+        let runtime = MockContainerRuntime::new();
+        // listed_containers is empty by default.
+        let (orch, _tmp) = make_orchestrator_shared(runtime);
+        let spec = stack("app", vec![svc("web")]);
+
+        let cleaned = orch.cleanup_orphans(&spec, "sbx-test").unwrap();
+        assert!(cleaned.is_empty());
+    }
+
+    #[test]
+    fn cleanup_orphans_emits_events() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
+        *runtime.listed_containers.lock().unwrap() = vec!["ctr-orphan-1".to_string()];
+        let (mut orch, _tmp) = make_orchestrator_shared(runtime);
+        let rx = orch.subscribe();
+        let spec = stack("app", vec![svc("web")]);
+
+        let cleaned = orch.cleanup_orphans(&spec, "sbx-test").unwrap();
+        assert_eq!(cleaned.len(), 1);
+
+        // Check that OrphanCleaned event was emitted.
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StackEvent::OrphanCleaned {
+                    container_id, ..
+                } if container_id == "ctr-orphan-1")),
+            "should emit OrphanCleaned event"
+        );
     }
 }

@@ -124,9 +124,7 @@ fn main() -> anyhow::Result<()> {
         )
     );
 
-    let filter = if cli.quiet {
-        "error"
-    } else if is_stack_progress && cli.verbose == 0 {
+    let filter = if cli.quiet || (is_stack_progress && cli.verbose == 0) {
         "error"
     } else {
         match cli.verbose {
@@ -430,6 +428,50 @@ mod tests {
             cli.command,
             Commands::Vm(ref args) if matches!(args.action, commands::vm::VmCommand::Rm(_))
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_rm_all_with_yes() {
+        let cli =
+            Cli::try_parse_from(["vz", "vm", "rm", "--all", "--yes", "--force"]).expect("parse");
+        if let Commands::Vm(ref vm_args) = cli.command {
+            if let commands::vm::VmCommand::Rm(ref rm) = vm_args.action {
+                assert!(rm.all);
+                assert!(rm.yes);
+                assert!(rm.force);
+                assert!(rm.name.is_none());
+            } else {
+                panic!("expected Rm");
+            }
+        } else {
+            panic!("expected Vm");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_rm_all_requires_yes_at_parse_level() {
+        // --all without --yes should still parse (validation happens at runtime).
+        let cli = Cli::try_parse_from(["vz", "vm", "rm", "--all"]).expect("parse");
+        if let Commands::Vm(ref vm_args) = cli.command {
+            if let commands::vm::VmCommand::Rm(ref rm) = vm_args.action {
+                assert!(rm.all);
+                assert!(!rm.yes);
+            } else {
+                panic!("expected Rm");
+            }
+        } else {
+            panic!("expected Vm");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_rm_name_required_without_all() {
+        // Without --all, name is required.
+        let result = Cli::try_parse_from(["vz", "vm", "rm"]);
+        assert!(result.is_err());
     }
 
     #[cfg(target_os = "macos")]

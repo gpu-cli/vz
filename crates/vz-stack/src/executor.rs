@@ -137,6 +137,15 @@ pub trait ContainerRuntime: Send + Sync {
     fn has_sandbox(&self, _sandbox_id: &str) -> bool {
         false
     }
+
+    /// List container IDs currently running within a sandbox scope.
+    ///
+    /// Returns the IDs of all containers the runtime considers active
+    /// (running or paused) for the given sandbox. Used during startup
+    /// recovery to detect orphaned containers left by a prior crash.
+    fn list_containers(&self, _sandbox_id: &str) -> Result<Vec<String>, StackError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Container log output (stdout + stderr interleaved).
@@ -1266,6 +1275,8 @@ pub(crate) mod tests_support {
         /// Captured NetworkServiceConfigs from setup_sandbox_network calls.
         pub captured_network_services:
             Mutex<Vec<(String, Vec<vz_runtime_contract::NetworkServiceConfig>)>>,
+        /// Container IDs to return from `list_containers`.
+        pub listed_containers: Mutex<Vec<String>>,
     }
 
     impl MockContainerRuntime {
@@ -1283,6 +1294,7 @@ pub(crate) mod tests_support {
                 sandboxes: Mutex::new(HashSet::new()),
                 captured_configs: Mutex::new(Vec::new()),
                 captured_network_services: Mutex::new(Vec::new()),
+                listed_containers: Mutex::new(Vec::new()),
             }
         }
 
@@ -1477,6 +1489,14 @@ pub(crate) mod tests_support {
 
         fn has_sandbox(&self, sandbox_id: &str) -> bool {
             self.sandboxes.lock().unwrap().contains(sandbox_id)
+        }
+
+        fn list_containers(&self, sandbox_id: &str) -> Result<Vec<String>, StackError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("list_containers".to_string(), sandbox_id.to_string()));
+            Ok(self.listed_containers.lock().unwrap().clone())
         }
     }
 }

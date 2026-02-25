@@ -20,6 +20,11 @@ vz-runtime-contract = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "state_store_bench"
+harness = false
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 vz-oci-macos = { workspace = true }

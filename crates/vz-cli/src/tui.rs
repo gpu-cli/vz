@@ -394,6 +394,7 @@ fn event_color(event: &StackEvent) -> Color {
         StackEvent::ContainerFailed { .. } => Color::Red,
         StackEvent::ContainerRemoved { .. } => Color::DarkGray,
         StackEvent::DriftDetected { .. } => Color::Yellow,
+        StackEvent::OrphanCleaned { .. } => Color::Yellow,
     }
 }
 
@@ -588,6 +589,9 @@ fn format_event_summary(event: &StackEvent) -> String {
             severity,
             ..
         } => format!("Drift [{severity}]  {category}: {description}"),
+        StackEvent::OrphanCleaned { container_id, .. } => {
+            format!("OrphanCleaned    {container_id}")
+        }
     }
 }
 

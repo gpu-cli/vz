@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+mod chaos_tests;
 mod compose;
 mod convert;
 mod error;

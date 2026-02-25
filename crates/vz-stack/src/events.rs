@@ -395,6 +395,14 @@ pub enum StackEvent {
         /// Severity level ("info", "warning", "error").
         severity: String,
     },
+    /// An orphaned container was cleaned up during startup recovery.
+    #[serde(rename = "orphan_cleaned")]
+    OrphanCleaned {
+        /// Stack name the orphan belonged to.
+        stack_name: String,
+        /// Container ID that was removed.
+        container_id: String,
+    },
 }
 
 /// Persisted event record with metadata from the store.
@@ -682,6 +690,10 @@ mod tests {
                 category: "desired_state".to_string(),
                 description: "desired state without observations".to_string(),
                 severity: "warning".to_string(),
+            },
+            StackEvent::OrphanCleaned {
+                stack_name: "myapp".to_string(),
+                container_id: "ctr-orphan-1".to_string(),
             },
         ]
     }
@@ -1015,6 +1027,13 @@ mod tests {
                     severity: "warning".to_string(),
                 },
                 "drift_detected",
+            ),
+            (
+                StackEvent::OrphanCleaned {
+                    stack_name: "t".to_string(),
+                    container_id: "ctr-orphan".to_string(),
+                },
+                "orphan_cleaned",
             ),
         ];
 

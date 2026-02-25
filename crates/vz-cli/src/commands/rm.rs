@@ -8,8 +8,9 @@ use tracing::{info, warn};
 /// Remove VM bookkeeping state, and optionally image artifacts.
 #[derive(Args, Debug)]
 pub struct RmArgs {
-    /// VM name in the local registry.
-    pub name: String,
+    /// VM name in the local registry. Required unless --all is passed.
+    #[arg(required_unless_present = "all")]
+    pub name: Option<String>,
 
     /// Force stop a running VM before removing metadata.
     #[arg(long)]
@@ -22,51 +23,77 @@ pub struct RmArgs {
     /// Explicit image path to remove with --delete-image.
     #[arg(long)]
     pub image: Option<PathBuf>,
+
+    /// Remove ALL VMs from the registry.
+    #[arg(long)]
+    pub all: bool,
+
+    /// Skip confirmation when using --all (proceed immediately).
+    #[arg(long, requires = "all")]
+    pub yes: bool,
 }
 
 pub async fn run(args: RmArgs) -> anyhow::Result<()> {
+    if args.all {
+        return run_remove_all(args).await;
+    }
+
+    // Single VM removal — name is guaranteed present by clap.
+    let name = args
+        .name
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("VM name is required unless --all is passed"))?;
+    run_remove_single(name, args.force, args.delete_image, args.image.as_deref()).await
+}
+
+/// Remove a single VM by name.
+async fn run_remove_single(
+    name: &str,
+    force: bool,
+    delete_image: bool,
+    explicit_image: Option<&Path>,
+) -> anyhow::Result<()> {
     info!(
-        name = %args.name,
-        force = args.force,
-        delete_image = args.delete_image,
-        image = ?args.image,
+        name = %name,
+        force,
+        delete_image,
         "removing vm"
     );
 
     let mut registry = crate::registry::Registry::load()?;
-    let entry = registry.get(&args.name).cloned();
+    let entry = registry.get(name).cloned();
 
     if let Some(entry) = entry.as_ref()
         && crate::registry::is_pid_alive(entry.pid)
     {
-        if !args.force {
+        if !force {
             anyhow::bail!(
                 "VM '{}' is running (PID {}). Stop it first or pass --force.",
-                args.name,
+                name,
                 entry.pid
             );
         }
 
-        stop_running_vm(&args.name, entry.pid).await;
+        stop_running_vm(name, entry.pid).await;
     }
 
-    let removed_registry_entry = registry.remove(&args.name).is_some();
+    let removed_registry_entry = registry.remove(name).is_some();
     if removed_registry_entry {
         registry.save()?;
     }
 
-    let removed_runtime_files = remove_runtime_artifacts(&args.name)?;
+    let removed_runtime_files = remove_runtime_artifacts(name)?;
 
-    let removed_image_files = if args.delete_image {
-        let image_path = match args.image {
-            Some(path) => path,
+    let removed_image_files = if delete_image {
+        let image_path = match explicit_image {
+            Some(path) => path.to_path_buf(),
             None => entry
                 .as_ref()
                 .map(|entry| PathBuf::from(&entry.image))
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "cannot infer image path for '{}'. Pass --image with --delete-image.",
-                        args.name
+                        name
                     )
                 })?,
         };
@@ -77,12 +104,12 @@ pub async fn run(args: RmArgs) -> anyhow::Result<()> {
 
     if !removed_registry_entry && removed_runtime_files.is_empty() && removed_image_files.is_empty()
     {
-        println!("Nothing to remove for '{}'.", args.name);
+        println!("Nothing to remove for '{name}'.");
         return Ok(());
     }
 
     if removed_registry_entry {
-        println!("Removed VM '{}' from registry.", args.name);
+        println!("Removed VM '{name}' from registry.");
     }
 
     if !removed_runtime_files.is_empty() {
@@ -99,6 +126,43 @@ pub async fn run(args: RmArgs) -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Remove ALL VMs from the registry.
+async fn run_remove_all(args: RmArgs) -> anyhow::Result<()> {
+    let registry = crate::registry::Registry::load()?;
+    let names: Vec<String> = registry.entries().keys().cloned().collect();
+
+    if names.is_empty() {
+        println!("No VMs in registry.");
+        return Ok(());
+    }
+
+    if !args.yes {
+        // Per CLAUDE.md we don't use window.confirm/alert. Print a warning
+        // and require --yes for non-interactive confirmation.
+        anyhow::bail!(
+            "About to remove {} VM(s): {}. Pass --yes to confirm.",
+            names.len(),
+            names.join(", ")
+        );
+    }
+
+    info!(count = names.len(), "removing all VMs");
+
+    let mut total_removed = 0;
+    for name in &names {
+        match run_remove_single(name, args.force, args.delete_image, None).await {
+            Ok(()) => total_removed += 1,
+            Err(e) => {
+                warn!(name = %name, error = %e, "failed to remove VM, continuing");
+                println!("Warning: failed to remove '{name}': {e}");
+            }
+        }
+    }
+
+    println!("Removed {total_removed}/{} VMs.", names.len());
     Ok(())
 }
 
@@ -194,5 +258,18 @@ mod tests {
         assert_eq!(artifacts[3], PathBuf::from("/tmp/base-user.machineid"));
         assert_eq!(artifacts[4], PathBuf::from("/tmp/base-user.state"));
         assert_eq!(artifacts[5], PathBuf::from("/tmp/base-user.password"));
+    }
+
+    #[test]
+    fn remove_file_if_exists_returns_false_for_missing() {
+        let result = remove_file_if_exists(Path::new("/nonexistent/path/to/file"));
+        assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn remove_runtime_artifacts_handles_missing_dir() {
+        // If the run dir does not exist, should return empty vec.
+        let removed = remove_runtime_artifacts("nonexistent-vm-12345");
+        assert!(removed.unwrap().is_empty());
     }
 }

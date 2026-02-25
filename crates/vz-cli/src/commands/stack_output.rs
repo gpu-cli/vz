@@ -208,10 +208,14 @@ impl StackOutput {
                 service_name, port, ..
             } => {
                 self.message(&format!(
-                    " {} {} requested host port {} already in use",
+                    " {} {} port conflict: host port {} is already in use",
                     style("!").bold().red(),
                     service_name,
                     port
+                ));
+                self.message(&format!(
+                    "   {} try 'vz stack ls' to find conflicting stacks, or use a different port",
+                    style("\u{2192}").dim()
                 ));
             }
             StackEvent::VolumeCreated { volume_name, .. } => {
@@ -323,7 +327,8 @@ impl StackOutput {
             | StackEvent::ContainerExited { .. }
             | StackEvent::ContainerFailed { .. }
             | StackEvent::ContainerRemoved { .. }
-            | StackEvent::DriftDetected { .. } => {}
+            | StackEvent::DriftDetected { .. }
+            | StackEvent::OrphanCleaned { .. } => {}
         }
         self.update_header();
     }
@@ -812,7 +817,10 @@ impl StackOutput {
         }
 
         for name in &health.newly_failed {
-            self.mark_failed(name, "health check failed");
+            self.mark_failed(
+                name,
+                "health check retries exhausted; check logs with 'vz stack logs'",
+            );
         }
     }
 

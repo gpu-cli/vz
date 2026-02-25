@@ -1881,7 +1881,8 @@ fn event_service_name(event: &StackEvent) -> Option<&str> {
         | StackEvent::ContainerExited { .. }
         | StackEvent::ContainerFailed { .. }
         | StackEvent::ContainerRemoved { .. }
-        | StackEvent::DriftDetected { .. } => None,
+        | StackEvent::DriftDetected { .. }
+        | StackEvent::OrphanCleaned { .. } => None,
     }
 }
 
@@ -1895,6 +1896,62 @@ struct StackListEntry {
     ready: usize,
     total: usize,
     error_summary: Option<String>,
+}
+
+/// Compute the aggregate stack status from observed service states.
+///
+/// Returns `(status_string, ready_count, total_count, error_summary)`.
+///
+/// Status logic:
+/// - All services stopped/pending with none running/failed: `"○ stopped"`
+/// - Some services failed AND some running: `"◐ partial"` (degraded)
+/// - ALL active services failed (none running): `"\u{2717} failed"`
+/// - All services running: `"\u{2713} running"`
+/// - Some services running but not all started yet: `"◐ starting"`
+fn format_stack_status(
+    observed: &[ServiceObservedState],
+) -> (String, usize, usize, Option<String>) {
+    let ready_count = observed
+        .iter()
+        .filter(|o| o.phase == ServicePhase::Running && o.ready)
+        .count();
+    let running = observed
+        .iter()
+        .filter(|o| o.phase == ServicePhase::Running)
+        .count();
+    let total = observed
+        .iter()
+        .filter(|o| o.phase != ServicePhase::Stopped && o.phase != ServicePhase::Pending)
+        .count();
+    let failed = observed
+        .iter()
+        .filter(|o| o.phase == ServicePhase::Failed)
+        .count();
+
+    let first_error = || {
+        observed
+            .iter()
+            .find(|o| o.phase == ServicePhase::Failed && o.last_error.is_some())
+            .and_then(|o| o.last_error.clone())
+    };
+
+    let (status, error_summary) = if total == 0 && running == 0 {
+        ("\u{25cb} stopped".to_string(), None)
+    } else if failed > 0 && running == 0 {
+        // ALL active services failed -- this is a full failure, not partial.
+        ("\u{2717} failed".to_string(), first_error())
+    } else if failed > 0 && running > 0 {
+        // Some services running, some failed -- degraded/partial.
+        ("\u{25d0} partial".to_string(), first_error())
+    } else if running > 0 && running == total {
+        ("\u{2713} running".to_string(), None)
+    } else if running > 0 {
+        ("\u{25d0} starting".to_string(), None)
+    } else {
+        ("\u{25cb} stopped".to_string(), None)
+    };
+
+    (status, ready_count, total, error_summary)
 }
 
 async fn cmd_ls(args: LsArgs) -> anyhow::Result<()> {
@@ -1936,47 +1993,10 @@ async fn cmd_ls(args: LsArgs) -> anyhow::Result<()> {
         // Try to load observed state for service counts.
         let (status, ready, total, error_summary) = match StateStore::open(&db_path) {
             Ok(store) => match store.load_observed_state(&stack_name) {
-                Ok(observed) => {
-                    let ready_count = observed
-                        .iter()
-                        .filter(|o| o.phase == ServicePhase::Running && o.ready)
-                        .count();
-                    let running = observed
-                        .iter()
-                        .filter(|o| o.phase == ServicePhase::Running)
-                        .count();
-                    let total = observed
-                        .iter()
-                        .filter(|o| {
-                            o.phase != ServicePhase::Stopped && o.phase != ServicePhase::Pending
-                        })
-                        .count();
-                    let failed = observed
-                        .iter()
-                        .filter(|o| o.phase == ServicePhase::Failed)
-                        .count();
-
-                    let (status, error_summary) = if total == 0 && running == 0 {
-                        ("◌ stopped".to_string(), None)
-                    } else if failed > 0 {
-                        let error = observed
-                            .iter()
-                            .find(|o| o.phase == ServicePhase::Failed && o.last_error.is_some())
-                            .and_then(|o| o.last_error.clone());
-                        ("○ failed".to_string(), error)
-                    } else if running > 0 && running == total {
-                        // All services are running (even if ready flag isn't set)
-                        ("● running".to_string(), None)
-                    } else if running > 0 {
-                        ("◐ starting".to_string(), None)
-                    } else {
-                        ("◌ stopped".to_string(), None)
-                    };
-                    (status, ready_count, total, error_summary)
-                }
-                Err(_) => ("○ unknown".to_string(), 0, 0, None),
+                Ok(observed) => format_stack_status(&observed),
+                Err(_) => ("\u{2717} unknown".to_string(), 0, 0, None),
             },
-            Err(_) => ("○ unknown".to_string(), 0, 0, None),
+            Err(_) => ("\u{2717} unknown".to_string(), 0, 0, None),
         };
 
         entries.push(StackListEntry {
@@ -2048,11 +2068,17 @@ async fn cmd_ls(args: LsArgs) -> anyhow::Result<()> {
 
         // Footer with summary
         println!();
-        let running = entries.iter().filter(|e| e.status.starts_with("●")).count();
-        let starting = entries.iter().filter(|e| e.status.starts_with("◐")).count();
+        let running = entries
+            .iter()
+            .filter(|e| e.status.contains("running"))
+            .count();
+        let starting = entries
+            .iter()
+            .filter(|e| e.status.contains("starting"))
+            .count();
         let failed = entries
             .iter()
-            .filter(|e| e.status.starts_with("○ failed"))
+            .filter(|e| e.status.contains("failed"))
             .count();
 
         if failed > 0 {
@@ -2332,25 +2358,40 @@ fn print_ps_table(observed: &[ServiceObservedState], desired: Option<&StackSpec>
     let name_width = 14;
     let status_width = 14;
     let health_width = 8;
+    let cpu_width = 8;
+    let mem_width = 10;
     let ports_width = 16;
     let container_width = 20;
 
     println!(
-        "{:<width_name$} {:<width_status$} {:<width_health$} {:<width_ports$} {:<width_container$}",
+        "{:<wn$} {:<ws$} {:<wh$} {:<wc$} {:<wm$} {:<wp$} {:<wcid$}",
         "SERVICE",
         "STATUS",
         "HEALTH",
+        "CPU",
+        "MEMORY",
         "PORTS",
         "CONTAINER",
-        width_name = name_width,
-        width_status = status_width,
-        width_health = health_width,
-        width_ports = ports_width,
-        width_container = container_width
+        wn = name_width,
+        ws = status_width,
+        wh = health_width,
+        wc = cpu_width,
+        wm = mem_width,
+        wp = ports_width,
+        wcid = container_width
     );
     println!(
         "{}",
-        "-".repeat(name_width + status_width + health_width + ports_width + container_width + 4)
+        "-".repeat(
+            name_width
+                + status_width
+                + health_width
+                + cpu_width
+                + mem_width
+                + ports_width
+                + container_width
+                + 6
+        )
     );
 
     for svc in observed {
@@ -2365,14 +2406,18 @@ fn print_ps_table(observed: &[ServiceObservedState], desired: Option<&StackSpec>
         };
 
         let health = if svc.phase == ServicePhase::Failed {
-            "✗ fail".to_string()
+            "\u{2717} fail".to_string()
         } else if svc.ready {
-            "✓ ok".to_string()
+            "\u{2713} ok".to_string()
         } else if svc.phase == ServicePhase::Running {
             "-".to_string()
         } else {
             "-".to_string()
         };
+
+        // Resource usage: not yet available from the runtime backend.
+        let cpu = "N/A";
+        let mem = "N/A";
 
         let ports = ports_map
             .get(svc.service_name.as_str())
@@ -2381,19 +2426,27 @@ fn print_ps_table(observed: &[ServiceObservedState], desired: Option<&StackSpec>
 
         let cid = svc.container_id.as_deref().unwrap_or("-");
         println!(
-            "{:<width_name$} {:<width_status$} {:<width_health$} {:<width_ports$} {:<width_container$}",
+            "{:<wn$} {:<ws$} {:<wh$} {:<wc$} {:<wm$} {:<wp$} {:<wcid$}",
             svc.service_name,
             status,
             health,
+            cpu,
+            mem,
             ports,
             cid,
-            width_name = name_width,
-            width_status = status_width,
-            width_health = health_width,
-            width_ports = ports_width,
-            width_container = container_width
+            wn = name_width,
+            ws = status_width,
+            wh = health_width,
+            wc = cpu_width,
+            wm = mem_width,
+            wp = ports_width,
+            wcid = container_width
         );
     }
+
+    // Note about resource usage
+    println!();
+    println!("Note: CPU/Memory usage requires runtime metrics (not yet available)");
 }
 
 fn print_events_table(records: &[EventRecord]) {
@@ -2602,6 +2655,9 @@ fn format_event_summary(event: &StackEvent) -> String {
             severity,
             ..
         } => format!("drift [{severity}] {category}: {description}"),
+        StackEvent::OrphanCleaned { container_id, .. } => {
+            format!("orphan cleaned: {container_id}")
+        }
     }
 }
 
@@ -3073,5 +3129,117 @@ mod tests {
         assert!(resp.error.is_none());
 
         server.await.unwrap();
+    }
+
+    // ── format_stack_status tests ──
+
+    fn obs(name: &str, phase: ServicePhase, ready: bool) -> ServiceObservedState {
+        ServiceObservedState {
+            service_name: name.to_string(),
+            phase,
+            container_id: None,
+            last_error: None,
+            ready,
+        }
+    }
+
+    #[test]
+    fn format_stack_status_all_running() {
+        let observed = vec![
+            obs("web", ServicePhase::Running, true),
+            obs("db", ServicePhase::Running, true),
+        ];
+        let (status, ready, total, err) = format_stack_status(&observed);
+        assert!(
+            status.contains("running"),
+            "expected running, got: {status}"
+        );
+        assert_eq!(ready, 2);
+        assert_eq!(total, 2);
+        assert!(err.is_none());
+    }
+
+    #[test]
+    fn format_stack_status_all_stopped() {
+        let observed = vec![
+            obs("web", ServicePhase::Stopped, false),
+            obs("db", ServicePhase::Stopped, false),
+        ];
+        let (status, _ready, total, _err) = format_stack_status(&observed);
+        assert!(
+            status.contains("stopped"),
+            "expected stopped, got: {status}"
+        );
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn format_stack_status_all_failed() {
+        let observed = vec![
+            ServiceObservedState {
+                service_name: "web".into(),
+                phase: ServicePhase::Failed,
+                container_id: None,
+                last_error: Some("connection refused".into()),
+                ready: false,
+            },
+            ServiceObservedState {
+                service_name: "db".into(),
+                phase: ServicePhase::Failed,
+                container_id: None,
+                last_error: Some("oom killed".into()),
+                ready: false,
+            },
+        ];
+        let (status, _ready, _total, err) = format_stack_status(&observed);
+        assert!(
+            status.contains("failed"),
+            "expected 'failed' when ALL services fail, got: {status}"
+        );
+        assert!(err.is_some());
+    }
+
+    #[test]
+    fn format_stack_status_partial_failure() {
+        let observed = vec![
+            obs("web", ServicePhase::Running, true),
+            ServiceObservedState {
+                service_name: "db".into(),
+                phase: ServicePhase::Failed,
+                container_id: None,
+                last_error: Some("crash".into()),
+                ready: false,
+            },
+        ];
+        let (status, _ready, _total, err) = format_stack_status(&observed);
+        assert!(
+            status.contains("partial"),
+            "expected 'partial' when some fail and some run, got: {status}"
+        );
+        assert!(err.is_some());
+    }
+
+    #[test]
+    fn format_stack_status_starting() {
+        let observed = vec![
+            obs("web", ServicePhase::Running, false),
+            obs("db", ServicePhase::Creating, false),
+        ];
+        let (status, _ready, _total, _err) = format_stack_status(&observed);
+        assert!(
+            status.contains("starting"),
+            "expected starting, got: {status}"
+        );
+    }
+
+    #[test]
+    fn format_stack_status_empty() {
+        let (status, ready, total, _err) = format_stack_status(&[]);
+        assert!(
+            status.contains("stopped"),
+            "expected stopped, got: {status}"
+        );
+        assert_eq!(ready, 0);
+        assert_eq!(total, 0);
     }
 }
