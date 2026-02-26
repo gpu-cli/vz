@@ -2,6 +2,7 @@
 name = "vz-api"
 version = "0.1.0"
 description = "OpenAPI + SSE/WebSocket transport adapter for Runtime V2"
+build = "build.rs"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,10 +17,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tokio-stream = { workspace = true }
+tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+utoipa = { version = "5.4", features = ["axum_extras"] }
 vz-runtime-contract = { workspace = true }
+vz-runtime-proto = { workspace = true }
+vz-runtimed-client = { workspace = true }
 vz-stack = { workspace = true }
 
 [dev-dependencies]
@@ -27,6 +32,7 @@ reqwest = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true }
 vz-agent-proto = { workspace = true }
+vz-runtimed = { workspace = true }
 
 [lints]
 workspace = true

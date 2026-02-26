@@ -1,0 +1,1113 @@
+use super::super::*;
+
+fn open_stack_store(daemon: &RuntimeDaemon) -> Result<vz_stack::StateStore, StackError> {
+    vz_stack::StateStore::open_with_pragmas(
+        daemon.state_store_path(),
+        vz_stack::StateStorePragmas::daemon_defaults(),
+    )
+}
+
+fn resolve_inherited_exec_pty(
+    daemon: &RuntimeDaemon,
+    container_id: &str,
+) -> Result<bool, StackError> {
+    let store = open_stack_store(daemon)?;
+    Ok(store
+        .resolve_service_tty_for_container(container_id)?
+        .unwrap_or(false))
+}
+
+fn resolve_exec_pty_mode(
+    daemon: &RuntimeDaemon,
+    request: &runtime_v2::CreateExecutionRequest,
+    container_id: &str,
+    request_id: &str,
+) -> Result<bool, Status> {
+    let mode = runtime_v2::create_execution_request::PtyMode::try_from(request.pty_mode).map_err(
+        |_| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                format!("invalid pty_mode value: {}", request.pty_mode),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            ))
+        },
+    )?;
+
+    match mode {
+        runtime_v2::create_execution_request::PtyMode::Inherit => {
+            resolve_inherited_exec_pty(daemon, container_id)
+                .map_err(|error| status_from_stack_error(error, request_id))
+        }
+        runtime_v2::create_execution_request::PtyMode::Enabled => Ok(true),
+        runtime_v2::create_execution_request::PtyMode::Disabled => Ok(false),
+    }
+}
+
+fn execution_not_found_status(execution_id: &str, request_id: &str) -> Status {
+    status_from_machine_error(MachineError::new(
+        MachineErrorCode::NotFound,
+        format!("execution not found: {execution_id}"),
+        Some(request_id.to_string()),
+        BTreeMap::new(),
+    ))
+}
+
+fn terminal_stream_event(execution: &Execution) -> Option<runtime_v2::ExecOutputEvent> {
+    let payload = match execution.state {
+        ExecutionState::Exited => {
+            runtime_v2::exec_output_event::Payload::ExitCode(execution.exit_code.unwrap_or(0))
+        }
+        ExecutionState::Canceled => {
+            runtime_v2::exec_output_event::Payload::ExitCode(execution.exit_code.unwrap_or(130))
+        }
+        ExecutionState::Failed => runtime_v2::exec_output_event::Payload::Error(format!(
+            "execution {} is in failed state",
+            execution.execution_id
+        )),
+        ExecutionState::Queued | ExecutionState::Running => return None,
+    };
+    Some(runtime_v2::ExecOutputEvent {
+        payload: Some(payload),
+        sequence: 0,
+    })
+}
+
+fn session_registry_status(
+    error: crate::ExecutionSessionRegistryError,
+    request_id: &str,
+) -> Status {
+    match error {
+        crate::ExecutionSessionRegistryError::LockPoisoned => {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::InternalError,
+                "execution session registry lock poisoned".to_string(),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            ))
+        }
+        crate::ExecutionSessionRegistryError::NotFound { execution_id } => {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::NotFound,
+                format!("execution session not found: {execution_id}"),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            ))
+        }
+    }
+}
+
+fn runtime_operation_status(
+    error: vz_runtime_contract::RuntimeError,
+    operation: &str,
+    request_id: &str,
+) -> Status {
+    status_from_machine_error(MachineError::new(
+        error.machine_code(),
+        format!("runtime operation `{operation}` failed: {error}"),
+        Some(request_id.to_string()),
+        BTreeMap::new(),
+    ))
+}
+
+fn execution_transition_stack_error(message: impl Into<String>) -> StackError {
+    StackError::Machine {
+        code: MachineErrorCode::StateConflict,
+        message: message.into(),
+    }
+}
+
+fn build_exec_command(spec: &ExecutionSpec) -> Vec<String> {
+    let mut command = spec.cmd.clone();
+    command.extend(spec.args.clone());
+    command
+}
+
+fn exec_config_from_execution(execution: &Execution) -> vz_runtime_contract::ExecConfig {
+    vz_runtime_contract::ExecConfig {
+        execution_id: Some(execution.execution_id.clone()),
+        cmd: build_exec_command(&execution.exec_spec),
+        env: execution
+            .exec_spec
+            .env_override
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        working_dir: None,
+        user: None,
+        pty: execution.exec_spec.pty,
+        term_rows: if execution.exec_spec.pty {
+            Some(24)
+        } else {
+            None
+        },
+        term_cols: if execution.exec_spec.pty {
+            Some(80)
+        } else {
+            None
+        },
+        timeout: execution
+            .exec_spec
+            .timeout_secs
+            .map(std::time::Duration::from_secs),
+    }
+}
+
+fn should_start_execution_task(
+    daemon: &RuntimeDaemon,
+    execution: &Execution,
+) -> Result<bool, StackError> {
+    if execution.state != ExecutionState::Queued {
+        return Ok(false);
+    }
+    daemon.with_state_store(|store| Ok(store.load_container(&execution.container_id)?.is_some()))
+}
+
+fn update_execution_running(
+    daemon: &RuntimeDaemon,
+    execution_id: &str,
+) -> Result<Option<Execution>, StackError> {
+    daemon.with_state_store(|store| {
+        let Some(mut execution) = store.load_execution(execution_id)? else {
+            return Ok(None);
+        };
+
+        match execution.state {
+            ExecutionState::Queued => {
+                let now = current_unix_secs();
+                execution.started_at = Some(now);
+                execution
+                    .transition_to(ExecutionState::Running)
+                    .map_err(|error| execution_transition_stack_error(error.to_string()))?;
+                store.with_immediate_transaction(|tx| {
+                    tx.save_execution(&execution)?;
+                    let _ = tx.emit_event(
+                        "api",
+                        &StackEvent::ExecutionRunning {
+                            execution_id: execution.execution_id.clone(),
+                        },
+                    );
+                    Ok(())
+                })?;
+                Ok(Some(execution))
+            }
+            ExecutionState::Running => Ok(Some(execution)),
+            _ => Ok(None),
+        }
+    })
+}
+
+fn update_execution_terminal(
+    daemon: &RuntimeDaemon,
+    execution_id: &str,
+    target_state: ExecutionState,
+    exit_code: Option<i32>,
+    failure_error: Option<String>,
+) -> Result<Option<Execution>, StackError> {
+    daemon.with_state_store(|store| {
+        let Some(mut execution) = store.load_execution(execution_id)? else {
+            return Ok(None);
+        };
+
+        if execution.state.is_terminal() {
+            return Ok(Some(execution));
+        }
+
+        let now = current_unix_secs();
+        if execution.state == ExecutionState::Queued {
+            execution.started_at = Some(now);
+            execution
+                .transition_to(ExecutionState::Running)
+                .map_err(|error| execution_transition_stack_error(error.to_string()))?;
+        }
+
+        execution.ended_at = Some(now);
+        execution.exit_code = exit_code;
+        execution
+            .transition_to(target_state)
+            .map_err(|error| execution_transition_stack_error(error.to_string()))?;
+
+        store.with_immediate_transaction(|tx| {
+            tx.save_execution(&execution)?;
+            match target_state {
+                ExecutionState::Exited => {
+                    let _ = tx.emit_event(
+                        "api",
+                        &StackEvent::ExecutionExited {
+                            execution_id: execution.execution_id.clone(),
+                            exit_code: exit_code.unwrap_or_default(),
+                        },
+                    );
+                }
+                ExecutionState::Failed => {
+                    let _ = tx.emit_event(
+                        "api",
+                        &StackEvent::ExecutionFailed {
+                            execution_id: execution.execution_id.clone(),
+                            error: failure_error
+                                .clone()
+                                .unwrap_or_else(|| "execution failed".to_string()),
+                        },
+                    );
+                }
+                ExecutionState::Canceled => {
+                    let _ = tx.emit_event(
+                        "api",
+                        &StackEvent::ExecutionCanceled {
+                            execution_id: execution.execution_id.clone(),
+                        },
+                    );
+                }
+                ExecutionState::Queued | ExecutionState::Running => {}
+            }
+            Ok(())
+        })?;
+
+        Ok(Some(execution))
+    })
+}
+
+#[cfg(target_os = "macos")]
+async fn execute_backend_execution(
+    daemon: &RuntimeDaemon,
+    execution: &Execution,
+) -> Result<(vz_runtime_contract::ExecOutput, bool), vz_runtime_contract::RuntimeError> {
+    let execution_id = execution.execution_id.clone();
+    let output = daemon
+        .manager()
+        .backend()
+        .exec_container_streaming(
+            &execution.container_id,
+            exec_config_from_execution(execution),
+            |event| match event {
+                vz_oci_macos::InteractiveExecEvent::Stdout(stdout) => {
+                    let _ = daemon
+                        .execution_sessions()
+                        .publish_stdout(&execution_id, stdout);
+                }
+                vz_oci_macos::InteractiveExecEvent::Stderr(stderr) => {
+                    let _ = daemon
+                        .execution_sessions()
+                        .publish_stderr(&execution_id, stderr);
+                }
+                vz_oci_macos::InteractiveExecEvent::Exit(exit_code) => {
+                    let _ = daemon
+                        .execution_sessions()
+                        .publish_exit_code(&execution_id, exit_code);
+                }
+            },
+        )
+        .await?;
+    Ok((output, true))
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn execute_backend_execution(
+    daemon: &RuntimeDaemon,
+    execution: &Execution,
+) -> Result<(vz_runtime_contract::ExecOutput, bool), vz_runtime_contract::RuntimeError> {
+    let output = daemon
+        .manager()
+        .exec_container(
+            &execution.container_id,
+            exec_config_from_execution(execution),
+        )
+        .await?;
+    Ok((output, false))
+}
+
+async fn run_execution_task(daemon: Arc<RuntimeDaemon>, execution_id: String) {
+    let running_execution = match update_execution_running(daemon.as_ref(), &execution_id) {
+        Ok(execution) => execution,
+        Err(error) => {
+            warn!(
+                execution_id = %execution_id,
+                error = %error,
+                "failed to transition execution to running"
+            );
+            let _ = daemon
+                .execution_sessions()
+                .publish_error(&execution_id, format!("execution could not start: {error}"));
+            let _ = daemon.execution_sessions().remove(&execution_id);
+            return;
+        }
+    };
+
+    let Some(execution) = running_execution else {
+        let _ = daemon.execution_sessions().remove(&execution_id);
+        return;
+    };
+
+    let result = execute_backend_execution(daemon.as_ref(), &execution).await;
+
+    match result {
+        Ok((output, emitted_live_events)) => {
+            if !emitted_live_events && !output.stdout.is_empty() {
+                let _ = daemon
+                    .execution_sessions()
+                    .publish_stdout(&execution_id, output.stdout.as_bytes().to_vec());
+            }
+            if !emitted_live_events && !output.stderr.is_empty() {
+                let _ = daemon
+                    .execution_sessions()
+                    .publish_stderr(&execution_id, output.stderr.as_bytes().to_vec());
+            }
+            if !emitted_live_events {
+                let _ = daemon
+                    .execution_sessions()
+                    .publish_exit_code(&execution_id, output.exit_code);
+            }
+
+            if let Err(error) = update_execution_terminal(
+                daemon.as_ref(),
+                &execution_id,
+                ExecutionState::Exited,
+                Some(output.exit_code),
+                None,
+            ) {
+                warn!(
+                    execution_id = %execution_id,
+                    error = %error,
+                    "failed to persist exited execution state"
+                );
+            }
+        }
+        Err(error) => {
+            let error_message = format!("runtime execution failed: {error}");
+            let _ = daemon
+                .execution_sessions()
+                .publish_error(&execution_id, error_message.clone());
+            if let Err(persist_error) = update_execution_terminal(
+                daemon.as_ref(),
+                &execution_id,
+                ExecutionState::Failed,
+                None,
+                Some(error_message),
+            ) {
+                warn!(
+                    execution_id = %execution_id,
+                    error = %persist_error,
+                    "failed to persist failed execution state"
+                );
+            }
+        }
+    }
+
+    let _ = daemon.execution_sessions().remove(&execution_id);
+}
+
+fn maybe_spawn_execution_task(
+    daemon: Arc<RuntimeDaemon>,
+    execution: &Execution,
+    request_id: &str,
+) -> Result<(), Status> {
+    if !should_start_execution_task(daemon.as_ref(), execution)
+        .map_err(|error| status_from_stack_error(error, request_id))?
+    {
+        return Ok(());
+    }
+
+    let execution_id = execution.execution_id.clone();
+    let daemon_task = daemon.clone();
+    let task = tokio::spawn(async move {
+        run_execution_task(daemon_task, execution_id).await;
+    });
+    let abort_handle = task.abort_handle();
+
+    match daemon
+        .execution_sessions()
+        .attach_task_abort(&execution.execution_id, abort_handle)
+    {
+        Ok(()) => Ok(()),
+        Err(crate::ExecutionSessionRegistryError::NotFound { .. }) => Ok(()),
+        Err(other) => {
+            task.abort();
+            Err(session_registry_status(other, request_id))
+        }
+    }
+}
+
+pub(in crate::grpc) struct ExecutionServiceImpl {
+    daemon: Arc<RuntimeDaemon>,
+}
+
+impl ExecutionServiceImpl {
+    pub(in crate::grpc) fn new(daemon: Arc<RuntimeDaemon>) -> Self {
+        Self { daemon }
+    }
+}
+
+#[tonic::async_trait]
+impl runtime_v2::execution_service_server::ExecutionService for ExecutionServiceImpl {
+    type StreamExecOutputStream =
+        tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::ExecOutputEvent, Status>>;
+
+    async fn create_execution(
+        &self,
+        request: Request<runtime_v2::CreateExecutionRequest>,
+    ) -> Result<Response<runtime_v2::ExecutionResponse>, Status> {
+        let intercepted_request_id = request_id_from_extensions(&request);
+        let request = request.into_inner();
+        let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
+        let request_id = metadata
+            .request_id
+            .clone()
+            .unwrap_or_else(generate_request_id);
+        let idempotency_key = metadata.idempotency_key.clone();
+        let normalized_idempotency_key = normalize_idempotency_key(idempotency_key.as_deref());
+
+        let container_id = request.container_id.trim().to_string();
+        if container_id.is_empty() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                "container_id cannot be empty".to_string(),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+        let resolved_pty =
+            resolve_exec_pty_mode(self.daemon.as_ref(), &request, &container_id, &request_id)?;
+        let request_hash = create_execution_request_hash(&request);
+
+        if let Some(key) = normalized_idempotency_key {
+            if let Some(cached_execution) = load_idempotent_execution_replay(
+                &self.daemon,
+                key,
+                "create_execution",
+                &request_hash,
+                &request_id,
+            )? {
+                if !cached_execution.state.is_terminal() {
+                    self.daemon
+                        .execution_sessions()
+                        .register(&cached_execution.execution_id)
+                        .map_err(|error| session_registry_status(error, &request_id))?;
+                    maybe_spawn_execution_task(
+                        self.daemon.clone(),
+                        &cached_execution,
+                        &request_id,
+                    )?;
+                }
+                return Ok(Response::new(runtime_v2::ExecutionResponse {
+                    request_id: request_id.clone(),
+                    execution: Some(execution_to_proto_payload(&cached_execution)),
+                }));
+            }
+        }
+
+        let execution = Execution {
+            execution_id: generate_execution_id(),
+            container_id: container_id.clone(),
+            exec_spec: ExecutionSpec {
+                cmd: request.cmd,
+                args: request.args,
+                env_override: request.env_override.into_iter().collect(),
+                pty: resolved_pty,
+                timeout_secs: if request.timeout_secs == 0 {
+                    None
+                } else {
+                    Some(request.timeout_secs)
+                },
+            },
+            state: ExecutionState::Queued,
+            exit_code: None,
+            started_at: None,
+            ended_at: None,
+        };
+
+        let now = current_unix_secs();
+        let receipt_id = generate_receipt_id();
+        let persist_result = self.daemon.with_state_store(|store| {
+            store.with_immediate_transaction(|tx| {
+                tx.save_execution(&execution)?;
+                tx.save_receipt(&Receipt {
+                    receipt_id: receipt_id.clone(),
+                    operation: "create_execution".to_string(),
+                    entity_id: execution.execution_id.clone(),
+                    entity_type: "execution".to_string(),
+                    request_id: request_id.clone(),
+                    status: "success".to_string(),
+                    created_at: now,
+                    metadata: serde_json::json!({}),
+                })?;
+                if let Some(key) = normalized_idempotency_key {
+                    tx.save_idempotency_result(&IdempotencyRecord {
+                        key: key.to_string(),
+                        operation: "create_execution".to_string(),
+                        request_hash: request_hash.clone(),
+                        response_json: execution.execution_id.clone(),
+                        status_code: 201,
+                        created_at: now,
+                        expires_at: now.saturating_add(IDEMPOTENCY_TTL_SECS),
+                    })?;
+                }
+                Ok(())
+            })
+        });
+        if let Err(error) = persist_result {
+            if let Some(key) = normalized_idempotency_key {
+                if let Some(cached_execution) = load_idempotent_execution_replay(
+                    &self.daemon,
+                    key,
+                    "create_execution",
+                    &request_hash,
+                    &request_id,
+                )? {
+                    if !cached_execution.state.is_terminal() {
+                        self.daemon
+                            .execution_sessions()
+                            .register(&cached_execution.execution_id)
+                            .map_err(|error| session_registry_status(error, &request_id))?;
+                        maybe_spawn_execution_task(
+                            self.daemon.clone(),
+                            &cached_execution,
+                            &request_id,
+                        )?;
+                    }
+                    return Ok(Response::new(runtime_v2::ExecutionResponse {
+                        request_id,
+                        execution: Some(execution_to_proto_payload(&cached_execution)),
+                    }));
+                }
+            }
+            return Err(status_from_stack_error(error, &request_id));
+        }
+
+        self.daemon
+            .execution_sessions()
+            .register(&execution.execution_id)
+            .map_err(|error| session_registry_status(error, &request_id))?;
+        maybe_spawn_execution_task(self.daemon.clone(), &execution, &request_id)?;
+
+        let mut response = Response::new(runtime_v2::ExecutionResponse {
+            request_id,
+            execution: Some(execution_to_proto_payload(&execution)),
+        });
+        if let Ok(value) = MetadataValue::try_from(receipt_id.as_str()) {
+            response.metadata_mut().insert("x-receipt-id", value);
+        }
+        Ok(response)
+    }
+
+    async fn get_execution(
+        &self,
+        request: Request<runtime_v2::GetExecutionRequest>,
+    ) -> Result<Response<runtime_v2::ExecutionResponse>, Status> {
+        let intercepted_request_id = request_id_from_extensions(&request);
+        let request = request.into_inner();
+        let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
+        let request_id = metadata
+            .request_id
+            .clone()
+            .unwrap_or_else(generate_request_id);
+
+        let execution = self
+            .daemon
+            .with_state_store(|store| store.load_execution(&request.execution_id))
+            .map_err(|error| status_from_stack_error(error, &request_id))?
+            .ok_or_else(|| {
+                status_from_machine_error(MachineError::new(
+                    MachineErrorCode::NotFound,
+                    format!("execution not found: {}", request.execution_id),
+                    Some(request_id.clone()),
+                    BTreeMap::new(),
+                ))
+            })?;
+
+        Ok(Response::new(runtime_v2::ExecutionResponse {
+            request_id,
+            execution: Some(execution_to_proto_payload(&execution)),
+        }))
+    }
+
+    async fn list_executions(
+        &self,
+        request: Request<runtime_v2::ListExecutionsRequest>,
+    ) -> Result<Response<runtime_v2::ListExecutionsResponse>, Status> {
+        let intercepted_request_id = request_id_from_extensions(&request);
+        let request = request.into_inner();
+        let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
+        let request_id = metadata
+            .request_id
+            .clone()
+            .unwrap_or_else(generate_request_id);
+
+        let executions = self
+            .daemon
+            .with_state_store(|store| store.list_executions())
+            .map_err(|error| status_from_stack_error(error, &request_id))?
+            .iter()
+            .map(execution_to_proto_payload)
+            .collect();
+
+        Ok(Response::new(runtime_v2::ListExecutionsResponse {
+            request_id,
+            executions,
+        }))
+    }
+
+    async fn cancel_execution(
+        &self,
+        request: Request<runtime_v2::CancelExecutionRequest>,
+    ) -> Result<Response<runtime_v2::ExecutionResponse>, Status> {
+        let intercepted_request_id = request_id_from_extensions(&request);
+        let request = request.into_inner();
+        let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
+        let request_id = metadata
+            .request_id
+            .clone()
+            .unwrap_or_else(generate_request_id);
+
+        let mut execution = self
+            .daemon
+            .with_state_store(|store| store.load_execution(&request.execution_id))
+            .map_err(|error| status_from_stack_error(error, &request_id))?
+            .ok_or_else(|| {
+                status_from_machine_error(MachineError::new(
+                    MachineErrorCode::NotFound,
+                    format!("execution not found: {}", request.execution_id),
+                    Some(request_id.clone()),
+                    BTreeMap::new(),
+                ))
+            })?;
+
+        if execution.state.is_terminal() {
+            return Ok(Response::new(runtime_v2::ExecutionResponse {
+                request_id,
+                execution: Some(execution_to_proto_payload(&execution)),
+            }));
+        }
+
+        let task_abort_result = match self
+            .daemon
+            .execution_sessions()
+            .abort_task(&execution.execution_id)
+        {
+            Ok(result) => result,
+            Err(crate::ExecutionSessionRegistryError::NotFound { .. }) => false,
+            Err(error) => return Err(session_registry_status(error, &request_id)),
+        };
+
+        if execution.state == ExecutionState::Running {
+            let cancel_result = self
+                .daemon
+                .manager()
+                .cancel_exec(&execution.execution_id)
+                .await;
+            if let Err(error) = cancel_result
+                && (!matches!(
+                    error,
+                    vz_runtime_contract::RuntimeError::UnsupportedOperation { .. }
+                ) || !task_abort_result)
+            {
+                return Err(runtime_operation_status(error, "cancel_exec", &request_id));
+            }
+        }
+
+        let now = current_unix_secs();
+        if execution.started_at.is_none() {
+            execution.started_at = Some(now);
+        }
+        execution.exit_code = Some(130);
+        execution.ended_at = Some(now);
+        execution
+            .transition_to(ExecutionState::Canceled)
+            .map_err(|error| {
+                status_from_machine_error(MachineError::new(
+                    MachineErrorCode::StateConflict,
+                    error.to_string(),
+                    Some(request_id.clone()),
+                    BTreeMap::new(),
+                ))
+            })?;
+
+        let receipt_id = generate_receipt_id();
+        self.daemon
+            .with_state_store(|store| {
+                store.with_immediate_transaction(|tx| {
+                    tx.save_execution(&execution)?;
+                    let _ = tx.emit_event(
+                        "api",
+                        &StackEvent::ExecutionCanceled {
+                            execution_id: execution.execution_id.clone(),
+                        },
+                    );
+                    tx.save_receipt(&Receipt {
+                        receipt_id: receipt_id.clone(),
+                        operation: "cancel_execution".to_string(),
+                        entity_id: execution.execution_id.clone(),
+                        entity_type: "execution".to_string(),
+                        request_id: request_id.clone(),
+                        status: "success".to_string(),
+                        created_at: now,
+                        metadata: serde_json::json!({}),
+                    })?;
+                    Ok(())
+                })
+            })
+            .map_err(|error| status_from_stack_error(error, &request_id))?;
+
+        let exit_code = execution.exit_code.unwrap_or(130);
+        let _ = self
+            .daemon
+            .execution_sessions()
+            .publish_exit_code(&execution.execution_id, exit_code);
+        let _ = self
+            .daemon
+            .execution_sessions()
+            .remove(&execution.execution_id);
+
+        let mut response = Response::new(runtime_v2::ExecutionResponse {
+            request_id,
+            execution: Some(execution_to_proto_payload(&execution)),
+        });
+        if let Ok(value) = MetadataValue::try_from(receipt_id.as_str()) {
+            response.metadata_mut().insert("x-receipt-id", value);
+        }
+        Ok(response)
+    }
+
+    async fn stream_exec_output(
+        &self,
+        request: Request<runtime_v2::StreamExecOutputRequest>,
+    ) -> Result<Response<Self::StreamExecOutputStream>, Status> {
+        let intercepted_request_id = request_id_from_extensions(&request);
+        let request = request.into_inner();
+        let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
+        let request_id = metadata
+            .request_id
+            .clone()
+            .unwrap_or_else(generate_request_id);
+        let execution_id = request.execution_id.trim().to_string();
+        if execution_id.is_empty() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                "execution_id cannot be empty".to_string(),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        let execution = self
+            .daemon
+            .with_state_store(|store| store.load_execution(&execution_id))
+            .map_err(|error| status_from_stack_error(error, &request_id))?
+            .ok_or_else(|| execution_not_found_status(&execution_id, &request_id))?;
+
+        let mut session_rx = match self.daemon.execution_sessions().subscribe(&execution_id) {
+            Ok(receiver) => receiver,
+            Err(crate::ExecutionSessionRegistryError::NotFound { .. }) => {
+                if let Some(event) = terminal_stream_event(&execution) {
+                    let (tx, rx) = tokio::sync::mpsc::channel::<
+                        Result<runtime_v2::ExecOutputEvent, Status>,
+                    >(1);
+                    tokio::spawn(async move {
+                        let _ = tx.send(Ok(event)).await;
+                    });
+                    return Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+                        rx,
+                    )));
+                }
+                return Err(status_from_machine_error(MachineError::new(
+                    MachineErrorCode::UnsupportedOperation,
+                    format!("execution session is not active for {execution_id}"),
+                    Some(request_id.clone()),
+                    BTreeMap::new(),
+                )));
+            }
+            Err(other) => return Err(session_registry_status(other, &request_id)),
+        };
+
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Result<runtime_v2::ExecOutputEvent, Status>>(32);
+        let stream_request_id = request_id.clone();
+        tokio::spawn(async move {
+            loop {
+                match session_rx.recv().await {
+                    Ok(event) => {
+                        if tx.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        let lagged = runtime_v2::ExecOutputEvent {
+                            payload: Some(runtime_v2::exec_output_event::Payload::Error(format!(
+                                "execution output lagged; dropped {skipped} events"
+                            ))),
+                            sequence: 0,
+                        };
+                        if tx.send(Ok(lagged)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        let _ = tx
+                            .send(Ok(runtime_v2::ExecOutputEvent {
+                                payload: Some(runtime_v2::exec_output_event::Payload::Error(
+                                    format!(
+                                        "execution output stream closed (request_id={stream_request_id})"
+                                    ),
+                                )),
+                                sequence: 0,
+                            }))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
+    async fn write_exec_stdin(
+        &self,
+        request: Request<runtime_v2::WriteExecStdinRequest>,
+    ) -> Result<Response<runtime_v2::ExecutionResponse>, Status> {
+        let intercepted_request_id = request_id_from_extensions(&request);
+        let request = request.into_inner();
+        let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
+        let request_id = metadata
+            .request_id
+            .clone()
+            .unwrap_or_else(generate_request_id);
+        let execution_id = request.execution_id.trim().to_string();
+        if execution_id.is_empty() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                "execution_id cannot be empty".to_string(),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        let execution = self
+            .daemon
+            .with_state_store(|store| store.load_execution(&execution_id))
+            .map_err(|error| status_from_stack_error(error, &request_id))?
+            .ok_or_else(|| execution_not_found_status(&execution_id, &request_id))?;
+
+        if execution.state.is_terminal() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::StateConflict,
+                format!("execution {execution_id} is in terminal state"),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        let has_session = self
+            .daemon
+            .execution_sessions()
+            .contains(&execution_id)
+            .map_err(|error| session_registry_status(error, &request_id))?;
+        if !has_session {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::UnsupportedOperation,
+                format!("execution session is not active for {execution_id}"),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        self.daemon
+            .manager()
+            .write_exec_stdin(&execution_id, &request.data)
+            .await
+            .map_err(|error| runtime_operation_status(error, "write_exec_stdin", &request_id))?;
+
+        Ok(Response::new(runtime_v2::ExecutionResponse {
+            request_id,
+            execution: Some(execution_to_proto_payload(&execution)),
+        }))
+    }
+
+    async fn resize_exec_pty(
+        &self,
+        request: Request<runtime_v2::ResizeExecPtyRequest>,
+    ) -> Result<Response<runtime_v2::ExecutionResponse>, Status> {
+        let intercepted_request_id = request_id_from_extensions(&request);
+        let request = request.into_inner();
+        let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
+        let request_id = metadata
+            .request_id
+            .clone()
+            .unwrap_or_else(generate_request_id);
+
+        let execution_id = request.execution_id.trim().to_string();
+        if execution_id.is_empty() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                "execution_id cannot be empty".to_string(),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        let execution = self
+            .daemon
+            .with_state_store(|store| store.load_execution(&execution_id))
+            .map_err(|error| status_from_stack_error(error, &request_id))?
+            .ok_or_else(|| {
+                status_from_machine_error(MachineError::new(
+                    MachineErrorCode::NotFound,
+                    format!("execution not found: {execution_id}"),
+                    Some(request_id.clone()),
+                    BTreeMap::new(),
+                ))
+            })?;
+
+        if execution.state != ExecutionState::Running {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::StateConflict,
+                format!("execution {execution_id} is not running"),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        let has_session = self
+            .daemon
+            .execution_sessions()
+            .contains(&execution_id)
+            .map_err(|error| session_registry_status(error, &request_id))?;
+        if !has_session {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::UnsupportedOperation,
+                format!("execution session is not active for {execution_id}"),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        let cols = u16::try_from(request.cols).map_err(|_| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                format!("cols out of range for u16: {}", request.cols),
+                Some(request_id.clone()),
+                BTreeMap::new(),
+            ))
+        })?;
+        let rows = u16::try_from(request.rows).map_err(|_| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                format!("rows out of range for u16: {}", request.rows),
+                Some(request_id.clone()),
+                BTreeMap::new(),
+            ))
+        })?;
+
+        self.daemon
+            .manager()
+            .resize_exec_pty(&execution_id, cols, rows)
+            .await
+            .map_err(|error| runtime_operation_status(error, "resize_exec_pty", &request_id))?;
+
+        let _ = self.daemon.with_state_store(|store| {
+            store.emit_event(
+                "api",
+                &StackEvent::ExecutionResized {
+                    execution_id: execution_id.clone(),
+                    cols,
+                    rows,
+                },
+            )
+        });
+
+        Ok(Response::new(runtime_v2::ExecutionResponse {
+            request_id,
+            execution: Some(execution_to_proto_payload(&execution)),
+        }))
+    }
+
+    async fn signal_exec(
+        &self,
+        request: Request<runtime_v2::SignalExecRequest>,
+    ) -> Result<Response<runtime_v2::ExecutionResponse>, Status> {
+        let intercepted_request_id = request_id_from_extensions(&request);
+        let request = request.into_inner();
+        let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
+        let request_id = metadata
+            .request_id
+            .clone()
+            .unwrap_or_else(generate_request_id);
+
+        let execution_id = request.execution_id.trim().to_string();
+        if execution_id.is_empty() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                "execution_id cannot be empty".to_string(),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+        let signal = request.signal.trim().to_string();
+        if signal.is_empty() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                "signal cannot be empty".to_string(),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        let execution = self
+            .daemon
+            .with_state_store(|store| store.load_execution(&execution_id))
+            .map_err(|error| status_from_stack_error(error, &request_id))?
+            .ok_or_else(|| {
+                status_from_machine_error(MachineError::new(
+                    MachineErrorCode::NotFound,
+                    format!("execution not found: {execution_id}"),
+                    Some(request_id.clone()),
+                    BTreeMap::new(),
+                ))
+            })?;
+
+        if execution.state != ExecutionState::Running {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::StateConflict,
+                format!("execution {execution_id} is not running"),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        let has_session = self
+            .daemon
+            .execution_sessions()
+            .contains(&execution_id)
+            .map_err(|error| session_registry_status(error, &request_id))?;
+        if !has_session {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::UnsupportedOperation,
+                format!("execution session is not active for {execution_id}"),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        self.daemon
+            .manager()
+            .signal_exec(&execution_id, &signal)
+            .await
+            .map_err(|error| runtime_operation_status(error, "signal_exec", &request_id))?;
+
+        let _ = self.daemon.with_state_store(|store| {
+            store.emit_event(
+                "api",
+                &StackEvent::ExecutionSignaled {
+                    execution_id: execution_id.clone(),
+                    signal: signal.clone(),
+                },
+            )
+        });
+
+        Ok(Response::new(runtime_v2::ExecutionResponse {
+            request_id,
+            execution: Some(execution_to_proto_payload(&execution)),
+        }))
+    }
+}

@@ -24,7 +24,8 @@ pub use types::{
     IsolationLevel, Lease, LeaseState, MountAccess, MountSpec, MountType, NamespaceConfig,
     NetworkDomain, NetworkDomainState, NetworkServiceConfig, PortMapping, PortProtocol,
     PruneResult, PublishedPort, Receipt, ReceiptResultClassification, RunConfig,
-    RuntimeCapabilities, RuntimeOperation, Sandbox, SandboxBackend, SandboxSpec, SandboxState,
+    RuntimeCapabilities, RuntimeOperation, SANDBOX_LABEL_BASE_IMAGE_REF,
+    SANDBOX_LABEL_MAIN_CONTAINER, Sandbox, SandboxBackend, SandboxSpec, SandboxState,
     SandboxVolumeMount, SharedVmPhase, SharedVmPhaseTracker, StackResourceHint, StackVolumeMount,
     Volume, VolumeType, default_namespace_config,
 };
@@ -1309,6 +1310,41 @@ impl<B: RuntimeBackend> WorkspaceRuntimeManager<B> {
         self.backend.prune_images()
     }
 
+    // ── Build operations ──────────────────────────────────────────
+
+    /// Start an asynchronous image build.
+    pub async fn start_build(
+        &self,
+        sandbox_id: &str,
+        build_spec: BuildSpec,
+        idempotency_key: Option<String>,
+    ) -> Result<Build, RuntimeError> {
+        self.backend
+            .start_build(sandbox_id, build_spec, idempotency_key)
+            .await
+    }
+
+    /// Load build status/details.
+    pub async fn get_build(&self, build_id: &str) -> Result<Build, RuntimeError> {
+        self.backend.get_build(build_id).await
+    }
+
+    /// Stream historical build events.
+    pub async fn stream_build_events(
+        &self,
+        build_id: &str,
+        after_event_id: Option<u64>,
+    ) -> Result<Vec<Event>, RuntimeError> {
+        self.backend
+            .stream_build_events(build_id, after_event_id)
+            .await
+    }
+
+    /// Cancel an in-flight build.
+    pub async fn cancel_build(&self, build_id: &str) -> Result<Build, RuntimeError> {
+        self.backend.cancel_build(build_id).await
+    }
+
     // ── Sandbox-scoped operations ──────────────────────────────────
     //
     // These methods provide sandbox-oriented terminology for operations
@@ -2221,7 +2257,11 @@ mod tests {
     #[test]
     fn contract_types_are_constructible() {
         let _run = RunConfig::default();
-        let _exec = ExecConfig::default();
+        let exec = ExecConfig::default();
+        assert!(exec.execution_id.is_none());
+        assert!(!exec.pty);
+        assert!(exec.term_rows.is_none());
+        assert!(exec.term_cols.is_none());
         let _output = ExecOutput {
             exit_code: 0,
             stdout: String::new(),
@@ -2272,6 +2312,8 @@ mod tests {
         let _sandbox_spec = SandboxSpec {
             cpus: Some(2),
             memory_mb: Some(4096),
+            base_image_ref: Some("alpine:3.20".to_string()),
+            main_container: Some("workspace-main".to_string()),
             network_profile: Some("default".to_string()),
             volume_mounts: vec![SandboxVolumeMount {
                 volume_id: "vol-1".to_string(),
@@ -2308,7 +2350,10 @@ mod tests {
             build_spec: BuildSpec {
                 context: ".".to_string(),
                 dockerfile: Some("Dockerfile".to_string()),
+                target: None,
                 args: BTreeMap::new(),
+                cache_from: Vec::new(),
+                image_tag: None,
             },
             state: BuildState::Queued,
             result_digest: None,

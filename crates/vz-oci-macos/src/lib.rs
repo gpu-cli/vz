@@ -22,7 +22,7 @@ pub use config::{
 };
 pub use error::MacosOciError;
 pub use macos_backend::MacosRuntimeBackend;
-pub use runtime::Runtime;
+pub use runtime::{InteractiveExecEvent, Runtime};
 
 // Re-export shared types for convenience.
 pub use vz_oci::bundle::CONTAINER_LOG_FILE;

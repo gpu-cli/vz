@@ -179,6 +179,9 @@ pub struct RunConfig {
 /// Options for executing a command in an already-running container.
 #[derive(Debug, Clone, Default)]
 pub struct ExecConfig {
+    /// Optional daemon-side execution identity used to bind backend
+    /// control operations to an active exec session.
+    pub execution_id: Option<String>,
     /// Command and arguments to execute.
     pub cmd: Vec<String>,
     /// Optional working directory inside the container.
@@ -187,6 +190,12 @@ pub struct ExecConfig {
     pub env: Vec<(String, String)>,
     /// Optional user to run as inside the container.
     pub user: Option<String>,
+    /// Allocate an interactive PTY for the process.
+    pub pty: bool,
+    /// Optional initial terminal rows when PTY is enabled.
+    pub term_rows: Option<u16>,
+    /// Optional initial terminal cols when PTY is enabled.
+    pub term_cols: Option<u16>,
     /// Optional exec timeout override.
     pub timeout: Option<Duration>,
 }
@@ -795,12 +804,21 @@ pub enum SandboxBackend {
 }
 
 /// Sandbox resource/network specification.
+pub const SANDBOX_LABEL_BASE_IMAGE_REF: &str = "vz.sandbox.base_image_ref";
+/// Canonical sandbox label key for main container selection.
+pub const SANDBOX_LABEL_MAIN_CONTAINER: &str = "vz.sandbox.main_container";
+
+/// Sandbox resource/network specification.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SandboxSpec {
     /// Optional CPU core limit.
     pub cpus: Option<u8>,
     /// Optional memory limit in MB.
     pub memory_mb: Option<u64>,
+    /// Optional default image reference for sandbox startup workload.
+    pub base_image_ref: Option<String>,
+    /// Optional main workload/container identifier for sandbox startup.
+    pub main_container: Option<String>,
     /// Logical network profile identifier.
     pub network_profile: Option<String>,
     /// Volume attachments to surface in the sandbox.
@@ -1030,8 +1048,17 @@ pub struct BuildSpec {
     pub context: String,
     /// Optional Dockerfile path in the context.
     pub dockerfile: Option<String>,
+    /// Optional multi-stage target to build.
+    pub target: Option<String>,
     /// Build arguments supplied to the builder.
     pub args: BTreeMap<String, String>,
+    /// Optional cache sources (for example registry references).
+    #[serde(default)]
+    pub cache_from: Vec<String>,
+    /// Optional image tag/name to publish the build output under.
+    ///
+    /// When unset, backends may derive a deterministic internal tag.
+    pub image_tag: Option<String>,
 }
 
 /// Build lifecycle states.

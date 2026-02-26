@@ -6,6 +6,7 @@
 
 use vz_runtime_contract::{self as contract, RuntimeBackend, RuntimeError};
 
+use crate::buildkit::{BuildManager, BuildManagerError};
 use crate::config as oci_config;
 use crate::runtime::Runtime;
 use vz_oci::container_store as oci_container;
@@ -13,17 +14,39 @@ use vz_oci::container_store as oci_container;
 /// macOS backend wrapping the existing [`Runtime`].
 pub struct MacosRuntimeBackend {
     runtime: Runtime,
+    build_manager: BuildManager,
 }
 
 impl MacosRuntimeBackend {
     /// Create a new macOS backend from an existing runtime.
     pub fn new(runtime: Runtime) -> Self {
-        Self { runtime }
+        let build_manager = BuildManager::new(runtime.clone_config());
+        Self {
+            runtime,
+            build_manager,
+        }
     }
 
     /// Access the underlying runtime.
     pub fn inner(&self) -> &Runtime {
         &self.runtime
+    }
+
+    pub async fn exec_container_streaming<F>(
+        &self,
+        id: &str,
+        config: contract::ExecConfig,
+        mut on_event: F,
+    ) -> Result<contract::ExecOutput, RuntimeError>
+    where
+        F: FnMut(crate::runtime::InteractiveExecEvent),
+    {
+        let oci_config = exec_config_from_contract(config);
+        self.runtime
+            .exec_container_streaming(id, oci_config, |event| on_event(event))
+            .await
+            .map(exec_output_to_contract)
+            .map_err(oci_err)
     }
 }
 
@@ -90,6 +113,39 @@ impl RuntimeBackend for MacosRuntimeBackend {
             .exec_container(id, oci_config)
             .await
             .map(exec_output_to_contract)
+            .map_err(oci_err)
+    }
+
+    async fn write_exec_stdin(&self, execution_id: &str, data: &[u8]) -> Result<(), RuntimeError> {
+        self.runtime
+            .write_exec_stdin(execution_id, data)
+            .await
+            .map_err(oci_err)
+    }
+
+    async fn signal_exec(&self, execution_id: &str, signal: &str) -> Result<(), RuntimeError> {
+        self.runtime
+            .signal_exec(execution_id, signal)
+            .await
+            .map_err(oci_err)
+    }
+
+    async fn resize_exec_pty(
+        &self,
+        execution_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), RuntimeError> {
+        self.runtime
+            .resize_exec_pty(execution_id, cols, rows)
+            .await
+            .map_err(oci_err)
+    }
+
+    async fn cancel_exec(&self, execution_id: &str) -> Result<(), RuntimeError> {
+        self.runtime
+            .cancel_exec(execution_id)
+            .await
             .map_err(oci_err)
     }
 
@@ -197,10 +253,14 @@ impl RuntimeBackend for MacosRuntimeBackend {
         // This works even when the container's init process has exited.
         let log_path = format!("{}/output.log", container_log_dir(container_id));
         let exec_config = oci_config::ExecConfig {
+            execution_id: None,
             cmd: vec!["tail".into(), "-n".into(), "100".into(), log_path],
             working_dir: None,
             env: vec![],
             user: None,
+            pty: false,
+            term_rows: None,
+            term_cols: None,
             timeout: Some(std::time::Duration::from_secs(5)),
         };
 
@@ -218,21 +278,93 @@ impl RuntimeBackend for MacosRuntimeBackend {
             },
         })
     }
+
+    async fn start_build(
+        &self,
+        sandbox_id: &str,
+        build_spec: contract::BuildSpec,
+        idempotency_key: Option<String>,
+    ) -> Result<contract::Build, RuntimeError> {
+        self.build_manager
+            .start_build(sandbox_id, build_spec, idempotency_key)
+            .await
+            .map_err(build_manager_err)
+    }
+
+    async fn get_build(&self, build_id: &str) -> Result<contract::Build, RuntimeError> {
+        self.build_manager
+            .get_build(build_id)
+            .await
+            .map_err(build_manager_err)
+    }
+
+    async fn stream_build_events(
+        &self,
+        build_id: &str,
+        after_event_id: Option<u64>,
+    ) -> Result<Vec<contract::Event>, RuntimeError> {
+        self.build_manager
+            .stream_build_events(build_id, after_event_id)
+            .await
+            .map_err(build_manager_err)
+    }
+
+    async fn cancel_build(&self, build_id: &str) -> Result<contract::Build, RuntimeError> {
+        self.build_manager
+            .cancel_build(build_id)
+            .await
+            .map_err(build_manager_err)
+    }
 }
 
 // ── Error mapping ─────────────────────────────────────────────────
 
 fn oci_err(e: crate::error::MacosOciError) -> RuntimeError {
     match e {
+        crate::error::MacosOciError::InvalidConfig(message) => RuntimeError::InvalidConfig(message),
+        crate::error::MacosOciError::InvalidRootfs { path } => RuntimeError::InvalidRootfs { path },
+        crate::error::MacosOciError::Storage(source) => RuntimeError::Io(source),
         crate::error::MacosOciError::UnsupportedExecutionMode { mode } => {
             RuntimeError::UnsupportedOperation {
                 operation: "execution_mode".to_string(),
                 reason: format!("execution mode `{mode}` is not yet supported"),
             }
         }
+        crate::error::MacosOciError::ExecutionSessionNotFound { execution_id } => {
+            RuntimeError::ContainerNotFound { id: execution_id }
+        }
+        crate::error::MacosOciError::ExecutionControlUnsupported { operation, reason } => {
+            RuntimeError::UnsupportedOperation { operation, reason }
+        }
         other => RuntimeError::Backend {
             message: other.to_string(),
             source: Box::new(other),
+        },
+    }
+}
+
+fn build_manager_err(error: BuildManagerError) -> RuntimeError {
+    match error {
+        BuildManagerError::BuildNotFound { build_id } => RuntimeError::Backend {
+            message: format!("build not found: {build_id}"),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("build not found: {build_id}"),
+            )),
+        },
+        BuildManagerError::IdempotencyConflict {
+            key,
+            existing_build_id,
+        } => RuntimeError::ContainerFailed {
+            id: existing_build_id,
+            reason: format!("idempotency key conflict: {key}"),
+        },
+        BuildManagerError::RequestNormalization { details } => {
+            RuntimeError::InvalidConfig(format!("failed to normalize build request: {details}"))
+        }
+        BuildManagerError::Buildkit(source) => RuntimeError::Backend {
+            message: source.to_string(),
+            source: Box::new(source),
         },
     }
 }
@@ -282,10 +414,14 @@ fn run_config_from_contract(c: contract::RunConfig) -> oci_config::RunConfig {
 
 fn exec_config_from_contract(c: contract::ExecConfig) -> oci_config::ExecConfig {
     oci_config::ExecConfig {
+        execution_id: c.execution_id,
         cmd: c.cmd,
         working_dir: c.working_dir,
         env: c.env,
         user: c.user,
+        pty: c.pty,
+        term_rows: c.term_rows,
+        term_cols: c.term_cols,
         timeout: c.timeout,
     }
 }

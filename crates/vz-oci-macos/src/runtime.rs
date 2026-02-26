@@ -12,7 +12,7 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 use vz::Vm;
-use vz::protocol::ExecOutput;
+use vz::protocol::{ExecEvent, ExecOutput};
 use vz::{NetworkConfig, SharedDirConfig};
 use vz_image::{
     ImageConfigSummary, ImageId, ImagePuller, ImageStore, parse_image_config_summary_from_store,
@@ -36,11 +36,17 @@ use vz_image::{ImageInfo, PruneResult};
 
 const STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const LOG_ROTATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const LOG_ROTATION_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_INTERACTIVE_EXEC_ROWS: u16 = 24;
+const DEFAULT_INTERACTIVE_EXEC_COLS: u16 = 80;
 const OCI_RUNTIME_BIN_SHARE_TAG: &str = "oci-runtime-bin";
 const OCI_DEFAULT_GUEST_STATE_DIR: &str = "/run/vz-oci";
 const OCI_BUNDLE_DIRNAME: &str = "bundles";
 const OCI_ANNOTATION_CONTAINER_CLASS: &str = "io.vz.container.class";
 const OCI_ANNOTATION_AUTO_REMOVE: &str = "io.vz.container.auto_remove";
+const OCI_ANNOTATION_COMPOSE_LOGGING_DRIVER: &str = "io.vz.compose.logging.driver";
+const OCI_ANNOTATION_COMPOSE_LOGGING_OPTIONS: &str = "io.vz.compose.logging.options";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContainerLifecycleClass {
@@ -69,6 +75,26 @@ impl fmt::Display for ContainerLifecycleClass {
 struct ActiveContainerLifecycle {
     class: ContainerLifecycleClass,
     auto_remove: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComposeLogRotation {
+    max_size_bytes: u64,
+    max_files: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InteractiveExecEvent {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Exit(i32),
+}
+
+#[derive(Clone)]
+struct InteractiveExecSession {
+    vm: Arc<LinuxVm>,
+    guest_exec_id: u64,
+    pty_enabled: bool,
 }
 
 /// Unified runtime entrypoint.
@@ -105,6 +131,14 @@ pub struct Runtime {
     ///
     /// Entries exist only while container lifecycle is active (running/leased).
     active_lifecycle: Arc<Mutex<HashMap<String, ActiveContainerLifecycle>>>,
+    /// Active compose log-rotation background tasks keyed by container ID.
+    ///
+    /// Tasks enforce `logging.options.max-size`/`max-file` for compose
+    /// services by rotating `/run/vz-oci/logs/<container>/output.log` in
+    /// the guest VM with copy-truncate semantics.
+    log_rotation_tasks: Arc<Mutex<HashMap<String, LogRotationTask>>>,
+    /// Active interactive execution sessions keyed by daemon execution_id.
+    exec_sessions: Arc<Mutex<HashMap<String, InteractiveExecSession>>>,
 }
 
 impl Runtime {
@@ -128,6 +162,8 @@ impl Runtime {
             port_forwards: Arc::new(Mutex::new(HashMap::new())),
             stack_port_forwards: Arc::new(Mutex::new(HashMap::new())),
             active_lifecycle: Arc::new(Mutex::new(HashMap::new())),
+            log_rotation_tasks: Arc::new(Mutex::new(HashMap::new())),
+            exec_sessions: Arc::new(Mutex::new(HashMap::new())),
         };
 
         runtime.reconcile_stale_containers();
@@ -139,6 +175,11 @@ impl Runtime {
     /// Return configured data directory.
     pub fn data_dir(&self) -> &PathBuf {
         &self.config.data_dir
+    }
+
+    /// Clone the runtime configuration used by this runtime instance.
+    pub fn clone_config(&self) -> RuntimeConfig {
+        self.config.clone()
     }
 
     /// Advertised checkpoint capabilities for this backend runtime.
@@ -206,6 +247,7 @@ impl Runtime {
         if let Some(pf) = self.port_forwards.lock().await.remove(id) {
             pf.shutdown().await;
         }
+        self.stop_log_rotation_task(id).await;
 
         // Best-effort OCI delete via guest runtime if VM is still up.
         // Try the per-container handle first; fall back to the shared stack VM
@@ -277,6 +319,7 @@ impl Runtime {
 
         if !matches!(container.status, ContainerStatus::Running) {
             self.active_lifecycle.lock().await.remove(id);
+            self.stop_log_rotation_task(id).await;
             return Ok(container);
         }
 
@@ -295,6 +338,7 @@ impl Runtime {
         let effective_grace = grace_period.unwrap_or(STOP_GRACE_PERIOD);
         let exit_code = stop_via_oci_runtime(&*vm, id, force, effective_grace, signal).await?;
         let lifecycle = self.active_lifecycle.lock().await.remove(id);
+        self.stop_log_rotation_task(id).await;
 
         // Best-effort OCI delete.
         match vm.oci_delete(id.to_string(), true).await {
@@ -1083,6 +1127,8 @@ impl Runtime {
             .lock()
             .await
             .insert(container_id.to_string(), stack_id.to_string());
+        self.start_log_rotation_task_if_needed(container_id.as_str(), Arc::clone(&vm), &run)
+            .await?;
 
         container.status = ContainerStatus::Running;
         container.started_unix_secs = Some(current_unix_secs());
@@ -1163,6 +1209,7 @@ impl Runtime {
 
         // Stop each container via OCI lifecycle.
         for cid in &stack_containers {
+            self.stop_log_rotation_task(cid).await;
             let _ = stop_via_oci_runtime(&*vm, cid, false, STOP_GRACE_PERIOD, None).await;
             let _ = vm.oci_delete(cid.to_string(), true).await;
 
@@ -1349,6 +1396,20 @@ impl Runtime {
     /// [`create_container`](Self::create_container) or be running from a
     /// detached [`run`](Self::run) call.
     pub async fn exec_container(&self, id: &str, exec: ExecConfig) -> Result<ExecOutput, OciError> {
+        self.exec_container_streaming(id, exec, |_| {}).await
+    }
+
+    /// Execute a command inside an already-running container and emit
+    /// incremental output events when available.
+    pub async fn exec_container_streaming<F>(
+        &self,
+        id: &str,
+        exec: ExecConfig,
+        mut on_event: F,
+    ) -> Result<ExecOutput, OciError>
+    where
+        F: FnMut(InteractiveExecEvent),
+    {
         let vm = self
             .vm_handles
             .lock()
@@ -1367,6 +1428,118 @@ impl Runtime {
             .ok_or_else(|| OciError::InvalidConfig("exec command must not be empty".to_string()))?;
 
         let timeout = exec.timeout.unwrap_or(self.config.exec_timeout);
+        let execution_id = exec.execution_id.clone();
+
+        if exec.pty {
+            let Some(execution_id) = execution_id else {
+                return Err(OciError::ExecutionControlUnsupported {
+                    operation: "exec_container".to_string(),
+                    reason: "interactive exec requires execution_id".to_string(),
+                });
+            };
+
+            let state = vm.oci_state(id.to_string()).await?;
+            let Some(pid) = state.pid else {
+                return Err(OciError::InvalidConfig(format!(
+                    "container '{id}' has no running pid for interactive exec"
+                )));
+            };
+
+            let mut nsenter_args: Vec<String> = vec![
+                format!("--mount=/proc/{pid}/ns/mnt"),
+                format!("--net=/proc/{pid}/ns/net"),
+                format!("--pid=/proc/{pid}/ns/pid"),
+                format!("--ipc=/proc/{pid}/ns/ipc"),
+                format!("--uts=/proc/{pid}/ns/uts"),
+                format!("--root=/proc/{pid}/root"),
+            ];
+            if let Some(working_dir) = exec.working_dir.clone()
+                && !working_dir.is_empty()
+            {
+                nsenter_args.push(format!("--wd={working_dir}"));
+            }
+            nsenter_args.push("--".to_string());
+            nsenter_args.push(command.clone());
+            nsenter_args.extend(args.to_vec());
+
+            let nsenter_arg_refs: Vec<&str> = nsenter_args.iter().map(String::as_str).collect();
+            let term_rows = u32::from(exec.term_rows.unwrap_or(DEFAULT_INTERACTIVE_EXEC_ROWS));
+            let term_cols = u32::from(exec.term_cols.unwrap_or(DEFAULT_INTERACTIVE_EXEC_COLS));
+
+            let (mut stream, guest_exec_id) = tokio::time::timeout(
+                timeout,
+                vm.exec_interactive("nsenter", &nsenter_arg_refs, None, term_rows, term_cols),
+            )
+            .await
+            .map_err(|_| {
+                OciError::InvalidConfig(format!(
+                    "exec timed out after {:.3}s",
+                    timeout.as_secs_f64()
+                ))
+            })??;
+
+            self.exec_sessions.lock().await.insert(
+                execution_id.clone(),
+                InteractiveExecSession {
+                    vm: Arc::clone(&vm),
+                    guest_exec_id,
+                    pty_enabled: true,
+                },
+            );
+
+            let stream_result = tokio::time::timeout(timeout, async {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                let mut saw_exit = false;
+                let mut exit_code = -1;
+
+                while let Some(event) = stream.next().await {
+                    match event {
+                        ExecEvent::Stdout(data) => {
+                            on_event(InteractiveExecEvent::Stdout(data.clone()));
+                            stdout.extend_from_slice(&data);
+                        }
+                        ExecEvent::Stderr(data) => {
+                            on_event(InteractiveExecEvent::Stderr(data.clone()));
+                            stderr.extend_from_slice(&data);
+                        }
+                        ExecEvent::Exit(code) => {
+                            on_event(InteractiveExecEvent::Exit(code));
+                            saw_exit = true;
+                            exit_code = code;
+                            break;
+                        }
+                    }
+                }
+
+                if !saw_exit {
+                    return Err(OciError::InvalidConfig(
+                        "interactive exec stream ended without exit code".to_string(),
+                    ));
+                }
+
+                Ok(ExecOutput {
+                    exit_code,
+                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                })
+            })
+            .await;
+
+            let result = match stream_result {
+                Ok(result) => result,
+                Err(_) => {
+                    let _ = vm.signal(guest_exec_id, 15).await;
+                    Err(OciError::InvalidConfig(format!(
+                        "exec timed out after {:.3}s",
+                        timeout.as_secs_f64()
+                    )))
+                }
+            };
+
+            self.exec_sessions.lock().await.remove(&execution_id);
+            return result;
+        }
 
         let result = tokio::time::timeout(
             timeout,
@@ -1389,11 +1562,99 @@ impl Runtime {
             ))
         })??;
 
+        if !result.stdout.is_empty() {
+            on_event(InteractiveExecEvent::Stdout(
+                result.stdout.as_bytes().to_vec(),
+            ));
+        }
+        if !result.stderr.is_empty() {
+            on_event(InteractiveExecEvent::Stderr(
+                result.stderr.as_bytes().to_vec(),
+            ));
+        }
+        on_event(InteractiveExecEvent::Exit(result.exit_code));
+
         Ok(ExecOutput {
             exit_code: result.exit_code,
             stdout: result.stdout,
             stderr: result.stderr,
         })
+    }
+
+    /// Write stdin bytes into an active interactive execution session.
+    pub async fn write_exec_stdin(&self, execution_id: &str, data: &[u8]) -> Result<(), OciError> {
+        let session = self.require_exec_session(execution_id).await?;
+        if !session.pty_enabled {
+            return Err(OciError::ExecutionControlUnsupported {
+                operation: "write_exec_stdin".to_string(),
+                reason: "execution session is not interactive".to_string(),
+            });
+        }
+        session
+            .vm
+            .stdin_write(session.guest_exec_id, data)
+            .await
+            .map_err(OciError::from)
+    }
+
+    /// Send a signal into an active interactive execution session.
+    pub async fn signal_exec(&self, execution_id: &str, signal: &str) -> Result<(), OciError> {
+        let session = self.require_exec_session(execution_id).await?;
+        let Some(signal_num) = parse_signal_number(signal) else {
+            return Err(OciError::InvalidConfig(format!(
+                "unsupported signal '{signal}'"
+            )));
+        };
+        session
+            .vm
+            .signal(session.guest_exec_id, signal_num)
+            .await
+            .map_err(OciError::from)
+    }
+
+    /// Resize PTY dimensions for an active interactive execution session.
+    pub async fn resize_exec_pty(
+        &self,
+        execution_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), OciError> {
+        let session = self.require_exec_session(execution_id).await?;
+        if !session.pty_enabled {
+            return Err(OciError::ExecutionControlUnsupported {
+                operation: "resize_exec_pty".to_string(),
+                reason: "execution session has no PTY".to_string(),
+            });
+        }
+        session
+            .vm
+            .resize_exec_pty(session.guest_exec_id, u32::from(rows), u32::from(cols))
+            .await
+            .map_err(OciError::from)
+    }
+
+    /// Cancel an active interactive execution session.
+    pub async fn cancel_exec(&self, execution_id: &str) -> Result<(), OciError> {
+        let session = self.require_exec_session(execution_id).await?;
+        session
+            .vm
+            .signal(session.guest_exec_id, 15)
+            .await
+            .map_err(OciError::from)
+    }
+
+    async fn require_exec_session(
+        &self,
+        execution_id: &str,
+    ) -> Result<InteractiveExecSession, OciError> {
+        self.exec_sessions
+            .lock()
+            .await
+            .get(execution_id)
+            .cloned()
+            .ok_or_else(|| OciError::ExecutionSessionNotFound {
+                execution_id: execution_id.to_string(),
+            })
     }
 
     /// Execute a command at the VM level (not inside a container namespace).
@@ -1614,7 +1875,7 @@ impl Runtime {
         self.vm_handles
             .lock()
             .await
-            .insert(container_id.to_string(), vm);
+            .insert(container_id.to_string(), Arc::clone(&vm));
 
         // Keep port forwarding alive for the container's lifetime.
         if let Some(pf) = port_forwarding {
@@ -1623,6 +1884,8 @@ impl Runtime {
                 .await
                 .insert(container_id.to_string(), pf);
         }
+        self.start_log_rotation_task_if_needed(container_id, Arc::clone(&vm), run)
+            .await?;
 
         Ok(())
     }
@@ -1994,8 +2257,41 @@ impl Runtime {
             .insert(container_id, lifecycle);
     }
 
+    async fn start_log_rotation_task_if_needed(
+        &self,
+        container_id: &str,
+        vm: Arc<LinuxVm>,
+        run: &RunConfig,
+    ) -> Result<(), OciError> {
+        if !run.capture_logs {
+            self.stop_log_rotation_task(container_id).await;
+            return Ok(());
+        }
+
+        let Some(rotation) = parse_compose_log_rotation(&run.oci_annotations)? else {
+            self.stop_log_rotation_task(container_id).await;
+            return Ok(());
+        };
+
+        self.stop_log_rotation_task(container_id).await;
+        let task = spawn_log_rotation_task(container_id.to_string(), vm, rotation);
+        self.log_rotation_tasks
+            .lock()
+            .await
+            .insert(container_id.to_string(), task);
+        Ok(())
+    }
+
+    async fn stop_log_rotation_task(&self, container_id: &str) {
+        let task = { self.log_rotation_tasks.lock().await.remove(container_id) };
+        if let Some(task) = task {
+            task.shutdown().await;
+        }
+    }
+
     async fn finalize_one_off_cleanup(&self, container_id: &str, auto_remove: bool) {
         self.active_lifecycle.lock().await.remove(container_id);
+        self.stop_log_rotation_task(container_id).await;
 
         if auto_remove {
             if let Err(err) = self.remove_container(container_id).await {
@@ -2060,6 +2356,38 @@ impl Runtime {
 }
 
 type OciLifecycleFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, OciError>> + 'a>>;
+
+fn parse_signal_number(signal: &str) -> Option<i32> {
+    let trimmed = signal.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = trimmed.parse::<i32>() {
+        return (parsed > 0).then_some(parsed);
+    }
+
+    let upper = trimmed.to_ascii_uppercase();
+    let normalized = upper.strip_prefix("SIG").unwrap_or(upper.as_str());
+    match normalized {
+        "HUP" => Some(1),
+        "INT" => Some(2),
+        "QUIT" => Some(3),
+        "KILL" => Some(9),
+        "TERM" => Some(15),
+        "USR1" => Some(10),
+        "USR2" => Some(12),
+        "PIPE" => Some(13),
+        "ALRM" => Some(14),
+        "CHLD" => Some(17),
+        "CONT" => Some(18),
+        "STOP" => Some(19),
+        "TSTP" => Some(20),
+        "TTIN" => Some(21),
+        "TTOU" => Some(22),
+        "WINCH" => Some(28),
+        _ => None,
+    }
+}
 
 trait OciLifecycleOps {
     fn oci_create<'a>(&'a self, id: String, bundle_path: String) -> OciLifecycleFuture<'a, ()>;
@@ -2149,6 +2477,120 @@ async fn run_oci_lifecycle(
         (Ok(_), Err(delete_err)) => Err(delete_err),
         (Err(exec_err), Err(_delete_err)) => Err(exec_err),
     }
+}
+
+struct LogRotationTask {
+    shutdown_tx: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl LogRotationTask {
+    async fn shutdown(self) {
+        let _ = self.shutdown_tx.send(true);
+        let _ = self.task.await;
+    }
+}
+
+fn spawn_log_rotation_task(
+    container_id: String,
+    vm: Arc<LinuxVm>,
+    rotation: ComposeLogRotation,
+) -> LogRotationTask {
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let task_container_id = container_id.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(LOG_ROTATION_POLL_INTERVAL) => {
+                    if let Err(error) = run_log_rotation_tick(vm.as_ref(), &task_container_id, rotation).await {
+                        warn!(
+                            container_id = %task_container_id,
+                            error = %error,
+                            "compose log-rotation tick failed"
+                        );
+                    }
+                }
+            }
+        }
+    });
+
+    LogRotationTask { shutdown_tx, task }
+}
+
+async fn run_log_rotation_tick(
+    vm: &LinuxVm,
+    container_id: &str,
+    rotation: ComposeLogRotation,
+) -> Result<(), OciError> {
+    let script = build_log_rotation_script(container_id, rotation);
+    let output = vm
+        .exec_capture(
+            "/bin/busybox".to_string(),
+            vec!["sh".to_string(), "-c".to_string(), script],
+            LOG_ROTATION_COMMAND_TIMEOUT,
+        )
+        .await
+        .map_err(OciError::from)?;
+
+    if output.exit_code != 0 {
+        let detail = if output.stderr.trim().is_empty() {
+            output.stdout.trim().to_string()
+        } else {
+            output.stderr.trim().to_string()
+        };
+        return Err(OciError::InvalidConfig(format!(
+            "compose log-rotation command failed for container `{container_id}` (exit {}): {detail}",
+            output.exit_code
+        )));
+    }
+
+    Ok(())
+}
+
+fn build_log_rotation_script(container_id: &str, rotation: ComposeLogRotation) -> String {
+    let log_path = format!("{}/output.log", container_log_dir(container_id));
+    let archives = rotation.max_files.saturating_sub(1);
+
+    if archives == 0 {
+        return format!(
+            "set -eu\n\
+             log=\"{log_path}\"\n\
+             [ -f \"$log\" ] || exit 0\n\
+             size=$(/bin/busybox wc -c < \"$log\" | /bin/busybox tr -d '[:space:]')\n\
+             if [ \"$size\" -ge {max_size} ]; then\n\
+               : > \"$log\"\n\
+             fi\n",
+            max_size = rotation.max_size_bytes,
+        );
+    }
+
+    let rotate_from = archives.saturating_sub(1);
+    format!(
+        "set -eu\n\
+         log=\"{log_path}\"\n\
+         [ -f \"$log\" ] || exit 0\n\
+         size=$(/bin/busybox wc -c < \"$log\" | /bin/busybox tr -d '[:space:]')\n\
+         if [ \"$size\" -lt {max_size} ]; then\n\
+           exit 0\n\
+         fi\n\
+         /bin/busybox rm -f \"$log.{archives}\"\n\
+         i={rotate_from}\n\
+         while [ \"$i\" -ge 1 ]; do\n\
+           if [ -f \"$log.$i\" ]; then\n\
+             next=$((i + 1))\n\
+             /bin/busybox mv \"$log.$i\" \"$log.$next\"\n\
+           fi\n\
+           i=$((i - 1))\n\
+         done\n\
+         /bin/busybox cp \"$log\" \"$log.1\"\n\
+         : > \"$log\"\n",
+        max_size = rotation.max_size_bytes,
+    )
 }
 
 struct PortForwarding {
@@ -2723,6 +3165,136 @@ fn parse_auto_remove_flag(raw: &str) -> Result<bool, OciError> {
     }
 }
 
+fn parse_compose_log_rotation(
+    oci_annotations: &[(String, String)],
+) -> Result<Option<ComposeLogRotation>, OciError> {
+    let mut logging_driver = None;
+    let mut logging_options_raw = None;
+    for (key, value) in oci_annotations {
+        if key == OCI_ANNOTATION_COMPOSE_LOGGING_DRIVER {
+            logging_driver = Some(value.as_str());
+            continue;
+        }
+        if key == OCI_ANNOTATION_COMPOSE_LOGGING_OPTIONS {
+            logging_options_raw = Some(value.as_str());
+        }
+    }
+
+    let Some(driver) = logging_driver else {
+        return Ok(None);
+    };
+    let normalized_driver = driver.trim().to_ascii_lowercase();
+    if normalized_driver == "none" {
+        return Ok(None);
+    }
+    if normalized_driver != "json-file" && normalized_driver != "local" {
+        return Ok(None);
+    }
+
+    let options = parse_compose_logging_options(logging_options_raw.unwrap_or_default())?;
+    if options.contains_key("labels") {
+        return Err(OciError::InvalidConfig(
+            "compose logging option `labels` is not supported in runtime log capture".to_string(),
+        ));
+    }
+    if options.contains_key("tag") {
+        return Err(OciError::InvalidConfig(
+            "compose logging option `tag` is not supported in runtime log capture".to_string(),
+        ));
+    }
+
+    let Some(max_size_raw) = options.get("max-size") else {
+        return Ok(None);
+    };
+    let max_size_bytes = parse_compose_log_size_bytes(max_size_raw).ok_or_else(|| {
+        OciError::InvalidConfig(format!(
+            "invalid OCI annotation `{OCI_ANNOTATION_COMPOSE_LOGGING_OPTIONS}` max-size `{max_size_raw}`"
+        ))
+    })?;
+
+    let max_files = match options.get("max-file") {
+        Some(raw) => {
+            let parsed = raw.parse::<u32>().map_err(|_| {
+                OciError::InvalidConfig(format!(
+                    "invalid OCI annotation `{OCI_ANNOTATION_COMPOSE_LOGGING_OPTIONS}` max-file `{raw}`"
+                ))
+            })?;
+            if parsed == 0 {
+                return Err(OciError::InvalidConfig(
+                    "compose logging option `max-file` must be at least 1".to_string(),
+                ));
+            }
+            parsed
+        }
+        None => 1,
+    };
+
+    Ok(Some(ComposeLogRotation {
+        max_size_bytes,
+        max_files,
+    }))
+}
+
+fn parse_compose_logging_options(raw: &str) -> Result<HashMap<String, String>, OciError> {
+    let mut parsed = HashMap::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let (key, value) = trimmed.split_once('=').ok_or_else(|| {
+            OciError::InvalidConfig(format!(
+                "invalid OCI annotation `{OCI_ANNOTATION_COMPOSE_LOGGING_OPTIONS}` entry `{trimmed}`"
+            ))
+        })?;
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(OciError::InvalidConfig(format!(
+                "invalid OCI annotation `{OCI_ANNOTATION_COMPOSE_LOGGING_OPTIONS}` entry `{trimmed}`"
+            )));
+        }
+
+        parsed.insert(key.to_string(), value.to_string());
+    }
+
+    Ok(parsed)
+}
+
+fn parse_compose_log_size_bytes(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut boundary = trimmed.len();
+    for (idx, ch) in trimmed.char_indices() {
+        if !ch.is_ascii_digit() {
+            boundary = idx;
+            break;
+        }
+    }
+    if boundary == 0 {
+        return None;
+    }
+
+    let quantity = trimmed[..boundary].parse::<u64>().ok()?;
+    if quantity == 0 {
+        return None;
+    }
+
+    let unit = trimmed[boundary..].trim().to_ascii_lowercase();
+    let multiplier = match unit.as_str() {
+        "" | "b" => 1_u64,
+        "k" | "kb" | "ki" | "kib" => 1024_u64,
+        "m" | "mb" | "mi" | "mib" => 1024_u64 * 1024_u64,
+        "g" | "gb" | "gi" | "gib" => 1024_u64 * 1024_u64 * 1024_u64,
+        _ => return None,
+    };
+
+    quantity.checked_mul(multiplier)
+}
+
 fn resolve_run_config(
     image_config: ImageConfigSummary,
     run: RunConfig,
@@ -2770,6 +3342,7 @@ fn resolve_run_config(
     let resolved_env = image_config.resolve_env(&run_env, container_id);
     let working_dir = image_config.resolve_working_dir(run_working_dir.as_deref());
     let user = image_config.resolve_user(run_user.as_deref());
+    let _ = parse_compose_log_rotation(&oci_annotations)?;
 
     if init_process.as_ref().is_some_and(Vec::is_empty) {
         return Err(OciError::InvalidConfig(
@@ -3330,6 +3903,137 @@ mod tests {
         assert!(
             matches!(auto_remove_err, OciError::InvalidConfig(ref msg) if msg.contains(OCI_ANNOTATION_AUTO_REMOVE))
         );
+    }
+
+    #[test]
+    fn parse_compose_log_rotation_accepts_json_file_max_size_and_max_file() {
+        let annotations = vec![
+            (
+                OCI_ANNOTATION_COMPOSE_LOGGING_DRIVER.to_string(),
+                "json-file".to_string(),
+            ),
+            (
+                OCI_ANNOTATION_COMPOSE_LOGGING_OPTIONS.to_string(),
+                "max-size=10m\nmax-file=3".to_string(),
+            ),
+        ];
+
+        let rotation = parse_compose_log_rotation(&annotations)
+            .unwrap()
+            .expect("rotation config should be present");
+        assert_eq!(rotation.max_size_bytes, 10 * 1024 * 1024);
+        assert_eq!(rotation.max_files, 3);
+    }
+
+    #[test]
+    fn parse_compose_log_rotation_defaults_max_file_to_one() {
+        let annotations = vec![
+            (
+                OCI_ANNOTATION_COMPOSE_LOGGING_DRIVER.to_string(),
+                "local".to_string(),
+            ),
+            (
+                OCI_ANNOTATION_COMPOSE_LOGGING_OPTIONS.to_string(),
+                "max-size=1m".to_string(),
+            ),
+        ];
+
+        let rotation = parse_compose_log_rotation(&annotations)
+            .unwrap()
+            .expect("rotation config should be present");
+        assert_eq!(rotation.max_size_bytes, 1024 * 1024);
+        assert_eq!(rotation.max_files, 1);
+    }
+
+    #[test]
+    fn parse_compose_log_rotation_skips_none_driver_or_missing_max_size() {
+        let none_driver = vec![
+            (
+                OCI_ANNOTATION_COMPOSE_LOGGING_DRIVER.to_string(),
+                "none".to_string(),
+            ),
+            (
+                OCI_ANNOTATION_COMPOSE_LOGGING_OPTIONS.to_string(),
+                "max-size=10m".to_string(),
+            ),
+        ];
+        assert!(parse_compose_log_rotation(&none_driver).unwrap().is_none());
+
+        let no_max_size = vec![
+            (
+                OCI_ANNOTATION_COMPOSE_LOGGING_DRIVER.to_string(),
+                "json-file".to_string(),
+            ),
+            (
+                OCI_ANNOTATION_COMPOSE_LOGGING_OPTIONS.to_string(),
+                "max-file=3".to_string(),
+            ),
+        ];
+        assert!(parse_compose_log_rotation(&no_max_size).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_compose_log_rotation_rejects_labels_and_tag_options() {
+        let labels = vec![
+            (
+                OCI_ANNOTATION_COMPOSE_LOGGING_DRIVER.to_string(),
+                "json-file".to_string(),
+            ),
+            (
+                OCI_ANNOTATION_COMPOSE_LOGGING_OPTIONS.to_string(),
+                "max-size=10m\nlabels=com.example.team".to_string(),
+            ),
+        ];
+        let labels_err = parse_compose_log_rotation(&labels).unwrap_err();
+        assert!(matches!(
+            labels_err,
+            OciError::InvalidConfig(ref message) if message.contains("labels")
+        ));
+
+        let tag = vec![
+            (
+                OCI_ANNOTATION_COMPOSE_LOGGING_DRIVER.to_string(),
+                "json-file".to_string(),
+            ),
+            (
+                OCI_ANNOTATION_COMPOSE_LOGGING_OPTIONS.to_string(),
+                "max-size=10m\ntag=svc".to_string(),
+            ),
+        ];
+        let tag_err = parse_compose_log_rotation(&tag).unwrap_err();
+        assert!(matches!(
+            tag_err,
+            OciError::InvalidConfig(ref message) if message.contains("tag")
+        ));
+    }
+
+    #[test]
+    fn build_log_rotation_script_uses_copy_truncate_for_archives() {
+        let script = build_log_rotation_script(
+            "container-123",
+            ComposeLogRotation {
+                max_size_bytes: 1024,
+                max_files: 3,
+            },
+        );
+        assert!(script.contains("/run/vz-oci/logs/container-123/output.log"));
+        assert!(script.contains("rm -f \"$log.2\""));
+        assert!(script.contains("cp \"$log\" \"$log.1\""));
+        assert!(script.contains(": > \"$log\""));
+    }
+
+    #[test]
+    fn build_log_rotation_script_truncates_when_max_file_is_one() {
+        let script = build_log_rotation_script(
+            "container-456",
+            ComposeLogRotation {
+                max_size_bytes: 2048,
+                max_files: 1,
+            },
+        );
+        assert!(script.contains("if [ \"$size\" -ge 2048 ]"));
+        assert!(!script.contains("cp \"$log\" \"$log.1\""));
+        assert!(script.contains(": > \"$log\""));
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3989,11 +4693,65 @@ mod tests {
     #[test]
     fn exec_config_default_is_empty() {
         let cfg = ExecConfig::default();
+        assert!(cfg.execution_id.is_none());
         assert!(cfg.cmd.is_empty());
         assert!(cfg.working_dir.is_none());
         assert!(cfg.env.is_empty());
         assert!(cfg.user.is_none());
+        assert!(!cfg.pty);
+        assert!(cfg.term_rows.is_none());
+        assert!(cfg.term_cols.is_none());
         assert!(cfg.timeout.is_none());
+    }
+
+    #[test]
+    fn parse_signal_number_supports_symbolic_and_numeric_inputs() {
+        assert_eq!(parse_signal_number("SIGTERM"), Some(15));
+        assert_eq!(parse_signal_number("term"), Some(15));
+        assert_eq!(parse_signal_number("2"), Some(2));
+        assert_eq!(parse_signal_number("SIGWINCH"), Some(28));
+        assert_eq!(parse_signal_number(""), None);
+        assert_eq!(parse_signal_number("SIGDOESNOTEXIST"), None);
+    }
+
+    #[tokio::test]
+    async fn exec_control_missing_session_returns_not_found() {
+        let data_dir = unique_temp_dir("exec-control-missing");
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir,
+            ..RuntimeConfig::default()
+        });
+
+        let write = runtime
+            .write_exec_stdin("exec-missing", b"hello")
+            .await
+            .unwrap_err();
+        let signal = runtime
+            .signal_exec("exec-missing", "SIGTERM")
+            .await
+            .unwrap_err();
+        let resize = runtime
+            .resize_exec_pty("exec-missing", 120, 40)
+            .await
+            .unwrap_err();
+        let cancel = runtime.cancel_exec("exec-missing").await.unwrap_err();
+
+        assert!(matches!(
+            write,
+            OciError::ExecutionSessionNotFound { execution_id } if execution_id == "exec-missing"
+        ));
+        assert!(matches!(
+            signal,
+            OciError::ExecutionSessionNotFound { execution_id } if execution_id == "exec-missing"
+        ));
+        assert!(matches!(
+            resize,
+            OciError::ExecutionSessionNotFound { execution_id } if execution_id == "exec-missing"
+        ));
+        assert!(matches!(
+            cancel,
+            OciError::ExecutionSessionNotFound { execution_id } if execution_id == "exec-missing"
+        ));
     }
 
     #[tokio::test]

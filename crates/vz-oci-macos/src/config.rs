@@ -194,6 +194,9 @@ pub struct RunConfig {
 /// Options for executing a command in an already-running container.
 #[derive(Debug, Clone, Default)]
 pub struct ExecConfig {
+    /// Optional daemon-side execution identity used for runtime
+    /// interactive control session binding.
+    pub execution_id: Option<String>,
     /// Command and arguments to execute.
     pub cmd: Vec<String>,
     /// Optional working directory inside the container.
@@ -202,6 +205,12 @@ pub struct ExecConfig {
     pub env: Vec<(String, String)>,
     /// Optional user to run as inside the container.
     pub user: Option<String>,
+    /// Allocate an interactive PTY for the process.
+    pub pty: bool,
+    /// Optional initial terminal rows when PTY is enabled.
+    pub term_rows: Option<u16>,
+    /// Optional initial terminal cols when PTY is enabled.
+    pub term_cols: Option<u16>,
     /// Optional exec timeout override.
     pub timeout: Option<Duration>,
 }

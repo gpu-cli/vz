@@ -284,6 +284,100 @@ async fn lifecycle_create_exec_stop_remove() {
     );
 }
 
+/// Validate live interactive exec control (stdin/resize/signal) and stale
+/// session diagnostics after completion.
+#[tokio::test]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn interactive_exec_control_session_round_trip() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
+    init_tracing();
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = test_runtime(tmp.path());
+
+    let container_id = rt
+        .create_container(
+            "alpine:latest",
+            RunConfig {
+                cmd: vec!["sleep".into(), "300".into()],
+                execution_mode: ExecutionMode::OciRuntime,
+                ..RunConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let execution_id = "exec-interactive-e2e".to_string();
+    let rt_exec = rt.clone();
+    let container_for_exec = container_id.clone();
+    let execution_for_task = execution_id.clone();
+    let exec_task = tokio::spawn(async move {
+        rt_exec
+            .exec_container(
+                &container_for_exec,
+                ExecConfig {
+                    execution_id: Some(execution_for_task),
+                    cmd: vec![
+                        "sh".into(),
+                        "-lc".into(),
+                        "read line; sleep 1; echo got:$line".into(),
+                    ],
+                    pty: true,
+                    term_rows: Some(24),
+                    term_cols: Some(80),
+                    timeout: Some(Duration::from_secs(30)),
+                    ..ExecConfig::default()
+                },
+            )
+            .await
+    });
+
+    let mut wrote = false;
+    for _ in 0..40 {
+        match rt
+            .write_exec_stdin(&execution_id, b"hello-interactive\n")
+            .await
+        {
+            Ok(()) => {
+                wrote = true;
+                break;
+            }
+            Err(vz_oci_macos::MacosOciError::ExecutionSessionNotFound { .. }) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(err) => panic!("unexpected stdin error: {err:?}"),
+        }
+    }
+    assert!(wrote, "interactive session should accept stdin writes");
+
+    rt.resize_exec_pty(&execution_id, 120, 40).await.unwrap();
+    rt.signal_exec(&execution_id, "SIGWINCH").await.unwrap();
+
+    let output = exec_task.await.unwrap().unwrap();
+    assert_eq!(output.exit_code, 0, "interactive exec should complete");
+    assert!(
+        output.stdout.contains("got:hello-interactive"),
+        "interactive stdout should contain echoed line, got: {}",
+        output.stdout
+    );
+
+    let stale = rt
+        .write_exec_stdin(&execution_id, b"after-complete\n")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            stale,
+            vz_oci_macos::MacosOciError::ExecutionSessionNotFound { .. }
+        ),
+        "stale session should return ExecutionSessionNotFound, got: {stale:?}"
+    );
+
+    let _ = rt.stop_container(&container_id, true, None, None).await;
+    let _ = rt.remove_container(&container_id).await;
+}
+
 // ── Container logs ──────────────────────────────────────────────
 
 /// Create a container with capture_logs, run a command that writes output,

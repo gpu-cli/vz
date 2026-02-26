@@ -20,6 +20,22 @@ pub enum MacosOciError {
     #[error(transparent)]
     Linux(#[from] vz_linux::LinuxError),
 
+    /// Requested execution session is not active.
+    #[error("execution session not found: {execution_id}")]
+    ExecutionSessionNotFound {
+        /// Daemon execution identifier.
+        execution_id: String,
+    },
+
+    /// Interactive execution control is unsupported for the session.
+    #[error("execution control unsupported for `{operation}`: {reason}")]
+    ExecutionControlUnsupported {
+        /// Operation name.
+        operation: String,
+        /// Actionable unsupported reason.
+        reason: String,
+    },
+
     /// The selected execution strategy is not yet implemented.
     #[error("execution mode '{mode}' is not yet supported")]
     UnsupportedExecutionMode {
