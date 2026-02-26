@@ -444,6 +444,7 @@ impl LinuxVm {
         &self,
         command: &str,
         args: &[&str],
+        working_dir: Option<&str>,
         rows: u32,
         cols: u32,
     ) -> Result<(crate::grpc_client::GrpcExecStream, u64), LinuxError> {
@@ -453,11 +454,15 @@ impl LinuxVm {
             .as_mut()
             .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let options = ExecOptions {
+            working_dir: working_dir.map(|s| s.to_string()),
+            ..ExecOptions::default()
+        };
         client
             .exec_stream_interactive(
                 command.to_string(),
                 args_owned,
-                ExecOptions::default(),
+                options,
                 rows,
                 cols,
             )

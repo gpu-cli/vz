@@ -339,18 +339,15 @@ async fn attach_interactive(
 
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
 
+    let wd = if working_dir.is_empty() {
+        None
+    } else {
+        Some(working_dir)
+    };
     let (mut stream, exec_id) = vm
-        .exec_interactive(shell, &[], rows as u32, cols as u32)
+        .exec_interactive(shell, &[], wd, rows as u32, cols as u32)
         .await
         .context("failed to start interactive session")?;
-
-    // Set working directory inside the shell.
-    if !working_dir.is_empty() {
-        let cd_cmd = format!("cd {working_dir}\n");
-        vm.stdin_write(exec_id, cd_cmd.as_bytes())
-            .await
-            .context("failed to send cd command")?;
-    }
 
     terminal::enable_raw_mode().context("failed to enable raw mode")?;
 
@@ -419,6 +416,14 @@ fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
                 if ctrl_byte <= 26 {
                     return vec![ctrl_byte];
                 }
+            }
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                // Alt+key sends ESC prefix followed by the key byte.
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
+                let mut out = vec![0x1b];
+                out.extend_from_slice(s.as_bytes());
+                return out;
             }
             let mut buf = [0u8; 4];
             let s = c.encode_utf8(&mut buf);

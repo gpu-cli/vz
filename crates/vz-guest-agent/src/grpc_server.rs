@@ -9,7 +9,6 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
-use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
@@ -25,12 +24,19 @@ use vz_agent_proto::*;
 
 use crate::process_table::ProcessTable;
 
-// ── PTY master fd tracking ─────────────────────────────────────────
+// ── PTY handle tracking ─────────────────────────────────────────
 
-static PTY_MASTERS: OnceLock<StdMutex<HashMap<u64, RawFd>>> = OnceLock::new();
+/// Holds the writer and master PTY for a PTY session, supporting
+/// stdin writes and terminal resizing.
+struct PtyMasterHandle {
+    writer: Box<dyn std::io::Write + Send>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+}
 
-fn pty_masters() -> &'static StdMutex<HashMap<u64, RawFd>> {
-    PTY_MASTERS.get_or_init(|| StdMutex::new(HashMap::new()))
+static PTY_HANDLES: OnceLock<StdMutex<HashMap<u64, PtyMasterHandle>>> = OnceLock::new();
+
+fn pty_handles() -> &'static StdMutex<HashMap<u64, PtyMasterHandle>> {
+    PTY_HANDLES.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
 // ── Shared state passed to all service impls ────────────────────────
@@ -329,117 +335,79 @@ impl AgentServiceImpl {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    /// PTY-based exec. Allocates a pseudo-terminal and spawns the child process
-    /// with the slave side as its controlling terminal. Output is read from the
-    /// master fd and streamed as stdout events (PTY combines stdout+stderr).
+    /// PTY-based exec. Allocates a pseudo-terminal via `portable-pty` and spawns
+    /// the child process with the slave side as its controlling terminal. Output
+    /// is read from the master and streamed as stdout events.
     async fn exec_pty(
         &self,
         req: ExecRequest,
         request_id: String,
     ) -> Result<Response<ReceiverStream<Result<ExecEvent, Status>>>, Status> {
-        use std::os::fd::AsRawFd;
-        use std::process::Stdio;
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        use std::io::Read;
 
-        let env: Vec<(String, String)> = req.env.into_iter().collect();
-        let working_dir = if req.working_dir.is_empty() {
-            None
-        } else {
-            Some(req.working_dir.clone())
-        };
-
-        // Open a PTY pair (master + slave).
-        let pty = nix::pty::openpty(None, None)
-            .map_err(|e| Status::internal(format!("openpty failed: {e}")))?;
-        let master_fd = pty.master.as_raw_fd();
-        let slave_fd = pty.slave.as_raw_fd();
-
-        // Set initial window size on the master fd.
         let rows = if req.term_rows == 0 { 24 } else { req.term_rows };
         let cols = if req.term_cols == 0 { 80 } else { req.term_cols };
-        let winsize = libc::winsize {
-            ws_row: rows as u16,
-            ws_col: cols as u16,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        // SAFETY: TIOCSWINSZ is a standard ioctl to set terminal window size.
-        unsafe {
-            libc::ioctl(master_fd, libc::TIOCSWINSZ as libc::c_ulong, &winsize);
-        }
 
-        let mut cmd = tokio::process::Command::new(&req.command);
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: rows as u16,
+                cols: cols as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| Status::internal(format!("openpty failed: {e}")))?;
+
+        let mut cmd = CommandBuilder::new(&req.command);
         cmd.args(&req.args);
 
-        if let Some(ref dir) = working_dir {
-            cmd.current_dir(dir);
+        if !req.working_dir.is_empty() {
+            cmd.cwd(&req.working_dir);
         }
 
         cmd.env("TERM", "xterm-256color");
-        for (key, value) in &env {
+        for (key, value) in &req.env {
             cmd.env(key, value);
         }
 
-        // Redirect stdio to null; the pre_exec hook will dup2 the slave fd
-        // onto stdin/stdout/stderr before exec.
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::null());
-
-        // SAFETY: pre_exec runs between fork and exec in the child process.
-        // We create a new session, set the slave as the controlling terminal,
-        // and redirect stdin/stdout/stderr to it.
-        unsafe {
-            cmd.pre_exec(move || {
-                // Create a new session so the child becomes the session leader.
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // Set the slave fd as the controlling terminal.
-                if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // Redirect stdin/stdout/stderr to the slave fd.
-                libc::dup2(slave_fd, 0);
-                libc::dup2(slave_fd, 1);
-                libc::dup2(slave_fd, 2);
-                // Close the slave fd (it's now duplicated onto 0/1/2).
-                if slave_fd > 2 {
-                    libc::close(slave_fd);
-                }
-                // Close the master fd in the child — only the parent reads it.
-                libc::close(master_fd);
-                Ok(())
-            });
-        }
-
-        let child = cmd.spawn().map_err(|e| {
+        let child = pair.slave.spawn_command(cmd).map_err(|e| {
             warn!(command = %req.command, error = %e, "grpc: pty exec spawn failed");
             Status::internal(format!("failed to spawn PTY process: {e}"))
         })?;
 
-        // Close the slave fd on the parent side — only the child uses it.
-        // The master pty.master OwnedFd will be kept alive via PTY_MASTERS.
-        drop(pty.slave);
+        // Drop slave — only the child uses it.
+        drop(pair.slave);
 
-        let exec_id = child.id().unwrap_or(0) as u64;
+        let exec_id = child.process_id().unwrap_or(0) as u64;
         info!(
             request_id = %request_id, exec_id, command = %req.command,
             args = ?req.args, rows, cols, "grpc: pty process spawned"
         );
 
-        // Store the master fd for stdin_write and resize operations.
-        {
-            let mut masters = pty_masters().lock().unwrap_or_else(|p| p.into_inner());
-            masters.insert(exec_id, master_fd);
-        }
-        // Keep the OwnedFd alive by leaking it — we manage lifetime via PTY_MASTERS.
-        // We close it explicitly on cleanup.
-        std::mem::forget(pty.master);
+        // Get reader (cloned handle) and writer from the master.
+        let mut reader = pair.master.try_clone_reader().map_err(|e| {
+            Status::internal(format!("failed to clone PTY reader: {e}"))
+        })?;
+        let writer = pair.master.take_writer().map_err(|e| {
+            Status::internal(format!("failed to take PTY writer: {e}"))
+        })?;
 
-        // Insert child into process table (no stdin pipe — we use master fd).
+        // Store master + writer for stdin_write and resize operations.
+        {
+            let mut handles = pty_handles().lock().unwrap_or_else(|p| p.into_inner());
+            handles.insert(exec_id, PtyMasterHandle {
+                writer,
+                master: pair.master,
+            });
+        }
+
+        // Insert child into process table (no stdin pipe — we use PTY writer).
         {
             let mut table = self.state.process_table.lock().await;
-            table.insert(exec_id, child, None);
+            // portable-pty Child isn't tokio-compatible, so we wrap it in the
+            // process table as a waitable entry below instead.
+            table.insert_pty(exec_id, child);
         }
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ExecEvent, Status>>(64);
@@ -456,79 +424,34 @@ impl AgentServiceImpl {
             warn!(exec_id, "grpc: failed to send initial pty exec event");
         }
 
-        // Spawn PTY master reader task. PTY combines stdout and stderr into a
-        // single stream on the master fd.
+        // Spawn blocking reader task. portable-pty gives us a synchronous Read,
+        // so we read in a blocking thread and forward chunks as exec events.
         let reader_exec_id = exec_id;
-        let pty_reader_handle = tokio::spawn(async move {
-            // Set the master fd to non-blocking for async I/O.
-            // SAFETY: fcntl F_SETFL is a standard POSIX call.
-            unsafe {
-                let flags = libc::fcntl(master_fd, libc::F_GETFL);
-                libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
-
-            // Wrap the raw fd in an AsyncFd for tokio-based polling.
-            let async_fd = match tokio::io::unix::AsyncFd::new(
-                unsafe { std::os::fd::BorrowedFd::borrow_raw(master_fd) },
-            ) {
-                Ok(fd) => fd,
-                Err(e) => {
-                    warn!(exec_id = reader_exec_id, error = %e, "grpc: failed to create AsyncFd for pty master");
-                    return;
-                }
-            };
-
+        let pty_reader_handle = tokio::task::spawn_blocking(move || {
             let mut buf = vec![0u8; 65536];
             loop {
-                let mut ready = match async_fd.readable().await {
-                    Ok(ready) => ready,
-                    Err(e) => {
-                        debug!(exec_id = reader_exec_id, error = %e, "grpc: pty async_fd readable error");
-                        break;
-                    }
-                };
-
-                match ready.try_io(|inner| {
-                    let n = unsafe {
-                        libc::read(
-                            inner.get_ref().as_raw_fd(),
-                            buf.as_mut_ptr().cast::<libc::c_void>(),
-                            buf.len(),
-                        )
-                    };
-                    if n > 0 {
-                        Ok(n as usize)
-                    } else if n == 0 {
-                        Ok(0)
-                    } else {
-                        let err = std::io::Error::last_os_error();
-                        if err.kind() == std::io::ErrorKind::WouldBlock {
-                            Err(err)
-                        } else {
-                            // EIO is expected when the slave side closes (child exited).
-                            Ok(0)
-                        }
-                    }
-                }) {
-                    Ok(Ok(0)) => break,
-                    Ok(Ok(n)) => {
-                        match send_ordered_exec_event(
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let data = buf[..n].to_vec();
+                        let rt = tokio::runtime::Handle::current();
+                        match rt.block_on(send_ordered_exec_event(
                             reader_exec_id,
-                            exec_event::Event::Stdout(buf[..n].to_vec()),
-                        )
-                        .await
-                        {
+                            exec_event::Event::Stdout(data),
+                        )) {
                             Ok(sequence) => {
                                 debug!(exec_id = reader_exec_id, sequence, bytes = n, "grpc: pty stdout chunk");
                             }
                             Err(_) => break,
                         }
                     }
-                    Ok(Err(e)) => {
-                        warn!(exec_id = reader_exec_id, error = %e, "grpc: pty read error");
+                    Err(e) => {
+                        // EIO is expected when the slave side closes (child exited).
+                        if e.raw_os_error() != Some(libc::EIO) {
+                            warn!(exec_id = reader_exec_id, error = %e, "grpc: pty read error");
+                        }
                         break;
                     }
-                    Err(_would_block) => continue,
                 }
             }
         });
@@ -538,17 +461,7 @@ impl AgentServiceImpl {
         tokio::spawn(async move {
             let exit_code = {
                 let mut table = exit_table.lock().await;
-                if let Some(entry) = table.get_mut(exec_id) {
-                    match entry.child.wait().await {
-                        Ok(status) => status.code().unwrap_or(-1),
-                        Err(e) => {
-                            warn!(exec_id, error = %e, "grpc: pty wait error");
-                            -1
-                        }
-                    }
-                } else {
-                    -1
-                }
+                table.wait_pty(exec_id).await
             };
 
             // Brief window for remaining PTY output.
@@ -566,17 +479,14 @@ impl AgentServiceImpl {
                 debug!(exec_id, sequence, "grpc: pty exit event");
             }
 
-            // Clean up: remove from process table, PTY masters, and order context.
+            // Clean up: remove from process table, PTY handles, and order context.
             {
                 let mut table = exit_table.lock().await;
                 table.remove(exec_id);
             }
             {
-                let mut masters = pty_masters().lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(fd) = masters.remove(&exec_id) {
-                    // SAFETY: closing the master fd we opened and own.
-                    unsafe { libc::close(fd); }
-                }
+                let mut handles = pty_handles().lock().unwrap_or_else(|p| p.into_inner());
+                handles.remove(&exec_id);
             }
             remove_exec_order_context(exec_id);
         });
@@ -662,18 +572,15 @@ impl agent_service_server::AgentService for AgentServiceImpl {
             );
         }
 
-        // For PTY sessions, write to the master fd instead of the child's stdin pipe.
+        // For PTY sessions, write to the master PTY writer.
         {
-            let masters = pty_masters().lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(&master_fd) = masters.get(&req.exec_id) {
-                let data = req.data;
-                // Write to PTY master fd using nix::unistd::write (blocking, but
-                // PTY writes are fast and bounded by the data size).
-                nix::unistd::write(
-                    unsafe { std::os::fd::BorrowedFd::borrow_raw(master_fd) },
-                    &data,
-                )
-                .map_err(|e| Status::internal(format!("pty write failed: {e}")))?;
+            let mut handles = pty_handles().lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(handle) = handles.get_mut(&req.exec_id) {
+                use std::io::Write;
+                handle
+                    .writer
+                    .write_all(&req.data)
+                    .map_err(|e| Status::internal(format!("pty write failed: {e}")))?;
                 return Ok(Response::new(StdinWriteResponse {}));
             }
         }
@@ -849,23 +756,23 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         &self,
         request: Request<ResizeExecPtyRequest>,
     ) -> Result<Response<ResizeExecPtyResponse>, Status> {
+        use portable_pty::PtySize;
+
         let req = request.into_inner();
-        let masters = pty_masters().lock().unwrap_or_else(|p| p.into_inner());
-        let master_fd = masters
-            .get(&req.exec_id)
+        let mut handles = pty_handles().lock().unwrap_or_else(|p| p.into_inner());
+        let handle = handles
+            .get_mut(&req.exec_id)
             .ok_or_else(|| Status::not_found(format!("no PTY for exec {}", req.exec_id)))?;
 
-        let winsize = libc::winsize {
-            ws_row: req.rows as u16,
-            ws_col: req.cols as u16,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        // SAFETY: TIOCSWINSZ is a standard ioctl to set terminal window size.
-        let ret = unsafe { libc::ioctl(*master_fd, libc::TIOCSWINSZ as libc::c_ulong, &winsize) };
-        if ret != 0 {
-            return Err(Status::internal("ioctl TIOCSWINSZ failed"));
-        }
+        handle
+            .master
+            .resize(PtySize {
+                rows: req.rows as u16,
+                cols: req.cols as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| Status::internal(format!("pty resize failed: {e}")))?;
 
         info!(exec_id = req.exec_id, rows = req.rows, cols = req.cols, "grpc: pty resized");
         Ok(Response::new(ResizeExecPtyResponse {}))

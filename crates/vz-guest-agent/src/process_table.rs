@@ -25,6 +25,8 @@ impl ProcessEntry {
 /// Table of active child processes, keyed by exec_id.
 pub struct ProcessTable {
     entries: HashMap<u64, ProcessEntry>,
+    /// PTY children from portable-pty (separate from tokio children).
+    pty_children: HashMap<u64, Box<dyn portable_pty::Child + Send>>,
 }
 
 #[allow(dead_code)]
@@ -33,6 +35,7 @@ impl ProcessTable {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            pty_children: HashMap::new(),
         }
     }
 
@@ -79,6 +82,31 @@ impl ProcessTable {
     /// Remove all entries from the table.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.pty_children.clear();
+    }
+
+    /// Insert a PTY child process (from portable-pty).
+    pub fn insert_pty(&mut self, exec_id: u64, child: Box<dyn portable_pty::Child + Send>) {
+        self.pty_children.insert(exec_id, child);
+    }
+
+    /// Wait for a PTY child to exit, returning its exit code.
+    ///
+    /// Must be called from an async context — internally uses `spawn_blocking`
+    /// since portable-pty's `Child::wait` is synchronous.
+    pub async fn wait_pty(&mut self, exec_id: u64) -> i32 {
+        let Some(mut child) = self.pty_children.remove(&exec_id) else {
+            return -1;
+        };
+        // portable-pty Child::wait() is blocking, run on a thread.
+        tokio::task::spawn_blocking(move || {
+            match child.wait() {
+                Ok(status) => status.exit_code() as i32,
+                Err(_) => -1,
+            }
+        })
+        .await
+        .unwrap_or(-1)
     }
 }
 

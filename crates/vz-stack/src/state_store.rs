@@ -1018,11 +1018,15 @@ impl StateStore {
 
     /// Persist a sandbox, upserting on `sandbox_id`.
     pub fn save_sandbox(&self, sandbox: &Sandbox) -> Result<(), StackError> {
+        // Standalone sandboxes have no stack_name label — use sandbox_id to
+        // satisfy the UNIQUE(stack_name) constraint (each sandbox is its own
+        // "stack" when running standalone).
         let stack_name = sandbox
             .labels
             .get("stack_name")
+            .filter(|s| !s.is_empty())
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_else(|| sandbox.sandbox_id.clone());
         let state_json = serde_json::to_string(&sandbox.state)?;
         let backend_json = serde_json::to_string(&sandbox.backend)?;
         let spec_json = serde_json::to_string(&sandbox.spec)?;
