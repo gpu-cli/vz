@@ -1235,11 +1235,7 @@ mod tests {
         assert_eq!(result.services_failed, 0);
 
         // Service phase in state store should be Running (not Creating or Stopping).
-        let observed = orch
-            .executor()
-            .store()
-            .load_observed_state("app")
-            .unwrap();
+        let observed = orch.executor().store().load_observed_state("app").unwrap();
         let web = observed.iter().find(|o| o.service_name == "web").unwrap();
         assert_eq!(
             web.phase,
@@ -1266,11 +1262,7 @@ mod tests {
         // keeps retrying → hits max_rounds.
         assert_eq!(result.services_failed, 1);
 
-        let observed = orch
-            .executor()
-            .store()
-            .load_observed_state("app")
-            .unwrap();
+        let observed = orch.executor().store().load_observed_state("app").unwrap();
         let web = observed.iter().find(|o| o.service_name == "web").unwrap();
         assert_eq!(
             web.phase,

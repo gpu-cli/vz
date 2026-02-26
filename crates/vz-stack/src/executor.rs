@@ -868,8 +868,9 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
             // Partition prepared creates: those whose image pull failed go straight
             // to the error path; the rest proceed to parallel container creation.
-            let (ok_prepared, failed_prepared): (Vec<_>, Vec<_>) =
-                prepared.into_iter().partition(|p| pulled_images.contains(&p.image));
+            let (ok_prepared, failed_prepared): (Vec<_>, Vec<_>) = prepared
+                .into_iter()
+                .partition(|p| pulled_images.contains(&p.image));
 
             for prep in failed_prepared {
                 let full_name = prep.full_name();
@@ -3283,11 +3284,17 @@ mod tests {
         }];
 
         let result = executor.execute(&spec, &actions).unwrap();
-        assert!(result.all_succeeded(), "remove should succeed despite stop failure");
+        assert!(
+            result.all_succeeded(),
+            "remove should succeed despite stop failure"
+        );
 
         // Verify both stop AND remove were attempted.
         let calls = executor.runtime().call_log();
-        assert!(calls.iter().any(|(op, _)| op == "stop"), "stop should be attempted");
+        assert!(
+            calls.iter().any(|(op, _)| op == "stop"),
+            "stop should be attempted"
+        );
         assert!(
             calls.iter().any(|(op, _)| op == "remove"),
             "remove should still be called after stop failure"
@@ -3327,7 +3334,10 @@ mod tests {
         }];
 
         let result = executor.execute(&spec, &actions).unwrap();
-        assert!(result.all_succeeded(), "remove should succeed even when runtime remove fails");
+        assert!(
+            result.all_succeeded(),
+            "remove should succeed even when runtime remove fails"
+        );
 
         // State should be Stopped (not stuck in Running).
         let observed = executor.store().load_observed_state("myapp").unwrap();
@@ -3453,7 +3463,11 @@ mod tests {
         let spec_name = "replica-sd";
 
         // Simulate 3 running replicas.
-        for (name, cid) in [("web", "ctr-web"), ("web-2", "ctr-web-2"), ("web-3", "ctr-web-3")] {
+        for (name, cid) in [
+            ("web", "ctr-web"),
+            ("web-2", "ctr-web-2"),
+            ("web-3", "ctr-web-3"),
+        ] {
             executor
                 .store()
                 .save_observed_state(

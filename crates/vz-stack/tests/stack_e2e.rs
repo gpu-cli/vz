@@ -2655,10 +2655,10 @@ volumes:
     );
 
     // 3. Read the shared data from reader container.
-    let (exit_code, stdout, stderr) = orchestrator
-        .executor()
-        .runtime()
-        .exec_with_output(reader_cid, vec!["cat".into(), "/mnt/shared/data.txt".into()]);
+    let (exit_code, stdout, stderr) = orchestrator.executor().runtime().exec_with_output(
+        reader_cid,
+        vec!["cat".into(), "/mnt/shared/data.txt".into()],
+    );
     assert_eq!(
         exit_code, 0,
         "reader should see writer's data: stderr={stderr}"
@@ -2887,11 +2887,7 @@ services:
     // Verify env_file variable is present inside the running container.
     let (exit_code, stdout, stderr) = orchestrator.executor().runtime().exec_with_output(
         app_cid,
-        vec![
-            "sh".into(),
-            "-c".into(),
-            "echo $DB_HOST".into(),
-        ],
+        vec!["sh".into(), "-c".into(), "echo $DB_HOST".into()],
     );
     assert_eq!(exit_code, 0, "echo DB_HOST should succeed: stderr={stderr}");
     assert_eq!(stdout.trim(), "db.internal");
@@ -2899,11 +2895,7 @@ services:
     // Verify inline env overrides env_file.
     let (exit_code, stdout, _) = orchestrator.executor().runtime().exec_with_output(
         app_cid,
-        vec![
-            "sh".into(),
-            "-c".into(),
-            "echo $LOG_LEVEL".into(),
-        ],
+        vec!["sh".into(), "-c".into(), "echo $LOG_LEVEL".into()],
     );
     assert_eq!(exit_code, 0);
     assert_eq!(
@@ -2915,11 +2907,7 @@ services:
     // Verify purely-inline variable.
     let (exit_code, stdout, _) = orchestrator.executor().runtime().exec_with_output(
         app_cid,
-        vec![
-            "sh".into(),
-            "-c".into(),
-            "echo $CUSTOM_VAR".into(),
-        ],
+        vec!["sh".into(), "-c".into(), "echo $CUSTOM_VAR".into()],
     );
     assert_eq!(exit_code, 0);
     assert_eq!(stdout.trim(), "injected");
@@ -3082,10 +3070,7 @@ networks:
             "db".into(),
         ],
     );
-    assert_ne!(
-        exit_code, 0,
-        "web should NOT reach db (different networks)"
-    );
+    assert_ne!(exit_code, 0, "web should NOT reach db (different networks)");
 
     // Teardown.
     let down_spec = vz_stack::StackSpec {

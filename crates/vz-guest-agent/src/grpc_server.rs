@@ -346,8 +346,16 @@ impl AgentServiceImpl {
         use portable_pty::{CommandBuilder, PtySize, native_pty_system};
         use std::io::Read;
 
-        let rows = if req.term_rows == 0 { 24 } else { req.term_rows };
-        let cols = if req.term_cols == 0 { 80 } else { req.term_cols };
+        let rows = if req.term_rows == 0 {
+            24
+        } else {
+            req.term_rows
+        };
+        let cols = if req.term_cols == 0 {
+            80
+        } else {
+            req.term_cols
+        };
 
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -386,20 +394,25 @@ impl AgentServiceImpl {
         );
 
         // Get reader (cloned handle) and writer from the master.
-        let mut reader = pair.master.try_clone_reader().map_err(|e| {
-            Status::internal(format!("failed to clone PTY reader: {e}"))
-        })?;
-        let writer = pair.master.take_writer().map_err(|e| {
-            Status::internal(format!("failed to take PTY writer: {e}"))
-        })?;
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| Status::internal(format!("failed to clone PTY reader: {e}")))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|e| Status::internal(format!("failed to take PTY writer: {e}")))?;
 
         // Store master + writer for stdin_write and resize operations.
         {
             let mut handles = pty_handles().lock().unwrap_or_else(|p| p.into_inner());
-            handles.insert(exec_id, PtyMasterHandle {
-                writer,
-                master: pair.master,
-            });
+            handles.insert(
+                exec_id,
+                PtyMasterHandle {
+                    writer,
+                    master: pair.master,
+                },
+            );
         }
 
         // Insert child into process table (no stdin pipe — we use PTY writer).
@@ -414,12 +427,9 @@ impl AgentServiceImpl {
         register_exec_order_context(exec_id, ExecOrderContext::new(tx.clone(), request_id));
 
         // Send the first event with exec_id so the client can correlate.
-        if let Err(()) = send_ordered_exec_event_with_id(
-            exec_id,
-            exec_event::Event::Stdout(Vec::new()),
-            exec_id,
-        )
-        .await
+        if let Err(()) =
+            send_ordered_exec_event_with_id(exec_id, exec_event::Event::Stdout(Vec::new()), exec_id)
+                .await
         {
             warn!(exec_id, "grpc: failed to send initial pty exec event");
         }
@@ -440,7 +450,12 @@ impl AgentServiceImpl {
                             exec_event::Event::Stdout(data),
                         )) {
                             Ok(sequence) => {
-                                debug!(exec_id = reader_exec_id, sequence, bytes = n, "grpc: pty stdout chunk");
+                                debug!(
+                                    exec_id = reader_exec_id,
+                                    sequence,
+                                    bytes = n,
+                                    "grpc: pty stdout chunk"
+                                );
                             }
                             Err(_) => break,
                         }
@@ -465,11 +480,8 @@ impl AgentServiceImpl {
             };
 
             // Brief window for remaining PTY output.
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_millis(500),
-                pty_reader_handle,
-            )
-            .await;
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), pty_reader_handle)
+                .await;
 
             info!(exec_id, exit_code, "grpc: pty process exited");
 
@@ -774,7 +786,12 @@ impl agent_service_server::AgentService for AgentServiceImpl {
             })
             .map_err(|e| Status::internal(format!("pty resize failed: {e}")))?;
 
-        info!(exec_id = req.exec_id, rows = req.rows, cols = req.cols, "grpc: pty resized");
+        info!(
+            exec_id = req.exec_id,
+            rows = req.rows,
+            cols = req.cols,
+            "grpc: pty resized"
+        );
         Ok(Response::new(ResizeExecPtyResponse {}))
     }
 }

@@ -3790,6 +3790,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "vz-runtimed"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vz-linux-native",
+ "vz-oci-macos",
+ "vz-runtime-contract",
+]
+
+[[package]]
 name = "vz-sandbox"
 version = "0.1.0"
 dependencies = [

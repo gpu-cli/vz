@@ -1,0 +1,29 @@
+[package]
+name = "vz-runtimed"
+version = "0.1.0"
+description = "Runtime V2 control-plane daemon"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+vz-runtime-contract = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+vz-oci-macos = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+vz-linux-native = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

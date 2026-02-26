@@ -5,6 +5,7 @@ members = [
     "vz-agent-proto",
     "vz-sandbox",
     "vz-cli",
+    "vz-runtimed",
     "vz-guest-agent",
     "vz-image",
     "vz-linux",
@@ -171,6 +172,7 @@ vz-stack = { path = "vz-stack" }
 vz-agent-proto = { path = "vz-agent-proto" }
 vz-validation = { path = "vz-validation" }
 vz-api = { path = "vz-api" }
+vz-runtimed = { path = "vz-runtimed" }
 
 # gRPC / Protobuf
 tonic = { version = "0.12", features = ["transport"] }

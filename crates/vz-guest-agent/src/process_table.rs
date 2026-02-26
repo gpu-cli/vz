@@ -99,11 +99,9 @@ impl ProcessTable {
             return -1;
         };
         // portable-pty Child::wait() is blocking, run on a thread.
-        tokio::task::spawn_blocking(move || {
-            match child.wait() {
-                Ok(status) => status.exit_code() as i32,
-                Err(_) => -1,
-            }
+        tokio::task::spawn_blocking(move || match child.wait() {
+            Ok(status) => status.exit_code() as i32,
+            Err(_) => -1,
         })
         .await
         .unwrap_or(-1)
