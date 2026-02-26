@@ -65,6 +65,15 @@ pub struct ExecRequest {
     pub user: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "6")]
     pub metadata: ::core::option::Option<TransportMetadata>,
+    /// allocate a PTY for interactive use
+    #[prost(bool, tag = "7")]
+    pub allocate_pty: bool,
+    /// initial terminal rows (PTY only)
+    #[prost(uint32, tag = "8")]
+    pub term_rows: u32,
+    /// initial terminal cols (PTY only)
+    #[prost(uint32, tag = "9")]
+    pub term_cols: u32,
 }
 /// Server-streamed event for a running exec. The last event is always
 /// exit_code (or error if the command failed to start).
@@ -76,6 +85,9 @@ pub struct ExecEvent {
     /// Correlated request identifier echoed from the originating request.
     #[prost(string, tag = "6")]
     pub request_id: ::prost::alloc::string::String,
+    /// Exec identifier for correlation (sent in first event for PTY sessions).
+    #[prost(uint64, tag = "7")]
+    pub exec_id: u64,
     #[prost(oneof = "exec_event::Event", tags = "1, 2, 3, 4")]
     pub event: ::core::option::Option<exec_event::Event>,
 }
@@ -124,6 +136,19 @@ pub struct SignalRequest {
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct SignalResponse {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResizeExecPtyRequest {
+    #[prost(uint64, tag = "1")]
+    pub exec_id: u64,
+    #[prost(uint32, tag = "2")]
+    pub rows: u32,
+    #[prost(uint32, tag = "3")]
+    pub cols: u32,
+    #[prost(message, optional, tag = "4")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ResizeExecPtyResponse {}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PortForwardFrame {
     #[prost(oneof = "port_forward_frame::Frame", tags = "1, 2")]
@@ -537,6 +562,31 @@ pub mod agent_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("vz.agent.v1.AgentService", "Signal"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Resize the PTY window for a running exec session.
+        pub async fn resize_exec_pty(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ResizeExecPtyRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ResizeExecPtyResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.agent.v1.AgentService/ResizeExecPty",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("vz.agent.v1.AgentService", "ResizeExecPty"));
             self.inner.unary(req, path, codec).await
         }
         /// Bidirectional TCP relay through the guest.
@@ -1021,6 +1071,14 @@ pub mod agent_service_server {
             &self,
             request: tonic::Request<super::SignalRequest>,
         ) -> std::result::Result<tonic::Response<super::SignalResponse>, tonic::Status>;
+        /// Resize the PTY window for a running exec session.
+        async fn resize_exec_pty(
+            &self,
+            request: tonic::Request<super::ResizeExecPtyRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ResizeExecPtyResponse>,
+            tonic::Status,
+        >;
         /// Server streaming response type for the PortForward method.
         type PortForwardStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::PortForwardFrame, tonic::Status>,
@@ -1413,6 +1471,51 @@ pub mod agent_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = SignalSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.agent.v1.AgentService/ResizeExecPty" => {
+                    #[allow(non_camel_case_types)]
+                    struct ResizeExecPtySvc<T: AgentService>(pub Arc<T>);
+                    impl<
+                        T: AgentService,
+                    > tonic::server::UnaryService<super::ResizeExecPtyRequest>
+                    for ResizeExecPtySvc<T> {
+                        type Response = super::ResizeExecPtyResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ResizeExecPtyRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentService>::resize_exec_pty(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ResizeExecPtySvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

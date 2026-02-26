@@ -656,10 +656,11 @@ impl RuntimeCapabilities {
 /// Backends expose the strongest isolation they provide. Callers can
 /// query a backend's isolation level to make scheduling, security, and
 /// resource decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IsolationLevel {
     /// Full hardware-virtualised isolation (e.g., Virtualization.framework VM).
+    #[default]
     Full,
     /// OCI-runtime container isolation (namespaces + cgroups + seccomp).
     Container,
@@ -697,12 +698,6 @@ impl IsolationLevel {
     /// Whether this level provides full VM-based isolation.
     pub fn has_vm_isolation(self) -> bool {
         matches!(self, Self::Full)
-    }
-}
-
-impl Default for IsolationLevel {
-    fn default() -> Self {
-        Self::Full
     }
 }
 

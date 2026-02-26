@@ -133,21 +133,16 @@ impl StressReport {
 }
 
 /// Controls which test results contribute to duration accounting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SweepMode {
     /// Account durations from all iterations (pass and fail).
+    #[default]
     All,
     /// Account durations only from failed iterations.
     ///
     /// Useful for diagnosing slow failure paths without pass-iteration
     /// noise diluting the timing signal.
     FailOnly,
-}
-
-impl Default for SweepMode {
-    fn default() -> Self {
-        Self::All
-    }
 }
 
 /// Configuration for a sweep run (parameterised stress with duration

@@ -36,6 +36,9 @@ service AgentService {
   // Send a signal to a running exec.
   rpc Signal(SignalRequest) returns (SignalResponse);
 
+  // Resize the PTY window for a running exec session.
+  rpc ResizeExecPty(ResizeExecPtyRequest) returns (ResizeExecPtyResponse);
+
   // Bidirectional TCP relay through the guest.
   // Client sends PortForwardOpen as the first frame, then raw data
   // flows in both directions.
@@ -116,6 +119,9 @@ message ExecRequest {
   map<string, string> env = 4;
   string user = 5;            // empty = agent's user (root)
   TransportMetadata metadata = 6;
+  bool allocate_pty = 7;      // allocate a PTY for interactive use
+  uint32 term_rows = 8;       // initial terminal rows (PTY only)
+  uint32 term_cols = 9;       // initial terminal cols (PTY only)
 }
 
 // Server-streamed event for a running exec. The last event is always
@@ -131,6 +137,8 @@ message ExecEvent {
   uint64 sequence = 5;
   // Correlated request identifier echoed from the originating request.
   string request_id = 6;
+  // Exec identifier for correlation (sent in first event for PTY sessions).
+  uint64 exec_id = 7;
 }
 
 message StdinWriteRequest {
@@ -152,6 +160,16 @@ message SignalRequest {
   TransportMetadata metadata = 3;
 }
 message SignalResponse {}
+
+// ─── PTY Resize ─────────────────────────────────────────────
+
+message ResizeExecPtyRequest {
+  uint64 exec_id = 1;
+  uint32 rows = 2;
+  uint32 cols = 3;
+  TransportMetadata metadata = 4;
+}
+message ResizeExecPtyResponse {}
 
 // ─── Port Forward ───────────────────────────────────────────────
 

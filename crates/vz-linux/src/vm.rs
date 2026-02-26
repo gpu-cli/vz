@@ -437,6 +437,78 @@ impl LinuxVm {
         client.network_teardown(stack_id, service_names).await
     }
 
+    /// Execute a command interactively with PTY allocation.
+    ///
+    /// Returns a streaming handle and exec_id for stdin/resize operations.
+    pub async fn exec_interactive(
+        &self,
+        command: &str,
+        args: &[&str],
+        rows: u32,
+        cols: u32,
+    ) -> Result<(crate::grpc_client::GrpcExecStream, u64), LinuxError> {
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
+        let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        client
+            .exec_stream_interactive(
+                command.to_string(),
+                args_owned,
+                ExecOptions::default(),
+                rows,
+                cols,
+            )
+            .await
+    }
+
+    /// Write data to a running exec's stdin (or PTY master).
+    pub async fn stdin_write(&self, exec_id: u64, data: &[u8]) -> Result<(), LinuxError> {
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
+        client.stdin_write(exec_id, data).await
+    }
+
+    /// Close a running exec's stdin.
+    pub async fn stdin_close(&self, exec_id: u64) -> Result<(), LinuxError> {
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
+        client.stdin_close(exec_id).await
+    }
+
+    /// Send a signal to a running exec process.
+    pub async fn signal(&self, exec_id: u64, signal: i32) -> Result<(), LinuxError> {
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
+        client.signal(exec_id, signal).await
+    }
+
+    /// Resize the PTY window for a running interactive exec session.
+    pub async fn resize_exec_pty(
+        &self,
+        exec_id: u64,
+        rows: u32,
+        cols: u32,
+    ) -> Result<(), LinuxError> {
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
+        client.resize_exec_pty(exec_id, rows, cols).await
+    }
+
     /// Borrow the underlying base VM.
     pub fn inner(&self) -> &Vm {
         self.vm.as_ref()

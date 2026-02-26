@@ -8,10 +8,12 @@ pub mod cache;
 pub mod checkpoint;
 #[cfg(target_os = "macos")]
 pub mod cleanup;
+pub mod debug;
 pub mod docker;
 #[cfg(target_os = "macos")]
 pub mod exec;
 pub mod execution;
+pub mod image;
 #[cfg(target_os = "macos")]
 pub mod init;
 pub mod lease;

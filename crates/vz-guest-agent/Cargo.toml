@@ -18,6 +18,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 libc = { workspace = true }
+nix = { workspace = true, features = ["term"] }
 clap = { workspace = true }
 
 # gRPC

@@ -90,6 +90,9 @@ mod tests {
                 request_id: "req_exec_1".to_string(),
                 idempotency_key: "exec_container:req_exec_1".to_string(),
             }),
+            allocate_pty: false,
+            term_rows: 0,
+            term_cols: 0,
         };
         let encoded = msg.encode_to_vec();
         let decoded = ExecRequest::decode(encoded.as_slice()).unwrap();
@@ -102,6 +105,7 @@ mod tests {
             event: Some(exec_event::Event::Stdout(b"hello world\n".to_vec())),
             sequence: 1,
             request_id: "req_exec_1".to_string(),
+            exec_id: 0,
         };
         let encoded = msg.encode_to_vec();
         let decoded = ExecEvent::decode(encoded.as_slice()).unwrap();
@@ -121,6 +125,7 @@ mod tests {
             event: Some(exec_event::Event::ExitCode(0)),
             sequence: 2,
             request_id: "req_exec_1".to_string(),
+            exec_id: 0,
         };
         let encoded = msg.encode_to_vec();
         let decoded = ExecEvent::decode(encoded.as_slice()).unwrap();

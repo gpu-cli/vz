@@ -18,8 +18,9 @@ use vz::protocol::{ExecOutput, OciContainerState, OciExecResult};
 use vz_agent_proto::{
     ExecRequest as ProtoExecRequest, NetworkSetupRequest, NetworkTeardownRequest, OciCreateRequest,
     OciDeleteRequest, OciExecRequest, OciKillRequest, OciStartRequest, OciStateRequest,
-    PingRequest, PortForwardFrame, PortForwardOpen, ResourceStatsRequest, ResourceStatsResponse,
-    SystemInfoRequest, SystemInfoResponse, TransportMetadata as ProtoTransportMetadata,
+    PingRequest, PortForwardFrame, PortForwardOpen, ResizeExecPtyRequest, ResourceStatsRequest,
+    ResourceStatsResponse, SignalRequest, StdinCloseRequest, StdinWriteRequest, SystemInfoRequest,
+    SystemInfoResponse, TransportMetadata as ProtoTransportMetadata,
     agent_service_client::AgentServiceClient, exec_event,
     network_service_client::NetworkServiceClient, oci_service_client::OciServiceClient,
     port_forward_frame,
@@ -218,6 +219,9 @@ impl GrpcAgentClient {
             env,
             user: options.user.unwrap_or_default(),
             metadata: Some(metadata),
+            allocate_pty: false,
+            term_rows: 0,
+            term_cols: 0,
         };
 
         let response = self.agent.exec(request).await?;
@@ -295,6 +299,9 @@ impl GrpcAgentClient {
             env,
             user: options.user.unwrap_or_default(),
             metadata: Some(metadata),
+            allocate_pty: false,
+            term_rows: 0,
+            term_cols: 0,
         };
 
         let response = self.agent.exec(request).await?;
@@ -511,6 +518,104 @@ impl GrpcAgentClient {
 
         Ok(GrpcPortForwardStream::new(inbound, tx))
     }
+
+    /// Write data to a running exec's stdin.
+    pub async fn stdin_write(&mut self, exec_id: u64, data: &[u8]) -> Result<(), LinuxError> {
+        let metadata = self.next_transport_metadata(None);
+        self.agent
+            .stdin_write(StdinWriteRequest {
+                exec_id,
+                data: data.to_vec(),
+                metadata: Some(metadata),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Send a signal to a running exec process.
+    pub async fn signal(&mut self, exec_id: u64, signal: i32) -> Result<(), LinuxError> {
+        let metadata = self.next_transport_metadata(None);
+        self.agent
+            .signal(SignalRequest {
+                exec_id,
+                signal,
+                metadata: Some(metadata),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Close a running exec's stdin.
+    pub async fn stdin_close(&mut self, exec_id: u64) -> Result<(), LinuxError> {
+        let metadata = self.next_transport_metadata(None);
+        self.agent
+            .stdin_close(StdinCloseRequest {
+                exec_id,
+                metadata: Some(metadata),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Resize the PTY window for a running interactive exec session.
+    pub async fn resize_exec_pty(
+        &mut self,
+        exec_id: u64,
+        rows: u32,
+        cols: u32,
+    ) -> Result<(), LinuxError> {
+        let metadata = self.next_transport_metadata(None);
+        self.agent
+            .resize_exec_pty(ResizeExecPtyRequest {
+                exec_id,
+                rows,
+                cols,
+                metadata: Some(metadata),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Execute a command with PTY allocation and return a streaming handle + exec_id.
+    ///
+    /// Unlike [`exec_stream`](Self::exec_stream), this allocates a PTY on the guest
+    /// and returns the exec_id needed for stdin_write, signal, and resize_exec_pty.
+    pub async fn exec_stream_interactive(
+        &mut self,
+        command: String,
+        args: Vec<String>,
+        options: ExecOptions,
+        rows: u32,
+        cols: u32,
+    ) -> Result<(GrpcExecStream, u64), LinuxError> {
+        let env = options.env.into_iter().collect::<HashMap<String, String>>();
+        let metadata = self.next_transport_metadata(Some(RuntimeOperation::ExecContainer));
+        let expected_request_id = if metadata.request_id.is_empty() {
+            None
+        } else {
+            Some(metadata.request_id.clone())
+        };
+
+        let request = ProtoExecRequest {
+            command,
+            args,
+            working_dir: options.working_dir.unwrap_or_default(),
+            env,
+            user: options.user.unwrap_or_default(),
+            metadata: Some(metadata),
+            allocate_pty: true,
+            term_rows: rows,
+            term_cols: cols,
+        };
+
+        let response = self.agent.exec(request).await?;
+        let inner_stream = response.into_inner();
+
+        let (stream, exec_id) =
+            GrpcExecStream::new_interactive(inner_stream, expected_request_id).await?;
+
+        Ok((stream, exec_id))
+    }
 }
 
 /// A stream of exec events from a gRPC-based command execution.
@@ -521,6 +626,8 @@ pub struct GrpcExecStream {
     done: bool,
     last_sequence: u64,
     expected_request_id: Option<String>,
+    /// Buffered first proto event consumed during interactive session setup.
+    buffered_first: Option<vz_agent_proto::ExecEvent>,
 }
 
 impl GrpcExecStream {
@@ -534,7 +641,35 @@ impl GrpcExecStream {
             done: false,
             last_sequence: 0,
             expected_request_id,
+            buffered_first: None,
         }
+    }
+
+    /// Create a new interactive exec stream, extracting exec_id from the first event.
+    ///
+    /// Returns the stream and the exec_id for subsequent stdin_write/resize operations.
+    pub async fn new_interactive(
+        mut inner: tonic::Streaming<vz_agent_proto::ExecEvent>,
+        expected_request_id: Option<String>,
+    ) -> Result<(Self, u64), LinuxError> {
+        // Read the first event to extract exec_id.
+        let first = inner
+            .message()
+            .await?
+            .ok_or_else(|| LinuxError::Protocol("interactive exec stream empty".to_string()))?;
+
+        let exec_id = first.exec_id;
+        if exec_id == 0 {
+            return Err(LinuxError::Protocol(
+                "interactive exec missing exec_id in first event".to_string(),
+            ));
+        }
+
+        // Buffer the first event so its data is not lost.
+        let mut stream = Self::new(inner, expected_request_id);
+        stream.buffered_first = Some(first);
+
+        Ok((stream, exec_id))
     }
 
     /// Read the next event from the stream.
@@ -547,7 +682,14 @@ impl GrpcExecStream {
         }
 
         loop {
-            match self.inner.message().await {
+            // Return the buffered first event if present (from interactive setup).
+            let next_event = if let Some(buffered) = self.buffered_first.take() {
+                Ok(Some(buffered))
+            } else {
+                self.inner.message().await
+            };
+
+            match next_event {
                 Ok(Some(proto_event)) => {
                     if validate_exec_event_metadata(
                         &mut self.last_sequence,

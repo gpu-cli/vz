@@ -16,7 +16,7 @@ pub use benchmark::{
 };
 pub use config::LinuxVmConfig;
 pub use error::LinuxError;
-pub use grpc_client::{ExecOptions, GrpcPortForwardStream, OciExecOptions};
+pub use grpc_client::{ExecOptions, GrpcExecStream, GrpcPortForwardStream, OciExecOptions};
 pub use kernel::{
     EnsureKernelOptions, KernelPaths, KernelVersion, default_linux_dir, ensure_kernel,
     ensure_kernel_with_options,

@@ -9,6 +9,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
@@ -23,6 +24,14 @@ use tracing::error;
 use vz_agent_proto::*;
 
 use crate::process_table::ProcessTable;
+
+// ── PTY master fd tracking ─────────────────────────────────────────
+
+static PTY_MASTERS: OnceLock<StdMutex<HashMap<u64, RawFd>>> = OnceLock::new();
+
+fn pty_masters() -> &'static StdMutex<HashMap<u64, RawFd>> {
+    PTY_MASTERS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
 
 // ── Shared state passed to all service impls ────────────────────────
 
@@ -104,6 +113,16 @@ fn request_id_from_metadata(metadata: Option<&TransportMetadata>, prefix: &str) 
 }
 
 async fn send_ordered_exec_event(exec_id: u64, event: exec_event::Event) -> Result<u64, ()> {
+    send_ordered_exec_event_with_id(exec_id, event, 0).await
+}
+
+/// Send an ordered exec event with an explicit exec_id field in the event.
+/// Used for PTY sessions where the client needs the exec_id for correlation.
+async fn send_ordered_exec_event_with_id(
+    exec_id: u64,
+    event: exec_event::Event,
+    event_exec_id: u64,
+) -> Result<u64, ()> {
     let Some(context) = lookup_exec_order_context(exec_id) else {
         return Err(());
     };
@@ -115,6 +134,7 @@ async fn send_ordered_exec_event(exec_id: u64, event: exec_event::Event) -> Resu
             event: Some(event),
             sequence,
             request_id: context.request_id.clone(),
+            exec_id: event_exec_id,
         }))
         .await
         .map_err(|_| ())?;
@@ -143,6 +163,425 @@ impl AgentServiceImpl {
     /// Create a new `AgentServiceImpl` with the given shared state.
     pub fn new(state: SharedState) -> Self {
         Self { state }
+    }
+
+    /// Pipe-based exec (the original non-PTY path). Spawns a child process with
+    /// piped stdin/stdout/stderr and streams output events back to the client.
+    async fn exec_pipe(
+        &self,
+        req: ExecRequest,
+        request_id: String,
+    ) -> Result<Response<ReceiverStream<Result<ExecEvent, Status>>>, Status> {
+        use tokio::io::AsyncReadExt;
+
+        let env: Vec<(String, String)> = req.env.into_iter().collect();
+        let working_dir = if req.working_dir.is_empty() {
+            None
+        } else {
+            Some(req.working_dir)
+        };
+        let user = if req.user.is_empty() {
+            None
+        } else {
+            Some(req.user)
+        };
+
+        let spawn_result = if let Some(ref username) = user {
+            crate::spawn_as_user(
+                username,
+                &req.command,
+                &req.args,
+                working_dir.as_deref(),
+                &env,
+            )
+        } else {
+            crate::spawn_direct(&req.command, &req.args, working_dir.as_deref(), &env)
+        };
+
+        let mut child = match spawn_result {
+            Ok(child) => child,
+            Err(e) => {
+                warn!(request_id = %request_id, command = %req.command, error = %e, "grpc: exec spawn failed");
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                let _ = tx
+                    .send(Ok(ExecEvent {
+                        event: Some(exec_event::Event::Error(e.to_string())),
+                        sequence: 1,
+                        request_id: request_id.clone(),
+                        exec_id: 0,
+                    }))
+                    .await;
+                return Ok(Response::new(ReceiverStream::new(rx)));
+            }
+        };
+
+        info!(request_id = %request_id, command = %req.command, args = ?req.args, "grpc: process spawned");
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let stdin = child.stdin.take();
+        let exec_id = child.id().unwrap_or(0) as u64;
+
+        {
+            let mut table = self.state.process_table.lock().await;
+            table.insert(exec_id, child, stdin);
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ExecEvent, Status>>(64);
+        register_exec_order_context(exec_id, ExecOrderContext::new(tx.clone(), request_id));
+
+        let process_table = self.state.process_table.clone();
+
+        let stdout_handle = tokio::spawn(async move {
+            if let Some(mut stdout) = stdout {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    match stdout.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            match send_ordered_exec_event(
+                                exec_id,
+                                exec_event::Event::Stdout(buf[..n].to_vec()),
+                            )
+                            .await
+                            {
+                                Ok(sequence) => {
+                                    debug!(exec_id, sequence, bytes = n, "grpc: stdout chunk");
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        Err(e) => {
+                            warn!(exec_id, error = %e, "grpc: stdout read error");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let stderr_handle = tokio::spawn(async move {
+            if let Some(mut stderr) = stderr {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    match stderr.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            match send_ordered_exec_event(
+                                exec_id,
+                                exec_event::Event::Stderr(buf[..n].to_vec()),
+                            )
+                            .await
+                            {
+                                Ok(sequence) => {
+                                    debug!(exec_id, sequence, bytes = n, "grpc: stderr chunk");
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        Err(e) => {
+                            warn!(exec_id, error = %e, "grpc: stderr read error");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let exit_table = process_table;
+        tokio::spawn(async move {
+            let exit_code = {
+                let mut table = exit_table.lock().await;
+                if let Some(entry) = table.get_mut(exec_id) {
+                    match entry.child.wait().await {
+                        Ok(status) => status.code().unwrap_or(-1),
+                        Err(e) => {
+                            warn!(exec_id, error = %e, "grpc: wait error");
+                            -1
+                        }
+                    }
+                } else {
+                    -1
+                }
+            };
+
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                let _ = stdout_handle.await;
+                let _ = stderr_handle.await;
+            })
+            .await;
+
+            info!(exec_id, exit_code, "grpc: process exited");
+
+            if let Ok(sequence) =
+                send_ordered_exec_event(exec_id, exec_event::Event::ExitCode(exit_code)).await
+            {
+                debug!(exec_id, sequence, "grpc: exit event");
+            }
+
+            {
+                let mut table = exit_table.lock().await;
+                table.remove(exec_id);
+            }
+            remove_exec_order_context(exec_id);
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    /// PTY-based exec. Allocates a pseudo-terminal and spawns the child process
+    /// with the slave side as its controlling terminal. Output is read from the
+    /// master fd and streamed as stdout events (PTY combines stdout+stderr).
+    async fn exec_pty(
+        &self,
+        req: ExecRequest,
+        request_id: String,
+    ) -> Result<Response<ReceiverStream<Result<ExecEvent, Status>>>, Status> {
+        use std::os::fd::AsRawFd;
+        use std::process::Stdio;
+
+        let env: Vec<(String, String)> = req.env.into_iter().collect();
+        let working_dir = if req.working_dir.is_empty() {
+            None
+        } else {
+            Some(req.working_dir.clone())
+        };
+
+        // Open a PTY pair (master + slave).
+        let pty = nix::pty::openpty(None, None)
+            .map_err(|e| Status::internal(format!("openpty failed: {e}")))?;
+        let master_fd = pty.master.as_raw_fd();
+        let slave_fd = pty.slave.as_raw_fd();
+
+        // Set initial window size on the master fd.
+        let rows = if req.term_rows == 0 { 24 } else { req.term_rows };
+        let cols = if req.term_cols == 0 { 80 } else { req.term_cols };
+        let winsize = libc::winsize {
+            ws_row: rows as u16,
+            ws_col: cols as u16,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: TIOCSWINSZ is a standard ioctl to set terminal window size.
+        unsafe {
+            libc::ioctl(master_fd, libc::TIOCSWINSZ as libc::c_ulong, &winsize);
+        }
+
+        let mut cmd = tokio::process::Command::new(&req.command);
+        cmd.args(&req.args);
+
+        if let Some(ref dir) = working_dir {
+            cmd.current_dir(dir);
+        }
+
+        cmd.env("TERM", "xterm-256color");
+        for (key, value) in &env {
+            cmd.env(key, value);
+        }
+
+        // Redirect stdio to null; the pre_exec hook will dup2 the slave fd
+        // onto stdin/stdout/stderr before exec.
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+
+        // SAFETY: pre_exec runs between fork and exec in the child process.
+        // We create a new session, set the slave as the controlling terminal,
+        // and redirect stdin/stdout/stderr to it.
+        unsafe {
+            cmd.pre_exec(move || {
+                // Create a new session so the child becomes the session leader.
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Set the slave fd as the controlling terminal.
+                if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Redirect stdin/stdout/stderr to the slave fd.
+                libc::dup2(slave_fd, 0);
+                libc::dup2(slave_fd, 1);
+                libc::dup2(slave_fd, 2);
+                // Close the slave fd (it's now duplicated onto 0/1/2).
+                if slave_fd > 2 {
+                    libc::close(slave_fd);
+                }
+                // Close the master fd in the child — only the parent reads it.
+                libc::close(master_fd);
+                Ok(())
+            });
+        }
+
+        let child = cmd.spawn().map_err(|e| {
+            warn!(command = %req.command, error = %e, "grpc: pty exec spawn failed");
+            Status::internal(format!("failed to spawn PTY process: {e}"))
+        })?;
+
+        // Close the slave fd on the parent side — only the child uses it.
+        // The master pty.master OwnedFd will be kept alive via PTY_MASTERS.
+        drop(pty.slave);
+
+        let exec_id = child.id().unwrap_or(0) as u64;
+        info!(
+            request_id = %request_id, exec_id, command = %req.command,
+            args = ?req.args, rows, cols, "grpc: pty process spawned"
+        );
+
+        // Store the master fd for stdin_write and resize operations.
+        {
+            let mut masters = pty_masters().lock().unwrap_or_else(|p| p.into_inner());
+            masters.insert(exec_id, master_fd);
+        }
+        // Keep the OwnedFd alive by leaking it — we manage lifetime via PTY_MASTERS.
+        // We close it explicitly on cleanup.
+        std::mem::forget(pty.master);
+
+        // Insert child into process table (no stdin pipe — we use master fd).
+        {
+            let mut table = self.state.process_table.lock().await;
+            table.insert(exec_id, child, None);
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ExecEvent, Status>>(64);
+        register_exec_order_context(exec_id, ExecOrderContext::new(tx.clone(), request_id));
+
+        // Send the first event with exec_id so the client can correlate.
+        if let Err(()) = send_ordered_exec_event_with_id(
+            exec_id,
+            exec_event::Event::Stdout(Vec::new()),
+            exec_id,
+        )
+        .await
+        {
+            warn!(exec_id, "grpc: failed to send initial pty exec event");
+        }
+
+        // Spawn PTY master reader task. PTY combines stdout and stderr into a
+        // single stream on the master fd.
+        let reader_exec_id = exec_id;
+        let pty_reader_handle = tokio::spawn(async move {
+            // Set the master fd to non-blocking for async I/O.
+            // SAFETY: fcntl F_SETFL is a standard POSIX call.
+            unsafe {
+                let flags = libc::fcntl(master_fd, libc::F_GETFL);
+                libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+
+            // Wrap the raw fd in an AsyncFd for tokio-based polling.
+            let async_fd = match tokio::io::unix::AsyncFd::new(
+                unsafe { std::os::fd::BorrowedFd::borrow_raw(master_fd) },
+            ) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    warn!(exec_id = reader_exec_id, error = %e, "grpc: failed to create AsyncFd for pty master");
+                    return;
+                }
+            };
+
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let mut ready = match async_fd.readable().await {
+                    Ok(ready) => ready,
+                    Err(e) => {
+                        debug!(exec_id = reader_exec_id, error = %e, "grpc: pty async_fd readable error");
+                        break;
+                    }
+                };
+
+                match ready.try_io(|inner| {
+                    let n = unsafe {
+                        libc::read(
+                            inner.get_ref().as_raw_fd(),
+                            buf.as_mut_ptr().cast::<libc::c_void>(),
+                            buf.len(),
+                        )
+                    };
+                    if n > 0 {
+                        Ok(n as usize)
+                    } else if n == 0 {
+                        Ok(0)
+                    } else {
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() == std::io::ErrorKind::WouldBlock {
+                            Err(err)
+                        } else {
+                            // EIO is expected when the slave side closes (child exited).
+                            Ok(0)
+                        }
+                    }
+                }) {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => {
+                        match send_ordered_exec_event(
+                            reader_exec_id,
+                            exec_event::Event::Stdout(buf[..n].to_vec()),
+                        )
+                        .await
+                        {
+                            Ok(sequence) => {
+                                debug!(exec_id = reader_exec_id, sequence, bytes = n, "grpc: pty stdout chunk");
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        warn!(exec_id = reader_exec_id, error = %e, "grpc: pty read error");
+                        break;
+                    }
+                    Err(_would_block) => continue,
+                }
+            }
+        });
+
+        // Spawn exit watcher for the PTY session.
+        let exit_table = self.state.process_table.clone();
+        tokio::spawn(async move {
+            let exit_code = {
+                let mut table = exit_table.lock().await;
+                if let Some(entry) = table.get_mut(exec_id) {
+                    match entry.child.wait().await {
+                        Ok(status) => status.code().unwrap_or(-1),
+                        Err(e) => {
+                            warn!(exec_id, error = %e, "grpc: pty wait error");
+                            -1
+                        }
+                    }
+                } else {
+                    -1
+                }
+            };
+
+            // Brief window for remaining PTY output.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                pty_reader_handle,
+            )
+            .await;
+
+            info!(exec_id, exit_code, "grpc: pty process exited");
+
+            if let Ok(sequence) =
+                send_ordered_exec_event(exec_id, exec_event::Event::ExitCode(exit_code)).await
+            {
+                debug!(exec_id, sequence, "grpc: pty exit event");
+            }
+
+            // Clean up: remove from process table, PTY masters, and order context.
+            {
+                let mut table = exit_table.lock().await;
+                table.remove(exec_id);
+            }
+            {
+                let mut masters = pty_masters().lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(fd) = masters.remove(&exec_id) {
+                    // SAFETY: closing the master fd we opened and own.
+                    unsafe { libc::close(fd); }
+                }
+            }
+            remove_exec_order_context(exec_id);
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 
@@ -197,172 +636,14 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         &self,
         request: Request<ExecRequest>,
     ) -> Result<Response<Self::ExecStream>, Status> {
-        use tokio::io::AsyncReadExt;
-
         let req = request.into_inner();
         let request_id = request_id_from_metadata(req.metadata.as_ref(), "exec");
-        let env: Vec<(String, String)> = req.env.into_iter().collect();
-        let working_dir = if req.working_dir.is_empty() {
-            None
+
+        if req.allocate_pty {
+            self.exec_pty(req, request_id).await
         } else {
-            Some(req.working_dir)
-        };
-        let user = if req.user.is_empty() {
-            None
-        } else {
-            Some(req.user)
-        };
-
-        let spawn_result = if let Some(ref username) = user {
-            crate::spawn_as_user(
-                username,
-                &req.command,
-                &req.args,
-                working_dir.as_deref(),
-                &env,
-            )
-        } else {
-            crate::spawn_direct(&req.command, &req.args, working_dir.as_deref(), &env)
-        };
-
-        let mut child = match spawn_result {
-            Ok(child) => child,
-            Err(e) => {
-                warn!(request_id = %request_id, command = %req.command, error = %e, "grpc: exec spawn failed");
-                // Return a stream with a single error event.
-                let (tx, rx) = tokio::sync::mpsc::channel(1);
-                let _ = tx
-                    .send(Ok(ExecEvent {
-                        event: Some(exec_event::Event::Error(e.to_string())),
-                        sequence: 1,
-                        request_id: request_id.clone(),
-                    }))
-                    .await;
-                return Ok(Response::new(ReceiverStream::new(rx)));
-            }
-        };
-
-        info!(request_id = %request_id, command = %req.command, args = ?req.args, "grpc: process spawned");
-
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let stdin = child.stdin.take();
-
-        // Generate exec_id from the child PID (or a fallback).
-        let exec_id = child.id().unwrap_or(0) as u64;
-
-        {
-            let mut table = self.state.process_table.lock().await;
-            table.insert(exec_id, child, stdin);
+            self.exec_pipe(req, request_id).await
         }
-
-        // Channel for streaming ExecEvents back to the client.
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ExecEvent, Status>>(64);
-        register_exec_order_context(exec_id, ExecOrderContext::new(tx.clone(), request_id));
-
-        let process_table = self.state.process_table.clone();
-
-        // Spawn stdout reader.
-        let stdout_handle = tokio::spawn(async move {
-            if let Some(mut stdout) = stdout {
-                let mut buf = vec![0u8; 65536];
-                loop {
-                    match stdout.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            match send_ordered_exec_event(
-                                exec_id,
-                                exec_event::Event::Stdout(buf[..n].to_vec()),
-                            )
-                            .await
-                            {
-                                Ok(sequence) => {
-                                    debug!(exec_id, sequence, bytes = n, "grpc: stdout chunk");
-                                }
-                                Err(_) => break, // Stream no longer active.
-                            }
-                        }
-                        Err(e) => {
-                            warn!(exec_id, error = %e, "grpc: stdout read error");
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-
-        // Spawn stderr reader.
-        let stderr_handle = tokio::spawn(async move {
-            if let Some(mut stderr) = stderr {
-                let mut buf = vec![0u8; 65536];
-                loop {
-                    match stderr.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            match send_ordered_exec_event(
-                                exec_id,
-                                exec_event::Event::Stderr(buf[..n].to_vec()),
-                            )
-                            .await
-                            {
-                                Ok(sequence) => {
-                                    debug!(exec_id, sequence, bytes = n, "grpc: stderr chunk");
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        Err(e) => {
-                            warn!(exec_id, error = %e, "grpc: stderr read error");
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-
-        // Spawn exit watcher.
-        let exit_table = process_table;
-        tokio::spawn(async move {
-            // Wait for child exit before draining pipes.
-            let exit_code = {
-                let mut table = exit_table.lock().await;
-                if let Some(entry) = table.get_mut(exec_id) {
-                    match entry.child.wait().await {
-                        Ok(status) => status.code().unwrap_or(-1),
-                        Err(e) => {
-                            warn!(exec_id, error = %e, "grpc: wait error");
-                            -1
-                        }
-                    }
-                } else {
-                    -1
-                }
-            };
-
-            // Brief window for remaining stdout/stderr data.
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
-                let _ = stdout_handle.await;
-                let _ = stderr_handle.await;
-            })
-            .await;
-
-            info!(exec_id, exit_code, "grpc: process exited");
-
-            if let Ok(sequence) =
-                send_ordered_exec_event(exec_id, exec_event::Event::ExitCode(exit_code)).await
-            {
-                debug!(exec_id, sequence, "grpc: exit event");
-            }
-
-            // Remove from process table.
-            {
-                let mut table = exit_table.lock().await;
-                table.remove(exec_id);
-            }
-            remove_exec_order_context(exec_id);
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn stdin_write(
@@ -380,6 +661,23 @@ impl agent_service_server::AgentService for AgentServiceImpl {
                 "grpc: stdin write ordered"
             );
         }
+
+        // For PTY sessions, write to the master fd instead of the child's stdin pipe.
+        {
+            let masters = pty_masters().lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(&master_fd) = masters.get(&req.exec_id) {
+                let data = req.data;
+                // Write to PTY master fd using nix::unistd::write (blocking, but
+                // PTY writes are fast and bounded by the data size).
+                nix::unistd::write(
+                    unsafe { std::os::fd::BorrowedFd::borrow_raw(master_fd) },
+                    &data,
+                )
+                .map_err(|e| Status::internal(format!("pty write failed: {e}")))?;
+                return Ok(Response::new(StdinWriteResponse {}));
+            }
+        }
+
         let mut table = self.state.process_table.lock().await;
 
         let entry = table
@@ -545,6 +843,32 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn resize_exec_pty(
+        &self,
+        request: Request<ResizeExecPtyRequest>,
+    ) -> Result<Response<ResizeExecPtyResponse>, Status> {
+        let req = request.into_inner();
+        let masters = pty_masters().lock().unwrap_or_else(|p| p.into_inner());
+        let master_fd = masters
+            .get(&req.exec_id)
+            .ok_or_else(|| Status::not_found(format!("no PTY for exec {}", req.exec_id)))?;
+
+        let winsize = libc::winsize {
+            ws_row: req.rows as u16,
+            ws_col: req.cols as u16,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: TIOCSWINSZ is a standard ioctl to set terminal window size.
+        let ret = unsafe { libc::ioctl(*master_fd, libc::TIOCSWINSZ as libc::c_ulong, &winsize) };
+        if ret != 0 {
+            return Err(Status::internal("ioctl TIOCSWINSZ failed"));
+        }
+
+        info!(exec_id = req.exec_id, rows = req.rows, cols = req.cols, "grpc: pty resized");
+        Ok(Response::new(ResizeExecPtyResponse {}))
     }
 }
 
@@ -1191,6 +1515,7 @@ mod tests {
                 sequence: 1,
                 request_id,
                 event: Some(exec_event::Event::Stdout(_)),
+                ..
             })) if request_id == "req-test"
         ));
         let second = rx.recv().await;
@@ -1200,6 +1525,7 @@ mod tests {
                 sequence: 3,
                 request_id,
                 event: Some(exec_event::Event::Stderr(_)),
+                ..
             })) if request_id == "req-test"
         ));
 
