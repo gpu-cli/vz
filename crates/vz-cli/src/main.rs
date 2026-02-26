@@ -371,8 +371,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn parse_debug_vm_init() {
-        let cli =
-            Cli::try_parse_from(["vz", "debug", "vm", "init", "--disk-size", "64G"]).expect("parse");
+        let cli = Cli::try_parse_from(["vz", "debug", "vm", "init", "--disk-size", "64G"])
+            .expect("parse");
         assert!(matches!(cli.command, Some(Commands::Debug(_))));
     }
 

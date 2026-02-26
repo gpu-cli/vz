@@ -459,13 +459,7 @@ impl LinuxVm {
             ..ExecOptions::default()
         };
         client
-            .exec_stream_interactive(
-                command.to_string(),
-                args_owned,
-                options,
-                rows,
-                cols,
-            )
+            .exec_stream_interactive(command.to_string(), args_owned, options, rows, cols)
             .await
     }
 

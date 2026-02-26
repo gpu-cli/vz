@@ -611,8 +611,14 @@ impl GrpcAgentClient {
         let response = self.agent.exec(request).await?;
         let inner_stream = response.into_inner();
 
-        let (stream, exec_id) =
-            GrpcExecStream::new_interactive(inner_stream, expected_request_id).await?;
+        let (stream, exec_id) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            GrpcExecStream::new_interactive(inner_stream, expected_request_id),
+        )
+        .await
+        .map_err(|_| {
+            LinuxError::Protocol("timeout waiting for initial exec event from guest".to_string())
+        })??;
 
         Ok((stream, exec_id))
     }

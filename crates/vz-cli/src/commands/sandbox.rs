@@ -36,8 +36,8 @@ fn dirs_path() -> Option<PathBuf> {
 #[derive(Args, Debug)]
 pub struct SandboxListArgs {
     /// Path to the state database.
-    #[arg(long, default_value = DEFAULT_STATE_DB)]
-    state_db: PathBuf,
+    #[arg(long)]
+    state_db: Option<PathBuf>,
 
     /// Output as JSON.
     #[arg(long)]
@@ -51,8 +51,8 @@ pub struct SandboxInspectArgs {
     pub sandbox_id: String,
 
     /// Path to the state database.
-    #[arg(long, default_value = DEFAULT_STATE_DB)]
-    state_db: PathBuf,
+    #[arg(long)]
+    state_db: Option<PathBuf>,
 }
 
 /// Arguments for `vz rm`.
@@ -62,8 +62,8 @@ pub struct SandboxTerminateArgs {
     pub sandbox_id: String,
 
     /// Path to the state database.
-    #[arg(long, default_value = DEFAULT_STATE_DB)]
-    state_db: PathBuf,
+    #[arg(long)]
+    state_db: Option<PathBuf>,
 }
 
 /// Arguments for `vz attach`.
@@ -73,8 +73,8 @@ pub struct SandboxAttachArgs {
     pub sandbox_id: String,
 
     /// Path to the state database.
-    #[arg(long, default_value = DEFAULT_STATE_DB)]
-    state_db: PathBuf,
+    #[arg(long)]
+    state_db: Option<PathBuf>,
 }
 
 // ── Default sandbox command (no subcommand) ─────────────────────
@@ -108,7 +108,10 @@ pub async fn cmd_default_sandbox(
 }
 
 /// Continue the most recent sandbox for the current directory.
-async fn cmd_continue_sandbox(state_db: &std::path::Path, cwd: &std::path::Path) -> anyhow::Result<()> {
+async fn cmd_continue_sandbox(
+    state_db: &std::path::Path,
+    cwd: &std::path::Path,
+) -> anyhow::Result<()> {
     let store = StateStore::open(state_db).context("failed to open state store")?;
     let sandboxes = store.list_sandboxes().context("failed to list sandboxes")?;
     let cwd_str = cwd.to_string_lossy();
@@ -144,7 +147,10 @@ async fn cmd_resume_sandbox(state_db: &std::path::Path, target: &str) -> anyhow:
     let store = StateStore::open(state_db).context("failed to open state store")?;
 
     // Try exact ID match first.
-    if let Some(sandbox) = store.load_sandbox(target).context("failed to load sandbox")? {
+    if let Some(sandbox) = store
+        .load_sandbox(target)
+        .context("failed to load sandbox")?
+    {
         if sandbox.state.is_terminal() {
             bail!("sandbox {target} is in terminal state");
         }
@@ -254,9 +260,11 @@ async fn boot_and_attach(
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
     use vz::SharedDirConfig;
-    use vz_linux::{LinuxVmConfig, LinuxVm, ensure_kernel};
+    use vz_linux::{LinuxVm, LinuxVmConfig, ensure_kernel};
 
-    let kernel = ensure_kernel().await.context("failed to ensure Linux kernel")?;
+    let kernel = ensure_kernel()
+        .await
+        .context("failed to ensure Linux kernel")?;
 
     let mut vm_config = LinuxVmConfig::new(kernel.kernel, kernel.initramfs);
     vm_config.cpus = spec.cpus.unwrap_or(2);
@@ -269,10 +277,12 @@ async fn boot_and_attach(
         read_only: false,
     });
 
-    // Always configure serial port (write to /dev/null) to prevent guest boot hang.
+    // Configure serial port (required for boot — without it, kernel blocks on console writes).
     vm_config.serial_log_file = Some(PathBuf::from("/dev/null"));
 
-    let vm = LinuxVm::create(vm_config).await.context("failed to create VM")?;
+    let vm = LinuxVm::create(vm_config)
+        .await
+        .context("failed to create VM")?;
 
     let boot_time = vm
         .start_and_wait_for_agent_with_progress(
@@ -288,8 +298,31 @@ async fn boot_and_attach(
 
     eprintln!("Sandbox ready ({:.1}s)", boot_time.as_secs_f64());
 
-    // Mount workspace inside guest.
+    // Mount devpts for PTY support (required before interactive shell).
     let timeout = std::time::Duration::from_secs(10);
+    let devpts_result = vm
+        .exec_capture(
+            "/bin/busybox".to_string(),
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "/bin/busybox mkdir -p /dev/pts && /bin/busybox mount -t devpts devpts /dev/pts"
+                    .to_string(),
+            ],
+            timeout,
+        )
+        .await;
+
+    if let Ok(output) = &devpts_result {
+        if output.exit_code != 0 {
+            eprintln!(
+                "warning: failed to mount devpts: {}{}",
+                output.stdout, output.stderr
+            );
+        }
+    }
+
+    // Mount workspace inside guest.
     let mount_result = vm
         .exec_capture(
             "/bin/busybox".to_string(),
@@ -304,7 +337,10 @@ async fn boot_and_attach(
 
     match &mount_result {
         Ok(output) if output.exit_code != 0 => {
-            eprintln!("warning: failed to mount workspace: {}{}", output.stdout, output.stderr);
+            eprintln!(
+                "warning: failed to mount workspace: {}{}",
+                output.stdout, output.stderr
+            );
         }
         Err(e) => {
             eprintln!("warning: failed to mount workspace: {e}");
@@ -393,7 +429,9 @@ async fn attach_interactive(
                 stdout.write_all(&data).ok();
                 stdout.flush().ok();
             }
-            ExecEvent::Exit(_) => break,
+            ExecEvent::Exit(_code) => {
+                break;
+            }
         }
     }
 
@@ -466,7 +504,8 @@ fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
 
 /// List all sandboxes (`vz ls`).
 pub fn cmd_list(args: SandboxListArgs) -> anyhow::Result<()> {
-    let store = StateStore::open(&args.state_db).context("failed to open state store")?;
+    let state_db = args.state_db.unwrap_or_else(default_state_db);
+    let store = StateStore::open(&state_db).context("failed to open state store")?;
     let sandboxes = store.list_sandboxes().context("failed to list sandboxes")?;
 
     if args.json {
@@ -520,17 +559,13 @@ pub fn cmd_list(args: SandboxListArgs) -> anyhow::Result<()> {
             .unwrap_or_else(|| "-".to_string());
 
         // Use name label if available, otherwise truncate sandbox_id.
-        let display_id = sandbox
-            .labels
-            .get("name")
-            .cloned()
-            .unwrap_or_else(|| {
-                if sandbox.sandbox_id.len() > 14 {
-                    format!("{}…", &sandbox.sandbox_id[..13])
-                } else {
-                    sandbox.sandbox_id.clone()
-                }
-            });
+        let display_id = sandbox.labels.get("name").cloned().unwrap_or_else(|| {
+            if sandbox.sandbox_id.len() > 14 {
+                format!("{}…", &sandbox.sandbox_id[..13])
+            } else {
+                sandbox.sandbox_id.clone()
+            }
+        });
 
         println!(
             "{:<16} {:<12} {:<6} {:<10} {:<30} {:<12}",
@@ -543,7 +578,8 @@ pub fn cmd_list(args: SandboxListArgs) -> anyhow::Result<()> {
 
 /// Show detailed sandbox information (`vz inspect`).
 pub fn cmd_inspect(args: SandboxInspectArgs) -> anyhow::Result<()> {
-    let store = StateStore::open(&args.state_db).context("failed to open state store")?;
+    let state_db = args.state_db.unwrap_or_else(default_state_db);
+    let store = StateStore::open(&state_db).context("failed to open state store")?;
     let sandbox = store
         .load_sandbox(&args.sandbox_id)
         .context("failed to load sandbox")?;
@@ -561,7 +597,8 @@ pub fn cmd_inspect(args: SandboxInspectArgs) -> anyhow::Result<()> {
 
 /// Terminate (remove) a sandbox (`vz rm`).
 pub fn cmd_terminate(args: SandboxTerminateArgs) -> anyhow::Result<()> {
-    let store = StateStore::open(&args.state_db).context("failed to open state store")?;
+    let state_db = args.state_db.unwrap_or_else(default_state_db);
+    let store = StateStore::open(&state_db).context("failed to open state store")?;
     let mut sandbox = store
         .load_sandbox(&args.sandbox_id)
         .context("failed to load sandbox")?
@@ -614,7 +651,8 @@ pub async fn cmd_attach(_args: SandboxAttachArgs) -> anyhow::Result<()> {
     // Full VM handle reattach requires runtime persistence (tracked separately).
     #[cfg(target_os = "macos")]
     {
-        return attach_to_sandbox_by_id(&_args.state_db, &_args.sandbox_id).await;
+        let state_db = _args.state_db.unwrap_or_else(default_state_db);
+        return attach_to_sandbox_by_id(&state_db, &_args.sandbox_id).await;
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -622,7 +660,10 @@ pub async fn cmd_attach(_args: SandboxAttachArgs) -> anyhow::Result<()> {
 }
 
 /// Attach to a sandbox by its ID (shared helper).
-async fn attach_to_sandbox_by_id(state_db: &std::path::Path, sandbox_id: &str) -> anyhow::Result<()> {
+async fn attach_to_sandbox_by_id(
+    state_db: &std::path::Path,
+    sandbox_id: &str,
+) -> anyhow::Result<()> {
     let store = StateStore::open(state_db).context("failed to open state store")?;
     let sandbox = store
         .load_sandbox(sandbox_id)
