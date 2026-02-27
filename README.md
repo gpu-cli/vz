@@ -201,6 +201,21 @@ vz vm run --image ~/.vz/images/base-patched.img --name delta-test --headless
 
 `vm init`, `vm run`, `vm exec`, `vm save`, `vm restore`, `vm list`, `vm stop`, `vm cache`, `vm provision`, `vm cleanup`, `vm self-sign`, `vm validate`, `vm base`, `vm patch`
 
+## Runtime Daemon Connectivity
+
+Runtime-mutating CLI surfaces (`sandbox`, `stack`, `image`, `file`, `lease`, `execution`, `checkpoint`, `build`) use `vz-runtimed` over gRPC/UDS.
+
+- Default socket path is derived from the state DB directory:
+  - `<state-db-parent>/.vz-runtime/runtimed.sock`
+- Endpoint override:
+  - `VZ_RUNTIME_DAEMON_SOCKET=/absolute/path/to/runtimed.sock`
+- Autostart policy:
+  - `VZ_RUNTIME_DAEMON_AUTOSTART=1` (default) enables daemon cold-start
+  - `VZ_RUNTIME_DAEMON_AUTOSTART=0` disables autostart and fails fast when unreachable
+- Transport selector:
+  - `VZ_CONTROL_PLANE_TRANSPORT=daemon-grpc` (default)
+  - `api-http` is reserved and currently fail-closed
+
 ## Architecture
 
 ```
@@ -256,6 +271,7 @@ See `docs/sandbox-vm-e2e.md` for reproducible debug workflow and artifact paths.
 Conformance and parity coverage:
 
 - [Runtime primitive conformance matrix](docs/runtime-primitive-conformance.md)
+- [Daemon-only guardrails and fail-close policy](docs/daemon-only-guardrails.md)
 
 ## License
 

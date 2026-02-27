@@ -236,13 +236,12 @@ impl DaemonClient {
         let mut stream = response.into_inner();
         let completion =
             read_create_sandbox_completion(&self.config.socket_path, &mut stream).await?;
-        let sandbox_response =
-            completion
-                .response
-                .ok_or_else(|| status_to_client_error(
-                    &self.config.socket_path,
-                    Status::internal("create_sandbox completion missing response payload"),
-                ))?;
+        let sandbox_response = completion.response.ok_or_else(|| {
+            status_to_client_error(
+                &self.config.socket_path,
+                Status::internal("create_sandbox completion missing response payload"),
+            )
+        })?;
 
         let mut grpc_response = tonic::Response::new(sandbox_response);
         if !completion.receipt_id.trim().is_empty()
@@ -334,13 +333,12 @@ impl DaemonClient {
         let mut stream = response.into_inner();
         let completion =
             read_terminate_sandbox_completion(&self.config.socket_path, &mut stream).await?;
-        let sandbox_response =
-            completion
-                .response
-                .ok_or_else(|| status_to_client_error(
-                    &self.config.socket_path,
-                    Status::internal("terminate_sandbox completion missing response payload"),
-                ))?;
+        let sandbox_response = completion.response.ok_or_else(|| {
+            status_to_client_error(
+                &self.config.socket_path,
+                Status::internal("terminate_sandbox completion missing response payload"),
+            )
+        })?;
 
         let mut grpc_response = tonic::Response::new(sandbox_response);
         if !completion.receipt_id.trim().is_empty()
@@ -909,7 +907,9 @@ impl DaemonClient {
         &mut self,
         request: runtime_v2::StackServiceActionRequest,
     ) -> Result<tonic::Response<runtime_v2::StackServiceActionResponse>> {
-        let response = self.stop_stack_service_stream_with_metadata(request).await?;
+        let response = self
+            .stop_stack_service_stream_with_metadata(request)
+            .await?;
         let mut stream = response.into_inner();
         let completion =
             read_stack_service_action_completion(&self.config.socket_path, &mut stream).await?;
@@ -934,7 +934,9 @@ impl DaemonClient {
         &mut self,
         request: runtime_v2::StackServiceActionRequest,
     ) -> Result<tonic::Streaming<runtime_v2::StackServiceActionEvent>> {
-        let response = self.stop_stack_service_stream_with_metadata(request).await?;
+        let response = self
+            .stop_stack_service_stream_with_metadata(request)
+            .await?;
         Ok(response.into_inner())
     }
 
@@ -964,7 +966,9 @@ impl DaemonClient {
         &mut self,
         request: runtime_v2::StackServiceActionRequest,
     ) -> Result<tonic::Response<runtime_v2::StackServiceActionResponse>> {
-        let response = self.start_stack_service_stream_with_metadata(request).await?;
+        let response = self
+            .start_stack_service_stream_with_metadata(request)
+            .await?;
         let mut stream = response.into_inner();
         let completion =
             read_stack_service_action_completion(&self.config.socket_path, &mut stream).await?;
@@ -989,7 +993,9 @@ impl DaemonClient {
         &mut self,
         request: runtime_v2::StackServiceActionRequest,
     ) -> Result<tonic::Streaming<runtime_v2::StackServiceActionEvent>> {
-        let response = self.start_stack_service_stream_with_metadata(request).await?;
+        let response = self
+            .start_stack_service_stream_with_metadata(request)
+            .await?;
         Ok(response.into_inner())
     }
 
@@ -1019,7 +1025,9 @@ impl DaemonClient {
         &mut self,
         request: runtime_v2::StackServiceActionRequest,
     ) -> Result<tonic::Response<runtime_v2::StackServiceActionResponse>> {
-        let response = self.restart_stack_service_stream_with_metadata(request).await?;
+        let response = self
+            .restart_stack_service_stream_with_metadata(request)
+            .await?;
         let mut stream = response.into_inner();
         let completion =
             read_stack_service_action_completion(&self.config.socket_path, &mut stream).await?;
@@ -1044,7 +1052,9 @@ impl DaemonClient {
         &mut self,
         request: runtime_v2::StackServiceActionRequest,
     ) -> Result<tonic::Streaming<runtime_v2::StackServiceActionEvent>> {
-        let response = self.restart_stack_service_stream_with_metadata(request).await?;
+        let response = self
+            .restart_stack_service_stream_with_metadata(request)
+            .await?;
         Ok(response.into_inner())
     }
 
@@ -2127,6 +2137,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_with_missing_socket_returns_unavailable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = client_config(&tmp, false);
+        let missing_socket = tmp.path().join("missing").join("runtimed.sock");
+        config.socket_path = missing_socket.clone();
+
+        let error = DaemonClient::connect_with_config(config)
+            .await
+            .expect_err("missing socket should fail");
+        match error {
+            DaemonClientError::Unavailable { socket_path, .. }
+            | DaemonClientError::StartupTimeout { socket_path, .. } => {
+                assert_eq!(socket_path, missing_socket);
+            }
+            other => panic!("expected unavailable/startup-timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_socket_path_override_connects_successfully() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let daemon_config = runtimed_config(&tmp);
+        let daemon = start_daemon(daemon_config.clone()).await;
+
+        let config = DaemonClientConfig {
+            socket_path: daemon_config.socket_path,
+            auto_spawn: false,
+            state_store_path: Some(tmp.path().join("alternate").join("stack-state.db")),
+            runtime_data_dir: Some(tmp.path().join("alternate-runtime")),
+            startup_timeout: Duration::from_secs(3),
+            connect_timeout: Duration::from_millis(300),
+            request_timeout: Duration::from_millis(500),
+            retry_backoff: Duration::from_millis(30),
+            max_retry_backoff: Duration::from_millis(120),
+            ..DaemonClientConfig::default()
+        };
+
+        let client = DaemonClient::connect_with_config(config)
+            .await
+            .expect("socket override should connect");
+        assert!(!client.handshake().daemon_id.is_empty());
+
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
     async fn reconnect_after_daemon_restart_yields_new_handshake() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let daemon_config = runtimed_config(&tmp);
@@ -2196,7 +2252,10 @@ mod tests {
             }
         }
 
-        assert!(saw_progress, "stream should emit at least one progress event");
+        assert!(
+            saw_progress,
+            "stream should emit at least one progress event"
+        );
         let completion = completion.expect("stream should emit completion");
         let response = completion
             .response
@@ -2273,9 +2332,7 @@ mod tests {
                         saw_progress = true;
                     }
                     Some(runtime_v2::create_sandbox_event::Payload::Completion(_)) => {
-                        panic!(
-                            "stream should not emit completion for invalid project_dir request"
-                        );
+                        panic!("stream should not emit completion for invalid project_dir request");
                     }
                     None => {}
                 },
@@ -2285,7 +2342,10 @@ mod tests {
                 Err(error) => break error,
             }
         };
-        assert!(saw_progress, "stream should emit progress before terminal error");
+        assert!(
+            saw_progress,
+            "stream should emit progress before terminal error"
+        );
         assert_eq!(error.code(), Code::InvalidArgument);
 
         let wrapped = client
@@ -2305,6 +2365,135 @@ mod tests {
             wrapped,
             DaemonClientError::Grpc(status) if status.code() == Code::InvalidArgument
         ));
+
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn stack_apply_and_teardown_round_trip_via_daemon_client() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let daemon = start_daemon(runtimed_config(&tmp)).await;
+        let mut client = DaemonClient::connect_with_config(client_config(&tmp, false))
+            .await
+            .expect("client connect");
+
+        let stack_name = "stack-client-e2e".to_string();
+        let applied = client
+            .apply_stack_with_metadata(runtime_v2::ApplyStackRequest {
+                metadata: None,
+                stack_name: stack_name.clone(),
+                compose_yaml: "services: {}\n".to_string(),
+                compose_dir: ".".to_string(),
+                detach: false,
+                dry_run: false,
+            })
+            .await
+            .expect("apply stack");
+        assert!(applied.metadata().get("x-receipt-id").is_some());
+        let applied = applied.into_inner();
+        assert_eq!(applied.stack_name, stack_name);
+
+        let status = client
+            .get_stack_status(runtime_v2::GetStackStatusRequest {
+                metadata: None,
+                stack_name: stack_name.clone(),
+            })
+            .await
+            .expect("get stack status");
+        assert!(status.services.is_empty());
+
+        let events = client
+            .list_stack_events(runtime_v2::ListStackEventsRequest {
+                metadata: None,
+                stack_name: stack_name.clone(),
+                after: 0,
+                limit: 100,
+            })
+            .await
+            .expect("list stack events");
+        assert!(
+            !events.events.is_empty(),
+            "stack apply should emit observable events"
+        );
+
+        let torn_down = client
+            .teardown_stack_with_metadata(runtime_v2::TeardownStackRequest {
+                metadata: None,
+                stack_name,
+                remove_volumes: false,
+                dry_run: false,
+            })
+            .await
+            .expect("teardown stack");
+        assert!(torn_down.metadata().get("x-receipt-id").is_some());
+
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn pull_and_prune_images_round_trip_via_daemon_client() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let daemon = start_daemon(runtimed_config(&tmp)).await;
+        let mut client = DaemonClient::connect_with_config(client_config(&tmp, false))
+            .await
+            .expect("client connect");
+
+        let mut pull_stream = client
+            .pull_image(runtime_v2::PullImageRequest {
+                metadata: None,
+                image_ref: "alpine:3.20".to_string(),
+            })
+            .await
+            .expect("pull image");
+        let mut pulled = None;
+        while let Some(event) = pull_stream.message().await.expect("read pull image stream") {
+            if let Some(runtime_v2::pull_image_event::Payload::Completion(done)) = event.payload {
+                pulled = Some(done);
+            }
+        }
+        let pulled = pulled.expect("pull stream completion");
+        assert_eq!(
+            pulled
+                .image
+                .as_ref()
+                .map(|image| image.image_ref.as_str())
+                .unwrap_or_default(),
+            "alpine:3.20"
+        );
+        assert!(!pulled.receipt_id.trim().is_empty());
+
+        let listed = client
+            .list_images(runtime_v2::ListImagesRequest { metadata: None })
+            .await
+            .expect("list images");
+        assert!(
+            listed
+                .images
+                .iter()
+                .any(|image| image.image_ref == "alpine:3.20"),
+            "pulled image should be present in daemon image index"
+        );
+
+        let mut prune_stream = client
+            .prune_images(runtime_v2::PruneImagesRequest { metadata: None })
+            .await
+            .expect("prune images");
+        let mut pruned = None;
+        while let Some(event) = prune_stream
+            .message()
+            .await
+            .expect("read prune image stream")
+        {
+            if let Some(runtime_v2::prune_images_event::Payload::Completion(done)) = event.payload {
+                pruned = Some(done);
+            }
+        }
+        let pruned = pruned.expect("prune stream completion");
+        assert!(
+            pruned.remaining_images <= listed.images.len() as u64,
+            "prune completion remaining count should not increase image index size"
+        );
+        assert!(!pruned.receipt_id.trim().is_empty());
 
         daemon.stop().await;
     }

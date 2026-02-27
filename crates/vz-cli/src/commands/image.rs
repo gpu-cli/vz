@@ -1,10 +1,13 @@
 //! `vz image` — OCI image management subcommands.
 
+use std::path::Path;
+
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
 use vz_runtime_proto::runtime_v2;
+use vz_runtimed_client::DaemonClient;
 
-use super::runtime_daemon::{connect_control_plane_for_state_db, default_state_db_path};
+use super::runtime_daemon::{daemon_client_config, default_state_db_path};
 
 /// Manage OCI images.
 #[derive(Args, Debug)]
@@ -33,13 +36,35 @@ fn pull_auth_overrides_requested(opts: &super::oci::ContainerOpts) -> bool {
     opts.docker_config || opts.username.is_some() || opts.password.is_some()
 }
 
-pub(crate) async fn run_pull_stream(args: super::oci::PullArgs) -> anyhow::Result<()> {
+async fn connect_image_daemon(
+    state_db: &Path,
+    auto_spawn_override: Option<bool>,
+) -> anyhow::Result<DaemonClient> {
+    let mut config = daemon_client_config(state_db)?;
+    if let Some(auto_spawn) = auto_spawn_override {
+        config.auto_spawn = auto_spawn;
+    }
+
+    DaemonClient::connect_with_config(config)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to connect to vz-runtimed for state db {}",
+                state_db.display()
+            )
+        })
+}
+
+async fn run_pull_stream_for_state_db(
+    args: super::oci::PullArgs,
+    state_db: &Path,
+    auto_spawn_override: Option<bool>,
+) -> anyhow::Result<()> {
     if pull_auth_overrides_requested(&args.opts) {
         bail!("registry auth flags are not supported for daemon-backed `vz image pull` yet");
     }
 
-    let state_db = default_state_db_path();
-    let mut client = connect_control_plane_for_state_db(&state_db).await?;
+    let mut client = connect_image_daemon(state_db, auto_spawn_override).await?;
     let mut stream = client
         .pull_image(runtime_v2::PullImageRequest {
             image_ref: args.image.clone(),
@@ -75,9 +100,17 @@ pub(crate) async fn run_pull_stream(args: super::oci::PullArgs) -> anyhow::Resul
     Ok(())
 }
 
-async fn run_prune_stream(_args: super::oci::PruneArgs) -> anyhow::Result<()> {
+pub(crate) async fn run_pull_stream(args: super::oci::PullArgs) -> anyhow::Result<()> {
     let state_db = default_state_db_path();
-    let mut client = connect_control_plane_for_state_db(&state_db).await?;
+    run_pull_stream_for_state_db(args, &state_db, None).await
+}
+
+async fn run_prune_stream_for_state_db(
+    _args: super::oci::PruneArgs,
+    state_db: &Path,
+    auto_spawn_override: Option<bool>,
+) -> anyhow::Result<()> {
+    let mut client = connect_image_daemon(state_db, auto_spawn_override).await?;
     let mut stream = client
         .prune_images(runtime_v2::PruneImagesRequest { metadata: None })
         .await?;
@@ -110,6 +143,11 @@ async fn run_prune_stream(_args: super::oci::PruneArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_prune_stream(args: super::oci::PruneArgs) -> anyhow::Result<()> {
+    let state_db = default_state_db_path();
+    run_prune_stream_for_state_db(args, &state_db, None).await
+}
+
 /// Run the image subcommand.
 pub async fn run(args: ImageArgs) -> anyhow::Result<()> {
     match args.action {
@@ -123,7 +161,7 @@ pub async fn run(args: ImageArgs) -> anyhow::Result<()> {
         }
         ImageCommand::Ls(_images_args) => {
             let state_db = default_state_db_path();
-            let mut client = connect_control_plane_for_state_db(&state_db).await?;
+            let mut client = connect_image_daemon(&state_db, None).await?;
             let response = client
                 .list_images(runtime_v2::ListImagesRequest { metadata: None })
                 .await?;
@@ -151,5 +189,56 @@ pub async fn run(args: ImageArgs) -> anyhow::Result<()> {
             Ok(())
         }
         ImageCommand::Prune(prune_args) => run_prune_stream(prune_args).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::oci::{ContainerOpts, PruneArgs, PullArgs};
+
+    #[tokio::test]
+    async fn pull_stream_reports_unreachable_daemon_when_autostart_disabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_db = tmp.path().join("state").join("stack-state.db");
+        let error = run_pull_stream_for_state_db(
+            PullArgs {
+                image: "alpine:3.20".to_string(),
+                opts: ContainerOpts::default(),
+            },
+            &state_db,
+            Some(false),
+        )
+        .await
+        .expect_err("missing daemon socket should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to connect to vz-runtimed for state db"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_stream_reports_unreachable_daemon_when_autostart_disabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_db = tmp.path().join("state").join("stack-state.db");
+        let error = run_prune_stream_for_state_db(
+            PruneArgs {
+                opts: ContainerOpts::default(),
+            },
+            &state_db,
+            Some(false),
+        )
+        .await
+        .expect_err("missing daemon socket should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to connect to vz-runtimed for state db"),
+            "unexpected error: {error:#}"
+        );
     }
 }

@@ -148,8 +148,8 @@ async fn daemon_create_sandbox(
             None => {}
         }
     }
-    let completion =
-        completion.ok_or_else(|| anyhow!("daemon create_sandbox stream ended without completion"))?;
+    let completion = completion
+        .ok_or_else(|| anyhow!("daemon create_sandbox stream ended without completion"))?;
     let response = completion
         .response
         .ok_or_else(|| anyhow!("daemon create_sandbox completion missing response payload"))?;
