@@ -50,6 +50,137 @@ pub(crate) struct CapabilitiesResponse {
     pub(crate) capabilities: Vec<Capability>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub(crate) struct StackEventsQuery {
+    pub(crate) after: Option<i64>,
+    pub(crate) limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub(crate) struct StackLogsQuery {
+    pub(crate) service: Option<String>,
+    pub(crate) tail: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct ApplyStackRequest {
+    pub(crate) stack_name: String,
+    pub(crate) compose_yaml: String,
+    pub(crate) compose_dir: String,
+    #[serde(default)]
+    pub(crate) dry_run: Option<bool>,
+    #[serde(default)]
+    pub(crate) detach: Option<bool>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct StackServiceStatusPayload {
+    pub(crate) service_name: String,
+    pub(crate) phase: String,
+    pub(crate) ready: bool,
+    pub(crate) container_id: String,
+    pub(crate) last_error: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ApplyStackPayload {
+    pub(crate) stack_name: String,
+    pub(crate) changed_actions: u32,
+    pub(crate) converged: bool,
+    pub(crate) services_ready: u32,
+    pub(crate) services_failed: u32,
+    pub(crate) services: Vec<StackServiceStatusPayload>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ApplyStackResponse {
+    pub(crate) request_id: String,
+    pub(crate) stack: ApplyStackPayload,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct TeardownStackRequest {
+    pub(crate) stack_name: String,
+    #[serde(default)]
+    pub(crate) dry_run: Option<bool>,
+    #[serde(default)]
+    pub(crate) remove_volumes: Option<bool>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct TeardownStackPayload {
+    pub(crate) stack_name: String,
+    pub(crate) changed_actions: u32,
+    pub(crate) removed_volumes: u32,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct TeardownStackResponse {
+    pub(crate) request_id: String,
+    pub(crate) stack: TeardownStackPayload,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct StackStatusResponse {
+    pub(crate) request_id: String,
+    pub(crate) stack_name: String,
+    pub(crate) services: Vec<StackServiceStatusPayload>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct StackEventsResponse {
+    pub(crate) request_id: String,
+    pub(crate) events: Vec<ApiEventRecord>,
+    pub(crate) next_cursor: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct StackServiceLogPayload {
+    pub(crate) service_name: String,
+    pub(crate) output: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct StackLogsResponse {
+    pub(crate) request_id: String,
+    pub(crate) stack_name: String,
+    pub(crate) logs: Vec<StackServiceLogPayload>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct StackServiceActionPayload {
+    pub(crate) stack_name: String,
+    pub(crate) service: StackServiceStatusPayload,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct StackServiceActionResponse {
+    pub(crate) request_id: String,
+    pub(crate) action: StackServiceActionPayload,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct StackRunContainerRequest {
+    pub(crate) stack_name: String,
+    pub(crate) service_name: String,
+    #[serde(default)]
+    pub(crate) run_service_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct StackRunContainerPayload {
+    pub(crate) stack_name: String,
+    pub(crate) service_name: String,
+    pub(crate) run_service_name: String,
+    pub(crate) container_id: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct StackRunContainerResponse {
+    pub(crate) request_id: String,
+    pub(crate) run_container: StackRunContainerPayload,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct CreateSandboxRequest {
     #[serde(default)]

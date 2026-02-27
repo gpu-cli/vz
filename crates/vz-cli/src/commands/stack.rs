@@ -8,9 +8,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Args, Subcommand};
-use serde::Serialize;
+use reqwest::StatusCode as HttpStatusCode;
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use vz_runtime_proto::runtime_v2;
@@ -18,7 +20,10 @@ use vz_stack::{
     EventRecord, ServiceObservedState, ServicePhase, StackEvent, StackSpec, parse_compose_with_dir,
 };
 
-use super::runtime_daemon::{connect_control_plane_for_state_db, default_state_db_path};
+use super::runtime_daemon::{
+    ControlPlaneTransport, connect_control_plane_for_state_db, control_plane_transport,
+    default_state_db_path, runtime_api_base_url,
+};
 
 /// Manage multi-service stacks from Compose files.
 #[derive(Args, Debug)]
@@ -384,7 +389,624 @@ fn split_exec_command(command: &[String]) -> anyhow::Result<(Vec<String>, Vec<St
     Ok((vec![head.clone()], tail.to_vec()))
 }
 
-async fn execute_stack_container_command(
+#[derive(Debug, Deserialize)]
+struct ApiErrorPayload {
+    code: String,
+    message: String,
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorEnvelope {
+    error: ApiErrorPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiStackServiceStatus {
+    service_name: String,
+    phase: String,
+    ready: bool,
+    container_id: String,
+    last_error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiApplyStackPayload {
+    stack_name: String,
+    changed_actions: u32,
+    converged: bool,
+    services_ready: u32,
+    services_failed: u32,
+    services: Vec<ApiStackServiceStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiApplyStackResponse {
+    stack: ApiApplyStackPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiApplyStackRequest {
+    stack_name: String,
+    compose_yaml: String,
+    compose_dir: String,
+    dry_run: bool,
+    detach: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiTeardownStackPayload {
+    stack_name: String,
+    changed_actions: u32,
+    removed_volumes: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiTeardownStackResponse {
+    stack: ApiTeardownStackPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiTeardownStackRequest {
+    stack_name: String,
+    dry_run: bool,
+    remove_volumes: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiStackStatusResponse {
+    stack_name: String,
+    services: Vec<ApiStackServiceStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiEventRecord {
+    id: i64,
+    stack_name: String,
+    created_at: String,
+    event: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiStackEventsResponse {
+    events: Vec<ApiEventRecord>,
+    next_cursor: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiStackServiceLog {
+    service_name: String,
+    output: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiStackLogsResponse {
+    logs: Vec<ApiStackServiceLog>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiStackServiceActionPayload {
+    stack_name: String,
+    service: ApiStackServiceStatus,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiStackServiceActionResponse {
+    action: ApiStackServiceActionPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiStackRunContainerRequest {
+    stack_name: String,
+    service_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_service_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiStackRunContainerPayload {
+    stack_name: String,
+    service_name: String,
+    run_service_name: String,
+    container_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiStackRunContainerResponse {
+    run_container: ApiStackRunContainerPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiSandboxPayload {
+    sandbox_id: String,
+    state: String,
+    labels: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiSandboxListResponse {
+    sandboxes: Vec<ApiSandboxPayload>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiCreateExecutionRequest {
+    container_id: String,
+    cmd: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    args: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    env_override: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pty_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiExecutionPayload {
+    execution_id: String,
+    state: String,
+    exit_code: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiExecutionResponse {
+    execution: ApiExecutionPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiExecutionOutputEvent {
+    event: String,
+    #[serde(default)]
+    data_base64: Option<String>,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiExecutionStreamErrorBody {
+    code: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiExecutionStreamError {
+    request_id: String,
+    error: ApiExecutionStreamErrorBody,
+}
+
+fn stack_service_status_from_api(payload: ApiStackServiceStatus) -> runtime_v2::StackServiceStatus {
+    runtime_v2::StackServiceStatus {
+        service_name: payload.service_name,
+        phase: payload.phase,
+        ready: payload.ready,
+        container_id: payload.container_id,
+        last_error: payload.last_error,
+    }
+}
+
+fn runtime_api_url(path: &str) -> anyhow::Result<String> {
+    let base = runtime_api_base_url()?;
+    Ok(format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    ))
+}
+
+async fn api_error_response(response: reqwest::Response, context: &str) -> anyhow::Error {
+    let status = response.status();
+    let body = response.bytes().await.unwrap_or_default();
+    if let Ok(error) = serde_json::from_slice::<ApiErrorEnvelope>(&body) {
+        return anyhow!(
+            "{context}: api error {} {} (request_id={})",
+            error.error.code,
+            error.error.message,
+            error.error.request_id
+        );
+    }
+    let snippet = String::from_utf8_lossy(&body);
+    anyhow!("{context}: api status {status} body={snippet}")
+}
+
+async fn api_apply_stack(request: ApiApplyStackRequest) -> anyhow::Result<ApiApplyStackPayload> {
+    let url = runtime_api_url("/v1/stacks/apply")?;
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&request)
+        .send()
+        .await
+        .context("failed to call api apply stack")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to apply stack via api").await);
+    }
+    let payload: ApiApplyStackResponse = response
+        .json()
+        .await
+        .context("failed to decode api apply stack response")?;
+    Ok(payload.stack)
+}
+
+async fn api_teardown_stack(
+    request: ApiTeardownStackRequest,
+) -> anyhow::Result<ApiTeardownStackPayload> {
+    let url = runtime_api_url("/v1/stacks/teardown")?;
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&request)
+        .send()
+        .await
+        .context("failed to call api teardown stack")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to teardown stack via api").await);
+    }
+    let payload: ApiTeardownStackResponse = response
+        .json()
+        .await
+        .context("failed to decode api teardown stack response")?;
+    Ok(payload.stack)
+}
+
+async fn api_get_stack_status(stack_name: &str) -> anyhow::Result<ApiStackStatusResponse> {
+    let url = runtime_api_url(&format!("/v1/stacks/{stack_name}/status"))?;
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .context("failed to call api stack status")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to get stack status via api").await);
+    }
+    response
+        .json()
+        .await
+        .context("failed to decode api stack status response")
+}
+
+async fn api_list_stack_events(
+    stack_name: &str,
+    after: i64,
+    limit: u32,
+) -> anyhow::Result<ApiStackEventsResponse> {
+    let url = runtime_api_url(&format!(
+        "/v1/stacks/{stack_name}/events?after={after}&limit={limit}"
+    ))?;
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .context("failed to call api stack events")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to list stack events via api").await);
+    }
+    response
+        .json()
+        .await
+        .context("failed to decode api stack events response")
+}
+
+async fn api_get_stack_logs(
+    stack_name: &str,
+    service: &str,
+    tail: u32,
+) -> anyhow::Result<ApiStackLogsResponse> {
+    let url = if service.trim().is_empty() {
+        runtime_api_url(&format!("/v1/stacks/{stack_name}/logs?tail={tail}"))?
+    } else {
+        runtime_api_url(&format!(
+            "/v1/stacks/{stack_name}/logs?service={service}&tail={tail}"
+        ))?
+    };
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .context("failed to call api stack logs")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to get stack logs via api").await);
+    }
+    response
+        .json()
+        .await
+        .context("failed to decode api stack logs response")
+}
+
+async fn api_stack_service_action(
+    stack_name: &str,
+    service_name: &str,
+    action: &str,
+) -> anyhow::Result<ApiStackServiceActionPayload> {
+    let url = runtime_api_url(&format!(
+        "/v1/stacks/{stack_name}/services/{service_name}/{action}"
+    ))?;
+    let response = reqwest::Client::new()
+        .post(url)
+        .send()
+        .await
+        .context("failed to call api stack service action")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed stack service action via api").await);
+    }
+    let payload: ApiStackServiceActionResponse = response
+        .json()
+        .await
+        .context("failed to decode api stack service action response")?;
+    Ok(payload.action)
+}
+
+async fn api_create_stack_run_container(
+    request: ApiStackRunContainerRequest,
+) -> anyhow::Result<ApiStackRunContainerPayload> {
+    let url = runtime_api_url("/v1/stacks/run-container/create")?;
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&request)
+        .send()
+        .await
+        .context("failed to call api create stack run container")?;
+    if !response.status().is_success() {
+        return Err(
+            api_error_response(response, "failed to create stack run container via api").await,
+        );
+    }
+    let payload: ApiStackRunContainerResponse = response
+        .json()
+        .await
+        .context("failed to decode api create stack run container response")?;
+    Ok(payload.run_container)
+}
+
+async fn api_remove_stack_run_container(
+    request: ApiStackRunContainerRequest,
+) -> anyhow::Result<()> {
+    let url = runtime_api_url("/v1/stacks/run-container/remove")?;
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&request)
+        .send()
+        .await
+        .context("failed to call api remove stack run container")?;
+    if !response.status().is_success() {
+        return Err(
+            api_error_response(response, "failed to remove stack run container via api").await,
+        );
+    }
+    Ok(())
+}
+
+async fn api_list_sandboxes() -> anyhow::Result<Vec<ApiSandboxPayload>> {
+    let url = runtime_api_url("/v1/sandboxes")?;
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .context("failed to call api list sandboxes")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to list sandboxes via api").await);
+    }
+    let payload: ApiSandboxListResponse = response
+        .json()
+        .await
+        .context("failed to decode api list sandboxes response")?;
+    Ok(payload.sandboxes)
+}
+
+async fn api_create_execution(
+    request: ApiCreateExecutionRequest,
+) -> anyhow::Result<ApiExecutionPayload> {
+    let url = runtime_api_url("/v1/executions")?;
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&request)
+        .send()
+        .await
+        .context("failed to call api create execution")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to create execution via api").await);
+    }
+    let payload: ApiExecutionResponse = response
+        .json()
+        .await
+        .context("failed to decode api create execution response")?;
+    Ok(payload.execution)
+}
+
+async fn api_get_execution(execution_id: &str) -> anyhow::Result<Option<ApiExecutionPayload>> {
+    let url = runtime_api_url(&format!("/v1/executions/{execution_id}"))?;
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .context("failed to call api get execution")?;
+    if response.status() == HttpStatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to get execution via api").await);
+    }
+    let payload: ApiExecutionResponse = response
+        .json()
+        .await
+        .context("failed to decode api get execution response")?;
+    Ok(Some(payload.execution))
+}
+
+async fn api_stream_exec_output(execution_id: &str) -> anyhow::Result<reqwest::Response> {
+    let url = runtime_api_url(&format!("/v1/executions/{execution_id}/stream"))?;
+    let response = reqwest::Client::new()
+        .get(url)
+        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .send()
+        .await
+        .context("failed to call api execution output stream")?;
+    if !response.status().is_success() {
+        return Err(
+            api_error_response(response, "failed to stream execution output via api").await,
+        );
+    }
+    Ok(response)
+}
+
+fn handle_api_exec_stream_event(
+    execution_id: &str,
+    payload_json: &str,
+    stdout: &mut std::io::StdoutLock<'_>,
+    stderr: &mut std::io::StderrLock<'_>,
+) -> anyhow::Result<Option<i32>> {
+    if let Ok(event) = serde_json::from_str::<ApiExecutionOutputEvent>(payload_json) {
+        match event.event.as_str() {
+            "stdout" => {
+                if let Some(encoded) = event.data_base64 {
+                    let chunk = BASE64_STANDARD.decode(encoded).with_context(|| {
+                        format!(
+                            "failed to decode stdout chunk from api stream for `{execution_id}`"
+                        )
+                    })?;
+                    if !chunk.is_empty() {
+                        stdout
+                            .write_all(&chunk)
+                            .context("failed writing execution stdout")?;
+                        stdout.flush().context("failed flushing execution stdout")?;
+                    }
+                }
+                return Ok(None);
+            }
+            "stderr" => {
+                if let Some(encoded) = event.data_base64 {
+                    let chunk = BASE64_STANDARD.decode(encoded).with_context(|| {
+                        format!(
+                            "failed to decode stderr chunk from api stream for `{execution_id}`"
+                        )
+                    })?;
+                    if !chunk.is_empty() {
+                        stderr
+                            .write_all(&chunk)
+                            .context("failed writing execution stderr")?;
+                        stderr.flush().context("failed flushing execution stderr")?;
+                    }
+                }
+                return Ok(None);
+            }
+            "exit_code" => return Ok(event.exit_code),
+            "error" => {
+                let message = event
+                    .error
+                    .unwrap_or_else(|| "unknown execution stream error".to_string());
+                bail!("execution `{execution_id}` reported error: {message}");
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    if let Ok(error) = serde_json::from_str::<ApiExecutionStreamError>(payload_json) {
+        bail!(
+            "execution stream failed: {} {} (request_id={})",
+            error.error.code,
+            error.error.message,
+            error.request_id
+        );
+    }
+
+    bail!("received unrecognized execution stream payload: {payload_json}");
+}
+
+async fn execute_stack_container_command_api(
+    container_id: String,
+    command: &[String],
+) -> anyhow::Result<()> {
+    let (cmd, cmd_args) = split_exec_command(command)?;
+    let execution = api_create_execution(ApiCreateExecutionRequest {
+        container_id,
+        cmd,
+        args: Some(cmd_args),
+        env_override: Some(HashMap::new()),
+        pty_mode: Some("inherit".to_string()),
+        timeout_secs: None,
+    })
+    .await?;
+    let execution_id = execution.execution_id;
+    let mut stream = api_stream_exec_output(&execution_id).await?;
+    let mut pending = Vec::<u8>::new();
+    let mut event_data = String::new();
+    let mut terminal_exit_code = execution.exit_code;
+
+    let stdout_handle = std::io::stdout();
+    let stderr_handle = std::io::stderr();
+    let mut stdout = stdout_handle.lock();
+    let mut stderr = stderr_handle.lock();
+
+    while let Some(chunk) = stream
+        .chunk()
+        .await
+        .with_context(|| format!("failed reading output stream for `{execution_id}`"))?
+    {
+        pending.extend_from_slice(&chunk);
+        while let Some(line_end) = pending.iter().position(|byte| *byte == b'\n') {
+            let mut line = pending.drain(..=line_end).collect::<Vec<u8>>();
+            if line.last() == Some(&b'\n') {
+                let _ = line.pop();
+            }
+            if line.last() == Some(&b'\r') {
+                let _ = line.pop();
+            }
+            let line = String::from_utf8(line)
+                .with_context(|| format!("received non UTF-8 stream line for `{execution_id}`"))?;
+            if line.is_empty() {
+                if !event_data.is_empty() {
+                    if let Some(code) = handle_api_exec_stream_event(
+                        &execution_id,
+                        &event_data,
+                        &mut stdout,
+                        &mut stderr,
+                    )? {
+                        terminal_exit_code = Some(code);
+                    }
+                    event_data.clear();
+                }
+                continue;
+            }
+            if line.starts_with(':') {
+                continue;
+            }
+            if let Some(data_line) = line.strip_prefix("data:") {
+                if !event_data.is_empty() {
+                    event_data.push('\n');
+                }
+                event_data.push_str(data_line.trim_start());
+            }
+        }
+    }
+
+    if terminal_exit_code.is_none()
+        && !event_data.is_empty()
+        && let Some(code) =
+            handle_api_exec_stream_event(&execution_id, &event_data, &mut stdout, &mut stderr)?
+    {
+        terminal_exit_code = Some(code);
+    }
+
+    if terminal_exit_code.is_none()
+        && let Some(execution) = api_get_execution(&execution_id).await?
+    {
+        if execution.state.eq_ignore_ascii_case("failed") {
+            bail!("execution `{execution_id}` ended in failed state");
+        }
+        terminal_exit_code = execution.exit_code;
+    }
+
+    if terminal_exit_code.unwrap_or(0) != 0 {
+        bail!(
+            "stack command exited with status {}",
+            terminal_exit_code.unwrap_or(1)
+        );
+    }
+
+    Ok(())
+}
+
+async fn execute_stack_container_command_daemon(
     client: &mut vz_runtimed_client::DaemonClient,
     container_id: String,
     command: &[String],
@@ -568,39 +1190,67 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from("."));
 
     let stack_name = resolve_stack_name(args.name.as_deref(), &file)?;
-    let state_db = stack_state_db_path(args.state_dir.as_deref());
-    let mut client = connect_control_plane_for_state_db(&state_db).await?;
-    let mut stream = client
-        .apply_stack_stream(runtime_v2::ApplyStackRequest {
-            metadata: None,
-            stack_name: stack_name.clone(),
-            compose_yaml: yaml,
-            compose_dir: compose_dir.to_string_lossy().to_string(),
-            dry_run: args.dry_run,
-            detach: args.detach,
-        })
-        .await
-        .with_context(|| format!("failed to apply stack `{stack_name}` via daemon"))?;
-    let mut completion = None;
-    while let Some(event) = stream
-        .message()
-        .await
-        .with_context(|| format!("failed to read apply stack stream for `{stack_name}`"))?
-    {
-        match event.payload {
-            Some(runtime_v2::apply_stack_event::Payload::Progress(progress)) => {
-                println!("[{}] {}", progress.phase, progress.detail);
+    let compose_dir = compose_dir.to_string_lossy().to_string();
+    let response = match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let state_db = stack_state_db_path(args.state_dir.as_deref());
+            let mut client = connect_control_plane_for_state_db(&state_db).await?;
+            let mut stream = client
+                .apply_stack_stream(runtime_v2::ApplyStackRequest {
+                    metadata: None,
+                    stack_name: stack_name.clone(),
+                    compose_yaml: yaml.clone(),
+                    compose_dir: compose_dir.clone(),
+                    dry_run: args.dry_run,
+                    detach: args.detach,
+                })
+                .await
+                .with_context(|| format!("failed to apply stack `{stack_name}` via daemon"))?;
+            let mut completion = None;
+            while let Some(event) = stream
+                .message()
+                .await
+                .with_context(|| format!("failed to read apply stack stream for `{stack_name}`"))?
+            {
+                match event.payload {
+                    Some(runtime_v2::apply_stack_event::Payload::Progress(progress)) => {
+                        println!("[{}] {}", progress.phase, progress.detail);
+                    }
+                    Some(runtime_v2::apply_stack_event::Payload::Completion(done)) => {
+                        completion = Some(done);
+                    }
+                    None => {}
+                }
             }
-            Some(runtime_v2::apply_stack_event::Payload::Completion(done)) => {
-                completion = Some(done);
-            }
-            None => {}
+            completion
+                .ok_or_else(|| anyhow!("daemon apply_stack stream ended without completion"))?
+                .response
+                .ok_or_else(|| anyhow!("daemon apply_stack completion missing response payload"))?
         }
-    }
-    let response = completion
-        .ok_or_else(|| anyhow::anyhow!("daemon apply_stack stream ended without completion"))?
-        .response
-        .ok_or_else(|| anyhow::anyhow!("daemon apply_stack completion missing response payload"))?;
+        ControlPlaneTransport::ApiHttp => {
+            let response = api_apply_stack(ApiApplyStackRequest {
+                stack_name: stack_name.clone(),
+                compose_yaml: yaml,
+                compose_dir,
+                dry_run: args.dry_run,
+                detach: args.detach,
+            })
+            .await?;
+            runtime_v2::ApplyStackResponse {
+                request_id: String::new(),
+                stack_name: response.stack_name,
+                changed_actions: response.changed_actions,
+                converged: response.converged,
+                services_ready: response.services_ready,
+                services_failed: response.services_failed,
+                services: response
+                    .services
+                    .into_iter()
+                    .map(stack_service_status_from_api)
+                    .collect(),
+            }
+        }
+    };
 
     let observed = observed_from_stack_statuses(&response.services);
 
@@ -641,93 +1291,140 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
 
 /// Connect to a running `vz stack up` session and execute a command.
 async fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
-    let state_db = stack_state_db_path(args.state_dir.as_deref());
-    let mut client = connect_control_plane_for_state_db(&state_db).await?;
-    let status = client
-        .get_stack_status(runtime_v2::GetStackStatusRequest {
-            metadata: None,
-            stack_name: args.name.clone(),
-        })
-        .await
-        .with_context(|| format!("failed to load stack status for `{}` via daemon", args.name))?;
-    let container_id = resolve_service_container_id(&args.name, &args.service, &status.services)?;
-    execute_stack_container_command(&mut client, container_id, &args.command)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to execute command for stack `{}` service `{}`",
-                args.name, args.service
-            )
-        })
+    match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let state_db = stack_state_db_path(args.state_dir.as_deref());
+            let mut client = connect_control_plane_for_state_db(&state_db).await?;
+            let status = client
+                .get_stack_status(runtime_v2::GetStackStatusRequest {
+                    metadata: None,
+                    stack_name: args.name.clone(),
+                })
+                .await
+                .with_context(|| {
+                    format!("failed to load stack status for `{}` via daemon", args.name)
+                })?;
+            let container_id =
+                resolve_service_container_id(&args.name, &args.service, &status.services)?;
+            execute_stack_container_command_daemon(&mut client, container_id, &args.command)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to execute command for stack `{}` service `{}`",
+                        args.name, args.service
+                    )
+                })
+        }
+        ControlPlaneTransport::ApiHttp => {
+            let status = api_get_stack_status(&args.name).await.with_context(|| {
+                format!("failed to load stack status for `{}` via api", args.name)
+            })?;
+            let services = status
+                .services
+                .into_iter()
+                .map(stack_service_status_from_api)
+                .collect::<Vec<_>>();
+            let container_id = resolve_service_container_id(&args.name, &args.service, &services)?;
+            execute_stack_container_command_api(container_id, &args.command)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to execute command for stack `{}` service `{}`",
+                        args.name, args.service
+                    )
+                })
+        }
+    }
 }
 
 // ── service start/stop/restart ─────────────────────────────────────
 
 /// Send a daemon-backed service-level action (stop/start/restart).
 async fn cmd_service_action(args: ServiceArgs, action: ControlAction) -> anyhow::Result<()> {
-    let state_db = stack_state_db_path(args.state_dir.as_deref());
-    let mut client = connect_control_plane_for_state_db(&state_db).await?;
-    let request = runtime_v2::StackServiceActionRequest {
-        metadata: None,
-        stack_name: args.name.clone(),
-        service_name: args.service.clone(),
-    };
-    let mut stream = match action {
-        ControlAction::Stop => client
-            .stop_stack_service_stream(request)
-            .await
-            .with_context(|| {
+    let service = match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let state_db = stack_state_db_path(args.state_dir.as_deref());
+            let mut client = connect_control_plane_for_state_db(&state_db).await?;
+            let request = runtime_v2::StackServiceActionRequest {
+                metadata: None,
+                stack_name: args.name.clone(),
+                service_name: args.service.clone(),
+            };
+            let mut stream = match action {
+                ControlAction::Stop => client
+                    .stop_stack_service_stream(request)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to stop service `{}` in stack `{}` via daemon",
+                            args.service, args.name
+                        )
+                    })?,
+                ControlAction::Start => client
+                    .start_stack_service_stream(request)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to start service `{}` in stack `{}` via daemon",
+                            args.service, args.name
+                        )
+                    })?,
+                ControlAction::Restart => client
+                    .restart_stack_service_stream(request)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to restart service `{}` in stack `{}` via daemon",
+                            args.service, args.name
+                        )
+                    })?,
+            };
+            let mut completion = None;
+            while let Some(event) = stream.message().await.with_context(|| {
                 format!(
-                    "failed to stop service `{}` in stack `{}` via daemon",
+                    "failed to read service action stream for `{}` in stack `{}`",
                     args.service, args.name
                 )
-            })?,
-        ControlAction::Start => client
-            .start_stack_service_stream(request)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to start service `{}` in stack `{}` via daemon",
-                    args.service, args.name
-                )
-            })?,
-        ControlAction::Restart => client
-            .restart_stack_service_stream(request)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to restart service `{}` in stack `{}` via daemon",
-                    args.service, args.name
-                )
-            })?,
-    };
-    let mut completion = None;
-    while let Some(event) = stream.message().await.with_context(|| {
-        format!(
-            "failed to read service action stream for `{}` in stack `{}`",
-            args.service, args.name
-        )
-    })? {
-        match event.payload {
-            Some(runtime_v2::stack_service_action_event::Payload::Progress(progress)) => {
-                println!("[{}] {}", progress.phase, progress.detail);
+            })? {
+                match event.payload {
+                    Some(runtime_v2::stack_service_action_event::Payload::Progress(progress)) => {
+                        println!("[{}] {}", progress.phase, progress.detail);
+                    }
+                    Some(runtime_v2::stack_service_action_event::Payload::Completion(done)) => {
+                        completion = Some(done);
+                    }
+                    None => {}
+                }
             }
-            Some(runtime_v2::stack_service_action_event::Payload::Completion(done)) => {
-                completion = Some(done);
-            }
-            None => {}
-        }
-    }
-    let response = completion
-        .ok_or_else(|| anyhow::anyhow!("daemon stack service stream ended without completion"))?
-        .response
-        .ok_or_else(|| {
-            anyhow::anyhow!("daemon stack service completion missing response payload")
-        })?;
+            let response = completion
+                .ok_or_else(|| anyhow!("daemon stack service stream ended without completion"))?
+                .response
+                .ok_or_else(|| {
+                    anyhow!("daemon stack service completion missing response payload")
+                })?;
 
-    let service = response
-        .service
-        .ok_or_else(|| anyhow::anyhow!("daemon returned missing stack service payload"))?;
+            response
+                .service
+                .ok_or_else(|| anyhow!("daemon returned missing stack service payload"))?
+        }
+        ControlPlaneTransport::ApiHttp => {
+            let action_name = match action {
+                ControlAction::Stop => "stop",
+                ControlAction::Start => "start",
+                ControlAction::Restart => "restart",
+            };
+            let response = api_stack_service_action(&args.name, &args.service, action_name)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to {action_name} service `{}` in stack `{}` via api",
+                        args.service, args.name
+                    )
+                })?;
+            stack_service_status_from_api(response.service)
+        }
+    };
+
     let phase = if service.phase.trim().is_empty() {
         "unknown"
     } else {
@@ -735,20 +1432,20 @@ async fn cmd_service_action(args: ServiceArgs, action: ControlAction) -> anyhow:
     };
     println!(
         "Service `{}` in stack `{}` now reports phase `{}`.",
-        service.service_name, response.stack_name, phase
+        service.service_name, args.name, phase
     );
     if phase.eq_ignore_ascii_case("failed") {
         if service.last_error.trim().is_empty() {
             bail!(
                 "service `{}` in stack `{}` entered failed state",
                 service.service_name,
-                response.stack_name
+                args.name
             );
         }
         bail!(
             "service `{}` in stack `{}` entered failed state: {}",
             service.service_name,
-            response.stack_name,
+            args.name,
             service.last_error
         );
     }
@@ -759,39 +1456,55 @@ async fn cmd_service_action(args: ServiceArgs, action: ControlAction) -> anyhow:
 // ── down ───────────────────────────────────────────────────────────
 
 async fn cmd_down(args: DownArgs) -> anyhow::Result<()> {
-    let state_db = stack_state_db_path(args.state_dir.as_deref());
-    let mut client = connect_control_plane_for_state_db(&state_db).await?;
-    let mut stream = client
-        .teardown_stack_stream(runtime_v2::TeardownStackRequest {
-            metadata: None,
-            stack_name: args.name.clone(),
-            dry_run: args.dry_run,
-            remove_volumes: args.volumes,
-        })
-        .await
-        .with_context(|| format!("failed to teardown stack `{}` via daemon", args.name))?;
-    let mut completion = None;
-    while let Some(event) = stream
-        .message()
-        .await
-        .with_context(|| format!("failed to read teardown stack stream for `{}`", args.name))?
-    {
-        match event.payload {
-            Some(runtime_v2::teardown_stack_event::Payload::Progress(progress)) => {
-                println!("[{}] {}", progress.phase, progress.detail);
+    let response = match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let state_db = stack_state_db_path(args.state_dir.as_deref());
+            let mut client = connect_control_plane_for_state_db(&state_db).await?;
+            let mut stream = client
+                .teardown_stack_stream(runtime_v2::TeardownStackRequest {
+                    metadata: None,
+                    stack_name: args.name.clone(),
+                    dry_run: args.dry_run,
+                    remove_volumes: args.volumes,
+                })
+                .await
+                .with_context(|| format!("failed to teardown stack `{}` via daemon", args.name))?;
+            let mut completion = None;
+            while let Some(event) = stream.message().await.with_context(|| {
+                format!("failed to read teardown stack stream for `{}`", args.name)
+            })? {
+                match event.payload {
+                    Some(runtime_v2::teardown_stack_event::Payload::Progress(progress)) => {
+                        println!("[{}] {}", progress.phase, progress.detail);
+                    }
+                    Some(runtime_v2::teardown_stack_event::Payload::Completion(done)) => {
+                        completion = Some(done);
+                    }
+                    None => {}
+                }
             }
-            Some(runtime_v2::teardown_stack_event::Payload::Completion(done)) => {
-                completion = Some(done);
-            }
-            None => {}
+            completion
+                .ok_or_else(|| anyhow!("daemon teardown_stack stream ended without completion"))?
+                .response
+                .ok_or_else(|| {
+                    anyhow!("daemon teardown_stack completion missing response payload")
+                })?
         }
-    }
-    let response = completion
-        .ok_or_else(|| anyhow::anyhow!("daemon teardown_stack stream ended without completion"))?
-        .response
-        .ok_or_else(|| {
-            anyhow::anyhow!("daemon teardown_stack completion missing response payload")
-        })?;
+        ControlPlaneTransport::ApiHttp => {
+            let response = api_teardown_stack(ApiTeardownStackRequest {
+                stack_name: args.name.clone(),
+                dry_run: args.dry_run,
+                remove_volumes: args.volumes,
+            })
+            .await?;
+            runtime_v2::TeardownStackResponse {
+                request_id: String::new(),
+                stack_name: response.stack_name,
+                changed_actions: response.changed_actions,
+                removed_volumes: response.removed_volumes,
+            }
+        }
+    };
 
     if args.dry_run {
         println!(
@@ -825,15 +1538,35 @@ async fn cmd_down(args: DownArgs) -> anyhow::Result<()> {
 // ── ps ─────────────────────────────────────────────────────────────
 
 async fn cmd_ps(args: PsArgs) -> anyhow::Result<()> {
-    let state_db = stack_state_db_path(args.state_dir.as_deref());
-    let mut client = connect_control_plane_for_state_db(&state_db).await?;
-    let response = client
-        .get_stack_status(runtime_v2::GetStackStatusRequest {
-            metadata: None,
-            stack_name: args.name.clone(),
-        })
-        .await
-        .with_context(|| format!("failed to get stack status for `{}` via daemon", args.name))?;
+    let response = match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let state_db = stack_state_db_path(args.state_dir.as_deref());
+            let mut client = connect_control_plane_for_state_db(&state_db).await?;
+            client
+                .get_stack_status(runtime_v2::GetStackStatusRequest {
+                    metadata: None,
+                    stack_name: args.name.clone(),
+                })
+                .await
+                .with_context(|| {
+                    format!("failed to get stack status for `{}` via daemon", args.name)
+                })?
+        }
+        ControlPlaneTransport::ApiHttp => {
+            let response = api_get_stack_status(&args.name).await.with_context(|| {
+                format!("failed to get stack status for `{}` via api", args.name)
+            })?;
+            runtime_v2::GetStackStatusResponse {
+                request_id: String::new(),
+                stack_name: response.stack_name,
+                services: response
+                    .services
+                    .into_iter()
+                    .map(stack_service_status_from_api)
+                    .collect(),
+            }
+        }
+    };
 
     let observed = observed_from_stack_statuses(&response.services);
     if args.json {
@@ -850,31 +1583,60 @@ async fn cmd_ps(args: PsArgs) -> anyhow::Result<()> {
 // ── events ─────────────────────────────────────────────────────────
 
 async fn cmd_events(args: EventsArgs) -> anyhow::Result<()> {
-    let state_db = stack_state_db_path(args.state_dir.as_deref());
-    let mut client = connect_control_plane_for_state_db(&state_db).await?;
-
     let mut cursor = args.since.max(0);
     let mut events = Vec::new();
-    loop {
-        let response = client
-            .list_stack_events(runtime_v2::ListStackEventsRequest {
-                metadata: None,
-                stack_name: args.name.clone(),
-                after: cursor,
-                limit: 1000,
-            })
-            .await
-            .with_context(|| {
-                format!("failed to list stack events for `{}` via daemon", args.name)
-            })?;
-        if response.events.is_empty() {
-            break;
+    match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let state_db = stack_state_db_path(args.state_dir.as_deref());
+            let mut client = connect_control_plane_for_state_db(&state_db).await?;
+            loop {
+                let response = client
+                    .list_stack_events(runtime_v2::ListStackEventsRequest {
+                        metadata: None,
+                        stack_name: args.name.clone(),
+                        after: cursor,
+                        limit: 1000,
+                    })
+                    .await
+                    .with_context(|| {
+                        format!("failed to list stack events for `{}` via daemon", args.name)
+                    })?;
+                if response.events.is_empty() {
+                    break;
+                }
+                events.extend(response.events);
+                if response.next_cursor <= cursor {
+                    break;
+                }
+                cursor = response.next_cursor;
+            }
         }
-        events.extend(response.events);
-        if response.next_cursor <= cursor {
-            break;
-        }
-        cursor = response.next_cursor;
+        ControlPlaneTransport::ApiHttp => loop {
+            let response = api_list_stack_events(&args.name, cursor, 1000)
+                .await
+                .with_context(|| {
+                    format!("failed to list stack events for `{}` via api", args.name)
+                })?;
+            if response.events.is_empty() {
+                break;
+            }
+            let mut page_events = Vec::with_capacity(response.events.len());
+            for event in response.events {
+                let event_json = serde_json::to_string(&event.event)
+                    .context("failed to serialize api stack event payload")?;
+                page_events.push(runtime_v2::RuntimeEvent {
+                    id: event.id,
+                    stack_name: event.stack_name,
+                    created_at: event.created_at,
+                    event_json,
+                });
+            }
+            events.extend(page_events);
+            if response.next_cursor <= cursor {
+                break;
+            }
+            cursor = response.next_cursor;
+        },
     }
 
     if args.json {
@@ -902,8 +1664,6 @@ async fn cmd_events(args: EventsArgs) -> anyhow::Result<()> {
 // ── logs ──────────────────────────────────────────────────────────
 
 async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
-    let state_db = stack_state_db_path(args.state_dir.as_deref());
-    let mut client = connect_control_plane_for_state_db(&state_db).await?;
     let service_filter = args.service.unwrap_or_default();
     let tail_limit = u32::try_from(args.tail).unwrap_or(u32::MAX);
 
@@ -911,22 +1671,48 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
     let mut first_iteration = true;
 
     loop {
-        let response = client
-            .get_stack_logs(runtime_v2::GetStackLogsRequest {
-                metadata: None,
-                stack_name: args.name.clone(),
-                service: service_filter.clone(),
-                tail: if first_iteration { tail_limit } else { 0 },
-            })
-            .await
-            .with_context(|| format!("failed to get stack logs for `{}` via daemon", args.name))?;
+        let logs = match control_plane_transport()? {
+            ControlPlaneTransport::DaemonGrpc => {
+                let state_db = stack_state_db_path(args.state_dir.as_deref());
+                let mut client = connect_control_plane_for_state_db(&state_db).await?;
+                let response = client
+                    .get_stack_logs(runtime_v2::GetStackLogsRequest {
+                        metadata: None,
+                        stack_name: args.name.clone(),
+                        service: service_filter.clone(),
+                        tail: if first_iteration { tail_limit } else { 0 },
+                    })
+                    .await
+                    .with_context(|| {
+                        format!("failed to get stack logs for `{}` via daemon", args.name)
+                    })?;
+                response.logs
+            }
+            ControlPlaneTransport::ApiHttp => {
+                let response = api_get_stack_logs(
+                    &args.name,
+                    &service_filter,
+                    if first_iteration { tail_limit } else { 0 },
+                )
+                .await
+                .with_context(|| format!("failed to get stack logs for `{}` via api", args.name))?;
+                response
+                    .logs
+                    .into_iter()
+                    .map(|log| runtime_v2::StackServiceLog {
+                        service_name: log.service_name,
+                        output: log.output,
+                    })
+                    .collect()
+            }
+        };
 
-        if response.logs.is_empty() {
+        if logs.is_empty() {
             bail!("no running services in stack `{}`", args.name);
         }
 
-        let multi = response.logs.len() > 1 || service_filter.is_empty();
-        for log in response.logs {
+        let multi = logs.len() > 1 || service_filter.is_empty();
+        for log in logs {
             let previous = previous_outputs
                 .get(&log.service_name)
                 .map(String::as_str)
@@ -1050,27 +1836,47 @@ async fn cmd_ls(args: LsArgs) -> anyhow::Result<()> {
         total: usize,
     }
 
-    let state_db = default_state_db_path();
-    let mut client = connect_control_plane_for_state_db(&state_db).await?;
-    let response = client
-        .list_sandboxes(runtime_v2::ListSandboxesRequest { metadata: None })
-        .await
-        .with_context(|| "failed to list sandboxes via daemon for stack listing")?;
-
     let mut grouped: HashMap<String, StackAggregate> = HashMap::new();
-    for sandbox in response.sandboxes {
-        let stack_name = sandbox
-            .labels
-            .get("stack_name")
-            .filter(|value| !value.trim().is_empty())
-            .cloned()
-            .unwrap_or_else(|| sandbox.sandbox_id.clone());
-        let aggregate = grouped.entry(stack_name).or_default();
-        aggregate.total += 1;
-        if sandbox.state.eq_ignore_ascii_case("ready") {
-            aggregate.ready += 1;
+    match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let state_db = default_state_db_path();
+            let mut client = connect_control_plane_for_state_db(&state_db).await?;
+            let response = client
+                .list_sandboxes(runtime_v2::ListSandboxesRequest { metadata: None })
+                .await
+                .with_context(|| "failed to list sandboxes via daemon for stack listing")?;
+            for sandbox in response.sandboxes {
+                let stack_name = sandbox
+                    .labels
+                    .get("stack_name")
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| sandbox.sandbox_id.clone());
+                let aggregate = grouped.entry(stack_name).or_default();
+                aggregate.total += 1;
+                if sandbox.state.eq_ignore_ascii_case("ready") {
+                    aggregate.ready += 1;
+                }
+                aggregate.states.push(sandbox.state);
+            }
         }
-        aggregate.states.push(sandbox.state);
+        ControlPlaneTransport::ApiHttp => {
+            let sandboxes = api_list_sandboxes().await?;
+            for sandbox in sandboxes {
+                let stack_name = sandbox
+                    .labels
+                    .get("stack_name")
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| sandbox.sandbox_id.clone());
+                let aggregate = grouped.entry(stack_name).or_default();
+                aggregate.total += 1;
+                if sandbox.state.eq_ignore_ascii_case("ready") {
+                    aggregate.ready += 1;
+                }
+                aggregate.states.push(sandbox.state);
+            }
+        }
     }
 
     let mut entries: Vec<StackListEntry> = grouped
@@ -1204,66 +2010,111 @@ async fn cmd_config(args: ConfigArgs) -> anyhow::Result<()> {
 // ── run ────────────────────────────────────────────────────────────
 
 async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
-    let state_db = stack_state_db_path(args.state_dir.as_deref());
-    let mut client = connect_control_plane_for_state_db(&state_db).await?;
     let _ = &args.file;
 
-    let run_container = client
-        .create_stack_run_container(runtime_v2::StackRunContainerRequest {
-            metadata: None,
-            stack_name: args.name.clone(),
-            service_name: args.service.clone(),
-            run_service_name: String::new(),
-        })
-        .await
-        .with_context(|| {
-            format!(
-                "failed to create StackExecutor-backed run container for stack `{}` service `{}`",
-                args.name, args.service
-            )
-        })?;
-    let container_id = run_container.container_id.clone();
+    let (container_id, run_service_name) = match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let state_db = stack_state_db_path(args.state_dir.as_deref());
+            let mut client = connect_control_plane_for_state_db(&state_db).await?;
+            let run_container = client
+                .create_stack_run_container(runtime_v2::StackRunContainerRequest {
+                    metadata: None,
+                    stack_name: args.name.clone(),
+                    service_name: args.service.clone(),
+                    run_service_name: String::new(),
+                })
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to create StackExecutor-backed run container for stack `{}` service `{}`",
+                        args.name, args.service
+                    )
+                })?;
+            (run_container.container_id, run_container.run_service_name)
+        }
+        ControlPlaneTransport::ApiHttp => {
+            let run_container = api_create_stack_run_container(ApiStackRunContainerRequest {
+                stack_name: args.name.clone(),
+                service_name: args.service.clone(),
+                run_service_name: None,
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create api-backed run container for stack `{}` service `{}`",
+                    args.name, args.service
+                )
+            })?;
+            (run_container.container_id, run_container.run_service_name)
+        }
+    };
+
     if container_id.trim().is_empty() {
         bail!(
-            "daemon returned empty container id for one-off run on service `{}`",
+            "runtime returned empty container id for one-off run on service `{}`",
             args.service
         );
     }
-    let run_service_name = run_container.run_service_name;
     if run_service_name.trim().is_empty() {
         bail!(
-            "daemon returned empty run service name for stack `{}` service `{}`",
+            "runtime returned empty run service name for stack `{}` service `{}`",
             args.name,
             args.service
         );
     }
 
-    let command_result =
-        execute_stack_container_command(&mut client, container_id.clone(), &args.command)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to run one-off command for stack `{}` service `{}`",
-                    args.name, args.service
-                )
-            });
+    let command_result = match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let state_db = stack_state_db_path(args.state_dir.as_deref());
+            let mut client = connect_control_plane_for_state_db(&state_db).await?;
+            execute_stack_container_command_daemon(&mut client, container_id.clone(), &args.command)
+                .await
+        }
+        ControlPlaneTransport::ApiHttp => {
+            execute_stack_container_command_api(container_id.clone(), &args.command).await
+        }
+    }
+    .with_context(|| {
+        format!(
+            "failed to run one-off command for stack `{}` service `{}`",
+            args.name, args.service
+        )
+    });
 
     let cleanup_result = if args.rm {
-        client
-            .remove_stack_run_container(runtime_v2::StackRunContainerRequest {
-                metadata: None,
+        match control_plane_transport()? {
+            ControlPlaneTransport::DaemonGrpc => {
+                let state_db = stack_state_db_path(args.state_dir.as_deref());
+                let mut client = connect_control_plane_for_state_db(&state_db).await?;
+                client
+                    .remove_stack_run_container(runtime_v2::StackRunContainerRequest {
+                        metadata: None,
+                        stack_name: args.name.clone(),
+                        service_name: args.service.clone(),
+                        run_service_name: run_service_name.clone(),
+                    })
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to remove one-off run service `{}` (container `{}`) for stack `{}` service `{}`",
+                            run_service_name, container_id, args.name, args.service
+                        )
+                    })
+                    .map(|_| ())
+            }
+            ControlPlaneTransport::ApiHttp => api_remove_stack_run_container(ApiStackRunContainerRequest {
                 stack_name: args.name.clone(),
                 service_name: args.service.clone(),
-                run_service_name: run_service_name.clone(),
+                run_service_name: Some(run_service_name.clone()),
             })
             .await
             .with_context(|| {
                 format!(
-                    "failed to remove one-off run service `{}` (container `{}`) for stack `{}` service `{}`",
+                    "failed to remove one-off run service `{}` (container `{}`) for stack `{}` service `{}` via api",
                     run_service_name, container_id, args.name, args.service
                 )
-            })
-            .map(|_| ())
+            }),
+        }
     } else {
         Ok(())
     };

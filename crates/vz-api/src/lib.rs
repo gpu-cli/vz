@@ -165,6 +165,31 @@ pub fn router(config: ApiConfig) -> Router {
     Router::new()
         .route("/openapi.json", get(openapi_json))
         .route("/v1/capabilities", get(capabilities))
+        .route("/v1/stacks/apply", post(apply_stack))
+        .route("/v1/stacks/teardown", post(teardown_stack))
+        .route("/v1/stacks/{stack_name}/status", get(get_stack_status))
+        .route("/v1/stacks/{stack_name}/events", get(list_stack_events))
+        .route("/v1/stacks/{stack_name}/logs", get(get_stack_logs))
+        .route(
+            "/v1/stacks/{stack_name}/services/{service_name}/stop",
+            post(stop_stack_service),
+        )
+        .route(
+            "/v1/stacks/{stack_name}/services/{service_name}/start",
+            post(start_stack_service),
+        )
+        .route(
+            "/v1/stacks/{stack_name}/services/{service_name}/restart",
+            post(restart_stack_service),
+        )
+        .route(
+            "/v1/stacks/run-container/create",
+            post(create_stack_run_container),
+        )
+        .route(
+            "/v1/stacks/run-container/remove",
+            post(remove_stack_run_container),
+        )
         .route("/v1/events/{stack_name}", get(list_events))
         .route("/v1/events/{stack_name}/stream", get(stream_events_sse))
         .route("/v1/events/{stack_name}/ws", get(stream_events_ws))

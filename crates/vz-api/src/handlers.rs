@@ -39,6 +39,220 @@ pub(super) async fn capabilities(
     })
 }
 
+pub(super) async fn apply_stack(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_apply_stack_via_daemon(&state, &headers, raw_body.as_ref(), &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "stack operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn teardown_stack(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_teardown_stack_via_daemon(&state, &headers, raw_body.as_ref(), &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "stack operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn get_stack_status(
+    State(state): State<ApiState>,
+    Path(stack_name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_get_stack_status_via_daemon(&state, &stack_name, &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "stack operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn list_stack_events(
+    State(state): State<ApiState>,
+    Path(stack_name): Path<String>,
+    Query(query): Query<StackEventsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_list_stack_events_via_daemon(&state, &stack_name, &query, &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "stack operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn get_stack_logs(
+    State(state): State<ApiState>,
+    Path(stack_name): Path<String>,
+    Query(query): Query<StackLogsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_get_stack_logs_via_daemon(&state, &stack_name, &query, &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "stack operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn stop_stack_service(
+    State(state): State<ApiState>,
+    Path((stack_name, service_name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_stack_service_action_via_daemon(
+        &state,
+        &headers,
+        &stack_name,
+        &service_name,
+        &request_id,
+        StackServiceActionKind::Stop,
+    )
+    .await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "stack operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn start_stack_service(
+    State(state): State<ApiState>,
+    Path((stack_name, service_name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_stack_service_action_via_daemon(
+        &state,
+        &headers,
+        &stack_name,
+        &service_name,
+        &request_id,
+        StackServiceActionKind::Start,
+    )
+    .await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "stack operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn restart_stack_service(
+    State(state): State<ApiState>,
+    Path((stack_name, service_name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_stack_service_action_via_daemon(
+        &state,
+        &headers,
+        &stack_name,
+        &service_name,
+        &request_id,
+        StackServiceActionKind::Restart,
+    )
+    .await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "stack operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn create_stack_run_container(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_create_stack_run_container_via_daemon(&state, &headers, raw_body.as_ref(), &request_id)
+            .await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "stack operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn remove_stack_run_container(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_remove_stack_run_container_via_daemon(&state, &headers, raw_body.as_ref(), &request_id)
+            .await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "stack operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
 pub(super) async fn list_events(
     State(state): State<ApiState>,
     Path(stack_name): Path<String>,
