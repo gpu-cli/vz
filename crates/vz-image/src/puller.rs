@@ -9,7 +9,7 @@ use oci_distribution::manifest::ImageIndexEntry;
 use oci_distribution::manifest::OciDescriptor;
 use oci_distribution::secrets::RegistryAuth;
 use oci_distribution::{Client, Reference};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 use tokio_stream::StreamExt;
 
@@ -137,16 +137,30 @@ struct RawImageConfigEnvelope {
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 struct RawImageConfig {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_vec_or_default")]
     entrypoint: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_vec_or_default")]
     cmd: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_vec_or_default")]
     env: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_default")]
     working_dir: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_default")]
     user: String,
+}
+
+fn deserialize_string_vec_or_default<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_string_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// Pulls OCI images from remote registries and stores them in `ImageStore`.
@@ -414,6 +428,26 @@ mod tests {
         );
         assert_eq!(summary.working_dir.as_deref(), Some("/workspace"));
         assert_eq!(summary.user.as_deref(), Some("1000:1000"));
+    }
+
+    #[test]
+    fn parse_config_summary_tolerates_null_fields() {
+        let raw = r#"{
+  "config": {
+    "Entrypoint": null,
+    "Cmd": null,
+    "Env": null,
+    "WorkingDir": null,
+    "User": null
+  }
+}"#;
+
+        let summary = parse_image_config_summary(raw).expect("config summary should parse");
+        assert_eq!(summary.entrypoint, None);
+        assert_eq!(summary.cmd, None);
+        assert_eq!(summary.env, None);
+        assert_eq!(summary.working_dir, None);
+        assert_eq!(summary.user, None);
     }
 
     #[test]

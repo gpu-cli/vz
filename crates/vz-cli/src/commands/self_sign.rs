@@ -14,6 +14,10 @@ pub struct SelfSignArgs {
     /// Path to the binary to sign. Defaults to the currently running binary.
     #[arg(long)]
     pub binary: Option<std::path::PathBuf>,
+
+    /// Skip auto-signing adjacent `vz-runtimed` binary.
+    #[arg(long, default_value_t = false)]
+    pub no_runtimed: bool,
 }
 
 pub async fn run(args: SelfSignArgs) -> anyhow::Result<()> {
@@ -26,12 +30,28 @@ pub async fn run(args: SelfSignArgs) -> anyhow::Result<()> {
         anyhow::bail!("binary not found: {}", binary.display());
     }
 
-    info!(binary = %binary.display(), "ad-hoc signing binary");
-
     // Locate the entitlements plist
     let entitlements = find_entitlements()?;
+    let mut signed_targets = vec![binary.clone()];
+    if !args.no_runtimed
+        && let Some(parent) = binary.parent()
+    {
+        let sibling = parent.join("vz-runtimed");
+        if sibling.exists() && sibling != binary {
+            signed_targets.push(sibling);
+        }
+    }
 
-    // Run codesign
+    for target in signed_targets {
+        sign_binary(&target, &entitlements)?;
+    }
+
+    Ok(())
+}
+
+fn sign_binary(binary: &std::path::Path, entitlements: &std::path::Path) -> anyhow::Result<()> {
+    info!(binary = %binary.display(), "ad-hoc signing binary");
+
     let status = std::process::Command::new("codesign")
         .args([
             "--sign",
@@ -45,15 +65,15 @@ pub async fn run(args: SelfSignArgs) -> anyhow::Result<()> {
 
     if !status.success() {
         anyhow::bail!(
-            "codesign failed with exit code {}",
-            status.code().unwrap_or(-1)
+            "codesign failed with exit code {} for {}",
+            status.code().unwrap_or(-1),
+            binary.display()
         );
     }
 
     info!(binary = %binary.display(), "signing complete");
     println!("Signed: {}", binary.display());
 
-    // Verify
     let verify = std::process::Command::new("codesign")
         .args(["--verify", "--verbose", &binary.to_string_lossy()])
         .status()?;
@@ -61,8 +81,11 @@ pub async fn run(args: SelfSignArgs) -> anyhow::Result<()> {
     if verify.success() {
         println!("Verification: OK");
     } else {
-        warn!("signature verification failed");
-        println!("Verification: FAILED (binary may not work with Virtualization.framework)");
+        warn!(binary = %binary.display(), "signature verification failed");
+        println!(
+            "Verification: FAILED for {} (binary may not work with Virtualization.framework)",
+            binary.display()
+        );
     }
 
     Ok(())
