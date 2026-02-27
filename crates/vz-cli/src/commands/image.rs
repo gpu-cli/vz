@@ -33,7 +33,7 @@ fn pull_auth_overrides_requested(opts: &super::oci::ContainerOpts) -> bool {
     opts.docker_config || opts.username.is_some() || opts.password.is_some()
 }
 
-async fn run_pull_stream(args: super::oci::PullArgs) -> anyhow::Result<()> {
+pub(crate) async fn run_pull_stream(args: super::oci::PullArgs) -> anyhow::Result<()> {
     if pull_auth_overrides_requested(&args.opts) {
         bail!("registry auth flags are not supported for daemon-backed `vz image pull` yet");
     }

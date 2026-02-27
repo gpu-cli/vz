@@ -295,78 +295,31 @@ pub struct LogsArgs {
 
 /// Entry point for `vz pull`.
 pub async fn run_pull(args: PullArgs) -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let runtime = build_macos_runtime(&args.opts)?;
-        pull_image(&runtime, args).await
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let backend = build_linux_backend(&args.opts);
-        pull_image_linux(&backend, args).await
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = args;
-        anyhow::bail!("Container commands are not supported on this platform")
-    }
+    super::image::run_pull_stream(args).await
 }
 
 /// Entry point for `vz run`.
 pub async fn run_container(args: RunArgs) -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let runtime = build_macos_runtime(&args.opts)?;
-        run_image(runtime, args).await
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let backend = build_linux_backend(&args.opts);
-        run_image_linux(&backend, args).await
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = args;
-        anyhow::bail!("Container commands are not supported on this platform")
-    }
+    let _ = args;
+    anyhow::bail!(
+        "unsupported_operation: surface=oci; operation=run; reason=legacy local-runtime path removed in daemon-only mode; guidance=use daemon-backed sandbox or stack commands"
+    )
 }
 
 /// Entry point for `vz create`.
 pub async fn run_create(args: CreateArgs) -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let runtime = build_macos_runtime(&args.opts)?;
-        create_container(&runtime, args).await
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let backend = build_linux_backend(&args.opts);
-        create_container_linux(&backend, args).await
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = args;
-        anyhow::bail!("Container commands are not supported on this platform")
-    }
+    let _ = args;
+    anyhow::bail!(
+        "unsupported_operation: surface=oci; operation=create; reason=legacy local-runtime path removed in daemon-only mode; guidance=use daemon-backed stack workflows"
+    )
 }
 
 /// Entry point for `vz exec`.
 pub async fn run_exec(args: ExecArgs) -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let runtime = build_macos_runtime(&args.opts)?;
-        exec_container(&runtime, args).await
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let backend = build_linux_backend(&args.opts);
-        exec_container_linux(&backend, args).await
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = args;
-        anyhow::bail!("Container commands are not supported on this platform")
-    }
+    let _ = args;
+    anyhow::bail!(
+        "unsupported_operation: surface=oci; operation=exec; reason=legacy local-runtime path removed in daemon-only mode; guidance=use daemon-backed execution APIs"
+    )
 }
 
 /// Entry point for `vz ps`.
@@ -390,40 +343,18 @@ pub async fn run_ps(args: PsArgs) -> anyhow::Result<()> {
 
 /// Entry point for `vz stop`.
 pub async fn run_stop(args: StopArgs) -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let runtime = build_macos_runtime(&args.opts)?;
-        stop_container(&runtime, args).await
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let backend = build_linux_backend(&args.opts);
-        stop_container_linux(&backend, args).await
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = args;
-        anyhow::bail!("Container commands are not supported on this platform")
-    }
+    let _ = args;
+    anyhow::bail!(
+        "unsupported_operation: surface=oci; operation=stop; reason=legacy local-runtime path removed in daemon-only mode; guidance=use daemon-backed stack service controls"
+    )
 }
 
 /// Entry point for `vz rm`.
 pub async fn run_rm(args: RmArgs) -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let runtime = build_macos_runtime(&args.opts)?;
-        remove_container(&runtime, args).await
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let backend = build_linux_backend(&args.opts);
-        remove_container_linux(&backend, args).await
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = args;
-        anyhow::bail!("Container commands are not supported on this platform")
-    }
+    let _ = args;
+    anyhow::bail!(
+        "unsupported_operation: surface=oci; operation=rm; reason=legacy local-runtime path removed in daemon-only mode; guidance=use daemon-backed stack/sandbox removal flows"
+    )
 }
 
 /// Entry point for `vz logs`.
@@ -1276,6 +1207,29 @@ fn parse_volume_mount(spec: &str) -> anyhow::Result<MountSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+
+    fn run_async<F>(future: F) -> anyhow::Result<()>
+    where
+        F: Future<Output = anyhow::Result<()>>,
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(future)
+    }
+
+    fn assert_daemon_only_error(error: anyhow::Error, operation: &str) {
+        let message = error.to_string();
+        assert!(message.contains("unsupported_operation: surface=oci"));
+        assert!(message.contains(&format!("operation={operation}")));
+        assert!(message.contains("daemon-only mode"));
+    }
+
+    fn default_opts() -> ContainerOpts {
+        ContainerOpts::default()
+    }
 
     #[test]
     fn parse_port_mapping_defaults_to_tcp() {
@@ -1381,5 +1335,55 @@ mod tests {
     fn parse_volume_mount_rejects_bare_path() {
         let result = parse_volume_mount("/just/one/path");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn run_container_fails_closed_in_daemon_only_mode() {
+        let args = RunArgs {
+            image: "alpine:latest".to_string(),
+            command: vec!["echo".to_string(), "hi".to_string()],
+            env: Vec::new(),
+            publish: Vec::new(),
+            workdir: None,
+            user: None,
+            cpus: None,
+            memory_mb: None,
+            no_network: false,
+            timeout_secs: None,
+            serial_log_file: None,
+            detach: false,
+            internal_detached_child: false,
+            internal_container_id: None,
+            volume: Vec::new(),
+            execution_mode: ExecutionModeArg::GuestExec,
+            opts: default_opts(),
+        };
+        let error = run_async(run_container(args)).expect_err("run should fail-closed");
+        assert_daemon_only_error(error, "run");
+    }
+
+    #[test]
+    fn run_exec_fails_closed_in_daemon_only_mode() {
+        let args = ExecArgs {
+            id: "ctr-test".to_string(),
+            command: vec!["true".to_string()],
+            env: Vec::new(),
+            workdir: None,
+            user: None,
+            timeout_secs: None,
+            opts: default_opts(),
+        };
+        let error = run_async(run_exec(args)).expect_err("exec should fail-closed");
+        assert_daemon_only_error(error, "exec");
+    }
+
+    #[test]
+    fn run_rm_fails_closed_in_daemon_only_mode() {
+        let args = RmArgs {
+            id: "ctr-test".to_string(),
+            opts: default_opts(),
+        };
+        let error = run_async(run_rm(args)).expect_err("rm should fail-closed");
+        assert_daemon_only_error(error, "rm");
     }
 }
