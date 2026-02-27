@@ -198,7 +198,22 @@ fn openapi_document_source_avoids_codegen_and_manual_schema_maps() {
 #[test]
 fn transport_modules_do_not_directly_import_state_store() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for relative in ["src/handlers.rs", "src/daemon_bridge.rs"] {
+    let transport_sources = [
+        "src/handlers.rs",
+        "src/daemon_bridge/mod.rs",
+        "src/daemon_bridge/common.rs",
+        "src/daemon_bridge/sandbox.rs",
+        "src/daemon_bridge/stack.rs",
+        "src/daemon_bridge/lease.rs",
+        "src/daemon_bridge/build.rs",
+        "src/daemon_bridge/execution.rs",
+        "src/daemon_bridge/checkpoint.rs",
+        "src/daemon_bridge/events.rs",
+        "src/daemon_bridge/images.rs",
+        "src/daemon_bridge/container.rs",
+        "src/daemon_bridge/filesystem.rs",
+    ];
+    for relative in transport_sources {
         let source = std::fs::read_to_string(manifest_dir.join(relative))
             .expect("read transport source module");
         assert!(
