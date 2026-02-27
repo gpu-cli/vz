@@ -173,6 +173,14 @@ pub fn router(config: ApiConfig) -> Router {
             "/v1/sandboxes/{sandbox_id}",
             get(get_sandbox).delete(terminate_sandbox),
         )
+        .route(
+            "/v1/sandboxes/{sandbox_id}/shell/open",
+            post(open_sandbox_shell),
+        )
+        .route(
+            "/v1/sandboxes/{sandbox_id}/shell/close",
+            post(close_sandbox_shell),
+        )
         .route("/v1/leases", get(list_leases).post(open_lease))
         .route("/v1/leases/{lease_id}", get(get_lease).delete(close_lease))
         .route("/v1/leases/{lease_id}/heartbeat", post(heartbeat_lease))
@@ -183,6 +191,10 @@ pub fn router(config: ApiConfig) -> Router {
         .route(
             "/v1/executions/{execution_id}",
             get(get_execution).delete(cancel_execution),
+        )
+        .route(
+            "/v1/executions/{execution_id}/stream",
+            get(stream_execution_output_sse),
         )
         .route("/v1/executions/{execution_id}/resize", post(resize_exec))
         .route(

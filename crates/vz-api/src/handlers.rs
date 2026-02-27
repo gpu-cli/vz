@@ -1,4 +1,5 @@
 use super::*;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -222,6 +223,52 @@ pub(super) async fn terminate_sandbox(
     )
 }
 
+pub(super) async fn open_sandbox_shell(
+    State(state): State<ApiState>,
+    Path(sandbox_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+
+    if let Some(response) =
+        try_open_sandbox_shell_via_daemon(&state, &sandbox_id, &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "sandbox shell operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn close_sandbox_shell(
+    State(state): State<ApiState>,
+    Path(sandbox_id): Path<String>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_close_sandbox_shell_via_daemon(
+        &state,
+        &headers,
+        &sandbox_id,
+        raw_body.as_ref(),
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "sandbox shell operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
 // ── Lease handlers ──
 
 pub(super) async fn open_lease(
@@ -435,6 +482,94 @@ pub(super) async fn signal_exec(
         "execution operations require vz-runtimed daemon",
         &request_id,
     )
+}
+
+pub(super) async fn stream_execution_output_sse(
+    State(state): State<ApiState>,
+    Path(execution_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let mut stream =
+        match open_execution_output_stream_via_daemon(&state, &execution_id, &request_id).await {
+            Ok(stream) => stream,
+            Err(response) => return response,
+        };
+    let keep_alive = state.event_poll_interval;
+    let stream_request_id = request_id.clone();
+
+    let sse_stream = stream! {
+        loop {
+            match stream.message().await {
+                Ok(Some(runtime_event)) => {
+                    let payload = match runtime_event.payload {
+                        Some(runtime_v2::exec_output_event::Payload::Stdout(chunk)) => {
+                            ExecutionOutputStreamEventPayload {
+                                sequence: runtime_event.sequence,
+                                event: "stdout".to_string(),
+                                data_base64: Some(BASE64_STANDARD.encode(chunk)),
+                                exit_code: None,
+                                error: None,
+                            }
+                        }
+                        Some(runtime_v2::exec_output_event::Payload::Stderr(chunk)) => {
+                            ExecutionOutputStreamEventPayload {
+                                sequence: runtime_event.sequence,
+                                event: "stderr".to_string(),
+                                data_base64: Some(BASE64_STANDARD.encode(chunk)),
+                                exit_code: None,
+                                error: None,
+                            }
+                        }
+                        Some(runtime_v2::exec_output_event::Payload::ExitCode(code)) => {
+                            ExecutionOutputStreamEventPayload {
+                                sequence: runtime_event.sequence,
+                                event: "exit_code".to_string(),
+                                data_base64: None,
+                                exit_code: Some(code),
+                                error: None,
+                            }
+                        }
+                        Some(runtime_v2::exec_output_event::Payload::Error(message)) => {
+                            ExecutionOutputStreamEventPayload {
+                                sequence: runtime_event.sequence,
+                                event: "error".to_string(),
+                                data_base64: None,
+                                exit_code: None,
+                                error: Some(message),
+                            }
+                        }
+                        None => continue,
+                    };
+                    let payload_json = serialize_json_or_marker(&payload);
+                    yield Ok::<Event, Infallible>(
+                        Event::default()
+                            .id(payload.sequence.to_string())
+                            .event(payload.event.clone())
+                            .data(payload_json),
+                    );
+                }
+                Ok(None) => break,
+                Err(status) => {
+                    let payload = SseStreamErrorPayload {
+                        request_id: stream_request_id.clone(),
+                        error: StreamErrorBody {
+                            code: "backend_unavailable".to_string(),
+                            message: status.message().to_string(),
+                        },
+                    };
+                    yield Ok::<Event, Infallible>(
+                        Event::default().event("error").data(serialize_json_or_marker(&payload))
+                    );
+                    break;
+                }
+            }
+        }
+    };
+
+    Sse::new(sse_stream)
+        .keep_alive(KeepAlive::new().interval(keep_alive))
+        .into_response()
 }
 
 // ── Checkpoint handlers ──

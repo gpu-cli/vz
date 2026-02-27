@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::Args;
+use reqwest::StatusCode as HttpStatusCode;
+use serde::{Deserialize, Serialize};
 use tonic::Code;
 use vz_runtime_contract::{
     SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER, Sandbox, SandboxBackend,
@@ -18,7 +21,10 @@ use vz_runtime_contract::{
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed_client::DaemonClientError;
 
-use super::runtime_daemon::{connect_control_plane_for_state_db, default_state_db_path};
+use super::runtime_daemon::{
+    ControlPlaneTransport, connect_control_plane_for_state_db, control_plane_transport,
+    default_state_db_path, runtime_api_base_url,
+};
 
 const SANDBOX_PROJECT_DIR_LABEL: &str = "project_dir";
 
@@ -111,7 +117,412 @@ fn sandbox_from_proto(payload: runtime_v2::SandboxPayload) -> anyhow::Result<San
     })
 }
 
-async fn daemon_list_sandboxes(state_db: &Path) -> anyhow::Result<Vec<Sandbox>> {
+#[derive(Debug, Deserialize)]
+struct ApiErrorPayload {
+    code: String,
+    message: String,
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorEnvelope {
+    error: ApiErrorPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiSandboxPayload {
+    sandbox_id: String,
+    backend: String,
+    state: String,
+    cpus: Option<u8>,
+    memory_mb: Option<u64>,
+    base_image_ref: Option<String>,
+    main_container: Option<String>,
+    created_at: u64,
+    updated_at: u64,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiSandboxResponse {
+    sandbox: ApiSandboxPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiSandboxListResponse {
+    sandboxes: Vec<ApiSandboxPayload>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiCreateSandboxRequest {
+    stack_name: String,
+    cpus: u8,
+    memory_mb: u64,
+    labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiOpenSandboxShellPayload {
+    sandbox_id: String,
+    container_id: String,
+    #[serde(default)]
+    cmd: Vec<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    execution_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiOpenSandboxShellResponse {
+    shell: ApiOpenSandboxShellPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiCloseSandboxShellRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiCloseSandboxShellPayload {
+    sandbox_id: String,
+    execution_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiCloseSandboxShellResponse {
+    shell: ApiCloseSandboxShellPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiExecutionPayload {
+    state: String,
+    exit_code: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiExecutionResponse {
+    execution: ApiExecutionPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiWriteExecStdinRequest {
+    data: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiResizeExecRequest {
+    cols: u16,
+    rows: u16,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiExecutionOutputEvent {
+    event: String,
+    #[serde(default)]
+    data_base64: Option<String>,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiStreamErrorBody {
+    code: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiExecutionOutputStreamError {
+    request_id: String,
+    error: ApiStreamErrorBody,
+}
+
+fn sandbox_from_api_payload(payload: ApiSandboxPayload) -> anyhow::Result<Sandbox> {
+    let mut labels = payload.labels;
+
+    if let Some(base_image_ref) = payload.base_image_ref.as_deref().map(str::trim)
+        && !base_image_ref.is_empty()
+    {
+        labels
+            .entry(SANDBOX_LABEL_BASE_IMAGE_REF.to_string())
+            .or_insert_with(|| base_image_ref.to_string());
+    }
+    if let Some(main_container) = payload.main_container.as_deref().map(str::trim)
+        && !main_container.is_empty()
+    {
+        labels
+            .entry(SANDBOX_LABEL_MAIN_CONTAINER.to_string())
+            .or_insert_with(|| main_container.to_string());
+    }
+
+    Ok(Sandbox {
+        sandbox_id: payload.sandbox_id,
+        backend: sandbox_backend_from_wire(&payload.backend),
+        spec: SandboxSpec {
+            cpus: payload.cpus,
+            memory_mb: payload.memory_mb,
+            base_image_ref: normalize_optional_label(labels.get(SANDBOX_LABEL_BASE_IMAGE_REF))
+                .or(payload.base_image_ref),
+            main_container: normalize_optional_label(labels.get(SANDBOX_LABEL_MAIN_CONTAINER))
+                .or(payload.main_container),
+            network_profile: None,
+            volume_mounts: Vec::new(),
+        },
+        state: sandbox_state_from_wire(&payload.state)?,
+        created_at: payload.created_at,
+        updated_at: payload.updated_at,
+        labels,
+    })
+}
+
+fn runtime_api_url(path: &str) -> anyhow::Result<String> {
+    let base = runtime_api_base_url()?;
+    Ok(format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    ))
+}
+
+async fn api_error_response(response: reqwest::Response, context: &str) -> anyhow::Error {
+    let status = response.status();
+    let body = response.bytes().await.unwrap_or_default();
+    if let Ok(error) = serde_json::from_slice::<ApiErrorEnvelope>(&body) {
+        return anyhow!(
+            "{context}: api error {} {} (request_id={})",
+            error.error.code,
+            error.error.message,
+            error.error.request_id
+        );
+    }
+
+    let snippet = String::from_utf8_lossy(&body);
+    anyhow!("{context}: api status {status} body={snippet}")
+}
+
+async fn api_list_sandboxes() -> anyhow::Result<Vec<Sandbox>> {
+    let url = runtime_api_url("/v1/sandboxes")?;
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .context("failed to call api list sandboxes")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to list sandboxes via api").await);
+    }
+
+    let payload: ApiSandboxListResponse = response
+        .json()
+        .await
+        .context("failed to decode api list sandboxes response")?;
+    payload
+        .sandboxes
+        .into_iter()
+        .map(sandbox_from_api_payload)
+        .collect()
+}
+
+async fn api_get_sandbox(sandbox_id: &str) -> anyhow::Result<Option<Sandbox>> {
+    let url = runtime_api_url(&format!("/v1/sandboxes/{sandbox_id}"))?;
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .context("failed to call api get sandbox")?;
+    if response.status() == HttpStatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to get sandbox via api").await);
+    }
+
+    let payload: ApiSandboxResponse = response
+        .json()
+        .await
+        .context("failed to decode api get sandbox response")?;
+    Ok(Some(sandbox_from_api_payload(payload.sandbox)?))
+}
+
+async fn api_create_sandbox(
+    sandbox_id: &str,
+    cpus: u8,
+    memory: u64,
+    labels: BTreeMap<String, String>,
+) -> anyhow::Result<Sandbox> {
+    let url = runtime_api_url("/v1/sandboxes")?;
+    let request = ApiCreateSandboxRequest {
+        stack_name: sandbox_id.to_string(),
+        cpus,
+        memory_mb: memory,
+        labels,
+    };
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&request)
+        .send()
+        .await
+        .context("failed to call api create sandbox")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to create sandbox via api").await);
+    }
+
+    let payload: ApiSandboxResponse = response
+        .json()
+        .await
+        .context("failed to decode api create sandbox response")?;
+    sandbox_from_api_payload(payload.sandbox)
+}
+
+async fn api_terminate_sandbox(sandbox_id: &str) -> anyhow::Result<Option<Sandbox>> {
+    let url = runtime_api_url(&format!("/v1/sandboxes/{sandbox_id}"))?;
+    let response = reqwest::Client::new()
+        .delete(url)
+        .send()
+        .await
+        .context("failed to call api terminate sandbox")?;
+    if response.status() == HttpStatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to terminate sandbox via api").await);
+    }
+
+    let payload: ApiSandboxResponse = response
+        .json()
+        .await
+        .context("failed to decode api terminate sandbox response")?;
+    Ok(Some(sandbox_from_api_payload(payload.sandbox)?))
+}
+
+async fn api_open_sandbox_shell(
+    sandbox_id: &str,
+) -> anyhow::Result<runtime_v2::OpenSandboxShellResponse> {
+    let url = runtime_api_url(&format!("/v1/sandboxes/{sandbox_id}/shell/open"))?;
+    let response = reqwest::Client::new()
+        .post(url)
+        .send()
+        .await
+        .context("failed to call api open sandbox shell")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to open sandbox shell via api").await);
+    }
+
+    let payload: ApiOpenSandboxShellResponse = response
+        .json()
+        .await
+        .context("failed to decode api open sandbox shell response")?;
+    Ok(runtime_v2::OpenSandboxShellResponse {
+        request_id: String::new(),
+        sandbox_id: payload.shell.sandbox_id,
+        container_id: payload.shell.container_id,
+        cmd: payload.shell.cmd,
+        args: payload.shell.args,
+        execution_id: payload.shell.execution_id,
+    })
+}
+
+async fn api_close_sandbox_shell(
+    sandbox_id: &str,
+    execution_id: Option<&str>,
+) -> anyhow::Result<runtime_v2::CloseSandboxShellResponse> {
+    let url = runtime_api_url(&format!("/v1/sandboxes/{sandbox_id}/shell/close"))?;
+    let request = ApiCloseSandboxShellRequest {
+        execution_id: execution_id.map(ToOwned::to_owned),
+    };
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&request)
+        .send()
+        .await
+        .context("failed to call api close sandbox shell")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to close sandbox shell via api").await);
+    }
+
+    let payload: ApiCloseSandboxShellResponse = response
+        .json()
+        .await
+        .context("failed to decode api close sandbox shell response")?;
+    Ok(runtime_v2::CloseSandboxShellResponse {
+        request_id: String::new(),
+        sandbox_id: payload.shell.sandbox_id,
+        execution_id: payload.shell.execution_id,
+    })
+}
+
+async fn api_get_execution(execution_id: &str) -> anyhow::Result<Option<ApiExecutionPayload>> {
+    let url = runtime_api_url(&format!("/v1/executions/{execution_id}"))?;
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .context("failed to call api get execution")?;
+    if response.status() == HttpStatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to get execution via api").await);
+    }
+
+    let payload: ApiExecutionResponse = response
+        .json()
+        .await
+        .context("failed to decode api execution response")?;
+    Ok(Some(payload.execution))
+}
+
+async fn api_write_exec_stdin(execution_id: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
+    let url = runtime_api_url(&format!("/v1/executions/{execution_id}/stdin"))?;
+    let body = ApiWriteExecStdinRequest {
+        data: String::from_utf8_lossy(&bytes).to_string(),
+    };
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .context("failed to call api write execution stdin")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to write stdin via api").await);
+    }
+    Ok(())
+}
+
+async fn api_resize_exec_pty(execution_id: &str, cols: u16, rows: u16) -> anyhow::Result<()> {
+    let url = runtime_api_url(&format!("/v1/executions/{execution_id}/resize"))?;
+    let body = ApiResizeExecRequest { cols, rows };
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .context("failed to call api resize execution pty")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to resize execution via api").await);
+    }
+    Ok(())
+}
+
+async fn api_stream_exec_output(execution_id: &str) -> anyhow::Result<reqwest::Response> {
+    let url = runtime_api_url(&format!("/v1/executions/{execution_id}/stream"))?;
+    let response = reqwest::Client::new()
+        .get(url)
+        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .send()
+        .await
+        .context("failed to call api execution stream")?;
+    if !response.status().is_success() {
+        return Err(
+            api_error_response(response, "failed to stream execution output via api").await,
+        );
+    }
+    Ok(response)
+}
+
+async fn daemon_grpc_list_sandboxes(state_db: &Path) -> anyhow::Result<Vec<Sandbox>> {
     let mut client = connect_control_plane_for_state_db(state_db).await?;
     let response = client
         .list_sandboxes(runtime_v2::ListSandboxesRequest { metadata: None })
@@ -124,7 +535,10 @@ async fn daemon_list_sandboxes(state_db: &Path) -> anyhow::Result<Vec<Sandbox>> 
         .collect()
 }
 
-async fn daemon_get_sandbox(state_db: &Path, sandbox_id: &str) -> anyhow::Result<Option<Sandbox>> {
+async fn daemon_grpc_get_sandbox(
+    state_db: &Path,
+    sandbox_id: &str,
+) -> anyhow::Result<Option<Sandbox>> {
     let mut client = connect_control_plane_for_state_db(state_db).await?;
     match client
         .get_sandbox(runtime_v2::GetSandboxRequest {
@@ -144,7 +558,7 @@ async fn daemon_get_sandbox(state_db: &Path, sandbox_id: &str) -> anyhow::Result
     }
 }
 
-async fn daemon_create_sandbox(
+async fn daemon_grpc_create_sandbox(
     state_db: &Path,
     sandbox_id: &str,
     cpus: u8,
@@ -189,7 +603,7 @@ async fn daemon_create_sandbox(
     sandbox_from_proto(payload)
 }
 
-async fn daemon_terminate_sandbox(
+async fn daemon_grpc_terminate_sandbox(
     state_db: &Path,
     sandbox_id: &str,
 ) -> anyhow::Result<Option<Sandbox>> {
@@ -234,35 +648,84 @@ async fn daemon_terminate_sandbox(
     }
 }
 
+async fn daemon_list_sandboxes(state_db: &Path) -> anyhow::Result<Vec<Sandbox>> {
+    match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => daemon_grpc_list_sandboxes(state_db).await,
+        ControlPlaneTransport::ApiHttp => api_list_sandboxes().await,
+    }
+}
+
+async fn daemon_get_sandbox(state_db: &Path, sandbox_id: &str) -> anyhow::Result<Option<Sandbox>> {
+    match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => daemon_grpc_get_sandbox(state_db, sandbox_id).await,
+        ControlPlaneTransport::ApiHttp => api_get_sandbox(sandbox_id).await,
+    }
+}
+
+async fn daemon_create_sandbox(
+    state_db: &Path,
+    sandbox_id: &str,
+    cpus: u8,
+    memory: u64,
+    labels: BTreeMap<String, String>,
+) -> anyhow::Result<Sandbox> {
+    match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            daemon_grpc_create_sandbox(state_db, sandbox_id, cpus, memory, labels).await
+        }
+        ControlPlaneTransport::ApiHttp => {
+            api_create_sandbox(sandbox_id, cpus, memory, labels).await
+        }
+    }
+}
+
+async fn daemon_terminate_sandbox(
+    state_db: &Path,
+    sandbox_id: &str,
+) -> anyhow::Result<Option<Sandbox>> {
+    match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            daemon_grpc_terminate_sandbox(state_db, sandbox_id).await
+        }
+        ControlPlaneTransport::ApiHttp => api_terminate_sandbox(sandbox_id).await,
+    }
+}
+
 async fn daemon_open_sandbox_shell(
     state_db: &Path,
     sandbox_id: &str,
 ) -> anyhow::Result<runtime_v2::OpenSandboxShellResponse> {
-    let mut client = connect_control_plane_for_state_db(state_db).await?;
-    let mut stream = client
-        .open_sandbox_shell(runtime_v2::OpenSandboxShellRequest {
-            sandbox_id: sandbox_id.to_string(),
-            metadata: None,
-        })
-        .await
-        .context("failed to open sandbox shell via daemon")?;
-    let mut completion = None;
-    while let Some(event) = stream
-        .message()
-        .await
-        .context("failed reading open sandbox shell stream")?
-    {
-        match event.payload {
-            Some(runtime_v2::open_sandbox_shell_event::Payload::Progress(progress)) => {
-                println!("[{}] {}", progress.phase, progress.detail);
+    match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let mut client = connect_control_plane_for_state_db(state_db).await?;
+            let mut stream = client
+                .open_sandbox_shell(runtime_v2::OpenSandboxShellRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    metadata: None,
+                })
+                .await
+                .context("failed to open sandbox shell via daemon")?;
+            let mut completion = None;
+            while let Some(event) = stream
+                .message()
+                .await
+                .context("failed reading open sandbox shell stream")?
+            {
+                match event.payload {
+                    Some(runtime_v2::open_sandbox_shell_event::Payload::Progress(progress)) => {
+                        println!("[{}] {}", progress.phase, progress.detail);
+                    }
+                    Some(runtime_v2::open_sandbox_shell_event::Payload::Completion(done)) => {
+                        completion = Some(done);
+                    }
+                    None => {}
+                }
             }
-            Some(runtime_v2::open_sandbox_shell_event::Payload::Completion(done)) => {
-                completion = Some(done);
-            }
-            None => {}
+            completion
+                .ok_or_else(|| anyhow!("daemon open_sandbox_shell stream ended without completion"))
         }
+        ControlPlaneTransport::ApiHttp => api_open_sandbox_shell(sandbox_id).await,
     }
-    completion.ok_or_else(|| anyhow!("daemon open_sandbox_shell stream ended without completion"))
 }
 
 async fn daemon_close_sandbox_shell(
@@ -270,32 +733,39 @@ async fn daemon_close_sandbox_shell(
     sandbox_id: &str,
     execution_id: Option<&str>,
 ) -> anyhow::Result<runtime_v2::CloseSandboxShellResponse> {
-    let mut client = connect_control_plane_for_state_db(state_db).await?;
-    let mut stream = client
-        .close_sandbox_shell(runtime_v2::CloseSandboxShellRequest {
-            sandbox_id: sandbox_id.to_string(),
-            execution_id: execution_id.unwrap_or_default().to_string(),
-            metadata: None,
-        })
-        .await
-        .context("failed to close sandbox shell via daemon")?;
-    let mut completion = None;
-    while let Some(event) = stream
-        .message()
-        .await
-        .context("failed reading close sandbox shell stream")?
-    {
-        match event.payload {
-            Some(runtime_v2::close_sandbox_shell_event::Payload::Progress(progress)) => {
-                println!("[{}] {}", progress.phase, progress.detail);
+    match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let mut client = connect_control_plane_for_state_db(state_db).await?;
+            let mut stream = client
+                .close_sandbox_shell(runtime_v2::CloseSandboxShellRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    execution_id: execution_id.unwrap_or_default().to_string(),
+                    metadata: None,
+                })
+                .await
+                .context("failed to close sandbox shell via daemon")?;
+            let mut completion = None;
+            while let Some(event) = stream
+                .message()
+                .await
+                .context("failed reading close sandbox shell stream")?
+            {
+                match event.payload {
+                    Some(runtime_v2::close_sandbox_shell_event::Payload::Progress(progress)) => {
+                        println!("[{}] {}", progress.phase, progress.detail);
+                    }
+                    Some(runtime_v2::close_sandbox_shell_event::Payload::Completion(done)) => {
+                        completion = Some(done);
+                    }
+                    None => {}
+                }
             }
-            Some(runtime_v2::close_sandbox_shell_event::Payload::Completion(done)) => {
-                completion = Some(done);
-            }
-            None => {}
+            completion.ok_or_else(|| {
+                anyhow!("daemon close_sandbox_shell stream ended without completion")
+            })
         }
+        ControlPlaneTransport::ApiHttp => api_close_sandbox_shell(sandbox_id, execution_id).await,
     }
-    completion.ok_or_else(|| anyhow!("daemon close_sandbox_shell stream ended without completion"))
 }
 
 // ── Top-level argument types ────────────────────────────────────
@@ -519,6 +989,18 @@ async fn attach_to_execution_interactive(
     state_db: &Path,
     execution_id: &str,
 ) -> anyhow::Result<()> {
+    match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            attach_to_execution_interactive_daemon(state_db, execution_id).await
+        }
+        ControlPlaneTransport::ApiHttp => attach_to_execution_interactive_api(execution_id).await,
+    }
+}
+
+async fn attach_to_execution_interactive_daemon(
+    state_db: &Path,
+    execution_id: &str,
+) -> anyhow::Result<()> {
     use crossterm::event::{self, Event};
     use crossterm::terminal;
     use std::io::Write;
@@ -732,6 +1214,291 @@ async fn attach_to_execution_interactive(
                 && let Some(execution) = response.execution
             {
                 terminal_exit_code = Some(execution.exit_code);
+            }
+        }
+
+        Ok::<_, anyhow::Error>((detached, terminal_exit_code))
+    }
+    .await;
+
+    terminal::disable_raw_mode().ok();
+    stop_input.store(true, Ordering::Relaxed);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), input_handle).await;
+    let (detached, terminal_exit_code) = interaction_result?;
+
+    if detached {
+        eprintln!("\nDetached (Ctrl-P Ctrl-Q). Session remains active.");
+        return Ok(());
+    }
+
+    if let Some(exit_code) = terminal_exit_code
+        && exit_code != 0
+    {
+        bail!("sandbox shell exited with status {exit_code}");
+    }
+
+    println!();
+    Ok(())
+}
+
+fn handle_api_execution_stream_event(
+    execution_id: &str,
+    payload_json: &str,
+    stdout: &mut std::io::Stdout,
+    stderr: &mut std::io::Stderr,
+    terminal_exit_code: &mut Option<i32>,
+) -> anyhow::Result<bool> {
+    if let Ok(event) = serde_json::from_str::<ApiExecutionOutputEvent>(payload_json) {
+        match event.event.as_str() {
+            "stdout" => {
+                if let Some(encoded) = event.data_base64 {
+                    let chunk = BASE64_STANDARD.decode(encoded).with_context(|| {
+                        format!(
+                            "failed to decode stdout chunk from api stream for `{execution_id}`"
+                        )
+                    })?;
+                    if !chunk.is_empty() {
+                        use std::io::Write;
+                        stdout
+                            .write_all(&chunk)
+                            .context("failed writing sandbox stdout")?;
+                        stdout.flush().context("failed flushing sandbox stdout")?;
+                    }
+                }
+                return Ok(false);
+            }
+            "stderr" => {
+                if let Some(encoded) = event.data_base64 {
+                    let chunk = BASE64_STANDARD.decode(encoded).with_context(|| {
+                        format!(
+                            "failed to decode stderr chunk from api stream for `{execution_id}`"
+                        )
+                    })?;
+                    if !chunk.is_empty() {
+                        use std::io::Write;
+                        stderr
+                            .write_all(&chunk)
+                            .context("failed writing sandbox stderr")?;
+                        stderr.flush().context("failed flushing sandbox stderr")?;
+                    }
+                }
+                return Ok(false);
+            }
+            "exit_code" => {
+                *terminal_exit_code = event.exit_code;
+                return Ok(true);
+            }
+            "error" => {
+                let message = event
+                    .error
+                    .unwrap_or_else(|| "unknown execution stream error".to_string());
+                bail!("sandbox execution `{execution_id}` reported error: {message}");
+            }
+            _ => return Ok(false),
+        }
+    }
+
+    if let Ok(error) = serde_json::from_str::<ApiExecutionOutputStreamError>(payload_json) {
+        bail!(
+            "sandbox execution stream failed: {} {} (request_id={})",
+            error.error.code,
+            error.error.message,
+            error.request_id
+        );
+    }
+
+    bail!("received unrecognized execution stream payload from api: {payload_json}");
+}
+
+async fn attach_to_execution_interactive_api(execution_id: &str) -> anyhow::Result<()> {
+    use crossterm::event::{self, Event};
+    use crossterm::terminal;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let execution_id = execution_id.to_string();
+    let mut stream = api_stream_exec_output(&execution_id)
+        .await
+        .with_context(|| {
+            format!("failed to stream sandbox execution output for `{execution_id}`")
+        })?;
+
+    terminal::enable_raw_mode().context("failed to enable raw mode")?;
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<AttachInputEvent>();
+    let stop_input = Arc::new(AtomicBool::new(false));
+    let stop_input_worker = Arc::clone(&stop_input);
+    let input_handle = tokio::task::spawn_blocking(move || {
+        let mut detach_prefix_pending = false;
+        loop {
+            if stop_input_worker.load(Ordering::Relaxed) {
+                break;
+            }
+
+            match event::poll(std::time::Duration::from_millis(100)) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => break,
+            }
+
+            match event::read() {
+                Ok(Event::Key(key_event)) => {
+                    let bytes = key_event_to_bytes(&key_event);
+                    if detach_prefix_pending {
+                        detach_prefix_pending = false;
+                        if is_detach_confirm(bytes.as_slice()) {
+                            if input_tx.send(AttachInputEvent::Detach).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        if input_tx.send(AttachInputEvent::Bytes(vec![0x10])).is_err() {
+                            break;
+                        }
+                    } else if is_detach_prefix(bytes.as_slice()) {
+                        detach_prefix_pending = true;
+                        continue;
+                    }
+
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    if input_tx.send(AttachInputEvent::Bytes(bytes)).is_err() {
+                        break;
+                    }
+                }
+                Ok(Event::Resize(new_cols, new_rows)) => {
+                    if input_tx
+                        .send(AttachInputEvent::Resize {
+                            cols: new_cols,
+                            rows: new_rows,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+
+    let interaction_result = async {
+        let mut stdout = std::io::stdout();
+        let mut stderr = std::io::stderr();
+        let mut detached = false;
+        let mut terminal_exit_code: Option<i32> = None;
+        let mut pending = Vec::<u8>::new();
+        let mut event_data = String::new();
+
+        loop {
+            tokio::select! {
+                maybe_input = input_rx.recv() => {
+                    let Some(input) = maybe_input else {
+                        continue;
+                    };
+                    match input {
+                        AttachInputEvent::Bytes(bytes) => {
+                            let write_result = api_write_exec_stdin(&execution_id, bytes).await;
+                            if let Err(error) = write_result {
+                                if let Ok(Some(execution)) = api_get_execution(&execution_id).await
+                                    && execution_state_is_terminal(execution.state.as_str())
+                                {
+                                    terminal_exit_code = execution.exit_code;
+                                    break;
+                                }
+                                return Err(error).with_context(|| format!("failed to write stdin to `{execution_id}`"));
+                            }
+                        }
+                        AttachInputEvent::Resize { cols, rows } => {
+                            let resize_result = api_resize_exec_pty(&execution_id, cols, rows).await;
+                            if let Err(error) = resize_result {
+                                if let Ok(Some(execution)) = api_get_execution(&execution_id).await
+                                    && execution_state_is_terminal(execution.state.as_str())
+                                {
+                                    terminal_exit_code = execution.exit_code;
+                                    break;
+                                }
+                                return Err(error).with_context(|| format!("failed to resize PTY for `{execution_id}`"));
+                            }
+                        }
+                        AttachInputEvent::Detach => {
+                            detached = true;
+                            break;
+                        }
+                    }
+                }
+                maybe_chunk = stream.chunk() => {
+                    let maybe_chunk = maybe_chunk
+                        .with_context(|| format!("failed reading stream for `{execution_id}`"))?;
+                    let Some(chunk) = maybe_chunk else {
+                        break;
+                    };
+
+                    pending.extend_from_slice(&chunk);
+                    while let Some(line_end) = pending.iter().position(|byte| *byte == b'\n') {
+                        let mut line = pending.drain(..=line_end).collect::<Vec<u8>>();
+                        if line.last() == Some(&b'\n') {
+                            let _ = line.pop();
+                        }
+                        if line.last() == Some(&b'\r') {
+                            let _ = line.pop();
+                        }
+
+                        let line = String::from_utf8(line).with_context(|| {
+                            format!("received non UTF-8 stream line for `{execution_id}`")
+                        })?;
+
+                        if line.is_empty() {
+                            if !event_data.is_empty() {
+                                let done = handle_api_execution_stream_event(
+                                    &execution_id,
+                                    &event_data,
+                                    &mut stdout,
+                                    &mut stderr,
+                                    &mut terminal_exit_code,
+                                )?;
+                                event_data.clear();
+                                if done {
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+
+                        if line.starts_with(':') {
+                            continue;
+                        }
+                        if let Some(data_line) = line.strip_prefix("data:") {
+                            if !event_data.is_empty() {
+                                event_data.push('\n');
+                            }
+                            event_data.push_str(data_line.trim_start());
+                        }
+                    }
+
+                    if terminal_exit_code.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if terminal_exit_code.is_none() && !detached {
+            if !event_data.is_empty() {
+                handle_api_execution_stream_event(
+                    &execution_id,
+                    &event_data,
+                    &mut stdout,
+                    &mut stderr,
+                    &mut terminal_exit_code,
+                )?;
+            }
+
+            if let Ok(Some(execution)) = api_get_execution(&execution_id).await {
+                terminal_exit_code = execution.exit_code;
             }
         }
 

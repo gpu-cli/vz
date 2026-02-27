@@ -2,12 +2,13 @@
 
 use super::{
     BuildListResponse, BuildResponse, CapabilitiesResponse, CheckpointListResponse,
-    CheckpointResponse, ChmodPathRequest, ChownPathRequest, ContainerListResponse,
-    ContainerResponse, CopyPathRequest, CreateCheckpointRequest, CreateContainerRequest,
-    CreateExecutionRequest, CreateSandboxRequest, ErrorResponse, EventsResponse,
-    ExecutionListResponse, ExecutionResponse, FileMutationResponse, ForkCheckpointRequest,
-    ImageListResponse, ImageResponse, LeaseListResponse, LeaseResponse, ListFilesRequest,
-    ListFilesResponse, MakeDirRequest, MovePathRequest, OpenLeaseRequest, ReadFileRequest,
+    CheckpointResponse, ChmodPathRequest, ChownPathRequest, CloseSandboxShellRequest,
+    CloseSandboxShellResponse, ContainerListResponse, ContainerResponse, CopyPathRequest,
+    CreateCheckpointRequest, CreateContainerRequest, CreateExecutionRequest, CreateSandboxRequest,
+    ErrorResponse, EventsResponse, ExecutionListResponse, ExecutionOutputStreamEventPayload,
+    ExecutionResponse, FileMutationResponse, ForkCheckpointRequest, ImageListResponse,
+    ImageResponse, LeaseListResponse, LeaseResponse, ListFilesRequest, ListFilesResponse,
+    MakeDirRequest, MovePathRequest, OpenLeaseRequest, OpenSandboxShellResponse, ReadFileRequest,
     ReadFileResponse, ReceiptResponse, RemovePathRequest, ResizeExecRequest,
     RestoreCheckpointResponse, SandboxListResponse, SandboxResponse, SignalExecRequest,
     StartBuildRequest, WriteExecStdinRequest, WriteFileRequest, WriteFileResponse,
@@ -155,6 +156,40 @@ fn terminate_sandbox() {}
 
 #[utoipa::path(
     post,
+    path = "/v1/sandboxes/{sandbox_id}/shell/open",
+    operation_id = "openSandboxShell",
+    summary = "Open an interactive shell session for a sandbox",
+    params(("sandbox_id" = String, Path, description = "Unique sandbox identifier (sbx-...)")),
+    responses(
+        (status = 200, description = "Sandbox shell opened", body = OpenSandboxShellResponse),
+        (status = 404, description = "Sandbox not found", body = ErrorResponse),
+        (status = 409, description = "Sandbox not ready for shell", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn open_sandbox_shell() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/sandboxes/{sandbox_id}/shell/close",
+    operation_id = "closeSandboxShell",
+    summary = "Close an interactive shell session for a sandbox",
+    params(
+        ("sandbox_id" = String, Path, description = "Unique sandbox identifier (sbx-...)"),
+        ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY_KEY_DESCRIPTION),
+    ),
+    request_body = CloseSandboxShellRequest,
+    responses(
+        (status = 200, description = "Sandbox shell closed", body = CloseSandboxShellResponse),
+        (status = 404, description = "Sandbox or execution not found", body = ErrorResponse),
+        (status = 409, description = "Sandbox shell not active", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn close_sandbox_shell() {}
+
+#[utoipa::path(
+    post,
     path = "/v1/leases",
     operation_id = "openLease",
     summary = "Open a lease for a sandbox",
@@ -298,6 +333,25 @@ fn get_execution() {}
     )
 )]
 fn cancel_execution() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/executions/{execution_id}/stream",
+    operation_id = "streamExecutionOutputSse",
+    summary = "Server-Sent Events stream for execution stdout/stderr/exit",
+    params((
+        "execution_id" = String,
+        Path,
+        description = "Unique execution identifier (exec-...)"
+    )),
+    responses((
+        status = 200,
+        description = "SSE execution output stream",
+        content_type = "text/event-stream",
+        body = ExecutionOutputStreamEventPayload
+    ))
+)]
+fn stream_execution_output_sse() {}
 
 #[utoipa::path(
     post,
@@ -796,6 +850,8 @@ fn chown_path() {}
         list_sandboxes,
         get_sandbox,
         terminate_sandbox,
+        open_sandbox_shell,
+        close_sandbox_shell,
         open_lease,
         list_leases,
         get_lease,
@@ -805,6 +861,7 @@ fn chown_path() {}
         list_executions,
         get_execution,
         cancel_execution,
+        stream_execution_output_sse,
         resize_exec,
         signal_exec,
         write_exec_stdin,
@@ -843,6 +900,11 @@ fn chown_path() {}
         crate::SandboxPayload,
         crate::SandboxResponse,
         crate::SandboxListResponse,
+        crate::OpenSandboxShellPayload,
+        crate::OpenSandboxShellResponse,
+        crate::CloseSandboxShellRequest,
+        crate::CloseSandboxShellPayload,
+        crate::CloseSandboxShellResponse,
         crate::OpenLeaseRequest,
         crate::LeasePayload,
         crate::LeaseResponse,
@@ -852,6 +914,7 @@ fn chown_path() {}
         crate::ExecutionPayload,
         crate::ExecutionResponse,
         crate::ExecutionListResponse,
+        crate::ExecutionOutputStreamEventPayload,
         crate::ResizeExecRequest,
         crate::SignalExecRequest,
         crate::WriteExecStdinRequest,

@@ -597,6 +597,200 @@ pub(super) async fn try_terminate_sandbox_via_daemon(
     }
 }
 
+pub(super) async fn try_open_sandbox_shell_via_daemon(
+    state: &ApiState,
+    sandbox_id: &str,
+    request_id: &str,
+) -> Option<Response> {
+    let mut client = match DaemonClient::connect_with_config(daemon_client_config(state)).await {
+        Ok(client) => client,
+        Err(error) => {
+            return Some(json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon_unavailable",
+                &error.to_string(),
+                request_id,
+            ));
+        }
+    };
+
+    let mut stream = match client
+        .open_sandbox_shell(runtime_v2::OpenSandboxShellRequest {
+            sandbox_id: sandbox_id.to_string(),
+            metadata: Some(daemon_request_metadata(request_id, None)),
+        })
+        .await
+    {
+        Ok(stream) => stream,
+        Err(DaemonClientError::Grpc(status)) => {
+            return Some(daemon_status_to_http_response(status, request_id));
+        }
+        Err(error) => {
+            return Some(json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon_unavailable",
+                &error.to_string(),
+                request_id,
+            ));
+        }
+    };
+
+    let mut completion: Option<runtime_v2::OpenSandboxShellResponse> = None;
+    loop {
+        match stream.message().await {
+            Ok(Some(event)) => {
+                if let Some(runtime_v2::open_sandbox_shell_event::Payload::Completion(done)) =
+                    event.payload
+                {
+                    completion = Some(done);
+                }
+            }
+            Ok(None) => break,
+            Err(status) => return Some(daemon_status_to_http_response(status, request_id)),
+        }
+    }
+
+    let completion = match completion {
+        Some(completion) => completion,
+        None => {
+            return Some(json_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "daemon open_sandbox_shell stream ended without completion",
+                request_id,
+            ));
+        }
+    };
+
+    Some(
+        (
+            StatusCode::OK,
+            Json(OpenSandboxShellResponse {
+                request_id: if completion.request_id.trim().is_empty() {
+                    request_id.to_string()
+                } else {
+                    completion.request_id
+                },
+                shell: OpenSandboxShellPayload {
+                    sandbox_id: completion.sandbox_id,
+                    container_id: completion.container_id,
+                    cmd: completion.cmd,
+                    args: completion.args,
+                    execution_id: completion.execution_id,
+                },
+            }),
+        )
+            .into_response(),
+    )
+}
+
+pub(super) async fn try_close_sandbox_shell_via_daemon(
+    state: &ApiState,
+    headers: &HeaderMap,
+    sandbox_id: &str,
+    raw_body: &[u8],
+    request_id: &str,
+) -> Option<Response> {
+    let body: CloseSandboxShellRequest =
+        if raw_body.is_empty() || raw_body.iter().all(u8::is_ascii_whitespace) {
+            CloseSandboxShellRequest { execution_id: None }
+        } else {
+            match serde_json::from_slice(raw_body) {
+                Ok(body) => body,
+                Err(error) => {
+                    return Some(json_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request",
+                        &format!("invalid JSON body: {error}"),
+                        request_id,
+                    ));
+                }
+            }
+        };
+
+    let mut client = match DaemonClient::connect_with_config(daemon_client_config(state)).await {
+        Ok(client) => client,
+        Err(error) => {
+            return Some(json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon_unavailable",
+                &error.to_string(),
+                request_id,
+            ));
+        }
+    };
+
+    let mut stream = match client
+        .close_sandbox_shell(runtime_v2::CloseSandboxShellRequest {
+            sandbox_id: sandbox_id.to_string(),
+            execution_id: body.execution_id.unwrap_or_default(),
+            metadata: Some(daemon_request_metadata(
+                request_id,
+                extract_idempotency_key(headers),
+            )),
+        })
+        .await
+    {
+        Ok(stream) => stream,
+        Err(DaemonClientError::Grpc(status)) => {
+            return Some(daemon_status_to_http_response(status, request_id));
+        }
+        Err(error) => {
+            return Some(json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon_unavailable",
+                &error.to_string(),
+                request_id,
+            ));
+        }
+    };
+
+    let mut completion: Option<runtime_v2::CloseSandboxShellResponse> = None;
+    loop {
+        match stream.message().await {
+            Ok(Some(event)) => {
+                if let Some(runtime_v2::close_sandbox_shell_event::Payload::Completion(done)) =
+                    event.payload
+                {
+                    completion = Some(done);
+                }
+            }
+            Ok(None) => break,
+            Err(status) => return Some(daemon_status_to_http_response(status, request_id)),
+        }
+    }
+
+    let completion = match completion {
+        Some(completion) => completion,
+        None => {
+            return Some(json_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "daemon close_sandbox_shell stream ended without completion",
+                request_id,
+            ));
+        }
+    };
+
+    Some(
+        (
+            StatusCode::OK,
+            Json(CloseSandboxShellResponse {
+                request_id: if completion.request_id.trim().is_empty() {
+                    request_id.to_string()
+                } else {
+                    completion.request_id
+                },
+                shell: CloseSandboxShellPayload {
+                    sandbox_id: completion.sandbox_id,
+                    execution_id: completion.execution_id,
+                },
+            }),
+        )
+            .into_response(),
+    )
+}
+
 pub(super) async fn try_open_lease_via_daemon(
     state: &ApiState,
     headers: &HeaderMap,
@@ -2201,6 +2395,40 @@ pub(super) async fn open_event_stream_via_daemon(
             stack_name: stack_name.to_string(),
             after: query.after.unwrap_or(0),
             scope: query.scope.clone().unwrap_or_default(),
+            metadata: Some(daemon_request_metadata(request_id, None)),
+        })
+        .await
+        .map_err(|error| match error {
+            DaemonClientError::Grpc(status) => daemon_status_to_http_response(status, request_id),
+            other => json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon_unavailable",
+                &other.to_string(),
+                request_id,
+            ),
+        })
+}
+
+pub(super) async fn open_execution_output_stream_via_daemon(
+    state: &ApiState,
+    execution_id: &str,
+    request_id: &str,
+) -> Result<tonic::Streaming<runtime_v2::ExecOutputEvent>, Response> {
+    let mut client = match DaemonClient::connect_with_config(daemon_client_config(state)).await {
+        Ok(client) => client,
+        Err(error) => {
+            return Err(json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon_unavailable",
+                &error.to_string(),
+                request_id,
+            ));
+        }
+    };
+
+    client
+        .stream_exec_output(runtime_v2::StreamExecOutputRequest {
+            execution_id: execution_id.to_string(),
             metadata: Some(daemon_request_metadata(request_id, None)),
         })
         .await

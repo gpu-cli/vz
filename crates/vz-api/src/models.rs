@@ -92,6 +92,51 @@ pub(crate) struct SandboxListResponse {
     pub(crate) sandboxes: Vec<SandboxPayload>,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct OpenSandboxShellPayload {
+    pub(crate) sandbox_id: String,
+    pub(crate) container_id: String,
+    pub(crate) cmd: Vec<String>,
+    pub(crate) args: Vec<String>,
+    pub(crate) execution_id: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct OpenSandboxShellResponse {
+    pub(crate) request_id: String,
+    pub(crate) shell: OpenSandboxShellPayload,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct CloseSandboxShellRequest {
+    #[serde(default)]
+    pub(crate) execution_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct CloseSandboxShellPayload {
+    pub(crate) sandbox_id: String,
+    pub(crate) execution_id: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct CloseSandboxShellResponse {
+    pub(crate) request_id: String,
+    pub(crate) shell: CloseSandboxShellPayload,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ExecutionOutputStreamEventPayload {
+    pub(crate) sequence: u64,
+    pub(crate) event: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) data_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
+}
+
 // ── Lease types ──
 
 #[derive(Debug, Deserialize, ToSchema)]

@@ -105,6 +105,17 @@ fn test_config_daemon_only(state_store_path: PathBuf) -> ApiConfig {
 fn sample_openapi_path(path: &str) -> String {
     match path {
         "/v1/events/{stack_name}" => "/v1/events/runtime-conformance-stack".to_string(),
+        "/v1/sandboxes/{sandbox_id}" => "/v1/sandboxes/sbx-nonexistent".to_string(),
+        "/v1/sandboxes/{sandbox_id}/shell/open" => {
+            "/v1/sandboxes/sbx-nonexistent/shell/open".to_string()
+        }
+        "/v1/sandboxes/{sandbox_id}/shell/close" => {
+            "/v1/sandboxes/sbx-nonexistent/shell/close".to_string()
+        }
+        "/v1/executions/{execution_id}" => "/v1/executions/exec-nonexistent".to_string(),
+        "/v1/executions/{execution_id}/stream" => {
+            "/v1/executions/exec-nonexistent/stream".to_string()
+        }
         "/v1/containers/{container_id}" => "/v1/containers/ctr-nonexistent".to_string(),
         "/v1/images/{image_ref}" => "/v1/images/nginx:latest".to_string(),
         "/v1/receipts/{receipt_id}" => "/v1/receipts/rcp-nonexistent".to_string(),
@@ -123,6 +134,8 @@ fn openapi_document_contains_required_paths() {
     let paths = document["paths"].as_object().unwrap();
     assert!(paths.contains_key("/v1/sandboxes"));
     assert!(paths.contains_key("/v1/sandboxes/{sandbox_id}"));
+    assert!(paths.contains_key("/v1/sandboxes/{sandbox_id}/shell/open"));
+    assert!(paths.contains_key("/v1/sandboxes/{sandbox_id}/shell/close"));
     assert!(paths.contains_key("/v1/leases"));
     assert!(paths.contains_key("/v1/leases/{lease_id}"));
     assert!(paths.contains_key("/v1/images"));
@@ -133,6 +146,7 @@ fn openapi_document_contains_required_paths() {
     assert!(paths.contains_key("/v1/containers/{container_id}"));
     assert!(paths.contains_key("/v1/executions"));
     assert!(paths.contains_key("/v1/executions/{execution_id}"));
+    assert!(paths.contains_key("/v1/executions/{execution_id}/stream"));
     assert!(paths.contains_key("/v1/executions/{execution_id}/resize"));
     assert!(paths.contains_key("/v1/executions/{execution_id}/stdin"));
     assert!(paths.contains_key("/v1/executions/{execution_id}/signal"));
@@ -2425,6 +2439,21 @@ async fn authz_execution_get_nonexistent_returns_404() {
 }
 
 #[tokio::test]
+async fn authz_execution_stream_nonexistent_returns_404() {
+    let (app, _dir) = test_router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/executions/exec-phantom/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn authz_execution_cancel_nonexistent_returns_404() {
     let (app, _dir) = test_router();
     let response = app
@@ -2433,6 +2462,39 @@ async fn authz_execution_cancel_nonexistent_returns_404() {
                 .method("DELETE")
                 .uri("/v1/executions/exec-phantom")
                 .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn authz_sandbox_shell_open_nonexistent_returns_404() {
+    let (app, _dir) = test_router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sandboxes/sbx-phantom/shell/open")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn authz_sandbox_shell_close_nonexistent_returns_404() {
+    let (app, _dir) = test_router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sandboxes/sbx-phantom/shell/close")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"execution_id":"exec-phantom"}"#))
                 .unwrap(),
         )
         .await

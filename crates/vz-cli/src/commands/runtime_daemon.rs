@@ -15,6 +15,8 @@ const CONTROL_PLANE_TRANSPORT_ENV: &str = "VZ_CONTROL_PLANE_TRANSPORT";
 const DAEMON_SOCKET_PATH_ENV: &str = "VZ_RUNTIME_DAEMON_SOCKET";
 /// Optional daemon autostart policy override (`true/false`, `1/0`, etc.).
 const DAEMON_AUTOSTART_ENV: &str = "VZ_RUNTIME_DAEMON_AUTOSTART";
+/// Runtime API base URL used when control plane transport is `api-http`.
+const API_BASE_URL_ENV: &str = "VZ_RUNTIME_API_BASE_URL";
 
 static CONTROL_PLANE_TRANSPORT_OVERRIDE: OnceLock<ControlPlaneTransport> = OnceLock::new();
 static API_HTTP_FALLBACK_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
@@ -78,6 +80,33 @@ fn parse_control_plane_transport(raw: Option<OsString>) -> anyhow::Result<Contro
 
 fn parse_env_control_plane_transport() -> anyhow::Result<ControlPlaneTransport> {
     parse_control_plane_transport(std::env::var_os(CONTROL_PLANE_TRANSPORT_ENV))
+}
+
+fn parse_api_base_url(raw: Option<OsString>) -> anyhow::Result<String> {
+    let Some(raw) = raw else {
+        return Ok("http://127.0.0.1:8181".to_string());
+    };
+
+    let value = raw.to_string_lossy().trim().to_string();
+    if value.is_empty() {
+        return Ok("http://127.0.0.1:8181".to_string());
+    }
+
+    let parsed = reqwest::Url::parse(&value)
+        .with_context(|| format!("invalid `{API_BASE_URL_ENV}` URL: {value}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!(
+            "invalid `{}` URL scheme `{}`; expected http or https",
+            API_BASE_URL_ENV,
+            parsed.scheme()
+        );
+    }
+
+    Ok(value)
+}
+
+fn parse_env_api_base_url() -> anyhow::Result<String> {
+    parse_api_base_url(std::env::var_os(API_BASE_URL_ENV))
 }
 
 fn parse_daemon_autostart(raw: Option<OsString>) -> anyhow::Result<bool> {
@@ -151,6 +180,16 @@ fn configured_control_plane_transport() -> anyhow::Result<ControlPlaneTransport>
         return Ok(transport);
     }
     parse_env_control_plane_transport()
+}
+
+/// Resolve the currently configured control-plane transport.
+pub(crate) fn control_plane_transport() -> anyhow::Result<ControlPlaneTransport> {
+    configured_control_plane_transport()
+}
+
+/// Resolve the base URL for `api-http` transport.
+pub(crate) fn runtime_api_base_url() -> anyhow::Result<String> {
+    parse_env_api_base_url()
 }
 
 /// Build daemon client config scoped to a specific runtime state DB path.
@@ -260,6 +299,19 @@ mod tests {
     fn parse_daemon_socket_override_ignores_empty() {
         let override_path = parse_daemon_socket_override(Some(OsString::from("")));
         assert!(override_path.is_none());
+    }
+
+    #[test]
+    fn parse_api_base_url_defaults_and_validates() {
+        assert_eq!(
+            parse_api_base_url(None).ok(),
+            Some("http://127.0.0.1:8181".to_string())
+        );
+        assert_eq!(
+            parse_api_base_url(Some(OsString::from("http://localhost:9999"))).ok(),
+            Some("http://localhost:9999".to_string())
+        );
+        assert!(parse_api_base_url(Some(OsString::from("ftp://localhost:9999"))).is_err());
     }
 
     #[test]
