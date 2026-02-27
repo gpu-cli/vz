@@ -1,4 +1,5 @@
 use super::*;
+use serde::Serialize;
 
 #[derive(Debug, Serialize)]
 struct StreamErrorBody {

@@ -174,6 +174,19 @@ fn openapi_document_source_avoids_codegen_and_manual_schema_maps() {
     );
 }
 
+#[test]
+fn transport_modules_do_not_directly_import_state_store() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for relative in ["src/handlers.rs", "src/daemon_bridge.rs"] {
+        let source = std::fs::read_to_string(manifest_dir.join(relative))
+            .expect("read transport source module");
+        assert!(
+            !source.contains("StateStore"),
+            "{relative} must not directly import or mutate StateStore"
+        );
+    }
+}
+
 #[tokio::test]
 async fn capabilities_endpoint_returns_runtime_capabilities() {
     let temp_dir = tempdir().unwrap();
