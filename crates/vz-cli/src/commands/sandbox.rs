@@ -41,6 +41,13 @@ fn sandbox_state_from_wire(state: &str) -> anyhow::Result<SandboxState> {
     }
 }
 
+fn execution_state_is_terminal(state: &str) -> bool {
+    matches!(
+        state.trim().to_ascii_lowercase().as_str(),
+        "exited" | "failed" | "canceled"
+    )
+}
+
 fn normalize_optional_label(value: Option<&String>) -> Option<String> {
     let raw = value?.trim();
     if raw.is_empty() {
@@ -605,25 +612,73 @@ async fn attach_to_execution_interactive(
                     };
                     match input {
                         AttachInputEvent::Bytes(bytes) => {
-                            client
+                            let write_result = client
                                 .write_exec_stdin(runtime_v2::WriteExecStdinRequest {
                                     execution_id: execution_id.clone(),
                                     data: bytes,
                                     metadata: None,
                                 })
-                                .await
-                                .with_context(|| format!("failed to write stdin to `{execution_id}`"))?;
+                                .await;
+                            if let Err(status) = write_result {
+                                if matches!(
+                                    status,
+                                    DaemonClientError::Grpc(ref grpc_status)
+                                        if matches!(
+                                            grpc_status.code(),
+                                            Code::FailedPrecondition | Code::NotFound
+                                        )
+                                ) {
+                                    if let Ok(response) = client
+                                        .get_execution(runtime_v2::GetExecutionRequest {
+                                            execution_id: execution_id.clone(),
+                                            metadata: None,
+                                        })
+                                        .await
+                                        && let Some(execution) = response.execution
+                                        && execution_state_is_terminal(execution.state.as_str())
+                                    {
+                                        terminal_exit_code = Some(execution.exit_code);
+                                        break;
+                                    }
+                                }
+                                return Err(status)
+                                    .with_context(|| format!("failed to write stdin to `{execution_id}`"));
+                            }
                         }
                         AttachInputEvent::Resize { cols, rows } => {
-                            client
+                            let resize_result = client
                                 .resize_exec_pty(runtime_v2::ResizeExecPtyRequest {
                                     execution_id: execution_id.clone(),
                                     cols: u32::from(cols),
                                     rows: u32::from(rows),
                                     metadata: None,
                                 })
-                                .await
-                                .with_context(|| format!("failed to resize PTY for `{execution_id}`"))?;
+                                .await;
+                            if let Err(status) = resize_result {
+                                if matches!(
+                                    status,
+                                    DaemonClientError::Grpc(ref grpc_status)
+                                        if matches!(
+                                            grpc_status.code(),
+                                            Code::FailedPrecondition | Code::NotFound
+                                        )
+                                ) {
+                                    if let Ok(response) = client
+                                        .get_execution(runtime_v2::GetExecutionRequest {
+                                            execution_id: execution_id.clone(),
+                                            metadata: None,
+                                        })
+                                        .await
+                                        && let Some(execution) = response.execution
+                                        && execution_state_is_terminal(execution.state.as_str())
+                                    {
+                                        terminal_exit_code = Some(execution.exit_code);
+                                        break;
+                                    }
+                                }
+                                return Err(status)
+                                    .with_context(|| format!("failed to resize PTY for `{execution_id}`"));
+                            }
                         }
                         AttachInputEvent::Detach => {
                             detached = true;

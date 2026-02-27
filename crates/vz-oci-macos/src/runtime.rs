@@ -40,6 +40,7 @@ const LOG_ROTATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const LOG_ROTATION_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_INTERACTIVE_EXEC_ROWS: u16 = 24;
 const DEFAULT_INTERACTIVE_EXEC_COLS: u16 = 80;
+const INTERACTIVE_EXEC_PTY_PREP_TIMEOUT: Duration = Duration::from_secs(2);
 const OCI_RUNTIME_BIN_SHARE_TAG: &str = "oci-runtime-bin";
 const OCI_DEFAULT_GUEST_STATE_DIR: &str = "/run/vz-oci";
 const OCI_BUNDLE_DIRNAME: &str = "bundles";
@@ -1446,6 +1447,7 @@ impl Runtime {
             };
 
             let mut nsenter_args: Vec<String> = vec![
+                "nsenter".to_string(),
                 format!("--mount=/proc/{pid}/ns/mnt"),
                 format!("--net=/proc/{pid}/ns/net"),
                 format!("--pid=/proc/{pid}/ns/pid"),
@@ -1466,9 +1468,17 @@ impl Runtime {
             let term_rows = u32::from(exec.term_rows.unwrap_or(DEFAULT_INTERACTIVE_EXEC_ROWS));
             let term_cols = u32::from(exec.term_cols.unwrap_or(DEFAULT_INTERACTIVE_EXEC_COLS));
 
+            ensure_interactive_exec_pty_prerequisites(vm.as_ref(), timeout).await;
+
             let (mut stream, guest_exec_id) = tokio::time::timeout(
                 timeout,
-                vm.exec_interactive("nsenter", &nsenter_arg_refs, None, term_rows, term_cols),
+                vm.exec_interactive(
+                    "/bin/busybox",
+                    &nsenter_arg_refs,
+                    None,
+                    term_rows,
+                    term_cols,
+                ),
             )
             .await
             .map_err(|_| {
@@ -2746,6 +2756,47 @@ async fn relay_port_forward_connection(
         .map_err(|error| LinuxError::Protocol(format!("port forward relay failed: {error}")))?;
 
     Ok(())
+}
+
+async fn ensure_interactive_exec_pty_prerequisites(vm: &LinuxVm, exec_timeout: Duration) {
+    let prep_timeout = exec_timeout.min(INTERACTIVE_EXEC_PTY_PREP_TIMEOUT);
+    if prep_timeout.is_zero() {
+        return;
+    }
+
+    // Best-effort guest PTY repair for older agent artifacts that may start
+    // without devpts mounted or /dev/ptmx linked.
+    let prep_script = "set -eu; \
+        /bin/busybox mkdir -p /dev/pts; \
+        if ! /bin/busybox awk '$2==\"/dev/pts\" && $3==\"devpts\" {found=1} END {exit found?0:1}' /proc/mounts; then \
+          /bin/busybox mount -t devpts devpts /dev/pts -o ptmxmode=0666,mode=0620 || true; \
+        fi; \
+        if [ ! -e /dev/ptmx ]; then \
+          /bin/busybox ln -sf pts/ptmx /dev/ptmx || true; \
+        fi";
+
+    match vm
+        .exec_capture(
+            "/bin/busybox".to_string(),
+            vec!["sh".to_string(), "-lc".to_string(), prep_script.to_string()],
+            prep_timeout,
+        )
+        .await
+    {
+        Ok(output) if output.exit_code == 0 => {}
+        Ok(output) => {
+            warn!(
+                exit_code = output.exit_code,
+                "interactive exec PTY prerequisite command returned non-zero status"
+            );
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                "interactive exec PTY prerequisite check failed"
+            );
+        }
+    }
 }
 
 /// Stop a container through OCI runtime lifecycle: kill → poll state → escalate.
