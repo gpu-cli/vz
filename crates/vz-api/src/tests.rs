@@ -446,6 +446,37 @@ async fn checkpoint_create_requires_daemon_when_legacy_fallback_disabled() {
 }
 
 #[tokio::test]
+async fn image_pull_requires_daemon_when_legacy_fallback_disabled() {
+    let temp_dir = tempdir().unwrap();
+    let state_path = temp_dir.path().join("state.db");
+    StateStore::open(&state_path).unwrap();
+
+    let app = router(test_config_daemon_only(state_path.clone()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/pull")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"image_ref":"alpine:3.20"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        payload["error"]["code"].as_str().unwrap(),
+        "daemon_unavailable"
+    );
+
+    let store = StateStore::open(&state_path).unwrap();
+    assert!(store.list_images().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn events_endpoint_respects_cursor_and_limit() {
     let temp_dir = tempdir().unwrap();
     let state_path = temp_dir.path().join("state.db");
@@ -3374,6 +3405,54 @@ async fn authz_image_get_nonexistent_returns_404() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn image_pull_invalid_json_returns_400() {
+    let (app, _dir) = test_router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/pull")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"image_ref":"alpine:3.20""#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["error"]["code"].as_str(), Some("invalid_request"));
+}
+
+#[tokio::test]
+async fn image_prune_returns_200_with_expected_fields() {
+    let (app, _dir) = test_router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/prune")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(payload["request_id"].as_str().is_some());
+    assert!(payload["removed_refs"].as_u64().is_some());
+    assert!(payload["removed_manifests"].as_u64().is_some());
+    assert!(payload["removed_configs"].as_u64().is_some());
+    assert!(payload["removed_layer_dirs"].as_u64().is_some());
+    assert!(payload["remaining_images"].as_u64().is_some());
+    assert!(payload.get("receipt_id").is_some());
 }
 
 // -- Scenario 13: Receipt entity validation --
