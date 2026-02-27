@@ -3853,6 +3853,7 @@ dependencies = [
  "hyper-util",
  "serde",
  "serde_json",
+ "shell-words",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

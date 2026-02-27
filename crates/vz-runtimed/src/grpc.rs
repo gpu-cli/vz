@@ -55,6 +55,78 @@ pub enum RuntimedServerError {
 const IDEMPOTENCY_CLEANUP_INTERVAL: Duration = Duration::from_millis(50);
 #[cfg(not(test))]
 const IDEMPOTENCY_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const ORPHAN_SHELL_EXECUTION_GRACE_SECS: u64 = 1;
+#[cfg(not(test))]
+const ORPHAN_SHELL_EXECUTION_GRACE_SECS: u64 = 300;
+
+fn reconcile_orphaned_shell_executions(daemon: &RuntimeDaemon) -> Result<u64, StackError> {
+    let now = current_unix_secs();
+    let executions = daemon.with_state_store(|store| store.list_executions())?;
+    let mut reconciled = 0;
+
+    for mut execution in executions {
+        if execution.state.is_terminal() {
+            continue;
+        }
+        if !execution.exec_spec.pty {
+            continue;
+        }
+        if execution
+            .exec_spec
+            .env_override
+            .get(SANDBOX_SHELL_SESSION_ENV_KEY)
+            .is_none_or(|value| value != "1")
+        {
+            continue;
+        }
+
+        let has_session = daemon
+            .execution_sessions()
+            .contains(&execution.execution_id)
+            .map_err(|_| StackError::Machine {
+                code: MachineErrorCode::InternalError,
+                message: "execution session registry lock poisoned".to_string(),
+            })?;
+        if has_session {
+            continue;
+        }
+
+        let started_at = execution.started_at.unwrap_or(now);
+        if now.saturating_sub(started_at) < ORPHAN_SHELL_EXECUTION_GRACE_SECS {
+            continue;
+        }
+
+        if execution.started_at.is_none() {
+            execution.started_at = Some(now);
+        }
+        execution.ended_at = Some(now);
+        execution.exit_code = Some(130);
+        execution
+            .transition_to(ExecutionState::Canceled)
+            .map_err(|error| StackError::Machine {
+                code: MachineErrorCode::StateConflict,
+                message: error.to_string(),
+            })?;
+
+        daemon.with_state_store(|store| {
+            store.with_immediate_transaction(|tx| {
+                tx.save_execution(&execution)?;
+                tx.emit_event(
+                    "daemon",
+                    &StackEvent::ExecutionCanceled {
+                        execution_id: execution.execution_id.clone(),
+                    },
+                )?;
+                Ok(())
+            })
+        })?;
+        let _ = daemon.execution_sessions().remove(&execution.execution_id);
+        reconciled += 1;
+    }
+
+    Ok(reconciled)
+}
 
 async fn run_maintenance_loop(daemon: Arc<RuntimeDaemon>, shutdown: Arc<tokio::sync::Notify>) {
     let mut ticker = tokio::time::interval(IDEMPOTENCY_CLEANUP_INTERVAL);
@@ -84,6 +156,19 @@ async fn run_maintenance_loop(daemon: Arc<RuntimeDaemon>, shutdown: Arc<tokio::s
                     }
                     Err(error) => {
                         warn!(error = %error, "daemon maintenance: failed to clean expired idempotency keys");
+                    }
+                }
+                match reconcile_orphaned_shell_executions(daemon.as_ref()) {
+                    Ok(reconciled) => {
+                        if reconciled > 0 {
+                            debug!(
+                                reconciled_executions = reconciled,
+                                "daemon maintenance: reconciled orphaned shell executions"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "daemon maintenance: failed to reconcile orphaned shell executions");
                     }
                 }
             }

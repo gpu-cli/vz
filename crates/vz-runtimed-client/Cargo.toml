@@ -20,7 +20,7 @@ vz-runtime-translate = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-vz-runtimed = { workspace = true }
+vz-runtimed = { workspace = true, features = ["test-backend"] }
 
 [lints]
 workspace = true

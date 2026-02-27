@@ -1,4 +1,7 @@
 use super::super::*;
+use std::path::PathBuf;
+use std::time::Duration;
+use vz_runtime_contract::{MountAccess, MountSpec, MountType, RunConfig};
 
 #[derive(Clone)]
 pub(in crate::grpc) struct ContainerServiceImpl {
@@ -8,6 +11,314 @@ pub(in crate::grpc) struct ContainerServiceImpl {
 impl ContainerServiceImpl {
     pub(in crate::grpc) fn new(daemon: Arc<RuntimeDaemon>) -> Self {
         Self { daemon }
+    }
+}
+
+fn runtime_container_not_active(
+    error: &vz_runtime_contract::RuntimeError,
+    container_id: &str,
+) -> bool {
+    if error.machine_code() == MachineErrorCode::NotFound {
+        return true;
+    }
+
+    let message = error.to_string().to_ascii_lowercase();
+    let container_id_lc = container_id.to_ascii_lowercase();
+    message.contains("container not found")
+        || message.contains("no active vm handle")
+        || message.contains("not running")
+        || message.contains("not found") && message.contains(&container_id_lc)
+}
+
+fn container_runtime_status(
+    error: vz_runtime_contract::RuntimeError,
+    operation: &str,
+    container_id: &str,
+    request_id: &str,
+) -> Status {
+    status_from_machine_error(MachineError::new(
+        error.machine_code(),
+        format!("failed to {operation} runtime container {container_id}: {error}"),
+        Some(request_id.to_string()),
+        BTreeMap::new(),
+    ))
+}
+
+async fn create_runtime_container(
+    daemon: Arc<RuntimeDaemon>,
+    sandbox_id: String,
+    image_digest: String,
+    run_config: RunConfig,
+    container_id: &str,
+    request_id: &str,
+) -> Result<String, Status> {
+    let container_id_owned = container_id.to_string();
+    let bridge_result = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("failed to initialize runtime bridge: {error}"))?;
+        Ok::<_, String>(
+            runtime.block_on(daemon.manager().create_container_in_sandbox(
+                &sandbox_id,
+                &image_digest,
+                run_config,
+            )),
+        )
+    })
+    .await
+    .map_err(|join_error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::InternalError,
+            format!(
+                "runtime bridge join failure while creating container {container_id}: {join_error}"
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })?;
+
+    let runtime_result = bridge_result.map_err(|bridge_error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::InternalError,
+            format!(
+                "runtime bridge initialization failed while creating container {container_id}: {bridge_error}"
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })?;
+    match runtime_result {
+        Ok(runtime_container_id) => Ok(runtime_container_id),
+        Err(error) => Err(container_runtime_status(
+            error,
+            "create",
+            &container_id_owned,
+            request_id,
+        )),
+    }
+}
+
+async fn stop_runtime_container(
+    daemon: Arc<RuntimeDaemon>,
+    container_id: &str,
+    request_id: &str,
+) -> Result<(), Status> {
+    let container_id_owned = container_id.to_string();
+    let bridge_result = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("failed to initialize runtime bridge: {error}"))?;
+        Ok::<_, String>(runtime.block_on(daemon.manager().stop_container(
+            &container_id_owned,
+            false,
+            Some("SIGTERM"),
+            Some(Duration::from_secs(5)),
+        )))
+    })
+    .await
+    .map_err(|join_error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::InternalError,
+            format!(
+                "runtime bridge join failure while stopping container {container_id}: {join_error}"
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })?;
+
+    let runtime_result = bridge_result.map_err(|bridge_error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::InternalError,
+            format!(
+                "runtime bridge initialization failed while stopping container {container_id}: {bridge_error}"
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })?;
+
+    match runtime_result {
+        Ok(_) => Ok(()),
+        Err(error) if runtime_container_not_active(&error, container_id) => Ok(()),
+        Err(error) => Err(container_runtime_status(
+            error,
+            "stop",
+            container_id,
+            request_id,
+        )),
+    }
+}
+
+async fn remove_runtime_container(
+    daemon: Arc<RuntimeDaemon>,
+    container_id: &str,
+    request_id: &str,
+) -> Result<(), Status> {
+    let container_id_owned = container_id.to_string();
+    let bridge_result = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("failed to initialize runtime bridge: {error}"))?;
+        Ok::<_, String>(runtime.block_on(daemon.manager().remove_container(&container_id_owned)))
+    })
+    .await
+    .map_err(|join_error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::InternalError,
+            format!(
+                "runtime bridge join failure while removing container {container_id}: {join_error}"
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })?;
+
+    let runtime_result = bridge_result.map_err(|bridge_error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::InternalError,
+            format!(
+                "runtime bridge initialization failed while removing container {container_id}: {bridge_error}"
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })?;
+
+    match runtime_result {
+        Ok(()) => Ok(()),
+        Err(error) if runtime_container_not_active(&error, container_id) => Ok(()),
+        Err(error) => Err(container_runtime_status(
+            error,
+            "remove",
+            container_id,
+            request_id,
+        )),
+    }
+}
+
+fn sandbox_workspace_dir_from_labels(
+    sandbox: &Sandbox,
+    request_id: &str,
+) -> Result<Option<PathBuf>, Status> {
+    let Some(project_dir) = sandbox
+        .labels
+        .get("project_dir")
+        .and_then(|value| normalize_optional_wire_field(value))
+    else {
+        return Ok(None);
+    };
+
+    let path = PathBuf::from(project_dir.trim());
+    if !path.is_absolute() {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!(
+                "sandbox label `project_dir` must be an absolute path: {}",
+                path.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+    if !path.exists() {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!(
+                "sandbox label `project_dir` does not exist: {}",
+                path.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+    if !path.is_dir() {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!(
+                "sandbox label `project_dir` must reference a directory: {}",
+                path.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+
+    Ok(Some(path))
+}
+
+fn default_keepalive_container_cmd() -> Vec<String> {
+    vec![
+        "/bin/sh".to_string(),
+        "-lc".to_string(),
+        "while :; do sleep 3600; done".to_string(),
+    ]
+}
+
+fn build_runtime_run_config(
+    sandbox: &Sandbox,
+    container: &Container,
+    request_id: &str,
+) -> Result<RunConfig, Status> {
+    let mut run_config = RunConfig {
+        cmd: container.container_spec.cmd.clone(),
+        working_dir: container.container_spec.cwd.clone(),
+        env: container
+            .container_spec
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        user: container.container_spec.user.clone(),
+        container_id: Some(container.container_id.clone()),
+        capture_logs: true,
+        ..RunConfig::default()
+    };
+
+    if run_config.cmd.is_empty() {
+        run_config.cmd = default_keepalive_container_cmd();
+    }
+
+    if let Some(project_dir) = sandbox_workspace_dir_from_labels(sandbox, request_id)? {
+        run_config.mounts.push(MountSpec {
+            source: Some(project_dir),
+            target: PathBuf::from("/workspace"),
+            mount_type: MountType::Bind,
+            access: MountAccess::ReadWrite,
+            subpath: None,
+        });
+        if run_config.working_dir.is_none() {
+            run_config.working_dir = Some("/workspace".to_string());
+        }
+    }
+
+    Ok(run_config)
+}
+
+async fn cleanup_runtime_container_after_persist_failure(
+    daemon: Arc<RuntimeDaemon>,
+    container_id: &str,
+    request_id: &str,
+) {
+    if let Err(error) = stop_runtime_container(daemon.clone(), container_id, request_id).await {
+        warn!(
+            container_id = %container_id,
+            request_id = %request_id,
+            error = %error,
+            "failed to stop runtime container during persistence-failure cleanup"
+        );
+    }
+
+    if let Err(error) = remove_runtime_container(daemon, container_id, request_id).await {
+        warn!(
+            container_id = %container_id,
+            request_id = %request_id,
+            error = %error,
+            "failed to remove runtime container during persistence-failure cleanup"
+        );
     }
 }
 
@@ -110,7 +421,7 @@ impl runtime_v2::container_service_server::ContainerService for ContainerService
             .map_err(status_from_machine_error)?;
 
         let now = current_unix_secs();
-        let container = Container {
+        let mut container = Container {
             container_id: generate_container_id(),
             sandbox_id,
             image_digest,
@@ -128,6 +439,20 @@ impl runtime_v2::container_service_server::ContainerService for ContainerService
             started_at: None,
             ended_at: None,
         };
+
+        let runtime_run_config = build_runtime_run_config(&sandbox, &container, &request_id)?;
+        let runtime_container_id = create_runtime_container(
+            self.daemon.clone(),
+            container.sandbox_id.clone(),
+            container.image_digest.clone(),
+            runtime_run_config,
+            &container.container_id,
+            &request_id,
+        )
+        .await?;
+        if runtime_container_id != container.container_id {
+            container.container_id = runtime_container_id;
+        }
 
         let receipt_id = generate_receipt_id();
         let persist_result = self.daemon.with_state_store(|store| {
@@ -183,6 +508,12 @@ impl runtime_v2::container_service_server::ContainerService for ContainerService
                     }));
                 }
             }
+            cleanup_runtime_container_after_persist_failure(
+                self.daemon.clone(),
+                &container.container_id,
+                &request_id,
+            )
+            .await;
             return Err(status_from_stack_error(error, &request_id));
         }
 
@@ -282,6 +613,9 @@ impl runtime_v2::container_service_server::ContainerService for ContainerService
                     BTreeMap::new(),
                 ))
             })?;
+
+        stop_runtime_container(self.daemon.clone(), &container.container_id, &request_id).await?;
+        remove_runtime_container(self.daemon.clone(), &container.container_id, &request_id).await?;
 
         let now = current_unix_secs();
         let mut removed_container = container.clone();

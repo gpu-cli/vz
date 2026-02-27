@@ -32,7 +32,7 @@ pub(super) use receipt_metadata::{
 };
 pub(super) use status::{status_from_machine_error, status_from_stack_error};
 pub(super) use wire::{
-    create_checkpoint_request_hash, create_container_request_hash, create_execution_request_hash,
-    create_fork_checkpoint_request_hash, create_open_lease_request_hash,
-    create_sandbox_request_hash, normalize_optional_wire_field,
+    SANDBOX_SHELL_SESSION_ENV_KEY, create_checkpoint_request_hash, create_container_request_hash,
+    create_execution_request_hash, create_fork_checkpoint_request_hash,
+    create_open_lease_request_hash, create_sandbox_request_hash, normalize_optional_wire_field,
 };

@@ -3,6 +3,8 @@
 mod execution_sessions;
 mod grpc;
 mod placement_scheduler;
+#[cfg(any(test, feature = "test-backend"))]
+mod test_backend;
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -38,9 +40,11 @@ impl RuntimePolicyHook for AllowAllPolicyHook {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(test, feature = "test-backend"))]
+type PlatformBackend = test_backend::TestRuntimeBackend;
+#[cfg(all(not(any(test, feature = "test-backend")), target_os = "linux"))]
 type PlatformBackend = vz_linux_native::LinuxNativeBackend;
-#[cfg(target_os = "macos")]
+#[cfg(all(not(any(test, feature = "test-backend")), target_os = "macos"))]
 type PlatformBackend = vz_oci_macos::MacosRuntimeBackend;
 
 /// Configuration for booting `vz-runtimed`.
@@ -334,7 +338,12 @@ impl RuntimeDaemon {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(test, feature = "test-backend"))]
+fn build_runtime_manager(_data_dir: &Path) -> WorkspaceRuntimeManager<PlatformBackend> {
+    WorkspaceRuntimeManager::new(test_backend::TestRuntimeBackend::default())
+}
+
+#[cfg(all(not(any(test, feature = "test-backend")), target_os = "macos"))]
 fn build_runtime_manager(data_dir: &Path) -> WorkspaceRuntimeManager<PlatformBackend> {
     let runtime = vz_oci_macos::Runtime::new(vz_oci_macos::RuntimeConfig {
         data_dir: data_dir.to_path_buf(),
@@ -344,7 +353,7 @@ fn build_runtime_manager(data_dir: &Path) -> WorkspaceRuntimeManager<PlatformBac
     WorkspaceRuntimeManager::new(backend)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(not(any(test, feature = "test-backend")), target_os = "linux"))]
 fn build_runtime_manager(data_dir: &Path) -> WorkspaceRuntimeManager<PlatformBackend> {
     let backend = vz_linux_native::LinuxNativeBackend::new(vz_linux_native::LinuxNativeConfig {
         data_dir: data_dir.to_path_buf(),
