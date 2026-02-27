@@ -1036,3 +1036,217 @@ async fn cli_api_http_mode_checkpoint_commands_work_against_stub_api_without_dae
 
     Ok(())
 }
+
+#[tokio::test]
+async fn cli_api_http_mode_lease_commands_work_against_stub_api_without_daemon() -> Result<()> {
+    let temp_dir = tempfile::tempdir().context("create temp dir")?;
+    let home_dir = temp_dir.path().join("home");
+    std::fs::create_dir_all(&home_dir).context("create isolated HOME directory")?;
+
+    let list_calls = Arc::new(AtomicUsize::new(0));
+    let inspect_calls = Arc::new(AtomicUsize::new(0));
+    let close_calls = Arc::new(AtomicUsize::new(0));
+
+    let list_calls_clone = Arc::clone(&list_calls);
+    let inspect_calls_clone = Arc::clone(&inspect_calls);
+    let close_calls_clone = Arc::clone(&close_calls);
+
+    let app = AxumRouter::new()
+        .route(
+            "/v1/leases",
+            get(move || {
+                let list_calls = Arc::clone(&list_calls_clone);
+                async move {
+                    list_calls.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "request_id": "req-lease-list",
+                        "leases": [{
+                            "lease_id": "lease-stub-1",
+                            "sandbox_id": "sbx-stub",
+                            "ttl_secs": 300u64,
+                            "last_heartbeat_at": 1730000000u64,
+                            "state": "active"
+                        }]
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/v1/leases/{lease_id}",
+            get(move |AxumPath(lease_id): AxumPath<String>| {
+                let inspect_calls = Arc::clone(&inspect_calls_clone);
+                async move {
+                    inspect_calls.fetch_add(1, Ordering::SeqCst);
+                    if lease_id != "lease-stub-1" {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "code": "not_found",
+                                    "message": format!("lease {lease_id} not found"),
+                                    "request_id": "req-lease-inspect-err"
+                                }
+                            })),
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "request_id": "req-lease-inspect",
+                            "lease": {
+                                "lease_id": "lease-stub-1",
+                                "sandbox_id": "sbx-stub",
+                                "ttl_secs": 300u64,
+                                "last_heartbeat_at": 1730000000u64,
+                                "state": "active"
+                            }
+                        })),
+                    )
+                }
+            })
+            .delete(move |AxumPath(lease_id): AxumPath<String>| {
+                let close_calls = Arc::clone(&close_calls_clone);
+                async move {
+                    close_calls.fetch_add(1, Ordering::SeqCst);
+                    if lease_id != "lease-stub-1" {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "code": "not_found",
+                                    "message": format!("lease {lease_id} not found"),
+                                    "request_id": "req-lease-close-err"
+                                }
+                            })),
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "request_id": "req-lease-close",
+                            "lease": {
+                                "lease_id": "lease-stub-1",
+                                "sandbox_id": "sbx-stub",
+                                "ttl_secs": 300u64,
+                                "last_heartbeat_at": 1730000001u64,
+                                "state": "closed"
+                            }
+                        })),
+                    )
+                }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("bind stub API listener")?;
+    let address = listener
+        .local_addr()
+        .context("resolve stub API listener address")?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    let api_base_url = format!("http://{address}");
+    let vz_bin = resolve_vz_binary()?;
+
+    let list_output = run_vz_command(
+        &vz_bin,
+        &api_base_url,
+        &home_dir,
+        &["debug", "lease", "list", "--json"],
+    )
+    .await?;
+    if !list_output.status.success() {
+        bail!(
+            "vz lease list failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&list_output.stdout),
+            String::from_utf8_lossy(&list_output.stderr)
+        );
+    }
+    let listed: serde_json::Value =
+        serde_json::from_slice(&list_output.stdout).context("decode lease list output")?;
+    let listed_items = listed
+        .as_array()
+        .context("lease list output should be JSON array")?;
+    if !listed_items.iter().any(|item| {
+        item.get("lease_id").and_then(serde_json::Value::as_str) == Some("lease-stub-1")
+    }) {
+        bail!("lease list output missing lease-stub-1");
+    }
+
+    let inspect_output = run_vz_command(
+        &vz_bin,
+        &api_base_url,
+        &home_dir,
+        &["debug", "lease", "inspect", "lease-stub-1"],
+    )
+    .await?;
+    if !inspect_output.status.success() {
+        bail!(
+            "vz lease inspect failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&inspect_output.stdout),
+            String::from_utf8_lossy(&inspect_output.stderr)
+        );
+    }
+    let inspected: serde_json::Value =
+        serde_json::from_slice(&inspect_output.stdout).context("decode lease inspect output")?;
+    if inspected
+        .get("lease_id")
+        .and_then(serde_json::Value::as_str)
+        != Some("lease-stub-1")
+    {
+        bail!("lease inspect output missing lease-stub-1");
+    }
+
+    let close_output = run_vz_command(
+        &vz_bin,
+        &api_base_url,
+        &home_dir,
+        &["debug", "lease", "close", "lease-stub-1"],
+    )
+    .await?;
+    if !close_output.status.success() {
+        bail!(
+            "vz lease close failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&close_output.stdout),
+            String::from_utf8_lossy(&close_output.stderr)
+        );
+    }
+    let close_stdout = String::from_utf8_lossy(&close_output.stdout);
+    if !close_stdout.contains("Lease lease-stub-1 state: closed.") {
+        bail!(
+            "vz lease close output missing expected marker:\n{}",
+            close_stdout
+        );
+    }
+
+    assert_eq!(
+        list_calls.load(Ordering::SeqCst),
+        1,
+        "lease list endpoint should be called exactly once"
+    );
+    assert_eq!(
+        inspect_calls.load(Ordering::SeqCst),
+        1,
+        "lease inspect endpoint should be called exactly once"
+    );
+    assert_eq!(
+        close_calls.load(Ordering::SeqCst),
+        1,
+        "lease close endpoint should be called exactly once"
+    );
+
+    let _ = shutdown_tx.send(());
+    server
+        .await
+        .context("join stub API server task")?
+        .context("run stub API server")?;
+
+    Ok(())
+}
