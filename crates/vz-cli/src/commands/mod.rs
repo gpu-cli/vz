@@ -13,6 +13,7 @@ pub mod docker;
 #[cfg(target_os = "macos")]
 pub mod exec;
 pub mod execution;
+pub mod file;
 pub mod image;
 #[cfg(target_os = "macos")]
 pub mod init;
@@ -28,13 +29,13 @@ pub mod restore;
 pub mod rm;
 #[cfg(target_os = "macos")]
 pub mod run;
+pub(crate) mod runtime_daemon;
 pub mod sandbox;
 #[cfg(target_os = "macos")]
 pub mod save;
 #[cfg(target_os = "macos")]
 pub mod self_sign;
 pub mod stack;
-mod stack_output;
 #[cfg(target_os = "macos")]
 pub mod stop;
 #[cfg(target_os = "macos")]

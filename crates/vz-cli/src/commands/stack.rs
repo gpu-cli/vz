@@ -1,38 +1,24 @@
 //! `vz stack` — multi-service stack lifecycle commands.
 //!
-//! Provides `up`, `down`, `ps`, `events`, `logs`, and `exec` subcommands
-//! backed by the `vz-stack` control plane. The [`OciContainerRuntime`]
-//! bridges the async [`RuntimeBackend`](vz_runtime_contract::RuntimeBackend)
-//! to the sync [`ContainerRuntime`] trait using `block_in_place` + `block_on`.
-//!
-//! ## Exec Architecture
-//!
-//! `vz stack up` (foreground mode) keeps the VM alive after convergence
-//! and listens on a Unix socket at `~/.vz/stacks/<name>/control.sock`.
-//! `vz stack exec` connects to that socket to execute commands inside
-//! running service containers.
+//! Runtime-mutating stack operations are daemon-owned.
+//! Command paths without daemon parity fail closed.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
-use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use serde::Serialize;
+use tracing::debug;
 
+use vz_runtime_proto::runtime_v2;
 use vz_stack::{
-    ContainerLogs, ContainerRuntime, EventRecord, LogLine, LogStream, OrchestrationConfig,
-    RoundReport, ServiceObservedState, ServicePhase, StackError, StackEvent, StackExecutor,
-    StackOrchestrator, StackSpec, StateStore, VolumeManager, parse_compose_with_dir,
+    EventRecord, ServiceObservedState, ServicePhase, StackEvent, StackSpec, parse_compose_with_dir,
 };
 
-use super::stack_output::{self, StackOutput};
-
-/// Log file path inside the container.
-const CONTAINER_LOG_FILE: &str = "/var/log/vz-oci/output.log";
+use super::runtime_daemon::{connect_control_plane_for_state_db, default_state_db_path};
 
 /// Manage multi-service stacks from Compose files.
 #[derive(Args, Debug)]
@@ -302,38 +288,11 @@ pub struct DashboardArgs {
 }
 
 /// Action types for control socket requests.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlAction {
-    Exec,
     Stop,
     Start,
     Restart,
-}
-
-/// JSON protocol for control socket requests.
-#[derive(Debug, Serialize, Deserialize)]
-struct ControlRequest {
-    #[serde(default = "default_action")]
-    action: ControlAction,
-    service: String,
-    #[serde(default)]
-    cmd: Vec<String>,
-    #[serde(default)]
-    idempotency_key: Option<String>,
-}
-
-fn default_action() -> ControlAction {
-    ControlAction::Exec
-}
-
-/// JSON protocol for exec responses over the control socket.
-#[derive(Debug, Serialize, Deserialize)]
-struct ControlResponse {
-    exit_code: i32,
-    stdout: String,
-    stderr: String,
-    error: Option<String>,
 }
 
 pub async fn run(args: StackArgs) -> anyhow::Result<()> {
@@ -354,393 +313,217 @@ pub async fn run(args: StackArgs) -> anyhow::Result<()> {
     }
 }
 
-// ── Platform backend type alias ───────────────────────────────────
-
-#[cfg(target_os = "macos")]
-type PlatformBackend = vz_oci_macos::MacosRuntimeBackend;
-
-#[cfg(target_os = "linux")]
-type PlatformBackend = vz_linux_native::LinuxNativeBackend;
-
-// ── OCI container runtime bridge ──────────────────────────────────
-
-/// Bridges the async [`RuntimeBackend`](vz_runtime_contract::RuntimeBackend)
-/// to the sync [`ContainerRuntime`] trait.
-///
-/// Each method uses `tokio::task::block_in_place` + `Handle::block_on`
-/// to call async runtime backend methods from within the synchronous
-/// executor context.
-struct OciContainerRuntime {
-    manager: vz_runtime_contract::WorkspaceRuntimeManager<PlatformBackend>,
-    handle: tokio::runtime::Handle,
+fn stack_state_db_path(explicit_state_dir: Option<&Path>) -> PathBuf {
+    explicit_state_dir
+        .map(|state_dir| state_dir.join("state.db"))
+        .unwrap_or_else(default_state_db_path)
 }
 
-fn unsupported_operation_error(operation: &str, reason: impl Into<String>) -> StackError {
-    StackError::Network(format!(
-        "unsupported_operation: surface=stack; operation={operation}; reason={}",
-        reason.into()
-    ))
-}
-
-fn map_runtime_error(operation: &str, error: vz_runtime_contract::RuntimeError) -> StackError {
-    match error {
-        vz_runtime_contract::RuntimeError::UnsupportedOperation {
-            operation: backend_operation,
-            reason,
-        } => unsupported_operation_error(
-            operation,
-            format!("backend_operation={backend_operation}; {reason}"),
-        ),
-        other => StackError::Network(format!("{operation} failed: {other}")),
+fn service_phase_from_stack_status(phase: &str) -> ServicePhase {
+    match phase.trim().to_ascii_lowercase().as_str() {
+        "pending" => ServicePhase::Pending,
+        "creating" => ServicePhase::Creating,
+        "running" => ServicePhase::Running,
+        "stopping" => ServicePhase::Stopping,
+        "stopped" => ServicePhase::Stopped,
+        "failed" => ServicePhase::Failed,
+        _ => ServicePhase::Pending,
     }
 }
 
-fn normalize_idempotency_component(component: &str) -> String {
-    component
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
+fn observed_from_stack_statuses(
+    services: &[runtime_v2::StackServiceStatus],
+) -> Vec<ServiceObservedState> {
+    services
+        .iter()
+        .map(|service| ServiceObservedState {
+            service_name: service.service_name.clone(),
+            phase: service_phase_from_stack_status(&service.phase),
+            container_id: if service.container_id.trim().is_empty() {
+                None
             } else {
-                '_'
-            }
+                Some(service.container_id.clone())
+            },
+            last_error: if service.last_error.trim().is_empty() {
+                None
+            } else {
+                Some(service.last_error.clone())
+            },
+            ready: service.ready,
         })
         .collect()
 }
 
-fn runtime_idempotency_key(
-    operation: vz_runtime_contract::RuntimeOperation,
-    components: &[&str],
-) -> Option<String> {
-    operation.idempotency_key_prefix().map(|prefix| {
-        let suffix = components
-            .iter()
-            .map(|part| normalize_idempotency_component(part))
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join(":");
-
-        if suffix.is_empty() {
-            prefix.to_string()
+fn resolve_service_container_id(
+    stack_name: &str,
+    service_name: &str,
+    services: &[runtime_v2::StackServiceStatus],
+) -> anyhow::Result<String> {
+    let service = services
+        .iter()
+        .find(|service| service.service_name == service_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!("service `{service_name}` not found in stack `{stack_name}`")
+        })?;
+    let container_id = service.container_id.trim();
+    if container_id.is_empty() {
+        let phase = if service.phase.trim().is_empty() {
+            "unknown"
         } else {
-            format!("{prefix}:{suffix}")
-        }
-    })
+            service.phase.as_str()
+        };
+        bail!("service `{service_name}` in stack `{stack_name}` is not running (phase: {phase})");
+    }
+    Ok(container_id.to_string())
 }
 
-fn control_action_operation(action: &ControlAction) -> vz_runtime_contract::RuntimeOperation {
-    match action {
-        ControlAction::Exec => vz_runtime_contract::RuntimeOperation::ExecContainer,
-        ControlAction::Stop => vz_runtime_contract::RuntimeOperation::StopContainer,
-        ControlAction::Start | ControlAction::Restart => {
-            vz_runtime_contract::RuntimeOperation::CreateContainer
+fn split_exec_command(command: &[String]) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let Some((head, tail)) = command.split_first() else {
+        bail!("command cannot be empty");
+    };
+    Ok((vec![head.clone()], tail.to_vec()))
+}
+
+async fn execute_stack_container_command(
+    client: &mut vz_runtimed_client::DaemonClient,
+    container_id: String,
+    command: &[String],
+) -> anyhow::Result<()> {
+    let (cmd, cmd_args) = split_exec_command(command)?;
+    let execution_response = client
+        .create_execution(runtime_v2::CreateExecutionRequest {
+            metadata: None,
+            container_id,
+            cmd,
+            args: cmd_args,
+            env_override: HashMap::new(),
+            timeout_secs: 0,
+            pty_mode: runtime_v2::create_execution_request::PtyMode::Inherit as i32,
+        })
+        .await
+        .context("failed to create execution")?;
+    let execution = execution_response
+        .execution
+        .ok_or_else(|| anyhow::anyhow!("daemon returned missing execution payload"))?;
+    let execution_id = execution.execution_id.clone();
+
+    let mut stream = client
+        .stream_exec_output(runtime_v2::StreamExecOutputRequest {
+            execution_id: execution_id.clone(),
+            metadata: None,
+        })
+        .await
+        .with_context(|| format!("failed to stream output for execution `{execution_id}`"))?;
+
+    let mut terminal_exit_code: Option<i32> = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .with_context(|| format!("failed reading output stream for `{execution_id}`"))?
+    {
+        match event.payload {
+            Some(runtime_v2::exec_output_event::Payload::Stdout(chunk)) => {
+                if !chunk.is_empty() {
+                    let mut stdout = std::io::stdout().lock();
+                    stdout
+                        .write_all(&chunk)
+                        .context("failed writing execution stdout")?;
+                    stdout.flush().context("failed flushing execution stdout")?;
+                }
+            }
+            Some(runtime_v2::exec_output_event::Payload::Stderr(chunk)) => {
+                if !chunk.is_empty() {
+                    let mut stderr = std::io::stderr().lock();
+                    stderr
+                        .write_all(&chunk)
+                        .context("failed writing execution stderr")?;
+                    stderr.flush().context("failed flushing execution stderr")?;
+                }
+            }
+            Some(runtime_v2::exec_output_event::Payload::ExitCode(code)) => {
+                terminal_exit_code = Some(code);
+                break;
+            }
+            Some(runtime_v2::exec_output_event::Payload::Error(message)) => {
+                bail!("execution `{execution_id}` reported error: {message}");
+            }
+            None => {}
         }
     }
-}
 
-fn control_request_idempotency_key(
-    stack_name: &str,
-    action: &ControlAction,
-    service: &str,
-    command: &[String],
-) -> Option<String> {
-    let operation = control_action_operation(action);
-    let command_fingerprint = if command.is_empty() {
-        String::new()
-    } else {
-        command.join("_")
+    let exit_code = match terminal_exit_code {
+        Some(code) => code,
+        None => {
+            let execution = client
+                .get_execution(runtime_v2::GetExecutionRequest {
+                    execution_id: execution_id.clone(),
+                    metadata: None,
+                })
+                .await
+                .with_context(|| {
+                    format!("failed to load terminal execution state for `{execution_id}`")
+                })?
+                .execution
+                .ok_or_else(|| anyhow::anyhow!("daemon returned missing execution payload"))?;
+            if execution.state.eq_ignore_ascii_case("failed") {
+                bail!("execution `{execution_id}` ended in failed state");
+            }
+            execution.exit_code
+        }
     };
 
-    runtime_idempotency_key(operation, &[stack_name, service, &command_fingerprint])
+    if exit_code != 0 {
+        bail!("stack command exited with status {exit_code}");
+    }
+
+    Ok(())
 }
 
-impl OciContainerRuntime {
-    #[cfg(target_os = "macos")]
-    fn new(oci_data_dir: &Path, auth: Option<vz_image::Auth>) -> anyhow::Result<Self> {
-        let mut config = vz_oci_macos::RuntimeConfig {
-            data_dir: oci_data_dir.to_path_buf(),
-            ..Default::default()
-        };
-        if let Some(auth) = auth {
-            config.auth = auth;
-        }
-        let runtime = vz_oci_macos::Runtime::new(config);
-        let backend = vz_oci_macos::MacosRuntimeBackend::new(runtime);
-        let manager = vz_runtime_contract::WorkspaceRuntimeManager::new(backend);
-        let handle = tokio::runtime::Handle::current();
-        Ok(Self { manager, handle })
+fn stack_status_from_sandbox_states(
+    states: &[String],
+    ready_count: usize,
+    total_count: usize,
+) -> (String, Option<String>) {
+    if total_count == 0 {
+        return ("\u{25cb} stopped".to_string(), None);
     }
 
-    #[cfg(target_os = "linux")]
-    fn new(oci_data_dir: &Path, auth: Option<vz_image::Auth>) -> anyhow::Result<Self> {
-        let mut config = vz_linux_native::LinuxNativeConfig {
-            data_dir: oci_data_dir.to_path_buf(),
-            ..Default::default()
-        };
-        if let Some(auth) = auth {
-            config.auth = auth;
-        }
-        let backend = vz_linux_native::LinuxNativeBackend::new(config);
-        let manager = vz_runtime_contract::WorkspaceRuntimeManager::new(backend);
-        let handle = tokio::runtime::Handle::current();
-        Ok(Self { manager, handle })
+    let failed = states
+        .iter()
+        .any(|state| state.eq_ignore_ascii_case("failed"));
+    let ready = states
+        .iter()
+        .filter(|state| state.eq_ignore_ascii_case("ready"))
+        .count();
+    let creating_or_draining = states.iter().any(|state| {
+        state.eq_ignore_ascii_case("creating") || state.eq_ignore_ascii_case("draining")
+    });
+    let terminated = states
+        .iter()
+        .filter(|state| state.eq_ignore_ascii_case("terminated"))
+        .count();
+
+    if failed {
+        return (
+            "\u{2717} failed".to_string(),
+            Some("one or more sandboxes are failed".to_string()),
+        );
     }
 
-    fn capabilities(&self) -> vz_runtime_contract::RuntimeCapabilities {
-        self.manager.capabilities()
+    if terminated == total_count {
+        return ("\u{25cb} stopped".to_string(), None);
     }
 
-    fn ensure_capability(
-        &self,
-        operation: &str,
-        capability_name: &str,
-        enabled: bool,
-    ) -> Result<(), StackError> {
-        if enabled {
-            return Ok(());
-        }
-        Err(unsupported_operation_error(
-            operation,
-            format!(
-                "backend={} missing capability {}",
-                self.manager.name(),
-                capability_name
-            ),
-        ))
+    if ready == total_count && ready_count == total_count {
+        return ("\u{2713} running".to_string(), None);
     }
+
+    if creating_or_draining {
+        return ("\u{25d0} starting".to_string(), None);
+    }
+
+    ("\u{25d0} partial".to_string(), None)
 }
-
-impl ContainerRuntime for OciContainerRuntime {
-    fn pull(&self, image: &str) -> Result<String, StackError> {
-        let idempotency_key =
-            runtime_idempotency_key(vz_runtime_contract::RuntimeOperation::PullImage, &[image]);
-        if let Some(key) = idempotency_key.as_deref() {
-            debug!(
-                operation = vz_runtime_contract::RuntimeOperation::PullImage.as_str(),
-                idempotency_key = %key,
-                image = %image,
-                "runtime mutation idempotency key"
-            );
-        }
-        tokio::task::block_in_place(|| {
-            self.handle
-                .block_on(self.manager.pull_image(image))
-                .map_err(|e| map_runtime_error("pull", e))
-        })
-    }
-
-    fn create(
-        &self,
-        image: &str,
-        config: vz_runtime_contract::RunConfig,
-    ) -> Result<String, StackError> {
-        let id_hint = config.container_id.as_deref().unwrap_or("auto");
-        let idempotency_key = runtime_idempotency_key(
-            vz_runtime_contract::RuntimeOperation::CreateContainer,
-            &[image, id_hint],
-        );
-        if let Some(key) = idempotency_key.as_deref() {
-            debug!(
-                operation = vz_runtime_contract::RuntimeOperation::CreateContainer.as_str(),
-                idempotency_key = %key,
-                image = %image,
-                container_hint = %id_hint,
-                "runtime mutation idempotency key"
-            );
-        }
-        tokio::task::block_in_place(|| {
-            self.handle
-                .block_on(self.manager.create_container(image, config))
-                .map_err(|e| map_runtime_error("create", e))
-        })
-    }
-
-    fn stop(
-        &self,
-        container_id: &str,
-        signal: Option<&str>,
-        grace_period: Option<std::time::Duration>,
-    ) -> Result<(), StackError> {
-        tokio::task::block_in_place(|| {
-            self.handle
-                .block_on(
-                    self.manager
-                        .stop_container(container_id, false, signal, grace_period),
-                )
-                .map(|_| ())
-                .map_err(|e| map_runtime_error("stop", e))
-        })
-    }
-
-    fn remove(&self, container_id: &str) -> Result<(), StackError> {
-        tokio::task::block_in_place(|| {
-            self.handle
-                .block_on(self.manager.remove_container(container_id))
-                .map_err(|e| map_runtime_error("remove", e))
-        })
-    }
-
-    fn exec(&self, container_id: &str, command: &[String]) -> Result<i32, StackError> {
-        let (code, _, _) = ContainerRuntime::exec_with_output(self, container_id, command)?;
-        Ok(code)
-    }
-
-    fn exec_with_output(
-        &self,
-        container_id: &str,
-        command: &[String],
-    ) -> Result<(i32, String, String), StackError> {
-        let command_fingerprint = command.join("_");
-        let idempotency_key = runtime_idempotency_key(
-            vz_runtime_contract::RuntimeOperation::ExecContainer,
-            &[container_id, &command_fingerprint],
-        );
-        if let Some(key) = idempotency_key.as_deref() {
-            debug!(
-                operation = vz_runtime_contract::RuntimeOperation::ExecContainer.as_str(),
-                idempotency_key = %key,
-                container = %container_id,
-                "runtime mutation idempotency key"
-            );
-        }
-        tokio::task::block_in_place(|| {
-            let exec_config = vz_runtime_contract::ExecConfig {
-                cmd: command.to_vec(),
-                ..Default::default()
-            };
-            self.handle
-                .block_on(self.manager.exec_container(container_id, exec_config))
-                .map(|output| (output.exit_code, output.stdout, output.stderr))
-                .map_err(|e| map_runtime_error("exec", e))
-        })
-    }
-
-    fn create_sandbox(
-        &self,
-        sandbox_id: &str,
-        ports: Vec<vz_runtime_contract::PortMapping>,
-        resources: vz_runtime_contract::StackResourceHint,
-    ) -> Result<(), StackError> {
-        let capabilities = self.capabilities();
-        self.ensure_capability("create_sandbox", "shared_vm", capabilities.shared_vm)?;
-        tokio::task::block_in_place(|| {
-            self.handle
-                .block_on(
-                    self.manager
-                        .ensure_stack_runtime(sandbox_id, ports, resources),
-                )
-                .map_err(|e| map_runtime_error("create_sandbox", e))
-        })
-    }
-
-    fn create_in_sandbox(
-        &self,
-        sandbox_id: &str,
-        image: &str,
-        config: vz_runtime_contract::RunConfig,
-    ) -> Result<String, StackError> {
-        let capabilities = self.capabilities();
-        self.ensure_capability("create_in_sandbox", "shared_vm", capabilities.shared_vm)?;
-        let id_hint = config.container_id.as_deref().unwrap_or("auto");
-        let idempotency_key = runtime_idempotency_key(
-            vz_runtime_contract::RuntimeOperation::CreateContainer,
-            &[sandbox_id, image, id_hint],
-        );
-        if let Some(key) = idempotency_key.as_deref() {
-            debug!(
-                operation = vz_runtime_contract::RuntimeOperation::CreateContainer.as_str(),
-                idempotency_key = %key,
-                sandbox = %sandbox_id,
-                image = %image,
-                container_hint = %id_hint,
-                "runtime mutation idempotency key"
-            );
-        }
-        tokio::task::block_in_place(|| {
-            self.handle
-                .block_on(
-                    self.manager
-                        .create_stack_container(sandbox_id, image, config),
-                )
-                .map_err(|e| map_runtime_error("create_in_sandbox", e))
-        })
-    }
-
-    fn setup_sandbox_network(
-        &self,
-        sandbox_id: &str,
-        services: Vec<vz_runtime_contract::NetworkServiceConfig>,
-    ) -> Result<(), StackError> {
-        let capabilities = self.capabilities();
-        self.ensure_capability("setup_sandbox_network", "shared_vm", capabilities.shared_vm)?;
-        self.ensure_capability(
-            "setup_sandbox_network",
-            "stack_networking",
-            capabilities.stack_networking,
-        )?;
-        tokio::task::block_in_place(|| {
-            self.handle
-                .block_on(self.manager.setup_sandbox_network(sandbox_id, services))
-                .map_err(|e| map_runtime_error("setup_sandbox_network", e))
-        })
-    }
-
-    fn teardown_sandbox_network(
-        &self,
-        sandbox_id: &str,
-        service_names: Vec<String>,
-    ) -> Result<(), StackError> {
-        let capabilities = self.capabilities();
-        self.ensure_capability(
-            "teardown_sandbox_network",
-            "shared_vm",
-            capabilities.shared_vm,
-        )?;
-        self.ensure_capability(
-            "teardown_sandbox_network",
-            "stack_networking",
-            capabilities.stack_networking,
-        )?;
-        tokio::task::block_in_place(|| {
-            self.handle
-                .block_on(
-                    self.manager
-                        .teardown_sandbox_network(sandbox_id, service_names),
-                )
-                .map_err(|e| map_runtime_error("teardown_sandbox_network", e))
-        })
-    }
-
-    fn shutdown_sandbox(&self, sandbox_id: &str) -> Result<(), StackError> {
-        let capabilities = self.capabilities();
-        self.ensure_capability("shutdown_sandbox", "shared_vm", capabilities.shared_vm)?;
-        tokio::task::block_in_place(|| {
-            self.handle
-                .block_on(self.manager.terminate_sandbox(sandbox_id))
-                .map_err(|e| map_runtime_error("shutdown_sandbox", e))
-        })
-    }
-
-    fn has_sandbox(&self, sandbox_id: &str) -> bool {
-        if !self.capabilities().shared_vm {
-            return false;
-        }
-        self.manager.has_sandbox(sandbox_id)
-    }
-
-    fn logs(&self, container_id: &str) -> Result<ContainerLogs, StackError> {
-        let capabilities = self.capabilities();
-        self.ensure_capability("logs", "container_logs", capabilities.container_logs)?;
-        let logs = self
-            .manager
-            .container_logs(container_id)
-            .map_err(|e| map_runtime_error("logs", e))?;
-        Ok(ContainerLogs {
-            output: logs.output,
-        })
-    }
-}
-
 // ── up ─────────────────────────────────────────────────────────────
 
 fn resolve_stack_registry_auth(
@@ -766,6 +549,14 @@ fn resolve_stack_registry_auth(
 }
 
 async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
+    let registry_auth = resolve_stack_registry_auth(&args.auth)?;
+    if registry_auth.is_some() {
+        bail!("registry auth flags are not supported for daemon stack apply yet");
+    }
+    if !args.no_tui {
+        debug!("daemon stack mode ignores TUI control socket flow");
+    }
+
     let file = resolve_compose_file(args.file)?;
     let yaml = std::fs::read_to_string(&file)
         .with_context(|| format!("failed to read compose file: {}", file.display()))?;
@@ -777,614 +568,52 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from("."));
 
     let stack_name = resolve_stack_name(args.name.as_deref(), &file)?;
-    let spec = parse_compose_with_dir(&yaml, &stack_name, &compose_dir)
-        .with_context(|| "failed to parse compose file")?;
+    let state_db = stack_state_db_path(args.state_dir.as_deref());
+    let mut client = connect_control_plane_for_state_db(&state_db).await?;
+    let response = client
+        .apply_stack(runtime_v2::ApplyStackRequest {
+            metadata: None,
+            stack_name: stack_name.clone(),
+            compose_yaml: yaml,
+            compose_dir: compose_dir.to_string_lossy().to_string(),
+            dry_run: args.dry_run,
+            detach: args.detach,
+        })
+        .await
+        .with_context(|| format!("failed to apply stack `{stack_name}` via daemon"))?;
 
-    let state_dir = resolve_state_dir(args.state_dir.as_deref(), &spec.name)?;
-    std::fs::create_dir_all(&state_dir)
-        .with_context(|| format!("failed to create state directory: {}", state_dir.display()))?;
-
-    let db_path = state_dir.join("state.db");
+    let observed = observed_from_stack_statuses(&response.services);
 
     if args.dry_run {
-        let store = StateStore::open(&db_path)
-            .with_context(|| format!("failed to open state store: {}", db_path.display()))?;
-        let health_statuses = HashMap::new();
-        let result = vz_stack::apply(&spec, &store, &health_statuses)
-            .with_context(|| "stack apply failed")?;
-        stack_output::print_dry_run(&result);
+        println!(
+            "Plan for stack `{}`: {} action(s) would change.",
+            response.stack_name, response.changed_actions
+        );
+        if !observed.is_empty() {
+            print_ps_table(&observed, None);
+        }
         println!("\n--dry-run: skipping execution");
         return Ok(());
     }
 
-    let runtime_auth = resolve_stack_registry_auth(&args.auth)?;
-
-    // Set up runtime, executor, and orchestrator.
-    let oci_runtime = OciContainerRuntime::new(&state_dir, runtime_auth.clone())
-        .with_context(|| "failed to initialize OCI runtime")?;
-
-    let exec_store =
-        StateStore::open(&db_path).with_context(|| "failed to open execution state store")?;
-    let reconcile_store =
-        StateStore::open(&db_path).with_context(|| "failed to open reconciliation state store")?;
-
-    let executor = StackExecutor::new(oci_runtime, exec_store, &state_dir);
-
-    if args.detach {
-        // Detach mode: single apply+execute pass, return immediately.
-        let mut orchestrator = StackOrchestrator::new(
-            executor,
-            reconcile_store,
-            OrchestrationConfig {
-                max_rounds: 1,
-                ..Default::default()
-            },
-        );
-        let _ = run_orchestration_with_live_output(&mut orchestrator, &spec)
-            .with_context(|| "stack up failed")?;
+    if observed.is_empty() && response.changed_actions == 0 {
+        println!("No changes needed.");
     } else {
-        // Foreground mode: full orchestration loop until convergence,
-        // then keep the VM alive with a control socket for `vz stack exec`.
-        let mut orchestrator =
-            StackOrchestrator::new(executor, reconcile_store, OrchestrationConfig::default());
-        let result = run_orchestration_with_live_output(&mut orchestrator, &spec)
-            .with_context(|| "stack orchestration failed")?;
-
-        if result.services_failed > 0 {
-            bail!("{} service(s) failed", result.services_failed);
-        }
-
-        if !result.converged {
-            bail!("stack did not converge");
-        }
-
-        // Keep the VM alive and listen for exec requests until ctrl-C.
-        let sock_path = state_dir.join("control.sock");
-
-        // Launch TUI dashboard in foreground mode if TTY and not disabled.
-        if !args.no_tui && crate::tui::is_tty() {
-            // Start control socket in background so `vz stack exec` still works.
-            let bg_sock_path = sock_path.clone();
-            let bg_spec = spec.clone();
-
-            // The TUI runs on the main thread; control socket runs in a
-            // background tokio task. We need to move the orchestrator into
-            // an Arc<Mutex> so the background task can use it.
-            let orchestrator = std::sync::Arc::new(std::sync::Mutex::new(orchestrator));
-            let bg_orchestrator = orchestrator.clone();
-
-            let _control_handle = tokio::spawn(async move {
-                if let Err(e) =
-                    serve_control_socket_bg(&bg_sock_path, &bg_spec, bg_orchestrator).await
-                {
-                    tracing::error!(error = %e, "control socket error");
-                }
-            });
-
-            // Run the TUI (blocks until user quits).
-            let tui_spec = spec.clone();
-            let tui_name = spec.name.clone();
-            let tui_db = db_path.clone();
-            crate::tui::run_tui(tui_name, tui_spec, tui_db, Some(sock_path.clone()))?;
-        } else {
-            serve_control_socket(&sock_path, &spec, &mut orchestrator).await?;
-        }
-
-        // Teardown on exit.
-        info!(stack = %spec.name, "shutting down stack");
-        let teardown_store =
-            StateStore::open(&db_path).with_context(|| "failed to open teardown state store")?;
-        let empty_spec = StackSpec {
-            name: spec.name.clone(),
-            services: vec![],
-            networks: vec![],
-            volumes: vec![],
-            secrets: vec![],
-            disk_size_mb: None,
-        };
-        let health_statuses = HashMap::new();
-        let teardown_actions = vz_stack::apply(&empty_spec, &teardown_store, &health_statuses)
-            .with_context(|| "teardown apply failed")?;
-        if !teardown_actions.actions.is_empty() {
-            let mut teardown_executor = StackExecutor::new(
-                OciContainerRuntime::new(&state_dir, runtime_auth)
-                    .with_context(|| "failed to create teardown runtime")?,
-                StateStore::open(&db_path).with_context(|| "failed to open teardown exec store")?,
-                &state_dir,
-            );
-            let _ = teardown_executor.execute(&empty_spec, &teardown_actions.actions);
-        }
-        println!("\nStack stopped.");
+        print_ps_table(&observed, None);
+        println!();
+        println!(
+            "Applied stack `{}` with {} changed action(s).",
+            response.stack_name, response.changed_actions
+        );
     }
 
-    Ok(())
-}
-
-fn run_orchestration_with_live_output(
-    orchestrator: &mut StackOrchestrator<OciContainerRuntime>,
-    spec: &StackSpec,
-) -> Result<vz_stack::OrchestrationResult, StackError> {
-    let output = Arc::new(Mutex::new(StackOutput::new(spec)));
-    let event_rx = orchestrator.subscribe();
-    let output_for_events = Arc::clone(&output);
-    let event_pump = std::thread::spawn(move || {
-        loop {
-            match event_rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(event) => {
-                    if let Ok(mut out) = output_for_events.lock() {
-                        out.on_event(&event);
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    if let Ok(mut out) = output_for_events.lock() {
-                        out.tick();
-                    }
-                }
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
-        }
-    });
-
-    let output_for_rounds = Arc::clone(&output);
-    let mut warnings_shown = false;
-    let result = orchestrator.run(
-        spec,
-        Some(&mut |report: &RoundReport| {
-            if let Ok(mut out) = output_for_rounds.lock() {
-                if !warnings_shown {
-                    if let Some(ref exec) = report.exec_result
-                        && !exec.skipped_mounts.is_empty()
-                    {
-                        out.on_warnings(&exec.skipped_mounts);
-                    }
-                    warnings_shown = true;
-                }
-                out.on_round(report);
-            }
-        }),
-    );
-
-    // Replace sender to close the previous event channel and let the pump exit.
-    drop(orchestrator.subscribe());
-    let _ = event_pump.join();
-
-    if let Ok(mut out) = output.lock() {
-        out.tick();
-        if let Ok(ref orchestration_result) = result {
-            out.finish(orchestration_result);
-        } else {
-            out.message("stack orchestration failed");
-        }
+    if response.services_failed > 0 {
+        bail!("{} service(s) failed", response.services_failed);
+    }
+    if !args.detach && !response.converged {
+        bail!("stack did not converge");
     }
 
-    result
-}
-
-// ── control socket (for exec) ─────────────────────────────────────
-
-/// Listen on a Unix socket for exec requests until ctrl-C.
-///
-/// The socket accepts one connection at a time. Each connection sends
-/// a JSON [`ControlRequest`] (newline-terminated) and receives a JSON
-/// [`ControlResponse`] (newline-terminated) back.
-async fn serve_control_socket(
-    sock_path: &Path,
-    spec: &StackSpec,
-    orchestrator: &mut StackOrchestrator<OciContainerRuntime>,
-) -> anyhow::Result<()> {
-    use tokio::net::UnixListener;
-
-    // Clean up stale socket from a previous run.
-    let _ = std::fs::remove_file(sock_path);
-
-    let listener = UnixListener::bind(sock_path)
-        .with_context(|| format!("failed to bind control socket: {}", sock_path.display()))?;
-
-    println!("Listening for exec requests on {}", sock_path.display());
-    println!("Press Ctrl+C to stop.\n");
-
-    // Wait for ctrl-C in parallel with accepting connections.
-    let shutdown = tokio::signal::ctrl_c();
-    tokio::pin!(shutdown);
-
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => {
-                info!("ctrl-C received, shutting down");
-                break;
-            }
-            accept = listener.accept() => {
-                match accept {
-                    Ok((stream, _)) => {
-                        handle_control_connection(stream, spec, orchestrator).await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to accept connection");
-                    }
-                }
-            }
-        }
-    }
-
-    // Remove socket file on exit.
-    let _ = std::fs::remove_file(sock_path);
-    Ok(())
-}
-
-/// Listen on a Unix socket for exec requests (background-compatible version).
-///
-/// Same as [`serve_control_socket`] but takes an `Arc<Mutex<StackOrchestrator>>`
-/// so it can run in a background tokio task alongside the TUI.
-async fn serve_control_socket_bg(
-    sock_path: &Path,
-    spec: &StackSpec,
-    orchestrator: std::sync::Arc<std::sync::Mutex<StackOrchestrator<OciContainerRuntime>>>,
-) -> anyhow::Result<()> {
-    use tokio::net::UnixListener;
-
-    let _ = std::fs::remove_file(sock_path);
-
-    let listener = UnixListener::bind(sock_path)
-        .with_context(|| format!("failed to bind control socket: {}", sock_path.display()))?;
-
-    let shutdown = tokio::signal::ctrl_c();
-    tokio::pin!(shutdown);
-
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => {
-                info!("ctrl-C received, shutting down control socket");
-                break;
-            }
-            accept = listener.accept() => {
-                match accept {
-                    Ok((stream, _)) => {
-                        handle_control_connection_bg(stream, spec, &orchestrator).await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to accept connection");
-                    }
-                }
-            }
-        }
-    }
-
-    let _ = std::fs::remove_file(sock_path);
-    Ok(())
-}
-
-/// Handle a control socket connection using a shared orchestrator.
-///
-/// This variant acquires the lock only for the synchronous exec/stop/start
-/// operations, releasing it before any `.await` so the `MutexGuard` is
-/// never held across an await point.
-async fn handle_control_connection_bg(
-    stream: tokio::net::UnixStream,
-    spec: &StackSpec,
-    orchestrator: &std::sync::Arc<std::sync::Mutex<StackOrchestrator<OciContainerRuntime>>>,
-) {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-
-    let line = match lines.next_line().await {
-        Ok(Some(line)) => line,
-        Ok(None) => return,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to read from control socket");
-            return;
-        }
-    };
-
-    let request: ControlRequest = match serde_json::from_str(&line) {
-        Ok(req) => req,
-        Err(e) => {
-            let resp = ControlResponse {
-                exit_code: 1,
-                stdout: String::new(),
-                stderr: String::new(),
-                error: Some(format!("invalid request: {e}")),
-            };
-            let _ = write_response(&mut writer, &resp).await;
-            return;
-        }
-    };
-
-    // Acquire lock, perform synchronous work, release lock before writing response.
-    // The lock must not be held across any .await point.
-    let resp = match orchestrator.lock() {
-        Ok(mut orch) => match request.action {
-            ControlAction::Exec => handle_exec(spec, &orch, &request),
-            ControlAction::Stop => handle_service_stop(
-                spec,
-                &mut orch,
-                &request.service,
-                request.idempotency_key.as_deref(),
-            ),
-            ControlAction::Start => handle_service_start(
-                spec,
-                &mut orch,
-                &request.service,
-                request.idempotency_key.as_deref(),
-            ),
-            ControlAction::Restart => {
-                let stop_resp = handle_service_stop(
-                    spec,
-                    &mut orch,
-                    &request.service,
-                    request.idempotency_key.as_deref(),
-                );
-                if stop_resp.error.is_some() {
-                    stop_resp
-                } else {
-                    handle_service_start(
-                        spec,
-                        &mut orch,
-                        &request.service,
-                        request.idempotency_key.as_deref(),
-                    )
-                }
-            }
-        },
-        Err(e) => ControlResponse {
-            exit_code: 1,
-            stdout: String::new(),
-            stderr: String::new(),
-            error: Some(format!("orchestrator lock poisoned: {e}")),
-        },
-    };
-
-    let _ = write_response(&mut writer, &resp).await;
-}
-
-/// Handle a single control socket connection (exec, stop, start, restart).
-async fn handle_control_connection(
-    stream: tokio::net::UnixStream,
-    spec: &StackSpec,
-    orchestrator: &mut StackOrchestrator<OciContainerRuntime>,
-) {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-
-    let line = match lines.next_line().await {
-        Ok(Some(line)) => line,
-        Ok(None) => return,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to read from control socket");
-            return;
-        }
-    };
-
-    let request: ControlRequest = match serde_json::from_str(&line) {
-        Ok(req) => req,
-        Err(e) => {
-            let resp = ControlResponse {
-                exit_code: 1,
-                stdout: String::new(),
-                stderr: String::new(),
-                error: Some(format!("invalid request: {e}")),
-            };
-            let _ = write_response(&mut writer, &resp).await;
-            return;
-        }
-    };
-
-    let resp = match request.action {
-        ControlAction::Exec => handle_exec(spec, orchestrator, &request),
-        ControlAction::Stop => handle_service_stop(
-            spec,
-            orchestrator,
-            &request.service,
-            request.idempotency_key.as_deref(),
-        ),
-        ControlAction::Start => handle_service_start(
-            spec,
-            orchestrator,
-            &request.service,
-            request.idempotency_key.as_deref(),
-        ),
-        ControlAction::Restart => {
-            let stop_resp = handle_service_stop(
-                spec,
-                orchestrator,
-                &request.service,
-                request.idempotency_key.as_deref(),
-            );
-            if stop_resp.error.is_some() {
-                stop_resp
-            } else {
-                handle_service_start(
-                    spec,
-                    orchestrator,
-                    &request.service,
-                    request.idempotency_key.as_deref(),
-                )
-            }
-        }
-    };
-
-    let _ = write_response(&mut writer, &resp).await;
-}
-
-/// Handle an exec action: run a command inside a service container.
-fn handle_exec(
-    spec: &StackSpec,
-    orchestrator: &StackOrchestrator<OciContainerRuntime>,
-    request: &ControlRequest,
-) -> ControlResponse {
-    let store = orchestrator.executor().store();
-    let observed = match store.load_observed_state(&spec.name) {
-        Ok(o) => o,
-        Err(e) => {
-            return ControlResponse {
-                exit_code: 1,
-                stdout: String::new(),
-                stderr: String::new(),
-                error: Some(format!("failed to load state: {e}")),
-            };
-        }
-    };
-
-    let container_id = match observed
-        .iter()
-        .find(|o| o.service_name == request.service)
-        .and_then(|s| s.container_id.as_deref())
-    {
-        Some(id) => id,
-        None => {
-            return ControlResponse {
-                exit_code: 1,
-                stdout: String::new(),
-                stderr: String::new(),
-                error: Some(format!("service '{}' is not running", request.service)),
-            };
-        }
-    };
-
-    info!(
-        service = %request.service,
-        container = %container_id,
-        idempotency_key = %request.idempotency_key.as_deref().unwrap_or("-"),
-        cmd = ?request.cmd,
-        "exec request"
-    );
-
-    let runtime = orchestrator.executor().runtime();
-    match runtime.exec_with_output(container_id, &request.cmd) {
-        Ok((exit_code, stdout, stderr)) => ControlResponse {
-            exit_code,
-            stdout,
-            stderr,
-            error: None,
-        },
-        Err(e) => ControlResponse {
-            exit_code: 1,
-            stdout: String::new(),
-            stderr: String::new(),
-            error: Some(format!("{e}")),
-        },
-    }
-}
-
-/// Handle a stop action: remove an individual service from the running stack.
-fn handle_service_stop(
-    spec: &StackSpec,
-    orchestrator: &mut StackOrchestrator<OciContainerRuntime>,
-    service_name: &str,
-    idempotency_key: Option<&str>,
-) -> ControlResponse {
-    info!(
-        service = %service_name,
-        idempotency_key = %idempotency_key.unwrap_or("-"),
-        "stop request"
-    );
-
-    let actions = vec![vz_stack::Action::ServiceRemove {
-        service_name: service_name.to_string(),
-    }];
-
-    match orchestrator.executor_mut().execute(spec, &actions) {
-        Ok(result) if result.all_succeeded() => ControlResponse {
-            exit_code: 0,
-            stdout: format!("service '{service_name}' stopped\n"),
-            stderr: String::new(),
-            error: None,
-        },
-        Ok(result) => ControlResponse {
-            exit_code: 1,
-            stdout: String::new(),
-            stderr: String::new(),
-            error: Some(format!(
-                "failed to stop service '{}': {}",
-                service_name,
-                result
-                    .errors
-                    .iter()
-                    .map(|(_, e)| e.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-        },
-        Err(e) => ControlResponse {
-            exit_code: 1,
-            stdout: String::new(),
-            stderr: String::new(),
-            error: Some(format!("stop failed: {e}")),
-        },
-    }
-}
-
-/// Handle a start action: (re)create an individual service from the spec.
-fn handle_service_start(
-    spec: &StackSpec,
-    orchestrator: &mut StackOrchestrator<OciContainerRuntime>,
-    service_name: &str,
-    idempotency_key: Option<&str>,
-) -> ControlResponse {
-    // Verify the service exists in the spec.
-    if !spec.services.iter().any(|s| s.name == service_name) {
-        return ControlResponse {
-            exit_code: 1,
-            stdout: String::new(),
-            stderr: String::new(),
-            error: Some(format!("service '{service_name}' not found in stack spec")),
-        };
-    }
-
-    info!(
-        service = %service_name,
-        idempotency_key = %idempotency_key.unwrap_or("-"),
-        "start request"
-    );
-
-    let actions = vec![vz_stack::Action::ServiceCreate {
-        service_name: service_name.to_string(),
-    }];
-
-    match orchestrator.executor_mut().execute(spec, &actions) {
-        Ok(result) if result.all_succeeded() => ControlResponse {
-            exit_code: 0,
-            stdout: format!("service '{service_name}' started\n"),
-            stderr: String::new(),
-            error: None,
-        },
-        Ok(result) => ControlResponse {
-            exit_code: 1,
-            stdout: String::new(),
-            stderr: String::new(),
-            error: Some(format!(
-                "failed to start service '{}': {}",
-                service_name,
-                result
-                    .errors
-                    .iter()
-                    .map(|(_, e)| e.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-        },
-        Err(e) => ControlResponse {
-            exit_code: 1,
-            stdout: String::new(),
-            stderr: String::new(),
-            error: Some(format!("start failed: {e}")),
-        },
-    }
-}
-
-async fn write_response(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    resp: &ControlResponse,
-) -> anyhow::Result<()> {
-    use tokio::io::AsyncWriteExt;
-
-    let mut json = serde_json::to_string(resp)?;
-    json.push('\n');
-    writer.write_all(json.as_bytes()).await?;
-    writer.flush().await?;
     Ok(())
 }
 
@@ -1392,122 +621,89 @@ async fn write_response(
 
 /// Connect to a running `vz stack up` session and execute a command.
 async fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
-
-    let state_dir = resolve_state_dir(args.state_dir.as_deref(), &args.name)?;
-    let sock_path = state_dir.join("control.sock");
-
-    if !sock_path.exists() {
-        bail!(
-            "stack '{}' is not running in foreground mode.\n\
-             Start it with: vz stack up -f <compose.yaml>",
-            args.name
-        );
-    }
-
-    let stream = UnixStream::connect(&sock_path).await.with_context(|| {
-        format!(
-            "failed to connect to control socket: {}",
-            sock_path.display()
-        )
-    })?;
-
-    let (reader, mut writer) = stream.into_split();
-
-    // Send the exec request.
-    let action = ControlAction::Exec;
-    let service = args.service;
-    let command = args.command;
-    let request = ControlRequest {
-        idempotency_key: control_request_idempotency_key(&args.name, &action, &service, &command),
-        action,
-        service,
-        cmd: command,
-    };
-    let mut json = serde_json::to_string(&request)?;
-    json.push('\n');
-    writer.write_all(json.as_bytes()).await?;
-    writer.flush().await?;
-
-    // Read the response.
-    let mut lines = BufReader::new(reader).lines();
-    let line = lines
-        .next_line()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("control socket closed without response"))?;
-
-    let resp: ControlResponse =
-        serde_json::from_str(&line).with_context(|| "failed to parse control response")?;
-
-    if let Some(err) = resp.error {
-        bail!("{err}");
-    }
-
-    // Print captured output.
-    if !resp.stdout.is_empty() {
-        print!("{}", resp.stdout);
-    }
-    if !resp.stderr.is_empty() {
-        eprint!("{}", resp.stderr);
-    }
-
-    std::process::exit(resp.exit_code);
+    let state_db = stack_state_db_path(args.state_dir.as_deref());
+    let mut client = connect_control_plane_for_state_db(&state_db).await?;
+    let status = client
+        .get_stack_status(runtime_v2::GetStackStatusRequest {
+            metadata: None,
+            stack_name: args.name.clone(),
+        })
+        .await
+        .with_context(|| format!("failed to load stack status for `{}` via daemon", args.name))?;
+    let container_id = resolve_service_container_id(&args.name, &args.service, &status.services)?;
+    execute_stack_container_command(&mut client, container_id, &args.command)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to execute command for stack `{}` service `{}`",
+                args.name, args.service
+            )
+        })
 }
 
 // ── service start/stop/restart ─────────────────────────────────────
 
-/// Send a service-level action (stop/start/restart) through the control socket.
+/// Send a daemon-backed service-level action (stop/start/restart).
 async fn cmd_service_action(args: ServiceArgs, action: ControlAction) -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
-
-    let state_dir = resolve_state_dir(args.state_dir.as_deref(), &args.name)?;
-    let sock_path = state_dir.join("control.sock");
-
-    if !sock_path.exists() {
-        bail!(
-            "stack '{}' is not running in foreground mode.\n\
-             Start it with: vz stack up -f <compose.yaml>",
-            args.name
-        );
-    }
-
-    let stream = UnixStream::connect(&sock_path).await.with_context(|| {
-        format!(
-            "failed to connect to control socket: {}",
-            sock_path.display()
-        )
-    })?;
-
-    let (reader, mut writer) = stream.into_split();
-
-    let request = ControlRequest {
-        idempotency_key: control_request_idempotency_key(&args.name, &action, &args.service, &[]),
-        action,
-        service: args.service,
-        cmd: vec![],
+    let state_db = stack_state_db_path(args.state_dir.as_deref());
+    let mut client = connect_control_plane_for_state_db(&state_db).await?;
+    let request = runtime_v2::StackServiceActionRequest {
+        metadata: None,
+        stack_name: args.name.clone(),
+        service_name: args.service.clone(),
     };
-    let mut json = serde_json::to_string(&request)?;
-    json.push('\n');
-    writer.write_all(json.as_bytes()).await?;
-    writer.flush().await?;
+    let response = match action {
+        ControlAction::Stop => client.stop_stack_service(request).await.with_context(|| {
+            format!(
+                "failed to stop service `{}` in stack `{}` via daemon",
+                args.service, args.name
+            )
+        })?,
+        ControlAction::Start => client.start_stack_service(request).await.with_context(|| {
+            format!(
+                "failed to start service `{}` in stack `{}` via daemon",
+                args.service, args.name
+            )
+        })?,
+        ControlAction::Restart => {
+            client
+                .restart_stack_service(request)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to restart service `{}` in stack `{}` via daemon",
+                        args.service, args.name
+                    )
+                })?
+        }
+    };
 
-    let mut lines = BufReader::new(reader).lines();
-    let line = lines
-        .next_line()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("control socket closed without response"))?;
-
-    let resp: ControlResponse =
-        serde_json::from_str(&line).with_context(|| "failed to parse control response")?;
-
-    if let Some(err) = resp.error {
-        bail!("{err}");
-    }
-
-    if !resp.stdout.is_empty() {
-        print!("{}", resp.stdout);
+    let service = response
+        .service
+        .ok_or_else(|| anyhow::anyhow!("daemon returned missing stack service payload"))?;
+    let phase = if service.phase.trim().is_empty() {
+        "unknown"
+    } else {
+        service.phase.as_str()
+    };
+    println!(
+        "Service `{}` in stack `{}` now reports phase `{}`.",
+        service.service_name, response.stack_name, phase
+    );
+    if phase.eq_ignore_ascii_case("failed") {
+        if service.last_error.trim().is_empty() {
+            bail!(
+                "service `{}` in stack `{}` entered failed state",
+                service.service_name,
+                response.stack_name
+            );
+        }
+        bail!(
+            "service `{}` in stack `{}` entered failed state: {}",
+            service.service_name,
+            response.stack_name,
+            service.last_error
+        );
     }
 
     Ok(())
@@ -1516,84 +712,41 @@ async fn cmd_service_action(args: ServiceArgs, action: ControlAction) -> anyhow:
 // ── down ───────────────────────────────────────────────────────────
 
 async fn cmd_down(args: DownArgs) -> anyhow::Result<()> {
-    let state_dir = resolve_state_dir(args.state_dir.as_deref(), &args.name)?;
-    let db_path = state_dir.join("state.db");
-
-    if !db_path.exists() {
-        bail!("no state found for stack `{}`", args.name);
-    }
-
-    let store = StateStore::open(&db_path).with_context(|| "failed to open state store")?;
-
-    // Load current desired state to get the stack name, then apply empty spec.
-    let current = store
-        .load_desired_state(&args.name)
-        .with_context(|| "failed to load desired state")?;
-
-    let stack_name = current
-        .as_ref()
-        .map(|s| s.name.clone())
-        .unwrap_or_else(|| args.name.clone());
-
-    // Apply an empty spec to trigger removal of all services.
-    let empty_spec = StackSpec {
-        name: stack_name.clone(),
-        services: vec![],
-        networks: vec![],
-        volumes: vec![],
-        secrets: vec![],
-        disk_size_mb: None,
-    };
-
-    let health_statuses = HashMap::new();
-    let result = vz_stack::apply(&empty_spec, &store, &health_statuses)
-        .with_context(|| "stack teardown failed")?;
+    let state_db = stack_state_db_path(args.state_dir.as_deref());
+    let mut client = connect_control_plane_for_state_db(&state_db).await?;
+    let response = client
+        .teardown_stack(runtime_v2::TeardownStackRequest {
+            metadata: None,
+            stack_name: args.name.clone(),
+            dry_run: args.dry_run,
+            remove_volumes: args.volumes,
+        })
+        .await
+        .with_context(|| format!("failed to teardown stack `{}` via daemon", args.name))?;
 
     if args.dry_run {
-        stack_output::print_dry_run(&result);
+        println!(
+            "Plan for stack `{}`: {} action(s) would change.",
+            response.stack_name, response.changed_actions
+        );
         println!("\n--dry-run: skipping execution");
         return Ok(());
     }
 
-    if result.actions.is_empty() && !args.volumes {
+    if response.changed_actions == 0 && response.removed_volumes == 0 {
         println!("No changes needed.");
         return Ok(());
     }
 
-    // Execute removal actions through the OCI runtime.
-    let service_names: Vec<String> = result
-        .actions
-        .iter()
-        .map(|a| a.service_name().to_string())
-        .collect();
-
-    if !result.actions.is_empty() {
-        let oci_runtime = OciContainerRuntime::new(&state_dir, None)
-            .with_context(|| "failed to initialize OCI runtime")?;
-
-        let exec_store =
-            StateStore::open(&db_path).with_context(|| "failed to open execution state store")?;
-
-        let mut executor = StackExecutor::new(oci_runtime, exec_store, &state_dir);
-        let exec_result = executor
-            .execute(&empty_spec, &result.actions)
-            .with_context(|| "teardown execution failed")?;
-
-        let mut out = StackOutput::new_down(&service_names);
-        out.on_down(&result, &exec_result);
-        out.finish_down();
-    }
-
-    // Remove named volumes if --volumes was specified.
+    println!(
+        "Teardown complete for stack `{}` ({} changed action(s)).",
+        response.stack_name, response.changed_actions
+    );
     if args.volumes {
-        let volume_mgr = VolumeManager::new(&state_dir);
-        let removed = volume_mgr
-            .remove_all()
-            .with_context(|| "failed to remove volumes")?;
-        if removed > 0 {
-            println!("Removed {removed} volume(s).");
-        } else {
+        if response.removed_volumes == 0 {
             println!("No volumes to remove.");
+        } else {
+            println!("Removed {} volume(s).", response.removed_volumes);
         }
     }
 
@@ -1603,29 +756,23 @@ async fn cmd_down(args: DownArgs) -> anyhow::Result<()> {
 // ── ps ─────────────────────────────────────────────────────────────
 
 async fn cmd_ps(args: PsArgs) -> anyhow::Result<()> {
-    let state_dir = resolve_state_dir(args.state_dir.as_deref(), &args.name)?;
-    let db_path = state_dir.join("state.db");
+    let state_db = stack_state_db_path(args.state_dir.as_deref());
+    let mut client = connect_control_plane_for_state_db(&state_db).await?;
+    let response = client
+        .get_stack_status(runtime_v2::GetStackStatusRequest {
+            metadata: None,
+            stack_name: args.name.clone(),
+        })
+        .await
+        .with_context(|| format!("failed to get stack status for `{}` via daemon", args.name))?;
 
-    if !db_path.exists() {
-        bail!("no state found for stack `{}`", args.name);
-    }
-
-    let store = StateStore::open(&db_path).with_context(|| "failed to open state store")?;
-
-    let observed = store
-        .load_observed_state(&args.name)
-        .with_context(|| "failed to load observed state")?;
-
-    // Load desired state for additional info (ports, etc)
-    let desired = store.load_desired_state(&args.name).ok().flatten();
-    let desired_ref = desired.as_ref();
-
+    let observed = observed_from_stack_statuses(&response.services);
     if args.json {
         let json = serde_json::to_string_pretty(&observed)
             .with_context(|| "failed to serialize observed state")?;
         println!("{json}");
     } else {
-        print_ps_table(&observed, desired_ref);
+        print_ps_table(&observed, None);
     }
 
     Ok(())
@@ -1634,221 +781,105 @@ async fn cmd_ps(args: PsArgs) -> anyhow::Result<()> {
 // ── events ─────────────────────────────────────────────────────────
 
 async fn cmd_events(args: EventsArgs) -> anyhow::Result<()> {
-    let state_dir = resolve_state_dir(args.state_dir.as_deref(), &args.name)?;
-    let db_path = state_dir.join("state.db");
+    let state_db = stack_state_db_path(args.state_dir.as_deref());
+    let mut client = connect_control_plane_for_state_db(&state_db).await?;
 
-    if !db_path.exists() {
-        bail!("no state found for stack `{}`", args.name);
+    let mut cursor = args.since.max(0);
+    let mut events = Vec::new();
+    loop {
+        let response = client
+            .list_stack_events(runtime_v2::ListStackEventsRequest {
+                metadata: None,
+                stack_name: args.name.clone(),
+                after: cursor,
+                limit: 1000,
+            })
+            .await
+            .with_context(|| {
+                format!("failed to list stack events for `{}` via daemon", args.name)
+            })?;
+        if response.events.is_empty() {
+            break;
+        }
+        events.extend(response.events);
+        if response.next_cursor <= cursor {
+            break;
+        }
+        cursor = response.next_cursor;
     }
-
-    let store = StateStore::open(&db_path).with_context(|| "failed to open state store")?;
-
-    let records = if args.since > 0 {
-        store
-            .load_events_since(&args.name, args.since)
-            .with_context(|| "failed to load events")?
-    } else {
-        store
-            .load_event_records(&args.name)
-            .with_context(|| "failed to load events")?
-    };
 
     if args.json {
-        for record in &records {
-            let json = serde_json::to_string(&record.event)
-                .with_context(|| "failed to serialize event")?;
-            println!("{json}");
+        for event in &events {
+            println!("{}", event.event_json);
         }
-    } else {
-        print_events_table(&records);
+        return Ok(());
     }
 
+    let mut records = Vec::with_capacity(events.len());
+    for event in events {
+        let parsed: StackEvent = serde_json::from_str(&event.event_json)
+            .with_context(|| format!("failed to parse stack event payload {}", event.id))?;
+        records.push(EventRecord {
+            id: event.id,
+            stack_name: event.stack_name,
+            created_at: event.created_at,
+            event: parsed,
+        });
+    }
+    print_events_table(&records);
     Ok(())
 }
 
 // ── logs ──────────────────────────────────────────────────────────
 
 async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
-    let state_dir = resolve_state_dir(args.state_dir.as_deref(), &args.name)?;
-    let sock_path = state_dir.join("control.sock");
+    let state_db = stack_state_db_path(args.state_dir.as_deref());
+    let mut client = connect_control_plane_for_state_db(&state_db).await?;
+    let service_filter = args.service.unwrap_or_default();
+    let tail_limit = u32::try_from(args.tail).unwrap_or(u32::MAX);
 
-    if !sock_path.exists() {
-        bail!(
-            "stack `{}` is not running (no control socket at {})",
-            args.name,
-            sock_path.display()
-        );
-    }
+    let mut previous_outputs: HashMap<String, String> = HashMap::new();
+    let mut first_iteration = true;
 
-    // Determine which services to fetch logs for.
-    let services = match &args.service {
-        Some(svc) => vec![svc.clone()],
-        None => {
-            let db_path = state_dir.join("state.db");
-            let store = StateStore::open(&db_path).with_context(|| "failed to open state store")?;
-            let observed = store
-                .load_observed_state(&args.name)
-                .with_context(|| "failed to load observed state")?;
-            observed
-                .into_iter()
-                .filter(|o| o.phase == ServicePhase::Running)
-                .map(|o| o.service_name)
-                .collect()
+    loop {
+        let response = client
+            .get_stack_logs(runtime_v2::GetStackLogsRequest {
+                metadata: None,
+                stack_name: args.name.clone(),
+                service: service_filter.clone(),
+                tail: if first_iteration { tail_limit } else { 0 },
+            })
+            .await
+            .with_context(|| format!("failed to get stack logs for `{}` via daemon", args.name))?;
+
+        if response.logs.is_empty() {
+            bail!("no running services in stack `{}`", args.name);
         }
-    };
 
-    if services.is_empty() {
-        bail!("no running services in stack `{}`", args.name);
-    }
-
-    let log_file = CONTAINER_LOG_FILE;
-    let multi = services.len() > 1;
-
-    if args.follow {
-        // Follow mode: stream logs from each service in parallel, printing
-        // lines as they arrive with colored service prefixes.
-        cmd_logs_follow(&sock_path, &args.name, &services, args.tail, log_file).await
-    } else {
-        // One-shot fetch: bounded tail -n <count>.
-        for service in &services {
-            let tail_n = args.tail.to_string();
-            let output = exec_via_socket(
-                &sock_path,
-                &args.name,
-                service,
-                &["tail", "-n", &tail_n, log_file],
-            )
-            .await?;
-            print_log_output(&output, service, multi);
+        let multi = response.logs.len() > 1 || service_filter.is_empty();
+        for log in response.logs {
+            let previous = previous_outputs
+                .get(&log.service_name)
+                .map(String::as_str)
+                .unwrap_or_default();
+            let delta = log
+                .output
+                .strip_prefix(previous)
+                .map(str::to_string)
+                .unwrap_or_else(|| log.output.clone());
+            print_log_output(&delta, &log.service_name, multi);
+            previous_outputs.insert(log.service_name, log.output);
         }
-        Ok(())
-    }
-}
 
-/// Follow log output from multiple services in parallel.
-///
-/// Each service gets its own polling thread that sends lines through a
-/// shared channel. The main thread reads from the channel and prints
-/// each line with a colored service prefix.
-async fn cmd_logs_follow(
-    sock_path: &Path,
-    stack_name: &str,
-    services: &[String],
-    tail: usize,
-    log_file: &str,
-) -> anyhow::Result<()> {
-    use console::style;
-
-    let multi = services.len() > 1;
-    let (tx, rx) = std::sync::mpsc::channel::<LogLine>();
-
-    // Print initial tail for each service.
-    for service in services {
-        let tail_n = tail.to_string();
-        let output = exec_via_socket(
-            sock_path,
-            stack_name,
-            service,
-            &["tail", "-n", &tail_n, log_file],
-        )
-        .await?;
-        print_log_output(&output, service, multi);
-    }
-
-    // Spawn a polling thread per service that reads new content and sends
-    // LogLines through the channel.
-    for (i, service) in services.iter().enumerate() {
-        let service_name = service.clone();
-        let sock = sock_path.to_path_buf();
-        let name = stack_name.to_string();
-        let log_path = log_file.to_string();
-        let sender = tx.clone();
-
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-            let Ok(rt) = rt else { return };
-            rt.block_on(async {
-                let mut offset = get_file_size(&sock, &name, &service_name, &log_path)
-                    .await
-                    .unwrap_or(0);
-
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    let offset_arg = format!("+{}", offset + 1);
-                    let output = exec_via_socket(
-                        &sock,
-                        &name,
-                        &service_name,
-                        &["tail", "-c", &offset_arg, &log_path],
-                    )
-                    .await;
-
-                    let Ok(output) = output else {
-                        break;
-                    };
-
-                    if !output.is_empty() {
-                        offset += output.len() as u64;
-                        for line in output.lines() {
-                            let log_line = LogLine {
-                                timestamp: None,
-                                service: service_name.clone(),
-                                line: line.to_string(),
-                            };
-                            if sender.send(log_line).is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            });
-            let _ = i; // suppress unused warning
-        });
-    }
-
-    // Drop the original sender so the channel closes when all threads exit.
-    drop(tx);
-
-    // Build a color palette for service prefixes.
-    let color_palette = build_service_color_palette(services);
-
-    // Print streamed lines with colored prefixes.
-    for log_line in rx {
-        let color_idx = color_palette.get(&log_line.service).copied().unwrap_or(0);
-        let prefix = color_service_prefix(&log_line.service, color_idx);
-        if let Some(ts) = &log_line.timestamp {
-            println!("{prefix} {ts} {}", log_line.line);
-        } else {
-            println!("{prefix} {}", log_line.line);
+        if !args.follow {
+            return Ok(());
         }
-    }
 
-    Ok(())
-}
-
-/// Build a mapping from service name to color palette index.
-fn build_service_color_palette(services: &[String]) -> HashMap<String, usize> {
-    services
-        .iter()
-        .enumerate()
-        .map(|(i, name)| (name.clone(), i))
-        .collect()
-}
-
-/// Render a colored `[service]` prefix using a rotating palette.
-fn color_service_prefix(service: &str, color_idx: usize) -> String {
-    use console::style;
-
-    let label = format!("[{service}]");
-    match color_idx % 6 {
-        0 => style(label).cyan().to_string(),
-        1 => style(label).green().to_string(),
-        2 => style(label).yellow().to_string(),
-        3 => style(label).magenta().to_string(),
-        4 => style(label).blue().to_string(),
-        _ => style(label).red().to_string(),
+        first_iteration = false;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+        }
     }
 }
 
@@ -1864,70 +895,6 @@ fn print_log_output(output: &str, service: &str, multi: bool) {
     } else {
         print!("{output}");
     }
-}
-
-/// Get file size inside a container via `wc -c`.
-async fn get_file_size(
-    sock_path: &Path,
-    stack_name: &str,
-    service: &str,
-    path: &str,
-) -> anyhow::Result<u64> {
-    let output = exec_via_socket(sock_path, stack_name, service, &["wc", "-c", path]).await?;
-    // wc -c output: "  12345 /path/to/file\n"
-    let size: u64 = output
-        .split_whitespace()
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    Ok(size)
-}
-
-/// Execute a command in a service container via the control socket.
-async fn exec_via_socket(
-    sock_path: &Path,
-    stack_name: &str,
-    service: &str,
-    cmd: &[&str],
-) -> anyhow::Result<String> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
-
-    let stream = UnixStream::connect(sock_path).await.with_context(|| {
-        format!(
-            "failed to connect to control socket: {}",
-            sock_path.display()
-        )
-    })?;
-
-    let (reader, mut writer) = stream.into_split();
-
-    let action = ControlAction::Exec;
-    let command: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
-    let request = ControlRequest {
-        idempotency_key: control_request_idempotency_key(stack_name, &action, service, &command),
-        action,
-        service: service.to_string(),
-        cmd: command,
-    };
-    let mut json = serde_json::to_string(&request)?;
-    json.push('\n');
-    writer.write_all(json.as_bytes()).await?;
-
-    let mut lines = BufReader::new(reader).lines();
-    let line = lines
-        .next_line()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("control socket closed without response"))?;
-
-    let resp: ControlResponse =
-        serde_json::from_str(&line).with_context(|| "failed to parse control response")?;
-
-    if let Some(err) = resp.error {
-        bail!("exec error for service '{service}': {err}");
-    }
-
-    Ok(resp.stdout)
 }
 
 /// Extract the service name from a stack event, if applicable.
@@ -2000,201 +967,138 @@ struct StackListEntry {
     error_summary: Option<String>,
 }
 
-/// Compute the aggregate stack status from observed service states.
-///
-/// Returns `(status_string, ready_count, total_count, error_summary)`.
-///
-/// Status logic:
-/// - All services stopped/pending with none running/failed: `"○ stopped"`
-/// - Some services failed AND some running: `"◐ partial"` (degraded)
-/// - ALL active services failed (none running): `"\u{2717} failed"`
-/// - All services running: `"\u{2713} running"`
-/// - Some services running but not all started yet: `"◐ starting"`
-fn format_stack_status(
-    observed: &[ServiceObservedState],
-) -> (String, usize, usize, Option<String>) {
-    let ready_count = observed
-        .iter()
-        .filter(|o| o.phase == ServicePhase::Running && o.ready)
-        .count();
-    let running = observed
-        .iter()
-        .filter(|o| o.phase == ServicePhase::Running)
-        .count();
-    let total = observed
-        .iter()
-        .filter(|o| o.phase != ServicePhase::Stopped && o.phase != ServicePhase::Pending)
-        .count();
-    let failed = observed
-        .iter()
-        .filter(|o| o.phase == ServicePhase::Failed)
-        .count();
-
-    let first_error = || {
-        observed
-            .iter()
-            .find(|o| o.phase == ServicePhase::Failed && o.last_error.is_some())
-            .and_then(|o| o.last_error.clone())
-    };
-
-    let (status, error_summary) = if total == 0 && running == 0 {
-        ("\u{25cb} stopped".to_string(), None)
-    } else if failed > 0 && running == 0 {
-        // ALL active services failed -- this is a full failure, not partial.
-        ("\u{2717} failed".to_string(), first_error())
-    } else if failed > 0 && running > 0 {
-        // Some services running, some failed -- degraded/partial.
-        ("\u{25d0} partial".to_string(), first_error())
-    } else if running > 0 && running == total {
-        ("\u{2713} running".to_string(), None)
-    } else if running > 0 {
-        ("\u{25d0} starting".to_string(), None)
-    } else {
-        ("\u{25cb} stopped".to_string(), None)
-    };
-
-    (status, ready_count, total, error_summary)
-}
-
 async fn cmd_ls(args: LsArgs) -> anyhow::Result<()> {
-    let stacks_dir = match args.state_dir {
-        Some(dir) => dir,
-        None => {
-            let home = std::env::var("HOME").with_context(|| "HOME not set")?;
-            PathBuf::from(home).join(".vz").join("stacks")
-        }
-    };
-
-    if !stacks_dir.exists() {
-        if args.json {
-            println!("[]");
-        } else {
-            println!("No stacks found.");
-        }
-        return Ok(());
+    if args.state_dir.is_some() {
+        bail!(
+            "`vz stack ls --state-dir` is not supported in daemon mode; use the daemon default state db"
+        );
     }
 
-    let mut entries: Vec<StackListEntry> = Vec::new();
-
-    let read_dir =
-        std::fs::read_dir(&stacks_dir).with_context(|| "failed to read stacks directory")?;
-
-    for dir_entry in read_dir {
-        let dir_entry = dir_entry.with_context(|| "failed to read directory entry")?;
-        if !dir_entry.file_type()?.is_dir() {
-            continue;
-        }
-
-        let db_path = dir_entry.path().join("state.db");
-        if !db_path.exists() {
-            continue;
-        }
-
-        let stack_name = dir_entry.file_name().to_str().unwrap_or("?").to_string();
-
-        // Try to load observed state for service counts.
-        let (status, ready, total, error_summary) = match StateStore::open(&db_path) {
-            Ok(store) => match store.load_observed_state(&stack_name) {
-                Ok(observed) => format_stack_status(&observed),
-                Err(_) => ("\u{2717} unknown".to_string(), 0, 0, None),
-            },
-            Err(_) => ("\u{2717} unknown".to_string(), 0, 0, None),
-        };
-
-        entries.push(StackListEntry {
-            name: stack_name,
-            status,
-            ready,
-            total,
-            error_summary,
-        });
+    #[derive(Default)]
+    struct StackAggregate {
+        states: Vec<String>,
+        ready: usize,
+        total: usize,
     }
 
+    let state_db = default_state_db_path();
+    let mut client = connect_control_plane_for_state_db(&state_db).await?;
+    let response = client
+        .list_sandboxes(runtime_v2::ListSandboxesRequest { metadata: None })
+        .await
+        .with_context(|| "failed to list sandboxes via daemon for stack listing")?;
+
+    let mut grouped: HashMap<String, StackAggregate> = HashMap::new();
+    for sandbox in response.sandboxes {
+        let stack_name = sandbox
+            .labels
+            .get("stack_name")
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| sandbox.sandbox_id.clone());
+        let aggregate = grouped.entry(stack_name).or_default();
+        aggregate.total += 1;
+        if sandbox.state.eq_ignore_ascii_case("ready") {
+            aggregate.ready += 1;
+        }
+        aggregate.states.push(sandbox.state);
+    }
+
+    let mut entries: Vec<StackListEntry> = grouped
+        .into_iter()
+        .map(|(name, aggregate)| {
+            let (status, error_summary) = stack_status_from_sandbox_states(
+                &aggregate.states,
+                aggregate.ready,
+                aggregate.total,
+            );
+            StackListEntry {
+                name,
+                status,
+                ready: aggregate.ready,
+                total: aggregate.total,
+                error_summary,
+            }
+        })
+        .collect();
     entries.sort_by(|a, b| a.name.cmp(&b.name));
 
     if args.json {
         let json = serde_json::to_string_pretty(&entries)
             .with_context(|| "failed to serialize stack list")?;
         println!("{json}");
-    } else if entries.is_empty() {
-        println!("No stacks found.");
-    } else {
-        // Calculate column widths
-        let name_width = entries
-            .iter()
-            .map(|e| e.name.len())
-            .max()
-            .unwrap_or(10)
-            .max(10);
-        let status_width = 14;
-        let ready_width = 11;
+        return Ok(());
+    }
 
-        // Header
+    if entries.is_empty() {
+        println!("No stacks found.");
+        return Ok(());
+    }
+
+    let name_width = entries
+        .iter()
+        .map(|entry| entry.name.len())
+        .max()
+        .unwrap_or(10)
+        .max(10);
+    let status_width = 14;
+    let ready_width = 11;
+
+    println!(
+        "{:<width$} {:<status_width$} {:<ready_width$}",
+        "STACK NAME",
+        "STATUS",
+        "READY/TOTAL",
+        width = name_width
+    );
+    println!(
+        "{}",
+        "-".repeat(name_width + status_width + ready_width + 2)
+    );
+
+    for entry in &entries {
+        let ready_str = format!("{}/{}", entry.ready, entry.total);
         println!(
             "{:<width$} {:<status_width$} {:<ready_width$}",
-            "STACK NAME",
-            "STATUS",
-            "READY/TOTAL",
+            entry.name,
+            entry.status,
+            ready_str,
             width = name_width
         );
-        println!(
-            "{}",
-            "-".repeat(name_width + status_width + ready_width + 2)
-        );
-
-        // Rows
-        for entry in &entries {
-            let ready_str = if entry.total > 0 {
-                format!("{}/{}", entry.ready, entry.total)
+        if let Some(ref err) = entry.error_summary {
+            let summary = if err.len() > 50 {
+                format!("{}...", &err[..47])
             } else {
-                "-".to_string()
+                err.clone()
             };
-            println!(
-                "{:<width$} {:<status_width$} {:<ready_width$}",
-                entry.name,
-                entry.status,
-                ready_str,
-                width = name_width
-            );
-
-            // Show error summary below failed stacks
-            if let Some(ref err) = entry.error_summary {
-                let summary = if err.len() > 50 {
-                    format!("{}...", &err[..47])
-                } else {
-                    err.clone()
-                };
-                println!("  └─ {}", summary);
-            }
+            println!("  └─ {}", summary);
         }
+    }
 
-        // Footer with summary
-        println!();
-        let running = entries
-            .iter()
-            .filter(|e| e.status.contains("running"))
-            .count();
-        let starting = entries
-            .iter()
-            .filter(|e| e.status.contains("starting"))
-            .count();
-        let failed = entries
-            .iter()
-            .filter(|e| e.status.contains("failed"))
-            .count();
+    println!();
+    let running = entries
+        .iter()
+        .filter(|entry| entry.status.contains("running"))
+        .count();
+    let starting = entries
+        .iter()
+        .filter(|entry| entry.status.contains("starting"))
+        .count();
+    let failed = entries
+        .iter()
+        .filter(|entry| entry.status.contains("failed"))
+        .count();
 
-        if failed > 0 {
-            println!(
-                "Showing {} stacks ({} running, {} starting, {} failed)",
-                entries.len(),
-                running,
-                starting,
-                failed
-            );
-            println!("Use 'vz stack logs <name>' for details on failed stacks");
-        } else {
-            println!("Showing {} stacks", entries.len());
-        }
+    if failed > 0 {
+        println!(
+            "Showing {} stacks ({} running, {} starting, {} failed)",
+            entries.len(),
+            running,
+            starting,
+            failed
+        );
+    } else {
+        println!("Showing {} stacks", entries.len());
     }
 
     Ok(())
@@ -2231,130 +1135,88 @@ async fn cmd_config(args: ConfigArgs) -> anyhow::Result<()> {
 // ── run ────────────────────────────────────────────────────────────
 
 async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
+    let state_db = stack_state_db_path(args.state_dir.as_deref());
+    let mut client = connect_control_plane_for_state_db(&state_db).await?;
+    let _ = &args.file;
 
-    let state_dir = resolve_state_dir(args.state_dir.as_deref(), &args.name)?;
-    let sock_path = state_dir.join("control.sock");
-
-    if !sock_path.exists() {
+    let run_container = client
+        .create_stack_run_container(runtime_v2::StackRunContainerRequest {
+            metadata: None,
+            stack_name: args.name.clone(),
+            service_name: args.service.clone(),
+            run_service_name: String::new(),
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "failed to create StackExecutor-backed run container for stack `{}` service `{}`",
+                args.name, args.service
+            )
+        })?;
+    let container_id = run_container.container_id.clone();
+    if container_id.trim().is_empty() {
         bail!(
-            "stack '{}' is not running in foreground mode.\n\
-             Start it with: vz stack up -f <compose.yaml>",
-            args.name
+            "daemon returned empty container id for one-off run on service `{}`",
+            args.service
+        );
+    }
+    let run_service_name = run_container.run_service_name;
+    if run_service_name.trim().is_empty() {
+        bail!(
+            "daemon returned empty run service name for stack `{}` service `{}`",
+            args.name,
+            args.service
         );
     }
 
-    // Verify the service exists in the compose file.
-    let file = resolve_compose_file(args.file)?;
-    let yaml = std::fs::read_to_string(&file)
-        .with_context(|| format!("failed to read compose file: {}", file.display()))?;
+    let command_result =
+        execute_stack_container_command(&mut client, container_id.clone(), &args.command)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to run one-off command for stack `{}` service `{}`",
+                    args.name, args.service
+                )
+            });
 
-    let compose_dir = file
-        .canonicalize()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    let spec = parse_compose_with_dir(&yaml, &args.name, &compose_dir)
-        .with_context(|| "failed to parse compose file")?;
-
-    if !spec.services.iter().any(|s| s.name == args.service) {
-        bail!(
-            "service '{}' not found in compose file. Available services: {}",
-            args.service,
-            spec.services
-                .iter()
-                .map(|s| s.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-
-    // Connect to the control socket and exec the command in the service container.
-    let stream = UnixStream::connect(&sock_path).await.with_context(|| {
-        format!(
-            "failed to connect to control socket: {}",
-            sock_path.display()
-        )
-    })?;
-
-    let (reader, mut writer) = stream.into_split();
-
-    let action = ControlAction::Exec;
-    let service = args.service;
-    let command = args.command;
-    let request = ControlRequest {
-        idempotency_key: control_request_idempotency_key(&args.name, &action, &service, &command),
-        action,
-        service,
-        cmd: command,
+    let cleanup_result = if args.rm {
+        client
+            .remove_stack_run_container(runtime_v2::StackRunContainerRequest {
+                metadata: None,
+                stack_name: args.name.clone(),
+                service_name: args.service.clone(),
+                run_service_name: run_service_name.clone(),
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to remove one-off run service `{}` (container `{}`) for stack `{}` service `{}`",
+                    run_service_name, container_id, args.name, args.service
+                )
+            })
+            .map(|_| ())
+    } else {
+        Ok(())
     };
-    let mut json = serde_json::to_string(&request)?;
-    json.push('\n');
-    writer.write_all(json.as_bytes()).await?;
-    writer.flush().await?;
 
-    let mut lines = BufReader::new(reader).lines();
-    let line = lines
-        .next_line()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("control socket closed without response"))?;
-
-    let resp: ControlResponse =
-        serde_json::from_str(&line).with_context(|| "failed to parse control response")?;
-
-    if let Some(err) = resp.error {
-        bail!("{err}");
+    match (command_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(command_error), Err(cleanup_error)) => Err(anyhow::anyhow!(
+            "{command_error}; cleanup failed: {cleanup_error}"
+        )),
     }
-
-    if !resp.stdout.is_empty() {
-        print!("{}", resp.stdout);
-    }
-    if !resp.stderr.is_empty() {
-        eprint!("{}", resp.stderr);
-    }
-
-    std::process::exit(resp.exit_code);
 }
 
 // ── dashboard ─────────────────────────────────────────────────────
 
 /// Open the TUI dashboard for an existing (running or stopped) stack.
 async fn cmd_dashboard(args: DashboardArgs) -> anyhow::Result<()> {
-    let state_dir = resolve_state_dir(args.state_dir.as_deref(), &args.name)?;
-    let db_path = state_dir.join("state.db");
-
-    if !db_path.exists() {
-        bail!("no state found for stack `{}`", args.name);
-    }
-
-    // Load the spec: prefer compose file if given, otherwise load from state DB.
-    let spec = if let Some(file) = args.file {
-        let yaml = std::fs::read_to_string(&file)
-            .with_context(|| format!("failed to read compose file: {}", file.display()))?;
-        let compose_dir = file
-            .canonicalize()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from("."));
-        parse_compose_with_dir(&yaml, &args.name, &compose_dir)
-            .with_context(|| "failed to parse compose file")?
-    } else {
-        let store = StateStore::open(&db_path).with_context(|| "failed to open state store")?;
-        store
-            .load_desired_state(&args.name)
-            .with_context(|| "failed to load desired state")?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no desired state found for stack `{}`; use -f to specify a compose file",
-                    args.name
-                )
-            })?
-    };
-
-    let sock_path = state_dir.join("control.sock");
-    crate::tui::run_tui(args.name, spec, db_path, Some(sock_path))
+    let _ = args;
+    bail!(
+        "`vz stack dashboard` is deprecated and removed in daemon mode. Use `vz stack ps`, `vz stack logs`, and `vz stack events` instead."
+    )
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -2408,23 +1270,6 @@ fn resolve_stack_name(
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()));
 
     parent.ok_or_else(|| anyhow::anyhow!("cannot determine stack name; use --name"))
-}
-
-/// Resolve the state directory for a stack.
-fn resolve_state_dir(
-    explicit: Option<&std::path::Path>,
-    stack_name: &str,
-) -> anyhow::Result<PathBuf> {
-    if let Some(dir) = explicit {
-        return Ok(dir.to_path_buf());
-    }
-
-    // Default: ~/.vz/stacks/<stack_name>/
-    let home = std::env::var("HOME").with_context(|| "HOME not set")?;
-    Ok(PathBuf::from(home)
-        .join(".vz")
-        .join("stacks")
-        .join(stack_name))
 }
 
 fn print_ps_table(observed: &[ServiceObservedState], desired: Option<&StackSpec>) {
@@ -2768,6 +1613,12 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn cwd_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn resolve_stack_registry_auth_defaults_to_none() {
@@ -2810,6 +1661,67 @@ mod tests {
     }
 
     #[test]
+    fn split_exec_command_separates_head_and_args() {
+        let command = vec![
+            "/bin/echo".to_string(),
+            "hello".to_string(),
+            "world".to_string(),
+        ];
+        let (cmd, args) = split_exec_command(&command).unwrap();
+        assert_eq!(cmd, vec!["/bin/echo".to_string()]);
+        assert_eq!(args, vec!["hello".to_string(), "world".to_string()]);
+    }
+
+    #[test]
+    fn split_exec_command_rejects_empty_input() {
+        let result = split_exec_command(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn resolve_service_container_id_returns_container_for_service() {
+        let services = vec![runtime_v2::StackServiceStatus {
+            service_name: "web".to_string(),
+            phase: "running".to_string(),
+            ready: true,
+            container_id: "ctr-web-1".to_string(),
+            last_error: String::new(),
+        }];
+
+        let container_id = resolve_service_container_id("demo", "web", &services).unwrap();
+        assert_eq!(container_id, "ctr-web-1");
+    }
+
+    #[test]
+    fn resolve_service_container_id_errors_when_service_not_running() {
+        let services = vec![runtime_v2::StackServiceStatus {
+            service_name: "web".to_string(),
+            phase: "creating".to_string(),
+            ready: false,
+            container_id: String::new(),
+            last_error: String::new(),
+        }];
+
+        let error = resolve_service_container_id("demo", "web", &services).unwrap_err();
+        assert!(error.to_string().contains("not running"));
+    }
+
+    #[test]
+    fn resolve_service_container_id_errors_when_service_missing() {
+        let services = vec![runtime_v2::StackServiceStatus {
+            service_name: "db".to_string(),
+            phase: "running".to_string(),
+            ready: true,
+            container_id: "ctr-db-1".to_string(),
+            last_error: String::new(),
+        }];
+
+        let error = resolve_service_container_id("demo", "web", &services).unwrap_err();
+        assert!(error.to_string().contains("not found"));
+    }
+
+    #[test]
     fn resolve_compose_file_explicit_path() {
         let p = resolve_compose_file(Some(PathBuf::from("/tmp/my-compose.yml"))).unwrap();
         assert_eq!(p, PathBuf::from("/tmp/my-compose.yml"));
@@ -2817,6 +1729,7 @@ mod tests {
 
     #[test]
     fn resolve_compose_file_discovery_in_tempdir() {
+        let _guard = cwd_lock().lock().unwrap();
         let dir = std::env::temp_dir().join("vz-test-compose-discovery");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2838,6 +1751,7 @@ mod tests {
 
     #[test]
     fn resolve_compose_file_no_file_errors() {
+        let _guard = cwd_lock().lock().unwrap();
         let dir = std::env::temp_dir().join("vz-test-compose-empty");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2856,6 +1770,18 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cmd_dashboard_returns_deprecation_message() {
+        let error = cmd_dashboard(DashboardArgs {
+            name: "demo".to_string(),
+            file: None,
+            state_dir: None,
+        })
+        .await
+        .expect_err("dashboard should be deprecated");
+        assert!(error.to_string().contains("deprecated and removed"));
     }
 
     #[test]
@@ -3000,348 +1926,5 @@ mod tests {
             stack_name: "s".into(),
         };
         assert_eq!(event_service_name(&event), None);
-    }
-
-    #[test]
-    fn control_request_serde_roundtrip() {
-        let req = ControlRequest {
-            action: ControlAction::Exec,
-            service: "db".into(),
-            cmd: vec!["psql".into(), "-U".into(), "app".into()],
-            idempotency_key: Some("exec_container:stack1:db:psql_-U_app".into()),
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        let parsed: ControlRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.action, ControlAction::Exec);
-        assert_eq!(parsed.service, "db");
-        assert_eq!(parsed.cmd, vec!["psql", "-U", "app"]);
-        assert_eq!(
-            parsed.idempotency_key.as_deref(),
-            Some("exec_container:stack1:db:psql_-U_app")
-        );
-    }
-
-    #[test]
-    fn control_request_defaults_to_exec() {
-        // Old-style request without action field should default to Exec.
-        let json = r#"{"service":"web","cmd":["echo","hi"]}"#;
-        let parsed: ControlRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.action, ControlAction::Exec);
-        assert!(parsed.idempotency_key.is_none());
-    }
-
-    #[test]
-    fn control_request_stop_action() {
-        let req = ControlRequest {
-            action: ControlAction::Stop,
-            service: "web".into(),
-            cmd: vec![],
-            idempotency_key: None,
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        let parsed: ControlRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.action, ControlAction::Stop);
-        assert_eq!(parsed.service, "web");
-    }
-
-    #[test]
-    fn control_request_restart_action() {
-        let req = ControlRequest {
-            action: ControlAction::Restart,
-            service: "cache".into(),
-            cmd: vec![],
-            idempotency_key: None,
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        let parsed: ControlRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.action, ControlAction::Restart);
-    }
-
-    #[test]
-    fn control_response_serde_roundtrip() {
-        let resp = ControlResponse {
-            exit_code: 0,
-            stdout: "1 row\n".into(),
-            stderr: String::new(),
-            error: None,
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: ControlResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.exit_code, 0);
-        assert_eq!(parsed.stdout, "1 row\n");
-        assert!(parsed.error.is_none());
-    }
-
-    #[test]
-    fn control_response_with_error() {
-        let resp = ControlResponse {
-            exit_code: 1,
-            stdout: String::new(),
-            stderr: String::new(),
-            error: Some("service 'web' is not running".into()),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: ControlResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.error.unwrap(), "service 'web' is not running");
-    }
-
-    #[test]
-    fn map_runtime_error_formats_unsupported_operation_deterministically() {
-        let stack_error = map_runtime_error(
-            "setup_sandbox_network",
-            vz_runtime_contract::RuntimeError::UnsupportedOperation {
-                operation: "setup_sandbox_network".to_string(),
-                reason: "missing stack_networking capability".to_string(),
-            },
-        );
-
-        match stack_error {
-            StackError::Network(message) => {
-                assert!(message.contains("unsupported_operation"));
-                assert!(message.contains("surface=stack"));
-                assert!(message.contains("operation=setup_sandbox_network"));
-                assert!(message.contains("missing stack_networking capability"));
-            }
-            other => panic!("expected StackError::Network, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn unsupported_operation_error_prefix_is_stable() {
-        let err = unsupported_operation_error("logs", "missing container_logs capability");
-        match err {
-            StackError::Network(message) => {
-                assert!(message.starts_with("unsupported_operation:"));
-                assert!(message.contains("surface=stack"));
-                assert!(message.contains("operation=logs"));
-            }
-            other => panic!("expected StackError::Network, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn runtime_idempotency_key_is_only_emitted_for_required_operations() {
-        let key = runtime_idempotency_key(
-            vz_runtime_contract::RuntimeOperation::CreateContainer,
-            &["stack-a", "web", "ctr-1"],
-        )
-        .unwrap();
-        assert!(key.starts_with("create_container:"));
-        assert_eq!(key, "create_container:stack-a:web:ctr-1");
-
-        let no_key = runtime_idempotency_key(
-            vz_runtime_contract::RuntimeOperation::StopContainer,
-            &["stack-a", "web"],
-        );
-        assert!(no_key.is_none());
-    }
-
-    #[test]
-    fn cli_transport_parity_matrix_is_claimed_for_idempotency_behavior() {
-        let components = ["stack-a", "web-service", "echo_hello"];
-        for entry in vz_runtime_contract::PRIMITIVE_CONFORMANCE_MATRIX {
-            if !entry.cli {
-                continue;
-            }
-
-            let key = runtime_idempotency_key(entry.operation, &components);
-            let expected = entry
-                .operation
-                .idempotency_key_prefix()
-                .map(|prefix| format!("{prefix}:stack-a:web-service:echo_hello"));
-
-            assert_eq!(
-                key,
-                expected,
-                "CLI parity key mismatch for {}",
-                entry.operation.as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn control_request_idempotency_key_is_deterministic() {
-        let key = control_request_idempotency_key(
-            "stack-1",
-            &ControlAction::Exec,
-            "api",
-            &["echo".to_string(), "hello world".to_string()],
-        )
-        .unwrap();
-        assert_eq!(key, "exec_container:stack-1:api:echo_hello_world");
-
-        let stop_key = control_request_idempotency_key("stack-1", &ControlAction::Stop, "api", &[]);
-        assert!(stop_key.is_none());
-    }
-
-    #[tokio::test]
-    async fn control_socket_roundtrip() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::{UnixListener, UnixStream};
-
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("test.sock");
-
-        let listener = UnixListener::bind(&sock_path).unwrap();
-
-        // Spawn a server that echoes back a fixed response.
-        let server_path = sock_path.clone();
-        let server = tokio::spawn(async move {
-            let _ = server_path; // keep the path alive
-            let (stream, _) = listener.accept().await.unwrap();
-            let (reader, mut writer) = stream.into_split();
-            let mut lines = BufReader::new(reader).lines();
-            let line = lines.next_line().await.unwrap().unwrap();
-            let req: ControlRequest = serde_json::from_str(&line).unwrap();
-            assert_eq!(req.service, "cache");
-            assert_eq!(req.cmd, vec!["redis-cli", "PING"]);
-
-            let resp = ControlResponse {
-                exit_code: 0,
-                stdout: "PONG\n".into(),
-                stderr: String::new(),
-                error: None,
-            };
-            let mut json = serde_json::to_string(&resp).unwrap();
-            json.push('\n');
-            writer.write_all(json.as_bytes()).await.unwrap();
-            writer.flush().await.unwrap();
-        });
-
-        // Client sends a request and reads the response.
-        let stream = UnixStream::connect(&sock_path).await.unwrap();
-        let (reader, mut writer) = stream.into_split();
-
-        let req = ControlRequest {
-            action: ControlAction::Exec,
-            service: "cache".into(),
-            cmd: vec!["redis-cli".into(), "PING".into()],
-            idempotency_key: Some("exec_container:test:cache:redis-cli_PING".into()),
-        };
-        let mut json = serde_json::to_string(&req).unwrap();
-        json.push('\n');
-        writer.write_all(json.as_bytes()).await.unwrap();
-        writer.flush().await.unwrap();
-
-        let mut lines = BufReader::new(reader).lines();
-        let line = lines.next_line().await.unwrap().unwrap();
-        let resp: ControlResponse = serde_json::from_str(&line).unwrap();
-        assert_eq!(resp.exit_code, 0);
-        assert_eq!(resp.stdout, "PONG\n");
-        assert!(resp.error.is_none());
-
-        server.await.unwrap();
-    }
-
-    // ── format_stack_status tests ──
-
-    fn obs(name: &str, phase: ServicePhase, ready: bool) -> ServiceObservedState {
-        ServiceObservedState {
-            service_name: name.to_string(),
-            phase,
-            container_id: None,
-            last_error: None,
-            ready,
-        }
-    }
-
-    #[test]
-    fn format_stack_status_all_running() {
-        let observed = vec![
-            obs("web", ServicePhase::Running, true),
-            obs("db", ServicePhase::Running, true),
-        ];
-        let (status, ready, total, err) = format_stack_status(&observed);
-        assert!(
-            status.contains("running"),
-            "expected running, got: {status}"
-        );
-        assert_eq!(ready, 2);
-        assert_eq!(total, 2);
-        assert!(err.is_none());
-    }
-
-    #[test]
-    fn format_stack_status_all_stopped() {
-        let observed = vec![
-            obs("web", ServicePhase::Stopped, false),
-            obs("db", ServicePhase::Stopped, false),
-        ];
-        let (status, _ready, total, _err) = format_stack_status(&observed);
-        assert!(
-            status.contains("stopped"),
-            "expected stopped, got: {status}"
-        );
-        assert_eq!(total, 0);
-    }
-
-    #[test]
-    fn format_stack_status_all_failed() {
-        let observed = vec![
-            ServiceObservedState {
-                service_name: "web".into(),
-                phase: ServicePhase::Failed,
-                container_id: None,
-                last_error: Some("connection refused".into()),
-                ready: false,
-            },
-            ServiceObservedState {
-                service_name: "db".into(),
-                phase: ServicePhase::Failed,
-                container_id: None,
-                last_error: Some("oom killed".into()),
-                ready: false,
-            },
-        ];
-        let (status, _ready, _total, err) = format_stack_status(&observed);
-        assert!(
-            status.contains("failed"),
-            "expected 'failed' when ALL services fail, got: {status}"
-        );
-        assert!(err.is_some());
-    }
-
-    #[test]
-    fn format_stack_status_partial_failure() {
-        let observed = vec![
-            obs("web", ServicePhase::Running, true),
-            ServiceObservedState {
-                service_name: "db".into(),
-                phase: ServicePhase::Failed,
-                container_id: None,
-                last_error: Some("crash".into()),
-                ready: false,
-            },
-        ];
-        let (status, _ready, _total, err) = format_stack_status(&observed);
-        assert!(
-            status.contains("partial"),
-            "expected 'partial' when some fail and some run, got: {status}"
-        );
-        assert!(err.is_some());
-    }
-
-    #[test]
-    fn format_stack_status_starting() {
-        let observed = vec![
-            obs("web", ServicePhase::Running, false),
-            obs("db", ServicePhase::Creating, false),
-        ];
-        let (status, _ready, _total, _err) = format_stack_status(&observed);
-        assert!(
-            status.contains("starting"),
-            "expected starting, got: {status}"
-        );
-    }
-
-    #[test]
-    fn format_stack_status_empty() {
-        let (status, ready, total, _err) = format_stack_status(&[]);
-        assert!(
-            status.contains("stopped"),
-            "expected stopped, got: {status}"
-        );
-        assert_eq!(ready, 0);
-        assert_eq!(total, 0);
     }
 }

@@ -1,0 +1,22 @@
+[package]
+name = "vz-runtime-proto"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Protobuf/gRPC service definitions for the vz Runtime V2 control-plane protocol."
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+prost = { workspace = true }
+
+[lints]
+workspace = true

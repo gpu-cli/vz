@@ -3,6 +3,9 @@ resolver = "3"
 members = [
     "vz",
     "vz-agent-proto",
+    "vz-runtime-proto",
+    "vz-runtime-translate",
+    "vz-runtimed-client",
     "vz-sandbox",
     "vz-cli",
     "vz-runtimed",
@@ -44,6 +47,7 @@ objc2-virtualization = { version = "0.3", features = [
     "VZPlatformConfiguration",
     "VZMacPlatformConfiguration",
     "VZGenericPlatformConfiguration",
+    "VZGenericMachineIdentifier",
     "VZMacOSRestoreImage",
     "VZMacOSInstaller",
     "VZMacHardwareModel",
@@ -170,6 +174,9 @@ vz-oci-macos = { path = "vz-oci-macos" }
 vz-runtime-contract = { path = "vz-runtime-contract" }
 vz-stack = { path = "vz-stack" }
 vz-agent-proto = { path = "vz-agent-proto" }
+vz-runtime-proto = { path = "vz-runtime-proto" }
+vz-runtime-translate = { path = "vz-runtime-translate" }
+vz-runtimed-client = { path = "vz-runtimed-client" }
 vz-validation = { path = "vz-validation" }
 vz-api = { path = "vz-api" }
 vz-runtimed = { path = "vz-runtimed" }

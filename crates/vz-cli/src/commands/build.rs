@@ -149,6 +149,7 @@ pub async fn run(args: BuildArgs) -> anyhow::Result<()> {
             dockerfile: args.dockerfile,
             tag,
             target: args.target,
+            cache_from: Vec::new(),
             build_args,
             secrets,
             no_cache: args.no_cache,

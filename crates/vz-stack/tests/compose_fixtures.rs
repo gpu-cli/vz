@@ -631,6 +631,95 @@ networks:
     assert!(message.contains("services.web.networks.frontend.aliases"));
 }
 
+#[test]
+fn compose_fixture_network_mode_host_is_stable_unsupported() {
+    let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    network_mode: host
+"#;
+
+    let err = parse_compose(yaml, "unsupported-network-mode").unwrap_err();
+    let message = err.to_string();
+    assert!(message.starts_with("unsupported_operation:"));
+    assert!(message.contains("surface=compose"));
+    assert!(message.contains("services.web.network_mode"));
+    assert!(message.contains("supported value is `bridge`"));
+}
+
+#[test]
+fn compose_fixture_parity_fields_interactive_logging_and_resources_parse() {
+    let yaml = r#"
+services:
+  api:
+    image: ghcr.io/acme/api:dev
+    expose:
+      - "9000"
+      - "9001"
+    stdin_open: true
+    tty: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: "512m"
+        reservations:
+          cpus: "0.5"
+          memory: "128m"
+"#;
+
+    let spec = parse_compose(yaml, "parity-fields").unwrap();
+    let api = spec.services.iter().find(|s| s.name == "api").unwrap();
+
+    assert_eq!(api.expose, vec![9000, 9001]);
+    assert!(api.stdin_open);
+    assert!(api.tty);
+
+    let logging = api.logging.as_ref().unwrap();
+    assert_eq!(logging.driver, "json-file");
+    assert_eq!(
+        logging.options.get("max-size").map(String::as_str),
+        Some("10m")
+    );
+    assert_eq!(
+        logging.options.get("max-file").map(String::as_str),
+        Some("3")
+    );
+
+    assert!((api.resources.cpus.unwrap_or_default() - 1.5).abs() < f64::EPSILON);
+    assert_eq!(api.resources.memory_bytes, Some(512 * 1024 * 1024));
+    assert!((api.resources.reservation_cpus.unwrap_or_default() - 0.5).abs() < f64::EPSILON);
+    assert_eq!(
+        api.resources.reservation_memory_bytes,
+        Some(128 * 1024 * 1024)
+    );
+}
+
+#[test]
+fn compose_fixture_service_healthy_without_healthcheck_is_rejected() {
+    let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    depends_on:
+      db:
+        condition: service_healthy
+  db:
+    image: postgres:16
+"#;
+
+    let err = parse_compose(yaml, "invalid-health-gate").unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("service_healthy"));
+    assert!(message.contains("has no healthcheck"));
+}
+
 // ── Helpers ────────────────────────────────────────────────────────
 
 fn open_temp_store() -> (StateStore, tempfile::TempDir) {

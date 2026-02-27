@@ -1,16 +1,19 @@
 //! `vz checkpoint` — checkpoint lifecycle management commands.
 //!
 //! Provides `list`, `inspect`, and `create` subcommands backed by the
-//! `vz-stack` state store for checkpoint persistence.
+//! runtime daemon control plane.
 
 #![allow(clippy::print_stdout)]
 
 use std::path::PathBuf;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use clap::{Args, Subcommand};
-use vz_runtime_contract::{Checkpoint, CheckpointClass, CheckpointState};
-use vz_stack::StateStore;
+use tonic::Code;
+use vz_runtime_proto::runtime_v2;
+use vz_runtimed_client::DaemonClientError;
+
+use super::runtime_daemon::connect_control_plane_for_state_db;
 
 /// Manage checkpoint fingerprints and lineage.
 #[derive(Args, Debug)]
@@ -80,28 +83,44 @@ pub struct CheckpointCreateArgs {
 /// Run the checkpoint subcommand.
 pub async fn run(args: CheckpointArgs) -> anyhow::Result<()> {
     match args.action {
-        CheckpointCommand::List(list_args) => cmd_list(list_args),
-        CheckpointCommand::Inspect(inspect_args) => cmd_inspect(inspect_args),
-        CheckpointCommand::Create(create_args) => cmd_create(create_args),
+        CheckpointCommand::List(list_args) => cmd_list(list_args).await,
+        CheckpointCommand::Inspect(inspect_args) => cmd_inspect(inspect_args).await,
+        CheckpointCommand::Create(create_args) => cmd_create(create_args).await,
     }
 }
 
-fn cmd_list(args: CheckpointListArgs) -> anyhow::Result<()> {
-    let store = StateStore::open(&args.state_db).context("failed to open state store")?;
+fn checkpoint_json(payload: &runtime_v2::CheckpointPayload) -> serde_json::Value {
+    serde_json::json!({
+        "checkpoint_id": payload.checkpoint_id,
+        "sandbox_id": payload.sandbox_id,
+        "parent_checkpoint_id": if payload.parent_checkpoint_id.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(payload.parent_checkpoint_id.clone())
+        },
+        "class": payload.checkpoint_class,
+        "state": payload.state,
+        "compatibility_fingerprint": payload.compatibility_fingerprint,
+        "created_at": payload.created_at,
+    })
+}
 
-    let checkpoints = if let Some(ref sandbox_id) = args.sandbox_id {
-        store
-            .list_checkpoints_for_sandbox(sandbox_id)
-            .context("failed to list checkpoints for sandbox")?
-    } else {
-        store
-            .list_checkpoints()
-            .context("failed to list checkpoints")?
-    };
+async fn cmd_list(args: CheckpointListArgs) -> anyhow::Result<()> {
+    let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+    let mut checkpoints = client
+        .list_checkpoints(runtime_v2::ListCheckpointsRequest { metadata: None })
+        .await
+        .context("failed to list checkpoints via daemon")?
+        .checkpoints;
+
+    if let Some(sandbox_id) = args.sandbox_id.as_deref() {
+        checkpoints.retain(|checkpoint| checkpoint.sandbox_id == sandbox_id);
+    }
 
     if args.json {
-        let json = serde_json::to_string_pretty(&checkpoints)
-            .context("failed to serialize checkpoints")?;
+        let payload: Vec<_> = checkpoints.iter().map(checkpoint_json).collect();
+        let json =
+            serde_json::to_string_pretty(&payload).context("failed to serialize checkpoints")?;
         println!("{json}");
         return Ok(());
     }
@@ -115,90 +134,89 @@ fn cmd_list(args: CheckpointListArgs) -> anyhow::Result<()> {
         "{:<40} {:<40} {:<12} {:<10} {:<20}",
         "CHECKPOINT ID", "SANDBOX ID", "CLASS", "STATE", "FINGERPRINT"
     );
-    for checkpoint in &checkpoints {
-        let class = serde_json::to_string(&checkpoint.class)
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string();
-        let state = serde_json::to_string(&checkpoint.state)
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string();
-        let fingerprint = if checkpoint.compatibility_fingerprint.len() > 18 {
-            format!("{}...", &checkpoint.compatibility_fingerprint[..18])
+    for payload in &checkpoints {
+        let class = if payload.checkpoint_class.trim().is_empty() {
+            "unknown"
         } else {
-            checkpoint.compatibility_fingerprint.clone()
+            payload.checkpoint_class.as_str()
+        };
+        let state = if payload.state.trim().is_empty() {
+            "unknown"
+        } else {
+            payload.state.as_str()
+        };
+        let fingerprint = if payload.compatibility_fingerprint.len() > 18 {
+            format!("{}...", &payload.compatibility_fingerprint[..18])
+        } else {
+            payload.compatibility_fingerprint.clone()
         };
         println!(
             "{:<40} {:<40} {:<12} {:<10} {:<20}",
-            checkpoint.checkpoint_id, checkpoint.sandbox_id, class, state, fingerprint
+            payload.checkpoint_id, payload.sandbox_id, class, state, fingerprint
         );
     }
 
     Ok(())
 }
 
-fn cmd_inspect(args: CheckpointInspectArgs) -> anyhow::Result<()> {
-    let store = StateStore::open(&args.state_db).context("failed to open state store")?;
-    let checkpoint = store
-        .load_checkpoint(&args.checkpoint_id)
-        .context("failed to load checkpoint")?;
-
-    match checkpoint {
-        Some(c) => {
-            let json =
-                serde_json::to_string_pretty(&c).context("failed to serialize checkpoint")?;
-            println!("{json}");
+async fn cmd_inspect(args: CheckpointInspectArgs) -> anyhow::Result<()> {
+    let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+    let response = match client
+        .get_checkpoint(runtime_v2::GetCheckpointRequest {
+            checkpoint_id: args.checkpoint_id.clone(),
+            metadata: None,
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(DaemonClientError::Grpc(status)) if status.code() == Code::NotFound => {
+            bail!("checkpoint {} not found", args.checkpoint_id)
         }
-        None => bail!("checkpoint {} not found", args.checkpoint_id),
-    }
+        Err(error) => return Err(anyhow!(error).context("failed to load checkpoint via daemon")),
+    };
+
+    let payload = response
+        .checkpoint
+        .ok_or_else(|| anyhow!("daemon returned missing checkpoint payload"))?;
+    let json = serde_json::to_string_pretty(&checkpoint_json(&payload))
+        .context("failed to serialize checkpoint")?;
+    println!("{json}");
 
     Ok(())
 }
 
-fn cmd_create(args: CheckpointCreateArgs) -> anyhow::Result<()> {
-    let store = StateStore::open(&args.state_db).context("failed to open state store")?;
-
-    let class = match args.class.as_str() {
-        "fs_quick" => CheckpointClass::FsQuick,
-        "vm_full" => CheckpointClass::VmFull,
+fn normalize_checkpoint_class(class: &str) -> anyhow::Result<String> {
+    match class.trim().to_ascii_lowercase().as_str() {
+        "fs_quick" | "fs-quick" => Ok("fs_quick".to_string()),
+        "vm_full" | "vm-full" => Ok("vm_full".to_string()),
         other => bail!("unknown checkpoint class: {other}"),
+    }
+}
+
+async fn cmd_create(args: CheckpointCreateArgs) -> anyhow::Result<()> {
+    let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+    let checkpoint_class = normalize_checkpoint_class(&args.class)?;
+    let response = client
+        .create_checkpoint(runtime_v2::CreateCheckpointRequest {
+            metadata: None,
+            sandbox_id: args.sandbox_id,
+            checkpoint_class,
+            compatibility_fingerprint: args.fingerprint,
+        })
+        .await
+        .context("failed to create checkpoint via daemon")?;
+
+    let payload = response
+        .checkpoint
+        .ok_or_else(|| anyhow!("daemon returned missing checkpoint payload"))?;
+    let state = if payload.state.trim().is_empty() {
+        "unknown"
+    } else {
+        payload.state.as_str()
     };
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let mut checkpoint = Checkpoint {
-        checkpoint_id: format!("ckpt-{}", uuid::Uuid::new_v4()),
-        sandbox_id: args.sandbox_id,
-        parent_checkpoint_id: None,
-        class,
-        state: CheckpointState::Creating,
-        created_at: now,
-        compatibility_fingerprint: args.fingerprint,
-    };
-
-    store
-        .save_checkpoint(&checkpoint)
-        .context("failed to save checkpoint")?;
-
-    checkpoint
-        .transition_to(CheckpointState::Ready)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    store
-        .save_checkpoint(&checkpoint)
-        .context("failed to update checkpoint state")?;
-
-    let state = serde_json::to_string(&checkpoint.state)
-        .unwrap_or_default()
-        .trim_matches('"')
-        .to_string();
     println!(
         "Checkpoint {} created (state: {state}).",
-        checkpoint.checkpoint_id
+        payload.checkpoint_id
     );
 
     Ok(())

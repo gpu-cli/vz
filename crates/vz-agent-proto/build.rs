@@ -1,5 +1,5 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proto_paths = &["proto/agent.proto", "proto/runtime_v2.proto"];
+    let proto_paths = &["proto/agent.proto"];
     let out_dir = "src/generated";
 
     // Re-run generation if any proto changes.

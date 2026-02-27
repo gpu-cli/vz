@@ -17,7 +17,6 @@ mod ipsw;
 #[cfg(target_os = "macos")]
 mod provision;
 mod registry;
-pub mod tui;
 
 use clap::Parser;
 use tracing::error;
@@ -46,6 +45,10 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Control-plane transport (`daemon-grpc` or `api-http`).
+    #[arg(long, global = true, value_enum)]
+    control_plane: Option<commands::runtime_daemon::ControlPlaneTransport>,
+
     /// Continue most recent sandbox for this directory.
     #[arg(short = 'c', long = "continue", conflicts_with_all = ["resume", "name"])]
     continue_last: bool,
@@ -65,6 +68,14 @@ struct Cli {
     /// Memory in MB for new sandboxes.
     #[arg(long, default_value = "2048")]
     memory: u64,
+
+    /// Default image reference for sandbox startup workload.
+    #[arg(long)]
+    base_image: Option<String>,
+
+    /// Main container/workload identifier for sandbox startup.
+    #[arg(long)]
+    main_container: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -101,9 +112,11 @@ enum Commands {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if let Some(transport) = cli.control_plane {
+        commands::runtime_daemon::set_control_plane_transport(transport)?;
+    }
 
-    // Suppress info-level tracing noise for stack up/down — the StackOutput
-    // abstraction handles user-facing progress display instead.
+    // Suppress info-level tracing noise for stack up/down.
     let is_stack_progress = matches!(
         cli.command,
         Some(Commands::Stack(ref args)) if matches!(
@@ -167,14 +180,16 @@ fn main() -> anyhow::Result<()> {
                     cli.name,
                     cli.cpus,
                     cli.memory,
+                    cli.base_image,
+                    cli.main_container,
                 )
                 .await
             }
 
             // Sandbox management
-            Some(Commands::Ls(args)) => commands::sandbox::cmd_list(args),
-            Some(Commands::Rm(args)) => commands::sandbox::cmd_terminate(args),
-            Some(Commands::Inspect(args)) => commands::sandbox::cmd_inspect(args),
+            Some(Commands::Ls(args)) => commands::sandbox::cmd_list(args).await,
+            Some(Commands::Rm(args)) => commands::sandbox::cmd_terminate(args).await,
+            Some(Commands::Inspect(args)) => commands::sandbox::cmd_inspect(args).await,
             Some(Commands::Attach(args)) => commands::sandbox::cmd_attach(args).await,
 
             // Stack orchestration
@@ -241,6 +256,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_sandbox_startup_selection_flags() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "--base-image",
+            "alpine:3.20",
+            "--main-container",
+            "workspace-main",
+        ])
+        .expect("parse");
+        assert_eq!(cli.base_image.as_deref(), Some("alpine:3.20"));
+        assert_eq!(cli.main_container.as_deref(), Some("workspace-main"));
+    }
+
+    #[test]
     fn parse_continue_conflicts_with_resume() {
         let result = Cli::try_parse_from(["vz", "-c", "-r", "foo"]);
         assert!(result.is_err());
@@ -262,6 +291,16 @@ mod tests {
     fn parse_json_flag() {
         let cli = Cli::try_parse_from(["vz", "--json", "ls"]).expect("parse");
         assert!(cli.json);
+    }
+
+    #[test]
+    fn parse_control_plane_flag() {
+        let cli =
+            Cli::try_parse_from(["vz", "--control-plane", "daemon-grpc", "ls"]).expect("parse");
+        assert_eq!(
+            cli.control_plane,
+            Some(commands::runtime_daemon::ControlPlaneTransport::DaemonGrpc)
+        );
     }
 
     #[test]

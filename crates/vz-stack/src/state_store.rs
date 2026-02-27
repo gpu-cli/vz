@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -346,25 +346,59 @@ pub struct StateStore {
     event_sender: Option<mpsc::Sender<StackEvent>>,
 }
 
+/// SQLite PRAGMA policy applied during state-store startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StateStorePragmas {
+    /// Enable WAL journal mode.
+    pub journal_mode_wal: bool,
+    /// Busy timeout in milliseconds.
+    pub busy_timeout_ms: Option<u64>,
+    /// Enable foreign-key enforcement.
+    pub foreign_keys: bool,
+}
+
+impl StateStorePragmas {
+    /// Daemon runtime defaults for single-writer, contention-tolerant startup.
+    pub const fn daemon_defaults() -> Self {
+        Self {
+            journal_mode_wal: true,
+            busy_timeout_ms: Some(5_000),
+            foreign_keys: true,
+        }
+    }
+}
+
 impl StateStore {
     /// Open or create a state store at the given path.
     pub fn open(path: &Path) -> Result<Self, StackError> {
+        Self::open_with_pragmas(path, StateStorePragmas::default())
+    }
+
+    /// Open or create a state store with explicit SQLite pragma policy.
+    pub fn open_with_pragmas(path: &Path, pragmas: StateStorePragmas) -> Result<Self, StackError> {
         let conn = Connection::open(path)?;
         let store = Self {
             conn,
             event_sender: None,
         };
+        store.apply_pragmas(pragmas)?;
         store.init_schema()?;
         Ok(store)
     }
 
     /// Create an in-memory state store (useful for testing).
     pub fn in_memory() -> Result<Self, StackError> {
+        Self::in_memory_with_pragmas(StateStorePragmas::default())
+    }
+
+    /// Create an in-memory state store with explicit SQLite pragma policy.
+    pub fn in_memory_with_pragmas(pragmas: StateStorePragmas) -> Result<Self, StackError> {
         let conn = Connection::open_in_memory()?;
         let store = Self {
             conn,
             event_sender: None,
         };
+        store.apply_pragmas(pragmas)?;
         store.init_schema()?;
         Ok(store)
     }
@@ -376,6 +410,61 @@ impl StateStore {
     /// Sending failures (receiver dropped) are silently ignored.
     pub fn set_event_sender(&mut self, sender: mpsc::Sender<StackEvent>) {
         self.event_sender = Some(sender);
+    }
+
+    fn apply_pragmas(&self, pragmas: StateStorePragmas) -> Result<(), StackError> {
+        if pragmas.journal_mode_wal {
+            self.conn.pragma_update(None, "journal_mode", "WAL")?;
+        }
+        if let Some(timeout_ms) = pragmas.busy_timeout_ms {
+            self.conn.busy_timeout(Duration::from_millis(timeout_ms))?;
+        }
+        if pragmas.foreign_keys {
+            self.conn.pragma_update(None, "foreign_keys", "ON")?;
+        }
+        Ok(())
+    }
+
+    /// Execute a closure within an immediate SQLite transaction boundary.
+    ///
+    /// The transaction is committed on success and rolled back on error.
+    pub fn with_immediate_transaction<T>(
+        &self,
+        f: impl FnOnce(&Self) -> Result<T, StackError>,
+    ) -> Result<T, StackError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        match f(self) {
+            Ok(value) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    /// Return effective SQLite journal mode for this connection.
+    pub fn journal_mode(&self) -> Result<String, StackError> {
+        self.conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .map_err(Into::into)
+    }
+
+    /// Return effective busy timeout (milliseconds) for this connection.
+    pub fn busy_timeout_ms(&self) -> Result<u64, StackError> {
+        self.conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, u64>(0))
+            .map_err(Into::into)
+    }
+
+    /// Return whether foreign-key enforcement is enabled for this connection.
+    pub fn foreign_keys_enabled(&self) -> Result<bool, StackError> {
+        self.conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+            .map(|value| value != 0)
+            .map_err(Into::into)
     }
 
     fn init_schema(&self) -> Result<(), StackError> {
@@ -795,6 +884,94 @@ impl StateStore {
             states.push(state);
         }
         Ok(states)
+    }
+
+    /// Resolve compose `tty` default for a runtime container identifier.
+    ///
+    /// Returns `Some(tty)` when the container can be mapped to a service in
+    /// observed state and that service exists in desired state.
+    pub fn resolve_service_tty_for_container(
+        &self,
+        container_id: &str,
+    ) -> Result<Option<bool>, StackError> {
+        let container_id = container_id.trim();
+        if container_id.is_empty() {
+            return Ok(None);
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT stack_name, state_json FROM observed_state")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        for row in rows {
+            let (stack_name, state_json) = row?;
+            let observed: ServiceObservedState = serde_json::from_str(&state_json)?;
+            if observed.container_id.as_deref() != Some(container_id) {
+                continue;
+            }
+
+            let Some(desired) = self.load_desired_state(&stack_name)? else {
+                continue;
+            };
+            let Some(service) = desired
+                .services
+                .iter()
+                .find(|service| service.name == observed.service_name)
+            else {
+                continue;
+            };
+
+            return Ok(Some(service.tty));
+        }
+
+        Ok(None)
+    }
+
+    /// Resolve inherited execution PTY default for a runtime container identifier.
+    ///
+    /// Returns `Some(true)` when the mapped service requests interactive I/O
+    /// via either `tty` or `stdin_open`.
+    pub fn resolve_service_exec_pty_default_for_container(
+        &self,
+        container_id: &str,
+    ) -> Result<Option<bool>, StackError> {
+        let container_id = container_id.trim();
+        if container_id.is_empty() {
+            return Ok(None);
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT stack_name, state_json FROM observed_state")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        for row in rows {
+            let (stack_name, state_json) = row?;
+            let observed: ServiceObservedState = serde_json::from_str(&state_json)?;
+            if observed.container_id.as_deref() != Some(container_id) {
+                continue;
+            }
+
+            let Some(desired) = self.load_desired_state(&stack_name)? else {
+                continue;
+            };
+            let Some(service) = desired
+                .services
+                .iter()
+                .find(|service| service.name == observed.service_name)
+            else {
+                continue;
+            };
+
+            return Ok(Some(service.tty || service.stdin_open));
+        }
+
+        Ok(None)
     }
 
     /// Persist health poller checkpoint state for a stack.
@@ -3054,6 +3231,105 @@ mod tests {
     }
 
     #[test]
+    fn resolve_service_tty_for_container_returns_desired_service_tty() {
+        let store = StateStore::in_memory().unwrap();
+
+        let mut spec = sample_spec();
+        spec.services[0].tty = true;
+        store.save_desired_state("myapp", &spec).unwrap();
+        store
+            .save_observed_state(
+                "myapp",
+                &ServiceObservedState {
+                    service_name: "web".to_string(),
+                    phase: ServicePhase::Running,
+                    container_id: Some("ctr-web-1".to_string()),
+                    last_error: None,
+                    ready: true,
+                },
+            )
+            .unwrap();
+
+        let resolved = store
+            .resolve_service_tty_for_container("ctr-web-1")
+            .unwrap();
+        assert_eq!(resolved, Some(true));
+    }
+
+    #[test]
+    fn resolve_service_tty_for_container_returns_none_when_unmapped() {
+        let store = StateStore::in_memory().unwrap();
+        store.save_desired_state("myapp", &sample_spec()).unwrap();
+        store
+            .save_observed_state(
+                "myapp",
+                &ServiceObservedState {
+                    service_name: "web".to_string(),
+                    phase: ServicePhase::Running,
+                    container_id: Some("ctr-web-1".to_string()),
+                    last_error: None,
+                    ready: true,
+                },
+            )
+            .unwrap();
+
+        let resolved_missing = store
+            .resolve_service_tty_for_container("ctr-missing")
+            .unwrap();
+        assert!(resolved_missing.is_none());
+    }
+
+    #[test]
+    fn resolve_service_exec_pty_default_for_container_uses_stdin_open_or_tty() {
+        let store = StateStore::in_memory().unwrap();
+
+        let mut spec = sample_spec();
+        spec.services[0].tty = false;
+        spec.services[0].stdin_open = true;
+        store.save_desired_state("myapp", &spec).unwrap();
+        store
+            .save_observed_state(
+                "myapp",
+                &ServiceObservedState {
+                    service_name: "web".to_string(),
+                    phase: ServicePhase::Running,
+                    container_id: Some("ctr-web-stdin".to_string()),
+                    last_error: None,
+                    ready: true,
+                },
+            )
+            .unwrap();
+
+        let resolved = store
+            .resolve_service_exec_pty_default_for_container("ctr-web-stdin")
+            .unwrap();
+        assert_eq!(resolved, Some(true));
+    }
+
+    #[test]
+    fn resolve_service_exec_pty_default_for_container_returns_none_when_unmapped() {
+        let store = StateStore::in_memory().unwrap();
+        store.save_desired_state("myapp", &sample_spec()).unwrap();
+        store
+            .save_observed_state(
+                "myapp",
+                &ServiceObservedState {
+                    service_name: "web".to_string(),
+                    phase: ServicePhase::Running,
+                    container_id: Some("ctr-web-1".to_string()),
+                    last_error: None,
+                    ready: true,
+                },
+            )
+            .unwrap();
+
+        let resolved_missing = store
+            .resolve_service_exec_pty_default_for_container("ctr-missing")
+            .unwrap();
+        assert!(resolved_missing.is_none());
+    }
+
+    #[test]
     fn observed_state_upsert_updates_service() {
         let store = StateStore::in_memory().unwrap();
 
@@ -4584,7 +4860,10 @@ mod tests {
             build_spec: BuildSpec {
                 context: "/tmp/ctx".to_string(),
                 dockerfile: Some("Dockerfile".to_string()),
+                target: None,
                 args: std::collections::BTreeMap::new(),
+                cache_from: Vec::new(),
+                image_tag: None,
             },
             state: BuildState::Queued,
             result_digest: None,
@@ -6630,5 +6909,103 @@ mod tests {
         }
         let loaded = store.load_events("compat").unwrap();
         assert_eq!(loaded.len(), v1_event_jsons.len());
+    }
+
+    #[test]
+    fn with_immediate_transaction_rolls_back_on_error() {
+        let store = StateStore::in_memory().unwrap();
+
+        let _: Result<(), StackError> = store.with_immediate_transaction(|tx| {
+            let sandbox = Sandbox {
+                sandbox_id: "sbx-rollback".to_string(),
+                backend: SandboxBackend::MacosVz,
+                spec: SandboxSpec::default(),
+                state: SandboxState::Ready,
+                created_at: 1,
+                updated_at: 1,
+                labels: std::collections::BTreeMap::new(),
+            };
+            tx.save_sandbox(&sandbox)?;
+            Err(StackError::InvalidSpec("force rollback".to_string()))
+        });
+
+        assert!(store.load_sandbox("sbx-rollback").unwrap().is_none());
+    }
+
+    #[test]
+    fn daemon_pragmas_busy_timeout_waits_through_write_lock_contention() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("state.db");
+
+        let contender_store =
+            StateStore::open_with_pragmas(&db_path, StateStorePragmas::daemon_defaults()).unwrap();
+
+        let (lock_started_tx, lock_started_rx) = std::sync::mpsc::channel();
+        let db_path_for_lock_holder = db_path.clone();
+        let lock_holder = std::thread::spawn(move || {
+            let lock_holder_store = StateStore::open_with_pragmas(
+                &db_path_for_lock_holder,
+                StateStorePragmas::daemon_defaults(),
+            )
+            .unwrap();
+
+            lock_holder_store
+                .with_immediate_transaction(|tx| {
+                    tx.save_sandbox(&Sandbox {
+                        sandbox_id: "sbx-lock-holder".to_string(),
+                        backend: SandboxBackend::MacosVz,
+                        spec: SandboxSpec::default(),
+                        state: SandboxState::Ready,
+                        created_at: 1,
+                        updated_at: 1,
+                        labels: std::collections::BTreeMap::new(),
+                    })?;
+
+                    lock_started_tx.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    Ok(())
+                })
+                .unwrap();
+        });
+
+        lock_started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("lock holder should enter transaction");
+
+        let start = std::time::Instant::now();
+        contender_store
+            .with_immediate_transaction(|tx| {
+                tx.save_sandbox(&Sandbox {
+                    sandbox_id: "sbx-contender".to_string(),
+                    backend: SandboxBackend::MacosVz,
+                    spec: SandboxSpec::default(),
+                    state: SandboxState::Ready,
+                    created_at: 2,
+                    updated_at: 2,
+                    labels: std::collections::BTreeMap::new(),
+                })?;
+                Ok(())
+            })
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        lock_holder.join().expect("lock holder thread should join");
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "contender transaction should wait for lock release (elapsed={elapsed:?})"
+        );
+        assert!(
+            contender_store
+                .load_sandbox("sbx-lock-holder")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            contender_store
+                .load_sandbox("sbx-contender")
+                .unwrap()
+                .is_some()
+        );
     }
 }

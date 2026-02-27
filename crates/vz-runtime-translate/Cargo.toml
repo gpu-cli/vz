@@ -1,0 +1,18 @@
+[package]
+name = "vz-runtime-translate"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic translation layer between Runtime V2 protobuf messages and runtime domain types."
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+vz-runtime-contract = { workspace = true }
+vz-runtime-proto = { workspace = true }
+
+[lints]
+workspace = true

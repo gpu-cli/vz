@@ -1,6 +1,6 @@
 // Runtime V2 gRPC service definitions for the vz control plane.
 //
-// Eight service groups covering the full runtime API:
+// Nine service groups covering the full runtime API:
 //   - SandboxService:    sandbox lifecycle (create, get, list, terminate)
 //   - LeaseService:      lease management (open, heartbeat, close)
 //   - ContainerService:  container lifecycle (create, get, list, remove)
@@ -8,6 +8,7 @@
 //   - CheckpointService: checkpoint/restore (create, restore, fork)
 //   - BuildService:      image builds (start, stream events, cancel)
 //   - EventService:      event log (list, stream)
+//   - FileService:       scoped sandbox filesystem primitives
 //   - CapabilityService: runtime capabilities discovery
 //
 // Separate from agent.proto (which is guest-agent communication over vsock).
@@ -193,6 +194,40 @@ message RemoveContainerRequest {
   RequestMetadata metadata = 2;
 }
 
+// ── 3b. ImageService ──────────────────────────────────────────────
+
+service ImageService {
+  rpc GetImage(GetImageRequest) returns (ImageResponse);
+  rpc ListImages(ListImagesRequest) returns (ListImagesResponse);
+}
+
+message ImagePayload {
+  string image_ref = 1;
+  string resolved_digest = 2;
+  string platform = 3;
+  string source_registry = 4;
+  uint64 pulled_at = 5;
+}
+
+message ImageResponse {
+  string request_id = 1;
+  ImagePayload image = 2;
+}
+
+message GetImageRequest {
+  string image_ref = 1;
+  RequestMetadata metadata = 2;
+}
+
+message ListImagesRequest {
+  RequestMetadata metadata = 1;
+}
+
+message ListImagesResponse {
+  string request_id = 1;
+  repeated ImagePayload images = 2;
+}
+
 // ── 4. ExecutionService ────────────────────────────────────────────
 
 service ExecutionService {
@@ -201,18 +236,32 @@ service ExecutionService {
   rpc ListExecutions(ListExecutionsRequest) returns (ListExecutionsResponse);
   rpc CancelExecution(CancelExecutionRequest) returns (ExecutionResponse);
   rpc StreamExecOutput(StreamExecOutputRequest) returns (stream ExecOutputEvent);
+  rpc WriteExecStdin(WriteExecStdinRequest) returns (ExecutionResponse);
   rpc ResizeExecPty(ResizeExecPtyRequest) returns (ExecutionResponse);
   rpc SignalExec(SignalExecRequest) returns (ExecutionResponse);
 }
 
 message CreateExecutionRequest {
+  enum PtyMode {
+    // Inherit execution PTY default from workload metadata (for example
+    // compose service `tty` settings).
+    PTY_MODE_INHERIT = 0;
+    // Force PTY allocation.
+    PTY_MODE_ENABLED = 1;
+    // Force non-PTY execution.
+    PTY_MODE_DISABLED = 2;
+  }
+
+  reserved 6;
+  reserved "pty";
+
   RequestMetadata metadata = 1;
   string container_id = 2;
   repeated string cmd = 3;
   repeated string args = 4;
   map<string, string> env_override = 5;
-  bool pty = 6;
   uint64 timeout_secs = 7;
+  PtyMode pty_mode = 8;
 }
 
 message ExecutionPayload {
@@ -251,6 +300,12 @@ message CancelExecutionRequest {
 message StreamExecOutputRequest {
   string execution_id = 1;
   RequestMetadata metadata = 2;
+}
+
+message WriteExecStdinRequest {
+  string execution_id = 1;
+  bytes data = 2;
+  RequestMetadata metadata = 3;
 }
 
 message ExecOutputEvent {
@@ -397,6 +452,33 @@ message BuildEvent {
   uint64 timestamp = 3;
 }
 
+// ── 6b. ReceiptService ─────────────────────────────────────────────
+
+service ReceiptService {
+  rpc GetReceipt(GetReceiptRequest) returns (ReceiptResponse);
+}
+
+message ReceiptPayload {
+  string receipt_id = 1;
+  string operation = 2;
+  string entity_id = 3;
+  string entity_type = 4;
+  string request_id = 5;
+  string status = 6;
+  uint64 created_at = 7;
+  string metadata_json = 8;
+}
+
+message ReceiptResponse {
+  string request_id = 1;
+  ReceiptPayload receipt = 2;
+}
+
+message GetReceiptRequest {
+  string receipt_id = 1;
+  RequestMetadata metadata = 2;
+}
+
 // ── 7. EventService ───────────────────────────────────────────────
 
 service EventService {
@@ -432,7 +514,245 @@ message StreamEventsRequest {
   RequestMetadata metadata = 4;
 }
 
-// ── 8. CapabilityService ──────────────────────────────────────────
+// ── 8. StackService ───────────────────────────────────────────────
+
+service StackService {
+  rpc ApplyStack(ApplyStackRequest) returns (ApplyStackResponse);
+  rpc TeardownStack(TeardownStackRequest) returns (TeardownStackResponse);
+  rpc GetStackStatus(GetStackStatusRequest) returns (GetStackStatusResponse);
+  rpc ListStackEvents(ListStackEventsRequest) returns (ListStackEventsResponse);
+  rpc GetStackLogs(GetStackLogsRequest) returns (GetStackLogsResponse);
+  rpc StopStackService(StackServiceActionRequest) returns (StackServiceActionResponse);
+  rpc StartStackService(StackServiceActionRequest) returns (StackServiceActionResponse);
+  rpc RestartStackService(StackServiceActionRequest) returns (StackServiceActionResponse);
+  rpc CreateStackRunContainer(StackRunContainerRequest) returns (StackRunContainerResponse);
+  rpc RemoveStackRunContainer(StackRunContainerRequest) returns (StackRunContainerResponse);
+}
+
+message ApplyStackRequest {
+  RequestMetadata metadata = 1;
+  string stack_name = 2;
+  string compose_yaml = 3;
+  string compose_dir = 4;
+  bool dry_run = 5;
+  bool detach = 6;
+}
+
+message StackServiceStatus {
+  string service_name = 1;
+  string phase = 2;
+  bool ready = 3;
+  string container_id = 4;
+  string last_error = 5;
+}
+
+message ApplyStackResponse {
+  string request_id = 1;
+  string stack_name = 2;
+  uint32 changed_actions = 3;
+  bool converged = 4;
+  uint32 services_ready = 5;
+  uint32 services_failed = 6;
+  repeated StackServiceStatus services = 7;
+}
+
+message TeardownStackRequest {
+  RequestMetadata metadata = 1;
+  string stack_name = 2;
+  bool dry_run = 3;
+  bool remove_volumes = 4;
+}
+
+message TeardownStackResponse {
+  string request_id = 1;
+  string stack_name = 2;
+  uint32 changed_actions = 3;
+  uint32 removed_volumes = 4;
+}
+
+message GetStackStatusRequest {
+  RequestMetadata metadata = 1;
+  string stack_name = 2;
+}
+
+message GetStackStatusResponse {
+  string request_id = 1;
+  string stack_name = 2;
+  repeated StackServiceStatus services = 3;
+}
+
+message ListStackEventsRequest {
+  RequestMetadata metadata = 1;
+  string stack_name = 2;
+  int64 after = 3;
+  uint32 limit = 4;
+}
+
+message ListStackEventsResponse {
+  string request_id = 1;
+  repeated RuntimeEvent events = 2;
+  int64 next_cursor = 3;
+}
+
+message GetStackLogsRequest {
+  RequestMetadata metadata = 1;
+  string stack_name = 2;
+  string service = 3;
+  uint32 tail = 4;
+}
+
+message StackServiceLog {
+  string service_name = 1;
+  string output = 2;
+}
+
+message GetStackLogsResponse {
+  string request_id = 1;
+  string stack_name = 2;
+  repeated StackServiceLog logs = 3;
+}
+
+message StackServiceActionRequest {
+  RequestMetadata metadata = 1;
+  string stack_name = 2;
+  string service_name = 3;
+}
+
+message StackServiceActionResponse {
+  string request_id = 1;
+  string stack_name = 2;
+  StackServiceStatus service = 3;
+}
+
+message StackRunContainerRequest {
+  RequestMetadata metadata = 1;
+  string stack_name = 2;
+  string service_name = 3;
+  string run_service_name = 4;
+}
+
+message StackRunContainerResponse {
+  string request_id = 1;
+  string stack_name = 2;
+  string service_name = 3;
+  string run_service_name = 4;
+  string container_id = 5;
+}
+
+// ── 9. FileService ────────────────────────────────────────────────
+
+service FileService {
+  rpc ReadFile(ReadFileRequest) returns (ReadFileResponse);
+  rpc WriteFile(WriteFileRequest) returns (WriteFileResponse);
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+  rpc MakeDir(MakeDirRequest) returns (FileMutationResponse);
+  rpc RemovePath(RemovePathRequest) returns (FileMutationResponse);
+  rpc MovePath(MovePathRequest) returns (FileMutationResponse);
+  rpc CopyPath(CopyPathRequest) returns (FileMutationResponse);
+  rpc ChmodPath(ChmodPathRequest) returns (FileMutationResponse);
+  rpc ChownPath(ChownPathRequest) returns (FileMutationResponse);
+}
+
+message FileEntry {
+  string path = 1;
+  bool is_dir = 2;
+  uint64 size = 3;
+  uint64 modified_at = 4;
+}
+
+message ReadFileRequest {
+  RequestMetadata metadata = 1;
+  string sandbox_id = 2;
+  string path = 3;
+  uint64 offset = 4;
+  uint64 limit = 5;
+}
+
+message ReadFileResponse {
+  string request_id = 1;
+  bytes data = 2;
+  bool truncated = 3;
+}
+
+message WriteFileRequest {
+  RequestMetadata metadata = 1;
+  string sandbox_id = 2;
+  string path = 3;
+  bytes data = 4;
+  bool append = 5;
+  bool create_parents = 6;
+}
+
+message WriteFileResponse {
+  string request_id = 1;
+  uint64 bytes_written = 2;
+}
+
+message ListFilesRequest {
+  RequestMetadata metadata = 1;
+  string sandbox_id = 2;
+  string path = 3;
+  bool recursive = 4;
+  uint32 limit = 5;
+}
+
+message ListFilesResponse {
+  string request_id = 1;
+  repeated FileEntry entries = 2;
+}
+
+message MakeDirRequest {
+  RequestMetadata metadata = 1;
+  string sandbox_id = 2;
+  string path = 3;
+  bool parents = 4;
+}
+
+message RemovePathRequest {
+  RequestMetadata metadata = 1;
+  string sandbox_id = 2;
+  string path = 3;
+  bool recursive = 4;
+}
+
+message MovePathRequest {
+  RequestMetadata metadata = 1;
+  string sandbox_id = 2;
+  string src_path = 3;
+  string dst_path = 4;
+  bool overwrite = 5;
+}
+
+message CopyPathRequest {
+  RequestMetadata metadata = 1;
+  string sandbox_id = 2;
+  string src_path = 3;
+  string dst_path = 4;
+  bool overwrite = 5;
+}
+
+message ChmodPathRequest {
+  RequestMetadata metadata = 1;
+  string sandbox_id = 2;
+  string path = 3;
+  uint32 mode = 4;
+}
+
+message ChownPathRequest {
+  RequestMetadata metadata = 1;
+  string sandbox_id = 2;
+  string path = 3;
+  uint32 uid = 4;
+  uint32 gid = 5;
+}
+
+message FileMutationResponse {
+  string request_id = 1;
+  string path = 2;
+  string status = 3;
+}
+
+// ── 10. CapabilityService ─────────────────────────────────────────
 
 service CapabilityService {
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);

@@ -1,16 +1,19 @@
 //! `vz lease` -- lease lifecycle management commands.
 //!
 //! Provides `list`, `inspect`, and `close` subcommands backed by the
-//! `vz-stack` state store for lease persistence.
+//! runtime daemon control plane.
 
 #![allow(clippy::print_stdout)]
 
 use std::path::PathBuf;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use clap::{Args, Subcommand};
-use vz_runtime_contract::LeaseState;
-use vz_stack::StateStore;
+use tonic::Code;
+use vz_runtime_proto::runtime_v2;
+use vz_runtimed_client::DaemonClientError;
+
+use super::runtime_daemon::connect_control_plane_for_state_db;
 
 /// Manage lease access grants.
 #[derive(Args, Debug)]
@@ -68,18 +71,33 @@ pub struct LeaseCloseArgs {
 /// Run the lease subcommand.
 pub async fn run(args: LeaseArgs) -> anyhow::Result<()> {
     match args.action {
-        LeaseCommand::List(list_args) => cmd_list(list_args),
-        LeaseCommand::Inspect(inspect_args) => cmd_inspect(inspect_args),
-        LeaseCommand::Close(close_args) => cmd_close(close_args),
+        LeaseCommand::List(list_args) => cmd_list(list_args).await,
+        LeaseCommand::Inspect(inspect_args) => cmd_inspect(inspect_args).await,
+        LeaseCommand::Close(close_args) => cmd_close(close_args).await,
     }
 }
 
-fn cmd_list(args: LeaseListArgs) -> anyhow::Result<()> {
-    let store = StateStore::open(&args.state_db).context("failed to open state store")?;
-    let leases = store.list_leases().context("failed to list leases")?;
+fn lease_json(payload: &runtime_v2::LeasePayload) -> serde_json::Value {
+    serde_json::json!({
+        "lease_id": payload.lease_id,
+        "sandbox_id": payload.sandbox_id,
+        "ttl_secs": payload.ttl_secs,
+        "last_heartbeat_at": payload.last_heartbeat_at,
+        "state": payload.state,
+    })
+}
+
+async fn cmd_list(args: LeaseListArgs) -> anyhow::Result<()> {
+    let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+    let leases = client
+        .list_leases(runtime_v2::ListLeasesRequest { metadata: None })
+        .await
+        .context("failed to list leases via daemon")?
+        .leases;
 
     if args.json {
-        let json = serde_json::to_string_pretty(&leases).context("failed to serialize leases")?;
+        let payload: Vec<_> = leases.iter().map(lease_json).collect();
+        let json = serde_json::to_string_pretty(&payload).context("failed to serialize leases")?;
         println!("{json}");
         return Ok(());
     }
@@ -93,56 +111,76 @@ fn cmd_list(args: LeaseListArgs) -> anyhow::Result<()> {
         "{:<40} {:<40} {:<10} {:<10} {:<20}",
         "LEASE ID", "SANDBOX ID", "STATE", "TTL", "LAST HEARTBEAT"
     );
-    for lease in &leases {
-        let state = serde_json::to_string(&lease.state)
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string();
+    for payload in &leases {
+        let state = if payload.state.trim().is_empty() {
+            "unknown"
+        } else {
+            payload.state.as_str()
+        };
         println!(
             "{:<40} {:<40} {:<10} {:<10} {:<20}",
-            lease.lease_id, lease.sandbox_id, state, lease.ttl_secs, lease.last_heartbeat_at
+            payload.lease_id,
+            payload.sandbox_id,
+            state,
+            payload.ttl_secs,
+            payload.last_heartbeat_at
         );
     }
 
     Ok(())
 }
 
-fn cmd_inspect(args: LeaseInspectArgs) -> anyhow::Result<()> {
-    let store = StateStore::open(&args.state_db).context("failed to open state store")?;
-    let lease = store
-        .load_lease(&args.lease_id)
-        .context("failed to load lease")?;
-
-    match lease {
-        Some(l) => {
-            let json = serde_json::to_string_pretty(&l).context("failed to serialize lease")?;
-            println!("{json}");
+async fn cmd_inspect(args: LeaseInspectArgs) -> anyhow::Result<()> {
+    let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+    let response = match client
+        .get_lease(runtime_v2::GetLeaseRequest {
+            lease_id: args.lease_id.clone(),
+            metadata: None,
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(DaemonClientError::Grpc(status)) if status.code() == Code::NotFound => {
+            bail!("lease {} not found", args.lease_id)
         }
-        None => bail!("lease {} not found", args.lease_id),
-    }
+        Err(error) => return Err(anyhow!(error).context("failed to load lease via daemon")),
+    };
+
+    let payload = response
+        .lease
+        .ok_or_else(|| anyhow!("daemon returned missing lease payload"))?;
+    let json =
+        serde_json::to_string_pretty(&lease_json(&payload)).context("failed to serialize lease")?;
+    println!("{json}");
 
     Ok(())
 }
 
-fn cmd_close(args: LeaseCloseArgs) -> anyhow::Result<()> {
-    let store = StateStore::open(&args.state_db).context("failed to open state store")?;
-    let mut lease = store
-        .load_lease(&args.lease_id)
-        .context("failed to load lease")?
-        .ok_or_else(|| anyhow::anyhow!("lease {} not found", args.lease_id))?;
+async fn cmd_close(args: LeaseCloseArgs) -> anyhow::Result<()> {
+    let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+    let response = match client
+        .close_lease(runtime_v2::CloseLeaseRequest {
+            lease_id: args.lease_id.clone(),
+            metadata: None,
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(DaemonClientError::Grpc(status)) if status.code() == Code::NotFound => {
+            bail!("lease {} not found", args.lease_id)
+        }
+        Err(error) => return Err(anyhow!(error).context("failed to close lease via daemon")),
+    };
 
-    if lease.state == LeaseState::Closed {
-        println!("Lease {} is already closed.", args.lease_id);
-        return Ok(());
-    }
-
-    lease
-        .transition_to(LeaseState::Closed)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    store.save_lease(&lease).context("failed to save lease")?;
-
-    println!("Lease {} closed.", args.lease_id);
+    let payload = response
+        .lease
+        .ok_or_else(|| anyhow!("daemon returned missing lease payload"))?;
+    let state = if payload.state.trim().is_empty() {
+        "unknown"
+    } else {
+        payload.state.as_str()
+    };
+    println!("Lease {} state: {}.", payload.lease_id, state);
 
     Ok(())
 }

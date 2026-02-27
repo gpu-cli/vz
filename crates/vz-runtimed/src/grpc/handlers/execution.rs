@@ -1,20 +1,14 @@
 use super::super::*;
 
-fn open_stack_store(daemon: &RuntimeDaemon) -> Result<vz_stack::StateStore, StackError> {
-    vz_stack::StateStore::open_with_pragmas(
-        daemon.state_store_path(),
-        vz_stack::StateStorePragmas::daemon_defaults(),
-    )
-}
-
 fn resolve_inherited_exec_pty(
     daemon: &RuntimeDaemon,
     container_id: &str,
 ) -> Result<bool, StackError> {
-    let store = open_stack_store(daemon)?;
-    Ok(store
-        .resolve_service_tty_for_container(container_id)?
-        .unwrap_or(false))
+    daemon.with_state_store(|store| {
+        Ok(store
+            .resolve_service_exec_pty_default_for_container(container_id)?
+            .unwrap_or(false))
+    })
 }
 
 fn resolve_exec_pty_mode(
@@ -181,12 +175,12 @@ fn update_execution_running(
                     .map_err(|error| execution_transition_stack_error(error.to_string()))?;
                 store.with_immediate_transaction(|tx| {
                     tx.save_execution(&execution)?;
-                    let _ = tx.emit_event(
+                    tx.emit_event(
                         "api",
                         &StackEvent::ExecutionRunning {
                             execution_id: execution.execution_id.clone(),
                         },
-                    );
+                    )?;
                     Ok(())
                 })?;
                 Ok(Some(execution))
@@ -231,16 +225,16 @@ fn update_execution_terminal(
             tx.save_execution(&execution)?;
             match target_state {
                 ExecutionState::Exited => {
-                    let _ = tx.emit_event(
+                    tx.emit_event(
                         "api",
                         &StackEvent::ExecutionExited {
                             execution_id: execution.execution_id.clone(),
                             exit_code: exit_code.unwrap_or_default(),
                         },
-                    );
+                    )?;
                 }
                 ExecutionState::Failed => {
-                    let _ = tx.emit_event(
+                    tx.emit_event(
                         "api",
                         &StackEvent::ExecutionFailed {
                             execution_id: execution.execution_id.clone(),
@@ -248,15 +242,15 @@ fn update_execution_terminal(
                                 .clone()
                                 .unwrap_or_else(|| "execution failed".to_string()),
                         },
-                    );
+                    )?;
                 }
                 ExecutionState::Canceled => {
-                    let _ = tx.emit_event(
+                    tx.emit_event(
                         "api",
                         &StackEvent::ExecutionCanceled {
                             execution_id: execution.execution_id.clone(),
                         },
-                    );
+                    )?;
                 }
                 ExecutionState::Queued | ExecutionState::Running => {}
             }
@@ -404,6 +398,10 @@ fn maybe_spawn_execution_task(
     if !should_start_execution_task(daemon.as_ref(), execution)
         .map_err(|error| status_from_stack_error(error, request_id))?
     {
+        match daemon.execution_sessions().remove(&execution.execution_id) {
+            Ok(()) | Err(crate::ExecutionSessionRegistryError::NotFound { .. }) => {}
+            Err(error) => return Err(session_registry_status(error, request_id)),
+        }
         return Ok(());
     }
 
@@ -453,6 +451,12 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
             .request_id
             .clone()
             .unwrap_or_else(generate_request_id);
+        enforce_mutation_policy_preflight(
+            self.daemon.as_ref(),
+            RuntimeOperation::ExecContainer,
+            &metadata,
+            &request_id,
+        )?;
         let idempotency_key = metadata.idempotency_key.clone();
         let normalized_idempotency_key = normalize_idempotency_key(idempotency_key.as_deref());
 
@@ -520,6 +524,13 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
         let persist_result = self.daemon.with_state_store(|store| {
             store.with_immediate_transaction(|tx| {
                 tx.save_execution(&execution)?;
+                tx.emit_event(
+                    "api",
+                    &StackEvent::ExecutionQueued {
+                        container_id: execution.container_id.clone(),
+                        execution_id: execution.execution_id.clone(),
+                    },
+                )?;
                 tx.save_receipt(&Receipt {
                     receipt_id: receipt_id.clone(),
                     operation: "create_execution".to_string(),
@@ -528,7 +539,11 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
                     request_id: request_id.clone(),
                     status: "success".to_string(),
                     created_at: now,
-                    metadata: serde_json::json!({}),
+                    metadata: receipt_idempotent_mutation_metadata(
+                        "execution_queued",
+                        request_hash.as_str(),
+                        normalized_idempotency_key,
+                    )?,
                 })?;
                 if let Some(key) = normalized_idempotency_key {
                     tx.save_idempotency_result(&IdempotencyRecord {
@@ -600,7 +615,6 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
             .request_id
             .clone()
             .unwrap_or_else(generate_request_id);
-
         let execution = self
             .daemon
             .with_state_store(|store| store.load_execution(&request.execution_id))
@@ -657,6 +671,12 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
             .request_id
             .clone()
             .unwrap_or_else(generate_request_id);
+        enforce_mutation_policy_preflight(
+            self.daemon.as_ref(),
+            RuntimeOperation::CancelExec,
+            &metadata,
+            &request_id,
+        )?;
 
         let mut execution = self
             .daemon
@@ -726,12 +746,12 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
             .with_state_store(|store| {
                 store.with_immediate_transaction(|tx| {
                     tx.save_execution(&execution)?;
-                    let _ = tx.emit_event(
+                    tx.emit_event(
                         "api",
                         &StackEvent::ExecutionCanceled {
                             execution_id: execution.execution_id.clone(),
                         },
-                    );
+                    )?;
                     tx.save_receipt(&Receipt {
                         receipt_id: receipt_id.clone(),
                         operation: "cancel_execution".to_string(),
@@ -740,7 +760,7 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
                         request_id: request_id.clone(),
                         status: "success".to_string(),
                         created_at: now,
-                        metadata: serde_json::json!({}),
+                        metadata: receipt_event_metadata("execution_canceled")?,
                     })?;
                     Ok(())
                 })
@@ -873,6 +893,12 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
             .request_id
             .clone()
             .unwrap_or_else(generate_request_id);
+        enforce_mutation_policy_preflight(
+            self.daemon.as_ref(),
+            RuntimeOperation::WriteExecStdin,
+            &metadata,
+            &request_id,
+        )?;
         let execution_id = request.execution_id.trim().to_string();
         if execution_id.is_empty() {
             return Err(status_from_machine_error(MachineError::new(
@@ -918,10 +944,40 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
             .await
             .map_err(|error| runtime_operation_status(error, "write_exec_stdin", &request_id))?;
 
-        Ok(Response::new(runtime_v2::ExecutionResponse {
+        let now = current_unix_secs();
+        let receipt_id = generate_receipt_id();
+        self.daemon
+            .with_state_store(|store| {
+                store.with_immediate_transaction(|tx| {
+                    tx.emit_event(
+                        "api",
+                        &StackEvent::ExecutionRunning {
+                            execution_id: execution_id.clone(),
+                        },
+                    )?;
+                    tx.save_receipt(&Receipt {
+                        receipt_id: receipt_id.clone(),
+                        operation: "write_exec_stdin".to_string(),
+                        entity_id: execution.execution_id.clone(),
+                        entity_type: "execution".to_string(),
+                        request_id: request_id.clone(),
+                        status: "success".to_string(),
+                        created_at: now,
+                        metadata: receipt_execution_stdin_metadata(request.data.len())?,
+                    })?;
+                    Ok(())
+                })
+            })
+            .map_err(|error| status_from_stack_error(error, &request_id))?;
+
+        let mut response = Response::new(runtime_v2::ExecutionResponse {
             request_id,
             execution: Some(execution_to_proto_payload(&execution)),
-        }))
+        });
+        if let Ok(value) = MetadataValue::try_from(receipt_id.as_str()) {
+            response.metadata_mut().insert("x-receipt-id", value);
+        }
+        Ok(response)
     }
 
     async fn resize_exec_pty(
@@ -935,6 +991,12 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
             .request_id
             .clone()
             .unwrap_or_else(generate_request_id);
+        enforce_mutation_policy_preflight(
+            self.daemon.as_ref(),
+            RuntimeOperation::ResizeExecPty,
+            &metadata,
+            &request_id,
+        )?;
 
         let execution_id = request.execution_id.trim().to_string();
         if execution_id.is_empty() {
@@ -963,6 +1025,14 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
             return Err(status_from_machine_error(MachineError::new(
                 MachineErrorCode::StateConflict,
                 format!("execution {execution_id} is not running"),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+        if !execution.exec_spec.pty {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::UnsupportedOperation,
+                format!("execution PTY is disabled for {execution_id}"),
                 Some(request_id),
                 BTreeMap::new(),
             )));
@@ -1005,21 +1075,42 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
             .await
             .map_err(|error| runtime_operation_status(error, "resize_exec_pty", &request_id))?;
 
-        let _ = self.daemon.with_state_store(|store| {
-            store.emit_event(
-                "api",
-                &StackEvent::ExecutionResized {
-                    execution_id: execution_id.clone(),
-                    cols,
-                    rows,
-                },
-            )
-        });
+        let now = current_unix_secs();
+        let receipt_id = generate_receipt_id();
+        self.daemon
+            .with_state_store(|store| {
+                store.with_immediate_transaction(|tx| {
+                    tx.emit_event(
+                        "api",
+                        &StackEvent::ExecutionResized {
+                            execution_id: execution_id.clone(),
+                            cols,
+                            rows,
+                        },
+                    )?;
+                    tx.save_receipt(&Receipt {
+                        receipt_id: receipt_id.clone(),
+                        operation: "resize_exec_pty".to_string(),
+                        entity_id: execution.execution_id.clone(),
+                        entity_type: "execution".to_string(),
+                        request_id: request_id.clone(),
+                        status: "success".to_string(),
+                        created_at: now,
+                        metadata: receipt_execution_resized_metadata(cols, rows)?,
+                    })?;
+                    Ok(())
+                })
+            })
+            .map_err(|error| status_from_stack_error(error, &request_id))?;
 
-        Ok(Response::new(runtime_v2::ExecutionResponse {
+        let mut response = Response::new(runtime_v2::ExecutionResponse {
             request_id,
             execution: Some(execution_to_proto_payload(&execution)),
-        }))
+        });
+        if let Ok(value) = MetadataValue::try_from(receipt_id.as_str()) {
+            response.metadata_mut().insert("x-receipt-id", value);
+        }
+        Ok(response)
     }
 
     async fn signal_exec(
@@ -1033,6 +1124,12 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
             .request_id
             .clone()
             .unwrap_or_else(generate_request_id);
+        enforce_mutation_policy_preflight(
+            self.daemon.as_ref(),
+            RuntimeOperation::SignalExec,
+            &metadata,
+            &request_id,
+        )?;
 
         let execution_id = request.execution_id.trim().to_string();
         if execution_id.is_empty() {
@@ -1095,19 +1192,40 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
             .await
             .map_err(|error| runtime_operation_status(error, "signal_exec", &request_id))?;
 
-        let _ = self.daemon.with_state_store(|store| {
-            store.emit_event(
-                "api",
-                &StackEvent::ExecutionSignaled {
-                    execution_id: execution_id.clone(),
-                    signal: signal.clone(),
-                },
-            )
-        });
+        let now = current_unix_secs();
+        let receipt_id = generate_receipt_id();
+        self.daemon
+            .with_state_store(|store| {
+                store.with_immediate_transaction(|tx| {
+                    tx.emit_event(
+                        "api",
+                        &StackEvent::ExecutionSignaled {
+                            execution_id: execution_id.clone(),
+                            signal: signal.clone(),
+                        },
+                    )?;
+                    tx.save_receipt(&Receipt {
+                        receipt_id: receipt_id.clone(),
+                        operation: "signal_exec".to_string(),
+                        entity_id: execution.execution_id.clone(),
+                        entity_type: "execution".to_string(),
+                        request_id: request_id.clone(),
+                        status: "success".to_string(),
+                        created_at: now,
+                        metadata: receipt_execution_signaled_metadata(signal.as_str())?,
+                    })?;
+                    Ok(())
+                })
+            })
+            .map_err(|error| status_from_stack_error(error, &request_id))?;
 
-        Ok(Response::new(runtime_v2::ExecutionResponse {
+        let mut response = Response::new(runtime_v2::ExecutionResponse {
             request_id,
             execution: Some(execution_to_proto_payload(&execution)),
-        }))
+        });
+        if let Ok(value) = MetadataValue::try_from(receipt_id.as_str()) {
+            response.metadata_mut().insert("x-receipt-id", value);
+        }
+        Ok(response)
     }
 }

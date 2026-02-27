@@ -437,6 +437,7 @@ impl AgentServiceImpl {
         // Spawn blocking reader task. portable-pty gives us a synchronous Read,
         // so we read in a blocking thread and forward chunks as exec events.
         let reader_exec_id = exec_id;
+        let (reader_done_tx, mut reader_done_rx) = tokio::sync::oneshot::channel::<()>();
         let pty_reader_handle = tokio::task::spawn_blocking(move || {
             let mut buf = vec![0u8; 65536];
             loop {
@@ -469,14 +470,50 @@ impl AgentServiceImpl {
                     }
                 }
             }
+            let _ = reader_done_tx.send(());
         });
 
         // Spawn exit watcher for the PTY session.
         let exit_table = self.state.process_table.clone();
         tokio::spawn(async move {
-            let exit_code = {
+            let child = {
                 let mut table = exit_table.lock().await;
-                table.wait_pty(exec_id).await
+                table.take_pty(exec_id)
+            };
+
+            let mut wait_handle = child.map(|mut child| {
+                tokio::task::spawn_blocking(move || match child.wait() {
+                    Ok(status) => status.exit_code() as i32,
+                    Err(_) => -1,
+                })
+            });
+
+            let exit_code = if let Some(wait_handle) = wait_handle.as_mut() {
+                tokio::select! {
+                    result = &mut *wait_handle => {
+                        result.unwrap_or(-1)
+                    }
+                    _ = &mut reader_done_rx => {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            &mut *wait_handle,
+                        )
+                        .await
+                        {
+                            Ok(result) => result.unwrap_or(-1),
+                            Err(_) => {
+                                warn!(
+                                    exec_id,
+                                    "grpc: pty reader closed but wait() did not resolve; forcing exit event"
+                                );
+                                wait_handle.abort();
+                                -1
+                            }
+                        }
+                    }
+                }
+            } else {
+                -1
             };
 
             // Brief window for remaining PTY output.

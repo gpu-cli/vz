@@ -1,17 +1,17 @@
 #![allow(dead_code)]
 
 use super::{
-    ApiEventRecord, BuildListResponse, BuildPayload, BuildResponse, CapabilitiesResponse,
-    CheckpointListResponse, CheckpointPayload, CheckpointResponse, ContainerListResponse,
-    ContainerPayload, ContainerResponse, CreateCheckpointRequest, CreateContainerRequest,
+    BuildListResponse, BuildResponse, CapabilitiesResponse, CheckpointListResponse,
+    CheckpointResponse, ChmodPathRequest, ChownPathRequest, ContainerListResponse,
+    ContainerResponse, CopyPathRequest, CreateCheckpointRequest, CreateContainerRequest,
     CreateExecutionRequest, CreateSandboxRequest, ErrorResponse, EventsResponse,
-    ExecutionListResponse, ExecutionPayload, ExecutionResponse, ForkCheckpointRequest,
-    ImageListResponse, ImagePayload, ImageResponse, LeaseListResponse, LeasePayload, LeaseResponse,
-    OpenLeaseRequest, ReceiptPayload, ReceiptResponse, ResizeExecRequest,
-    RestoreCheckpointResponse, SandboxListResponse, SandboxPayload, SandboxResponse,
-    SignalExecRequest, StartBuildRequest, WriteExecStdinRequest,
+    ExecutionListResponse, ExecutionResponse, FileMutationResponse, ForkCheckpointRequest,
+    ImageListResponse, ImageResponse, LeaseListResponse, LeaseResponse, ListFilesRequest,
+    ListFilesResponse, MakeDirRequest, MovePathRequest, OpenLeaseRequest, ReadFileRequest,
+    ReadFileResponse, ReceiptResponse, RemovePathRequest, ResizeExecRequest,
+    RestoreCheckpointResponse, SandboxListResponse, SandboxResponse, SignalExecRequest,
+    StartBuildRequest, WriteExecStdinRequest, WriteFileRequest, WriteFileResponse,
 };
-use serde_json::json;
 use utoipa::OpenApi;
 
 const API_DESCRIPTION: &str = "Container runtime API with sandbox lifecycle, lease management, execution dispatch, checkpoint/restore, and real-time event streaming via SSE and WebSocket.";
@@ -612,11 +612,178 @@ fn cancel_build() {}
 )]
 fn get_receipt() {}
 
+#[utoipa::path(
+    post,
+    path = "/v1/files/read",
+    operation_id = "readFile",
+    summary = "Read file content from a sandbox filesystem",
+    request_body = ReadFileRequest,
+    responses(
+        (status = 200, description = "File content", body = ReadFileResponse),
+        (status = 400, description = "Invalid request body", body = ErrorResponse),
+        (status = 404, description = "Sandbox or path not found", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn read_file() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/files/write",
+    operation_id = "writeFile",
+    summary = "Write file content into a sandbox filesystem",
+    params(
+        ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY_KEY_DESCRIPTION),
+        ("X-Request-Id" = Option<String>, Header, description = REQUEST_ID_DESCRIPTION),
+    ),
+    request_body = WriteFileRequest,
+    responses(
+        (status = 200, description = "File written", body = WriteFileResponse),
+        (status = 400, description = "Invalid request body", body = ErrorResponse),
+        (status = 404, description = "Sandbox or path not found", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn write_file() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/files/list",
+    operation_id = "listFiles",
+    summary = "List files under a sandbox path",
+    request_body = ListFilesRequest,
+    responses(
+        (status = 200, description = "File list", body = ListFilesResponse),
+        (status = 400, description = "Invalid request body", body = ErrorResponse),
+        (status = 404, description = "Sandbox or path not found", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn list_files() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/files/mkdir",
+    operation_id = "makeDir",
+    summary = "Create a directory in a sandbox filesystem",
+    params(
+        ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY_KEY_DESCRIPTION),
+        ("X-Request-Id" = Option<String>, Header, description = REQUEST_ID_DESCRIPTION),
+    ),
+    request_body = MakeDirRequest,
+    responses(
+        (status = 200, description = "Directory created", body = FileMutationResponse),
+        (status = 400, description = "Invalid request body", body = ErrorResponse),
+        (status = 404, description = "Sandbox or path not found", body = ErrorResponse),
+        (status = 409, description = "State conflict", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn make_dir() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/files/remove",
+    operation_id = "removePath",
+    summary = "Remove a file or directory in a sandbox filesystem",
+    params(
+        ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY_KEY_DESCRIPTION),
+        ("X-Request-Id" = Option<String>, Header, description = REQUEST_ID_DESCRIPTION),
+    ),
+    request_body = RemovePathRequest,
+    responses(
+        (status = 200, description = "Path removed", body = FileMutationResponse),
+        (status = 400, description = "Invalid request body", body = ErrorResponse),
+        (status = 404, description = "Sandbox or path not found", body = ErrorResponse),
+        (status = 409, description = "State conflict", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn remove_path() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/files/move",
+    operation_id = "movePath",
+    summary = "Move or rename a path in a sandbox filesystem",
+    params(
+        ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY_KEY_DESCRIPTION),
+        ("X-Request-Id" = Option<String>, Header, description = REQUEST_ID_DESCRIPTION),
+    ),
+    request_body = MovePathRequest,
+    responses(
+        (status = 200, description = "Path moved", body = FileMutationResponse),
+        (status = 400, description = "Invalid request body", body = ErrorResponse),
+        (status = 404, description = "Sandbox or path not found", body = ErrorResponse),
+        (status = 409, description = "State conflict", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn move_path() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/files/copy",
+    operation_id = "copyPath",
+    summary = "Copy a path in a sandbox filesystem",
+    params(
+        ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY_KEY_DESCRIPTION),
+        ("X-Request-Id" = Option<String>, Header, description = REQUEST_ID_DESCRIPTION),
+    ),
+    request_body = CopyPathRequest,
+    responses(
+        (status = 200, description = "Path copied", body = FileMutationResponse),
+        (status = 400, description = "Invalid request body", body = ErrorResponse),
+        (status = 404, description = "Sandbox or path not found", body = ErrorResponse),
+        (status = 409, description = "State conflict", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn copy_path() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/files/chmod",
+    operation_id = "chmodPath",
+    summary = "Change mode bits for a sandbox path",
+    params(
+        ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY_KEY_DESCRIPTION),
+        ("X-Request-Id" = Option<String>, Header, description = REQUEST_ID_DESCRIPTION),
+    ),
+    request_body = ChmodPathRequest,
+    responses(
+        (status = 200, description = "Mode updated", body = FileMutationResponse),
+        (status = 400, description = "Invalid request body", body = ErrorResponse),
+        (status = 404, description = "Sandbox or path not found", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn chmod_path() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/files/chown",
+    operation_id = "chownPath",
+    summary = "Change owner/group for a sandbox path",
+    params(
+        ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY_KEY_DESCRIPTION),
+        ("X-Request-Id" = Option<String>, Header, description = REQUEST_ID_DESCRIPTION),
+    ),
+    request_body = ChownPathRequest,
+    responses(
+        (status = 200, description = "Owner updated", body = FileMutationResponse),
+        (status = 400, description = "Invalid request body", body = ErrorResponse),
+        (status = 404, description = "Sandbox or path not found", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn chown_path() {}
+
 include!(concat!(env!("OUT_DIR"), "/openapi_doc_generated.rs"));
 
 pub fn openapi_document() -> serde_json::Value {
     match serde_json::to_value(ApiDoc::openapi()) {
         Ok(value) => value,
-        Err(_) => json!({}),
+        Err(_) => serde_json::Value::Object(serde_json::Map::new()),
     }
 }

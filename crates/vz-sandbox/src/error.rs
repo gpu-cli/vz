@@ -6,6 +6,10 @@ use std::time::Duration;
 /// Errors from sandbox pool and session operations.
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
+    /// Sandbox image path is missing from configuration.
+    #[error("sandbox config image_path cannot be empty")]
+    ImagePathEmpty,
+
     /// Command execution timed out.
     #[error("exec timed out after {0:?}")]
     ExecTimeout(Duration),
@@ -106,6 +110,12 @@ mod tests {
     fn exec_timeout_display() {
         let err = SandboxError::ExecTimeout(Duration::from_secs(30));
         assert_eq!(err.to_string(), "exec timed out after 30s");
+    }
+
+    #[test]
+    fn image_path_empty_display() {
+        let err = SandboxError::ImagePathEmpty;
+        assert_eq!(err.to_string(), "sandbox config image_path cannot be empty");
     }
 
     #[test]

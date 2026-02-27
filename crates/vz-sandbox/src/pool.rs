@@ -62,6 +62,12 @@ pub struct SandboxConfig {
     /// Default timeout for exec calls. None = no timeout.
     /// Can be overridden per-exec.
     pub default_exec_timeout: Option<Duration>,
+
+    /// Default startup image reference for sandbox workloads.
+    pub base_image_ref: Option<String>,
+
+    /// Main workload/container identifier for sandbox startup.
+    pub main_container: Option<String>,
 }
 
 impl Default for SandboxConfig {
@@ -77,6 +83,8 @@ impl Default for SandboxConfig {
             isolation: IsolationMode::RestoreOnAcquire,
             network: NetworkPolicy::None,
             default_exec_timeout: None,
+            base_image_ref: None,
+            main_container: None,
         }
     }
 }
@@ -131,6 +139,8 @@ const MAX_POOL_SIZE: u8 = 2;
 const MAX_RECONNECT_ATTEMPTS: u32 = 3;
 /// Default on-disk checkpoint lineage file extension.
 const CHECKPOINT_LINEAGE_EXTENSION: &str = "checkpoint-lineage.json";
+const STARTUP_ENV_BASE_IMAGE_REF: &str = "VZ_SANDBOX_BASE_IMAGE_REF";
+const STARTUP_ENV_MAIN_CONTAINER: &str = "VZ_SANDBOX_MAIN_CONTAINER";
 
 /// A single entry in the VM pool.
 struct PoolEntry {
@@ -163,6 +173,10 @@ impl SandboxPool {
     /// If `state_path` is set in config, VMs restore from saved state (~5-10s).
     /// Otherwise, VMs cold boot (~30-60s).
     pub async fn new(config: SandboxConfig, pool_size: u8) -> Result<Self, SandboxError> {
+        if config.image_path.as_os_str().is_empty() {
+            return Err(SandboxError::ImagePathEmpty);
+        }
+
         let actual_size = pool_size.min(MAX_POOL_SIZE) as usize;
         let checkpoint_catalog_path = Self::checkpoint_catalog_path(&config);
         let checkpoint_lineage = Self::load_checkpoint_lineage(&checkpoint_catalog_path)?;
@@ -305,6 +319,7 @@ impl SandboxPool {
             slot_index,
             guest_project_path,
             self.config.default_exec_timeout,
+            self.startup_exec_env(),
             grpc,
         ))
     }
@@ -767,6 +782,30 @@ impl SandboxPool {
         let seq = self.lease_counter.fetch_add(1, Ordering::Relaxed) + 1;
         format!("lease-{slot_index}-{seq}")
     }
+
+    fn startup_exec_env(&self) -> Vec<(String, String)> {
+        let mut env = Vec::new();
+
+        if let Some(base_image_ref) = self.config.base_image_ref.as_deref().map(str::trim)
+            && !base_image_ref.is_empty()
+        {
+            env.push((
+                STARTUP_ENV_BASE_IMAGE_REF.to_string(),
+                base_image_ref.to_string(),
+            ));
+        }
+
+        if let Some(main_container) = self.config.main_container.as_deref().map(str::trim)
+            && !main_container.is_empty()
+        {
+            env.push((
+                STARTUP_ENV_MAIN_CONTAINER.to_string(),
+                main_container.to_string(),
+            ));
+        }
+
+        env
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -842,6 +881,8 @@ mod tests {
             isolation: IsolationMode::Reuse,
             network: NetworkPolicy::None,
             default_exec_timeout: None,
+            base_image_ref: None,
+            main_container: None,
         }
     }
 
@@ -990,6 +1031,35 @@ mod tests {
         assert_eq!(config.network, NetworkPolicy::None);
         assert!(config.checkpoint_catalog_path.is_none());
         assert!(config.default_exec_timeout.is_none());
+        assert!(config.base_image_ref.is_none());
+        assert!(config.main_container.is_none());
+    }
+
+    #[tokio::test]
+    async fn pool_creation_rejects_empty_image_path() {
+        let mut config = test_config();
+        config.image_path = PathBuf::new();
+        let result = SandboxPool::new(config, 1).await;
+        assert!(matches!(result, Err(SandboxError::ImagePathEmpty)));
+    }
+
+    #[tokio::test]
+    async fn startup_exec_env_includes_configured_startup_selection() {
+        let mut config = test_config();
+        config.base_image_ref = Some("alpine:3.20".to_string());
+        config.main_container = Some("workspace-main".to_string());
+
+        let pool = SandboxPool::new(config, 1).await.unwrap();
+        let env = pool.startup_exec_env();
+        assert_eq!(env.len(), 2);
+        assert!(env.contains(&(
+            STARTUP_ENV_BASE_IMAGE_REF.to_string(),
+            "alpine:3.20".to_string(),
+        )));
+        assert!(env.contains(&(
+            STARTUP_ENV_MAIN_CONTAINER.to_string(),
+            "workspace-main".to_string(),
+        )));
     }
 
     #[tokio::test]

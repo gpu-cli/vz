@@ -27,6 +27,10 @@ pub struct LinuxVmConfig {
     pub rootfs_dir: Option<PathBuf>,
     /// Optional file path for guest serial console output.
     pub serial_log_file: Option<PathBuf>,
+    /// Opaque machine identifier payload for generic Linux platform config.
+    ///
+    /// Persist this across boots when using VM save/restore snapshots.
+    pub machine_identifier: Option<Vec<u8>>,
     /// Enable vsock.
     pub vsock: bool,
     /// Optional network config.
@@ -74,6 +78,13 @@ impl LinuxVmConfig {
         if self.memory_mb == 0 {
             return Err(LinuxError::InvalidConfig(
                 "memory_mb must be greater than 0".to_string(),
+            ));
+        }
+        if let Some(machine_identifier) = &self.machine_identifier
+            && machine_identifier.is_empty()
+        {
+            return Err(LinuxError::InvalidConfig(
+                "machine_identifier must not be empty".to_string(),
             ));
         }
         if !self.kernel.exists() {
@@ -154,6 +165,9 @@ impl LinuxVmConfig {
         if let Some(serial_log_file) = &self.serial_log_file {
             builder = builder.serial_log_file(serial_log_file.clone());
         }
+        if let Some(machine_identifier) = &self.machine_identifier {
+            builder = builder.generic_machine_identifier(machine_identifier.clone());
+        }
 
         if self.vsock {
             builder = builder.enable_vsock();
@@ -182,6 +196,7 @@ impl Default for LinuxVmConfig {
             shared_dirs: Vec::new(),
             rootfs_dir: None,
             serial_log_file: None,
+            machine_identifier: None,
             vsock: true,
             network: None,
             disk_image: None,

@@ -24,6 +24,7 @@ mod state_store;
 mod volume;
 
 pub use compose::{
+    ComposeBuildSpec, collect_compose_build_specs, collect_compose_build_specs_with_dir,
     expand_variables, parse_compose, parse_compose_with_dir, parse_env_file_content,
 };
 pub use convert::service_to_run_config;
@@ -59,7 +60,7 @@ pub use spec::{
 pub use state_store::{
     AllocatorSnapshot, DriftFinding, DriftSeverity, IDEMPOTENCY_TTL_SECS, IdempotencyRecord,
     ImageRecord, Receipt, ReconcileAuditEntry, ReconcileSession, ReconcileSessionStatus,
-    ServiceObservedState, ServicePhase, StateStore,
+    ServiceObservedState, ServicePhase, StateStore, StateStorePragmas,
 };
 pub use volume::{
     ResolvedMount, ResolvedMountKind, SkippedMount, VolumeManager, mounts_changed,

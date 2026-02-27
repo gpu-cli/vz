@@ -96,6 +96,25 @@ impl LinuxVm {
             .await
     }
 
+    /// Restore from a saved snapshot and wait until guest agent is reachable.
+    ///
+    /// Intended for sandbox re-attach flows where a previous VM session
+    /// checkpoint was persisted on detach.
+    pub async fn restore_and_wait_for_agent(
+        &self,
+        path: &Path,
+        timeout: Duration,
+    ) -> Result<Duration, LinuxError> {
+        let started = Instant::now();
+        self.vm.restore_state(path).await?;
+        self.vm.resume().await?;
+        let mut grpc = self.grpc.lock().await;
+        *grpc = None;
+        drop(grpc);
+        self.wait_for_agent(timeout).await?;
+        Ok(started.elapsed())
+    }
+
     /// Start the VM and wait for agent readiness, reporting retry progress.
     pub async fn start_and_wait_for_agent_with_progress<F>(
         &self,

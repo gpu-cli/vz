@@ -1,0 +1,26 @@
+[package]
+name = "vz-runtimed-client"
+version = "0.1.0"
+description = "Reusable Runtime V2 daemon client over UDS gRPC with connect/spawn/handshake lifecycle."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hyper-util = { workspace = true, features = ["tokio"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "time"] }
+tonic = { workspace = true }
+tower = { workspace = true }
+vz-runtime-contract = { workspace = true }
+vz-runtime-proto = { workspace = true }
+vz-runtime-translate = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+vz-runtimed = { workspace = true }
+
+[lints]
+workspace = true

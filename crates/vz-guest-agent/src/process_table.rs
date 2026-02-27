@@ -90,12 +90,17 @@ impl ProcessTable {
         self.pty_children.insert(exec_id, child);
     }
 
+    /// Remove and return a PTY child process handle.
+    pub fn take_pty(&mut self, exec_id: u64) -> Option<Box<dyn portable_pty::Child + Send>> {
+        self.pty_children.remove(&exec_id)
+    }
+
     /// Wait for a PTY child to exit, returning its exit code.
     ///
     /// Must be called from an async context — internally uses `spawn_blocking`
     /// since portable-pty's `Child::wait` is synchronous.
     pub async fn wait_pty(&mut self, exec_id: u64) -> i32 {
-        let Some(mut child) = self.pty_children.remove(&exec_id) else {
+        let Some(mut child) = self.take_pty(exec_id) else {
             return -1;
         };
         // portable-pty Child::wait() is blocking, run on a thread.

@@ -1,16 +1,19 @@
 //! `vz build-mgmt` -- build entity lifecycle management commands.
 //!
 //! Provides `list`, `inspect`, and `cancel` subcommands backed by the
-//! `vz-stack` state store for build persistence.
+//! runtime daemon control plane.
 
 #![allow(clippy::print_stdout)]
 
 use std::path::PathBuf;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use clap::{Args, Subcommand};
-use vz_runtime_contract::BuildState;
-use vz_stack::StateStore;
+use tonic::Code;
+use vz_runtime_proto::runtime_v2;
+use vz_runtimed_client::DaemonClientError;
+
+use super::runtime_daemon::connect_control_plane_for_state_db;
 
 /// Manage asynchronous build operations.
 #[derive(Args, Debug)]
@@ -72,25 +75,46 @@ pub struct BuildMgmtCancelArgs {
 /// Run the build management subcommand.
 pub async fn run(args: BuildMgmtArgs) -> anyhow::Result<()> {
     match args.action {
-        BuildMgmtCommand::List(list_args) => cmd_list(list_args),
-        BuildMgmtCommand::Inspect(inspect_args) => cmd_inspect(inspect_args),
-        BuildMgmtCommand::Cancel(cancel_args) => cmd_cancel(cancel_args),
+        BuildMgmtCommand::List(list_args) => cmd_list(list_args).await,
+        BuildMgmtCommand::Inspect(inspect_args) => cmd_inspect(inspect_args).await,
+        BuildMgmtCommand::Cancel(cancel_args) => cmd_cancel(cancel_args).await,
     }
 }
 
-fn cmd_list(args: BuildMgmtListArgs) -> anyhow::Result<()> {
-    let store = StateStore::open(&args.state_db).context("failed to open state store")?;
+fn build_json(payload: &runtime_v2::BuildPayload) -> serde_json::Value {
+    serde_json::json!({
+        "build_id": payload.build_id,
+        "sandbox_id": payload.sandbox_id,
+        "state": payload.state,
+        "result_digest": if payload.result_digest.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(payload.result_digest.clone())
+        },
+        "started_at": payload.started_at,
+        "ended_at": if payload.ended_at == 0 {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::Number(payload.ended_at.into())
+        },
+    })
+}
 
-    let builds = if let Some(ref sandbox_id) = args.sandbox_id {
-        store
-            .list_builds_for_sandbox(sandbox_id)
-            .context("failed to list builds for sandbox")?
-    } else {
-        store.list_builds().context("failed to list builds")?
-    };
+async fn cmd_list(args: BuildMgmtListArgs) -> anyhow::Result<()> {
+    let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+    let mut builds = client
+        .list_builds(runtime_v2::ListBuildsRequest { metadata: None })
+        .await
+        .context("failed to list builds via daemon")?
+        .builds;
+
+    if let Some(sandbox_id) = args.sandbox_id.as_deref() {
+        builds.retain(|build| build.sandbox_id == sandbox_id);
+    }
 
     if args.json {
-        let json = serde_json::to_string_pretty(&builds).context("failed to serialize builds")?;
+        let payload: Vec<_> = builds.iter().map(build_json).collect();
+        let json = serde_json::to_string_pretty(&payload).context("failed to serialize builds")?;
         println!("{json}");
         return Ok(());
     }
@@ -101,77 +125,90 @@ fn cmd_list(args: BuildMgmtListArgs) -> anyhow::Result<()> {
     }
 
     println!(
-        "{:<40} {:<20} {:<12} {:<20} {:<12}",
-        "BUILD ID", "SANDBOX ID", "STATE", "CONTEXT", "DIGEST"
+        "{:<40} {:<20} {:<12} {:<12} {:<12}",
+        "BUILD ID", "SANDBOX ID", "STATE", "DIGEST", "STARTED"
     );
-    for build in &builds {
-        let state = serde_json::to_string(&build.state)
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string();
-        let context_display = if build.build_spec.context.len() > 18 {
-            format!("{}...", &build.build_spec.context[..15])
+    for payload in &builds {
+        let state = if payload.state.trim().is_empty() {
+            "unknown"
         } else {
-            build.build_spec.context.clone()
+            payload.state.as_str()
         };
-        let digest = build.result_digest.as_deref().unwrap_or("-");
+        let digest = if payload.result_digest.trim().is_empty() {
+            "-"
+        } else {
+            payload.result_digest.as_str()
+        };
         let digest_display = if digest.len() > 10 {
             format!("{}...", &digest[..7])
         } else {
             digest.to_string()
         };
+        let started = if payload.started_at == 0 {
+            "-".to_string()
+        } else {
+            payload.started_at.to_string()
+        };
         println!(
-            "{:<40} {:<20} {:<12} {:<20} {:<12}",
-            build.build_id, build.sandbox_id, state, context_display, digest_display
+            "{:<40} {:<20} {:<12} {:<12} {:<12}",
+            payload.build_id, payload.sandbox_id, state, digest_display, started
         );
     }
 
     Ok(())
 }
 
-fn cmd_inspect(args: BuildMgmtInspectArgs) -> anyhow::Result<()> {
-    let store = StateStore::open(&args.state_db).context("failed to open state store")?;
-    let build = store
-        .load_build(&args.build_id)
-        .context("failed to load build")?;
-
-    match build {
-        Some(b) => {
-            let json = serde_json::to_string_pretty(&b).context("failed to serialize build")?;
-            println!("{json}");
+async fn cmd_inspect(args: BuildMgmtInspectArgs) -> anyhow::Result<()> {
+    let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+    let response = match client
+        .get_build(runtime_v2::GetBuildRequest {
+            build_id: args.build_id.clone(),
+            metadata: None,
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(DaemonClientError::Grpc(status)) if status.code() == Code::NotFound => {
+            bail!("build {} not found", args.build_id)
         }
-        None => bail!("build {} not found", args.build_id),
-    }
+        Err(error) => return Err(anyhow!(error).context("failed to load build via daemon")),
+    };
+
+    let payload = response
+        .build
+        .ok_or_else(|| anyhow!("daemon returned missing build payload"))?;
+    let json =
+        serde_json::to_string_pretty(&build_json(&payload)).context("failed to serialize build")?;
+    println!("{json}");
 
     Ok(())
 }
 
-fn cmd_cancel(args: BuildMgmtCancelArgs) -> anyhow::Result<()> {
-    let store = StateStore::open(&args.state_db).context("failed to open state store")?;
-    let mut build = store
-        .load_build(&args.build_id)
-        .context("failed to load build")?
-        .ok_or_else(|| anyhow::anyhow!("build {} not found", args.build_id))?;
+async fn cmd_cancel(args: BuildMgmtCancelArgs) -> anyhow::Result<()> {
+    let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+    let response = match client
+        .cancel_build(runtime_v2::CancelBuildRequest {
+            build_id: args.build_id.clone(),
+            metadata: None,
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(DaemonClientError::Grpc(status)) if status.code() == Code::NotFound => {
+            bail!("build {} not found", args.build_id)
+        }
+        Err(error) => return Err(anyhow!(error).context("failed to cancel build via daemon")),
+    };
 
-    if build.state.is_terminal() {
-        println!("Build {} is already in terminal state.", args.build_id);
-        return Ok(());
-    }
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    build.ended_at = Some(now);
-
-    build
-        .transition_to(BuildState::Canceled)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    store.save_build(&build).context("failed to save build")?;
-
-    println!("Build {} canceled.", args.build_id);
+    let payload = response
+        .build
+        .ok_or_else(|| anyhow!("daemon returned missing build payload"))?;
+    let state = if payload.state.trim().is_empty() {
+        "unknown"
+    } else {
+        payload.state.as_str()
+    };
+    println!("Build {} state: {}.", payload.build_id, state);
 
     Ok(())
 }

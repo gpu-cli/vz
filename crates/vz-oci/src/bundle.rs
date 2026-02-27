@@ -13,6 +13,8 @@ use crate::error::OciError;
 
 const OCI_ROOTFS_DIRNAME: &str = "rootfs";
 pub const OCI_CONFIG_FILENAME: &str = "config.json";
+const OCI_ANNOTATION_COMPOSE_TTY: &str = "io.vz.compose.tty";
+const OCI_ANNOTATION_COMPOSE_STDIN_OPEN: &str = "io.vz.compose.stdin_open";
 
 /// Mount entry written into an OCI runtime-spec bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +162,12 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
     } else {
         cmd
     };
+    let tty_mode = parse_compose_bool_annotation(&oci_annotations, OCI_ANNOTATION_COMPOSE_TTY)?;
+    let stdin_open =
+        parse_compose_bool_annotation(&oci_annotations, OCI_ANNOTATION_COMPOSE_STDIN_OPEN)?;
+    // OCI does not expose a separate "keep stdin open" toggle. For compose
+    // `stdin_open=true`, allocate a terminal so interactive stdin stays wired.
+    let terminal_mode = tty_mode || stdin_open;
 
     // Ensure PATH is always set (Docker default behavior).
     let has_path = env.iter().any(|(k, _)| k == "PATH");
@@ -186,7 +194,8 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
         .env(env_strings)
         .cwd(cwd.unwrap_or_else(|| "/".to_string()))
         .user(parse_process_user(user.as_deref())?)
-        .capabilities(capabilities);
+        .capabilities(capabilities)
+        .terminal(terminal_mode);
 
     // Add rlimits if specified.
     if !ulimits.is_empty() {
@@ -257,6 +266,26 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
     }
 
     Ok(spec)
+}
+
+fn parse_compose_bool_annotation(
+    annotations: &[(String, String)],
+    key: &str,
+) -> Result<bool, OciError> {
+    let Some((_, raw)) = annotations
+        .iter()
+        .find(|(annotation_key, _)| annotation_key == key)
+    else {
+        return Ok(false);
+    };
+
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(OciError::InvalidConfig(format!(
+            "invalid OCI annotation '{key}={other}'; expected true or false"
+        ))),
+    }
 }
 
 /// Remove the network namespace entry so the container shares the host's
@@ -970,6 +999,144 @@ mod tests {
         assert_eq!(process.user().uid(), 0);
         assert_eq!(process.user().gid(), 0);
         assert_eq!(process.cwd(), &PathBuf::from("/"));
+    }
+
+    #[test]
+    fn compose_tty_annotation_sets_process_terminal_mode() {
+        let spec = build_runtime_spec(
+            BundleSpec {
+                cmd: vec!["/bin/sh".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: Vec::new(),
+                oci_annotations: vec![(OCI_ANNOTATION_COMPOSE_TTY.to_string(), "true".to_string())],
+                network_namespace_path: None,
+                share_host_network: false,
+                cpu_quota: None,
+                cpu_period: None,
+                capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: None,
+                domainname: None,
+            },
+            "/rootfs",
+        )
+        .unwrap();
+
+        let process = spec.process().as_ref().expect("process should exist");
+        assert_eq!(process.terminal(), Some(true));
+    }
+
+    #[test]
+    fn compose_stdin_open_annotation_sets_process_terminal_mode() {
+        let spec = build_runtime_spec(
+            BundleSpec {
+                cmd: vec!["/bin/sh".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: Vec::new(),
+                oci_annotations: vec![(
+                    OCI_ANNOTATION_COMPOSE_STDIN_OPEN.to_string(),
+                    "true".to_string(),
+                )],
+                network_namespace_path: None,
+                share_host_network: false,
+                cpu_quota: None,
+                cpu_period: None,
+                capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: None,
+                domainname: None,
+            },
+            "/rootfs",
+        )
+        .unwrap();
+
+        let process = spec.process().as_ref().expect("process should exist");
+        assert_eq!(process.terminal(), Some(true));
+    }
+
+    #[test]
+    fn compose_tty_annotation_rejects_invalid_boolean() {
+        let error = build_runtime_spec(
+            BundleSpec {
+                cmd: vec!["/bin/sh".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: Vec::new(),
+                oci_annotations: vec![(OCI_ANNOTATION_COMPOSE_TTY.to_string(), "yes".to_string())],
+                network_namespace_path: None,
+                share_host_network: false,
+                cpu_quota: None,
+                cpu_period: None,
+                capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: None,
+                domainname: None,
+            },
+            "/rootfs",
+        )
+        .expect_err("invalid tty annotation should fail");
+
+        let message = error.to_string();
+        assert!(message.contains("expected true or false"));
+    }
+
+    #[test]
+    fn compose_stdin_open_annotation_rejects_invalid_boolean() {
+        let error = build_runtime_spec(
+            BundleSpec {
+                cmd: vec!["/bin/sh".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: Vec::new(),
+                oci_annotations: vec![(
+                    OCI_ANNOTATION_COMPOSE_STDIN_OPEN.to_string(),
+                    "yes".to_string(),
+                )],
+                network_namespace_path: None,
+                share_host_network: false,
+                cpu_quota: None,
+                cpu_period: None,
+                capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: None,
+                domainname: None,
+            },
+            "/rootfs",
+        )
+        .expect_err("invalid stdin_open annotation should fail");
+
+        let message = error.to_string();
+        assert!(message.contains("expected true or false"));
     }
 
     #[test]

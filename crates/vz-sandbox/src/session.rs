@@ -24,6 +24,7 @@ use vz_linux::grpc_client::{ExecOptions, GrpcAgentClient, GrpcExecStream};
 use crate::error::SandboxError;
 
 const DEFAULT_EXEC_USER: &str = "dev";
+const AGENT_UNAVAILABLE_ERROR: &str = "sandbox guest agent unavailable: no gRPC client connected";
 
 // ---------------------------------------------------------------------------
 // SandboxSession
@@ -68,6 +69,8 @@ pub struct SandboxSession {
     guest_project_path: String,
     /// Default timeout for exec calls.
     default_exec_timeout: Option<Duration>,
+    /// Default environment variables included on every exec request.
+    default_env: Vec<(String, String)>,
     /// gRPC agent client (None when no VM is connected, e.g. in tests).
     grpc: Arc<Mutex<Option<GrpcAgentClient>>>,
     /// Active pinned workloads keyed by workload ID.
@@ -81,6 +84,7 @@ impl std::fmt::Debug for SandboxSession {
             .field("slot_index", &self.slot_index)
             .field("guest_project_path", &self.guest_project_path)
             .field("default_exec_timeout", &self.default_exec_timeout)
+            .field("default_env_len", &self.default_env.len())
             .finish()
     }
 }
@@ -92,6 +96,7 @@ impl SandboxSession {
         slot_index: usize,
         guest_project_path: String,
         default_exec_timeout: Option<Duration>,
+        default_env: Vec<(String, String)>,
         grpc: Arc<Mutex<Option<GrpcAgentClient>>>,
     ) -> Self {
         Self {
@@ -99,6 +104,7 @@ impl SandboxSession {
             slot_index,
             guest_project_path,
             default_exec_timeout,
+            default_env,
             grpc,
             pinned_workloads: StdMutex::new(BTreeMap::new()),
         }
@@ -124,6 +130,11 @@ impl SandboxSession {
     /// Get the default exec timeout for this session.
     pub fn default_exec_timeout(&self) -> Option<Duration> {
         self.default_exec_timeout
+    }
+
+    /// Default environment variables injected into every exec request.
+    pub fn default_env(&self) -> &[(String, String)] {
+        &self.default_env
     }
 
     /// Pin a workload to this lease.
@@ -215,7 +226,7 @@ impl SandboxSession {
         if let Some(ref mut client) = *grpc {
             let options = ExecOptions {
                 working_dir: Some(self.guest_project_path.clone()),
-                env: Vec::new(),
+                env: self.default_env.clone(),
                 user: Some(DEFAULT_EXEC_USER.to_string()),
             };
             let stream = client
@@ -224,9 +235,7 @@ impl SandboxSession {
                 .map_err(|e| SandboxError::GrpcError(e.to_string()))?;
             Ok(stream)
         } else {
-            Err(SandboxError::GrpcError(
-                "no gRPC client connected".to_string(),
-            ))
+            Err(SandboxError::GrpcError(AGENT_UNAVAILABLE_ERROR.to_string()))
         }
     }
 
@@ -255,7 +264,7 @@ impl SandboxSession {
         if let Some(ref mut client) = *grpc {
             let options = ExecOptions {
                 working_dir: Some(self.guest_project_path.clone()),
-                env: Vec::new(),
+                env: self.default_env.clone(),
                 user: Some(resolve_exec_user(user).to_string()),
             };
 
@@ -272,13 +281,9 @@ impl SandboxSession {
                     .map_err(|e| SandboxError::GrpcError(e.to_string()))
             }
         } else {
-            // No client available (test mode or VM not connected)
-            debug!("no gRPC client connected, returning empty output");
-            Ok(ExecOutput {
-                exit_code: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-            })
+            // No client available (VM missing/disconnected). Never fake success.
+            debug!("no gRPC client connected, command was not executed");
+            Err(SandboxError::GrpcError(AGENT_UNAVAILABLE_ERROR.to_string()))
         }
     }
 
@@ -324,6 +329,7 @@ mod tests {
             0,
             "/mnt/workspace/my-project".to_string(),
             Some(Duration::from_secs(30)),
+            Vec::new(),
             Arc::new(Mutex::new(None)),
         )
     }
@@ -338,6 +344,7 @@ mod tests {
             session.default_exec_timeout(),
             Some(Duration::from_secs(30))
         );
+        assert!(session.default_env().is_empty());
     }
 
     #[test]
@@ -406,28 +413,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_returns_output() {
+    async fn exec_without_grpc_client_returns_error() {
         let session = make_session();
-        let output = session.exec("echo hello").await.unwrap();
-        // Stub returns exit code 0 with empty output
-        assert_eq!(output.exit_code, 0);
+        let err = session.exec("echo hello").await.unwrap_err();
+        assert!(matches!(err, SandboxError::GrpcError(_)));
+        assert!(
+            err.to_string().contains("guest agent unavailable"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
-    async fn exec_as_root_returns_output() {
+    async fn exec_as_root_without_grpc_client_returns_error() {
         let session = make_session();
-        let output = session.exec_as_root("whoami").await.unwrap();
-        assert_eq!(output.exit_code, 0);
+        let err = session.exec_as_root("whoami").await.unwrap_err();
+        assert!(matches!(err, SandboxError::GrpcError(_)));
     }
 
     #[tokio::test]
-    async fn exec_with_timeout_works() {
+    async fn exec_with_timeout_without_grpc_client_returns_error() {
         let session = make_session();
-        let output = session
+        let err = session
             .exec_with_timeout("sleep 1", Some(Duration::from_secs(5)))
             .await
-            .unwrap();
-        assert_eq!(output.exit_code, 0);
+            .unwrap_err();
+        assert!(matches!(err, SandboxError::GrpcError(_)));
+    }
+
+    #[tokio::test]
+    async fn exec_streaming_without_grpc_client_returns_error() {
+        let session = make_session();
+        let result = session.exec_streaming("echo hello").await;
+        assert!(matches!(result, Err(SandboxError::GrpcError(_))));
     }
 
     #[test]
@@ -457,8 +474,13 @@ mod tests {
             1,
             "/mnt/workspace/other".to_string(),
             None,
+            vec![(
+                "VZ_SANDBOX_BASE_IMAGE_REF".to_string(),
+                "alpine:3.20".to_string(),
+            )],
             Arc::new(Mutex::new(None)),
         );
         assert!(session.default_exec_timeout().is_none());
+        assert_eq!(session.default_env().len(), 1);
     }
 }

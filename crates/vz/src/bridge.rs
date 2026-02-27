@@ -21,9 +21,9 @@ use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_foundation::{NSArray, NSData, NSError, NSFileHandle, NSObject, NSString, NSURL};
 use objc2_virtualization::{
     VZDiskImageStorageDeviceAttachment, VZFileHandleSerialPortAttachment,
-    VZGenericPlatformConfiguration, VZLinuxBootLoader, VZMacAuxiliaryStorage,
-    VZMacGraphicsDeviceConfiguration, VZMacGraphicsDisplayConfiguration, VZMacHardwareModel,
-    VZMacMachineIdentifier, VZMacOSBootLoader, VZMacPlatformConfiguration,
+    VZGenericMachineIdentifier, VZGenericPlatformConfiguration, VZLinuxBootLoader,
+    VZMacAuxiliaryStorage, VZMacGraphicsDeviceConfiguration, VZMacGraphicsDisplayConfiguration,
+    VZMacHardwareModel, VZMacMachineIdentifier, VZMacOSBootLoader, VZMacPlatformConfiguration,
     VZNATNetworkDeviceAttachment, VZSharedDirectory, VZSingleDirectoryShare,
     VZUSBKeyboardConfiguration, VZUSBScreenCoordinatePointingDeviceConfiguration,
     VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
@@ -317,6 +317,21 @@ pub(crate) fn build_objc_config(
             // Linux guests require a generic platform configuration.
             // SAFETY: VZGenericPlatformConfiguration::new() creates a valid generic platform.
             let platform = unsafe { VZGenericPlatformConfiguration::new() };
+            if let Some(machine_identifier_data) = &config.generic_machine_identifier {
+                let machine_identifier_data = NSData::with_bytes(machine_identifier_data);
+                // SAFETY: initWithDataRepresentation validates the opaque bytes payload.
+                let machine_identifier = unsafe {
+                    VZGenericMachineIdentifier::initWithDataRepresentation(
+                        VZGenericMachineIdentifier::alloc(),
+                        &machine_identifier_data,
+                    )
+                }
+                .ok_or_else(|| {
+                    VzError::InvalidConfig("invalid generic machine identifier payload".to_string())
+                })?;
+                // SAFETY: setMachineIdentifier assigns a validated machine identifier.
+                unsafe { platform.setMachineIdentifier(&machine_identifier) };
+            }
             // SAFETY: setPlatform accepts any VZPlatformConfiguration subclass.
             unsafe { vz_config.setPlatform(&platform) };
         }

@@ -3544,6 +3544,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
+name = "utoipa"
+version = "5.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fcc29c80c21c31608227e0912b2d7fddba57ad76b606890627ba8ee7964e993"
+dependencies = [
+ "indexmap 2.13.0",
+ "serde",
+ "serde_json",
+ "utoipa-gen",
+]
+
+[[package]]
+name = "utoipa-gen"
+version = "5.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d79d08d92ab8af4c5e8a6da20c47ae3f61a0f1dabc1997cdf2d082b757ca08b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "regex",
+ "syn",
+]
+
+[[package]]
 name = "uuid"
 version = "1.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3608,6 +3632,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "axum 0.8.8",
+ "base64 0.22.1",
  "clap",
  "reqwest",
  "serde",
@@ -3615,12 +3640,17 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tonic",
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+ "utoipa",
  "uuid",
  "vz-agent-proto",
  "vz-runtime-contract",
+ "vz-runtime-proto",
+ "vz-runtimed",
+ "vz-runtimed-client",
  "vz-stack",
 ]
 
@@ -3646,10 +3676,12 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "shell-words",
  "tar",
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tonic",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -3659,6 +3691,8 @@ dependencies = [
  "vz-linux-native",
  "vz-oci-macos",
  "vz-runtime-contract",
+ "vz-runtime-proto",
+ "vz-runtimed-client",
  "vz-sandbox",
  "vz-stack",
  "vz-validation",
@@ -3790,19 +3824,65 @@ dependencies = [
 ]
 
 [[package]]
+name = "vz-runtime-proto"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "protoc-bin-vendored",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
+name = "vz-runtime-translate"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "vz-runtime-contract",
+ "vz-runtime-proto",
+]
+
+[[package]]
 name = "vz-runtimed"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hyper-util",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
  "vz-linux-native",
  "vz-oci-macos",
  "vz-runtime-contract",
+ "vz-runtime-proto",
+ "vz-runtime-translate",
+ "vz-stack",
+]
+
+[[package]]
+name = "vz-runtimed-client"
+version = "0.1.0"
+dependencies = [
+ "hyper-util",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic",
+ "tower 0.5.3",
+ "vz-runtime-contract",
+ "vz-runtime-proto",
+ "vz-runtime-translate",
+ "vz-runtimed",
 ]
 
 [[package]]

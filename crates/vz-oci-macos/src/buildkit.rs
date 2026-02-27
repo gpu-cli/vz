@@ -131,6 +131,8 @@ pub struct BuildRequest {
     pub tag: String,
     /// Optional multi-stage target name.
     pub target: Option<String>,
+    /// Optional cache sources (for example registry references).
+    pub cache_from: Vec<String>,
     /// Build-time key/value arguments.
     pub build_args: BTreeMap<String, String>,
     /// Build secrets forwarded to BuildKit (`id=...,src=...`).
@@ -268,6 +270,9 @@ struct NormalizedStartBuildRequest<'a> {
     sandbox_id: &'a str,
     context: String,
     dockerfile: String,
+    target: Option<String>,
+    cache_from: Vec<String>,
+    image_tag: Option<String>,
     args: &'a BTreeMap<String, String>,
 }
 
@@ -690,6 +695,9 @@ fn normalize_start_build_request(
             build_spec.dockerfile.as_deref().unwrap_or("Dockerfile"),
             "Dockerfile",
         ),
+        target: normalize_optional_request_component(build_spec.target.as_deref()),
+        cache_from: normalize_cache_from_entries(&build_spec.cache_from),
+        image_tag: normalize_optional_request_component(build_spec.image_tag.as_deref()),
         args: &build_spec.args,
     };
     serde_json::to_string(&request).map_err(|error| BuildManagerError::RequestNormalization {
@@ -706,6 +714,22 @@ fn normalize_request_component(value: &str, default: &str) -> String {
     }
 }
 
+fn normalize_optional_request_component(value: Option<&str>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+fn normalize_cache_from_entries(entries: &[String]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| entry.trim())
+        .filter(|entry| !entry.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 fn normalize_idempotency_key(key: Option<String>) -> Option<String> {
     key.and_then(|key| {
         let normalized = key.trim();
@@ -714,6 +738,9 @@ fn normalize_idempotency_key(key: Option<String>) -> Option<String> {
 }
 
 fn build_request_from_spec(build: &Build) -> BuildRequest {
+    let image_tag = normalize_optional_request_component(build.build_spec.image_tag.as_deref())
+        .unwrap_or_else(|| format!("vz-build:{}", build.build_id));
+
     BuildRequest {
         context_dir: PathBuf::from(normalize_request_component(&build.build_spec.context, ".")),
         dockerfile: PathBuf::from(normalize_request_component(
@@ -724,8 +751,9 @@ fn build_request_from_spec(build: &Build) -> BuildRequest {
                 .unwrap_or("Dockerfile"),
             "Dockerfile",
         )),
-        tag: format!("vz-build:{}", build.build_id),
-        target: None,
+        tag: image_tag,
+        target: normalize_optional_request_component(build.build_spec.target.as_deref()),
+        cache_from: normalize_cache_from_entries(&build.build_spec.cache_from),
         build_args: build.build_spec.args.clone(),
         secrets: Vec::new(),
         no_cache: false,
@@ -1504,6 +1532,10 @@ async fn run_guest_build(
     if let Some(target) = &request.target {
         args.push("--opt".to_string());
         args.push(format!("target={target}"));
+    }
+    for cache_ref in &request.cache_from {
+        args.push("--import-cache".to_string());
+        args.push(format!("type=registry,ref={cache_ref}"));
     }
     if request.no_cache {
         args.push("--no-cache".to_string());
@@ -2356,6 +2388,7 @@ mod tests {
             dockerfile: PathBuf::from("Dockerfile"),
             tag: "example:test".to_string(),
             target: None,
+            cache_from: Vec::new(),
             build_args: BTreeMap::new(),
             secrets: vec![],
             no_cache: false,
@@ -2539,7 +2572,10 @@ mod tests {
         BuildSpec {
             context: ".".to_string(),
             dockerfile: Some("Dockerfile".to_string()),
+            target: None,
             args: BTreeMap::from([("ARG".to_string(), arg_value.to_string())]),
+            cache_from: Vec::new(),
+            image_tag: None,
         }
     }
 

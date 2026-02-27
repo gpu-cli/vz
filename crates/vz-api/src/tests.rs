@@ -135,6 +135,15 @@ fn openapi_document_contains_required_paths() {
     assert!(paths.contains_key("/v1/events/{stack_name}/ws"));
     assert!(paths.contains_key("/v1/receipts/{receipt_id}"));
     assert!(paths.contains_key("/v1/capabilities"));
+    assert!(paths.contains_key("/v1/files/read"));
+    assert!(paths.contains_key("/v1/files/write"));
+    assert!(paths.contains_key("/v1/files/list"));
+    assert!(paths.contains_key("/v1/files/mkdir"));
+    assert!(paths.contains_key("/v1/files/remove"));
+    assert!(paths.contains_key("/v1/files/move"));
+    assert!(paths.contains_key("/v1/files/copy"));
+    assert!(paths.contains_key("/v1/files/chmod"));
+    assert!(paths.contains_key("/v1/files/chown"));
 }
 
 #[tokio::test]
@@ -1571,6 +1580,16 @@ fn transport_parity_openapi_operations_match_grpc_rpcs() {
         // EventService
         "ListEvents",
         "StreamEvents",
+        // FileService
+        "ReadFile",
+        "WriteFile",
+        "ListFiles",
+        "MakeDir",
+        "RemovePath",
+        "MovePath",
+        "CopyPath",
+        "ChmodPath",
+        "ChownPath",
         // CapabilityService
         "GetCapabilities",
     ];
@@ -2344,7 +2363,7 @@ async fn authz_execution_stdin_nonexistent_returns_404() {
 }
 
 #[tokio::test]
-async fn authz_execution_stdin_without_live_backend_session_returns_404() {
+async fn authz_execution_stdin_without_live_backend_session_returns_501() {
     let temp_dir = tempdir().unwrap();
     let state_path = temp_dir.path().join("state.db");
     StateStore::open(&state_path).unwrap();
@@ -2383,10 +2402,13 @@ async fn authz_execution_stdin_without_live_backend_session_returns_404() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["error"]["code"].as_str().unwrap(), "not_found");
+    assert_eq!(
+        payload["error"]["code"].as_str().unwrap(),
+        "unsupported_operation"
+    );
 }
 
 #[tokio::test]

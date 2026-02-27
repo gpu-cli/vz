@@ -1,14 +1,14 @@
 #![forbid(unsafe_code)]
 
 use std::future::pending;
-use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use vz_runtimed::{RuntimeDaemon, RuntimedConfig};
+use vz_runtimed::{RuntimeDaemon, RuntimedConfig, serve_runtime_uds_with_shutdown};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -17,10 +17,6 @@ use vz_runtimed::{RuntimeDaemon, RuntimedConfig};
     about = "Runtime V2 control-plane daemon"
 )]
 struct Cli {
-    /// Reserved bind address for future daemon IPC transport.
-    #[arg(long, default_value = "127.0.0.1:9191")]
-    _bind: SocketAddr,
-
     /// SQLite state-store path for runtime entities/events/receipts.
     #[arg(long, default_value = "stack-state.db")]
     state_store_path: PathBuf,
@@ -28,6 +24,10 @@ struct Cli {
     /// Runtime backend data directory.
     #[arg(long, default_value = ".vz-runtime")]
     runtime_data_dir: PathBuf,
+
+    /// Unix domain socket path for Runtime V2 gRPC.
+    #[arg(long, default_value = ".vz-runtime/runtimed.sock")]
+    socket_path: PathBuf,
 }
 
 #[tokio::main]
@@ -35,20 +35,30 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
 
-    let daemon = RuntimeDaemon::start(RuntimedConfig {
-        state_store_path: cli.state_store_path,
-        runtime_data_dir: cli.runtime_data_dir,
-    })
-    .context("failed to start runtime daemon")?;
+    let daemon = Arc::new(
+        RuntimeDaemon::start(RuntimedConfig {
+            state_store_path: cli.state_store_path,
+            runtime_data_dir: cli.runtime_data_dir,
+            socket_path: cli.socket_path,
+        })
+        .context("failed to start runtime daemon")?,
+    );
 
     let health = daemon.health();
     info!(
+        daemon_id = %health.daemon_id,
+        daemon_version = %health.daemon_version,
         backend = %health.backend_name,
+        socket_path = %daemon.socket_path().display(),
         started_at = health.started_at_unix_secs,
         "runtime daemon ready"
     );
 
-    shutdown_signal().await;
+    let socket_path = daemon.socket_path().to_path_buf();
+    serve_runtime_uds_with_shutdown(daemon, socket_path, shutdown_signal())
+        .await
+        .context("runtime gRPC server failed")?;
+
     info!("runtime daemon shutting down");
     Ok(())
 }

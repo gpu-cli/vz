@@ -67,6 +67,7 @@ pub struct VmConfigBuilder {
     disk_size_bytes: Option<u64>,
     shared_dirs: Vec<SharedDirConfig>,
     serial_log_file: Option<PathBuf>,
+    generic_machine_identifier: Option<Vec<u8>>,
     network: NetworkConfig,
     vsock: bool,
     headless: bool,
@@ -84,6 +85,7 @@ impl VmConfigBuilder {
             disk_size_bytes: None,
             shared_dirs: Vec::new(),
             serial_log_file: None,
+            generic_machine_identifier: None,
             network: NetworkConfig::Nat,
             vsock: false,
             headless: true,
@@ -180,6 +182,12 @@ impl VmConfigBuilder {
         self
     }
 
+    /// Set a persisted generic machine identifier for Linux VM save/restore.
+    pub fn generic_machine_identifier(mut self, machine_identifier: Vec<u8>) -> Self {
+        self.generic_machine_identifier = Some(machine_identifier);
+        self
+    }
+
     /// Set network configuration.
     pub fn network(mut self, config: NetworkConfig) -> Self {
         self.network = config;
@@ -227,6 +235,7 @@ impl VmConfigBuilder {
             disk_size_bytes: self.disk_size_bytes,
             shared_dirs: self.shared_dirs,
             serial_log_file: self.serial_log_file,
+            generic_machine_identifier: self.generic_machine_identifier,
             network: self.network,
             vsock: self.vsock,
             headless: self.headless,
@@ -253,6 +262,7 @@ pub struct VmConfig {
     pub(crate) disk_size_bytes: Option<u64>,
     pub(crate) shared_dirs: Vec<SharedDirConfig>,
     pub(crate) serial_log_file: Option<PathBuf>,
+    pub(crate) generic_machine_identifier: Option<Vec<u8>>,
     pub(crate) network: NetworkConfig,
     pub(crate) vsock: bool,
     /// Controls whether to attach a virtual display. Used by CLI layer.

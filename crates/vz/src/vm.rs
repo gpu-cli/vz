@@ -244,6 +244,17 @@ impl Vm {
     /// Requires macOS 14 (Sonoma) or later. The saved state file is
     /// hardware-encrypted and tied to this Mac + user account.
     pub async fn save_state(&self, path: &Path) -> Result<(), VzError> {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(VzError::SaveFailed(format!(
+                    "failed to remove existing save file {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         let path = path.to_path_buf();
 

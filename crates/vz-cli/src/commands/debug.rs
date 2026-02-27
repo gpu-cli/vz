@@ -36,6 +36,9 @@ pub enum DebugCommand {
 
     /// Manage asynchronous build operations.
     Build(super::build_mgmt::BuildMgmtArgs),
+
+    /// Manage sandbox filesystem operations.
+    File(super::file::FileArgs),
 }
 
 /// Raw OCI container operations for debugging.
@@ -80,6 +83,7 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
         DebugCommand::Execution(exec_args) => super::execution::run(exec_args).await,
         DebugCommand::Checkpoint(checkpoint_args) => super::checkpoint::run(checkpoint_args).await,
         DebugCommand::Build(build_args) => super::build_mgmt::run(build_args).await,
+        DebugCommand::File(file_args) => super::file::run(file_args).await,
     }
 }
 

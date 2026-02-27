@@ -5,7 +5,7 @@
 //! contract. Unsupported keys are rejected with stable error codes
 //! before any reconciliation starts.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use serde_yml::Value;
@@ -43,6 +43,7 @@ const ACCEPTED_SERVICE: &[&str] = &[
     "deploy",
     "secrets",
     "networks",
+    "network_mode",
     // Security fields
     "cap_add",
     "cap_drop",
@@ -117,6 +118,23 @@ const REJECTED_SERVICE: &[(&str, &str)] = &[
 
 // ── Public API ─────────────────────────────────────────────────────
 
+/// Normalized Compose build directive for a single service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposeBuildSpec {
+    /// Service name owning this build directive.
+    pub service_name: String,
+    /// Build context path (string form from Compose after variable expansion).
+    pub context: String,
+    /// Optional Dockerfile path relative to context.
+    pub dockerfile: Option<String>,
+    /// Optional multi-stage target.
+    pub target: Option<String>,
+    /// Build arguments.
+    pub args: BTreeMap<String, String>,
+    /// Optional cache source references.
+    pub cache_from: Vec<String>,
+}
+
 /// Parse a Compose YAML string into a [`StackSpec`].
 ///
 /// The `stack_name` is used as the stack namespace when the Compose
@@ -165,6 +183,59 @@ pub fn parse_compose_with_dir(
     let expanded = expand_variables(yaml, &dot_env);
 
     parse_compose_inner(&expanded, stack_name, Some(compose_dir))
+}
+
+/// Extract normalized build directives from Compose services.
+///
+/// Variable expansion follows the same `.env` behavior as
+/// [`parse_compose_with_dir`]. Relative paths are preserved in string form;
+/// callers decide how to resolve them.
+pub fn collect_compose_build_specs_with_dir(
+    yaml: &str,
+    compose_dir: &Path,
+) -> Result<BTreeMap<String, ComposeBuildSpec>, StackError> {
+    let dot_env_path = compose_dir.join(".env");
+    let dot_env = if dot_env_path.is_file() {
+        let content = std::fs::read_to_string(&dot_env_path).map_err(|e| {
+            StackError::ComposeParse(format!("failed to read {}: {e}", dot_env_path.display()))
+        })?;
+        parse_env_file_content(&content)
+    } else {
+        HashMap::new()
+    };
+
+    let expanded = expand_variables(yaml, &dot_env);
+    collect_compose_build_specs(&expanded)
+}
+
+/// Extract normalized build directives from already-expanded Compose YAML.
+pub fn collect_compose_build_specs(
+    expanded_yaml: &str,
+) -> Result<BTreeMap<String, ComposeBuildSpec>, StackError> {
+    let root: Value =
+        serde_yml::from_str(expanded_yaml).map_err(|e| StackError::ComposeParse(e.to_string()))?;
+    let root_map = root
+        .as_mapping()
+        .ok_or_else(|| StackError::ComposeParse("compose file must be a YAML mapping".into()))?;
+
+    let Some(services_map) = root_map.get(val("services")).and_then(Value::as_mapping) else {
+        return Ok(BTreeMap::new());
+    };
+
+    let mut builds = BTreeMap::new();
+    for (key, svc_value) in services_map {
+        let svc_name = key
+            .as_str()
+            .ok_or_else(|| StackError::ComposeParse("service name must be a string".into()))?;
+        let svc_map = svc_value.as_mapping().ok_or_else(|| {
+            StackError::ComposeParse(format!("service `{svc_name}` must be a YAML mapping"))
+        })?;
+        if let Some(build_spec) = parse_build_directive(svc_name, svc_map)? {
+            builds.insert(svc_name.to_string(), build_spec);
+        }
+    }
+
+    Ok(builds)
 }
 
 fn parse_compose_inner(
@@ -427,7 +498,8 @@ fn parse_service(
 
     validate_service_keys(name, svc_map)?;
 
-    let has_build = parse_build_directive(name, svc_map)?;
+    let build = parse_build_directive(name, svc_map)?;
+    let has_build = build.is_some();
     let image = svc_map
         .get(val("image"))
         .and_then(|v| v.as_str())
@@ -472,7 +544,13 @@ fn parse_service(
     let extra_hosts = parse_extra_hosts(name, svc_map)?;
     let resources = parse_deploy(name, svc_map)?;
     let secrets = parse_service_secrets(name, svc_map, defined_secrets)?;
+    let network_mode = parse_network_mode(name, svc_map)?;
     let networks = parse_service_networks(name, svc_map)?;
+    if network_mode.is_some() && svc_map.get(val("networks")).is_some() {
+        return Err(StackError::ComposeValidation(format!(
+            "service `{name}` cannot set both `network_mode` and `networks`; choose one networking model"
+        )));
+    }
 
     // Security fields
     let cap_add = parse_string_list(name, svc_map, "cap_add")?;
@@ -601,9 +679,12 @@ fn parse_service(
     })
 }
 
-fn parse_build_directive(svc_name: &str, svc_map: &serde_yml::Mapping) -> Result<bool, StackError> {
+fn parse_build_directive(
+    svc_name: &str,
+    svc_map: &serde_yml::Mapping,
+) -> Result<Option<ComposeBuildSpec>, StackError> {
     let Some(value) = svc_map.get(val("build")) else {
-        return Ok(false);
+        return Ok(None);
     };
 
     if let Some(context) = value.as_str() {
@@ -612,7 +693,14 @@ fn parse_build_directive(svc_name: &str, svc_map: &serde_yml::Mapping) -> Result
                 "service `{svc_name}`: `build` context must not be empty"
             )));
         }
-        return Ok(true);
+        return Ok(Some(ComposeBuildSpec {
+            service_name: svc_name.to_string(),
+            context: context.trim().to_string(),
+            dockerfile: None,
+            target: None,
+            args: BTreeMap::new(),
+            cache_from: Vec::new(),
+        }));
     }
 
     let Some(build_map) = value.as_mapping() else {
@@ -627,12 +715,11 @@ fn parse_build_directive(svc_name: &str, svc_map: &serde_yml::Mapping) -> Result
             && key_str != "dockerfile"
             && key_str != "args"
             && key_str != "target"
+            && key_str != "cache_from"
         {
             return Err(StackError::ComposeUnsupportedFeature {
                 feature: format!("services.{svc_name}.build.{key_str}"),
-                reason:
-                    "only `context`, `dockerfile`, `args`, and `target` are supported under `build`"
-                        .to_string(),
+                reason: "only `context`, `dockerfile`, `args`, `target`, and `cache_from` are supported under `build`".to_string(),
             });
         }
     }
@@ -666,19 +753,52 @@ fn parse_build_directive(svc_name: &str, svc_map: &serde_yml::Mapping) -> Result
         }
     }
 
-    if let Some(args_value) = build_map.get(val("args")) {
-        parse_build_args(svc_name, args_value)?;
-    }
+    let context = build_map
+        .get(val("context"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(".")
+        .to_string();
+    let dockerfile = build_map
+        .get(val("dockerfile"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let target = build_map
+        .get(val("target"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let args = if let Some(args_value) = build_map.get(val("args")) {
+        parse_build_args(svc_name, args_value)?
+    } else {
+        BTreeMap::new()
+    };
+    let cache_from = if let Some(cache_from_value) = build_map.get(val("cache_from")) {
+        parse_build_cache_from(svc_name, cache_from_value)?
+    } else {
+        Vec::new()
+    };
 
-    Ok(true)
+    Ok(Some(ComposeBuildSpec {
+        service_name: svc_name.to_string(),
+        context,
+        dockerfile,
+        target,
+        args,
+        cache_from,
+    }))
 }
 
 fn parse_build_args(
     svc_name: &str,
     value: &serde_yml::Value,
-) -> Result<HashMap<String, String>, StackError> {
+) -> Result<BTreeMap<String, String>, StackError> {
     if let Some(obj) = value.as_mapping() {
-        let mut args = HashMap::new();
+        let mut args = BTreeMap::new();
         for (k, v) in obj {
             let key = k.as_str().ok_or_else(|| {
                 StackError::ComposeParse(format!(
@@ -702,7 +822,7 @@ fn parse_build_args(
     }
 
     if let Some(seq) = value.as_sequence() {
-        let mut args = HashMap::new();
+        let mut args = BTreeMap::new();
         for entry in seq {
             let item = entry.as_str().ok_or_else(|| {
                 StackError::ComposeParse(format!(
@@ -721,6 +841,46 @@ fn parse_build_args(
 
     Err(StackError::ComposeParse(format!(
         "service `{svc_name}`: `build.args` must be a mapping or list"
+    )))
+}
+
+fn parse_build_cache_from(
+    svc_name: &str,
+    value: &serde_yml::Value,
+) -> Result<Vec<String>, StackError> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+
+    if let Some(single) = value.as_str() {
+        if single.trim().is_empty() {
+            return Err(StackError::ComposeParse(format!(
+                "service `{svc_name}`: `build.cache_from` entries must not be empty"
+            )));
+        }
+        return Ok(vec![single.to_string()]);
+    }
+
+    if let Some(seq) = value.as_sequence() {
+        let mut values = Vec::with_capacity(seq.len());
+        for entry in seq {
+            let image = entry.as_str().ok_or_else(|| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `build.cache_from` entries must be strings"
+                ))
+            })?;
+            if image.trim().is_empty() {
+                return Err(StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `build.cache_from` entries must not be empty"
+                )));
+            }
+            values.push(image.to_string());
+        }
+        return Ok(values);
+    }
+
+    Err(StackError::ComposeParse(format!(
+        "service `{svc_name}`: `build.cache_from` must be a string or list"
     )))
 }
 
@@ -794,6 +954,27 @@ fn validate_workspace_service_invariants(services: &[ServiceSpec]) -> Result<(),
             "multiple workspace services defined ({}); only one workspace service is allowed",
             workspace_services.join(", ")
         )));
+    }
+
+    let service_map: HashMap<&str, &ServiceSpec> = services
+        .iter()
+        .map(|svc| (svc.name.as_str(), svc))
+        .collect();
+    for service in services {
+        for dep in &service.depends_on {
+            if dep.condition != DependencyCondition::ServiceHealthy {
+                continue;
+            }
+            let Some(dep_service) = service_map.get(dep.service.as_str()) else {
+                continue;
+            };
+            if dep_service.healthcheck.is_none() {
+                return Err(StackError::ComposeValidation(format!(
+                    "service `{}` depends_on `{}` with condition `service_healthy`, but `{}` has no healthcheck",
+                    service.name, dep.service, dep.service
+                )));
+            }
+        }
     }
 
     Ok(())
@@ -2506,6 +2687,52 @@ fn parse_service_networks(
     )))
 }
 
+/// Parse `network_mode` for deterministic diagnostics.
+///
+/// Current runtime supports default bridge networking only.
+/// `network_mode: bridge` is accepted as an explicit no-op.
+fn parse_network_mode(
+    svc_name: &str,
+    map: &serde_yml::Mapping,
+) -> Result<Option<String>, StackError> {
+    let Some(value) = map.get(val("network_mode")) else {
+        return Ok(None);
+    };
+
+    let mode = value.as_str().ok_or_else(|| {
+        StackError::ComposeParse(format!(
+            "service `{svc_name}`: `network_mode` must be a string"
+        ))
+    })?;
+    let mode = mode.trim();
+    if mode.is_empty() {
+        return Err(StackError::ComposeParse(format!(
+            "service `{svc_name}`: `network_mode` must not be empty"
+        )));
+    }
+
+    match mode {
+        "bridge" => Ok(Some(mode.to_string())),
+        "host" | "none" => Err(StackError::ComposeUnsupportedFeature {
+            feature: format!("services.{svc_name}.network_mode"),
+            reason: format!(
+                "`network_mode: {mode}` is not supported by this runtime; supported value is `bridge`"
+            ),
+        }),
+        _ if mode.starts_with("service:") || mode.starts_with("container:") => {
+            Err(StackError::ComposeUnsupportedFeature {
+                feature: format!("services.{svc_name}.network_mode"),
+                reason: format!(
+                    "`network_mode: {mode}` is not supported; use default bridge networking and service DNS"
+                ),
+            })
+        }
+        other => Err(StackError::ComposeValidation(format!(
+            "service `{svc_name}`: unsupported `network_mode` `{other}`; supported value is `bridge`"
+        ))),
+    }
+}
+
 // ── Security & identity field parsers ──────────────────────────────
 
 /// Parse a simple list of strings (e.g., `cap_add`, `cap_drop`).
@@ -2759,8 +2986,13 @@ fn parse_logging(
             StackError::ComposeParse(format!(
                 "service `{svc_name}`: `logging.driver` is required and must be a string"
             ))
-        })?
-        .to_string();
+        })?;
+    let driver = driver.trim().to_ascii_lowercase();
+    if driver.is_empty() {
+        return Err(StackError::ComposeParse(format!(
+            "service `{svc_name}`: `logging.driver` must not be empty"
+        )));
+    }
 
     let options = if let Some(opts_value) = log_map.get(val("options")) {
         let opts_map = opts_value.as_mapping().ok_or_else(|| {
@@ -2800,6 +3032,64 @@ fn parse_logging(
                 feature: format!("services.{svc_name}.logging.{key_str}"),
                 reason: "only `driver` and `options` are supported inside `logging`".to_string(),
             });
+        }
+    }
+
+    match driver.as_str() {
+        "json-file" | "local" | "none" => {}
+        "syslog" => {
+            return Err(StackError::ComposeUnsupportedFeature {
+                feature: format!("services.{svc_name}.logging.driver"),
+                reason: "logging driver `syslog` is not supported by this runtime; supported drivers are `json-file`, `local`, and `none`".to_string(),
+            });
+        }
+        other => {
+            return Err(StackError::ComposeValidation(format!(
+                "service `{svc_name}`: unsupported logging.driver `{other}`; supported drivers are `json-file`, `local`, and `none`"
+            )));
+        }
+    }
+
+    if driver == "none" && !options.is_empty() {
+        return Err(StackError::ComposeValidation(format!(
+            "service `{svc_name}`: `logging.options` is not allowed when `logging.driver` is `none`"
+        )));
+    }
+
+    if driver == "json-file" || driver == "local" {
+        for key in options.keys() {
+            if key == "labels" || key == "tag" {
+                return Err(StackError::ComposeUnsupportedFeature {
+                    feature: format!("services.{svc_name}.logging.options.{key}"),
+                    reason: format!("logging option `{key}` is not supported yet"),
+                });
+            }
+            if key != "max-size" && key != "max-file" {
+                return Err(StackError::ComposeUnsupportedFeature {
+                    feature: format!("services.{svc_name}.logging.options.{key}"),
+                    reason: "supported logging options are `max-size` and `max-file`".to_string(),
+                });
+            }
+        }
+
+        if let Some(max_size) = options.get("max-size") {
+            parse_memory_string(svc_name, max_size).map_err(|_| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: invalid `logging.options.max-size` value `{max_size}`"
+                ))
+            })?;
+        }
+        if let Some(max_file) = options.get("max-file") {
+            let parsed = max_file.parse::<u32>().map_err(|_| {
+                StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `logging.options.max-file` must be a positive integer"
+                ))
+            })?;
+            if parsed == 0 {
+                return Err(StackError::ComposeParse(format!(
+                    "service `{svc_name}`: `logging.options.max-file` must be at least 1"
+                )));
+            }
         }
     }
 
@@ -3238,6 +3528,8 @@ services:
 services:
   db:
     image: postgres:15
+    healthcheck:
+      test: ["CMD", "true"]
   web:
     image: nginx:latest
     depends_on:
@@ -3300,6 +3592,24 @@ services:
             web.depends_on[0].condition,
             DependencyCondition::ServiceCompletedSuccessfully
         );
+    }
+
+    #[test]
+    fn depends_on_service_healthy_requires_healthcheck() {
+        let yaml = r#"
+services:
+  db:
+    image: postgres:15
+  web:
+    image: nginx:latest
+    depends_on:
+      db:
+        condition: service_healthy
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("condition `service_healthy`"));
+        assert!(msg.contains("has no healthcheck"));
     }
 
     #[test]
@@ -3546,7 +3856,7 @@ services:
     }
 
     #[test]
-    fn build_rejects_unknown_mapping_key() {
+    fn build_mapping_form_with_cache_from_is_accepted() {
         let yaml = r#"
 services:
   web:
@@ -3555,11 +3865,65 @@ services:
       context: .
       cache_from:
         - web:cache
+        - ghcr.io/acme/web:buildcache
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services[0].name, "web");
+        assert_eq!(spec.services[0].image, "web:latest");
+    }
+
+    #[test]
+    fn build_cache_from_rejects_non_string_entries() {
+        let yaml = r#"
+services:
+  web:
+    image: web:latest
+    build:
+      context: .
+      cache_from:
+        - web:cache
+        - 123
 "#;
         let err = parse_compose(yaml, "myapp").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("build.cache_from"));
-        assert!(msg.contains("only `context`, `dockerfile`, `args`, and `target`"));
+        assert!(msg.contains("entries must be strings"));
+    }
+
+    #[test]
+    fn collect_compose_build_specs_returns_normalized_builds() {
+        let yaml = r#"
+services:
+  web:
+    image: web:latest
+    build:
+      context: ./app
+      dockerfile: Dockerfile.dev
+      target: runtime
+      args:
+        APP_ENV: dev
+      cache_from:
+        - ghcr.io/acme/web:cache
+  worker:
+    build: .
+"#;
+        let builds = collect_compose_build_specs(yaml).unwrap();
+        assert_eq!(builds.len(), 2);
+
+        let web = builds.get("web").unwrap();
+        assert_eq!(web.service_name, "web");
+        assert_eq!(web.context, "./app");
+        assert_eq!(web.dockerfile.as_deref(), Some("Dockerfile.dev"));
+        assert_eq!(web.target.as_deref(), Some("runtime"));
+        assert_eq!(web.args.get("APP_ENV").map(String::as_str), Some("dev"));
+        assert_eq!(web.cache_from, vec!["ghcr.io/acme/web:cache".to_string()]);
+
+        let worker = builds.get("worker").unwrap();
+        assert_eq!(worker.context, ".");
+        assert!(worker.dockerfile.is_none());
+        assert!(worker.target.is_none());
+        assert!(worker.args.is_empty());
+        assert!(worker.cache_from.is_empty());
     }
 
     // ── Network parsing ──────────────────────────────────────────
@@ -3677,6 +4041,51 @@ networks:
         let msg = err.to_string();
         assert!(msg.contains("services.web.networks.frontend.aliases"));
         assert!(msg.contains("network attachment options are not supported"));
+    }
+
+    #[test]
+    fn network_mode_bridge_is_accepted() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    network_mode: bridge
+"#;
+        let spec = parse_compose(yaml, "myapp").unwrap();
+        assert_eq!(spec.services.len(), 1);
+        assert_eq!(spec.services[0].name, "web");
+    }
+
+    #[test]
+    fn network_mode_host_rejected_with_stable_error() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    network_mode: host
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.starts_with("unsupported_operation:"));
+        assert!(msg.contains("services.web.network_mode"));
+        assert!(msg.contains("supported value is `bridge`"));
+    }
+
+    #[test]
+    fn network_mode_and_networks_are_mutually_exclusive() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    network_mode: bridge
+    networks:
+      - frontend
+networks:
+  frontend:
+"#;
+        let err = parse_compose(yaml, "myapp").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cannot set both `network_mode` and `networks`"));
     }
 
     #[test]
@@ -5389,6 +5798,8 @@ services:
         condition: service_healthy
   db:
     image: postgres:16
+    healthcheck:
+      test: ["CMD", "true"]
 "#;
         let spec = parse_compose(yaml, "test").unwrap();
         let web = spec.services.iter().find(|s| s.name == "web").unwrap();
@@ -5569,5 +5980,146 @@ services:
 
         // cache assertions
         assert_eq!(cache.restart_policy, Some(RestartPolicy::Always));
+    }
+
+    #[test]
+    fn logging_driver_none_disallows_options() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    logging:
+      driver: none
+      options:
+        max-size: "10m"
+"#;
+        let err = parse_compose(yaml, "test").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("logging.options"));
+        assert!(msg.contains("driver` is `none`"));
+    }
+
+    #[test]
+    fn logging_driver_none_is_accepted_without_options() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    logging:
+      driver: none
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        let logging = spec.services[0].logging.as_ref().unwrap();
+        assert_eq!(logging.driver, "none");
+        assert!(logging.options.is_empty());
+    }
+
+    #[test]
+    fn logging_driver_syslog_is_rejected_as_unsupported() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    logging:
+      driver: syslog
+"#;
+        let err = parse_compose(yaml, "test").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.starts_with("unsupported_operation:"));
+        assert!(msg.contains("services.web.logging.driver"));
+        assert!(msg.contains("syslog"));
+    }
+
+    #[test]
+    fn logging_unknown_driver_is_validation_error() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    logging:
+      driver: journald
+"#;
+        let err = parse_compose(yaml, "test").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unsupported logging.driver"));
+        assert!(msg.contains("journald"));
+    }
+
+    #[test]
+    fn logging_json_file_validates_supported_options() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+"#;
+        let spec = parse_compose(yaml, "test").unwrap();
+        let logging = spec.services[0].logging.as_ref().unwrap();
+        assert_eq!(logging.driver, "json-file");
+        assert_eq!(
+            logging.options.get("max-size").map(String::as_str),
+            Some("10m")
+        );
+        assert_eq!(
+            logging.options.get("max-file").map(String::as_str),
+            Some("3")
+        );
+    }
+
+    #[test]
+    fn logging_json_file_rejects_labels_option() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    logging:
+      driver: json-file
+      options:
+        labels: "com.example.team"
+"#;
+        let err = parse_compose(yaml, "test").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.starts_with("unsupported_operation:"));
+        assert!(msg.contains("services.web.logging.options.labels"));
+        assert!(msg.contains("not supported yet"));
+    }
+
+    #[test]
+    fn logging_json_file_rejects_tag_option() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    logging:
+      driver: json-file
+      options:
+        tag: "my-web"
+"#;
+        let err = parse_compose(yaml, "test").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.starts_with("unsupported_operation:"));
+        assert!(msg.contains("services.web.logging.options.tag"));
+        assert!(msg.contains("not supported yet"));
+    }
+
+    #[test]
+    fn logging_json_file_rejects_unknown_option_key() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:latest
+    logging:
+      driver: json-file
+      options:
+        mode: non-blocking
+"#;
+        let err = parse_compose(yaml, "test").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.starts_with("unsupported_operation:"));
+        assert!(msg.contains("services.web.logging.options.mode"));
     }
 }

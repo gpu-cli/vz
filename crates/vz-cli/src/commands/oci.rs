@@ -683,10 +683,14 @@ async fn exec_container(runtime: &vz_oci_macos::Runtime, args: ExecArgs) -> anyh
     let timeout = args.timeout_secs.map(Duration::from_secs);
 
     let exec_config = vz_oci_macos::ExecConfig {
+        execution_id: None,
         cmd: args.command,
         working_dir: args.workdir,
         env,
         user: args.user,
+        pty: false,
+        term_rows: None,
+        term_cols: None,
         timeout,
     };
 
@@ -802,10 +806,14 @@ async fn container_logs(runtime: &vz_oci_macos::Runtime, args: LogsArgs) -> anyh
     // Initial fetch: bounded tail -n <count>.
     let tail_n = args.tail.to_string();
     let exec_config = vz_oci_macos::ExecConfig {
+        execution_id: None,
         cmd: vec!["tail".into(), "-n".into(), tail_n, log_file.into()],
         working_dir: None,
         env: vec![],
         user: None,
+        pty: false,
+        term_rows: None,
+        term_cols: None,
         timeout: Some(Duration::from_secs(5)),
     };
 
@@ -820,10 +828,14 @@ async fn container_logs(runtime: &vz_oci_macos::Runtime, args: LogsArgs) -> anyh
 
     // Follow mode: track byte offset, poll with tail -c +<offset>.
     let size_config = vz_oci_macos::ExecConfig {
+        execution_id: None,
         cmd: vec!["wc".into(), "-c".into(), log_file.into()],
         working_dir: None,
         env: vec![],
         user: None,
+        pty: false,
+        term_rows: None,
+        term_cols: None,
         timeout: Some(Duration::from_secs(5)),
     };
 
@@ -840,10 +852,14 @@ async fn container_logs(runtime: &vz_oci_macos::Runtime, args: LogsArgs) -> anyh
 
         let offset_arg = format!("+{}", offset + 1);
         let poll_config = vz_oci_macos::ExecConfig {
+            execution_id: None,
             cmd: vec!["tail".into(), "-c".into(), offset_arg, log_file.into()],
             working_dir: None,
             env: vec![],
             user: None,
+            pty: false,
+            term_rows: None,
+            term_cols: None,
             timeout: Some(Duration::from_secs(5)),
         };
 

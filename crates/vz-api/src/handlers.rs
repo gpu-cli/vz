@@ -1,0 +1,924 @@
+use super::*;
+
+#[derive(Debug, Serialize)]
+struct StreamErrorBody {
+    code: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SseStreamErrorPayload {
+    request_id: String,
+    error: StreamErrorBody,
+}
+
+#[derive(Debug, Serialize)]
+struct WsStreamErrorPayload {
+    error: StreamErrorBody,
+}
+
+fn serialize_json_or_marker(value: &impl serde::Serialize) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| serialization_error_value().to_string())
+}
+
+pub(super) async fn openapi_json() -> Json<serde_json::Value> {
+    Json(openapi_document())
+}
+
+pub(super) async fn capabilities(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let request_id = request_id_from_headers(&headers);
+    let capabilities = state.capabilities.to_capability_list();
+    Json(CapabilitiesResponse {
+        request_id,
+        capabilities,
+    })
+}
+
+pub(super) async fn list_events(
+    State(state): State<ApiState>,
+    Path(stack_name): Path<String>,
+    Query(query): Query<EventsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_list_events_via_daemon(&state, &stack_name, &query, &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "event operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn stream_events_sse(
+    State(state): State<ApiState>,
+    Path(stack_name): Path<String>,
+    Query(query): Query<EventsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let mut stream =
+        match open_event_stream_via_daemon(&state, &stack_name, &query, &request_id).await {
+            Ok(stream) => stream,
+            Err(response) => return response,
+        };
+    let keep_alive = state.event_poll_interval;
+    let stream_request_id = request_id.clone();
+
+    let sse_stream = stream! {
+        loop {
+            match stream.message().await {
+                Ok(Some(runtime_event)) => {
+                    let event = api_event_record_from_runtime_proto(runtime_event);
+                    let payload = serialize_json_or_marker(&event);
+                    yield Ok::<Event, Infallible>(Event::default().id(event.id.to_string()).data(payload));
+                }
+                Ok(None) => break,
+                Err(status) => {
+                    let payload = SseStreamErrorPayload {
+                        request_id: stream_request_id.clone(),
+                        error: StreamErrorBody {
+                            code: "backend_unavailable".to_string(),
+                            message: status.message().to_string(),
+                        },
+                    };
+                    yield Ok::<Event, Infallible>(
+                        Event::default().event("error").data(serialize_json_or_marker(&payload))
+                    );
+                    break;
+                }
+            }
+        }
+    };
+
+    Sse::new(sse_stream)
+        .keep_alive(KeepAlive::new().interval(keep_alive))
+        .into_response()
+}
+
+pub(super) async fn stream_events_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<ApiState>,
+    Path(stack_name): Path<String>,
+    Query(query): Query<EventsQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let request_id = request_id_from_headers(&headers);
+    let stream = match open_event_stream_via_daemon(&state, &stack_name, &query, &request_id).await
+    {
+        Ok(stream) => stream,
+        Err(response) => return response,
+    };
+
+    ws.on_upgrade(move |socket| forward_events_to_websocket(socket, stream))
+}
+
+pub(super) async fn forward_events_to_websocket(
+    mut socket: WebSocket,
+    mut stream: tonic::Streaming<runtime_v2::RuntimeEvent>,
+) {
+    loop {
+        match stream.message().await {
+            Ok(Some(runtime_event)) => {
+                let event = api_event_record_from_runtime_proto(runtime_event);
+                let payload = serialize_json_or_marker(&event);
+                if socket.send(Message::Text(payload.into())).await.is_err() {
+                    return;
+                }
+            }
+            Ok(None) => return,
+            Err(status) => {
+                let payload = WsStreamErrorPayload {
+                    error: StreamErrorBody {
+                        code: "backend_unavailable".to_string(),
+                        message: status.message().to_string(),
+                    },
+                };
+                let _ = socket
+                    .send(Message::Text(serialize_json_or_marker(&payload).into()))
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
+pub(super) async fn create_sandbox(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_create_sandbox_via_daemon(&state, &headers, raw_body.as_ref(), &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "sandbox operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn list_sandboxes(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let request_id = request_id_from_headers(&headers);
+
+    if let Some(response) = try_list_sandboxes_via_daemon(&state, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "sandbox operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn get_sandbox(
+    State(state): State<ApiState>,
+    Path(sandbox_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+
+    if let Some(response) = try_get_sandbox_via_daemon(&state, &sandbox_id, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "sandbox operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn terminate_sandbox(
+    State(state): State<ApiState>,
+    Path(sandbox_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+
+    if let Some(response) =
+        try_terminate_sandbox_via_daemon(&state, &headers, &sandbox_id, &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "sandbox operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+// ── Lease handlers ──
+
+pub(super) async fn open_lease(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_open_lease_via_daemon(&state, &headers, raw_body.as_ref(), &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "lease operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn list_leases(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_list_leases_via_daemon(&state, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "lease operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn get_lease(
+    State(state): State<ApiState>,
+    Path(lease_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_get_lease_via_daemon(&state, &lease_id, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "lease operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn close_lease(
+    State(state): State<ApiState>,
+    Path(lease_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_close_lease_via_daemon(&state, &lease_id, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "lease operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn heartbeat_lease(
+    State(state): State<ApiState>,
+    Path(lease_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_heartbeat_lease_via_daemon(&state, &lease_id, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "lease operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+// ── Execution handlers ──
+
+pub(super) async fn create_execution(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_create_execution_via_daemon(&state, &headers, raw_body.as_ref(), &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "execution operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn list_executions(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_list_executions_via_daemon(&state, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "execution operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn get_execution(
+    State(state): State<ApiState>,
+    Path(execution_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_get_execution_via_daemon(&state, &execution_id, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "execution operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn cancel_execution(
+    State(state): State<ApiState>,
+    Path(execution_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_cancel_execution_via_daemon(&state, &execution_id, &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "execution operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn resize_exec(
+    State(state): State<ApiState>,
+    Path(execution_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ResizeExecRequest>,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_resize_execution_via_daemon(&state, &execution_id, &body, &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "execution operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn write_exec_stdin(
+    State(state): State<ApiState>,
+    Path(execution_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<WriteExecStdinRequest>,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_write_execution_stdin_via_daemon(&state, &execution_id, &body, &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "execution operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn signal_exec(
+    State(state): State<ApiState>,
+    Path(execution_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<SignalExecRequest>,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_signal_execution_via_daemon(&state, &execution_id, &body, &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "execution operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+// ── Checkpoint handlers ──
+
+pub(super) async fn create_checkpoint(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_create_checkpoint_via_daemon(&state, &headers, raw_body.as_ref(), &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "checkpoint operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn list_checkpoints(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_list_checkpoints_via_daemon(&state, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "checkpoint operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn get_checkpoint(
+    State(state): State<ApiState>,
+    Path(checkpoint_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_get_checkpoint_via_daemon(&state, &checkpoint_id, &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "checkpoint operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn restore_checkpoint(
+    State(state): State<ApiState>,
+    Path(checkpoint_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_restore_checkpoint_via_daemon(&state, &checkpoint_id, &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "checkpoint operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn fork_checkpoint(
+    State(state): State<ApiState>,
+    Path(checkpoint_id): Path<String>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_fork_checkpoint_via_daemon(
+        &state,
+        &checkpoint_id,
+        &headers,
+        raw_body.as_ref(),
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "checkpoint operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn list_checkpoint_children(
+    State(state): State<ApiState>,
+    Path(checkpoint_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_list_checkpoint_children_via_daemon(&state, &checkpoint_id, &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "checkpoint operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+// ── Container handlers ──
+
+pub(super) async fn create_container(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_create_container_via_daemon(&state, &headers, raw_body.as_ref(), &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "container operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn list_containers(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_list_containers_via_daemon(&state, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "container operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn get_container(
+    State(state): State<ApiState>,
+    Path(container_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_get_container_via_daemon(&state, &container_id, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "container operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn remove_container(
+    State(state): State<ApiState>,
+    Path(container_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_remove_container_via_daemon(&state, &container_id, &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "container operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+// ── Image handlers ──
+
+pub(super) async fn list_images(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_list_images_via_daemon(&state, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "image operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn get_image(
+    State(state): State<ApiState>,
+    Path(image_ref): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_get_image_via_daemon(&state, &image_ref, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "image operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+// ── Build handlers ──
+
+pub(super) async fn start_build(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let body: StartBuildRequest = match serde_json::from_slice(&raw_body) {
+        Ok(body) => body,
+        Err(error) => {
+            return json_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &format!("invalid JSON body: {error}"),
+                &request_id,
+            );
+        }
+    };
+    if let Some(response) = try_start_build_via_daemon(&state, &body, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "build operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn list_builds(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_list_builds_via_daemon(&state, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "build operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn get_build(
+    State(state): State<ApiState>,
+    Path(build_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_get_build_via_daemon(&state, &build_id, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "build operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn cancel_build(
+    State(state): State<ApiState>,
+    Path(build_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_cancel_build_via_daemon(&state, &build_id, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "build operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+// ── Receipt handler ──
+
+pub(super) async fn get_receipt(
+    State(state): State<ApiState>,
+    Path(receipt_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_get_receipt_via_daemon(&state, &receipt_id, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "receipt operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+// ── File handlers ──
+
+pub(super) async fn read_file(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_read_file_via_daemon(&state, raw_body.as_ref(), &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "file operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn write_file(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_write_file_via_daemon(&state, &headers, raw_body.as_ref(), &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "file operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn list_files(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_list_files_via_daemon(&state, raw_body.as_ref(), &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "file operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn make_dir(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_make_dir_via_daemon(&state, &headers, raw_body.as_ref(), &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "file operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn remove_path(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_remove_path_via_daemon(&state, &headers, raw_body.as_ref(), &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "file operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn move_path(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_move_path_via_daemon(&state, &headers, raw_body.as_ref(), &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "file operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn copy_path(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_copy_path_via_daemon(&state, &headers, raw_body.as_ref(), &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "file operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn chmod_path(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_chmod_path_via_daemon(&state, &headers, raw_body.as_ref(), &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "file operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn chown_path(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_chown_path_via_daemon(&state, &headers, raw_body.as_ref(), &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "file operations require vz-runtimed daemon",
+        &request_id,
+    )
+}

@@ -1,16 +1,19 @@
 //! `vz execution` -- execution lifecycle management commands.
 //!
 //! Provides `list`, `inspect`, and `cancel` subcommands backed by the
-//! `vz-stack` state store for execution persistence.
+//! runtime daemon control plane.
 
 #![allow(clippy::print_stdout)]
 
 use std::path::PathBuf;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use clap::{Args, Subcommand};
-use vz_runtime_contract::ExecutionState;
-use vz_stack::StateStore;
+use tonic::Code;
+use vz_runtime_proto::runtime_v2;
+use vz_runtimed_client::DaemonClientError;
+
+use super::runtime_daemon::connect_control_plane_for_state_db;
 
 /// Manage container executions.
 #[derive(Args, Debug)]
@@ -72,28 +75,51 @@ pub struct ExecutionCancelArgs {
 /// Run the execution subcommand.
 pub async fn run(args: ExecutionArgs) -> anyhow::Result<()> {
     match args.action {
-        ExecutionCommand::List(list_args) => cmd_list(list_args),
-        ExecutionCommand::Inspect(inspect_args) => cmd_inspect(inspect_args),
-        ExecutionCommand::Cancel(cancel_args) => cmd_cancel(cancel_args),
+        ExecutionCommand::List(list_args) => cmd_list(list_args).await,
+        ExecutionCommand::Inspect(inspect_args) => cmd_inspect(inspect_args).await,
+        ExecutionCommand::Cancel(cancel_args) => cmd_cancel(cancel_args).await,
     }
 }
 
-fn cmd_list(args: ExecutionListArgs) -> anyhow::Result<()> {
-    let store = StateStore::open(&args.state_db).context("failed to open state store")?;
+fn execution_json(payload: &runtime_v2::ExecutionPayload) -> serde_json::Value {
+    serde_json::json!({
+        "execution_id": payload.execution_id,
+        "container_id": payload.container_id,
+        "state": payload.state,
+        "exit_code": if payload.exit_code == 0 {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::Number(payload.exit_code.into())
+        },
+        "started_at": if payload.started_at == 0 {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::Number(payload.started_at.into())
+        },
+        "ended_at": if payload.ended_at == 0 {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::Number(payload.ended_at.into())
+        },
+    })
+}
 
-    let executions = if let Some(ref container_id) = args.container_id {
-        store
-            .list_executions_for_container(container_id)
-            .context("failed to list executions for container")?
-    } else {
-        store
-            .list_executions()
-            .context("failed to list executions")?
-    };
+async fn cmd_list(args: ExecutionListArgs) -> anyhow::Result<()> {
+    let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+    let mut executions = client
+        .list_executions(runtime_v2::ListExecutionsRequest { metadata: None })
+        .await
+        .context("failed to list executions via daemon")?
+        .executions;
+
+    if let Some(container_id) = args.container_id.as_deref() {
+        executions.retain(|execution| execution.container_id == container_id);
+    }
 
     if args.json {
+        let payload: Vec<_> = executions.iter().map(execution_json).collect();
         let json =
-            serde_json::to_string_pretty(&executions).context("failed to serialize executions")?;
+            serde_json::to_string_pretty(&payload).context("failed to serialize executions")?;
         println!("{json}");
         return Ok(());
     }
@@ -104,85 +130,80 @@ fn cmd_list(args: ExecutionListArgs) -> anyhow::Result<()> {
     }
 
     println!(
-        "{:<40} {:<20} {:<10} {:<10} {:<12}",
-        "EXECUTION ID", "CONTAINER ID", "STATE", "EXIT CODE", "CMD"
+        "{:<40} {:<20} {:<10} {:<10}",
+        "EXECUTION ID", "CONTAINER ID", "STATE", "EXIT CODE"
     );
-    for execution in &executions {
-        let state = serde_json::to_string(&execution.state)
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string();
-        let exit_code = execution
-            .exit_code
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let cmd = execution.exec_spec.cmd.join(" ");
-        let cmd_display = if cmd.len() > 30 {
-            format!("{}...", &cmd[..27])
+    for payload in &executions {
+        let state = if payload.state.trim().is_empty() {
+            "unknown"
         } else {
-            cmd
+            payload.state.as_str()
+        };
+        let exit_code = if payload.exit_code == 0 {
+            "-".to_string()
+        } else {
+            payload.exit_code.to_string()
         };
         println!(
-            "{:<40} {:<20} {:<10} {:<10} {:<12}",
-            execution.execution_id, execution.container_id, state, exit_code, cmd_display
+            "{:<40} {:<20} {:<10} {:<10}",
+            payload.execution_id, payload.container_id, state, exit_code
         );
     }
 
     Ok(())
 }
 
-fn cmd_inspect(args: ExecutionInspectArgs) -> anyhow::Result<()> {
-    let store = StateStore::open(&args.state_db).context("failed to open state store")?;
-    let execution = store
-        .load_execution(&args.execution_id)
-        .context("failed to load execution")?;
-
-    match execution {
-        Some(e) => {
-            let json = serde_json::to_string_pretty(&e).context("failed to serialize execution")?;
-            println!("{json}");
+async fn cmd_inspect(args: ExecutionInspectArgs) -> anyhow::Result<()> {
+    let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+    let response = match client
+        .get_execution(runtime_v2::GetExecutionRequest {
+            execution_id: args.execution_id.clone(),
+            metadata: None,
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(DaemonClientError::Grpc(status)) if status.code() == Code::NotFound => {
+            bail!("execution {} not found", args.execution_id)
         }
-        None => bail!("execution {} not found", args.execution_id),
-    }
+        Err(error) => return Err(anyhow!(error).context("failed to load execution via daemon")),
+    };
+
+    let payload = response
+        .execution
+        .ok_or_else(|| anyhow!("daemon returned missing execution payload"))?;
+    let json = serde_json::to_string_pretty(&execution_json(&payload))
+        .context("failed to serialize execution")?;
+    println!("{json}");
 
     Ok(())
 }
 
-fn cmd_cancel(args: ExecutionCancelArgs) -> anyhow::Result<()> {
-    let store = StateStore::open(&args.state_db).context("failed to open state store")?;
-    let mut execution = store
-        .load_execution(&args.execution_id)
-        .context("failed to load execution")?
-        .ok_or_else(|| anyhow::anyhow!("execution {} not found", args.execution_id))?;
+async fn cmd_cancel(args: ExecutionCancelArgs) -> anyhow::Result<()> {
+    let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+    let response = match client
+        .cancel_execution(runtime_v2::CancelExecutionRequest {
+            execution_id: args.execution_id.clone(),
+            metadata: None,
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(DaemonClientError::Grpc(status)) if status.code() == Code::NotFound => {
+            bail!("execution {} not found", args.execution_id)
+        }
+        Err(error) => return Err(anyhow!(error).context("failed to cancel execution via daemon")),
+    };
 
-    if execution.state.is_terminal() {
-        println!(
-            "Execution {} is already in terminal state.",
-            args.execution_id
-        );
-        return Ok(());
-    }
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    // Ensure started_at is set for transition consistency.
-    if execution.started_at.is_none() {
-        execution.started_at = Some(now);
-    }
-    execution.ended_at = Some(now);
-
-    execution
-        .transition_to(ExecutionState::Canceled)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    store
-        .save_execution(&execution)
-        .context("failed to save execution")?;
-
-    println!("Execution {} canceled.", args.execution_id);
+    let payload = response
+        .execution
+        .ok_or_else(|| anyhow!("daemon returned missing execution payload"))?;
+    let state = if payload.state.trim().is_empty() {
+        "unknown"
+    } else {
+        payload.state.as_str()
+    };
+    println!("Execution {} state: {}.", payload.execution_id, state);
 
     Ok(())
 }

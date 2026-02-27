@@ -51,6 +51,8 @@ pub mod error;
 #[cfg(target_os = "macos")]
 pub mod install;
 #[cfg(target_os = "macos")]
+pub mod machine_identifier;
+#[cfg(target_os = "macos")]
 pub mod virtio_fs;
 #[cfg(target_os = "macos")]
 pub mod vm;
@@ -63,6 +65,8 @@ pub use config::{BootLoader, MacPlatformConfig, NetworkConfig, SharedDirConfig, 
 pub use error::VzError;
 #[cfg(target_os = "macos")]
 pub use install::{InstallResult, IpswSource, fetch_latest_ipsw_url, install_macos};
+#[cfg(target_os = "macos")]
+pub use machine_identifier::generate_generic_machine_identifier_data;
 #[cfg(target_os = "macos")]
 pub use vm::{Vm, VmState};
 #[cfg(target_os = "macos")]

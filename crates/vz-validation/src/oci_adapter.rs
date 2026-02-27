@@ -96,6 +96,7 @@ impl RuntimeAdapter for OciRuntimeAdapter {
             let (exec_exit, exec_stdout, exec_stderr) = if let Some(ref cmd) = scenario.command {
                 lifecycle.push("exec".to_string());
                 let exec_cfg = ExecConfig {
+                    execution_id: None,
                     cmd: cmd.clone(),
                     working_dir: scenario.working_dir.clone(),
                     env: scenario
@@ -104,6 +105,9 @@ impl RuntimeAdapter for OciRuntimeAdapter {
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect(),
                     user: scenario.user.clone(),
+                    pty: false,
+                    term_rows: None,
+                    term_cols: None,
                     timeout: Some(Duration::from_secs(30)),
                 };
                 let output = self

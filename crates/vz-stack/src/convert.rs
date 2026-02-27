@@ -11,6 +11,11 @@ use crate::spec::{PortSpec, ResourcesSpec, ServiceSecretRef, ServiceSpec};
 use crate::volume::ResolvedMount;
 
 const SERVICE_KIND_ANNOTATION: &str = "io.vz.service.kind";
+const COMPOSE_EXPOSE_ANNOTATION: &str = "io.vz.compose.expose";
+const COMPOSE_STDIN_OPEN_ANNOTATION: &str = "io.vz.compose.stdin_open";
+const COMPOSE_TTY_ANNOTATION: &str = "io.vz.compose.tty";
+const COMPOSE_LOGGING_DRIVER_ANNOTATION: &str = "io.vz.compose.logging.driver";
+const COMPOSE_LOGGING_OPTIONS_ANNOTATION: &str = "io.vz.compose.logging.options";
 
 /// Convert a [`ServiceSpec`] into a vz-oci [`RunConfig`].
 ///
@@ -44,6 +49,39 @@ pub fn service_to_run_config(
         SERVICE_KIND_ANNOTATION.to_string(),
         spec.kind.as_str().to_string(),
     ));
+    if !spec.expose.is_empty() {
+        let mut exposed_ports = spec.expose.clone();
+        exposed_ports.sort_unstable();
+        exposed_ports.dedup();
+        let exposed = exposed_ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        oci_annotations.push((COMPOSE_EXPOSE_ANNOTATION.to_string(), exposed));
+    }
+    if spec.stdin_open {
+        oci_annotations.push((
+            COMPOSE_STDIN_OPEN_ANNOTATION.to_string(),
+            "true".to_string(),
+        ));
+    }
+    if spec.tty {
+        oci_annotations.push((COMPOSE_TTY_ANNOTATION.to_string(), "true".to_string()));
+    }
+    if let Some(logging) = &spec.logging {
+        oci_annotations.push((
+            COMPOSE_LOGGING_DRIVER_ANNOTATION.to_string(),
+            logging.driver.clone(),
+        ));
+        let encoded_options = encode_logging_options(&logging.options);
+        if !encoded_options.is_empty() {
+            oci_annotations.push((
+                COMPOSE_LOGGING_OPTIONS_ANNOTATION.to_string(),
+                encoded_options,
+            ));
+        }
+    }
     oci_annotations.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Convert sysctls from HashMap to Vec.
@@ -75,7 +113,7 @@ pub fn service_to_run_config(
         network_enabled: Some(true),
         extra_hosts: spec.extra_hosts.clone(),
         // Capture container stdout/stderr to log files for `vz stack logs`.
-        capture_logs: true,
+        capture_logs: capture_logs_for_service(spec),
         // Security fields
         cap_add: spec.cap_add.clone(),
         cap_drop: spec.cap_drop.clone(),
@@ -95,6 +133,26 @@ pub fn service_to_run_config(
         // Remaining fields use defaults; future beads may populate them.
         ..Default::default()
     })
+}
+
+fn capture_logs_for_service(spec: &ServiceSpec) -> bool {
+    !matches!(
+        spec.logging.as_ref().map(|logging| logging.driver.as_str()),
+        Some("none")
+    )
+}
+
+fn encode_logging_options(options: &std::collections::HashMap<String, String>) -> String {
+    let mut pairs: Vec<(&str, &str)> = options
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    pairs.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    pairs
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Convert service secret references into bind mount specs.
@@ -337,6 +395,113 @@ mod tests {
             .collect();
         assert_eq!(kind_annotations.len(), 1);
         assert_eq!(kind_annotations[0].1, "task");
+    }
+
+    #[test]
+    fn interactive_and_expose_fields_emit_annotations() {
+        let mut spec = minimal_service();
+        spec.expose = vec![9001, 9000, 9001];
+        spec.stdin_open = true;
+        spec.tty = true;
+
+        let config = service_to_run_config(&spec, &[], &[]).unwrap();
+        let annotations = config
+            .oci_annotations
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(
+            annotations
+                .get(COMPOSE_EXPOSE_ANNOTATION)
+                .map(String::as_str),
+            Some("9000,9001")
+        );
+        assert_eq!(
+            annotations
+                .get(COMPOSE_STDIN_OPEN_ANNOTATION)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            annotations.get(COMPOSE_TTY_ANNOTATION).map(String::as_str),
+            Some("true")
+        );
+        assert!(
+            config.ports.is_empty(),
+            "expose must not create host port bindings"
+        );
+    }
+
+    #[test]
+    fn expose_with_ports_keeps_only_explicit_host_bindings() {
+        let mut spec = minimal_service();
+        spec.expose = vec![9000];
+        spec.ports = vec![PortSpec {
+            protocol: "tcp".to_string(),
+            container_port: 8080,
+            host_port: Some(18080),
+        }];
+
+        let config = service_to_run_config(&spec, &[], &[]).unwrap();
+        assert_eq!(config.ports.len(), 1);
+        assert_eq!(config.ports[0].host, 18080);
+        assert_eq!(config.ports[0].container, 8080);
+    }
+
+    #[test]
+    fn logging_driver_none_disables_capture_logs() {
+        let mut spec = minimal_service();
+        spec.logging = Some(crate::spec::LoggingConfig {
+            driver: "none".to_string(),
+            options: HashMap::new(),
+        });
+
+        let config = service_to_run_config(&spec, &[], &[]).unwrap();
+        assert!(!config.capture_logs);
+        let annotations = config
+            .oci_annotations
+            .iter()
+            .cloned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            annotations
+                .get(COMPOSE_LOGGING_DRIVER_ANNOTATION)
+                .map(String::as_str),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn logging_json_file_keeps_capture_logs_and_encodes_options() {
+        let mut spec = minimal_service();
+        spec.logging = Some(crate::spec::LoggingConfig {
+            driver: "json-file".to_string(),
+            options: HashMap::from([
+                ("max-file".to_string(), "3".to_string()),
+                ("max-size".to_string(), "10m".to_string()),
+            ]),
+        });
+
+        let config = service_to_run_config(&spec, &[], &[]).unwrap();
+        assert!(config.capture_logs);
+        let annotations = config
+            .oci_annotations
+            .iter()
+            .cloned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            annotations
+                .get(COMPOSE_LOGGING_DRIVER_ANNOTATION)
+                .map(String::as_str),
+            Some("json-file")
+        );
+        assert_eq!(
+            annotations
+                .get(COMPOSE_LOGGING_OPTIONS_ANNOTATION)
+                .map(String::as_str),
+            Some("max-file=3\nmax-size=10m")
+        );
     }
 
     #[test]

@@ -86,6 +86,7 @@ CMD ["cat", "/message.txt"]
         dockerfile: "Dockerfile".into(),
         tag: tag.clone(),
         target: None,
+        cache_from: Vec::new(),
         build_args: BTreeMap::new(),
         secrets: Vec::new(),
         no_cache: false,
