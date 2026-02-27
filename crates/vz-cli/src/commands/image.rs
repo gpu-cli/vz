@@ -2,12 +2,17 @@
 
 use std::path::Path;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use clap::{Args, Subcommand};
+use reqwest::StatusCode as HttpStatusCode;
+use serde::{Deserialize, Serialize};
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed_client::DaemonClient;
 
-use super::runtime_daemon::{daemon_client_config, default_state_db_path};
+use super::runtime_daemon::{
+    ControlPlaneTransport, control_plane_transport, daemon_client_config, default_state_db_path,
+    runtime_api_base_url,
+};
 
 /// Manage OCI images.
 #[derive(Args, Debug)]
@@ -53,6 +58,174 @@ async fn connect_image_daemon(
                 state_db.display()
             )
         })
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorPayload {
+    code: String,
+    message: String,
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorEnvelope {
+    error: ApiErrorPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiImagePayload {
+    image_ref: String,
+    resolved_digest: String,
+    platform: String,
+    source_registry: String,
+    pulled_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiImageListResponse {
+    images: Vec<ApiImagePayload>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiPullImageRequest {
+    image_ref: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiPullImageResponse {
+    image: ApiImagePayload,
+    receipt_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiPruneImagesResponse {
+    removed_refs: u64,
+    removed_manifests: u64,
+    removed_configs: u64,
+    removed_layer_dirs: u64,
+    remaining_images: u64,
+    receipt_id: Option<String>,
+}
+
+fn image_payload_from_api(payload: ApiImagePayload) -> runtime_v2::ImagePayload {
+    runtime_v2::ImagePayload {
+        image_ref: payload.image_ref,
+        resolved_digest: payload.resolved_digest,
+        platform: payload.platform,
+        source_registry: payload.source_registry,
+        pulled_at: payload.pulled_at,
+    }
+}
+
+fn runtime_api_url(path: &str) -> anyhow::Result<String> {
+    let base = runtime_api_base_url()?;
+    Ok(format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    ))
+}
+
+async fn api_error_response(response: reqwest::Response, context: &str) -> anyhow::Error {
+    let status = response.status();
+    let body = response.bytes().await.unwrap_or_default();
+    if let Ok(error) = serde_json::from_slice::<ApiErrorEnvelope>(&body) {
+        return anyhow!(
+            "{context}: api error {} {} (request_id={})",
+            error.error.code,
+            error.error.message,
+            error.error.request_id
+        );
+    }
+
+    let snippet = String::from_utf8_lossy(&body);
+    anyhow!("{context}: api status {status} body={snippet}")
+}
+
+async fn api_pull_image(image_ref: &str) -> anyhow::Result<ApiPullImageResponse> {
+    let url = runtime_api_url("/v1/images/pull")?;
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&ApiPullImageRequest {
+            image_ref: image_ref.to_string(),
+        })
+        .send()
+        .await
+        .context("failed to call api pull image")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to pull image via api").await);
+    }
+    response
+        .json()
+        .await
+        .context("failed to decode api pull image response")
+}
+
+async fn api_list_images() -> anyhow::Result<Vec<runtime_v2::ImagePayload>> {
+    let url = runtime_api_url("/v1/images")?;
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .context("failed to call api list images")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to list images via api").await);
+    }
+    let payload: ApiImageListResponse = response
+        .json()
+        .await
+        .context("failed to decode api list images response")?;
+    Ok(payload
+        .images
+        .into_iter()
+        .map(image_payload_from_api)
+        .collect())
+}
+
+async fn api_prune_images() -> anyhow::Result<ApiPruneImagesResponse> {
+    let url = runtime_api_url("/v1/images/prune")?;
+    let response = reqwest::Client::new()
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body("{}")
+        .send()
+        .await
+        .context("failed to call api prune images")?;
+    if response.status() == HttpStatusCode::METHOD_NOT_ALLOWED {
+        return Err(anyhow!(
+            "api endpoint /v1/images/prune is unavailable; update vz-api to latest daemon-backed image surface"
+        ));
+    }
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to prune images via api").await);
+    }
+    response
+        .json()
+        .await
+        .context("failed to decode api prune images response")
+}
+
+fn print_images(images: Vec<runtime_v2::ImagePayload>) {
+    if images.is_empty() {
+        println!("No images found.");
+        return;
+    }
+
+    println!(
+        "{:<40}  {:<14}  {:<18}  REF",
+        "DIGEST", "PLATFORM", "REGISTRY"
+    );
+    for image in images {
+        let digest = if image.resolved_digest.len() > 40 {
+            image.resolved_digest[..40].to_string()
+        } else {
+            image.resolved_digest.clone()
+        };
+        println!(
+            "{:<40}  {:<14}  {:<18}  {}",
+            digest, image.platform, image.source_registry, image.image_ref
+        );
+    }
 }
 
 async fn run_pull_stream_for_state_db(
@@ -101,8 +274,31 @@ async fn run_pull_stream_for_state_db(
 }
 
 pub(crate) async fn run_pull_stream(args: super::oci::PullArgs) -> anyhow::Result<()> {
-    let state_db = default_state_db_path();
-    run_pull_stream_for_state_db(args, &state_db, None).await
+    match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let state_db = default_state_db_path();
+            run_pull_stream_for_state_db(args, &state_db, None).await
+        }
+        ControlPlaneTransport::ApiHttp => {
+            if pull_auth_overrides_requested(&args.opts) {
+                bail!("registry auth flags are not supported for api-http `vz image pull` yet");
+            }
+
+            let done = api_pull_image(&args.image).await?;
+            let image = image_payload_from_api(done.image);
+            println!(
+                "Pulled {image_ref} as {digest}",
+                image_ref = image.image_ref,
+                digest = image.resolved_digest
+            );
+            if let Some(receipt_id) = done.receipt_id
+                && !receipt_id.trim().is_empty()
+            {
+                println!("Receipt: {receipt_id}");
+            }
+            Ok(())
+        }
+    }
 }
 
 async fn run_prune_stream_for_state_db(
@@ -144,8 +340,30 @@ async fn run_prune_stream_for_state_db(
 }
 
 async fn run_prune_stream(args: super::oci::PruneArgs) -> anyhow::Result<()> {
-    let state_db = default_state_db_path();
-    run_prune_stream_for_state_db(args, &state_db, None).await
+    match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let state_db = default_state_db_path();
+            run_prune_stream_for_state_db(args, &state_db, None).await
+        }
+        ControlPlaneTransport::ApiHttp => {
+            let _ = args;
+            let done = api_prune_images().await?;
+            println!(
+                "Pruned images: refs={refs}, manifests={manifests}, configs={configs}, layer_dirs={layer_dirs}, remaining={remaining}",
+                refs = done.removed_refs,
+                manifests = done.removed_manifests,
+                configs = done.removed_configs,
+                layer_dirs = done.removed_layer_dirs,
+                remaining = done.remaining_images
+            );
+            if let Some(receipt_id) = done.receipt_id
+                && !receipt_id.trim().is_empty()
+            {
+                println!("Receipt: {receipt_id}");
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Run the image subcommand.
@@ -160,32 +378,18 @@ pub async fn run(args: ImageArgs) -> anyhow::Result<()> {
             )
         }
         ImageCommand::Ls(_images_args) => {
-            let state_db = default_state_db_path();
-            let mut client = connect_image_daemon(&state_db, None).await?;
-            let response = client
-                .list_images(runtime_v2::ListImagesRequest { metadata: None })
-                .await?;
-            let images = response.images;
-            if images.is_empty() {
-                println!("No images found.");
-                return Ok(());
-            }
-
-            println!(
-                "{:<40}  {:<14}  {:<18}  REF",
-                "DIGEST", "PLATFORM", "REGISTRY"
-            );
-            for image in images {
-                let digest = if image.resolved_digest.len() > 40 {
-                    image.resolved_digest[..40].to_string()
-                } else {
-                    image.resolved_digest.clone()
-                };
-                println!(
-                    "{:<40}  {:<14}  {:<18}  {}",
-                    digest, image.platform, image.source_registry, image.image_ref
-                );
-            }
+            let images = match control_plane_transport()? {
+                ControlPlaneTransport::DaemonGrpc => {
+                    let state_db = default_state_db_path();
+                    let mut client = connect_image_daemon(&state_db, None).await?;
+                    client
+                        .list_images(runtime_v2::ListImagesRequest { metadata: None })
+                        .await?
+                        .images
+                }
+                ControlPlaneTransport::ApiHttp => api_list_images().await?,
+            };
+            print_images(images);
             Ok(())
         }
         ImageCommand::Prune(prune_args) => run_prune_stream(prune_args).await,
@@ -195,7 +399,30 @@ pub async fn run(args: ImageArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::oci::{ContainerOpts, PruneArgs, PullArgs};
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    use crate::commands::oci::{ContainerOpts, ImagesArgs, PruneArgs, PullArgs};
+    use axum::{Json, Router, routing::get};
+
+    fn set_env_var(key: &str, value: &str) -> Option<OsString> {
+        let previous = std::env::var_os(key);
+        // SAFETY: test code serializes env mutation with ENV_LOCK.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        previous
+    }
+
+    fn restore_env_var(key: &str, previous: Option<OsString>) {
+        // SAFETY: test code serializes env mutation with ENV_LOCK.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
 
     #[tokio::test]
     async fn pull_stream_reports_unreachable_daemon_when_autostart_disabled() {
@@ -239,6 +466,67 @@ mod tests {
                 .to_string()
                 .contains("failed to connect to vz-runtimed for state db"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_ls_uses_api_http_transport_when_configured() {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock env mutation guard");
+
+        let app = Router::new().route(
+            "/v1/images",
+            get(|| async move {
+                Json(serde_json::json!({
+                    "request_id": "req-test",
+                    "images": [],
+                }))
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind api test listener");
+        let address = listener.local_addr().expect("resolve listener address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let previous_transport = set_env_var("VZ_CONTROL_PLANE_TRANSPORT", "api-http");
+        let previous_api_base_url =
+            set_env_var("VZ_RUNTIME_API_BASE_URL", &format!("http://{address}"));
+        let previous_autostart = set_env_var("VZ_RUNTIME_DAEMON_AUTOSTART", "0");
+        let previous_socket = set_env_var(
+            "VZ_RUNTIME_DAEMON_SOCKET",
+            "/tmp/definitely-does-not-exist.sock",
+        );
+
+        let result = run(ImageArgs {
+            action: ImageCommand::Ls(ImagesArgs {
+                opts: ContainerOpts::default(),
+            }),
+        })
+        .await;
+
+        restore_env_var("VZ_RUNTIME_DAEMON_SOCKET", previous_socket);
+        restore_env_var("VZ_RUNTIME_DAEMON_AUTOSTART", previous_autostart);
+        restore_env_var("VZ_RUNTIME_API_BASE_URL", previous_api_base_url);
+        restore_env_var("VZ_CONTROL_PLANE_TRANSPORT", previous_transport);
+
+        let _ = shutdown_tx.send(());
+        let _ = server.await;
+
+        assert!(
+            result.is_ok(),
+            "image ls should succeed over api-http transport: {result:#?}"
         );
     }
 }

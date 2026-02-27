@@ -179,6 +179,29 @@ async fn create_sandbox_via_api(api_base_url: &str) -> Result<String> {
     Ok(payload.sandbox.sandbox_id)
 }
 
+fn resolve_vz_binary() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_vz") {
+        return Ok(PathBuf::from(path));
+    }
+
+    let current_exe = std::env::current_exe().context("resolve current test binary path")?;
+    if let Some(target_debug_dir) = current_exe.parent().and_then(|path| path.parent()) {
+        let candidate = target_debug_dir.join("vz");
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+        #[cfg(windows)]
+        {
+            let candidate_exe = target_debug_dir.join("vz.exe");
+            if candidate_exe.exists() {
+                return Ok(candidate_exe);
+            }
+        }
+    }
+
+    bail!("resolve vz binary")
+}
+
 fn run_vz_command(
     vz_bin: &Path,
     api_base_url: &str,
@@ -404,7 +427,7 @@ async fn cli_api_http_mode_end_to_end_sandbox_and_attach_flow() -> Result<()> {
         start_api_server(state_store_path.clone()).await?;
 
     let sandbox_id = create_sandbox_via_api(&api_base_url).await?;
-    let vz_bin = PathBuf::from(std::env::var("CARGO_BIN_EXE_vz").context("resolve vz binary")?);
+    let vz_bin = resolve_vz_binary()?;
 
     let ls_output = run_vz_command(&vz_bin, &api_base_url, &home_dir, &["ls", "--json"])?;
     if !ls_output.status.success() {

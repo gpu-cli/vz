@@ -8,10 +8,11 @@ use super::{
     ErrorResponse, EventsResponse, ExecutionListResponse, ExecutionOutputStreamEventPayload,
     ExecutionResponse, FileMutationResponse, ForkCheckpointRequest, ImageListResponse,
     ImageResponse, LeaseListResponse, LeaseResponse, ListFilesRequest, ListFilesResponse,
-    MakeDirRequest, MovePathRequest, OpenLeaseRequest, OpenSandboxShellResponse, ReadFileRequest,
-    ReadFileResponse, ReceiptResponse, RemovePathRequest, ResizeExecRequest,
-    RestoreCheckpointResponse, SandboxListResponse, SandboxResponse, SignalExecRequest,
-    StartBuildRequest, WriteExecStdinRequest, WriteFileRequest, WriteFileResponse,
+    MakeDirRequest, MovePathRequest, OpenLeaseRequest, OpenSandboxShellResponse,
+    PruneImagesResponse, PullImageRequest, PullImageResponse, ReadFileRequest, ReadFileResponse,
+    ReceiptResponse, RemovePathRequest, ResizeExecRequest, RestoreCheckpointResponse,
+    SandboxListResponse, SandboxResponse, SignalExecRequest, StartBuildRequest,
+    WriteExecStdinRequest, WriteFileRequest, WriteFileResponse,
 };
 use utoipa::OpenApi;
 
@@ -601,6 +602,34 @@ fn list_images() {}
 fn get_image() {}
 
 #[utoipa::path(
+    post,
+    path = "/v1/images/pull",
+    operation_id = "pullImage",
+    summary = "Pull and cache an OCI image",
+    params(("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY_KEY_DESCRIPTION)),
+    request_body = PullImageRequest,
+    responses(
+        (status = 200, description = "Image pulled", body = PullImageResponse),
+        (status = 400, description = "Invalid request body", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn pull_image() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/images/prune",
+    operation_id = "pruneImages",
+    summary = "Prune unreferenced image artifacts",
+    params(("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY_KEY_DESCRIPTION)),
+    responses(
+        (status = 200, description = "Image artifacts pruned", body = PruneImagesResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn prune_images() {}
+
+#[utoipa::path(
     get,
     path = "/v1/builds",
     operation_id = "listBuilds",
@@ -877,6 +906,8 @@ fn chown_path() {}
         remove_container,
         list_images,
         get_image,
+        pull_image,
+        prune_images,
         list_builds,
         start_build,
         get_build,
@@ -931,6 +962,9 @@ fn chown_path() {}
         crate::ImagePayload,
         crate::ImageResponse,
         crate::ImageListResponse,
+        crate::PullImageRequest,
+        crate::PullImageResponse,
+        crate::PruneImagesResponse,
         crate::ReceiptPayload,
         crate::ReceiptResponse,
         crate::StartBuildRequest,

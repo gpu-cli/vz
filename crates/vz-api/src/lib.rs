@@ -254,6 +254,8 @@ pub fn router(config: ApiConfig) -> Router {
         )
         .route("/v1/images", get(list_images))
         .route("/v1/images/{image_ref}", get(get_image))
+        .route("/v1/images/pull", post(pull_image))
+        .route("/v1/images/prune", post(prune_images))
         .route("/v1/builds", get(list_builds).post(start_build))
         .route("/v1/builds/{build_id}", get(get_build).delete(cancel_build))
         .route("/v1/receipts/{receipt_id}", get(get_receipt))

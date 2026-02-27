@@ -3174,6 +3174,192 @@ pub(super) async fn try_get_image_via_daemon(
     }
 }
 
+pub(super) async fn try_pull_image_via_daemon(
+    state: &ApiState,
+    headers: &HeaderMap,
+    raw_body: &[u8],
+    request_id: &str,
+) -> Option<Response> {
+    let body: PullImageRequest = match serde_json::from_slice(raw_body) {
+        Ok(body) => body,
+        Err(error) => {
+            return Some(json_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &format!("invalid JSON body: {error}"),
+                request_id,
+            ));
+        }
+    };
+
+    let mut client = match DaemonClient::connect_with_config(daemon_client_config(state)).await {
+        Ok(client) => client,
+        Err(error) => {
+            return Some(json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon_unavailable",
+                &error.to_string(),
+                request_id,
+            ));
+        }
+    };
+
+    let mut stream = match client
+        .pull_image(runtime_v2::PullImageRequest {
+            image_ref: body.image_ref,
+            metadata: Some(daemon_request_metadata(
+                request_id,
+                extract_idempotency_key(headers),
+            )),
+        })
+        .await
+    {
+        Ok(stream) => stream,
+        Err(DaemonClientError::Grpc(status)) => {
+            return Some(daemon_status_to_http_response(status, request_id));
+        }
+        Err(error) => {
+            return Some(json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon_unavailable",
+                &error.to_string(),
+                request_id,
+            ));
+        }
+    };
+
+    let mut completion = None;
+    loop {
+        match stream.message().await {
+            Ok(Some(event)) => {
+                if let Some(runtime_v2::pull_image_event::Payload::Completion(done)) = event.payload
+                {
+                    completion = Some(done);
+                }
+            }
+            Ok(None) => break,
+            Err(status) => return Some(daemon_status_to_http_response(status, request_id)),
+        }
+    }
+
+    let Some(done) = completion else {
+        return Some(json_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "daemon pull_image stream ended without completion",
+            request_id,
+        ));
+    };
+    let Some(image) = done.image else {
+        return Some(json_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "daemon returned missing image payload",
+            request_id,
+        ));
+    };
+    let receipt_id = normalize_optional_wire_field(&done.receipt_id);
+    Some(
+        (
+            StatusCode::OK,
+            Json(PullImageResponse {
+                request_id: if done.request_id.trim().is_empty() {
+                    request_id.to_string()
+                } else {
+                    done.request_id
+                },
+                image: image_payload_from_runtime_proto(image),
+                receipt_id,
+            }),
+        )
+            .into_response(),
+    )
+}
+
+pub(super) async fn try_prune_images_via_daemon(
+    state: &ApiState,
+    headers: &HeaderMap,
+    request_id: &str,
+) -> Option<Response> {
+    let mut client = match DaemonClient::connect_with_config(daemon_client_config(state)).await {
+        Ok(client) => client,
+        Err(error) => {
+            return Some(json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon_unavailable",
+                &error.to_string(),
+                request_id,
+            ));
+        }
+    };
+
+    let mut stream = match client
+        .prune_images(runtime_v2::PruneImagesRequest {
+            metadata: Some(daemon_request_metadata(
+                request_id,
+                extract_idempotency_key(headers),
+            )),
+        })
+        .await
+    {
+        Ok(stream) => stream,
+        Err(DaemonClientError::Grpc(status)) => {
+            return Some(daemon_status_to_http_response(status, request_id));
+        }
+        Err(error) => {
+            return Some(json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon_unavailable",
+                &error.to_string(),
+                request_id,
+            ));
+        }
+    };
+
+    let mut completion = None;
+    loop {
+        match stream.message().await {
+            Ok(Some(event)) => {
+                if let Some(runtime_v2::prune_images_event::Payload::Completion(done)) =
+                    event.payload
+                {
+                    completion = Some(done);
+                }
+            }
+            Ok(None) => break,
+            Err(status) => return Some(daemon_status_to_http_response(status, request_id)),
+        }
+    }
+
+    let Some(done) = completion else {
+        return Some(json_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "daemon prune_images stream ended without completion",
+            request_id,
+        ));
+    };
+    Some(
+        (
+            StatusCode::OK,
+            Json(PruneImagesResponse {
+                request_id: if done.request_id.trim().is_empty() {
+                    request_id.to_string()
+                } else {
+                    done.request_id
+                },
+                removed_refs: done.removed_refs,
+                removed_manifests: done.removed_manifests,
+                removed_configs: done.removed_configs,
+                removed_layer_dirs: done.removed_layer_dirs,
+                remaining_images: done.remaining_images,
+                receipt_id: normalize_optional_wire_field(&done.receipt_id),
+            }),
+        )
+            .into_response(),
+    )
+}
+
 pub(super) async fn try_get_receipt_via_daemon(
     state: &ApiState,
     receipt_id: &str,

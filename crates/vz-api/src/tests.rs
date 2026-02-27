@@ -140,6 +140,8 @@ fn openapi_document_contains_required_paths() {
     assert!(paths.contains_key("/v1/leases/{lease_id}"));
     assert!(paths.contains_key("/v1/images"));
     assert!(paths.contains_key("/v1/images/{image_ref}"));
+    assert!(paths.contains_key("/v1/images/pull"));
+    assert!(paths.contains_key("/v1/images/prune"));
     assert!(paths.contains_key("/v1/builds"));
     assert!(paths.contains_key("/v1/builds/{build_id}"));
     assert!(paths.contains_key("/v1/containers"));

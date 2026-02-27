@@ -476,6 +476,29 @@ pub(crate) struct ImageListResponse {
     pub(crate) images: Vec<ImagePayload>,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct PullImageRequest {
+    pub(crate) image_ref: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct PullImageResponse {
+    pub(crate) request_id: String,
+    pub(crate) image: ImagePayload,
+    pub(crate) receipt_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct PruneImagesResponse {
+    pub(crate) request_id: String,
+    pub(crate) removed_refs: u64,
+    pub(crate) removed_manifests: u64,
+    pub(crate) removed_configs: u64,
+    pub(crate) removed_layer_dirs: u64,
+    pub(crate) remaining_images: u64,
+    pub(crate) receipt_id: Option<String>,
+}
+
 // ── Receipt types ──
 
 #[derive(Debug, Serialize, ToSchema)]

@@ -1007,6 +1007,38 @@ pub(super) async fn get_image(
     )
 }
 
+pub(super) async fn pull_image(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_pull_image_via_daemon(&state, &headers, raw_body.as_ref(), &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "image operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn prune_images(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_prune_images_via_daemon(&state, &headers, &request_id).await {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "image operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
 // ── Build handlers ──
 
 pub(super) async fn start_build(
