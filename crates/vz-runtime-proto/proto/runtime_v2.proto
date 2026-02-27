@@ -656,9 +656,9 @@ service StackService {
   rpc GetStackStatus(GetStackStatusRequest) returns (GetStackStatusResponse);
   rpc ListStackEvents(ListStackEventsRequest) returns (ListStackEventsResponse);
   rpc GetStackLogs(GetStackLogsRequest) returns (GetStackLogsResponse);
-  rpc StopStackService(StackServiceActionRequest) returns (StackServiceActionResponse);
-  rpc StartStackService(StackServiceActionRequest) returns (StackServiceActionResponse);
-  rpc RestartStackService(StackServiceActionRequest) returns (StackServiceActionResponse);
+  rpc StopStackService(StackServiceActionRequest) returns (stream StackServiceActionEvent);
+  rpc StartStackService(StackServiceActionRequest) returns (stream StackServiceActionEvent);
+  rpc RestartStackService(StackServiceActionRequest) returns (stream StackServiceActionEvent);
   rpc CreateStackRunContainer(StackRunContainerRequest) returns (StackRunContainerResponse);
   rpc RemoveStackRunContainer(StackRunContainerRequest) returns (StackRunContainerResponse);
 }
@@ -789,6 +789,20 @@ message StackServiceActionResponse {
   string request_id = 1;
   string stack_name = 2;
   StackServiceStatus service = 3;
+}
+
+message StackServiceActionCompletion {
+  StackServiceActionResponse response = 1;
+  string receipt_id = 2;
+}
+
+message StackServiceActionEvent {
+  string request_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    StackMutationProgress progress = 3;
+    StackServiceActionCompletion completion = 4;
+  }
 }
 
 message StackRunContainerRequest {

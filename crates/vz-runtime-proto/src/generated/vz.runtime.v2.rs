@@ -1097,6 +1097,32 @@ pub struct StackServiceActionResponse {
     pub service: ::core::option::Option<StackServiceStatus>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StackServiceActionCompletion {
+    #[prost(message, optional, tag = "1")]
+    pub response: ::core::option::Option<StackServiceActionResponse>,
+    #[prost(string, tag = "2")]
+    pub receipt_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StackServiceActionEvent {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(oneof = "stack_service_action_event::Payload", tags = "3, 4")]
+    pub payload: ::core::option::Option<stack_service_action_event::Payload>,
+}
+/// Nested message and enum types in `StackServiceActionEvent`.
+pub mod stack_service_action_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "3")]
+        Progress(super::StackMutationProgress),
+        #[prost(message, tag = "4")]
+        Completion(super::StackServiceActionCompletion),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StackRunContainerRequest {
     #[prost(message, optional, tag = "1")]
     pub metadata: ::core::option::Option<RequestMetadata>,
@@ -3335,7 +3361,7 @@ pub mod stack_service_client {
             &mut self,
             request: impl tonic::IntoRequest<super::StackServiceActionRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::StackServiceActionResponse>,
+            tonic::Response<tonic::codec::Streaming<super::StackServiceActionEvent>>,
             tonic::Status,
         > {
             self.inner
@@ -3355,13 +3381,13 @@ pub mod stack_service_client {
                 .insert(
                     GrpcMethod::new("vz.runtime.v2.StackService", "StopStackService"),
                 );
-            self.inner.unary(req, path, codec).await
+            self.inner.server_streaming(req, path, codec).await
         }
         pub async fn start_stack_service(
             &mut self,
             request: impl tonic::IntoRequest<super::StackServiceActionRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::StackServiceActionResponse>,
+            tonic::Response<tonic::codec::Streaming<super::StackServiceActionEvent>>,
             tonic::Status,
         > {
             self.inner
@@ -3381,13 +3407,13 @@ pub mod stack_service_client {
                 .insert(
                     GrpcMethod::new("vz.runtime.v2.StackService", "StartStackService"),
                 );
-            self.inner.unary(req, path, codec).await
+            self.inner.server_streaming(req, path, codec).await
         }
         pub async fn restart_stack_service(
             &mut self,
             request: impl tonic::IntoRequest<super::StackServiceActionRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::StackServiceActionResponse>,
+            tonic::Response<tonic::codec::Streaming<super::StackServiceActionEvent>>,
             tonic::Status,
         > {
             self.inner
@@ -3407,7 +3433,7 @@ pub mod stack_service_client {
                 .insert(
                     GrpcMethod::new("vz.runtime.v2.StackService", "RestartStackService"),
                 );
-            self.inner.unary(req, path, codec).await
+            self.inner.server_streaming(req, path, codec).await
         }
         pub async fn create_stack_run_container(
             &mut self,
@@ -7244,25 +7270,43 @@ pub mod stack_service_server {
             tonic::Response<super::GetStackLogsResponse>,
             tonic::Status,
         >;
+        /// Server streaming response type for the StopStackService method.
+        type StopStackServiceStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::StackServiceActionEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
         async fn stop_stack_service(
             &self,
             request: tonic::Request<super::StackServiceActionRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::StackServiceActionResponse>,
+            tonic::Response<Self::StopStackServiceStream>,
             tonic::Status,
         >;
+        /// Server streaming response type for the StartStackService method.
+        type StartStackServiceStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::StackServiceActionEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
         async fn start_stack_service(
             &self,
             request: tonic::Request<super::StackServiceActionRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::StackServiceActionResponse>,
+            tonic::Response<Self::StartStackServiceStream>,
             tonic::Status,
         >;
+        /// Server streaming response type for the RestartStackService method.
+        type RestartStackServiceStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::StackServiceActionEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
         async fn restart_stack_service(
             &self,
             request: tonic::Request<super::StackServiceActionRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::StackServiceActionResponse>,
+            tonic::Response<Self::RestartStackServiceStream>,
             tonic::Status,
         >;
         async fn create_stack_run_container(
@@ -7589,11 +7633,13 @@ pub mod stack_service_server {
                     struct StopStackServiceSvc<T: StackService>(pub Arc<T>);
                     impl<
                         T: StackService,
-                    > tonic::server::UnaryService<super::StackServiceActionRequest>
-                    for StopStackServiceSvc<T> {
-                        type Response = super::StackServiceActionResponse;
+                    > tonic::server::ServerStreamingService<
+                        super::StackServiceActionRequest,
+                    > for StopStackServiceSvc<T> {
+                        type Response = super::StackServiceActionEvent;
+                        type ResponseStream = T::StopStackServiceStream;
                         type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
+                            tonic::Response<Self::ResponseStream>,
                             tonic::Status,
                         >;
                         fn call(
@@ -7625,7 +7671,7 @@ pub mod stack_service_server {
                                 max_decoding_message_size,
                                 max_encoding_message_size,
                             );
-                        let res = grpc.unary(method, req).await;
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
@@ -7635,11 +7681,13 @@ pub mod stack_service_server {
                     struct StartStackServiceSvc<T: StackService>(pub Arc<T>);
                     impl<
                         T: StackService,
-                    > tonic::server::UnaryService<super::StackServiceActionRequest>
-                    for StartStackServiceSvc<T> {
-                        type Response = super::StackServiceActionResponse;
+                    > tonic::server::ServerStreamingService<
+                        super::StackServiceActionRequest,
+                    > for StartStackServiceSvc<T> {
+                        type Response = super::StackServiceActionEvent;
+                        type ResponseStream = T::StartStackServiceStream;
                         type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
+                            tonic::Response<Self::ResponseStream>,
                             tonic::Status,
                         >;
                         fn call(
@@ -7671,7 +7719,7 @@ pub mod stack_service_server {
                                 max_decoding_message_size,
                                 max_encoding_message_size,
                             );
-                        let res = grpc.unary(method, req).await;
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
@@ -7681,11 +7729,13 @@ pub mod stack_service_server {
                     struct RestartStackServiceSvc<T: StackService>(pub Arc<T>);
                     impl<
                         T: StackService,
-                    > tonic::server::UnaryService<super::StackServiceActionRequest>
-                    for RestartStackServiceSvc<T> {
-                        type Response = super::StackServiceActionResponse;
+                    > tonic::server::ServerStreamingService<
+                        super::StackServiceActionRequest,
+                    > for RestartStackServiceSvc<T> {
+                        type Response = super::StackServiceActionEvent;
+                        type ResponseStream = T::RestartStackServiceStream;
                         type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
+                            tonic::Response<Self::ResponseStream>,
                             tonic::Status,
                         >;
                         fn call(
@@ -7717,7 +7767,7 @@ pub mod stack_service_server {
                                 max_decoding_message_size,
                                 max_encoding_message_size,
                             );
-                        let res = grpc.unary(method, req).await;
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

@@ -718,6 +718,8 @@ type ApplyStackEventStream =
     tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::ApplyStackEvent, Status>>;
 type TeardownStackEventStream =
     tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::TeardownStackEvent, Status>>;
+type StackServiceActionEventStream =
+    tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::StackServiceActionEvent, Status>>;
 
 fn stack_stream_from_events<T>(
     events: Vec<Result<T, Status>>,
@@ -824,10 +826,49 @@ fn teardown_stack_completion_event(
     }
 }
 
+fn stack_service_action_progress_event(
+    request_id: &str,
+    sequence: u64,
+    phase: &str,
+    detail: &str,
+) -> runtime_v2::StackServiceActionEvent {
+    runtime_v2::StackServiceActionEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::stack_service_action_event::Payload::Progress(
+            runtime_v2::StackMutationProgress {
+                phase: phase.to_string(),
+                detail: detail.to_string(),
+            },
+        )),
+    }
+}
+
+fn stack_service_action_completion_event(
+    request_id: &str,
+    sequence: u64,
+    response: runtime_v2::StackServiceActionResponse,
+    receipt_id: &str,
+) -> runtime_v2::StackServiceActionEvent {
+    runtime_v2::StackServiceActionEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::stack_service_action_event::Payload::Completion(
+            runtime_v2::StackServiceActionCompletion {
+                response: Some(response),
+                receipt_id: receipt_id.to_string(),
+            },
+        )),
+    }
+}
+
 #[tonic::async_trait]
 impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
     type ApplyStackStream = ApplyStackEventStream;
     type TeardownStackStream = TeardownStackEventStream;
+    type StopStackServiceStream = StackServiceActionEventStream;
+    type StartStackServiceStream = StackServiceActionEventStream;
+    type RestartStackServiceStream = StackServiceActionEventStream;
 
     async fn apply_stack(
         &self,
@@ -1464,7 +1505,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
     async fn stop_stack_service(
         &self,
         request: Request<runtime_v2::StackServiceActionRequest>,
-    ) -> Result<Response<runtime_v2::StackServiceActionResponse>, Status> {
+    ) -> Result<Response<Self::StopStackServiceStream>, Status> {
         let intercepted_request_id = request_id_from_extensions(&request);
         let request = request.into_inner();
         let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
@@ -1488,6 +1529,13 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 BTreeMap::new(),
             )));
         }
+        let mut sequence = 1u64;
+        let mut events = vec![Ok(stack_service_action_progress_event(
+            &request_id,
+            sequence,
+            "validating",
+            "validating stack service stop request",
+        ))];
         let service_name = request.service_name.trim().to_string();
         if service_name.is_empty() {
             return Err(status_from_machine_error(MachineError::new(
@@ -1498,14 +1546,27 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             )));
         }
 
-        let (spec, observed_state) = load_stack_service_action_context(
+        let (spec, observed_state) = match load_stack_service_action_context(
             self.daemon.as_ref(),
             &stack_name,
             &service_name,
             &request_id,
-        )?;
+        ) {
+            Ok(value) => value,
+            Err(status) => {
+                events.push(Err(status));
+                return Ok(stack_stream_response(events, None));
+            }
+        };
         if observed_state.phase != ServicePhase::Stopped || observed_state.container_id.is_some() {
-            execute_stack_service_action(
+            sequence += 1;
+            events.push(Ok(stack_service_action_progress_event(
+                &request_id,
+                sequence,
+                "executing",
+                "stopping stack service runtime",
+            )));
+            if let Err(status) = execute_stack_service_action(
                 self.daemon.clone(),
                 &spec,
                 Action::ServiceRemove {
@@ -1513,10 +1574,13 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 },
                 &request_id,
                 MachineErrorCode::StateConflict,
-            )?;
+            ) {
+                events.push(Err(status));
+                return Ok(stack_stream_response(events, None));
+            }
         }
 
-        let service_state = self
+        let service_state = match self
             .daemon
             .with_state_store(|store| {
                 Ok(store
@@ -1525,11 +1589,26 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                     .find(|service| service.service_name == service_name)
                     .unwrap_or_else(|| default_stopped_service(&service_name)))
             })
-            .map_err(|error| status_from_stack_error(error, &request_id))?;
+            .map_err(|error| status_from_stack_error(error, &request_id))
+        {
+            Ok(value) => value,
+            Err(status) => {
+                events.push(Err(status));
+                return Ok(stack_stream_response(events, None));
+            }
+        };
 
+        sequence += 1;
+        events.push(Ok(stack_service_action_progress_event(
+            &request_id,
+            sequence,
+            "persisting",
+            "persisting stop service receipt",
+        )));
         let now = current_unix_secs();
         let receipt_id = generate_receipt_id();
-        self.daemon
+        let persist_result = self
+            .daemon
             .with_state_store(|store| {
                 store.with_immediate_transaction(|tx| {
                     tx.save_receipt(&Receipt {
@@ -1545,23 +1624,25 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                     Ok(())
                 })
             })
-            .map_err(|error| status_from_stack_error(error, &request_id))?;
-
-        let mut response = Response::new(stack_service_action_response(
-            request_id,
-            stack_name,
-            service_state,
-        ));
-        if let Ok(value) = MetadataValue::try_from(receipt_id.as_str()) {
-            response.metadata_mut().insert("x-receipt-id", value);
+            .map_err(|error| status_from_stack_error(error, &request_id));
+        if let Err(status) = persist_result {
+            events.push(Err(status));
+            return Ok(stack_stream_response(events, None));
         }
-        Ok(response)
+        sequence += 1;
+        events.push(Ok(stack_service_action_completion_event(
+            &request_id,
+            sequence,
+            stack_service_action_response(request_id.clone(), stack_name, service_state),
+            receipt_id.as_str(),
+        )));
+        Ok(stack_stream_response(events, Some(receipt_id.as_str())))
     }
 
     async fn start_stack_service(
         &self,
         request: Request<runtime_v2::StackServiceActionRequest>,
-    ) -> Result<Response<runtime_v2::StackServiceActionResponse>, Status> {
+    ) -> Result<Response<Self::StartStackServiceStream>, Status> {
         let intercepted_request_id = request_id_from_extensions(&request);
         let request = request.into_inner();
         let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
@@ -1585,6 +1666,13 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 BTreeMap::new(),
             )));
         }
+        let mut sequence = 1u64;
+        let mut events = vec![Ok(stack_service_action_progress_event(
+            &request_id,
+            sequence,
+            "validating",
+            "validating stack service start request",
+        ))];
         let service_name = request.service_name.trim().to_string();
         if service_name.is_empty() {
             return Err(status_from_machine_error(MachineError::new(
@@ -1595,15 +1683,28 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             )));
         }
 
-        let (spec, observed_state) = load_stack_service_action_context(
+        let (spec, observed_state) = match load_stack_service_action_context(
             self.daemon.as_ref(),
             &stack_name,
             &service_name,
             &request_id,
-        )?;
+        ) {
+            Ok(value) => value,
+            Err(status) => {
+                events.push(Err(status));
+                return Ok(stack_stream_response(events, None));
+            }
+        };
         if !(observed_state.phase == ServicePhase::Running && observed_state.container_id.is_some())
         {
-            execute_stack_service_action(
+            sequence += 1;
+            events.push(Ok(stack_service_action_progress_event(
+                &request_id,
+                sequence,
+                "executing",
+                "starting stack service runtime",
+            )));
+            if let Err(status) = execute_stack_service_action(
                 self.daemon.clone(),
                 &spec,
                 Action::ServiceCreate {
@@ -1611,10 +1712,13 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 },
                 &request_id,
                 MachineErrorCode::InternalError,
-            )?;
+            ) {
+                events.push(Err(status));
+                return Ok(stack_stream_response(events, None));
+            }
         }
 
-        let service_state = self
+        let service_state = match self
             .daemon
             .with_state_store(|store| {
                 Ok(store
@@ -1623,11 +1727,26 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                     .find(|service| service.service_name == service_name)
                     .unwrap_or_else(|| default_stopped_service(&service_name)))
             })
-            .map_err(|error| status_from_stack_error(error, &request_id))?;
+            .map_err(|error| status_from_stack_error(error, &request_id))
+        {
+            Ok(value) => value,
+            Err(status) => {
+                events.push(Err(status));
+                return Ok(stack_stream_response(events, None));
+            }
+        };
 
+        sequence += 1;
+        events.push(Ok(stack_service_action_progress_event(
+            &request_id,
+            sequence,
+            "persisting",
+            "persisting start service receipt",
+        )));
         let now = current_unix_secs();
         let receipt_id = generate_receipt_id();
-        self.daemon
+        let persist_result = self
+            .daemon
             .with_state_store(|store| {
                 store.with_immediate_transaction(|tx| {
                     tx.save_receipt(&Receipt {
@@ -1643,23 +1762,25 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                     Ok(())
                 })
             })
-            .map_err(|error| status_from_stack_error(error, &request_id))?;
-
-        let mut response = Response::new(stack_service_action_response(
-            request_id,
-            stack_name,
-            service_state,
-        ));
-        if let Ok(value) = MetadataValue::try_from(receipt_id.as_str()) {
-            response.metadata_mut().insert("x-receipt-id", value);
+            .map_err(|error| status_from_stack_error(error, &request_id));
+        if let Err(status) = persist_result {
+            events.push(Err(status));
+            return Ok(stack_stream_response(events, None));
         }
-        Ok(response)
+        sequence += 1;
+        events.push(Ok(stack_service_action_completion_event(
+            &request_id,
+            sequence,
+            stack_service_action_response(request_id.clone(), stack_name, service_state),
+            receipt_id.as_str(),
+        )));
+        Ok(stack_stream_response(events, Some(receipt_id.as_str())))
     }
 
     async fn restart_stack_service(
         &self,
         request: Request<runtime_v2::StackServiceActionRequest>,
-    ) -> Result<Response<runtime_v2::StackServiceActionResponse>, Status> {
+    ) -> Result<Response<Self::RestartStackServiceStream>, Status> {
         let intercepted_request_id = request_id_from_extensions(&request);
         let request = request.into_inner();
         let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
@@ -1683,6 +1804,13 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 BTreeMap::new(),
             )));
         }
+        let mut sequence = 1u64;
+        let mut events = vec![Ok(stack_service_action_progress_event(
+            &request_id,
+            sequence,
+            "validating",
+            "validating stack service restart request",
+        ))];
         let service_name = request.service_name.trim().to_string();
         if service_name.is_empty() {
             return Err(status_from_machine_error(MachineError::new(
@@ -1693,13 +1821,26 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             )));
         }
 
-        let (spec, _observed_state) = load_stack_service_action_context(
+        let (spec, _observed_state) = match load_stack_service_action_context(
             self.daemon.as_ref(),
             &stack_name,
             &service_name,
             &request_id,
-        )?;
-        execute_stack_service_action(
+        ) {
+            Ok(value) => value,
+            Err(status) => {
+                events.push(Err(status));
+                return Ok(stack_stream_response(events, None));
+            }
+        };
+        sequence += 1;
+        events.push(Ok(stack_service_action_progress_event(
+            &request_id,
+            sequence,
+            "executing",
+            "restarting stack service runtime",
+        )));
+        if let Err(status) = execute_stack_service_action(
             self.daemon.clone(),
             &spec,
             Action::ServiceRecreate {
@@ -1707,9 +1848,12 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             },
             &request_id,
             MachineErrorCode::InternalError,
-        )?;
+        ) {
+            events.push(Err(status));
+            return Ok(stack_stream_response(events, None));
+        }
 
-        let service_state = self
+        let service_state = match self
             .daemon
             .with_state_store(|store| {
                 Ok(store
@@ -1718,11 +1862,26 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                     .find(|service| service.service_name == service_name)
                     .unwrap_or_else(|| default_stopped_service(&service_name)))
             })
-            .map_err(|error| status_from_stack_error(error, &request_id))?;
+            .map_err(|error| status_from_stack_error(error, &request_id))
+        {
+            Ok(value) => value,
+            Err(status) => {
+                events.push(Err(status));
+                return Ok(stack_stream_response(events, None));
+            }
+        };
 
+        sequence += 1;
+        events.push(Ok(stack_service_action_progress_event(
+            &request_id,
+            sequence,
+            "persisting",
+            "persisting restart service receipt",
+        )));
         let now = current_unix_secs();
         let receipt_id = generate_receipt_id();
-        self.daemon
+        let persist_result = self
+            .daemon
             .with_state_store(|store| {
                 store.with_immediate_transaction(|tx| {
                     tx.save_receipt(&Receipt {
@@ -1738,17 +1897,19 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                     Ok(())
                 })
             })
-            .map_err(|error| status_from_stack_error(error, &request_id))?;
-
-        let mut response = Response::new(stack_service_action_response(
-            request_id,
-            stack_name,
-            service_state,
-        ));
-        if let Ok(value) = MetadataValue::try_from(receipt_id.as_str()) {
-            response.metadata_mut().insert("x-receipt-id", value);
+            .map_err(|error| status_from_stack_error(error, &request_id));
+        if let Err(status) = persist_result {
+            events.push(Err(status));
+            return Ok(stack_stream_response(events, None));
         }
-        Ok(response)
+        sequence += 1;
+        events.push(Ok(stack_service_action_completion_event(
+            &request_id,
+            sequence,
+            stack_service_action_response(request_id.clone(), stack_name, service_state),
+            receipt_id.as_str(),
+        )));
+        Ok(stack_stream_response(events, Some(receipt_id.as_str())))
     }
 
     async fn create_stack_run_container(
@@ -1999,6 +2160,7 @@ mod tests {
     use crate::RuntimedConfig;
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use tokio_stream::StreamExt;
     use vz_runtime_contract::{Build, RuntimeError};
 
     #[test]
@@ -2409,6 +2571,25 @@ services:
         (tmp, daemon)
     }
 
+    async fn read_stack_service_action_completion(
+        response: Response<StackServiceActionEventStream>,
+    ) -> runtime_v2::StackServiceActionResponse {
+        let mut stream = response.into_inner();
+        let mut completion = None;
+        while let Some(item) = stream.next().await {
+            let event = item.expect("stack service stream event");
+            if let Some(runtime_v2::stack_service_action_event::Payload::Completion(done)) =
+                event.payload
+            {
+                completion = Some(done);
+            }
+        }
+        completion
+            .expect("expected terminal stack service completion event")
+            .response
+            .expect("stack service completion should include response")
+    }
+
     #[tokio::test]
     async fn stop_stack_service_noop_returns_stopped_status() {
         let (_tmp, daemon) = stack_test_daemon();
@@ -2447,7 +2628,7 @@ services:
         .await
         .expect("stop stack service");
 
-        let payload = response.into_inner();
+        let payload = read_stack_service_action_completion(response).await;
         let service_status = payload.service.expect("service payload");
         assert_eq!(service_status.service_name, "web");
         assert_eq!(service_status.phase, "stopped");
@@ -2492,7 +2673,7 @@ services:
         .await
         .expect("start stack service");
 
-        let payload = response.into_inner();
+        let payload = read_stack_service_action_completion(response).await;
         let service_status = payload.service.expect("service payload");
         assert_eq!(service_status.service_name, "web");
         assert_eq!(service_status.phase, "running");
@@ -2517,7 +2698,7 @@ services:
             .expect("persist desired state");
 
         let service = StackServiceImpl::new(daemon);
-        let error = runtime_v2::stack_service_server::StackService::stop_stack_service(
+        let response = runtime_v2::stack_service_server::StackService::stop_stack_service(
             &service,
             tonic::Request::new(runtime_v2::StackServiceActionRequest {
                 metadata: None,
@@ -2526,8 +2707,16 @@ services:
             }),
         )
         .await
-        .expect_err("unknown service should fail");
+        .expect("unknown service stream should start");
 
+        let mut stream = response.into_inner();
+        let error = loop {
+            match stream.next().await {
+                Some(Ok(_event)) => continue,
+                Some(Err(status)) => break status,
+                None => panic!("expected terminal stream error for unknown service"),
+            }
+        };
         assert_eq!(error.code(), tonic::Code::NotFound);
     }
 

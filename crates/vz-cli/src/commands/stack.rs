@@ -672,31 +672,60 @@ async fn cmd_service_action(args: ServiceArgs, action: ControlAction) -> anyhow:
         stack_name: args.name.clone(),
         service_name: args.service.clone(),
     };
-    let response = match action {
-        ControlAction::Stop => client.stop_stack_service(request).await.with_context(|| {
+    let mut stream = match action {
+        ControlAction::Stop => client
+            .stop_stack_service_stream(request)
+            .await
+            .with_context(|| {
             format!(
                 "failed to stop service `{}` in stack `{}` via daemon",
                 args.service, args.name
             )
         })?,
-        ControlAction::Start => client.start_stack_service(request).await.with_context(|| {
+        ControlAction::Start => client
+            .start_stack_service_stream(request)
+            .await
+            .with_context(|| {
             format!(
                 "failed to start service `{}` in stack `{}` via daemon",
                 args.service, args.name
             )
         })?,
-        ControlAction::Restart => {
-            client
-                .restart_stack_service(request)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to restart service `{}` in stack `{}` via daemon",
-                        args.service, args.name
-                    )
-                })?
+        ControlAction::Restart => client
+            .restart_stack_service_stream(request)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to restart service `{}` in stack `{}` via daemon",
+                    args.service, args.name
+                )
+            })?,
+    };
+    let mut completion = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to read service action stream for `{}` in stack `{}`",
+                args.service, args.name
+            )
+        })?
+    {
+        match event.payload {
+            Some(runtime_v2::stack_service_action_event::Payload::Progress(progress)) => {
+                println!("[{}] {}", progress.phase, progress.detail);
+            }
+            Some(runtime_v2::stack_service_action_event::Payload::Completion(done)) => {
+                completion = Some(done);
+            }
+            None => {}
         }
     };
+    let response = completion
+        .ok_or_else(|| anyhow::anyhow!("daemon stack service stream ended without completion"))?
+        .response
+        .ok_or_else(|| anyhow::anyhow!("daemon stack service completion missing response payload"))?;
 
     let service = response
         .service
