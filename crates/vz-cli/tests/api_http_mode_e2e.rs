@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router as AxumRouter,
-    extract::Json as ExtractJson,
+    extract::{Json as ExtractJson, Path as AxumPath},
+    http::StatusCode,
     routing::{get, post},
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -788,6 +789,243 @@ async fn cli_api_http_mode_image_commands_work_against_stub_api_without_daemon()
         prune_calls.load(Ordering::SeqCst),
         1,
         "prune endpoint should be called exactly once"
+    );
+
+    let _ = shutdown_tx.send(());
+    server
+        .await
+        .context("join stub API server task")?
+        .context("run stub API server")?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_api_http_mode_checkpoint_commands_work_against_stub_api_without_daemon() -> Result<()>
+{
+    let temp_dir = tempfile::tempdir().context("create temp dir")?;
+    let home_dir = temp_dir.path().join("home");
+    std::fs::create_dir_all(&home_dir).context("create isolated HOME directory")?;
+
+    let list_calls = Arc::new(AtomicUsize::new(0));
+    let create_calls = Arc::new(AtomicUsize::new(0));
+    let inspect_calls = Arc::new(AtomicUsize::new(0));
+
+    let list_calls_clone = Arc::clone(&list_calls);
+    let create_calls_clone = Arc::clone(&create_calls);
+    let inspect_calls_clone = Arc::clone(&inspect_calls);
+
+    let app = AxumRouter::new()
+        .route(
+            "/v1/checkpoints",
+            get(move || {
+                let list_calls = Arc::clone(&list_calls_clone);
+                async move {
+                    list_calls.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "request_id": "req-checkpoint-list",
+                        "checkpoints": [{
+                            "checkpoint_id": "ckpt-stub-1",
+                            "sandbox_id": "sbx-stub",
+                            "parent_checkpoint_id": serde_json::Value::Null,
+                            "class": "fs_quick",
+                            "state": "ready",
+                            "compatibility_fingerprint": "fp-stub",
+                            "created_at": 1730000000u64
+                        }]
+                    }))
+                }
+            })
+            .post(
+                move |ExtractJson(payload): ExtractJson<serde_json::Value>| {
+                    let create_calls = Arc::clone(&create_calls_clone);
+                    async move {
+                        create_calls.fetch_add(1, Ordering::SeqCst);
+                        if payload["sandbox_id"].as_str() != Some("sbx-stub")
+                            || payload["class"].as_str() != Some("fs_quick")
+                            || payload["compatibility_fingerprint"].as_str() != Some("fp-stub")
+                        {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": {
+                                        "code": "invalid_request",
+                                        "message": "unexpected checkpoint create payload",
+                                        "request_id": "req-checkpoint-create-err"
+                                    }
+                                })),
+                            );
+                        }
+                        (
+                            StatusCode::CREATED,
+                            Json(serde_json::json!({
+                                "request_id": "req-checkpoint-create",
+                                "checkpoint": {
+                                    "checkpoint_id": "ckpt-stub-1",
+                                    "sandbox_id": "sbx-stub",
+                                    "parent_checkpoint_id": serde_json::Value::Null,
+                                    "class": "fs_quick",
+                                    "state": "ready",
+                                    "compatibility_fingerprint": "fp-stub",
+                                    "created_at": 1730000000u64
+                                }
+                            })),
+                        )
+                    }
+                },
+            ),
+        )
+        .route(
+            "/v1/checkpoints/{checkpoint_id}",
+            get(move |AxumPath(checkpoint_id): AxumPath<String>| {
+                let inspect_calls = Arc::clone(&inspect_calls_clone);
+                async move {
+                    inspect_calls.fetch_add(1, Ordering::SeqCst);
+                    if checkpoint_id != "ckpt-stub-1" {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "code": "not_found",
+                                    "message": format!("checkpoint {checkpoint_id} not found"),
+                                    "request_id": "req-checkpoint-inspect-err"
+                                }
+                            })),
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "request_id": "req-checkpoint-inspect",
+                            "checkpoint": {
+                                "checkpoint_id": "ckpt-stub-1",
+                                "sandbox_id": "sbx-stub",
+                                "parent_checkpoint_id": serde_json::Value::Null,
+                                "class": "fs_quick",
+                                "state": "ready",
+                                "compatibility_fingerprint": "fp-stub",
+                                "created_at": 1730000000u64
+                            }
+                        })),
+                    )
+                }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("bind stub API listener")?;
+    let address = listener
+        .local_addr()
+        .context("resolve stub API listener address")?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    let api_base_url = format!("http://{address}");
+    let vz_bin = resolve_vz_binary()?;
+
+    let create_output = run_vz_command(
+        &vz_bin,
+        &api_base_url,
+        &home_dir,
+        &[
+            "debug",
+            "checkpoint",
+            "create",
+            "sbx-stub",
+            "--class",
+            "fs_quick",
+            "--fingerprint",
+            "fp-stub",
+        ],
+    )
+    .await?;
+    if !create_output.status.success() {
+        bail!(
+            "vz checkpoint create failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&create_output.stdout),
+            String::from_utf8_lossy(&create_output.stderr)
+        );
+    }
+    let create_stdout = String::from_utf8_lossy(&create_output.stdout);
+    if !create_stdout.contains("Checkpoint ckpt-stub-1 created (state: ready).") {
+        bail!(
+            "vz checkpoint create output missing expected marker:\n{}",
+            create_stdout
+        );
+    }
+
+    let list_output = run_vz_command(
+        &vz_bin,
+        &api_base_url,
+        &home_dir,
+        &["debug", "checkpoint", "list", "--json"],
+    )
+    .await?;
+    if !list_output.status.success() {
+        bail!(
+            "vz checkpoint list failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&list_output.stdout),
+            String::from_utf8_lossy(&list_output.stderr)
+        );
+    }
+    let listed: serde_json::Value =
+        serde_json::from_slice(&list_output.stdout).context("decode checkpoint list output")?;
+    let listed_items = listed
+        .as_array()
+        .context("checkpoint list output should be JSON array")?;
+    if !listed_items.iter().any(|item| {
+        item.get("checkpoint_id")
+            .and_then(serde_json::Value::as_str)
+            == Some("ckpt-stub-1")
+    }) {
+        bail!("checkpoint list output missing ckpt-stub-1");
+    }
+
+    let inspect_output = run_vz_command(
+        &vz_bin,
+        &api_base_url,
+        &home_dir,
+        &["debug", "checkpoint", "inspect", "ckpt-stub-1"],
+    )
+    .await?;
+    if !inspect_output.status.success() {
+        bail!(
+            "vz checkpoint inspect failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&inspect_output.stdout),
+            String::from_utf8_lossy(&inspect_output.stderr)
+        );
+    }
+    let inspected: serde_json::Value = serde_json::from_slice(&inspect_output.stdout)
+        .context("decode checkpoint inspect output")?;
+    if inspected
+        .get("checkpoint_id")
+        .and_then(serde_json::Value::as_str)
+        != Some("ckpt-stub-1")
+    {
+        bail!("checkpoint inspect output missing ckpt-stub-1");
+    }
+
+    assert_eq!(
+        create_calls.load(Ordering::SeqCst),
+        1,
+        "checkpoint create endpoint should be called exactly once"
+    );
+    assert_eq!(
+        list_calls.load(Ordering::SeqCst),
+        1,
+        "checkpoint list endpoint should be called exactly once"
+    );
+    assert_eq!(
+        inspect_calls.load(Ordering::SeqCst),
+        1,
+        "checkpoint inspect endpoint should be called exactly once"
     );
 
     let _ = shutdown_tx.send(());
