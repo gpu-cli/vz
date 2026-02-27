@@ -2,11 +2,17 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use axum::{
+    Json, Router as AxumRouter,
+    extract::Json as ExtractJson,
+    routing::{get, post},
+};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use vz_api::{ApiConfig, router};
@@ -202,19 +208,72 @@ fn resolve_vz_binary() -> Result<PathBuf> {
     bail!("resolve vz binary")
 }
 
-fn run_vz_command(
+fn run_vz_command_blocking(
+    vz_bin: PathBuf,
+    api_base_url: String,
+    home_dir: PathBuf,
+    args: Vec<String>,
+) -> Result<Output> {
+    let mut child = Command::new(&vz_bin)
+        .args(&args)
+        .env("VZ_CONTROL_PLANE_TRANSPORT", "api-http")
+        .env("VZ_RUNTIME_API_BASE_URL", &api_base_url)
+        .env("HOME", &home_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn vz command: {:?}", args))?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().context("poll vz command status")? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("timed out running vz command: {:?}", args);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    let mut stdout = Vec::new();
+    if let Some(mut stream) = child.stdout.take() {
+        stream
+            .read_to_end(&mut stdout)
+            .context("read vz command stdout")?;
+    }
+
+    let mut stderr = Vec::new();
+    if let Some(mut stream) = child.stderr.take() {
+        stream
+            .read_to_end(&mut stderr)
+            .context("read vz command stderr")?;
+    }
+
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+async fn run_vz_command(
     vz_bin: &Path,
     api_base_url: &str,
     home_dir: &Path,
     args: &[&str],
 ) -> Result<Output> {
-    Command::new(vz_bin)
-        .args(args)
-        .env("VZ_CONTROL_PLANE_TRANSPORT", "api-http")
-        .env("VZ_RUNTIME_API_BASE_URL", api_base_url)
-        .env("HOME", home_dir)
-        .output()
-        .with_context(|| format!("run vz command: {:?}", args))
+    let vz_bin = vz_bin.to_path_buf();
+    let api_base_url = api_base_url.to_string();
+    let home_dir = home_dir.to_path_buf();
+    let args: Vec<String> = args.iter().map(|value| (*value).to_string()).collect();
+
+    tokio::task::spawn_blocking(move || {
+        run_vz_command_blocking(vz_bin, api_base_url, home_dir, args)
+    })
+    .await
+    .context("join vz command task")?
 }
 
 fn transcript_contains(transcript: &Arc<Mutex<Vec<u8>>>, needle: &str) -> bool {
@@ -429,7 +488,8 @@ async fn cli_api_http_mode_end_to_end_sandbox_and_attach_flow() -> Result<()> {
     let sandbox_id = create_sandbox_via_api(&api_base_url).await?;
     let vz_bin = resolve_vz_binary()?;
 
-    let image_ls_output = run_vz_command(&vz_bin, &api_base_url, &home_dir, &["image", "ls"])?;
+    let image_ls_output =
+        run_vz_command(&vz_bin, &api_base_url, &home_dir, &["image", "ls"]).await?;
     if !image_ls_output.status.success() {
         bail!(
             "vz image ls failed\nstdout:\n{}\nstderr:\n{}",
@@ -446,7 +506,7 @@ async fn cli_api_http_mode_end_to_end_sandbox_and_attach_flow() -> Result<()> {
     }
 
     let image_prune_output =
-        run_vz_command(&vz_bin, &api_base_url, &home_dir, &["image", "prune"])?;
+        run_vz_command(&vz_bin, &api_base_url, &home_dir, &["image", "prune"]).await?;
     if !image_prune_output.status.success() {
         bail!(
             "vz image prune failed\nstdout:\n{}\nstderr:\n{}",
@@ -462,7 +522,7 @@ async fn cli_api_http_mode_end_to_end_sandbox_and_attach_flow() -> Result<()> {
         );
     }
 
-    let ls_output = run_vz_command(&vz_bin, &api_base_url, &home_dir, &["ls", "--json"])?;
+    let ls_output = run_vz_command(&vz_bin, &api_base_url, &home_dir, &["ls", "--json"]).await?;
     if !ls_output.status.success() {
         bail!(
             "vz ls failed\nstdout:\n{}\nstderr:\n{}",
@@ -480,7 +540,7 @@ async fn cli_api_http_mode_end_to_end_sandbox_and_attach_flow() -> Result<()> {
     }
 
     let inspect_output =
-        run_vz_command(&vz_bin, &api_base_url, &home_dir, &["inspect", &sandbox_id])?;
+        run_vz_command(&vz_bin, &api_base_url, &home_dir, &["inspect", &sandbox_id]).await?;
     if !inspect_output.status.success() {
         bail!(
             "vz inspect failed\nstdout:\n{}\nstderr:\n{}",
@@ -511,7 +571,8 @@ async fn cli_api_http_mode_end_to_end_sandbox_and_attach_flow() -> Result<()> {
         &api_base_url,
         &home_dir,
         &["close-shell", &sandbox_id],
-    )?;
+    )
+    .await?;
     if !close_output.status.success() {
         bail!(
             "vz close-shell failed\nstdout:\n{}\nstderr:\n{}",
@@ -532,7 +593,7 @@ async fn cli_api_http_mode_end_to_end_sandbox_and_attach_flow() -> Result<()> {
         );
     }
 
-    let rm_output = run_vz_command(&vz_bin, &api_base_url, &home_dir, &["rm", &sandbox_id])?;
+    let rm_output = run_vz_command(&vz_bin, &api_base_url, &home_dir, &["rm", &sandbox_id]).await?;
     if !rm_output.status.success() {
         bail!(
             "vz rm failed\nstdout:\n{}\nstderr:\n{}",
@@ -552,6 +613,188 @@ async fn cli_api_http_mode_end_to_end_sandbox_and_attach_flow() -> Result<()> {
         .await
         .context("join daemon server task")?
         .context("run daemon server")?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_api_http_mode_image_commands_work_against_stub_api_without_daemon() -> Result<()> {
+    let temp_dir = tempfile::tempdir().context("create temp dir")?;
+    let home_dir = temp_dir.path().join("home");
+    std::fs::create_dir_all(&home_dir).context("create isolated HOME directory")?;
+
+    let list_calls = Arc::new(AtomicUsize::new(0));
+    let pull_calls = Arc::new(AtomicUsize::new(0));
+    let prune_calls = Arc::new(AtomicUsize::new(0));
+
+    let list_calls_clone = Arc::clone(&list_calls);
+    let pull_calls_clone = Arc::clone(&pull_calls);
+    let prune_calls_clone = Arc::clone(&prune_calls);
+
+    let app = AxumRouter::new()
+        .route(
+            "/v1/images",
+            get(move || {
+                let list_calls = Arc::clone(&list_calls_clone);
+                async move {
+                    list_calls.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "request_id": "req-list",
+                        "images": [{
+                            "image_ref": "alpine:3.20",
+                            "resolved_digest": "sha256:abc123",
+                            "platform": "linux/arm64",
+                            "source_registry": "docker.io",
+                            "pulled_at": 1730000000u64
+                        }]
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/v1/images/pull",
+            post(
+                move |ExtractJson(payload): ExtractJson<serde_json::Value>| {
+                    let pull_calls = Arc::clone(&pull_calls_clone);
+                    async move {
+                        pull_calls.fetch_add(1, Ordering::SeqCst);
+                        if payload["image_ref"].as_str() != Some("alpine:3.20") {
+                            return Json(serde_json::json!({
+                                "error": {
+                                    "code": "invalid_request",
+                                    "message": "unexpected image_ref",
+                                    "request_id": "req-pull-err"
+                                }
+                            }));
+                        }
+                        Json(serde_json::json!({
+                            "request_id": "req-pull",
+                            "image": {
+                                "image_ref": "alpine:3.20",
+                                "resolved_digest": "sha256:abc123",
+                                "platform": "linux/arm64",
+                                "source_registry": "docker.io",
+                                "pulled_at": 1730000000u64
+                            },
+                            "receipt_id": "rcp-pull-1"
+                        }))
+                    }
+                },
+            ),
+        )
+        .route(
+            "/v1/images/prune",
+            post(move || {
+                let prune_calls = Arc::clone(&prune_calls_clone);
+                async move {
+                    prune_calls.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "request_id": "req-prune",
+                        "removed_refs": 1u64,
+                        "removed_manifests": 1u64,
+                        "removed_configs": 1u64,
+                        "removed_layer_dirs": 1u64,
+                        "remaining_images": 0u64,
+                        "receipt_id": "rcp-prune-1"
+                    }))
+                }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("bind stub API listener")?;
+    let address = listener
+        .local_addr()
+        .context("resolve stub API listener address")?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    let api_base_url = format!("http://{address}");
+    let vz_bin = resolve_vz_binary()?;
+
+    let pull_output = run_vz_command(
+        &vz_bin,
+        &api_base_url,
+        &home_dir,
+        &["image", "pull", "alpine:3.20"],
+    )
+    .await?;
+    if !pull_output.status.success() {
+        bail!(
+            "vz image pull failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&pull_output.stdout),
+            String::from_utf8_lossy(&pull_output.stderr)
+        );
+    }
+    let pull_stdout = String::from_utf8_lossy(&pull_output.stdout);
+    if !pull_stdout.contains("Pulled alpine:3.20 as sha256:abc123") {
+        bail!(
+            "vz image pull output missing expected marker:\n{}",
+            pull_stdout
+        );
+    }
+
+    let ls_output = run_vz_command(&vz_bin, &api_base_url, &home_dir, &["image", "ls"]).await?;
+    if !ls_output.status.success() {
+        bail!(
+            "vz image ls failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&ls_output.stdout),
+            String::from_utf8_lossy(&ls_output.stderr)
+        );
+    }
+    let ls_stdout = String::from_utf8_lossy(&ls_output.stdout);
+    if !ls_stdout.contains("alpine:3.20") {
+        bail!(
+            "vz image ls output missing expected image reference:\n{}",
+            ls_stdout
+        );
+    }
+
+    let prune_output =
+        run_vz_command(&vz_bin, &api_base_url, &home_dir, &["image", "prune"]).await?;
+    if !prune_output.status.success() {
+        bail!(
+            "vz image prune failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&prune_output.stdout),
+            String::from_utf8_lossy(&prune_output.stderr)
+        );
+    }
+    let prune_stdout = String::from_utf8_lossy(&prune_output.stdout);
+    if !prune_stdout.contains("Pruned images: refs=1") {
+        bail!(
+            "vz image prune output missing expected marker:\n{}",
+            prune_stdout
+        );
+    }
+
+    assert_eq!(
+        pull_calls.load(Ordering::SeqCst),
+        1,
+        "pull endpoint should be called exactly once"
+    );
+    assert_eq!(
+        list_calls.load(Ordering::SeqCst),
+        1,
+        "list endpoint should be called exactly once"
+    );
+    assert_eq!(
+        prune_calls.load(Ordering::SeqCst),
+        1,
+        "prune endpoint should be called exactly once"
+    );
+
+    let _ = shutdown_tx.send(());
+    server
+        .await
+        .context("join stub API server task")?
+        .context("run stub API server")?;
 
     Ok(())
 }
