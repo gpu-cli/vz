@@ -935,6 +935,39 @@ pub struct ApplyStackResponse {
     pub services: ::prost::alloc::vec::Vec<StackServiceStatus>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StackMutationProgress {
+    #[prost(string, tag = "1")]
+    pub phase: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ApplyStackCompletion {
+    #[prost(message, optional, tag = "1")]
+    pub response: ::core::option::Option<ApplyStackResponse>,
+    #[prost(string, tag = "2")]
+    pub receipt_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ApplyStackEvent {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(oneof = "apply_stack_event::Payload", tags = "3, 4")]
+    pub payload: ::core::option::Option<apply_stack_event::Payload>,
+}
+/// Nested message and enum types in `ApplyStackEvent`.
+pub mod apply_stack_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "3")]
+        Progress(super::StackMutationProgress),
+        #[prost(message, tag = "4")]
+        Completion(super::ApplyStackCompletion),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TeardownStackRequest {
     #[prost(message, optional, tag = "1")]
     pub metadata: ::core::option::Option<RequestMetadata>,
@@ -955,6 +988,32 @@ pub struct TeardownStackResponse {
     pub changed_actions: u32,
     #[prost(uint32, tag = "4")]
     pub removed_volumes: u32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TeardownStackCompletion {
+    #[prost(message, optional, tag = "1")]
+    pub response: ::core::option::Option<TeardownStackResponse>,
+    #[prost(string, tag = "2")]
+    pub receipt_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TeardownStackEvent {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(oneof = "teardown_stack_event::Payload", tags = "3, 4")]
+    pub payload: ::core::option::Option<teardown_stack_event::Payload>,
+}
+/// Nested message and enum types in `TeardownStackEvent`.
+pub mod teardown_stack_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "3")]
+        Progress(super::StackMutationProgress),
+        #[prost(message, tag = "4")]
+        Completion(super::TeardownStackCompletion),
+    }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetStackStatusRequest {
@@ -3154,7 +3213,7 @@ pub mod stack_service_client {
             &mut self,
             request: impl tonic::IntoRequest<super::ApplyStackRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::ApplyStackResponse>,
+            tonic::Response<tonic::codec::Streaming<super::ApplyStackEvent>>,
             tonic::Status,
         > {
             self.inner
@@ -3172,13 +3231,13 @@ pub mod stack_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("vz.runtime.v2.StackService", "ApplyStack"));
-            self.inner.unary(req, path, codec).await
+            self.inner.server_streaming(req, path, codec).await
         }
         pub async fn teardown_stack(
             &mut self,
             request: impl tonic::IntoRequest<super::TeardownStackRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::TeardownStackResponse>,
+            tonic::Response<tonic::codec::Streaming<super::TeardownStackEvent>>,
             tonic::Status,
         > {
             self.inner
@@ -3196,7 +3255,7 @@ pub mod stack_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("vz.runtime.v2.StackService", "TeardownStack"));
-            self.inner.unary(req, path, codec).await
+            self.inner.server_streaming(req, path, codec).await
         }
         pub async fn get_stack_status(
             &mut self,
@@ -7141,18 +7200,27 @@ pub mod stack_service_server {
     /// Generated trait containing gRPC methods that should be implemented for use with StackServiceServer.
     #[async_trait]
     pub trait StackService: std::marker::Send + std::marker::Sync + 'static {
+        /// Server streaming response type for the ApplyStack method.
+        type ApplyStackStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::ApplyStackEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
         async fn apply_stack(
             &self,
             request: tonic::Request<super::ApplyStackRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ApplyStackResponse>,
-            tonic::Status,
-        >;
+        ) -> std::result::Result<tonic::Response<Self::ApplyStackStream>, tonic::Status>;
+        /// Server streaming response type for the TeardownStack method.
+        type TeardownStackStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::TeardownStackEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
         async fn teardown_stack(
             &self,
             request: tonic::Request<super::TeardownStackRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::TeardownStackResponse>,
+            tonic::Response<Self::TeardownStackStream>,
             tonic::Status,
         >;
         async fn get_stack_status(
@@ -7293,11 +7361,12 @@ pub mod stack_service_server {
                     struct ApplyStackSvc<T: StackService>(pub Arc<T>);
                     impl<
                         T: StackService,
-                    > tonic::server::UnaryService<super::ApplyStackRequest>
+                    > tonic::server::ServerStreamingService<super::ApplyStackRequest>
                     for ApplyStackSvc<T> {
-                        type Response = super::ApplyStackResponse;
+                        type Response = super::ApplyStackEvent;
+                        type ResponseStream = T::ApplyStackStream;
                         type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
+                            tonic::Response<Self::ResponseStream>,
                             tonic::Status,
                         >;
                         fn call(
@@ -7328,7 +7397,7 @@ pub mod stack_service_server {
                                 max_decoding_message_size,
                                 max_encoding_message_size,
                             );
-                        let res = grpc.unary(method, req).await;
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
@@ -7338,11 +7407,12 @@ pub mod stack_service_server {
                     struct TeardownStackSvc<T: StackService>(pub Arc<T>);
                     impl<
                         T: StackService,
-                    > tonic::server::UnaryService<super::TeardownStackRequest>
+                    > tonic::server::ServerStreamingService<super::TeardownStackRequest>
                     for TeardownStackSvc<T> {
-                        type Response = super::TeardownStackResponse;
+                        type Response = super::TeardownStackEvent;
+                        type ResponseStream = T::TeardownStackStream;
                         type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
+                            tonic::Response<Self::ResponseStream>,
                             tonic::Status,
                         >;
                         fn call(
@@ -7373,7 +7443,7 @@ pub mod stack_service_server {
                                 max_decoding_message_size,
                                 max_encoding_message_size,
                             );
-                        let res = grpc.unary(method, req).await;
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

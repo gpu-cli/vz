@@ -735,8 +735,41 @@ impl DaemonClient {
     /// Call Runtime V2 `ApplyStack` and preserve gRPC response metadata.
     pub async fn apply_stack_with_metadata(
         &mut self,
-        mut request: runtime_v2::ApplyStackRequest,
+        request: runtime_v2::ApplyStackRequest,
     ) -> Result<tonic::Response<runtime_v2::ApplyStackResponse>> {
+        let response = self.apply_stack_stream_with_metadata(request).await?;
+        let mut stream = response.into_inner();
+        let completion = read_apply_stack_completion(&self.config.socket_path, &mut stream).await?;
+        let apply_response = completion.response.ok_or_else(|| {
+            status_to_client_error(
+                &self.config.socket_path,
+                Status::internal("apply_stack completion missing response payload"),
+            )
+        })?;
+
+        let mut grpc_response = tonic::Response::new(apply_response);
+        if !completion.receipt_id.trim().is_empty()
+            && let Ok(value) = MetadataValue::try_from(completion.receipt_id.as_str())
+        {
+            grpc_response.metadata_mut().insert("x-receipt-id", value);
+        }
+        Ok(grpc_response)
+    }
+
+    /// Call Runtime V2 `ApplyStack` as a server stream.
+    pub async fn apply_stack_stream(
+        &mut self,
+        request: runtime_v2::ApplyStackRequest,
+    ) -> Result<tonic::Streaming<runtime_v2::ApplyStackEvent>> {
+        let response = self.apply_stack_stream_with_metadata(request).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Call Runtime V2 `ApplyStack` as a server stream and preserve gRPC response metadata.
+    pub async fn apply_stack_stream_with_metadata(
+        &mut self,
+        mut request: runtime_v2::ApplyStackRequest,
+    ) -> Result<tonic::Response<tonic::Streaming<runtime_v2::ApplyStackEvent>>> {
         Self::ensure_metadata(&mut request.metadata);
         self.stack_client
             .apply_stack(Request::new(request))
@@ -756,8 +789,42 @@ impl DaemonClient {
     /// Call Runtime V2 `TeardownStack` and preserve gRPC response metadata.
     pub async fn teardown_stack_with_metadata(
         &mut self,
-        mut request: runtime_v2::TeardownStackRequest,
+        request: runtime_v2::TeardownStackRequest,
     ) -> Result<tonic::Response<runtime_v2::TeardownStackResponse>> {
+        let response = self.teardown_stack_stream_with_metadata(request).await?;
+        let mut stream = response.into_inner();
+        let completion =
+            read_teardown_stack_completion(&self.config.socket_path, &mut stream).await?;
+        let teardown_response = completion.response.ok_or_else(|| {
+            status_to_client_error(
+                &self.config.socket_path,
+                Status::internal("teardown_stack completion missing response payload"),
+            )
+        })?;
+
+        let mut grpc_response = tonic::Response::new(teardown_response);
+        if !completion.receipt_id.trim().is_empty()
+            && let Ok(value) = MetadataValue::try_from(completion.receipt_id.as_str())
+        {
+            grpc_response.metadata_mut().insert("x-receipt-id", value);
+        }
+        Ok(grpc_response)
+    }
+
+    /// Call Runtime V2 `TeardownStack` as a server stream.
+    pub async fn teardown_stack_stream(
+        &mut self,
+        request: runtime_v2::TeardownStackRequest,
+    ) -> Result<tonic::Streaming<runtime_v2::TeardownStackEvent>> {
+        let response = self.teardown_stack_stream_with_metadata(request).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Call Runtime V2 `TeardownStack` as a server stream and preserve gRPC response metadata.
+    pub async fn teardown_stack_stream_with_metadata(
+        &mut self,
+        mut request: runtime_v2::TeardownStackRequest,
+    ) -> Result<tonic::Response<tonic::Streaming<runtime_v2::TeardownStackEvent>>> {
         Self::ensure_metadata(&mut request.metadata);
         self.stack_client
             .teardown_stack(Request::new(request))
@@ -1773,6 +1840,47 @@ async fn read_terminate_sandbox_completion(
     Err(status_to_client_error(
         socket_path,
         Status::internal("terminate_sandbox stream ended without terminal completion event"),
+    ))
+}
+
+async fn read_apply_stack_completion(
+    socket_path: &Path,
+    stream: &mut tonic::Streaming<runtime_v2::ApplyStackEvent>,
+) -> Result<runtime_v2::ApplyStackCompletion> {
+    while let Some(event) = stream
+        .message()
+        .await
+        .map_err(|status| status_to_client_error(socket_path, status))?
+    {
+        if let Some(runtime_v2::apply_stack_event::Payload::Completion(completion)) = event.payload
+        {
+            return Ok(completion);
+        }
+    }
+    Err(status_to_client_error(
+        socket_path,
+        Status::internal("apply_stack stream ended without terminal completion event"),
+    ))
+}
+
+async fn read_teardown_stack_completion(
+    socket_path: &Path,
+    stream: &mut tonic::Streaming<runtime_v2::TeardownStackEvent>,
+) -> Result<runtime_v2::TeardownStackCompletion> {
+    while let Some(event) = stream
+        .message()
+        .await
+        .map_err(|status| status_to_client_error(socket_path, status))?
+    {
+        if let Some(runtime_v2::teardown_stack_event::Payload::Completion(completion)) =
+            event.payload
+        {
+            return Ok(completion);
+        }
+    }
+    Err(status_to_client_error(
+        socket_path,
+        Status::internal("teardown_stack stream ended without terminal completion event"),
     ))
 }
 

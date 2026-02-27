@@ -358,6 +358,54 @@ async fn read_terminate_sandbox_completion_response(
     read_terminate_sandbox_completion(&mut stream).await
 }
 
+async fn read_apply_stack_completion(
+    stream: &mut tonic::Streaming<runtime_v2::ApplyStackEvent>,
+) -> runtime_v2::ApplyStackResponse {
+    let mut completion = None;
+    while let Some(event) = stream.message().await.expect("read apply stack stream event") {
+        if let Some(runtime_v2::apply_stack_event::Payload::Completion(done)) = event.payload {
+            completion = Some(done);
+        }
+    }
+    completion
+        .expect("expected terminal apply stack completion event")
+        .response
+        .expect("apply stack completion should include response")
+}
+
+async fn read_apply_stack_completion_response(
+    response: tonic::Response<tonic::Streaming<runtime_v2::ApplyStackEvent>>,
+) -> runtime_v2::ApplyStackResponse {
+    let mut stream = response.into_inner();
+    read_apply_stack_completion(&mut stream).await
+}
+
+async fn read_teardown_stack_completion(
+    stream: &mut tonic::Streaming<runtime_v2::TeardownStackEvent>,
+) -> runtime_v2::TeardownStackResponse {
+    let mut completion = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .expect("read teardown stack stream event")
+    {
+        if let Some(runtime_v2::teardown_stack_event::Payload::Completion(done)) = event.payload {
+            completion = Some(done);
+        }
+    }
+    completion
+        .expect("expected terminal teardown stack completion event")
+        .response
+        .expect("teardown stack completion should include response")
+}
+
+async fn read_teardown_stack_completion_response(
+    response: tonic::Response<tonic::Streaming<runtime_v2::TeardownStackEvent>>,
+) -> runtime_v2::TeardownStackResponse {
+    let mut stream = response.into_inner();
+    read_teardown_stack_completion(&mut stream).await
+}
+
 struct DenyCreateSandboxPolicyHook;
 
 impl RuntimePolicyHook for DenyCreateSandboxPolicyHook {
@@ -1665,22 +1713,24 @@ services:
     image: postgres:16
 "#;
 
-    let applied = stack_client
-        .apply_stack(Request::new(runtime_v2::ApplyStackRequest {
-            metadata: Some(runtime_v2::RequestMetadata {
-                request_id: "req-stack-apply".to_string(),
-                idempotency_key: String::new(),
-                trace_id: String::new(),
-            }),
-            stack_name: "stack-multi".to_string(),
-            compose_yaml: compose_yaml.to_string(),
-            compose_dir: ".".to_string(),
-            detach: false,
-            dry_run: true,
-        }))
-        .await
-        .expect("apply stack dry-run")
-        .into_inner();
+    let applied = read_apply_stack_completion_response(
+        stack_client
+            .apply_stack(Request::new(runtime_v2::ApplyStackRequest {
+                metadata: Some(runtime_v2::RequestMetadata {
+                    request_id: "req-stack-apply".to_string(),
+                    idempotency_key: String::new(),
+                    trace_id: String::new(),
+                }),
+                stack_name: "stack-multi".to_string(),
+                compose_yaml: compose_yaml.to_string(),
+                compose_dir: ".".to_string(),
+                detach: false,
+                dry_run: true,
+            }))
+            .await
+            .expect("apply stack dry-run"),
+    )
+    .await;
 
     assert_eq!(applied.stack_name, "stack-multi");
     assert_eq!(applied.changed_actions, 2);
@@ -1746,7 +1796,7 @@ async fn apply_and_teardown_stack_persist_receipts_with_metadata() {
         .await
         .expect("apply stack");
     assert!(applied.metadata().get("x-receipt-id").is_some());
-    let applied = applied.into_inner();
+    let applied = read_apply_stack_completion_response(applied).await;
 
     let torn_down = stack_client
         .teardown_stack(Request::new(runtime_v2::TeardownStackRequest {
@@ -1762,7 +1812,7 @@ async fn apply_and_teardown_stack_persist_receipts_with_metadata() {
         .await
         .expect("teardown stack");
     assert!(torn_down.metadata().get("x-receipt-id").is_some());
-    let torn_down = torn_down.into_inner();
+    let torn_down = read_teardown_stack_completion_response(torn_down).await;
 
     let stack_receipts = daemon
         .with_state_store(|store| store.list_receipts_for_entity("stack", &stack_name))
@@ -2831,7 +2881,7 @@ services:
         }))
         .await
     {
-        Ok(response) => response.into_inner(),
+        Ok(response) => read_apply_stack_completion_response(response).await,
         Err(error) => {
             eprintln!(
                 "skipping interactive stdin round trip: failed to apply stack in this environment ({error})"

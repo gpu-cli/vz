@@ -714,12 +714,125 @@ fn tail_output(raw: &str, tail: usize) -> String {
     output
 }
 
+type ApplyStackEventStream =
+    tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::ApplyStackEvent, Status>>;
+type TeardownStackEventStream =
+    tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::TeardownStackEvent, Status>>;
+
+fn stack_stream_from_events<T>(
+    events: Vec<Result<T, Status>>,
+) -> tokio_stream::wrappers::ReceiverStream<Result<T, Status>>
+where
+    T: Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel(events.len().max(1));
+    for event in events {
+        if tx.try_send(event).is_err() {
+            break;
+        }
+    }
+    drop(tx);
+    tokio_stream::wrappers::ReceiverStream::new(rx)
+}
+
+fn stack_stream_response<T>(
+    events: Vec<Result<T, Status>>,
+    receipt_id: Option<&str>,
+) -> Response<tokio_stream::wrappers::ReceiverStream<Result<T, Status>>>
+where
+    T: Send + 'static,
+{
+    let mut response = Response::new(stack_stream_from_events(events));
+    if let Some(receipt_id) = receipt_id
+        && !receipt_id.trim().is_empty()
+        && let Ok(value) = MetadataValue::try_from(receipt_id)
+    {
+        response.metadata_mut().insert("x-receipt-id", value);
+    }
+    response
+}
+
+fn apply_stack_progress_event(
+    request_id: &str,
+    sequence: u64,
+    phase: &str,
+    detail: &str,
+) -> runtime_v2::ApplyStackEvent {
+    runtime_v2::ApplyStackEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::apply_stack_event::Payload::Progress(
+            runtime_v2::StackMutationProgress {
+                phase: phase.to_string(),
+                detail: detail.to_string(),
+            },
+        )),
+    }
+}
+
+fn apply_stack_completion_event(
+    request_id: &str,
+    sequence: u64,
+    response: runtime_v2::ApplyStackResponse,
+    receipt_id: &str,
+) -> runtime_v2::ApplyStackEvent {
+    runtime_v2::ApplyStackEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::apply_stack_event::Payload::Completion(
+            runtime_v2::ApplyStackCompletion {
+                response: Some(response),
+                receipt_id: receipt_id.to_string(),
+            },
+        )),
+    }
+}
+
+fn teardown_stack_progress_event(
+    request_id: &str,
+    sequence: u64,
+    phase: &str,
+    detail: &str,
+) -> runtime_v2::TeardownStackEvent {
+    runtime_v2::TeardownStackEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::teardown_stack_event::Payload::Progress(
+            runtime_v2::StackMutationProgress {
+                phase: phase.to_string(),
+                detail: detail.to_string(),
+            },
+        )),
+    }
+}
+
+fn teardown_stack_completion_event(
+    request_id: &str,
+    sequence: u64,
+    response: runtime_v2::TeardownStackResponse,
+    receipt_id: &str,
+) -> runtime_v2::TeardownStackEvent {
+    runtime_v2::TeardownStackEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::teardown_stack_event::Payload::Completion(
+            runtime_v2::TeardownStackCompletion {
+                response: Some(response),
+                receipt_id: receipt_id.to_string(),
+            },
+        )),
+    }
+}
+
 #[tonic::async_trait]
 impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
+    type ApplyStackStream = ApplyStackEventStream;
+    type TeardownStackStream = TeardownStackEventStream;
+
     async fn apply_stack(
         &self,
         request: Request<runtime_v2::ApplyStackRequest>,
-    ) -> Result<Response<runtime_v2::ApplyStackResponse>, Status> {
+    ) -> Result<Response<Self::ApplyStackStream>, Status> {
         let intercepted_request_id = request_id_from_extensions(&request);
         let request = request.into_inner();
         let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
@@ -754,10 +867,17 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
 
         let spec = parse_stack_spec(&stack_name, &request.compose_yaml, &request.compose_dir)
             .map_err(|error| status_from_stack_error(error, &request_id))?;
+        let mut sequence = 1u64;
+        let mut events = vec![Ok(apply_stack_progress_event(
+            &request_id,
+            sequence,
+            "planning",
+            "planning stack apply actions",
+        ))];
 
         let stack_dir = stack_runtime_dir(self.daemon.as_ref(), &stack_name);
-        std::fs::create_dir_all(&stack_dir).map_err(|error| {
-            status_from_machine_error(MachineError::new(
+        if let Err(error) = std::fs::create_dir_all(&stack_dir) {
+            events.push(Err(status_from_machine_error(MachineError::new(
                 MachineErrorCode::InternalError,
                 format!(
                     "failed to create stack runtime directory {}: {error}",
@@ -765,20 +885,36 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 ),
                 Some(request_id.clone()),
                 BTreeMap::new(),
-            ))
-        })?;
+            ))));
+            return Ok(stack_stream_response(events, None));
+        }
 
-        let preview_store = self
+        let preview_store = match self
             .daemon
             .open_dedicated_state_store()
-            .map_err(|error| status_from_stack_error(error, &request_id))?;
+        {
+            Ok(store) => store,
+            Err(error) => {
+                events.push(Err(status_from_stack_error(error, &request_id)));
+                return Ok(stack_stream_response(events, None));
+            }
+        };
         let health_statuses = HashMap::new();
-        let apply_result = apply(&spec, &preview_store, &health_statuses)
-            .map_err(|error| status_from_stack_error(error, &request_id))?;
+        let apply_result = match apply(&spec, &preview_store, &health_statuses) {
+            Ok(result) => result,
+            Err(error) => {
+                events.push(Err(status_from_stack_error(error, &request_id)));
+                return Ok(stack_stream_response(events, None));
+            }
+        };
         if request.dry_run {
-            let observed = preview_store
-                .load_observed_state(&stack_name)
-                .map_err(|error| status_from_stack_error(error, &request_id))?;
+            let observed = match preview_store.load_observed_state(&stack_name) {
+                Ok(value) => value,
+                Err(error) => {
+                    events.push(Err(status_from_stack_error(error, &request_id)));
+                    return Ok(stack_stream_response(events, None));
+                }
+            };
             let services: Vec<runtime_v2::StackServiceStatus> =
                 observed.iter().map(stack_status_from_observed).collect();
             let services_ready = observed.iter().filter(|item| item.ready).count();
@@ -786,34 +922,70 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 .iter()
                 .filter(|item| item.phase == ServicePhase::Failed)
                 .count();
-            return Ok(Response::new(runtime_v2::ApplyStackResponse {
-                request_id,
-                stack_name,
-                changed_actions: apply_result.actions.len() as u32,
-                converged: false,
-                services_ready: services_ready as u32,
-                services_failed: services_failed as u32,
-                services,
-            }));
+            sequence += 1;
+            events.push(Ok(apply_stack_completion_event(
+                &request_id,
+                sequence,
+                runtime_v2::ApplyStackResponse {
+                    request_id: request_id.clone(),
+                    stack_name,
+                    changed_actions: apply_result.actions.len() as u32,
+                    converged: false,
+                    services_ready: services_ready as u32,
+                    services_failed: services_failed as u32,
+                    services,
+                },
+                "",
+            )));
+            return Ok(stack_stream_response(events, None));
         }
 
-        run_compose_builds(
+        sequence += 1;
+        events.push(Ok(apply_stack_progress_event(
+            &request_id,
+            sequence,
+            "building_images",
+            "running compose build directives",
+        )));
+        if let Err(error) = run_compose_builds(
             self.daemon.clone(),
             &spec,
             &request.compose_yaml,
             &request.compose_dir,
         )
         .await
-        .map_err(|error| status_from_stack_error(error, &request_id))?;
+        {
+            events.push(Err(status_from_stack_error(error, &request_id)));
+            return Ok(stack_stream_response(events, None));
+        }
 
-        let exec_store = self
+        sequence += 1;
+        events.push(Ok(apply_stack_progress_event(
+            &request_id,
+            sequence,
+            "reconciling",
+            "reconciling stack runtime state",
+        )));
+        let exec_store = match self
             .daemon
             .open_dedicated_state_store()
-            .map_err(|error| status_from_stack_error(error, &request_id))?;
-        let reconcile_store = self
+        {
+            Ok(store) => store,
+            Err(error) => {
+                events.push(Err(status_from_stack_error(error, &request_id)));
+                return Ok(stack_stream_response(events, None));
+            }
+        };
+        let reconcile_store = match self
             .daemon
             .open_dedicated_state_store()
-            .map_err(|error| status_from_stack_error(error, &request_id))?;
+        {
+            Ok(store) => store,
+            Err(error) => {
+                events.push(Err(status_from_stack_error(error, &request_id)));
+                return Ok(stack_stream_response(events, None));
+            }
+        };
         let runtime = DaemonContainerRuntime::new(self.daemon.clone());
         let executor = StackExecutor::new(runtime, exec_store, &stack_dir);
         let config = if request.detach {
@@ -825,14 +997,20 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             OrchestrationConfig::default()
         };
         let mut orchestrator = StackOrchestrator::new(executor, reconcile_store, config);
-        let orchestration_result = orchestrator
-            .run(&spec, None)
-            .map_err(|error| status_from_stack_error(error, &request_id))?;
-        let observed = orchestrator
-            .executor()
-            .store()
-            .load_observed_state(&stack_name)
-            .map_err(|error| status_from_stack_error(error, &request_id))?;
+        let orchestration_result = match orchestrator.run(&spec, None) {
+            Ok(result) => result,
+            Err(error) => {
+                events.push(Err(status_from_stack_error(error, &request_id)));
+                return Ok(stack_stream_response(events, None));
+            }
+        };
+        let observed = match orchestrator.executor().store().load_observed_state(&stack_name) {
+            Ok(value) => value,
+            Err(error) => {
+                events.push(Err(status_from_stack_error(error, &request_id)));
+                return Ok(stack_stream_response(events, None));
+            }
+        };
         let services: Vec<runtime_v2::StackServiceStatus> =
             observed.iter().map(stack_status_from_observed).collect();
         let changed_actions = apply_result.actions.len() as u32;
@@ -840,9 +1018,17 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
         let services_ready = orchestration_result.services_ready as u32;
         let services_failed = orchestration_result.services_failed as u32;
 
+        sequence += 1;
+        events.push(Ok(apply_stack_progress_event(
+            &request_id,
+            sequence,
+            "persisting",
+            "persisting stack apply receipt",
+        )));
         let now = current_unix_secs();
         let receipt_id = generate_receipt_id();
-        self.daemon
+        let persist_result = self
+            .daemon
             .with_state_store(|store| {
                 store.with_immediate_transaction(|tx| {
                     tx.emit_event(
@@ -871,27 +1057,34 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                     Ok(())
                 })
             })
-            .map_err(|error| status_from_stack_error(error, &request_id))?;
-
-        let mut response = Response::new(runtime_v2::ApplyStackResponse {
-            request_id,
-            stack_name,
-            changed_actions,
-            converged,
-            services_ready,
-            services_failed,
-            services,
-        });
-        if let Ok(value) = MetadataValue::try_from(receipt_id.as_str()) {
-            response.metadata_mut().insert("x-receipt-id", value);
+            .map_err(|error| status_from_stack_error(error, &request_id));
+        if let Err(status) = persist_result {
+            events.push(Err(status));
+            return Ok(stack_stream_response(events, None));
         }
-        Ok(response)
+
+        sequence += 1;
+        events.push(Ok(apply_stack_completion_event(
+            &request_id,
+            sequence,
+            runtime_v2::ApplyStackResponse {
+                request_id: request_id.clone(),
+                stack_name,
+                changed_actions,
+                converged,
+                services_ready,
+                services_failed,
+                services,
+            },
+            receipt_id.as_str(),
+        )));
+        Ok(stack_stream_response(events, Some(receipt_id.as_str())))
     }
 
     async fn teardown_stack(
         &self,
         request: Request<runtime_v2::TeardownStackRequest>,
-    ) -> Result<Response<runtime_v2::TeardownStackResponse>, Status> {
+    ) -> Result<Response<Self::TeardownStackStream>, Status> {
         let intercepted_request_id = request_id_from_extensions(&request);
         let request = request.into_inner();
         let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
@@ -932,6 +1125,13 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 BTreeMap::new(),
             )));
         }
+        let mut sequence = 1u64;
+        let mut events = vec![Ok(teardown_stack_progress_event(
+            &request_id,
+            sequence,
+            "planning",
+            "planning stack teardown actions",
+        ))];
 
         let empty_spec = StackSpec {
             name: stack_name.clone(),
@@ -942,24 +1142,44 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             disk_size_mb: None,
         };
         let health_statuses = HashMap::new();
-        let apply_result = self
+        let apply_result = match self
             .daemon
             .with_state_store(|store| apply(&empty_spec, store, &health_statuses))
-            .map_err(|error| status_from_stack_error(error, &request_id))?;
+        {
+            Ok(result) => result,
+            Err(error) => {
+                events.push(Err(status_from_stack_error(error, &request_id)));
+                return Ok(stack_stream_response(events, None));
+            }
+        };
 
         if request.dry_run {
-            return Ok(Response::new(runtime_v2::TeardownStackResponse {
-                request_id,
-                stack_name,
-                changed_actions: apply_result.actions.len() as u32,
-                removed_volumes: 0,
-            }));
+            sequence += 1;
+            events.push(Ok(teardown_stack_completion_event(
+                &request_id,
+                sequence,
+                runtime_v2::TeardownStackResponse {
+                    request_id: request_id.clone(),
+                    stack_name,
+                    changed_actions: apply_result.actions.len() as u32,
+                    removed_volumes: 0,
+                },
+                "",
+            )));
+            return Ok(stack_stream_response(events, None));
         }
 
         if !apply_result.actions.is_empty() {
+            sequence += 1;
+            events.push(Ok(teardown_stack_progress_event(
+                &request_id,
+                sequence,
+                "executing",
+                "executing stack teardown actions",
+            )));
             let stack_dir = stack_runtime_dir(self.daemon.as_ref(), &stack_name);
-            std::fs::create_dir_all(&stack_dir).map_err(|error| {
-                status_from_machine_error(MachineError::new(
+            if let Err(error) = std::fs::create_dir_all(&stack_dir) {
+                events.push(Err(status_from_machine_error(MachineError::new(
                     MachineErrorCode::InternalError,
                     format!(
                         "failed to create stack runtime directory {}: {error}",
@@ -967,34 +1187,63 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                     ),
                     Some(request_id.clone()),
                     BTreeMap::new(),
-                ))
-            })?;
-            let exec_store = self
+                ))));
+                return Ok(stack_stream_response(events, None));
+            }
+            let exec_store = match self
                 .daemon
                 .open_dedicated_state_store()
-                .map_err(|error| status_from_stack_error(error, &request_id))?;
+            {
+                Ok(store) => store,
+                Err(error) => {
+                    events.push(Err(status_from_stack_error(error, &request_id)));
+                    return Ok(stack_stream_response(events, None));
+                }
+            };
             let runtime = DaemonContainerRuntime::new(self.daemon.clone());
             let mut executor = StackExecutor::new(runtime, exec_store, &stack_dir);
-            executor
-                .execute(&empty_spec, &apply_result.actions)
-                .map_err(|error| status_from_stack_error(error, &request_id))?;
+            if let Err(error) = executor.execute(&empty_spec, &apply_result.actions) {
+                events.push(Err(status_from_stack_error(error, &request_id)));
+                return Ok(stack_stream_response(events, None));
+            }
         }
 
+        if request.remove_volumes {
+            sequence += 1;
+            events.push(Ok(teardown_stack_progress_event(
+                &request_id,
+                sequence,
+                "removing_volumes",
+                "removing stack volumes",
+            )));
+        }
         let removed_volumes = if request.remove_volumes {
             let stack_dir = stack_runtime_dir(self.daemon.as_ref(), &stack_name);
             let volume_manager = VolumeManager::new(&stack_dir);
-            volume_manager
-                .remove_all()
-                .map_err(|error| status_from_stack_error(error, &request_id))?
+            match volume_manager.remove_all() {
+                Ok(count) => count,
+                Err(error) => {
+                    events.push(Err(status_from_stack_error(error, &request_id)));
+                    return Ok(stack_stream_response(events, None));
+                }
+            }
         } else {
             0
         };
 
         let changed_actions = apply_result.actions.len() as u32;
         let removed_volumes = removed_volumes as u32;
+        sequence += 1;
+        events.push(Ok(teardown_stack_progress_event(
+            &request_id,
+            sequence,
+            "persisting",
+            "persisting stack teardown receipt",
+        )));
         let now = current_unix_secs();
         let receipt_id = generate_receipt_id();
-        self.daemon
+        let persist_result = self
+            .daemon
             .with_state_store(|store| {
                 store.with_immediate_transaction(|tx| {
                     tx.emit_event(
@@ -1019,18 +1268,24 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                     Ok(())
                 })
             })
-            .map_err(|error| status_from_stack_error(error, &request_id))?;
-
-        let mut response = Response::new(runtime_v2::TeardownStackResponse {
-            request_id,
-            stack_name,
-            changed_actions,
-            removed_volumes,
-        });
-        if let Ok(value) = MetadataValue::try_from(receipt_id.as_str()) {
-            response.metadata_mut().insert("x-receipt-id", value);
+            .map_err(|error| status_from_stack_error(error, &request_id));
+        if let Err(status) = persist_result {
+            events.push(Err(status));
+            return Ok(stack_stream_response(events, None));
         }
-        Ok(response)
+        sequence += 1;
+        events.push(Ok(teardown_stack_completion_event(
+            &request_id,
+            sequence,
+            runtime_v2::TeardownStackResponse {
+                request_id: request_id.clone(),
+                stack_name,
+                changed_actions,
+                removed_volumes,
+            },
+            receipt_id.as_str(),
+        )));
+        Ok(stack_stream_response(events, Some(receipt_id.as_str())))
     }
 
     async fn get_stack_status(

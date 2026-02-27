@@ -651,8 +651,8 @@ message StreamEventsRequest {
 // ── 8. StackService ───────────────────────────────────────────────
 
 service StackService {
-  rpc ApplyStack(ApplyStackRequest) returns (ApplyStackResponse);
-  rpc TeardownStack(TeardownStackRequest) returns (TeardownStackResponse);
+  rpc ApplyStack(ApplyStackRequest) returns (stream ApplyStackEvent);
+  rpc TeardownStack(TeardownStackRequest) returns (stream TeardownStackEvent);
   rpc GetStackStatus(GetStackStatusRequest) returns (GetStackStatusResponse);
   rpc ListStackEvents(ListStackEventsRequest) returns (ListStackEventsResponse);
   rpc GetStackLogs(GetStackLogsRequest) returns (GetStackLogsResponse);
@@ -690,6 +690,25 @@ message ApplyStackResponse {
   repeated StackServiceStatus services = 7;
 }
 
+message StackMutationProgress {
+  string phase = 1;
+  string detail = 2;
+}
+
+message ApplyStackCompletion {
+  ApplyStackResponse response = 1;
+  string receipt_id = 2;
+}
+
+message ApplyStackEvent {
+  string request_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    StackMutationProgress progress = 3;
+    ApplyStackCompletion completion = 4;
+  }
+}
+
 message TeardownStackRequest {
   RequestMetadata metadata = 1;
   string stack_name = 2;
@@ -702,6 +721,20 @@ message TeardownStackResponse {
   string stack_name = 2;
   uint32 changed_actions = 3;
   uint32 removed_volumes = 4;
+}
+
+message TeardownStackCompletion {
+  TeardownStackResponse response = 1;
+  string receipt_id = 2;
+}
+
+message TeardownStackEvent {
+  string request_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    StackMutationProgress progress = 3;
+    TeardownStackCompletion completion = 4;
+  }
 }
 
 message GetStackStatusRequest {

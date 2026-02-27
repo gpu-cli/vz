@@ -570,8 +570,8 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
     let stack_name = resolve_stack_name(args.name.as_deref(), &file)?;
     let state_db = stack_state_db_path(args.state_dir.as_deref());
     let mut client = connect_control_plane_for_state_db(&state_db).await?;
-    let response = client
-        .apply_stack(runtime_v2::ApplyStackRequest {
+    let mut stream = client
+        .apply_stack_stream(runtime_v2::ApplyStackRequest {
             metadata: None,
             stack_name: stack_name.clone(),
             compose_yaml: yaml,
@@ -581,6 +581,26 @@ async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
         })
         .await
         .with_context(|| format!("failed to apply stack `{stack_name}` via daemon"))?;
+    let mut completion = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .with_context(|| format!("failed to read apply stack stream for `{stack_name}`"))?
+    {
+        match event.payload {
+            Some(runtime_v2::apply_stack_event::Payload::Progress(progress)) => {
+                println!("[{}] {}", progress.phase, progress.detail);
+            }
+            Some(runtime_v2::apply_stack_event::Payload::Completion(done)) => {
+                completion = Some(done);
+            }
+            None => {}
+        }
+    }
+    let response = completion
+        .ok_or_else(|| anyhow::anyhow!("daemon apply_stack stream ended without completion"))?
+        .response
+        .ok_or_else(|| anyhow::anyhow!("daemon apply_stack completion missing response payload"))?;
 
     let observed = observed_from_stack_statuses(&response.services);
 
@@ -714,8 +734,8 @@ async fn cmd_service_action(args: ServiceArgs, action: ControlAction) -> anyhow:
 async fn cmd_down(args: DownArgs) -> anyhow::Result<()> {
     let state_db = stack_state_db_path(args.state_dir.as_deref());
     let mut client = connect_control_plane_for_state_db(&state_db).await?;
-    let response = client
-        .teardown_stack(runtime_v2::TeardownStackRequest {
+    let mut stream = client
+        .teardown_stack_stream(runtime_v2::TeardownStackRequest {
             metadata: None,
             stack_name: args.name.clone(),
             dry_run: args.dry_run,
@@ -723,6 +743,28 @@ async fn cmd_down(args: DownArgs) -> anyhow::Result<()> {
         })
         .await
         .with_context(|| format!("failed to teardown stack `{}` via daemon", args.name))?;
+    let mut completion = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .with_context(|| format!("failed to read teardown stack stream for `{}`", args.name))?
+    {
+        match event.payload {
+            Some(runtime_v2::teardown_stack_event::Payload::Progress(progress)) => {
+                println!("[{}] {}", progress.phase, progress.detail);
+            }
+            Some(runtime_v2::teardown_stack_event::Payload::Completion(done)) => {
+                completion = Some(done);
+            }
+            None => {}
+        }
+    }
+    let response = completion
+        .ok_or_else(|| anyhow::anyhow!("daemon teardown_stack stream ended without completion"))?
+        .response
+        .ok_or_else(|| {
+            anyhow::anyhow!("daemon teardown_stack completion missing response payload")
+        })?;
 
     if args.dry_run {
         println!(
