@@ -122,8 +122,8 @@ async fn daemon_create_sandbox(
     labels: BTreeMap<String, String>,
 ) -> anyhow::Result<Sandbox> {
     let mut client = connect_control_plane_for_state_db(state_db).await?;
-    let response = client
-        .create_sandbox(runtime_v2::CreateSandboxRequest {
+    let mut stream = client
+        .create_sandbox_stream(runtime_v2::CreateSandboxRequest {
             metadata: None,
             stack_name: sandbox_id.to_string(),
             cpus: u32::from(cpus),
@@ -132,6 +132,27 @@ async fn daemon_create_sandbox(
         })
         .await
         .context("failed to create sandbox via daemon")?;
+    let mut completion = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .context("failed reading create sandbox stream")?
+    {
+        match event.payload {
+            Some(runtime_v2::create_sandbox_event::Payload::Progress(progress)) => {
+                println!("[{}] {}", progress.phase, progress.detail);
+            }
+            Some(runtime_v2::create_sandbox_event::Payload::Completion(done)) => {
+                completion = Some(done);
+            }
+            None => {}
+        }
+    }
+    let completion =
+        completion.ok_or_else(|| anyhow!("daemon create_sandbox stream ended without completion"))?;
+    let response = completion
+        .response
+        .ok_or_else(|| anyhow!("daemon create_sandbox completion missing response payload"))?;
     let payload = response
         .sandbox
         .ok_or_else(|| anyhow!("daemon create_sandbox returned missing payload"))?;
@@ -144,13 +165,35 @@ async fn daemon_terminate_sandbox(
 ) -> anyhow::Result<Option<Sandbox>> {
     let mut client = connect_control_plane_for_state_db(state_db).await?;
     match client
-        .terminate_sandbox(runtime_v2::TerminateSandboxRequest {
+        .terminate_sandbox_stream(runtime_v2::TerminateSandboxRequest {
             sandbox_id: sandbox_id.to_string(),
             metadata: None,
         })
         .await
     {
-        Ok(response) => {
+        Ok(mut stream) => {
+            let mut completion = None;
+            while let Some(event) = stream
+                .message()
+                .await
+                .context("failed reading terminate sandbox stream")?
+            {
+                match event.payload {
+                    Some(runtime_v2::terminate_sandbox_event::Payload::Progress(progress)) => {
+                        println!("[{}] {}", progress.phase, progress.detail);
+                    }
+                    Some(runtime_v2::terminate_sandbox_event::Payload::Completion(done)) => {
+                        completion = Some(done);
+                    }
+                    None => {}
+                }
+            }
+            let completion = completion.ok_or_else(|| {
+                anyhow!("daemon terminate_sandbox stream ended without completion")
+            })?;
+            let response = completion.response.ok_or_else(|| {
+                anyhow!("daemon terminate_sandbox completion missing response payload")
+            })?;
             let payload = response
                 .sandbox
                 .ok_or_else(|| anyhow!("daemon terminate_sandbox returned missing payload"))?;

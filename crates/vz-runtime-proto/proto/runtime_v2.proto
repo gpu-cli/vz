@@ -39,10 +39,10 @@ message ErrorDetail {
 // ── 1. SandboxService ──────────────────────────────────────────────
 
 service SandboxService {
-  rpc CreateSandbox(CreateSandboxRequest) returns (SandboxResponse);
+  rpc CreateSandbox(CreateSandboxRequest) returns (stream CreateSandboxEvent);
   rpc GetSandbox(GetSandboxRequest) returns (SandboxResponse);
   rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
-  rpc TerminateSandbox(TerminateSandboxRequest) returns (SandboxResponse);
+  rpc TerminateSandbox(TerminateSandboxRequest) returns (stream TerminateSandboxEvent);
   rpc OpenSandboxShell(OpenSandboxShellRequest) returns (stream OpenSandboxShellEvent);
   rpc CloseSandboxShell(CloseSandboxShellRequest) returns (stream CloseSandboxShellEvent);
 }
@@ -136,6 +136,39 @@ message CloseSandboxShellEvent {
   oneof payload {
     SandboxShellProgress progress = 3;
     CloseSandboxShellResponse completion = 4;
+  }
+}
+
+message SandboxLifecycleProgress {
+  string phase = 1;
+  string detail = 2;
+}
+
+message CreateSandboxCompletion {
+  SandboxResponse response = 1;
+  string receipt_id = 2;
+}
+
+message CreateSandboxEvent {
+  string request_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    SandboxLifecycleProgress progress = 3;
+    CreateSandboxCompletion completion = 4;
+  }
+}
+
+message TerminateSandboxCompletion {
+  SandboxResponse response = 1;
+  string receipt_id = 2;
+}
+
+message TerminateSandboxEvent {
+  string request_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    SandboxLifecycleProgress progress = 3;
+    TerminateSandboxCompletion completion = 4;
   }
 }
 

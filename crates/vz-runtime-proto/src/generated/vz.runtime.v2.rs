@@ -177,6 +177,65 @@ pub mod close_sandbox_shell_event {
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SandboxLifecycleProgress {
+    #[prost(string, tag = "1")]
+    pub phase: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateSandboxCompletion {
+    #[prost(message, optional, tag = "1")]
+    pub response: ::core::option::Option<SandboxResponse>,
+    #[prost(string, tag = "2")]
+    pub receipt_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateSandboxEvent {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(oneof = "create_sandbox_event::Payload", tags = "3, 4")]
+    pub payload: ::core::option::Option<create_sandbox_event::Payload>,
+}
+/// Nested message and enum types in `CreateSandboxEvent`.
+pub mod create_sandbox_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "3")]
+        Progress(super::SandboxLifecycleProgress),
+        #[prost(message, tag = "4")]
+        Completion(super::CreateSandboxCompletion),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TerminateSandboxCompletion {
+    #[prost(message, optional, tag = "1")]
+    pub response: ::core::option::Option<SandboxResponse>,
+    #[prost(string, tag = "2")]
+    pub receipt_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TerminateSandboxEvent {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(oneof = "terminate_sandbox_event::Payload", tags = "3, 4")]
+    pub payload: ::core::option::Option<terminate_sandbox_event::Payload>,
+}
+/// Nested message and enum types in `TerminateSandboxEvent`.
+pub mod terminate_sandbox_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "3")]
+        Progress(super::SandboxLifecycleProgress),
+        #[prost(message, tag = "4")]
+        Completion(super::TerminateSandboxCompletion),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OpenLeaseRequest {
     #[prost(message, optional, tag = "1")]
     pub metadata: ::core::option::Option<RequestMetadata>,
@@ -1272,7 +1331,7 @@ pub mod sandbox_service_client {
             &mut self,
             request: impl tonic::IntoRequest<super::CreateSandboxRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::SandboxResponse>,
+            tonic::Response<tonic::codec::Streaming<super::CreateSandboxEvent>>,
             tonic::Status,
         > {
             self.inner
@@ -1292,7 +1351,7 @@ pub mod sandbox_service_client {
                 .insert(
                     GrpcMethod::new("vz.runtime.v2.SandboxService", "CreateSandbox"),
                 );
-            self.inner.unary(req, path, codec).await
+            self.inner.server_streaming(req, path, codec).await
         }
         pub async fn get_sandbox(
             &mut self,
@@ -1348,7 +1407,7 @@ pub mod sandbox_service_client {
             &mut self,
             request: impl tonic::IntoRequest<super::TerminateSandboxRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::SandboxResponse>,
+            tonic::Response<tonic::codec::Streaming<super::TerminateSandboxEvent>>,
             tonic::Status,
         > {
             self.inner
@@ -1368,7 +1427,7 @@ pub mod sandbox_service_client {
                 .insert(
                     GrpcMethod::new("vz.runtime.v2.SandboxService", "TerminateSandbox"),
                 );
-            self.inner.unary(req, path, codec).await
+            self.inner.server_streaming(req, path, codec).await
         }
         pub async fn open_sandbox_shell(
             &mut self,
@@ -3792,10 +3851,19 @@ pub mod sandbox_service_server {
     /// Generated trait containing gRPC methods that should be implemented for use with SandboxServiceServer.
     #[async_trait]
     pub trait SandboxService: std::marker::Send + std::marker::Sync + 'static {
+        /// Server streaming response type for the CreateSandbox method.
+        type CreateSandboxStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::CreateSandboxEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
         async fn create_sandbox(
             &self,
             request: tonic::Request<super::CreateSandboxRequest>,
-        ) -> std::result::Result<tonic::Response<super::SandboxResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<Self::CreateSandboxStream>,
+            tonic::Status,
+        >;
         async fn get_sandbox(
             &self,
             request: tonic::Request<super::GetSandboxRequest>,
@@ -3807,10 +3875,19 @@ pub mod sandbox_service_server {
             tonic::Response<super::ListSandboxesResponse>,
             tonic::Status,
         >;
+        /// Server streaming response type for the TerminateSandbox method.
+        type TerminateSandboxStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::TerminateSandboxEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
         async fn terminate_sandbox(
             &self,
             request: tonic::Request<super::TerminateSandboxRequest>,
-        ) -> std::result::Result<tonic::Response<super::SandboxResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<Self::TerminateSandboxStream>,
+            tonic::Status,
+        >;
         /// Server streaming response type for the OpenSandboxShell method.
         type OpenSandboxShellStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::OpenSandboxShellEvent, tonic::Status>,
@@ -3919,11 +3996,12 @@ pub mod sandbox_service_server {
                     struct CreateSandboxSvc<T: SandboxService>(pub Arc<T>);
                     impl<
                         T: SandboxService,
-                    > tonic::server::UnaryService<super::CreateSandboxRequest>
+                    > tonic::server::ServerStreamingService<super::CreateSandboxRequest>
                     for CreateSandboxSvc<T> {
-                        type Response = super::SandboxResponse;
+                        type Response = super::CreateSandboxEvent;
+                        type ResponseStream = T::CreateSandboxStream;
                         type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
+                            tonic::Response<Self::ResponseStream>,
                             tonic::Status,
                         >;
                         fn call(
@@ -3954,7 +4032,7 @@ pub mod sandbox_service_server {
                                 max_decoding_message_size,
                                 max_encoding_message_size,
                             );
-                        let res = grpc.unary(method, req).await;
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
@@ -4054,11 +4132,13 @@ pub mod sandbox_service_server {
                     struct TerminateSandboxSvc<T: SandboxService>(pub Arc<T>);
                     impl<
                         T: SandboxService,
-                    > tonic::server::UnaryService<super::TerminateSandboxRequest>
-                    for TerminateSandboxSvc<T> {
-                        type Response = super::SandboxResponse;
+                    > tonic::server::ServerStreamingService<
+                        super::TerminateSandboxRequest,
+                    > for TerminateSandboxSvc<T> {
+                        type Response = super::TerminateSandboxEvent;
+                        type ResponseStream = T::TerminateSandboxStream;
                         type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
+                            tonic::Response<Self::ResponseStream>,
                             tonic::Status,
                         >;
                         fn call(
@@ -4090,7 +4170,7 @@ pub mod sandbox_service_server {
                                 max_decoding_message_size,
                                 max_encoding_message_size,
                             );
-                        let res = grpc.unary(method, req).await;
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

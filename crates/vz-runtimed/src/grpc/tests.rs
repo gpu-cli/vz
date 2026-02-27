@@ -283,6 +283,36 @@ async fn read_open_sandbox_shell_completion(
     completion.expect("expected terminal open sandbox shell completion event")
 }
 
+async fn read_create_sandbox_completion(
+    stream: &mut tonic::Streaming<runtime_v2::CreateSandboxEvent>,
+) -> runtime_v2::SandboxResponse {
+    try_read_create_sandbox_completion(stream)
+        .await
+        .expect("expected terminal create sandbox completion event")
+}
+
+async fn try_read_create_sandbox_completion(
+    stream: &mut tonic::Streaming<runtime_v2::CreateSandboxEvent>,
+) -> Result<runtime_v2::SandboxResponse, tonic::Status> {
+    let mut completion = None;
+    while let Some(event) = stream.message().await? {
+        if let Some(runtime_v2::create_sandbox_event::Payload::Completion(done)) = event.payload {
+            completion = Some(done);
+        }
+    }
+    completion
+        .ok_or_else(|| tonic::Status::internal("missing create sandbox completion event"))?
+        .response
+        .ok_or_else(|| tonic::Status::internal("create sandbox completion missing response"))
+}
+
+async fn read_create_sandbox_completion_response(
+    response: tonic::Response<tonic::Streaming<runtime_v2::CreateSandboxEvent>>,
+) -> runtime_v2::SandboxResponse {
+    let mut stream = response.into_inner();
+    read_create_sandbox_completion(&mut stream).await
+}
+
 async fn read_close_sandbox_shell_completion(
     stream: &mut tonic::Streaming<runtime_v2::CloseSandboxShellEvent>,
 ) -> runtime_v2::CloseSandboxShellResponse {
@@ -299,6 +329,33 @@ async fn read_close_sandbox_shell_completion(
         }
     }
     completion.expect("expected terminal close sandbox shell completion event")
+}
+
+async fn read_terminate_sandbox_completion(
+    stream: &mut tonic::Streaming<runtime_v2::TerminateSandboxEvent>,
+) -> runtime_v2::SandboxResponse {
+    let mut completion = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .expect("read terminate sandbox stream event")
+    {
+        if let Some(runtime_v2::terminate_sandbox_event::Payload::Completion(done)) = event.payload
+        {
+            completion = Some(done);
+        }
+    }
+    completion
+        .expect("expected terminal terminate sandbox completion event")
+        .response
+        .expect("terminate sandbox completion should include response")
+}
+
+async fn read_terminate_sandbox_completion_response(
+    response: tonic::Response<tonic::Streaming<runtime_v2::TerminateSandboxEvent>>,
+) -> runtime_v2::SandboxResponse {
+    let mut stream = response.into_inner();
+    read_terminate_sandbox_completion(&mut stream).await
 }
 
 struct DenyCreateSandboxPolicyHook;
@@ -463,21 +520,23 @@ async fn create_sandbox_writes_policy_allow_audit_receipt() {
     wait_for_socket(&config.socket_path).await;
 
     let mut client = connect_sandbox_client(&config.socket_path).await;
-    let created = client
-        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
-            metadata: Some(runtime_v2::RequestMetadata {
-                request_id: "req-policy-allow".to_string(),
-                idempotency_key: "".to_string(),
-                trace_id: "trace-policy-allow".to_string(),
-            }),
-            stack_name: "stack-policy-allow".to_string(),
-            cpus: 1,
-            memory_mb: 512,
-            labels: std::collections::HashMap::new(),
-        }))
-        .await
-        .expect("create sandbox")
-        .into_inner();
+    let created = read_create_sandbox_completion_response(
+        client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: Some(runtime_v2::RequestMetadata {
+                    request_id: "req-policy-allow".to_string(),
+                    idempotency_key: "".to_string(),
+                    trace_id: "trace-policy-allow".to_string(),
+                }),
+                stack_name: "stack-policy-allow".to_string(),
+                cpus: 1,
+                memory_mb: 512,
+                labels: std::collections::HashMap::new(),
+            }))
+            .await
+            .expect("create sandbox"),
+    )
+    .await;
     assert_eq!(created.request_id, "req-policy-allow");
 
     let policy_receipts = daemon
@@ -691,21 +750,26 @@ async fn create_sandbox_is_persisted_in_state_store() {
     wait_for_socket(&config.socket_path).await;
 
     let mut client = connect_sandbox_client(&config.socket_path).await;
-    let created = client
-        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
-            metadata: Some(runtime_v2::RequestMetadata {
-                request_id: "req-persist".to_string(),
-                idempotency_key: "".to_string(),
-                trace_id: "".to_string(),
-            }),
-            stack_name: "stack-a".to_string(),
-            cpus: 2,
-            memory_mb: 1024,
-            labels: std::collections::HashMap::from([("env".to_string(), "test".to_string())]),
-        }))
-        .await
-        .expect("create sandbox")
-        .into_inner();
+    let created = read_create_sandbox_completion_response(
+        client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: Some(runtime_v2::RequestMetadata {
+                    request_id: "req-persist".to_string(),
+                    idempotency_key: "".to_string(),
+                    trace_id: "".to_string(),
+                }),
+                stack_name: "stack-a".to_string(),
+                cpus: 2,
+                memory_mb: 1024,
+                labels: std::collections::HashMap::from([(
+                    "env".to_string(),
+                    "test".to_string(),
+                )]),
+            }))
+            .await
+            .expect("create sandbox"),
+    )
+    .await;
     let sandbox_id = created
         .sandbox
         .as_ref()
@@ -806,17 +870,19 @@ async fn open_sandbox_shell_creates_container_and_resolves_default_shell() {
     );
 
     let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
-    let sandbox = sandbox_client
-        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
-            metadata: None,
-            stack_name: "stack-open-shell-default".to_string(),
-            cpus: 0,
-            memory_mb: 0,
-            labels,
-        }))
-        .await
-        .expect("create sandbox")
-        .into_inner()
+    let sandbox = read_create_sandbox_completion_response(
+        sandbox_client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "stack-open-shell-default".to_string(),
+                cpus: 0,
+                memory_mb: 0,
+                labels,
+            }))
+            .await
+            .expect("create sandbox"),
+    )
+    .await
         .sandbox
         .expect("sandbox payload");
 
@@ -890,17 +956,19 @@ async fn open_sandbox_shell_prefers_main_container_command_override() {
     );
 
     let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
-    let sandbox = sandbox_client
-        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
-            metadata: None,
-            stack_name: "stack-open-shell-main-container".to_string(),
-            cpus: 0,
-            memory_mb: 0,
-            labels,
-        }))
-        .await
-        .expect("create sandbox")
-        .into_inner()
+    let sandbox = read_create_sandbox_completion_response(
+        sandbox_client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "stack-open-shell-main-container".to_string(),
+                cpus: 0,
+                memory_mb: 0,
+                labels,
+            }))
+            .await
+            .expect("create sandbox"),
+    )
+    .await
         .sandbox
         .expect("sandbox payload");
 
@@ -960,17 +1028,19 @@ async fn open_sandbox_shell_reuses_existing_active_execution_session() {
     );
 
     let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
-    let sandbox = sandbox_client
-        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
-            metadata: None,
-            stack_name: "stack-open-shell-reuse".to_string(),
-            cpus: 0,
-            memory_mb: 0,
-            labels,
-        }))
-        .await
-        .expect("create sandbox")
-        .into_inner()
+    let sandbox = read_create_sandbox_completion_response(
+        sandbox_client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "stack-open-shell-reuse".to_string(),
+                cpus: 0,
+                memory_mb: 0,
+                labels,
+            }))
+            .await
+            .expect("create sandbox"),
+    )
+    .await
         .sandbox
         .expect("sandbox payload");
 
@@ -1076,17 +1146,19 @@ async fn close_sandbox_shell_closes_active_execution_and_clears_session() {
     );
 
     let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
-    let sandbox = sandbox_client
-        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
-            metadata: None,
-            stack_name: "stack-close-shell".to_string(),
-            cpus: 0,
-            memory_mb: 0,
-            labels,
-        }))
-        .await
-        .expect("create sandbox")
-        .into_inner()
+    let sandbox = read_create_sandbox_completion_response(
+        sandbox_client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "stack-close-shell".to_string(),
+                cpus: 0,
+                memory_mb: 0,
+                labels,
+            }))
+            .await
+            .expect("create sandbox"),
+    )
+    .await
         .sandbox
         .expect("sandbox payload");
 
@@ -1319,21 +1391,23 @@ async fn create_sandbox_honors_idempotency_key_and_conflict() {
     wait_for_socket(&config.socket_path).await;
 
     let mut client = connect_sandbox_client(&config.socket_path).await;
-    let first = client
-        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
-            metadata: Some(runtime_v2::RequestMetadata {
-                request_id: "req-idem-1".to_string(),
-                idempotency_key: "idem-key-a".to_string(),
-                trace_id: "".to_string(),
-            }),
-            stack_name: "stack-idem".to_string(),
-            cpus: 1,
-            memory_mb: 256,
-            labels: std::collections::HashMap::new(),
-        }))
-        .await
-        .expect("first create")
-        .into_inner();
+    let first = read_create_sandbox_completion_response(
+        client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: Some(runtime_v2::RequestMetadata {
+                    request_id: "req-idem-1".to_string(),
+                    idempotency_key: "idem-key-a".to_string(),
+                    trace_id: "".to_string(),
+                }),
+                stack_name: "stack-idem".to_string(),
+                cpus: 1,
+                memory_mb: 256,
+                labels: std::collections::HashMap::new(),
+            }))
+            .await
+            .expect("first create"),
+    )
+    .await;
     let first_id = first
         .sandbox
         .as_ref()
@@ -1341,21 +1415,23 @@ async fn create_sandbox_honors_idempotency_key_and_conflict() {
         .sandbox_id
         .clone();
 
-    let replay = client
-        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
-            metadata: Some(runtime_v2::RequestMetadata {
-                request_id: "req-idem-2".to_string(),
-                idempotency_key: "idem-key-a".to_string(),
-                trace_id: "".to_string(),
-            }),
-            stack_name: "stack-idem".to_string(),
-            cpus: 1,
-            memory_mb: 256,
-            labels: std::collections::HashMap::new(),
-        }))
-        .await
-        .expect("idempotent replay")
-        .into_inner();
+    let replay = read_create_sandbox_completion_response(
+        client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: Some(runtime_v2::RequestMetadata {
+                    request_id: "req-idem-2".to_string(),
+                    idempotency_key: "idem-key-a".to_string(),
+                    trace_id: "".to_string(),
+                }),
+                stack_name: "stack-idem".to_string(),
+                cpus: 1,
+                memory_mb: 256,
+                labels: std::collections::HashMap::new(),
+            }))
+            .await
+            .expect("idempotent replay"),
+    )
+    .await;
     let replay_id = replay
         .sandbox
         .as_ref()
@@ -2972,17 +3048,19 @@ async fn create_container_then_get_list_and_remove_round_trip() {
     wait_for_socket(&config.socket_path).await;
 
     let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
-    let sandbox = sandbox_client
-        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
-            metadata: None,
-            stack_name: "stack-container-test".to_string(),
-            cpus: 0,
-            memory_mb: 0,
-            labels: std::collections::HashMap::new(),
-        }))
-        .await
-        .expect("create sandbox")
-        .into_inner()
+    let sandbox = read_create_sandbox_completion_response(
+        sandbox_client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "stack-container-test".to_string(),
+                cpus: 0,
+                memory_mb: 0,
+                labels: std::collections::HashMap::new(),
+            }))
+            .await
+            .expect("create sandbox"),
+    )
+    .await
         .sandbox
         .expect("sandbox payload");
 
@@ -3105,17 +3183,19 @@ async fn create_container_denied_when_scheduler_capacity_is_exhausted() {
     wait_for_socket(&config.socket_path).await;
 
     let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
-    let sandbox = sandbox_client
-        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
-            metadata: None,
-            stack_name: "stack-container-pressure".to_string(),
-            cpus: 0,
-            memory_mb: 0,
-            labels: std::collections::HashMap::new(),
-        }))
-        .await
-        .expect("create sandbox")
-        .into_inner()
+    let sandbox = read_create_sandbox_completion_response(
+        sandbox_client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "stack-container-pressure".to_string(),
+                cpus: 0,
+                memory_mb: 0,
+                labels: std::collections::HashMap::new(),
+            }))
+            .await
+            .expect("create sandbox"),
+    )
+    .await
         .sandbox
         .expect("sandbox payload");
 
@@ -3189,17 +3269,19 @@ async fn create_container_uses_sandbox_startup_defaults_when_request_omits_image
     );
 
     let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
-    let sandbox = sandbox_client
-        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
-            metadata: None,
-            stack_name: "stack-container-defaults".to_string(),
-            cpus: 0,
-            memory_mb: 0,
-            labels,
-        }))
-        .await
-        .expect("create sandbox")
-        .into_inner()
+    let sandbox = read_create_sandbox_completion_response(
+        sandbox_client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "stack-container-defaults".to_string(),
+                cpus: 0,
+                memory_mb: 0,
+                labels,
+            }))
+            .await
+            .expect("create sandbox"),
+    )
+    .await
         .sandbox
         .expect("sandbox payload");
 
@@ -3276,17 +3358,19 @@ async fn create_container_preserves_explicit_image_and_cmd_over_sandbox_defaults
     );
 
     let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
-    let sandbox = sandbox_client
-        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
-            metadata: None,
-            stack_name: "stack-container-overrides".to_string(),
-            cpus: 0,
-            memory_mb: 0,
-            labels,
-        }))
-        .await
-        .expect("create sandbox")
-        .into_inner()
+    let sandbox = read_create_sandbox_completion_response(
+        sandbox_client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "stack-container-overrides".to_string(),
+                cpus: 0,
+                memory_mb: 0,
+                labels,
+            }))
+            .await
+            .expect("create sandbox"),
+    )
+    .await
         .sandbox
         .expect("sandbox payload");
 
@@ -3542,17 +3626,19 @@ async fn file_service_write_read_list_round_trip_with_receipts() {
     wait_for_socket(&config.socket_path).await;
 
     let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
-    let sandbox = sandbox_client
-        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
-            metadata: None,
-            stack_name: "stack-file-ops".to_string(),
-            cpus: 0,
-            memory_mb: 0,
-            labels: std::collections::HashMap::new(),
-        }))
-        .await
-        .expect("create sandbox")
-        .into_inner()
+    let sandbox = read_create_sandbox_completion_response(
+        sandbox_client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "stack-file-ops".to_string(),
+                cpus: 0,
+                memory_mb: 0,
+                labels: std::collections::HashMap::new(),
+            }))
+            .await
+            .expect("create sandbox"),
+    )
+    .await
         .sandbox
         .expect("sandbox payload");
 
@@ -3667,17 +3753,19 @@ async fn file_service_rejects_path_traversal() {
     wait_for_socket(&config.socket_path).await;
 
     let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
-    let sandbox = sandbox_client
-        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
-            metadata: None,
-            stack_name: "stack-file-validate".to_string(),
-            cpus: 0,
-            memory_mb: 0,
-            labels: std::collections::HashMap::new(),
-        }))
-        .await
-        .expect("create sandbox")
-        .into_inner()
+    let sandbox = read_create_sandbox_completion_response(
+        sandbox_client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "stack-file-validate".to_string(),
+                cpus: 0,
+                memory_mb: 0,
+                labels: std::collections::HashMap::new(),
+            }))
+            .await
+            .expect("create sandbox"),
+    )
+    .await
         .sandbox
         .expect("sandbox payload");
 
@@ -3727,30 +3815,34 @@ async fn terminate_sandbox_honors_idempotency_and_emits_receipt_header() {
     wait_for_socket(&config.socket_path).await;
 
     let mut client = connect_sandbox_client(&config.socket_path).await;
-    let first = client
-        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
-            metadata: None,
-            stack_name: "stack-term-a".to_string(),
-            cpus: 0,
-            memory_mb: 0,
-            labels: std::collections::HashMap::new(),
-        }))
-        .await
-        .expect("create first sandbox")
-        .into_inner();
+    let first = read_create_sandbox_completion_response(
+        client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "stack-term-a".to_string(),
+                cpus: 0,
+                memory_mb: 0,
+                labels: std::collections::HashMap::new(),
+            }))
+            .await
+            .expect("create first sandbox"),
+    )
+    .await;
     let first_id = first.sandbox.expect("payload").sandbox_id;
 
-    let second = client
-        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
-            metadata: None,
-            stack_name: "stack-term-b".to_string(),
-            cpus: 0,
-            memory_mb: 0,
-            labels: std::collections::HashMap::new(),
-        }))
-        .await
-        .expect("create second sandbox")
-        .into_inner();
+    let second = read_create_sandbox_completion_response(
+        client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "stack-term-b".to_string(),
+                cpus: 0,
+                memory_mb: 0,
+                labels: std::collections::HashMap::new(),
+            }))
+            .await
+            .expect("create second sandbox"),
+    )
+    .await;
     let second_id = second.sandbox.expect("payload").sandbox_id;
 
     let terminated = client
@@ -3765,23 +3857,26 @@ async fn terminate_sandbox_honors_idempotency_and_emits_receipt_header() {
         .await
         .expect("terminate sandbox");
     assert!(terminated.metadata().get("x-receipt-id").is_some());
+    let terminated = read_terminate_sandbox_completion_response(terminated).await;
     assert_eq!(
-        terminated.into_inner().sandbox.expect("payload").state,
+        terminated.sandbox.expect("payload").state,
         "terminated"
     );
 
-    let replay = client
-        .terminate_sandbox(Request::new(runtime_v2::TerminateSandboxRequest {
-            sandbox_id: first_id,
-            metadata: Some(runtime_v2::RequestMetadata {
-                request_id: "req-term-2".to_string(),
-                idempotency_key: "term-key-a".to_string(),
-                trace_id: "".to_string(),
-            }),
-        }))
-        .await
-        .expect("idempotent replay should succeed")
-        .into_inner();
+    let replay = read_terminate_sandbox_completion_response(
+        client
+            .terminate_sandbox(Request::new(runtime_v2::TerminateSandboxRequest {
+                sandbox_id: first_id,
+                metadata: Some(runtime_v2::RequestMetadata {
+                    request_id: "req-term-2".to_string(),
+                    idempotency_key: "term-key-a".to_string(),
+                    trace_id: "".to_string(),
+                }),
+            }))
+            .await
+            .expect("idempotent replay should succeed"),
+    )
+    .await;
     assert_eq!(replay.sandbox.expect("payload").state, "terminated");
 
     let conflict = client
@@ -3854,8 +3949,8 @@ async fn concurrent_create_sandbox_replays_idempotent_result_with_single_mutatio
                 .get("x-receipt-id")
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
-            let sandbox_id = response
-                .into_inner()
+            let sandbox_response = read_create_sandbox_completion_response(response).await;
+            let sandbox_id = sandbox_response
                 .sandbox
                 .expect("sandbox payload")
                 .sandbox_id;
@@ -4013,7 +4108,7 @@ async fn concurrent_create_without_idempotency_returns_conflict_not_internal() {
         let socket = config.socket_path.clone();
         handles.push(tokio::spawn(async move {
             let mut client = connect_sandbox_client(&socket).await;
-            client
+            let response = client
                 .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
                     metadata: Some(runtime_v2::RequestMetadata {
                         request_id: format!("req-race-{index}"),
@@ -4025,7 +4120,9 @@ async fn concurrent_create_without_idempotency_returns_conflict_not_internal() {
                     memory_mb: 256,
                     labels: std::collections::HashMap::new(),
                 }))
-                .await
+                .await?;
+            let mut stream = response.into_inner();
+            try_read_create_sandbox_completion(&mut stream).await.map(|_| ())
         }));
     }
 

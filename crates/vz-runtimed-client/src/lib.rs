@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use hyper_util::rt::TokioIo;
 use thiserror::Error;
-use tonic::metadata::MetadataMap;
+use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::transport::{Channel, Endpoint, Uri};
 use tonic::{Code, Request, Status};
 use tower::service_fn;
@@ -230,8 +230,43 @@ impl DaemonClient {
     /// Call Runtime V2 `CreateSandbox` and preserve gRPC response metadata.
     pub async fn create_sandbox_with_metadata(
         &mut self,
-        mut request: runtime_v2::CreateSandboxRequest,
+        request: runtime_v2::CreateSandboxRequest,
     ) -> Result<tonic::Response<runtime_v2::SandboxResponse>> {
+        let response = self.create_sandbox_stream_with_metadata(request).await?;
+        let mut stream = response.into_inner();
+        let completion =
+            read_create_sandbox_completion(&self.config.socket_path, &mut stream).await?;
+        let sandbox_response =
+            completion
+                .response
+                .ok_or_else(|| status_to_client_error(
+                    &self.config.socket_path,
+                    Status::internal("create_sandbox completion missing response payload"),
+                ))?;
+
+        let mut grpc_response = tonic::Response::new(sandbox_response);
+        if !completion.receipt_id.trim().is_empty()
+            && let Ok(value) = MetadataValue::try_from(completion.receipt_id.as_str())
+        {
+            grpc_response.metadata_mut().insert("x-receipt-id", value);
+        }
+        Ok(grpc_response)
+    }
+
+    /// Call Runtime V2 `CreateSandbox` as a server stream.
+    pub async fn create_sandbox_stream(
+        &mut self,
+        request: runtime_v2::CreateSandboxRequest,
+    ) -> Result<tonic::Streaming<runtime_v2::CreateSandboxEvent>> {
+        let response = self.create_sandbox_stream_with_metadata(request).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Call Runtime V2 `CreateSandbox` as a server stream and preserve gRPC response metadata.
+    pub async fn create_sandbox_stream_with_metadata(
+        &mut self,
+        mut request: runtime_v2::CreateSandboxRequest,
+    ) -> Result<tonic::Response<tonic::Streaming<runtime_v2::CreateSandboxEvent>>> {
         Self::ensure_metadata(&mut request.metadata);
         self.sandbox_client
             .create_sandbox(Request::new(request))
@@ -293,8 +328,43 @@ impl DaemonClient {
     /// Call Runtime V2 `TerminateSandbox` and preserve gRPC response metadata.
     pub async fn terminate_sandbox_with_metadata(
         &mut self,
-        mut request: runtime_v2::TerminateSandboxRequest,
+        request: runtime_v2::TerminateSandboxRequest,
     ) -> Result<tonic::Response<runtime_v2::SandboxResponse>> {
+        let response = self.terminate_sandbox_stream_with_metadata(request).await?;
+        let mut stream = response.into_inner();
+        let completion =
+            read_terminate_sandbox_completion(&self.config.socket_path, &mut stream).await?;
+        let sandbox_response =
+            completion
+                .response
+                .ok_or_else(|| status_to_client_error(
+                    &self.config.socket_path,
+                    Status::internal("terminate_sandbox completion missing response payload"),
+                ))?;
+
+        let mut grpc_response = tonic::Response::new(sandbox_response);
+        if !completion.receipt_id.trim().is_empty()
+            && let Ok(value) = MetadataValue::try_from(completion.receipt_id.as_str())
+        {
+            grpc_response.metadata_mut().insert("x-receipt-id", value);
+        }
+        Ok(grpc_response)
+    }
+
+    /// Call Runtime V2 `TerminateSandbox` as a server stream.
+    pub async fn terminate_sandbox_stream(
+        &mut self,
+        request: runtime_v2::TerminateSandboxRequest,
+    ) -> Result<tonic::Streaming<runtime_v2::TerminateSandboxEvent>> {
+        let response = self.terminate_sandbox_stream_with_metadata(request).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Call Runtime V2 `TerminateSandbox` as a server stream and preserve gRPC response metadata.
+    pub async fn terminate_sandbox_stream_with_metadata(
+        &mut self,
+        mut request: runtime_v2::TerminateSandboxRequest,
+    ) -> Result<tonic::Response<tonic::Streaming<runtime_v2::TerminateSandboxEvent>>> {
         Self::ensure_metadata(&mut request.metadata);
         self.sandbox_client
             .terminate_sandbox(Request::new(request))
@@ -1662,6 +1732,48 @@ fn status_to_client_error(socket_path: &Path, status: Status) -> DaemonClientErr
         };
     }
     DaemonClientError::Grpc(status)
+}
+
+async fn read_create_sandbox_completion(
+    socket_path: &Path,
+    stream: &mut tonic::Streaming<runtime_v2::CreateSandboxEvent>,
+) -> Result<runtime_v2::CreateSandboxCompletion> {
+    while let Some(event) = stream
+        .message()
+        .await
+        .map_err(|status| status_to_client_error(socket_path, status))?
+    {
+        if let Some(runtime_v2::create_sandbox_event::Payload::Completion(completion)) =
+            event.payload
+        {
+            return Ok(completion);
+        }
+    }
+    Err(status_to_client_error(
+        socket_path,
+        Status::internal("create_sandbox stream ended without terminal completion event"),
+    ))
+}
+
+async fn read_terminate_sandbox_completion(
+    socket_path: &Path,
+    stream: &mut tonic::Streaming<runtime_v2::TerminateSandboxEvent>,
+) -> Result<runtime_v2::TerminateSandboxCompletion> {
+    while let Some(event) = stream
+        .message()
+        .await
+        .map_err(|status| status_to_client_error(socket_path, status))?
+    {
+        if let Some(runtime_v2::terminate_sandbox_event::Payload::Completion(completion)) =
+            event.payload
+        {
+            return Ok(completion);
+        }
+    }
+    Err(status_to_client_error(
+        socket_path,
+        Status::internal("terminate_sandbox stream ended without terminal completion event"),
+    ))
 }
 
 #[cfg(test)]

@@ -19,6 +19,10 @@ type OpenSandboxShellEventStream =
     tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::OpenSandboxShellEvent, Status>>;
 type CloseSandboxShellEventStream =
     tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::CloseSandboxShellEvent, Status>>;
+type CreateSandboxEventStream =
+    tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::CreateSandboxEvent, Status>>;
+type TerminateSandboxEventStream =
+    tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::TerminateSandboxEvent, Status>>;
 
 fn sandbox_shell_stream_from_events<T>(
     events: Vec<Result<T, Status>>,
@@ -34,6 +38,95 @@ where
     }
     drop(tx);
     tokio_stream::wrappers::ReceiverStream::new(rx)
+}
+
+fn sandbox_stream_response<T>(
+    events: Vec<Result<T, Status>>,
+    receipt_id: Option<&str>,
+) -> Response<tokio_stream::wrappers::ReceiverStream<Result<T, Status>>>
+where
+    T: Send + 'static,
+{
+    let mut response = Response::new(sandbox_shell_stream_from_events(events));
+    if let Some(receipt_id) = receipt_id
+        && !receipt_id.trim().is_empty()
+        && let Ok(value) = MetadataValue::try_from(receipt_id)
+    {
+        response.metadata_mut().insert("x-receipt-id", value);
+    }
+    response
+}
+
+fn create_sandbox_progress_event(
+    request_id: &str,
+    sequence: u64,
+    phase: &str,
+    detail: &str,
+) -> runtime_v2::CreateSandboxEvent {
+    runtime_v2::CreateSandboxEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::create_sandbox_event::Payload::Progress(
+            runtime_v2::SandboxLifecycleProgress {
+                phase: phase.to_string(),
+                detail: detail.to_string(),
+            },
+        )),
+    }
+}
+
+fn create_sandbox_completion_event(
+    request_id: &str,
+    sequence: u64,
+    response: runtime_v2::SandboxResponse,
+    receipt_id: &str,
+) -> runtime_v2::CreateSandboxEvent {
+    runtime_v2::CreateSandboxEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::create_sandbox_event::Payload::Completion(
+            runtime_v2::CreateSandboxCompletion {
+                response: Some(response),
+                receipt_id: receipt_id.to_string(),
+            },
+        )),
+    }
+}
+
+fn terminate_sandbox_progress_event(
+    request_id: &str,
+    sequence: u64,
+    phase: &str,
+    detail: &str,
+) -> runtime_v2::TerminateSandboxEvent {
+    runtime_v2::TerminateSandboxEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::terminate_sandbox_event::Payload::Progress(
+            runtime_v2::SandboxLifecycleProgress {
+                phase: phase.to_string(),
+                detail: detail.to_string(),
+            },
+        )),
+    }
+}
+
+fn terminate_sandbox_completion_event(
+    request_id: &str,
+    sequence: u64,
+    response: runtime_v2::SandboxResponse,
+    receipt_id: &str,
+) -> runtime_v2::TerminateSandboxEvent {
+    runtime_v2::TerminateSandboxEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::terminate_sandbox_event::Payload::Completion(
+            runtime_v2::TerminateSandboxCompletion {
+                response: Some(response),
+                receipt_id: receipt_id.to_string(),
+            },
+        )),
+    }
 }
 
 fn open_sandbox_shell_progress_event(
@@ -679,13 +772,15 @@ fn execution_is_sandbox_shell_session(
 
 #[tonic::async_trait]
 impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
+    type CreateSandboxStream = CreateSandboxEventStream;
+    type TerminateSandboxStream = TerminateSandboxEventStream;
     type OpenSandboxShellStream = OpenSandboxShellEventStream;
     type CloseSandboxShellStream = CloseSandboxShellEventStream;
 
     async fn create_sandbox(
         &self,
         request: Request<runtime_v2::CreateSandboxRequest>,
-    ) -> Result<Response<runtime_v2::SandboxResponse>, Status> {
+    ) -> Result<Response<Self::CreateSandboxStream>, Status> {
         let intercepted_request_id = request_id_from_extensions(&request);
         let request = request.into_inner();
         let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
@@ -693,6 +788,13 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
             .request_id
             .clone()
             .unwrap_or_else(generate_request_id);
+        let mut sequence = 1u64;
+        let mut events = vec![Ok(create_sandbox_progress_event(
+            &request_id,
+            sequence,
+            "validating",
+            "validating create sandbox request",
+        ))];
         enforce_mutation_policy_preflight(
             self.daemon.as_ref(),
             RuntimeOperation::CreateSandbox,
@@ -741,10 +843,24 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
                 &request_hash,
                 &request_id,
             )? {
-                return Ok(Response::new(runtime_v2::SandboxResponse {
-                    request_id: request_id.clone(),
-                    sandbox: Some(sandbox_to_proto_payload(&cached_sandbox)),
-                }));
+                sequence += 1;
+                events.push(Ok(create_sandbox_progress_event(
+                    &request_id,
+                    sequence,
+                    "idempotency_replay",
+                    "replaying cached create sandbox result",
+                )));
+                sequence += 1;
+                events.push(Ok(create_sandbox_completion_event(
+                    &request_id,
+                    sequence,
+                    runtime_v2::SandboxResponse {
+                        request_id: request_id.clone(),
+                        sandbox: Some(sandbox_to_proto_payload(&cached_sandbox)),
+                    },
+                    "",
+                )));
+                return Ok(sandbox_stream_response(events, None));
             }
         }
 
@@ -770,7 +886,14 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
         } else {
             Some(request.memory_mb)
         };
-        boot_runtime_sandbox_resources(
+        sequence += 1;
+        events.push(Ok(create_sandbox_progress_event(
+            &request_id,
+            sequence,
+            "booting_runtime",
+            "booting sandbox runtime resources",
+        )));
+        if let Err(status) = boot_runtime_sandbox_resources(
             self.daemon.clone(),
             &sandbox_id,
             cpus,
@@ -778,7 +901,11 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
             &labels,
             &request_id,
         )
-        .await?;
+        .await
+        {
+            events.push(Err(status));
+            return Ok(sandbox_stream_response(events, None));
+        }
 
         let spec = SandboxSpec {
             cpus,
@@ -800,6 +927,13 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
             labels,
         };
 
+        sequence += 1;
+        events.push(Ok(create_sandbox_progress_event(
+            &request_id,
+            sequence,
+            "persisting",
+            "persisting sandbox state and receipt",
+        )));
         let receipt_id = generate_receipt_id();
         let persist_result = self.daemon.with_state_store(|store| {
             store.with_immediate_transaction(|tx| {
@@ -854,10 +988,24 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
                     &request_hash,
                     &request_id,
                 )? {
-                    return Ok(Response::new(runtime_v2::SandboxResponse {
-                        request_id,
-                        sandbox: Some(sandbox_to_proto_payload(&cached_sandbox)),
-                    }));
+                    sequence += 1;
+                    events.push(Ok(create_sandbox_progress_event(
+                        &request_id,
+                        sequence,
+                        "idempotency_replay",
+                        "replaying cached create sandbox result after persistence race",
+                    )));
+                    sequence += 1;
+                    events.push(Ok(create_sandbox_completion_event(
+                        &request_id,
+                        sequence,
+                        runtime_v2::SandboxResponse {
+                            request_id: request_id.clone(),
+                            sandbox: Some(sandbox_to_proto_payload(&cached_sandbox)),
+                        },
+                        "",
+                    )));
+                    return Ok(sandbox_stream_response(events, None));
                 }
             }
 
@@ -867,12 +1015,13 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
                 .map_err(|store_error| status_from_stack_error(store_error, &request_id))?
                 .is_some();
             if exists_after_error {
-                return Err(status_from_machine_error(MachineError::new(
+                events.push(Err(status_from_machine_error(MachineError::new(
                     MachineErrorCode::StateConflict,
                     format!("sandbox already exists: {sandbox_id}"),
-                    Some(request_id),
+                    Some(request_id.clone()),
                     BTreeMap::new(),
-                )));
+                ))));
+                return Ok(sandbox_stream_response(events, None));
             }
 
             if let Err(cleanup_error) =
@@ -887,17 +1036,21 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
                 );
             }
 
-            return Err(status_from_stack_error(error, &request_id));
+            events.push(Err(status_from_stack_error(error, &request_id)));
+            return Ok(sandbox_stream_response(events, None));
         }
 
-        let mut response = Response::new(runtime_v2::SandboxResponse {
-            request_id,
-            sandbox: Some(sandbox_to_proto_payload(&sandbox)),
-        });
-        if let Ok(value) = MetadataValue::try_from(receipt_id.as_str()) {
-            response.metadata_mut().insert("x-receipt-id", value);
-        }
-        Ok(response)
+        sequence += 1;
+        events.push(Ok(create_sandbox_completion_event(
+            &request_id,
+            sequence,
+            runtime_v2::SandboxResponse {
+                request_id: request_id.clone(),
+                sandbox: Some(sandbox_to_proto_payload(&sandbox)),
+            },
+            receipt_id.as_str(),
+        )));
+        Ok(sandbox_stream_response(events, Some(receipt_id.as_str())))
     }
 
     async fn get_sandbox(
@@ -1169,7 +1322,7 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
     async fn terminate_sandbox(
         &self,
         request: Request<runtime_v2::TerminateSandboxRequest>,
-    ) -> Result<Response<runtime_v2::SandboxResponse>, Status> {
+    ) -> Result<Response<Self::TerminateSandboxStream>, Status> {
         let intercepted_request_id = request_id_from_extensions(&request);
         let request = request.into_inner();
         let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
@@ -1177,6 +1330,13 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
             .request_id
             .clone()
             .unwrap_or_else(generate_request_id);
+        let mut sequence = 1u64;
+        let mut events = vec![Ok(terminate_sandbox_progress_event(
+            &request_id,
+            sequence,
+            "validating",
+            "validating terminate sandbox request",
+        ))];
         enforce_mutation_policy_preflight(
             self.daemon.as_ref(),
             RuntimeOperation::TerminateSandbox,
@@ -1195,10 +1355,24 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
                 &request_hash,
                 &request_id,
             )? {
-                return Ok(Response::new(runtime_v2::SandboxResponse {
-                    request_id: request_id.clone(),
-                    sandbox: Some(sandbox_to_proto_payload(&cached_sandbox)),
-                }));
+                sequence += 1;
+                events.push(Ok(terminate_sandbox_progress_event(
+                    &request_id,
+                    sequence,
+                    "idempotency_replay",
+                    "replaying cached terminate sandbox result",
+                )));
+                sequence += 1;
+                events.push(Ok(terminate_sandbox_completion_event(
+                    &request_id,
+                    sequence,
+                    runtime_v2::SandboxResponse {
+                        request_id: request_id.clone(),
+                        sandbox: Some(sandbox_to_proto_payload(&cached_sandbox)),
+                    },
+                    "",
+                )));
+                return Ok(sandbox_stream_response(events, None));
             }
         }
 
@@ -1217,15 +1391,33 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
             })?;
 
         if sandbox.state != SandboxState::Terminated {
-            terminate_runtime_sandbox_resources(
+            sequence += 1;
+            events.push(Ok(terminate_sandbox_progress_event(
+                &request_id,
+                sequence,
+                "tearing_down_runtime",
+                "terminating sandbox runtime resources",
+            )));
+            if let Err(status) = terminate_runtime_sandbox_resources(
                 self.daemon.clone(),
                 &sandbox.sandbox_id,
                 &request_id,
             )
-            .await?;
+            .await
+            {
+                events.push(Err(status));
+                return Ok(sandbox_stream_response(events, None));
+            }
 
             sandbox.state = SandboxState::Terminated;
             sandbox.updated_at = now;
+            sequence += 1;
+            events.push(Ok(terminate_sandbox_progress_event(
+                &request_id,
+                sequence,
+                "persisting",
+                "persisting sandbox termination state and receipt",
+            )));
             let receipt_id = generate_receipt_id();
             let persist_result = self.daemon.with_state_store(|store| {
                 store.with_immediate_transaction(|tx| {
@@ -1274,29 +1466,54 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
                         &request_hash,
                         &request_id,
                     )? {
-                        return Ok(Response::new(runtime_v2::SandboxResponse {
-                            request_id,
-                            sandbox: Some(sandbox_to_proto_payload(&cached_sandbox)),
-                        }));
+                        sequence += 1;
+                        events.push(Ok(terminate_sandbox_progress_event(
+                            &request_id,
+                            sequence,
+                            "idempotency_replay",
+                            "replaying cached terminate sandbox result after persistence race",
+                        )));
+                        sequence += 1;
+                        events.push(Ok(terminate_sandbox_completion_event(
+                            &request_id,
+                            sequence,
+                            runtime_v2::SandboxResponse {
+                                request_id: request_id.clone(),
+                                sandbox: Some(sandbox_to_proto_payload(&cached_sandbox)),
+                            },
+                            "",
+                        )));
+                        return Ok(sandbox_stream_response(events, None));
                     }
                 }
-                return Err(status_from_stack_error(error, &request_id));
+                events.push(Err(status_from_stack_error(error, &request_id)));
+                return Ok(sandbox_stream_response(events, None));
             }
 
-            let mut response = Response::new(runtime_v2::SandboxResponse {
-                request_id,
-                sandbox: Some(sandbox_to_proto_payload(&sandbox)),
-            });
-            if let Ok(value) = MetadataValue::try_from(receipt_id.as_str()) {
-                response.metadata_mut().insert("x-receipt-id", value);
-            }
-            return Ok(response);
+            sequence += 1;
+            events.push(Ok(terminate_sandbox_completion_event(
+                &request_id,
+                sequence,
+                runtime_v2::SandboxResponse {
+                    request_id: request_id.clone(),
+                    sandbox: Some(sandbox_to_proto_payload(&sandbox)),
+                },
+                receipt_id.as_str(),
+            )));
+            return Ok(sandbox_stream_response(events, Some(receipt_id.as_str())));
         }
 
-        Ok(Response::new(runtime_v2::SandboxResponse {
-            request_id,
-            sandbox: Some(sandbox_to_proto_payload(&sandbox)),
-        }))
+        sequence += 1;
+        events.push(Ok(terminate_sandbox_completion_event(
+            &request_id,
+            sequence,
+            runtime_v2::SandboxResponse {
+                request_id: request_id.clone(),
+                sandbox: Some(sandbox_to_proto_payload(&sandbox)),
+            },
+            "",
+        )));
+        Ok(sandbox_stream_response(events, None))
     }
 }
 
