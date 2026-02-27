@@ -24,6 +24,103 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use prost::Message;
+    use std::collections::BTreeMap;
+
+    #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    enum RpcMode {
+        Unary,
+        ServerStreaming,
+    }
+
+    fn parse_runtime_v2_rpc_modes(proto: &str) -> BTreeMap<String, RpcMode> {
+        let mut modes = BTreeMap::new();
+        for line in proto.lines().map(str::trim) {
+            if !line.starts_with("rpc ") {
+                continue;
+            }
+            let Some((name, _rest)) = line
+                .strip_prefix("rpc ")
+                .and_then(|raw| raw.split_once('('))
+            else {
+                continue;
+            };
+            let mode = if line.contains("returns (stream ") {
+                RpcMode::ServerStreaming
+            } else {
+                RpcMode::Unary
+            };
+            modes.insert(name.trim().to_string(), mode);
+        }
+        modes
+    }
+
+    fn expected_runtime_v2_rpc_modes() -> BTreeMap<String, RpcMode> {
+        [
+            ("CreateSandbox", RpcMode::ServerStreaming),
+            ("GetSandbox", RpcMode::Unary),
+            ("ListSandboxes", RpcMode::Unary),
+            ("TerminateSandbox", RpcMode::ServerStreaming),
+            ("OpenSandboxShell", RpcMode::ServerStreaming),
+            ("CloseSandboxShell", RpcMode::ServerStreaming),
+            ("OpenLease", RpcMode::Unary),
+            ("GetLease", RpcMode::Unary),
+            ("ListLeases", RpcMode::Unary),
+            ("HeartbeatLease", RpcMode::Unary),
+            ("CloseLease", RpcMode::Unary),
+            ("CreateContainer", RpcMode::Unary),
+            ("GetContainer", RpcMode::Unary),
+            ("ListContainers", RpcMode::Unary),
+            ("RemoveContainer", RpcMode::Unary),
+            ("GetImage", RpcMode::Unary),
+            ("ListImages", RpcMode::Unary),
+            ("PullImage", RpcMode::ServerStreaming),
+            ("PruneImages", RpcMode::ServerStreaming),
+            ("CreateExecution", RpcMode::Unary),
+            ("GetExecution", RpcMode::Unary),
+            ("ListExecutions", RpcMode::Unary),
+            ("CancelExecution", RpcMode::Unary),
+            ("StreamExecOutput", RpcMode::ServerStreaming),
+            ("WriteExecStdin", RpcMode::Unary),
+            ("ResizeExecPty", RpcMode::Unary),
+            ("SignalExec", RpcMode::Unary),
+            ("CreateCheckpoint", RpcMode::Unary),
+            ("GetCheckpoint", RpcMode::Unary),
+            ("ListCheckpoints", RpcMode::Unary),
+            ("RestoreCheckpoint", RpcMode::Unary),
+            ("ForkCheckpoint", RpcMode::Unary),
+            ("StartBuild", RpcMode::Unary),
+            ("GetBuild", RpcMode::Unary),
+            ("ListBuilds", RpcMode::Unary),
+            ("CancelBuild", RpcMode::Unary),
+            ("StreamBuildEvents", RpcMode::ServerStreaming),
+            ("GetReceipt", RpcMode::Unary),
+            ("ListEvents", RpcMode::Unary),
+            ("StreamEvents", RpcMode::ServerStreaming),
+            ("ApplyStack", RpcMode::ServerStreaming),
+            ("TeardownStack", RpcMode::ServerStreaming),
+            ("GetStackStatus", RpcMode::Unary),
+            ("ListStackEvents", RpcMode::Unary),
+            ("GetStackLogs", RpcMode::Unary),
+            ("StopStackService", RpcMode::ServerStreaming),
+            ("StartStackService", RpcMode::ServerStreaming),
+            ("RestartStackService", RpcMode::ServerStreaming),
+            ("CreateStackRunContainer", RpcMode::Unary),
+            ("RemoveStackRunContainer", RpcMode::Unary),
+            ("ReadFile", RpcMode::Unary),
+            ("WriteFile", RpcMode::Unary),
+            ("ListFiles", RpcMode::Unary),
+            ("MakeDir", RpcMode::Unary),
+            ("RemovePath", RpcMode::Unary),
+            ("MovePath", RpcMode::Unary),
+            ("CopyPath", RpcMode::Unary),
+            ("ChmodPath", RpcMode::Unary),
+            ("ChownPath", RpcMode::Unary),
+            ("GetCapabilities", RpcMode::Unary),
+        ]
+        .into_iter()
+        .map(|(name, mode)| (name.to_string(), mode))
+        .collect()
+    }
 
     // ── Runtime V2 proto-contract consistency tests ──────────────
 
@@ -116,6 +213,17 @@ mod tests {
         assert_eq!(err.code, "not_found");
         assert_eq!(err.message, "sandbox not found");
         assert_eq!(err.request_id, "req-abc");
+    }
+
+    #[test]
+    fn runtime_v2_rpc_modes_are_explicit_and_stable() {
+        let proto = include_str!("../proto/runtime_v2.proto");
+        let observed = parse_runtime_v2_rpc_modes(proto);
+        let expected = expected_runtime_v2_rpc_modes();
+        assert_eq!(
+            observed, expected,
+            "Runtime V2 RPC mode contract changed; classify new RPCs and keep long-running surfaces stream-first."
+        );
     }
 
     #[test]

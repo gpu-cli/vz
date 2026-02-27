@@ -884,6 +884,85 @@ async fn create_sandbox_is_persisted_in_state_store() {
 }
 
 #[tokio::test]
+async fn create_sandbox_stream_slow_consumer_preserves_order_and_completion() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let mut client = connect_sandbox_client(&config.socket_path).await;
+    let mut stream = client
+        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+            metadata: None,
+            stack_name: "stack-slow-consumer".to_string(),
+            cpus: 1,
+            memory_mb: 512,
+            labels: std::collections::HashMap::new(),
+        }))
+        .await
+        .expect("create sandbox stream")
+        .into_inner();
+
+    let mut last_sequence = 0_u64;
+    let mut completion = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .expect("read create sandbox stream event")
+    {
+        assert!(
+            event.sequence > last_sequence,
+            "expected strictly increasing stream sequence numbers"
+        );
+        last_sequence = event.sequence;
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        if let Some(runtime_v2::create_sandbox_event::Payload::Completion(done)) = event.payload {
+            completion = Some(done);
+        }
+    }
+
+    let completion = completion.expect("expected terminal create sandbox completion event");
+    let response = completion
+        .response
+        .expect("completion should include sandbox response");
+    assert_eq!(
+        response
+            .sandbox
+            .expect("sandbox payload should exist")
+            .sandbox_id,
+        "stack-slow-consumer"
+    );
+    assert!(
+        !completion.receipt_id.trim().is_empty(),
+        "completion should include receipt id"
+    );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
 async fn open_sandbox_shell_creates_container_and_resolves_default_shell() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = RuntimedConfig {
