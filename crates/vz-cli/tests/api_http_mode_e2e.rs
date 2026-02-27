@@ -429,6 +429,39 @@ async fn cli_api_http_mode_end_to_end_sandbox_and_attach_flow() -> Result<()> {
     let sandbox_id = create_sandbox_via_api(&api_base_url).await?;
     let vz_bin = resolve_vz_binary()?;
 
+    let image_ls_output = run_vz_command(&vz_bin, &api_base_url, &home_dir, &["image", "ls"])?;
+    if !image_ls_output.status.success() {
+        bail!(
+            "vz image ls failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&image_ls_output.stdout),
+            String::from_utf8_lossy(&image_ls_output.stderr)
+        );
+    }
+    let image_ls_stdout = String::from_utf8_lossy(&image_ls_output.stdout);
+    if !image_ls_stdout.contains("No images found.") && !image_ls_stdout.contains("DIGEST") {
+        bail!(
+            "vz image ls output missing expected marker:\n{}",
+            image_ls_stdout
+        );
+    }
+
+    let image_prune_output =
+        run_vz_command(&vz_bin, &api_base_url, &home_dir, &["image", "prune"])?;
+    if !image_prune_output.status.success() {
+        bail!(
+            "vz image prune failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&image_prune_output.stdout),
+            String::from_utf8_lossy(&image_prune_output.stderr)
+        );
+    }
+    let image_prune_stdout = String::from_utf8_lossy(&image_prune_output.stdout);
+    if !image_prune_stdout.contains("Pruned images:") {
+        bail!(
+            "vz image prune output missing expected marker:\n{}",
+            image_prune_stdout
+        );
+    }
+
     let ls_output = run_vz_command(&vz_bin, &api_base_url, &home_dir, &["ls", "--json"])?;
     if !ls_output.status.success() {
         bail!(
