@@ -9,11 +9,16 @@ use std::path::PathBuf;
 
 use anyhow::{Context, anyhow, bail};
 use clap::{Args, Subcommand};
+use reqwest::StatusCode as HttpStatusCode;
+use serde::{Deserialize, Serialize};
 use tonic::Code;
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed_client::DaemonClientError;
 
-use super::runtime_daemon::connect_control_plane_for_state_db;
+use super::runtime_daemon::{
+    ControlPlaneTransport, connect_control_plane_for_state_db, control_plane_transport,
+    runtime_api_base_url,
+};
 
 /// Manage checkpoint fingerprints and lineage.
 #[derive(Args, Debug)]
@@ -89,6 +94,154 @@ pub async fn run(args: CheckpointArgs) -> anyhow::Result<()> {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ApiErrorPayload {
+    code: String,
+    message: String,
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorEnvelope {
+    error: ApiErrorPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiCheckpointPayload {
+    checkpoint_id: String,
+    sandbox_id: String,
+    parent_checkpoint_id: Option<String>,
+    class: String,
+    state: String,
+    compatibility_fingerprint: String,
+    created_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiCheckpointResponse {
+    checkpoint: ApiCheckpointPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiCheckpointListResponse {
+    checkpoints: Vec<ApiCheckpointPayload>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiCreateCheckpointRequest {
+    sandbox_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compatibility_fingerprint: Option<String>,
+}
+
+fn checkpoint_payload_from_api(payload: ApiCheckpointPayload) -> runtime_v2::CheckpointPayload {
+    runtime_v2::CheckpointPayload {
+        checkpoint_id: payload.checkpoint_id,
+        sandbox_id: payload.sandbox_id,
+        parent_checkpoint_id: payload.parent_checkpoint_id.unwrap_or_default(),
+        checkpoint_class: payload.class,
+        state: payload.state,
+        compatibility_fingerprint: payload.compatibility_fingerprint,
+        created_at: payload.created_at,
+    }
+}
+
+fn runtime_api_url(path: &str) -> anyhow::Result<String> {
+    let base = runtime_api_base_url()?;
+    Ok(format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    ))
+}
+
+async fn api_error_response(response: reqwest::Response, context: &str) -> anyhow::Error {
+    let status = response.status();
+    let body = response.bytes().await.unwrap_or_default();
+    if let Ok(error) = serde_json::from_slice::<ApiErrorEnvelope>(&body) {
+        return anyhow!(
+            "{context}: api error {} {} (request_id={})",
+            error.error.code,
+            error.error.message,
+            error.error.request_id
+        );
+    }
+    let snippet = String::from_utf8_lossy(&body);
+    anyhow!("{context}: api status {status} body={snippet}")
+}
+
+async fn api_list_checkpoints() -> anyhow::Result<Vec<runtime_v2::CheckpointPayload>> {
+    let url = runtime_api_url("/v1/checkpoints")?;
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .context("failed to call api list checkpoints")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to list checkpoints via api").await);
+    }
+    let payload: ApiCheckpointListResponse = response
+        .json()
+        .await
+        .context("failed to decode api list checkpoints response")?;
+    Ok(payload
+        .checkpoints
+        .into_iter()
+        .map(checkpoint_payload_from_api)
+        .collect())
+}
+
+async fn api_get_checkpoint(
+    checkpoint_id: &str,
+) -> anyhow::Result<Option<runtime_v2::CheckpointPayload>> {
+    let url = runtime_api_url(&format!("/v1/checkpoints/{checkpoint_id}"))?;
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .context("failed to call api get checkpoint")?;
+    if response.status() == HttpStatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to get checkpoint via api").await);
+    }
+    let payload: ApiCheckpointResponse = response
+        .json()
+        .await
+        .context("failed to decode api get checkpoint response")?;
+    Ok(Some(checkpoint_payload_from_api(payload.checkpoint)))
+}
+
+async fn api_create_checkpoint(
+    sandbox_id: String,
+    checkpoint_class: String,
+    fingerprint: String,
+) -> anyhow::Result<runtime_v2::CheckpointPayload> {
+    let url = runtime_api_url("/v1/checkpoints")?;
+    let body = ApiCreateCheckpointRequest {
+        sandbox_id,
+        class: Some(checkpoint_class),
+        compatibility_fingerprint: Some(fingerprint),
+    };
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .context("failed to call api create checkpoint")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to create checkpoint via api").await);
+    }
+    let payload: ApiCheckpointResponse = response
+        .json()
+        .await
+        .context("failed to decode api create checkpoint response")?;
+    Ok(checkpoint_payload_from_api(payload.checkpoint))
+}
+
 fn checkpoint_json(payload: &runtime_v2::CheckpointPayload) -> serde_json::Value {
     serde_json::json!({
         "checkpoint_id": payload.checkpoint_id,
@@ -106,12 +259,17 @@ fn checkpoint_json(payload: &runtime_v2::CheckpointPayload) -> serde_json::Value
 }
 
 async fn cmd_list(args: CheckpointListArgs) -> anyhow::Result<()> {
-    let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
-    let mut checkpoints = client
-        .list_checkpoints(runtime_v2::ListCheckpointsRequest { metadata: None })
-        .await
-        .context("failed to list checkpoints via daemon")?
-        .checkpoints;
+    let mut checkpoints = match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+            client
+                .list_checkpoints(runtime_v2::ListCheckpointsRequest { metadata: None })
+                .await
+                .context("failed to list checkpoints via daemon")?
+                .checkpoints
+        }
+        ControlPlaneTransport::ApiHttp => api_list_checkpoints().await?,
+    };
 
     if let Some(sandbox_id) = args.sandbox_id.as_deref() {
         checkpoints.retain(|checkpoint| checkpoint.sandbox_id == sandbox_id);
@@ -160,24 +318,32 @@ async fn cmd_list(args: CheckpointListArgs) -> anyhow::Result<()> {
 }
 
 async fn cmd_inspect(args: CheckpointInspectArgs) -> anyhow::Result<()> {
-    let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
-    let response = match client
-        .get_checkpoint(runtime_v2::GetCheckpointRequest {
-            checkpoint_id: args.checkpoint_id.clone(),
-            metadata: None,
-        })
-        .await
-    {
-        Ok(response) => response,
-        Err(DaemonClientError::Grpc(status)) if status.code() == Code::NotFound => {
-            bail!("checkpoint {} not found", args.checkpoint_id)
+    let payload = match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+            let response = match client
+                .get_checkpoint(runtime_v2::GetCheckpointRequest {
+                    checkpoint_id: args.checkpoint_id.clone(),
+                    metadata: None,
+                })
+                .await
+            {
+                Ok(response) => response,
+                Err(DaemonClientError::Grpc(status)) if status.code() == Code::NotFound => {
+                    bail!("checkpoint {} not found", args.checkpoint_id)
+                }
+                Err(error) => {
+                    return Err(anyhow!(error).context("failed to load checkpoint via daemon"));
+                }
+            };
+            response
+                .checkpoint
+                .ok_or_else(|| anyhow!("daemon returned missing checkpoint payload"))?
         }
-        Err(error) => return Err(anyhow!(error).context("failed to load checkpoint via daemon")),
+        ControlPlaneTransport::ApiHttp => api_get_checkpoint(&args.checkpoint_id)
+            .await?
+            .ok_or_else(|| anyhow!("checkpoint {} not found", args.checkpoint_id))?,
     };
-
-    let payload = response
-        .checkpoint
-        .ok_or_else(|| anyhow!("daemon returned missing checkpoint payload"))?;
     let json = serde_json::to_string_pretty(&checkpoint_json(&payload))
         .context("failed to serialize checkpoint")?;
     println!("{json}");
@@ -194,21 +360,27 @@ fn normalize_checkpoint_class(class: &str) -> anyhow::Result<String> {
 }
 
 async fn cmd_create(args: CheckpointCreateArgs) -> anyhow::Result<()> {
-    let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
     let checkpoint_class = normalize_checkpoint_class(&args.class)?;
-    let response = client
-        .create_checkpoint(runtime_v2::CreateCheckpointRequest {
-            metadata: None,
-            sandbox_id: args.sandbox_id,
-            checkpoint_class,
-            compatibility_fingerprint: args.fingerprint,
-        })
-        .await
-        .context("failed to create checkpoint via daemon")?;
-
-    let payload = response
-        .checkpoint
-        .ok_or_else(|| anyhow!("daemon returned missing checkpoint payload"))?;
+    let payload = match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+            let response = client
+                .create_checkpoint(runtime_v2::CreateCheckpointRequest {
+                    metadata: None,
+                    sandbox_id: args.sandbox_id,
+                    checkpoint_class,
+                    compatibility_fingerprint: args.fingerprint,
+                })
+                .await
+                .context("failed to create checkpoint via daemon")?;
+            response
+                .checkpoint
+                .ok_or_else(|| anyhow!("daemon returned missing checkpoint payload"))?
+        }
+        ControlPlaneTransport::ApiHttp => {
+            api_create_checkpoint(args.sandbox_id, checkpoint_class, args.fingerprint).await?
+        }
+    };
     let state = if payload.state.trim().is_empty() {
         "unknown"
     } else {

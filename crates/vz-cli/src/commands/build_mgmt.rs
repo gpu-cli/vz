@@ -9,11 +9,16 @@ use std::path::PathBuf;
 
 use anyhow::{Context, anyhow, bail};
 use clap::{Args, Subcommand};
+use reqwest::StatusCode as HttpStatusCode;
+use serde::Deserialize;
 use tonic::Code;
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed_client::DaemonClientError;
 
-use super::runtime_daemon::connect_control_plane_for_state_db;
+use super::runtime_daemon::{
+    ControlPlaneTransport, connect_control_plane_for_state_db, control_plane_transport,
+    runtime_api_base_url,
+};
 
 /// Manage asynchronous build operations.
 #[derive(Args, Debug)]
@@ -81,6 +86,134 @@ pub async fn run(args: BuildMgmtArgs) -> anyhow::Result<()> {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ApiErrorPayload {
+    code: String,
+    message: String,
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorEnvelope {
+    error: ApiErrorPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiBuildPayload {
+    build_id: String,
+    sandbox_id: String,
+    state: String,
+    result_digest: Option<String>,
+    started_at: u64,
+    ended_at: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiBuildResponse {
+    build: ApiBuildPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiBuildListResponse {
+    builds: Vec<ApiBuildPayload>,
+}
+
+fn build_payload_from_api(payload: ApiBuildPayload) -> runtime_v2::BuildPayload {
+    runtime_v2::BuildPayload {
+        build_id: payload.build_id,
+        sandbox_id: payload.sandbox_id,
+        state: payload.state,
+        result_digest: payload.result_digest.unwrap_or_default(),
+        started_at: payload.started_at,
+        ended_at: payload.ended_at.unwrap_or(0),
+    }
+}
+
+fn runtime_api_url(path: &str) -> anyhow::Result<String> {
+    let base = runtime_api_base_url()?;
+    Ok(format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    ))
+}
+
+async fn api_error_response(response: reqwest::Response, context: &str) -> anyhow::Error {
+    let status = response.status();
+    let body = response.bytes().await.unwrap_or_default();
+    if let Ok(error) = serde_json::from_slice::<ApiErrorEnvelope>(&body) {
+        return anyhow!(
+            "{context}: api error {} {} (request_id={})",
+            error.error.code,
+            error.error.message,
+            error.error.request_id
+        );
+    }
+    let snippet = String::from_utf8_lossy(&body);
+    anyhow!("{context}: api status {status} body={snippet}")
+}
+
+async fn api_list_builds() -> anyhow::Result<Vec<runtime_v2::BuildPayload>> {
+    let url = runtime_api_url("/v1/builds")?;
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .context("failed to call api list builds")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to list builds via api").await);
+    }
+    let payload: ApiBuildListResponse = response
+        .json()
+        .await
+        .context("failed to decode api list builds response")?;
+    Ok(payload
+        .builds
+        .into_iter()
+        .map(build_payload_from_api)
+        .collect())
+}
+
+async fn api_get_build(build_id: &str) -> anyhow::Result<Option<runtime_v2::BuildPayload>> {
+    let url = runtime_api_url(&format!("/v1/builds/{build_id}"))?;
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .context("failed to call api get build")?;
+    if response.status() == HttpStatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to get build via api").await);
+    }
+    let payload: ApiBuildResponse = response
+        .json()
+        .await
+        .context("failed to decode api get build response")?;
+    Ok(Some(build_payload_from_api(payload.build)))
+}
+
+async fn api_cancel_build(build_id: &str) -> anyhow::Result<Option<runtime_v2::BuildPayload>> {
+    let url = runtime_api_url(&format!("/v1/builds/{build_id}"))?;
+    let response = reqwest::Client::new()
+        .delete(url)
+        .send()
+        .await
+        .context("failed to call api cancel build")?;
+    if response.status() == HttpStatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to cancel build via api").await);
+    }
+    let payload: ApiBuildResponse = response
+        .json()
+        .await
+        .context("failed to decode api cancel build response")?;
+    Ok(Some(build_payload_from_api(payload.build)))
+}
+
 fn build_json(payload: &runtime_v2::BuildPayload) -> serde_json::Value {
     serde_json::json!({
         "build_id": payload.build_id,
@@ -101,12 +234,17 @@ fn build_json(payload: &runtime_v2::BuildPayload) -> serde_json::Value {
 }
 
 async fn cmd_list(args: BuildMgmtListArgs) -> anyhow::Result<()> {
-    let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
-    let mut builds = client
-        .list_builds(runtime_v2::ListBuildsRequest { metadata: None })
-        .await
-        .context("failed to list builds via daemon")?
-        .builds;
+    let mut builds = match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+            client
+                .list_builds(runtime_v2::ListBuildsRequest { metadata: None })
+                .await
+                .context("failed to list builds via daemon")?
+                .builds
+        }
+        ControlPlaneTransport::ApiHttp => api_list_builds().await?,
+    };
 
     if let Some(sandbox_id) = args.sandbox_id.as_deref() {
         builds.retain(|build| build.sandbox_id == sandbox_id);
@@ -159,24 +297,30 @@ async fn cmd_list(args: BuildMgmtListArgs) -> anyhow::Result<()> {
 }
 
 async fn cmd_inspect(args: BuildMgmtInspectArgs) -> anyhow::Result<()> {
-    let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
-    let response = match client
-        .get_build(runtime_v2::GetBuildRequest {
-            build_id: args.build_id.clone(),
-            metadata: None,
-        })
-        .await
-    {
-        Ok(response) => response,
-        Err(DaemonClientError::Grpc(status)) if status.code() == Code::NotFound => {
-            bail!("build {} not found", args.build_id)
+    let payload = match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+            let response = match client
+                .get_build(runtime_v2::GetBuildRequest {
+                    build_id: args.build_id.clone(),
+                    metadata: None,
+                })
+                .await
+            {
+                Ok(response) => response,
+                Err(DaemonClientError::Grpc(status)) if status.code() == Code::NotFound => {
+                    bail!("build {} not found", args.build_id)
+                }
+                Err(error) => return Err(anyhow!(error).context("failed to load build via daemon")),
+            };
+            response
+                .build
+                .ok_or_else(|| anyhow!("daemon returned missing build payload"))?
         }
-        Err(error) => return Err(anyhow!(error).context("failed to load build via daemon")),
+        ControlPlaneTransport::ApiHttp => api_get_build(&args.build_id)
+            .await?
+            .ok_or_else(|| anyhow!("build {} not found", args.build_id))?,
     };
-
-    let payload = response
-        .build
-        .ok_or_else(|| anyhow!("daemon returned missing build payload"))?;
     let json =
         serde_json::to_string_pretty(&build_json(&payload)).context("failed to serialize build")?;
     println!("{json}");
@@ -185,24 +329,32 @@ async fn cmd_inspect(args: BuildMgmtInspectArgs) -> anyhow::Result<()> {
 }
 
 async fn cmd_cancel(args: BuildMgmtCancelArgs) -> anyhow::Result<()> {
-    let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
-    let response = match client
-        .cancel_build(runtime_v2::CancelBuildRequest {
-            build_id: args.build_id.clone(),
-            metadata: None,
-        })
-        .await
-    {
-        Ok(response) => response,
-        Err(DaemonClientError::Grpc(status)) if status.code() == Code::NotFound => {
-            bail!("build {} not found", args.build_id)
+    let payload = match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+            let response = match client
+                .cancel_build(runtime_v2::CancelBuildRequest {
+                    build_id: args.build_id.clone(),
+                    metadata: None,
+                })
+                .await
+            {
+                Ok(response) => response,
+                Err(DaemonClientError::Grpc(status)) if status.code() == Code::NotFound => {
+                    bail!("build {} not found", args.build_id)
+                }
+                Err(error) => {
+                    return Err(anyhow!(error).context("failed to cancel build via daemon"));
+                }
+            };
+            response
+                .build
+                .ok_or_else(|| anyhow!("daemon returned missing build payload"))?
         }
-        Err(error) => return Err(anyhow!(error).context("failed to cancel build via daemon")),
+        ControlPlaneTransport::ApiHttp => api_cancel_build(&args.build_id)
+            .await?
+            .ok_or_else(|| anyhow!("build {} not found", args.build_id))?,
     };
-
-    let payload = response
-        .build
-        .ok_or_else(|| anyhow!("daemon returned missing build payload"))?;
     let state = if payload.state.trim().is_empty() {
         "unknown"
     } else {
