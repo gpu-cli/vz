@@ -16,6 +16,13 @@ The check fails when:
 - Runtime CLI command files open SQLite directly.
 - `vz-api` production surfaces open SQLite directly.
 - Known fail-closed runtime parity gaps are removed without replacement.
+- Any Runtime V2 RPC in `runtime_v2.proto` has no test invocation in daemon/client/API coverage suites.
+
+Run the RPC coverage gate directly:
+
+```bash
+./scripts/check-runtime-v2-rpc-test-coverage.sh
+```
 
 ## Happy-Path E2E Matrix (Daemon Endpoints)
 

@@ -76,9 +76,17 @@ check_contains "local-runtime path has been removed in daemon-only mode" \
   "crates/vz-cli/src/commands/image.rs" \
   "legacy image build command path must remain fail-closed in daemon mode"
 
+coverage_output=""
+if ! coverage_output="$("$ROOT/scripts/check-runtime-v2-rpc-test-coverage.sh" 2>&1)"; then
+  report_failure "$coverage_output"
+fi
+
 if [[ "$failures" -gt 0 ]]; then
   echo "daemon-only guardrails failed ($failures issue(s))" >&2
   exit 1
 fi
 
+if [[ -n "$coverage_output" ]]; then
+  echo "$coverage_output"
+fi
 echo "daemon-only guardrails passed"
