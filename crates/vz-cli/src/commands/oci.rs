@@ -369,44 +369,6 @@ pub async fn run_exec(args: ExecArgs) -> anyhow::Result<()> {
     }
 }
 
-/// Entry point for `vz images`.
-pub async fn run_images(args: ImagesArgs) -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let runtime = build_macos_runtime(&args.opts)?;
-        list_images(&runtime)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let backend = build_linux_backend(&args.opts);
-        list_images_linux(&backend)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = args;
-        anyhow::bail!("Container commands are not supported on this platform")
-    }
-}
-
-/// Entry point for `vz prune`.
-pub async fn run_prune(args: PruneArgs) -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let runtime = build_macos_runtime(&args.opts)?;
-        prune_images(&runtime)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let backend = build_linux_backend(&args.opts);
-        prune_images_linux(&backend)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = args;
-        anyhow::bail!("Container commands are not supported on this platform")
-    }
-}
-
 /// Entry point for `vz ps`.
 pub async fn run_ps(args: PsArgs) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
@@ -705,39 +667,6 @@ async fn exec_container(runtime: &vz_oci_macos::Runtime, args: ExecArgs) -> anyh
     if output.exit_code != 0 {
         process::exit(output.exit_code.rem_euclid(256));
     }
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn list_images(runtime: &vz_oci_macos::Runtime) -> anyhow::Result<()> {
-    let images = runtime.images()?;
-
-    if images.is_empty() {
-        println!("No cached images");
-        return Ok(());
-    }
-
-    println!("{:<35} IMAGE ID", "REFERENCE");
-    println!("{}", "-".repeat(70));
-    for image in images {
-        println!("{:<35} {}", image.reference, image.image_id);
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn prune_images(runtime: &vz_oci_macos::Runtime) -> anyhow::Result<()> {
-    let result = runtime.prune_images()?;
-
-    println!(
-        "Prune complete: {} refs, {} manifests, {} configs, {} layer dirs",
-        result.removed_refs,
-        result.removed_manifests,
-        result.removed_configs,
-        result.removed_layer_dirs,
-    );
 
     Ok(())
 }
@@ -1085,41 +1014,6 @@ async fn exec_container_linux(
     if output.exit_code != 0 {
         process::exit(output.exit_code.rem_euclid(256));
     }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn list_images_linux(backend: &vz_linux_native::LinuxNativeBackend) -> anyhow::Result<()> {
-    use vz_runtime_contract::RuntimeBackend;
-
-    let images = backend.images().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    if images.is_empty() {
-        println!("No cached images");
-        return Ok(());
-    }
-
-    println!("{:<35} IMAGE ID", "REFERENCE");
-    println!("{}", "-".repeat(70));
-    for image in images {
-        println!("{:<35} {}", image.reference, image.image_id);
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn prune_images_linux(backend: &vz_linux_native::LinuxNativeBackend) -> anyhow::Result<()> {
-    use vz_runtime_contract::RuntimeBackend;
-
-    let result = backend.prune_images().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    println!(
-        "Prune complete: {} refs, {} manifests, {} configs, {} layer dirs",
-        result.removed_refs,
-        result.removed_manifests,
-        result.removed_configs,
-        result.removed_layer_dirs,
-    );
     Ok(())
 }
 

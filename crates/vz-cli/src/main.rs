@@ -96,6 +96,9 @@ enum Commands {
     /// Attach to a running sandbox.
     Attach(commands::sandbox::SandboxAttachArgs),
 
+    /// Close an active shell session for a sandbox.
+    CloseShell(commands::sandbox::SandboxCloseShellArgs),
+
     // ── Stack orchestration ──
     /// Multi-service stack orchestration from Compose files.
     Stack(commands::stack::StackArgs),
@@ -191,6 +194,7 @@ fn main() -> anyhow::Result<()> {
             Some(Commands::Rm(args)) => commands::sandbox::cmd_terminate(args).await,
             Some(Commands::Inspect(args)) => commands::sandbox::cmd_inspect(args).await,
             Some(Commands::Attach(args)) => commands::sandbox::cmd_attach(args).await,
+            Some(Commands::CloseShell(args)) => commands::sandbox::cmd_close_shell(args).await,
 
             // Stack orchestration
             Some(Commands::Stack(args)) => commands::stack::run(args).await,
@@ -246,6 +250,18 @@ mod tests {
     fn parse_named_sandbox() {
         let cli = Cli::try_parse_from(["vz", "--name", "my-project"]).expect("parse");
         assert_eq!(cli.name.as_deref(), Some("my-project"));
+    }
+
+    #[test]
+    fn parse_close_shell_subcommand() {
+        let cli = Cli::try_parse_from(["vz", "close-shell", "sandbox-a"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::CloseShell(commands::sandbox::SandboxCloseShellArgs {
+                sandbox_id,
+                ..
+            })) if sandbox_id == "sandbox-a"
+        ));
     }
 
     #[test]
