@@ -2557,6 +2557,15 @@ impl StateStore {
         Ok(images)
     }
 
+    /// Replace all persisted image records with a new snapshot.
+    pub fn replace_images(&self, images: &[ImageRecord]) -> Result<(), StackError> {
+        self.conn.execute("DELETE FROM image_state", [])?;
+        for image in images {
+            self.save_image(image)?;
+        }
+        Ok(())
+    }
+
     // ── Receipt persistence (agent-a03881b1's complete version) ──
 
     /// Persist a receipt for a completed mutating operation.

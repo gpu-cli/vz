@@ -92,6 +92,46 @@ pub struct TerminateSandboxRequest {
     pub metadata: ::core::option::Option<RequestMetadata>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenSandboxShellRequest {
+    #[prost(string, tag = "1")]
+    pub sandbox_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub metadata: ::core::option::Option<RequestMetadata>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenSandboxShellResponse {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub sandbox_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub container_id: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "4")]
+    pub cmd: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "5")]
+    pub args: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "6")]
+    pub execution_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CloseSandboxShellRequest {
+    #[prost(string, tag = "1")]
+    pub sandbox_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub execution_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub metadata: ::core::option::Option<RequestMetadata>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CloseSandboxShellResponse {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub sandbox_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub execution_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OpenLeaseRequest {
     #[prost(message, optional, tag = "1")]
     pub metadata: ::core::option::Option<RequestMetadata>,
@@ -261,6 +301,89 @@ pub struct ListImagesResponse {
     pub request_id: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "2")]
     pub images: ::prost::alloc::vec::Vec<ImagePayload>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PullImageRequest {
+    #[prost(string, tag = "1")]
+    pub image_ref: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub metadata: ::core::option::Option<RequestMetadata>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PullImageResponse {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub image: ::core::option::Option<ImagePayload>,
+    #[prost(string, tag = "3")]
+    pub receipt_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PruneImagesRequest {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<RequestMetadata>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PruneImagesResponse {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub removed_refs: u64,
+    #[prost(uint64, tag = "3")]
+    pub removed_manifests: u64,
+    #[prost(uint64, tag = "4")]
+    pub removed_configs: u64,
+    #[prost(uint64, tag = "5")]
+    pub removed_layer_dirs: u64,
+    #[prost(uint64, tag = "6")]
+    pub remaining_images: u64,
+    #[prost(string, tag = "7")]
+    pub receipt_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ImageProgress {
+    #[prost(string, tag = "1")]
+    pub phase: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PullImageEvent {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(oneof = "pull_image_event::Payload", tags = "3, 4")]
+    pub payload: ::core::option::Option<pull_image_event::Payload>,
+}
+/// Nested message and enum types in `PullImageEvent`.
+pub mod pull_image_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "3")]
+        Progress(super::ImageProgress),
+        #[prost(message, tag = "4")]
+        Completion(super::PullImageResponse),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PruneImagesEvent {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(oneof = "prune_images_event::Payload", tags = "3, 4")]
+    pub payload: ::core::option::Option<prune_images_event::Payload>,
+}
+/// Nested message and enum types in `PruneImagesEvent`.
+pub mod prune_images_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "3")]
+        Progress(super::ImageProgress),
+        #[prost(message, tag = "4")]
+        Completion(super::PruneImagesResponse),
+    }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateExecutionRequest {
@@ -1202,6 +1325,58 @@ pub mod sandbox_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        pub async fn open_sandbox_shell(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OpenSandboxShellRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::OpenSandboxShellResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.runtime.v2.SandboxService/OpenSandboxShell",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("vz.runtime.v2.SandboxService", "OpenSandboxShell"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn close_sandbox_shell(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CloseSandboxShellRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CloseSandboxShellResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.runtime.v2.SandboxService/CloseSandboxShell",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("vz.runtime.v2.SandboxService", "CloseSandboxShell"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated client implementations.
@@ -1737,6 +1912,54 @@ pub mod image_service_client {
             req.extensions_mut()
                 .insert(GrpcMethod::new("vz.runtime.v2.ImageService", "ListImages"));
             self.inner.unary(req, path, codec).await
+        }
+        pub async fn pull_image(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PullImageRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::PullImageEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.runtime.v2.ImageService/PullImage",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("vz.runtime.v2.ImageService", "PullImage"));
+            self.inner.server_streaming(req, path, codec).await
+        }
+        pub async fn prune_images(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PruneImagesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::PruneImagesEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.runtime.v2.ImageService/PruneImages",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("vz.runtime.v2.ImageService", "PruneImages"));
+            self.inner.server_streaming(req, path, codec).await
         }
     }
 }
@@ -3543,6 +3766,20 @@ pub mod sandbox_service_server {
             &self,
             request: tonic::Request<super::TerminateSandboxRequest>,
         ) -> std::result::Result<tonic::Response<super::SandboxResponse>, tonic::Status>;
+        async fn open_sandbox_shell(
+            &self,
+            request: tonic::Request<super::OpenSandboxShellRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::OpenSandboxShellResponse>,
+            tonic::Status,
+        >;
+        async fn close_sandbox_shell(
+            &self,
+            request: tonic::Request<super::CloseSandboxShellRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CloseSandboxShellResponse>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct SandboxServiceServer<T> {
@@ -3786,6 +4023,98 @@ pub mod sandbox_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = TerminateSandboxSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.runtime.v2.SandboxService/OpenSandboxShell" => {
+                    #[allow(non_camel_case_types)]
+                    struct OpenSandboxShellSvc<T: SandboxService>(pub Arc<T>);
+                    impl<
+                        T: SandboxService,
+                    > tonic::server::UnaryService<super::OpenSandboxShellRequest>
+                    for OpenSandboxShellSvc<T> {
+                        type Response = super::OpenSandboxShellResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OpenSandboxShellRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SandboxService>::open_sandbox_shell(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OpenSandboxShellSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.runtime.v2.SandboxService/CloseSandboxShell" => {
+                    #[allow(non_camel_case_types)]
+                    struct CloseSandboxShellSvc<T: SandboxService>(pub Arc<T>);
+                    impl<
+                        T: SandboxService,
+                    > tonic::server::UnaryService<super::CloseSandboxShellRequest>
+                    for CloseSandboxShellSvc<T> {
+                        type Response = super::CloseSandboxShellResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CloseSandboxShellRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SandboxService>::close_sandbox_shell(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CloseSandboxShellSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -4579,6 +4908,29 @@ pub mod image_service_server {
             tonic::Response<super::ListImagesResponse>,
             tonic::Status,
         >;
+        /// Server streaming response type for the PullImage method.
+        type PullImageStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::PullImageEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn pull_image(
+            &self,
+            request: tonic::Request<super::PullImageRequest>,
+        ) -> std::result::Result<tonic::Response<Self::PullImageStream>, tonic::Status>;
+        /// Server streaming response type for the PruneImages method.
+        type PruneImagesStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::PruneImagesEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn prune_images(
+            &self,
+            request: tonic::Request<super::PruneImagesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::PruneImagesStream>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct ImageServiceServer<T> {
@@ -4742,6 +5094,98 @@ pub mod image_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.runtime.v2.ImageService/PullImage" => {
+                    #[allow(non_camel_case_types)]
+                    struct PullImageSvc<T: ImageService>(pub Arc<T>);
+                    impl<
+                        T: ImageService,
+                    > tonic::server::ServerStreamingService<super::PullImageRequest>
+                    for PullImageSvc<T> {
+                        type Response = super::PullImageEvent;
+                        type ResponseStream = T::PullImageStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PullImageRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ImageService>::pull_image(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PullImageSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.runtime.v2.ImageService/PruneImages" => {
+                    #[allow(non_camel_case_types)]
+                    struct PruneImagesSvc<T: ImageService>(pub Arc<T>);
+                    impl<
+                        T: ImageService,
+                    > tonic::server::ServerStreamingService<super::PruneImagesRequest>
+                    for PruneImagesSvc<T> {
+                        type Response = super::PruneImagesEvent;
+                        type ResponseStream = T::PruneImagesStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PruneImagesRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ImageService>::prune_images(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PruneImagesSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

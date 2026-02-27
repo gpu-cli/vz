@@ -43,6 +43,8 @@ service SandboxService {
   rpc GetSandbox(GetSandboxRequest) returns (SandboxResponse);
   rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
   rpc TerminateSandbox(TerminateSandboxRequest) returns (SandboxResponse);
+  rpc OpenSandboxShell(OpenSandboxShellRequest) returns (OpenSandboxShellResponse);
+  rpc CloseSandboxShell(CloseSandboxShellRequest) returns (CloseSandboxShellResponse);
 }
 
 message CreateSandboxRequest {
@@ -86,6 +88,32 @@ message ListSandboxesResponse {
 message TerminateSandboxRequest {
   string sandbox_id = 1;
   RequestMetadata metadata = 2;
+}
+
+message OpenSandboxShellRequest {
+  string sandbox_id = 1;
+  RequestMetadata metadata = 2;
+}
+
+message OpenSandboxShellResponse {
+  string request_id = 1;
+  string sandbox_id = 2;
+  string container_id = 3;
+  repeated string cmd = 4;
+  repeated string args = 5;
+  string execution_id = 6;
+}
+
+message CloseSandboxShellRequest {
+  string sandbox_id = 1;
+  string execution_id = 2;
+  RequestMetadata metadata = 3;
+}
+
+message CloseSandboxShellResponse {
+  string request_id = 1;
+  string sandbox_id = 2;
+  string execution_id = 3;
 }
 
 // ── 2. LeaseService ────────────────────────────────────────────────
@@ -199,6 +227,8 @@ message RemoveContainerRequest {
 service ImageService {
   rpc GetImage(GetImageRequest) returns (ImageResponse);
   rpc ListImages(ListImagesRequest) returns (ListImagesResponse);
+  rpc PullImage(PullImageRequest) returns (stream PullImageEvent);
+  rpc PruneImages(PruneImagesRequest) returns (stream PruneImagesEvent);
 }
 
 message ImagePayload {
@@ -226,6 +256,54 @@ message ListImagesRequest {
 message ListImagesResponse {
   string request_id = 1;
   repeated ImagePayload images = 2;
+}
+
+message PullImageRequest {
+  string image_ref = 1;
+  RequestMetadata metadata = 2;
+}
+
+message PullImageResponse {
+  string request_id = 1;
+  ImagePayload image = 2;
+  string receipt_id = 3;
+}
+
+message PruneImagesRequest {
+  RequestMetadata metadata = 1;
+}
+
+message PruneImagesResponse {
+  string request_id = 1;
+  uint64 removed_refs = 2;
+  uint64 removed_manifests = 3;
+  uint64 removed_configs = 4;
+  uint64 removed_layer_dirs = 5;
+  uint64 remaining_images = 6;
+  string receipt_id = 7;
+}
+
+message ImageProgress {
+  string phase = 1;
+  string detail = 2;
+}
+
+message PullImageEvent {
+  string request_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    ImageProgress progress = 3;
+    PullImageResponse completion = 4;
+  }
+}
+
+message PruneImagesEvent {
+  string request_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    ImageProgress progress = 3;
+    PruneImagesResponse completion = 4;
+  }
 }
 
 // ── 4. ExecutionService ────────────────────────────────────────────

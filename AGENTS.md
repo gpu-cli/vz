@@ -12,6 +12,12 @@ bd close <id>         # Complete work
 bd sync               # Sync with git
 ```
 
+## gRPC UX Policy
+
+- Prefer streaming gRPC responses for interactive or long-running operations.
+- Unary request/response APIs are for short, bounded operations only.
+- New control-plane surfaces should default to stream-first UX unless there is a clear reason not to.
+
 ## Landing the Plane (Session Completion)
 
 **When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
@@ -37,4 +43,3 @@ bd sync               # Sync with git
 - NEVER stop before pushing - that leaves work stranded locally
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
-

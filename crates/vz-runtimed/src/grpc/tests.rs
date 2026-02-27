@@ -6,7 +6,9 @@ use std::time::Duration;
 use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
-use vz_runtime_contract::{PolicyDecision, RequestMetadata, RuntimeOperation, RuntimePolicyHook};
+use vz_runtime_contract::{
+    PolicyDecision, RequestMetadata, RuntimeOperation, RuntimePolicyHook, SandboxBackend,
+};
 
 use super::*;
 use crate::{RuntimeDaemon, RuntimedConfig};
@@ -129,6 +131,25 @@ async fn connect_container_client(
         .await
         .expect("connect channel");
     runtime_v2::container_service_client::ContainerServiceClient::new(channel)
+}
+
+async fn connect_image_client(
+    socket_path: &Path,
+) -> runtime_v2::image_service_client::ImageServiceClient<Channel> {
+    let socket_path = socket_path.to_path_buf();
+    let channel = Endpoint::try_from("http://[::]:50051")
+        .expect("endpoint")
+        .connect_with_connector(service_fn(move |_: Uri| {
+            let socket_path = socket_path.clone();
+            async move {
+                tokio::net::UnixStream::connect(socket_path)
+                    .await
+                    .map(TokioIo::new)
+            }
+        }))
+        .await
+        .expect("connect channel");
+    runtime_v2::image_service_client::ImageServiceClient::new(channel)
 }
 
 async fn connect_build_client(
@@ -706,6 +727,466 @@ async fn create_sandbox_is_persisted_in_state_store() {
             .get("idempotency_key")
             .is_some_and(serde_json::Value::is_null)
     );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn open_sandbox_shell_creates_container_and_resolves_default_shell() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let mut labels = std::collections::HashMap::new();
+    labels.insert(
+        SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
+        "debian:bookworm".to_string(),
+    );
+    labels.insert(
+        SANDBOX_LABEL_MAIN_CONTAINER.to_string(),
+        "workspace-main".to_string(),
+    );
+
+    let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
+    let sandbox = sandbox_client
+        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+            metadata: None,
+            stack_name: "stack-open-shell-default".to_string(),
+            cpus: 0,
+            memory_mb: 0,
+            labels,
+        }))
+        .await
+        .expect("create sandbox")
+        .into_inner()
+        .sandbox
+        .expect("sandbox payload");
+
+    let opened = sandbox_client
+        .open_sandbox_shell(Request::new(runtime_v2::OpenSandboxShellRequest {
+            sandbox_id: sandbox.sandbox_id.clone(),
+            metadata: None,
+        }))
+        .await
+        .expect("open sandbox shell")
+        .into_inner();
+
+    assert_eq!(opened.sandbox_id, sandbox.sandbox_id);
+    assert!(!opened.container_id.is_empty());
+    assert!(!opened.execution_id.is_empty());
+    assert_eq!(opened.cmd, vec!["/bin/bash".to_string()]);
+    assert!(opened.args.is_empty());
+
+    let persisted = daemon
+        .with_state_store(|store| store.load_container(&opened.container_id))
+        .expect("load container from state store")
+        .expect("container should be persisted");
+    assert_eq!(persisted.sandbox_id, sandbox.sandbox_id);
+    let persisted_execution = daemon
+        .with_state_store(|store| store.load_execution(&opened.execution_id))
+        .expect("load execution from state store")
+        .expect("execution should be persisted");
+    assert_eq!(persisted_execution.container_id, opened.container_id);
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn open_sandbox_shell_prefers_main_container_command_override() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let mut labels = std::collections::HashMap::new();
+    labels.insert(
+        SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
+        "alpine:3.20".to_string(),
+    );
+    labels.insert(
+        SANDBOX_LABEL_MAIN_CONTAINER.to_string(),
+        "bash -lc \"echo ready\"".to_string(),
+    );
+
+    let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
+    let sandbox = sandbox_client
+        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+            metadata: None,
+            stack_name: "stack-open-shell-main-container".to_string(),
+            cpus: 0,
+            memory_mb: 0,
+            labels,
+        }))
+        .await
+        .expect("create sandbox")
+        .into_inner()
+        .sandbox
+        .expect("sandbox payload");
+
+    let opened = sandbox_client
+        .open_sandbox_shell(Request::new(runtime_v2::OpenSandboxShellRequest {
+            sandbox_id: sandbox.sandbox_id,
+            metadata: None,
+        }))
+        .await
+        .expect("open sandbox shell")
+        .into_inner();
+
+    assert!(!opened.execution_id.is_empty());
+    assert_eq!(opened.cmd, vec!["bash".to_string()]);
+    assert_eq!(
+        opened.args,
+        vec!["-lc".to_string(), "echo ready".to_string()]
+    );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn open_sandbox_shell_reuses_existing_active_execution_session() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let mut labels = std::collections::HashMap::new();
+    labels.insert(
+        SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
+        "debian:bookworm".to_string(),
+    );
+
+    let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
+    let sandbox = sandbox_client
+        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+            metadata: None,
+            stack_name: "stack-open-shell-reuse".to_string(),
+            cpus: 0,
+            memory_mb: 0,
+            labels,
+        }))
+        .await
+        .expect("create sandbox")
+        .into_inner()
+        .sandbox
+        .expect("sandbox payload");
+
+    let mut container_client = connect_container_client(&config.socket_path).await;
+    let container = container_client
+        .create_container(Request::new(runtime_v2::CreateContainerRequest {
+            metadata: None,
+            sandbox_id: sandbox.sandbox_id.clone(),
+            image_digest: "debian:bookworm".to_string(),
+            cmd: vec![
+                "/bin/sh".to_string(),
+                "-lc".to_string(),
+                "while :; do sleep 3600; done".to_string(),
+            ],
+            env: std::collections::HashMap::new(),
+            cwd: "/workspace".to_string(),
+            user: String::new(),
+        }))
+        .await
+        .expect("create container")
+        .into_inner()
+        .container
+        .expect("container payload");
+
+    let existing_execution = Execution {
+        execution_id: "exec-open-shell-reuse".to_string(),
+        container_id: container.container_id.clone(),
+        exec_spec: ExecutionSpec {
+            cmd: vec!["/bin/bash".to_string()],
+            args: Vec::new(),
+            env_override: BTreeMap::from([(
+                SANDBOX_SHELL_SESSION_ENV_KEY.to_string(),
+                "1".to_string(),
+            )]),
+            pty: true,
+            timeout_secs: None,
+        },
+        state: ExecutionState::Running,
+        exit_code: None,
+        started_at: Some(current_unix_secs()),
+        ended_at: None,
+    };
+    daemon
+        .with_state_store(|store| store.save_execution(&existing_execution))
+        .expect("persist existing execution");
+    daemon
+        .execution_sessions()
+        .register(&existing_execution.execution_id)
+        .expect("register existing execution session");
+
+    let opened = sandbox_client
+        .open_sandbox_shell(Request::new(runtime_v2::OpenSandboxShellRequest {
+            sandbox_id: sandbox.sandbox_id,
+            metadata: None,
+        }))
+        .await
+        .expect("open sandbox shell")
+        .into_inner();
+
+    assert_eq!(opened.execution_id, existing_execution.execution_id);
+    let executions = daemon
+        .with_state_store(|store| store.list_executions())
+        .expect("list executions");
+    assert_eq!(executions.len(), 1);
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn close_sandbox_shell_closes_active_execution_and_clears_session() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let mut labels = std::collections::HashMap::new();
+    labels.insert(
+        SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
+        "debian:bookworm".to_string(),
+    );
+
+    let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
+    let sandbox = sandbox_client
+        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+            metadata: None,
+            stack_name: "stack-close-shell".to_string(),
+            cpus: 0,
+            memory_mb: 0,
+            labels,
+        }))
+        .await
+        .expect("create sandbox")
+        .into_inner()
+        .sandbox
+        .expect("sandbox payload");
+
+    let opened = sandbox_client
+        .open_sandbox_shell(Request::new(runtime_v2::OpenSandboxShellRequest {
+            sandbox_id: sandbox.sandbox_id.clone(),
+            metadata: None,
+        }))
+        .await
+        .expect("open sandbox shell")
+        .into_inner();
+    assert!(!opened.execution_id.is_empty());
+
+    let closed = sandbox_client
+        .close_sandbox_shell(Request::new(runtime_v2::CloseSandboxShellRequest {
+            sandbox_id: sandbox.sandbox_id.clone(),
+            execution_id: opened.execution_id.clone(),
+            metadata: None,
+        }))
+        .await
+        .expect("close sandbox shell")
+        .into_inner();
+    assert_eq!(closed.sandbox_id, sandbox.sandbox_id);
+    assert_eq!(closed.execution_id, opened.execution_id);
+
+    let execution = daemon
+        .with_state_store(|store| store.load_execution(&opened.execution_id))
+        .expect("load execution")
+        .expect("execution should exist");
+    assert!(
+        execution.state.is_terminal(),
+        "close_sandbox_shell should leave execution in terminal state"
+    );
+
+    let has_session = daemon
+        .execution_sessions()
+        .contains(&opened.execution_id)
+        .expect("check execution session");
+    assert!(
+        !has_session,
+        "execution session should be removed after close_sandbox_shell"
+    );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn maintenance_reaps_orphaned_shell_execution_sessions() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let now = current_unix_secs();
+    daemon
+        .with_state_store(|store| {
+            store.with_immediate_transaction(|tx| {
+                tx.save_sandbox(&Sandbox {
+                    sandbox_id: "sandbox-orphan-shell".to_string(),
+                    backend: SandboxBackend::MacosVz,
+                    spec: SandboxSpec::default(),
+                    state: SandboxState::Ready,
+                    created_at: now.saturating_sub(10),
+                    updated_at: now.saturating_sub(10),
+                    labels: BTreeMap::new(),
+                })?;
+                tx.save_container(&Container {
+                    container_id: "container-orphan-shell".to_string(),
+                    sandbox_id: "sandbox-orphan-shell".to_string(),
+                    image_digest: "debian:bookworm".to_string(),
+                    container_spec: ContainerSpec::default(),
+                    state: ContainerState::Running,
+                    created_at: now.saturating_sub(10),
+                    started_at: Some(now.saturating_sub(10)),
+                    ended_at: None,
+                })?;
+                tx.save_execution(&Execution {
+                    execution_id: "exec-orphan-shell".to_string(),
+                    container_id: "container-orphan-shell".to_string(),
+                    exec_spec: ExecutionSpec {
+                        cmd: vec!["/bin/bash".to_string()],
+                        args: Vec::new(),
+                        env_override: BTreeMap::from([(
+                            SANDBOX_SHELL_SESSION_ENV_KEY.to_string(),
+                            "1".to_string(),
+                        )]),
+                        pty: true,
+                        timeout_secs: None,
+                    },
+                    state: ExecutionState::Running,
+                    exit_code: None,
+                    started_at: Some(now.saturating_sub(10)),
+                    ended_at: None,
+                })?;
+                Ok(())
+            })
+        })
+        .expect("seed orphan shell execution");
+
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let execution = daemon
+            .with_state_store(|store| store.load_execution("exec-orphan-shell"))
+            .expect("load execution")
+            .expect("execution exists");
+        if execution.state == ExecutionState::Canceled {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "expected orphan shell execution to be canceled by maintenance, got {:?}",
+                execution.state
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     shutdown.notify_waiters();
     let result = tokio::time::timeout(Duration::from_secs(5), server)
@@ -3526,6 +4007,161 @@ async fn concurrent_create_without_idempotency_returns_conflict_not_internal() {
         CONCURRENCY - 1,
         "all other creates should fail with conflict"
     );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn pull_image_stream_emits_progress_and_terminal_completion() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let mut image_client = connect_image_client(&config.socket_path).await;
+    let mut stream = image_client
+        .pull_image(Request::new(runtime_v2::PullImageRequest {
+            image_ref: "alpine:3.20".to_string(),
+            metadata: None,
+        }))
+        .await
+        .expect("pull image stream")
+        .into_inner();
+
+    let mut saw_progress = false;
+    let mut completion = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .expect("read pull image stream event")
+    {
+        match event.payload {
+            Some(runtime_v2::pull_image_event::Payload::Progress(progress)) => {
+                saw_progress = true;
+                assert!(!progress.phase.is_empty());
+            }
+            Some(runtime_v2::pull_image_event::Payload::Completion(done)) => {
+                completion = Some(done)
+            }
+            None => {}
+        }
+    }
+    assert!(saw_progress, "expected at least one progress event");
+    let completion = completion.expect("expected terminal completion event");
+    let image = completion.image.expect("completion image payload");
+    assert_eq!(image.image_ref, "alpine:3.20");
+    assert_eq!(image.resolved_digest, "sha256:test-mock");
+    assert!(!completion.receipt_id.is_empty());
+
+    let list_response = image_client
+        .list_images(Request::new(runtime_v2::ListImagesRequest {
+            metadata: None,
+        }))
+        .await
+        .expect("list images")
+        .into_inner();
+    assert_eq!(list_response.images.len(), 1);
+    assert_eq!(list_response.images[0].image_ref, "alpine:3.20");
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn prune_images_stream_emits_terminal_completion_and_clears_image_index() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let mut image_client = connect_image_client(&config.socket_path).await;
+    let mut pull_stream = image_client
+        .pull_image(Request::new(runtime_v2::PullImageRequest {
+            image_ref: "nginx:latest".to_string(),
+            metadata: None,
+        }))
+        .await
+        .expect("pull image stream")
+        .into_inner();
+    while pull_stream
+        .message()
+        .await
+        .expect("read pull event before prune")
+        .is_some()
+    {}
+
+    let mut prune_stream = image_client
+        .prune_images(Request::new(runtime_v2::PruneImagesRequest {
+            metadata: None,
+        }))
+        .await
+        .expect("prune images stream")
+        .into_inner();
+    let mut completion = None;
+    while let Some(event) = prune_stream
+        .message()
+        .await
+        .expect("read prune images stream event")
+    {
+        if let Some(runtime_v2::prune_images_event::Payload::Completion(done)) = event.payload {
+            completion = Some(done);
+        }
+    }
+    let completion = completion.expect("expected terminal prune completion event");
+    assert_eq!(completion.remaining_images, 0);
+    assert!(!completion.receipt_id.is_empty());
+
+    let list_response = image_client
+        .list_images(Request::new(runtime_v2::ListImagesRequest {
+            metadata: None,
+        }))
+        .await
+        .expect("list images")
+        .into_inner();
+    assert!(list_response.images.is_empty());
 
     shutdown.notify_waiters();
     let result = tokio::time::timeout(Duration::from_secs(5), server)

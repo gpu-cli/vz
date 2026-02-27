@@ -302,6 +302,48 @@ impl DaemonClient {
             .map_err(|status| status_to_client_error(&self.config.socket_path, status))
     }
 
+    /// Call Runtime V2 `OpenSandboxShell`.
+    pub async fn open_sandbox_shell(
+        &mut self,
+        request: runtime_v2::OpenSandboxShellRequest,
+    ) -> Result<runtime_v2::OpenSandboxShellResponse> {
+        let response = self.open_sandbox_shell_with_metadata(request).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Call Runtime V2 `OpenSandboxShell` and preserve gRPC response metadata.
+    pub async fn open_sandbox_shell_with_metadata(
+        &mut self,
+        mut request: runtime_v2::OpenSandboxShellRequest,
+    ) -> Result<tonic::Response<runtime_v2::OpenSandboxShellResponse>> {
+        Self::ensure_metadata(&mut request.metadata);
+        self.sandbox_client
+            .open_sandbox_shell(Request::new(request))
+            .await
+            .map_err(|status| status_to_client_error(&self.config.socket_path, status))
+    }
+
+    /// Call Runtime V2 `CloseSandboxShell`.
+    pub async fn close_sandbox_shell(
+        &mut self,
+        request: runtime_v2::CloseSandboxShellRequest,
+    ) -> Result<runtime_v2::CloseSandboxShellResponse> {
+        let response = self.close_sandbox_shell_with_metadata(request).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Call Runtime V2 `CloseSandboxShell` and preserve gRPC response metadata.
+    pub async fn close_sandbox_shell_with_metadata(
+        &mut self,
+        mut request: runtime_v2::CloseSandboxShellRequest,
+    ) -> Result<tonic::Response<runtime_v2::CloseSandboxShellResponse>> {
+        Self::ensure_metadata(&mut request.metadata);
+        self.sandbox_client
+            .close_sandbox_shell(Request::new(request))
+            .await
+            .map_err(|status| status_to_client_error(&self.config.socket_path, status))
+    }
+
     /// Convenience helper for `CreateSandbox`.
     pub async fn create_sandbox_for_stack(&mut self, stack_name: impl Into<String>) -> Result<()> {
         let request = runtime_v2::CreateSandboxRequest {
@@ -543,6 +585,32 @@ impl DaemonClient {
         self.image_client
             .list_images(Request::new(request))
             .await
+            .map_err(|status| status_to_client_error(&self.config.socket_path, status))
+    }
+
+    /// Call Runtime V2 `PullImage` as a server stream.
+    pub async fn pull_image(
+        &mut self,
+        mut request: runtime_v2::PullImageRequest,
+    ) -> Result<tonic::Streaming<runtime_v2::PullImageEvent>> {
+        Self::ensure_metadata(&mut request.metadata);
+        self.image_client
+            .pull_image(Request::new(request))
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| status_to_client_error(&self.config.socket_path, status))
+    }
+
+    /// Call Runtime V2 `PruneImages` as a server stream.
+    pub async fn prune_images(
+        &mut self,
+        mut request: runtime_v2::PruneImagesRequest,
+    ) -> Result<tonic::Streaming<runtime_v2::PruneImagesEvent>> {
+        Self::ensure_metadata(&mut request.metadata);
+        self.image_client
+            .prune_images(Request::new(request))
+            .await
+            .map(|response| response.into_inner())
             .map_err(|status| status_to_client_error(&self.config.socket_path, status))
     }
 
