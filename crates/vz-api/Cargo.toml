@@ -2,7 +2,6 @@
 name = "vz-api"
 version = "0.1.0"
 description = "OpenAPI + SSE/WebSocket transport adapter for Runtime V2"
-build = "build.rs"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

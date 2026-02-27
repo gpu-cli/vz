@@ -108,9 +108,13 @@ fn sample_openapi_path(path: &str) -> String {
     }
 }
 
+fn openapi_document_json() -> serde_json::Value {
+    serde_json::to_value(openapi_document()).expect("serialize OpenAPI document")
+}
+
 #[test]
 fn openapi_document_contains_required_paths() {
-    let document = openapi_document();
+    let document = openapi_document_json();
     let paths = document["paths"].as_object().unwrap();
     assert!(paths.contains_key("/v1/sandboxes"));
     assert!(paths.contains_key("/v1/sandboxes/{sandbox_id}"));
@@ -144,6 +148,30 @@ fn openapi_document_contains_required_paths() {
     assert!(paths.contains_key("/v1/files/copy"));
     assert!(paths.contains_key("/v1/files/chmod"));
     assert!(paths.contains_key("/v1/files/chown"));
+}
+
+#[test]
+fn openapi_document_source_avoids_codegen_and_manual_schema_maps() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let openapi_doc_source = std::fs::read_to_string(manifest_dir.join("src/openapi_doc.rs"))
+        .expect("read openapi_doc.rs");
+    assert!(
+        !openapi_doc_source
+            .contains("include!(concat!(env!(\"OUT_DIR\"), \"/openapi_doc_generated.rs\"));"),
+        "OpenAPI registration should be source-defined; OUT_DIR codegen include is disallowed"
+    );
+    assert!(
+        !openapi_doc_source.contains("serde_json::Map::new"),
+        "manual schema fallback maps are disallowed"
+    );
+    assert!(
+        !openapi_doc_source.contains("serde_json::json!"),
+        "manual schema json! fragments are disallowed"
+    );
+    assert!(
+        !manifest_dir.join("build.rs").exists(),
+        "vz-api should not use build.rs for OpenAPI/schema registration"
+    );
 }
 
 #[tokio::test]
@@ -478,7 +506,7 @@ fn transport_parity_openapi_and_grpc_surface_require_metadata_and_ordering() {
     assert_eq!(exec_event.sequence, 0);
     assert!(exec_event.request_id.is_empty());
 
-    let document = openapi_document();
+    let document = openapi_document_json();
     let paths = document["paths"].as_object().unwrap();
     assert!(paths.contains_key("/v1/executions"));
     assert!(paths.contains_key("/v1/events/{stack_name}/stream"));
@@ -487,7 +515,7 @@ fn transport_parity_openapi_and_grpc_surface_require_metadata_and_ordering() {
 
 #[tokio::test]
 async fn transport_parity_openapi_matrix_paths_match_contract() {
-    let document = openapi_document();
+    let document = openapi_document_json();
     let paths = document["paths"].as_object().unwrap();
     let mut matrix_paths = BTreeSet::new();
 
@@ -1549,7 +1577,7 @@ async fn checkpoint_restore_includes_fingerprint_metadata() {
 
 #[test]
 fn transport_parity_openapi_operations_match_grpc_rpcs() {
-    let doc = openapi_document();
+    let doc = openapi_document_json();
     let paths = doc["paths"].as_object().unwrap();
 
     // Extract all operationIds from OpenAPI.
@@ -1654,7 +1682,7 @@ fn transport_parity_openapi_operations_match_grpc_rpcs() {
 
 #[test]
 fn transport_parity_shared_error_codes() {
-    let doc = openapi_document();
+    let doc = openapi_document_json();
     let error_schema = &doc["components"]["schemas"]["ErrorResponse"];
     assert!(
         error_schema.is_object(),
@@ -1704,7 +1732,7 @@ fn transport_parity_shared_error_codes() {
 
 #[test]
 fn transport_parity_request_metadata_fields_present() {
-    let doc = openapi_document();
+    let doc = openapi_document_json();
     let paths = doc["paths"].as_object().unwrap();
     let component_params = doc["components"]["parameters"].as_object();
 
@@ -1749,7 +1777,7 @@ fn transport_parity_request_metadata_fields_present() {
 
 #[test]
 fn transport_parity_entity_payload_field_consistency() {
-    let doc = openapi_document();
+    let doc = openapi_document_json();
     let schemas = doc["components"]["schemas"].as_object().unwrap();
 
     // SandboxPayload fields: sandbox_id, backend, state, cpus, memory_mb,
@@ -1856,7 +1884,7 @@ fn transport_parity_entity_payload_field_consistency() {
 
 #[test]
 fn transport_parity_idempotency_on_mutating_operations() {
-    let doc = openapi_document();
+    let doc = openapi_document_json();
     let paths = doc["paths"].as_object().unwrap();
     let component_params = doc["components"]["parameters"].as_object();
 

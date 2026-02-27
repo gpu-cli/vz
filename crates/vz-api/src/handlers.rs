@@ -21,7 +21,7 @@ fn serialize_json_or_marker(value: &impl serde::Serialize) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| serialization_error_value().to_string())
 }
 
-pub(super) async fn openapi_json() -> Json<serde_json::Value> {
+pub(super) async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
     Json(openapi_document())
 }
 
