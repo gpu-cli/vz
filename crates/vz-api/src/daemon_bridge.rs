@@ -242,15 +242,37 @@ pub(super) fn extract_request_id_from_status_message(status: &tonic::Status) -> 
 
 pub(super) fn daemon_client_config(state: &ApiState) -> DaemonClientConfig {
     let mut config = DaemonClientConfig::default();
-    config.auto_spawn = false;
+    config.auto_spawn = state.daemon_auto_spawn;
     config.state_store_path = Some(state.state_store_path.clone());
-    if let Some(parent) = state.state_store_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        let runtime_dir = parent.join(".vz-runtime");
-        config.socket_path = runtime_dir.join("runtimed.sock");
-        config.runtime_data_dir = Some(runtime_dir);
+
+    if let Some(socket_path) = &state.daemon_socket_path {
+        config.socket_path = socket_path.clone();
     }
+
+    if let Some(runtime_data_dir) = &state.daemon_runtime_data_dir {
+        config.runtime_data_dir = Some(runtime_data_dir.clone());
+    }
+
+    if config.runtime_data_dir.is_none() {
+        if state.daemon_socket_path.is_some() {
+            if let Some(socket_parent) = config.socket_path.parent()
+                && !socket_parent.as_os_str().is_empty()
+            {
+                config.runtime_data_dir = Some(socket_parent.to_path_buf());
+            }
+        } else if let Some(parent) = state.state_store_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            config.runtime_data_dir = Some(parent.join(".vz-runtime"));
+        }
+    }
+
+    if state.daemon_socket_path.is_none()
+        && let Some(runtime_data_dir) = &config.runtime_data_dir
+    {
+        config.socket_path = runtime_data_dir.join("runtimed.sock");
+    }
+
     config
 }
 

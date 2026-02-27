@@ -250,6 +250,7 @@ cd crates
 cargo run -p vz-api -- \
   --bind 127.0.0.1:8181 \
   --state-store-path /tmp/vz-api-state.db \
+  --daemon-auto-spawn true \
   --stack-baseline \
   --capability fs_quick_checkpoint
 
@@ -257,6 +258,13 @@ cargo run -p vz-api -- \
 curl -s http://127.0.0.1:8181/v1/capabilities
 curl -s http://127.0.0.1:8181/openapi.json
 ```
+
+`vz-api` daemon lifecycle behavior can be tuned for local/dev/operator scenarios:
+
+- `VZ_RUNTIME_DAEMON_AUTOSTART=1` (default) enables cold-start of `vz-runtimed`
+- `VZ_RUNTIME_DAEMON_AUTOSTART=0` disables auto-start and returns `daemon_unavailable` if daemon is not already running
+- `VZ_RUNTIME_DAEMON_SOCKET=/absolute/path/to/runtimed.sock` overrides daemon socket target
+- `VZ_RUNTIME_DAEMON_RUNTIME_DIR=/absolute/path/to/.vz-runtime` overrides runtime data directory used during daemon spawn
 
 Sandbox-specific real VM integration validation (macOS ARM64):
 

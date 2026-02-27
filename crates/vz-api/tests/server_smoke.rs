@@ -64,6 +64,9 @@ async fn runtime_api_server_smoke_serves_capabilities() -> Result<()> {
     let state_store_path = temp_dir.path().join("state.db");
     let app = router(ApiConfig {
         state_store_path,
+        daemon_socket_path: None,
+        daemon_runtime_data_dir: None,
+        daemon_auto_spawn: true,
         capabilities: RuntimeCapabilities {
             fs_quick_checkpoint: true,
             ..RuntimeCapabilities::default()
@@ -127,6 +130,9 @@ async fn sandbox_crud_over_http() -> Result<()> {
     let (daemon_shutdown, daemon_server) = start_daemon_for_state_store(&state_store_path).await?;
     let app = router(ApiConfig {
         state_store_path,
+        daemon_socket_path: None,
+        daemon_runtime_data_dir: None,
+        daemon_auto_spawn: true,
         capabilities: RuntimeCapabilities::default(),
         event_poll_interval: Duration::from_millis(10),
         default_event_page_size: 10,
@@ -250,6 +256,9 @@ async fn file_service_round_trip_over_http() -> Result<()> {
     let (daemon_shutdown, daemon_server) = start_daemon_for_state_store(&state_store_path).await?;
     let app = router(ApiConfig {
         state_store_path,
+        daemon_socket_path: None,
+        daemon_runtime_data_dir: None,
+        daemon_auto_spawn: true,
         capabilities: RuntimeCapabilities::default(),
         event_poll_interval: Duration::from_millis(10),
         default_event_page_size: 10,

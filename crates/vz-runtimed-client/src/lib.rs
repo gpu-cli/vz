@@ -1389,6 +1389,19 @@ impl DaemonClient {
             .map_err(|status| status_to_client_error(&self.config.socket_path, status))
     }
 
+    /// Call Runtime V2 `StreamBuildEvents`.
+    pub async fn stream_build_events(
+        &mut self,
+        mut request: runtime_v2::StreamBuildEventsRequest,
+    ) -> Result<tonic::Streaming<runtime_v2::BuildEvent>> {
+        Self::ensure_metadata(&mut request.metadata);
+        self.build_client
+            .stream_build_events(Request::new(request))
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| status_to_client_error(&self.config.socket_path, status))
+    }
+
     /// Call Runtime V2 `CreateExecution`.
     pub async fn create_execution(
         &mut self,
@@ -2091,6 +2104,20 @@ mod tests {
         }
     }
 
+    fn assert_grpc_status_in(error: DaemonClientError, expected: &[Code]) {
+        match error {
+            DaemonClientError::Grpc(status) => {
+                assert!(
+                    expected.iter().any(|code| *code == status.code()),
+                    "unexpected grpc status code: {:?}, expected one of {:?}",
+                    status.code(),
+                    expected
+                );
+            }
+            other => panic!("expected grpc status error, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn connect_retries_until_daemon_cold_start_is_ready() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2514,6 +2541,361 @@ mod tests {
             error,
             DaemonClientError::IncompatibleVersion { .. }
         ));
+
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn heartbeat_lease_round_trip_and_signal_exec_missing_returns_not_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let daemon = start_daemon(runtimed_config(&tmp)).await;
+        let mut client = DaemonClient::connect_with_config(client_config(&tmp, false))
+            .await
+            .expect("client connect");
+
+        let sandbox = client
+            .create_sandbox(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "client-heartbeat-sandbox".to_string(),
+                cpus: 1,
+                memory_mb: 128,
+                labels: HashMap::new(),
+            })
+            .await
+            .expect("create sandbox");
+        let sandbox_id = sandbox
+            .sandbox
+            .expect("sandbox payload")
+            .sandbox_id
+            .to_string();
+
+        let lease = client
+            .open_lease(runtime_v2::OpenLeaseRequest {
+                metadata: None,
+                sandbox_id,
+                ttl_secs: 30,
+            })
+            .await
+            .expect("open lease");
+        let lease_id = lease.lease.expect("lease payload").lease_id;
+
+        let heartbeat = client
+            .heartbeat_lease(runtime_v2::HeartbeatLeaseRequest {
+                metadata: None,
+                lease_id: lease_id.clone(),
+            })
+            .await
+            .expect("heartbeat lease");
+        assert_eq!(
+            heartbeat.lease.expect("heartbeat lease payload").lease_id,
+            lease_id
+        );
+
+        let signal_error = client
+            .signal_exec(runtime_v2::SignalExecRequest {
+                metadata: None,
+                execution_id: "exec-missing-client".to_string(),
+                signal: "SIGTERM".to_string(),
+            })
+            .await
+            .expect_err("missing execution should fail");
+        assert_grpc_status_in(signal_error, &[Code::NotFound]);
+
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn image_get_receipt_and_stream_build_events_are_covered() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let daemon = start_daemon(runtimed_config(&tmp)).await;
+        let mut client = DaemonClient::connect_with_config(client_config(&tmp, false))
+            .await
+            .expect("client connect");
+
+        let mut pull_stream = client
+            .pull_image(runtime_v2::PullImageRequest {
+                metadata: None,
+                image_ref: "alpine:3.20".to_string(),
+            })
+            .await
+            .expect("pull image");
+        let mut pulled = None;
+        while let Some(event) = pull_stream.message().await.expect("read pull image stream") {
+            if let Some(runtime_v2::pull_image_event::Payload::Completion(done)) = event.payload {
+                pulled = Some(done);
+            }
+        }
+        let pulled = pulled.expect("pull completion");
+
+        let image = client
+            .get_image(runtime_v2::GetImageRequest {
+                metadata: None,
+                image_ref: "alpine:3.20".to_string(),
+            })
+            .await
+            .expect("get image");
+        assert_eq!(
+            image.image.expect("image payload").image_ref,
+            "alpine:3.20".to_string()
+        );
+
+        let receipt = client
+            .get_receipt(runtime_v2::GetReceiptRequest {
+                metadata: None,
+                receipt_id: pulled.receipt_id.clone(),
+            })
+            .await
+            .expect("get receipt");
+        assert_eq!(
+            receipt.receipt.expect("receipt payload").receipt_id,
+            pulled.receipt_id
+        );
+
+        let stream_error = client
+            .stream_build_events(runtime_v2::StreamBuildEventsRequest {
+                build_id: "bld-missing-client".to_string(),
+                metadata: None,
+            })
+            .await
+            .expect_err("missing build should fail");
+        assert_grpc_status_in(stream_error, &[Code::NotFound, Code::Unimplemented]);
+
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_restore_and_fork_missing_return_not_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let daemon = start_daemon(runtimed_config(&tmp)).await;
+        let mut client = DaemonClient::connect_with_config(client_config(&tmp, false))
+            .await
+            .expect("client connect");
+
+        let restore_error = client
+            .restore_checkpoint(runtime_v2::RestoreCheckpointRequest {
+                checkpoint_id: "ckpt-missing-client".to_string(),
+                metadata: None,
+            })
+            .await
+            .expect_err("missing checkpoint restore should fail");
+        assert_grpc_status_in(restore_error, &[Code::NotFound]);
+
+        let fork_error = client
+            .fork_checkpoint(runtime_v2::ForkCheckpointRequest {
+                checkpoint_id: "ckpt-missing-client".to_string(),
+                new_sandbox_id: "sbx-fork-target".to_string(),
+                metadata: None,
+            })
+            .await
+            .expect_err("missing checkpoint fork should fail");
+        assert_grpc_status_in(fork_error, &[Code::NotFound]);
+
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn stack_auxiliary_methods_and_event_stream_paths_are_covered() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let daemon = start_daemon(runtimed_config(&tmp)).await;
+        let mut client = DaemonClient::connect_with_config(client_config(&tmp, false))
+            .await
+            .expect("client connect");
+
+        let stack_name = "stack-client-aux".to_string();
+        client
+            .apply_stack(runtime_v2::ApplyStackRequest {
+                metadata: None,
+                stack_name: stack_name.clone(),
+                compose_yaml: "services: {}\n".to_string(),
+                compose_dir: ".".to_string(),
+                dry_run: false,
+                detach: false,
+            })
+            .await
+            .expect("apply stack");
+
+        let mut stream = client
+            .stream_events(runtime_v2::StreamEventsRequest {
+                stack_name: stack_name.clone(),
+                after: 0,
+                scope: String::new(),
+                metadata: None,
+            })
+            .await
+            .expect("stream events");
+        let first_event = tokio::time::timeout(Duration::from_secs(2), stream.message())
+            .await
+            .expect("stream event timeout")
+            .expect("stream events read")
+            .expect("at least one event");
+        assert_eq!(first_event.stack_name, stack_name);
+
+        let logs_result = client
+            .get_stack_logs(runtime_v2::GetStackLogsRequest {
+                metadata: None,
+                stack_name: "stack-missing-client".to_string(),
+                service: "svc".to_string(),
+                tail: 50,
+            })
+            .await;
+        if let Err(error) = logs_result {
+            assert_grpc_status_in(error, &[Code::NotFound, Code::Unimplemented]);
+        }
+
+        let stop_error = client
+            .stop_stack_service(runtime_v2::StackServiceActionRequest {
+                metadata: None,
+                stack_name: "stack-missing-client".to_string(),
+                service_name: "svc".to_string(),
+            })
+            .await
+            .expect_err("stop stack service should fail for missing stack/service");
+        assert_grpc_status_in(stop_error, &[Code::NotFound, Code::FailedPrecondition]);
+
+        let start_error = client
+            .start_stack_service(runtime_v2::StackServiceActionRequest {
+                metadata: None,
+                stack_name: "stack-missing-client".to_string(),
+                service_name: "svc".to_string(),
+            })
+            .await
+            .expect_err("start stack service should fail for missing stack/service");
+        assert_grpc_status_in(start_error, &[Code::NotFound, Code::FailedPrecondition]);
+
+        let restart_error = client
+            .restart_stack_service(runtime_v2::StackServiceActionRequest {
+                metadata: None,
+                stack_name: "stack-missing-client".to_string(),
+                service_name: "svc".to_string(),
+            })
+            .await
+            .expect_err("restart stack service should fail for missing stack/service");
+        assert_grpc_status_in(restart_error, &[Code::NotFound, Code::FailedPrecondition]);
+
+        let run_create_error = client
+            .create_stack_run_container(runtime_v2::StackRunContainerRequest {
+                metadata: None,
+                stack_name: "stack-missing-client".to_string(),
+                service_name: "svc".to_string(),
+                run_service_name: "svc-run".to_string(),
+            })
+            .await
+            .expect_err("create stack run container should fail for missing stack/service");
+        assert_grpc_status_in(
+            run_create_error,
+            &[Code::NotFound, Code::FailedPrecondition],
+        );
+
+        let run_remove_error = client
+            .remove_stack_run_container(runtime_v2::StackRunContainerRequest {
+                metadata: None,
+                stack_name: "stack-missing-client".to_string(),
+                service_name: "svc".to_string(),
+                run_service_name: "svc-run".to_string(),
+            })
+            .await
+            .expect_err("remove stack run container should fail for missing stack/service");
+        assert_grpc_status_in(
+            run_remove_error,
+            &[Code::NotFound, Code::FailedPrecondition],
+        );
+
+        drop(stream);
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn file_mutation_rpc_methods_are_covered() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let daemon = start_daemon(runtimed_config(&tmp)).await;
+        let mut client = DaemonClient::connect_with_config(client_config(&tmp, false))
+            .await
+            .expect("client connect");
+
+        let sandbox = client
+            .create_sandbox(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "client-file-rpc-sandbox".to_string(),
+                cpus: 1,
+                memory_mb: 128,
+                labels: HashMap::new(),
+            })
+            .await
+            .expect("create sandbox");
+        let sandbox_id = sandbox
+            .sandbox
+            .expect("sandbox payload")
+            .sandbox_id
+            .to_string();
+
+        client
+            .write_file(runtime_v2::WriteFileRequest {
+                metadata: None,
+                sandbox_id: sandbox_id.clone(),
+                path: "source.txt".to_string(),
+                data: b"hello".to_vec(),
+                append: false,
+                create_parents: true,
+            })
+            .await
+            .expect("write source file");
+
+        client
+            .copy_path(runtime_v2::CopyPathRequest {
+                metadata: None,
+                sandbox_id: sandbox_id.clone(),
+                src_path: "source.txt".to_string(),
+                dst_path: "copied.txt".to_string(),
+                overwrite: true,
+            })
+            .await
+            .expect("copy file");
+
+        client
+            .move_path(runtime_v2::MovePathRequest {
+                metadata: None,
+                sandbox_id: sandbox_id.clone(),
+                src_path: "copied.txt".to_string(),
+                dst_path: "moved.txt".to_string(),
+                overwrite: true,
+            })
+            .await
+            .expect("move file");
+
+        client
+            .remove_path(runtime_v2::RemovePathRequest {
+                metadata: None,
+                sandbox_id: sandbox_id.clone(),
+                path: "moved.txt".to_string(),
+                recursive: false,
+            })
+            .await
+            .expect("remove file");
+
+        let chmod_result = client
+            .chmod_path(runtime_v2::ChmodPathRequest {
+                metadata: None,
+                sandbox_id: sandbox_id.clone(),
+                path: "source.txt".to_string(),
+                mode: 0o644,
+            })
+            .await;
+        if let Err(error) = chmod_result {
+            assert_grpc_status_in(error, &[Code::Unimplemented, Code::NotFound]);
+        }
+
+        let chown_result = client
+            .chown_path(runtime_v2::ChownPathRequest {
+                metadata: None,
+                sandbox_id,
+                path: "source.txt".to_string(),
+                uid: 0,
+                gid: 0,
+            })
+            .await;
+        if let Err(error) = chown_result {
+            assert_grpc_status_in(error, &[Code::Unimplemented, Code::NotFound]);
+        }
 
         daemon.stop().await;
     }

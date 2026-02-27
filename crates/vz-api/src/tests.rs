@@ -78,6 +78,9 @@ fn ensure_test_daemon_for_state_store(state_store_path: &Path) {
 fn base_test_config(state_store_path: PathBuf) -> ApiConfig {
     ApiConfig {
         state_store_path,
+        daemon_socket_path: None,
+        daemon_runtime_data_dir: None,
+        daemon_auto_spawn: true,
         capabilities: RuntimeCapabilities {
             fs_quick_checkpoint: true,
             checkpoint_fork: true,
@@ -94,7 +97,9 @@ fn test_config(state_store_path: PathBuf) -> ApiConfig {
 }
 
 fn test_config_daemon_only(state_store_path: PathBuf) -> ApiConfig {
-    base_test_config(state_store_path)
+    let mut config = base_test_config(state_store_path);
+    config.daemon_auto_spawn = false;
+    config
 }
 
 fn sample_openapi_path(path: &str) -> String {
@@ -185,6 +190,54 @@ fn transport_modules_do_not_directly_import_state_store() {
             "{relative} must not directly import or mutate StateStore"
         );
     }
+}
+
+#[test]
+fn daemon_client_config_defaults_to_autospawn_and_state_store_runtime_dir() {
+    let state_store_path = PathBuf::from("/tmp/vz-api/state/stack-state.db");
+    let state = ApiState::from(base_test_config(state_store_path.clone()));
+    let config = daemon_client_config(&state);
+
+    assert!(config.auto_spawn);
+    assert_eq!(config.state_store_path, Some(state_store_path));
+    assert_eq!(
+        config.socket_path,
+        PathBuf::from("/tmp/vz-api/state/.vz-runtime/runtimed.sock")
+    );
+    assert_eq!(
+        config.runtime_data_dir,
+        Some(PathBuf::from("/tmp/vz-api/state/.vz-runtime"))
+    );
+}
+
+#[test]
+fn daemon_client_config_can_disable_autospawn() {
+    let state_store_path = PathBuf::from("/tmp/vz-api/state/stack-state.db");
+    let mut api_config = base_test_config(state_store_path);
+    api_config.daemon_auto_spawn = false;
+    let state = ApiState::from(api_config);
+    let config = daemon_client_config(&state);
+
+    assert!(!config.auto_spawn);
+}
+
+#[test]
+fn daemon_client_config_uses_explicit_socket_and_runtime_dir_overrides() {
+    let state_store_path = PathBuf::from("/tmp/vz-api/state/stack-state.db");
+    let mut api_config = base_test_config(state_store_path);
+    api_config.daemon_socket_path = Some(PathBuf::from("/tmp/custom-runtime/runtimed.sock"));
+    api_config.daemon_runtime_data_dir = Some(PathBuf::from("/tmp/custom-runtime"));
+    let state = ApiState::from(api_config);
+    let config = daemon_client_config(&state);
+
+    assert_eq!(
+        config.socket_path,
+        PathBuf::from("/tmp/custom-runtime/runtimed.sock")
+    );
+    assert_eq!(
+        config.runtime_data_dir,
+        Some(PathBuf::from("/tmp/custom-runtime"))
+    );
 }
 
 #[tokio::test]
@@ -1077,6 +1130,9 @@ fn test_config_with_resize(state_store_path: PathBuf) -> ApiConfig {
     ensure_test_daemon_for_state_store(&state_store_path);
     ApiConfig {
         state_store_path,
+        daemon_socket_path: None,
+        daemon_runtime_data_dir: None,
+        daemon_auto_spawn: true,
         capabilities: RuntimeCapabilities {
             fs_quick_checkpoint: true,
             checkpoint_fork: true,
@@ -1307,6 +1363,9 @@ fn test_config_with_capabilities(
     ensure_test_daemon_for_state_store(&state_store_path);
     ApiConfig {
         state_store_path,
+        daemon_socket_path: None,
+        daemon_runtime_data_dir: None,
+        daemon_auto_spawn: true,
         capabilities,
         event_poll_interval: Duration::from_millis(10),
         default_event_page_size: 2,

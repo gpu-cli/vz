@@ -56,6 +56,12 @@ use openapi_doc::openapi_document;
 pub struct ApiConfig {
     /// SQLite state-store path used for event reads.
     pub state_store_path: PathBuf,
+    /// Optional runtime daemon socket override.
+    pub daemon_socket_path: Option<PathBuf>,
+    /// Optional runtime daemon data directory override.
+    pub daemon_runtime_data_dir: Option<PathBuf>,
+    /// Whether API requests may auto-spawn `vz-runtimed` when unreachable.
+    pub daemon_auto_spawn: bool,
     /// Runtime capabilities advertised by this API surface.
     pub capabilities: RuntimeCapabilities,
     /// Poll interval for SSE/WebSocket event adapters.
@@ -68,6 +74,9 @@ impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             state_store_path: PathBuf::from("stack-state.db"),
+            daemon_socket_path: None,
+            daemon_runtime_data_dir: None,
+            daemon_auto_spawn: true,
             capabilities: RuntimeCapabilities::default(),
             event_poll_interval: DEFAULT_EVENT_POLL_INTERVAL,
             default_event_page_size: DEFAULT_EVENT_PAGE_SIZE,
@@ -78,6 +87,9 @@ impl Default for ApiConfig {
 #[derive(Debug, Clone)]
 struct ApiState {
     state_store_path: PathBuf,
+    daemon_socket_path: Option<PathBuf>,
+    daemon_runtime_data_dir: Option<PathBuf>,
+    daemon_auto_spawn: bool,
     capabilities: RuntimeCapabilities,
     event_poll_interval: Duration,
     default_event_page_size: usize,
@@ -87,6 +99,9 @@ impl From<ApiConfig> for ApiState {
     fn from(config: ApiConfig) -> Self {
         Self {
             state_store_path: config.state_store_path,
+            daemon_socket_path: config.daemon_socket_path,
+            daemon_runtime_data_dir: config.daemon_runtime_data_dir,
+            daemon_auto_spawn: config.daemon_auto_spawn,
             capabilities: config.capabilities,
             event_poll_interval: config.event_poll_interval,
             default_event_page_size: config.default_event_page_size.clamp(1, MAX_EVENT_PAGE_SIZE),

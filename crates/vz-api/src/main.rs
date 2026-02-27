@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::ffi::OsString;
 use std::future::pending;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -25,6 +26,9 @@ const SUPPORTED_CAPABILITIES: &[&str] = &[
     "stack_networking",
     "container_logs",
 ];
+const DAEMON_SOCKET_PATH_ENV: &str = "VZ_RUNTIME_DAEMON_SOCKET";
+const DAEMON_AUTOSTART_ENV: &str = "VZ_RUNTIME_DAEMON_AUTOSTART";
+const DAEMON_RUNTIME_DATA_DIR_ENV: &str = "VZ_RUNTIME_DAEMON_RUNTIME_DIR";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -40,6 +44,18 @@ struct Cli {
     /// SQLite state-store path used by event endpoints.
     #[arg(long, default_value = "stack-state.db")]
     state_store_path: PathBuf,
+
+    /// Runtime daemon socket override.
+    #[arg(long)]
+    daemon_socket_path: Option<PathBuf>,
+
+    /// Runtime daemon data directory override.
+    #[arg(long)]
+    daemon_runtime_data_dir: Option<PathBuf>,
+
+    /// Whether API should auto-spawn `vz-runtimed` when daemon is unreachable.
+    #[arg(long)]
+    daemon_auto_spawn: Option<bool>,
 
     /// Poll interval for SSE/WebSocket event adapters in milliseconds.
     #[arg(long, default_value_t = 250)]
@@ -62,10 +78,23 @@ struct Cli {
 async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
+    let daemon_auto_spawn = parse_daemon_autostart(
+        std::env::var_os(DAEMON_AUTOSTART_ENV),
+        cli.daemon_auto_spawn,
+    )?;
+    let daemon_socket_path = cli
+        .daemon_socket_path
+        .or_else(|| parse_path_override(std::env::var_os(DAEMON_SOCKET_PATH_ENV)));
+    let daemon_runtime_data_dir = cli
+        .daemon_runtime_data_dir
+        .or_else(|| parse_path_override(std::env::var_os(DAEMON_RUNTIME_DATA_DIR_ENV)));
 
     let capabilities = parse_capabilities(&cli.capabilities, cli.stack_baseline)?;
     let config = ApiConfig {
         state_store_path: cli.state_store_path.clone(),
+        daemon_socket_path,
+        daemon_runtime_data_dir,
+        daemon_auto_spawn,
         capabilities,
         event_poll_interval: Duration::from_millis(cli.event_poll_ms.max(1)),
         default_event_page_size: cli.default_event_page_size,
@@ -130,6 +159,39 @@ fn parse_capabilities(values: &[String], stack_baseline: bool) -> Result<Runtime
     }
 
     Ok(capabilities)
+}
+
+fn parse_path_override(raw: Option<OsString>) -> Option<PathBuf> {
+    let value = raw?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(value))
+}
+
+fn parse_daemon_autostart(raw: Option<OsString>, cli_override: Option<bool>) -> Result<bool> {
+    if let Some(cli_override) = cli_override {
+        return Ok(cli_override);
+    }
+
+    let Some(raw) = raw else {
+        return Ok(true);
+    };
+
+    let value = raw.to_string_lossy().trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Ok(true);
+    }
+
+    match value.as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => bail!(
+            "unsupported `{}` value `{}`; expected one of: 1,true,yes,on,0,false,no,off",
+            DAEMON_AUTOSTART_ENV,
+            value
+        ),
+    }
 }
 
 async fn shutdown_signal() {
@@ -201,5 +263,36 @@ mod tests {
         assert!(capabilities.shared_vm);
         assert!(capabilities.stack_networking);
         assert!(capabilities.container_logs);
+    }
+
+    #[test]
+    fn parse_daemon_autostart_defaults_to_true() {
+        assert!(parse_daemon_autostart(None, None).expect("default parse"));
+    }
+
+    #[test]
+    fn parse_daemon_autostart_accepts_env_and_cli_override() {
+        assert!(!parse_daemon_autostart(Some(OsString::from("0")), None).expect("parse env 0"));
+        assert!(
+            parse_daemon_autostart(Some(OsString::from("0")), Some(true))
+                .expect("cli override should win")
+        );
+    }
+
+    #[test]
+    fn parse_daemon_autostart_rejects_invalid_values() {
+        let error = parse_daemon_autostart(Some(OsString::from("sometimes")), None)
+            .expect_err("invalid value should fail");
+        assert!(error.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn parse_path_override_ignores_empty_values() {
+        assert!(parse_path_override(None).is_none());
+        assert!(parse_path_override(Some(OsString::from(""))).is_none());
+        assert_eq!(
+            parse_path_override(Some(OsString::from("/tmp/runtimed.sock"))),
+            Some(PathBuf::from("/tmp/runtimed.sock"))
+        );
     }
 }
