@@ -6,7 +6,6 @@ use std::sync::OnceLock;
 
 use anyhow::{Context, bail};
 use clap::ValueEnum;
-use tracing::warn;
 use vz_runtimed_client::{DaemonClient, DaemonClientConfig};
 
 /// Environment variable used to select the CLI control-plane transport.
@@ -19,7 +18,6 @@ const DAEMON_AUTOSTART_ENV: &str = "VZ_RUNTIME_DAEMON_AUTOSTART";
 const API_BASE_URL_ENV: &str = "VZ_RUNTIME_API_BASE_URL";
 
 static CONTROL_PLANE_TRANSPORT_OVERRIDE: OnceLock<ControlPlaneTransport> = OnceLock::new();
-static API_HTTP_FALLBACK_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
 
 /// CLI control-plane transport for runtime mutations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -215,22 +213,15 @@ async fn connect_daemon_grpc_for_state_db(state_db: &Path) -> anyhow::Result<Dae
         })
 }
 
-async fn connect_api_http_for_state_db(state_db: &Path) -> anyhow::Result<DaemonClient> {
-    let _ = API_HTTP_FALLBACK_WARNING_EMITTED.get_or_init(|| {
-        warn!(
-            "control-plane transport `api-http` currently falls back to daemon-grpc for command execution; full HTTP control-plane routing is tracked in bead vz-pip6"
-        );
-    });
-    connect_daemon_grpc_for_state_db(state_db).await
-}
-
 /// Connect to the configured runtime control-plane transport.
 pub(crate) async fn connect_control_plane_for_state_db(
     state_db: &Path,
 ) -> anyhow::Result<DaemonClient> {
     match configured_control_plane_transport()? {
         ControlPlaneTransport::DaemonGrpc => connect_daemon_grpc_for_state_db(state_db).await,
-        ControlPlaneTransport::ApiHttp => connect_api_http_for_state_db(state_db).await,
+        ControlPlaneTransport::ApiHttp => bail!(
+            "api-http transport cannot use direct daemon gRPC connector; route through runtime API HTTP client helpers"
+        ),
     }
 }
 

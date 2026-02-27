@@ -64,9 +64,13 @@ check_no_match "StateStore::open\\(" \
   "crates/vz-api/src/lib.rs" \
   "crates/vz-api/src/daemon_bridge.rs"
 
-check_contains "ControlPlaneTransport::ApiHttp => connect_api_http_for_state_db" \
+check_no_match "connect_api_http_for_state_db|falls back to daemon-grpc" \
+  "api-http transport daemon fallback shim must not exist" \
+  "crates/vz-cli/src/commands/runtime_daemon.rs"
+
+check_contains "api-http transport cannot use direct daemon gRPC connector" \
   "crates/vz-cli/src/commands/runtime_daemon.rs" \
-  "api-http transport selector must route through dedicated api-http connector"
+  "api-http transport selector must fail closed for direct daemon connector use"
 
 check_contains "legacy local-runtime path removed in daemon-only mode" \
   "crates/vz-cli/src/commands/oci.rs" \
