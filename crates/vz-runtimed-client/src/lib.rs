@@ -1932,6 +1932,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_sandbox_stream_emits_progress_and_completion() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let daemon = start_daemon(runtimed_config(&tmp)).await;
+        let mut client = DaemonClient::connect_with_config(client_config(&tmp, false))
+            .await
+            .expect("client connect");
+
+        let mut stream = client
+            .create_sandbox_stream(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "stream-sandbox-client".to_string(),
+                cpus: 1,
+                memory_mb: 256,
+                labels: HashMap::new(),
+            })
+            .await
+            .expect("create sandbox stream");
+
+        let mut saw_progress = false;
+        let mut completion = None;
+        while let Some(event) = stream.message().await.expect("read create sandbox stream") {
+            match event.payload {
+                Some(runtime_v2::create_sandbox_event::Payload::Progress(progress)) => {
+                    saw_progress = true;
+                    assert!(!progress.phase.trim().is_empty());
+                }
+                Some(runtime_v2::create_sandbox_event::Payload::Completion(done)) => {
+                    completion = Some(done);
+                }
+                None => {}
+            }
+        }
+
+        assert!(saw_progress, "stream should emit at least one progress event");
+        let completion = completion.expect("stream should emit completion");
+        let response = completion
+            .response
+            .expect("completion should include sandbox response");
+        assert_eq!(
+            response
+                .sandbox
+                .expect("sandbox payload should exist")
+                .sandbox_id,
+            "stream-sandbox-client"
+        );
+        assert!(!completion.receipt_id.trim().is_empty());
+
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_with_metadata_preserves_receipt_header_from_stream_completion() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let daemon = start_daemon(runtimed_config(&tmp)).await;
+        let mut client = DaemonClient::connect_with_config(client_config(&tmp, false))
+            .await
+            .expect("client connect");
+
+        let response = client
+            .create_sandbox_with_metadata(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "sandbox-receipt-header".to_string(),
+                cpus: 1,
+                memory_mb: 256,
+                labels: HashMap::new(),
+            })
+            .await
+            .expect("create sandbox with metadata");
+
+        let receipt_id = response
+            .metadata()
+            .get("x-receipt-id")
+            .expect("receipt header should be present")
+            .to_str()
+            .expect("receipt header should be valid utf8");
+        assert!(receipt_id.starts_with("rcp-"));
+
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_stream_terminal_error_is_mapped_to_invalid_argument() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let daemon = start_daemon(runtimed_config(&tmp)).await;
+        let mut client = DaemonClient::connect_with_config(client_config(&tmp, false))
+            .await
+            .expect("client connect");
+
+        let mut stream = client
+            .create_sandbox_stream(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "sandbox-invalid-project-dir".to_string(),
+                cpus: 1,
+                memory_mb: 256,
+                labels: HashMap::from([(
+                    "project_dir".to_string(),
+                    "relative/not-absolute".to_string(),
+                )]),
+            })
+            .await
+            .expect("create sandbox stream should start");
+
+        let mut saw_progress = false;
+        let error = loop {
+            match stream.message().await {
+                Ok(Some(event)) => match event.payload {
+                    Some(runtime_v2::create_sandbox_event::Payload::Progress(_)) => {
+                        saw_progress = true;
+                    }
+                    Some(runtime_v2::create_sandbox_event::Payload::Completion(_)) => {
+                        panic!(
+                            "stream should not emit completion for invalid project_dir request"
+                        );
+                    }
+                    None => {}
+                },
+                Ok(None) => {
+                    panic!("stream ended without terminal validation error");
+                }
+                Err(error) => break error,
+            }
+        };
+        assert!(saw_progress, "stream should emit progress before terminal error");
+        assert_eq!(error.code(), Code::InvalidArgument);
+
+        let wrapped = client
+            .create_sandbox_with_metadata(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "sandbox-invalid-project-dir-2".to_string(),
+                cpus: 1,
+                memory_mb: 256,
+                labels: HashMap::from([(
+                    "project_dir".to_string(),
+                    "relative/not-absolute".to_string(),
+                )]),
+            })
+            .await
+            .expect_err("unary compatibility wrapper should map stream terminal error");
+        assert!(matches!(
+            wrapped,
+            DaemonClientError::Grpc(status) if status.code() == Code::InvalidArgument
+        ));
+
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
     async fn version_mismatch_returns_incompatible_version() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let daemon = start_daemon(runtimed_config(&tmp)).await;

@@ -619,6 +619,35 @@ async fn sandbox_create_returns_201() {
 }
 
 #[tokio::test]
+async fn sandbox_create_stream_terminal_validation_error_maps_to_http_bad_request() {
+    let (app, _dir) = test_router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sandboxes")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"stack_name":"sbx-invalid-project-dir","labels":{"project_dir":"relative/not-absolute"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["error"]["code"].as_str(), Some("invalid_request"));
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("project_dir")),
+        "error message should include project_dir validation details"
+    );
+}
+
+#[tokio::test]
 async fn sandbox_list_empty() {
     let (app, _dir) = test_router();
     let response = app
