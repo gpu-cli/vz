@@ -39,6 +39,67 @@ fn pty_handles() -> &'static StdMutex<HashMap<u64, PtyMasterHandle>> {
     PTY_HANDLES.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
+#[cfg(target_os = "linux")]
+fn devpts_is_mounted() -> bool {
+    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+        return false;
+    };
+    mounts.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let _source = fields.next();
+        let target = fields.next();
+        let fs_type = fields.next();
+        target == Some("/dev/pts") && fs_type == Some("devpts")
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_devpts_ready() -> Result<(), Status> {
+    use std::ffi::CString;
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+
+    std::fs::create_dir_all("/dev/pts")
+        .map_err(|error| Status::internal(format!("failed to create /dev/pts: {error}")))?;
+
+    if !devpts_is_mounted() {
+        let source = CString::new("devpts")
+            .map_err(|error| Status::internal(format!("invalid devpts source: {error}")))?;
+        let target = CString::new("/dev/pts")
+            .map_err(|error| Status::internal(format!("invalid devpts target: {error}")))?;
+        let fs_type = CString::new("devpts")
+            .map_err(|error| Status::internal(format!("invalid devpts fs type: {error}")))?;
+        let data = CString::new("ptmxmode=0666,mode=0620")
+            .map_err(|error| Status::internal(format!("invalid devpts mount options: {error}")))?;
+        let mount_result = unsafe {
+            libc::mount(
+                source.as_ptr(),
+                target.as_ptr(),
+                fs_type.as_ptr(),
+                0,
+                data.as_ptr().cast(),
+            )
+        };
+        if mount_result != 0 {
+            let mount_error = std::io::Error::last_os_error();
+            if mount_error.raw_os_error() != Some(libc::EBUSY) {
+                return Err(Status::internal(format!(
+                    "failed to mount devpts at /dev/pts: {mount_error}"
+                )));
+            }
+        }
+    }
+
+    let ptmx_path = Path::new("/dev/ptmx");
+    if !ptmx_path.exists() {
+        symlink("pts/ptmx", ptmx_path).map_err(|error| {
+            Status::internal(format!("failed to create /dev/ptmx symlink: {error}"))
+        })?;
+    }
+
+    Ok(())
+}
+
 // ── Shared state passed to all service impls ────────────────────────
 
 /// Shared state accessible by all gRPC service implementations.
@@ -356,6 +417,9 @@ impl AgentServiceImpl {
         } else {
             req.term_cols
         };
+
+        #[cfg(target_os = "linux")]
+        ensure_devpts_ready()?;
 
         let pty_system = native_pty_system();
         let pair = pty_system

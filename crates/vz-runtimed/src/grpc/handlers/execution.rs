@@ -104,6 +104,58 @@ fn runtime_operation_status(
     ))
 }
 
+const EXEC_CONTROL_STARTUP_RETRY_MAX_ATTEMPTS: usize = 240;
+const EXEC_CONTROL_STARTUP_RETRY_DELAY_MS: u64 = 25;
+
+fn is_retryable_exec_control_error(
+    error: &vz_runtime_contract::RuntimeError,
+    execution_id: &str,
+) -> bool {
+    matches!(
+        error,
+        vz_runtime_contract::RuntimeError::ContainerNotFound { id } if id == execution_id
+    )
+}
+
+async fn run_exec_control_with_startup_retry<F, Fut>(
+    execution_id: &str,
+    operation: &str,
+    should_continue_retry: impl Fn() -> bool,
+    mut operation_fn: F,
+) -> Result<(), vz_runtime_contract::RuntimeError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), vz_runtime_contract::RuntimeError>>,
+{
+    let mut retry_count = 0usize;
+    loop {
+        match operation_fn().await {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if retry_count < EXEC_CONTROL_STARTUP_RETRY_MAX_ATTEMPTS
+                    && is_retryable_exec_control_error(&error, execution_id) =>
+            {
+                if !should_continue_retry() {
+                    return Err(error);
+                }
+                retry_count += 1;
+                warn!(
+                    execution_id = %execution_id,
+                    operation = %operation,
+                    retry_count,
+                    max_retries = EXEC_CONTROL_STARTUP_RETRY_MAX_ATTEMPTS,
+                    "execution control operation hit startup race; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    EXEC_CONTROL_STARTUP_RETRY_DELAY_MS,
+                ))
+                .await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn execution_transition_stack_error(message: impl Into<String>) -> StackError {
     StackError::Machine {
         code: MachineErrorCode::StateConflict,
@@ -938,11 +990,27 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
             )));
         }
 
-        self.daemon
-            .manager()
-            .write_exec_stdin(&execution_id, &request.data)
-            .await
-            .map_err(|error| runtime_operation_status(error, "write_exec_stdin", &request_id))?;
+        let manager = self.daemon.manager();
+        let daemon = self.daemon.clone();
+        let data = request.data.clone();
+        run_exec_control_with_startup_retry(
+            &execution_id,
+            "write_exec_stdin",
+            || match daemon.execution_sessions().contains(&execution_id) {
+                Ok(active) => active,
+                Err(error) => {
+                    warn!(
+                        execution_id = %execution_id,
+                        error = %error,
+                        "failed to inspect execution session registry during stdin retry"
+                    );
+                    false
+                }
+            },
+            || manager.write_exec_stdin(&execution_id, &data),
+        )
+        .await
+        .map_err(|error| runtime_operation_status(error, "write_exec_stdin", &request_id))?;
 
         let now = current_unix_secs();
         let receipt_id = generate_receipt_id();
@@ -1069,11 +1137,26 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
             ))
         })?;
 
-        self.daemon
-            .manager()
-            .resize_exec_pty(&execution_id, cols, rows)
-            .await
-            .map_err(|error| runtime_operation_status(error, "resize_exec_pty", &request_id))?;
+        let manager = self.daemon.manager();
+        let daemon = self.daemon.clone();
+        run_exec_control_with_startup_retry(
+            &execution_id,
+            "resize_exec_pty",
+            || match daemon.execution_sessions().contains(&execution_id) {
+                Ok(active) => active,
+                Err(error) => {
+                    warn!(
+                        execution_id = %execution_id,
+                        error = %error,
+                        "failed to inspect execution session registry during resize retry"
+                    );
+                    false
+                }
+            },
+            || manager.resize_exec_pty(&execution_id, cols, rows),
+        )
+        .await
+        .map_err(|error| runtime_operation_status(error, "resize_exec_pty", &request_id))?;
 
         let now = current_unix_secs();
         let receipt_id = generate_receipt_id();
@@ -1186,11 +1269,26 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
             )));
         }
 
-        self.daemon
-            .manager()
-            .signal_exec(&execution_id, &signal)
-            .await
-            .map_err(|error| runtime_operation_status(error, "signal_exec", &request_id))?;
+        let manager = self.daemon.manager();
+        let daemon = self.daemon.clone();
+        run_exec_control_with_startup_retry(
+            &execution_id,
+            "signal_exec",
+            || match daemon.execution_sessions().contains(&execution_id) {
+                Ok(active) => active,
+                Err(error) => {
+                    warn!(
+                        execution_id = %execution_id,
+                        error = %error,
+                        "failed to inspect execution session registry during signal retry"
+                    );
+                    false
+                }
+            },
+            || manager.signal_exec(&execution_id, &signal),
+        )
+        .await
+        .map_err(|error| runtime_operation_status(error, "signal_exec", &request_id))?;
 
         let now = current_unix_secs();
         let receipt_id = generate_receipt_id();
@@ -1227,5 +1325,98 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
             response.metadata_mut().insert("x-receipt-id", value);
         }
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn exec_control_startup_retry_retries_container_not_found_for_execution_id() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_operation = Arc::clone(&attempts);
+        let result = run_exec_control_with_startup_retry(
+            "exec-race",
+            "write_exec_stdin",
+            || true,
+            move || {
+                let attempts_for_operation = Arc::clone(&attempts_for_operation);
+                async move {
+                    let attempt = attempts_for_operation.fetch_add(1, Ordering::Relaxed);
+                    if attempt < 2 {
+                        Err(vz_runtime_contract::RuntimeError::ContainerNotFound {
+                            id: "exec-race".to_string(),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn exec_control_startup_retry_does_not_retry_non_retryable_error() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_operation = Arc::clone(&attempts);
+        let result = run_exec_control_with_startup_retry(
+            "exec-race",
+            "write_exec_stdin",
+            || true,
+            move || {
+                let attempts_for_operation = Arc::clone(&attempts_for_operation);
+                async move {
+                    attempts_for_operation.fetch_add(1, Ordering::Relaxed);
+                    Err(vz_runtime_contract::RuntimeError::UnsupportedOperation {
+                        operation: "write_exec_stdin".to_string(),
+                        reason: "not interactive".to_string(),
+                    })
+                }
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(vz_runtime_contract::RuntimeError::UnsupportedOperation { .. })
+        ));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn exec_control_startup_retry_stops_when_session_is_no_longer_active() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_operation = Arc::clone(&attempts);
+        let session_checks = Arc::new(AtomicUsize::new(0));
+        let session_checks_for_retry = Arc::clone(&session_checks);
+        let result = run_exec_control_with_startup_retry(
+            "exec-race",
+            "write_exec_stdin",
+            move || session_checks_for_retry.fetch_add(1, Ordering::Relaxed) == 0,
+            move || {
+                let attempts_for_operation = Arc::clone(&attempts_for_operation);
+                async move {
+                    attempts_for_operation.fetch_add(1, Ordering::Relaxed);
+                    Err(vz_runtime_contract::RuntimeError::ContainerNotFound {
+                        id: "exec-race".to_string(),
+                    })
+                }
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(vz_runtime_contract::RuntimeError::ContainerNotFound { .. })
+        ));
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(session_checks.load(Ordering::Relaxed), 2);
     }
 }
