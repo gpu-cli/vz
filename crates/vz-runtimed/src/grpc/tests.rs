@@ -266,6 +266,41 @@ async fn connect_file_client(
     runtime_v2::file_service_client::FileServiceClient::new(channel)
 }
 
+async fn read_open_sandbox_shell_completion(
+    stream: &mut tonic::Streaming<runtime_v2::OpenSandboxShellEvent>,
+) -> runtime_v2::OpenSandboxShellResponse {
+    let mut completion = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .expect("read open sandbox shell stream event")
+    {
+        if let Some(runtime_v2::open_sandbox_shell_event::Payload::Completion(done)) = event.payload
+        {
+            completion = Some(done);
+        }
+    }
+    completion.expect("expected terminal open sandbox shell completion event")
+}
+
+async fn read_close_sandbox_shell_completion(
+    stream: &mut tonic::Streaming<runtime_v2::CloseSandboxShellEvent>,
+) -> runtime_v2::CloseSandboxShellResponse {
+    let mut completion = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .expect("read close sandbox shell stream event")
+    {
+        if let Some(runtime_v2::close_sandbox_shell_event::Payload::Completion(done)) =
+            event.payload
+        {
+            completion = Some(done);
+        }
+    }
+    completion.expect("expected terminal close sandbox shell completion event")
+}
+
 struct DenyCreateSandboxPolicyHook;
 
 impl RuntimePolicyHook for DenyCreateSandboxPolicyHook {
@@ -785,7 +820,7 @@ async fn open_sandbox_shell_creates_container_and_resolves_default_shell() {
         .sandbox
         .expect("sandbox payload");
 
-    let opened = sandbox_client
+    let mut opened_stream = sandbox_client
         .open_sandbox_shell(Request::new(runtime_v2::OpenSandboxShellRequest {
             sandbox_id: sandbox.sandbox_id.clone(),
             metadata: None,
@@ -793,6 +828,7 @@ async fn open_sandbox_shell_creates_container_and_resolves_default_shell() {
         .await
         .expect("open sandbox shell")
         .into_inner();
+    let opened = read_open_sandbox_shell_completion(&mut opened_stream).await;
 
     assert_eq!(opened.sandbox_id, sandbox.sandbox_id);
     assert!(!opened.container_id.is_empty());
@@ -868,7 +904,7 @@ async fn open_sandbox_shell_prefers_main_container_command_override() {
         .sandbox
         .expect("sandbox payload");
 
-    let opened = sandbox_client
+    let mut opened_stream = sandbox_client
         .open_sandbox_shell(Request::new(runtime_v2::OpenSandboxShellRequest {
             sandbox_id: sandbox.sandbox_id,
             metadata: None,
@@ -876,6 +912,7 @@ async fn open_sandbox_shell_prefers_main_container_command_override() {
         .await
         .expect("open sandbox shell")
         .into_inner();
+    let opened = read_open_sandbox_shell_completion(&mut opened_stream).await;
 
     assert!(!opened.execution_id.is_empty());
     assert_eq!(opened.cmd, vec!["bash".to_string()]);
@@ -984,7 +1021,7 @@ async fn open_sandbox_shell_reuses_existing_active_execution_session() {
         .register(&existing_execution.execution_id)
         .expect("register existing execution session");
 
-    let opened = sandbox_client
+    let mut opened_stream = sandbox_client
         .open_sandbox_shell(Request::new(runtime_v2::OpenSandboxShellRequest {
             sandbox_id: sandbox.sandbox_id,
             metadata: None,
@@ -992,6 +1029,7 @@ async fn open_sandbox_shell_reuses_existing_active_execution_session() {
         .await
         .expect("open sandbox shell")
         .into_inner();
+    let opened = read_open_sandbox_shell_completion(&mut opened_stream).await;
 
     assert_eq!(opened.execution_id, existing_execution.execution_id);
     let executions = daemon
@@ -1052,7 +1090,7 @@ async fn close_sandbox_shell_closes_active_execution_and_clears_session() {
         .sandbox
         .expect("sandbox payload");
 
-    let opened = sandbox_client
+    let mut opened_stream = sandbox_client
         .open_sandbox_shell(Request::new(runtime_v2::OpenSandboxShellRequest {
             sandbox_id: sandbox.sandbox_id.clone(),
             metadata: None,
@@ -1060,9 +1098,10 @@ async fn close_sandbox_shell_closes_active_execution_and_clears_session() {
         .await
         .expect("open sandbox shell")
         .into_inner();
+    let opened = read_open_sandbox_shell_completion(&mut opened_stream).await;
     assert!(!opened.execution_id.is_empty());
 
-    let closed = sandbox_client
+    let mut close_stream = sandbox_client
         .close_sandbox_shell(Request::new(runtime_v2::CloseSandboxShellRequest {
             sandbox_id: sandbox.sandbox_id.clone(),
             execution_id: opened.execution_id.clone(),
@@ -1071,6 +1110,7 @@ async fn close_sandbox_shell_closes_active_execution_and_clears_session() {
         .await
         .expect("close sandbox shell")
         .into_inner();
+    let closed = read_close_sandbox_shell_completion(&mut close_stream).await;
     assert_eq!(closed.sandbox_id, sandbox.sandbox_id);
     assert_eq!(closed.execution_id, opened.execution_id);
 

@@ -302,45 +302,29 @@ impl DaemonClient {
             .map_err(|status| status_to_client_error(&self.config.socket_path, status))
     }
 
-    /// Call Runtime V2 `OpenSandboxShell`.
+    /// Call Runtime V2 `OpenSandboxShell` as a server stream.
     pub async fn open_sandbox_shell(
         &mut self,
-        request: runtime_v2::OpenSandboxShellRequest,
-    ) -> Result<runtime_v2::OpenSandboxShellResponse> {
-        let response = self.open_sandbox_shell_with_metadata(request).await?;
-        Ok(response.into_inner())
-    }
-
-    /// Call Runtime V2 `OpenSandboxShell` and preserve gRPC response metadata.
-    pub async fn open_sandbox_shell_with_metadata(
-        &mut self,
         mut request: runtime_v2::OpenSandboxShellRequest,
-    ) -> Result<tonic::Response<runtime_v2::OpenSandboxShellResponse>> {
+    ) -> Result<tonic::Streaming<runtime_v2::OpenSandboxShellEvent>> {
         Self::ensure_metadata(&mut request.metadata);
         self.sandbox_client
             .open_sandbox_shell(Request::new(request))
             .await
+            .map(|response| response.into_inner())
             .map_err(|status| status_to_client_error(&self.config.socket_path, status))
     }
 
-    /// Call Runtime V2 `CloseSandboxShell`.
+    /// Call Runtime V2 `CloseSandboxShell` as a server stream.
     pub async fn close_sandbox_shell(
         &mut self,
-        request: runtime_v2::CloseSandboxShellRequest,
-    ) -> Result<runtime_v2::CloseSandboxShellResponse> {
-        let response = self.close_sandbox_shell_with_metadata(request).await?;
-        Ok(response.into_inner())
-    }
-
-    /// Call Runtime V2 `CloseSandboxShell` and preserve gRPC response metadata.
-    pub async fn close_sandbox_shell_with_metadata(
-        &mut self,
         mut request: runtime_v2::CloseSandboxShellRequest,
-    ) -> Result<tonic::Response<runtime_v2::CloseSandboxShellResponse>> {
+    ) -> Result<tonic::Streaming<runtime_v2::CloseSandboxShellEvent>> {
         Self::ensure_metadata(&mut request.metadata);
         self.sandbox_client
             .close_sandbox_shell(Request::new(request))
             .await
+            .map(|response| response.into_inner())
             .map_err(|status| status_to_client_error(&self.config.socket_path, status))
     }
 

@@ -132,6 +132,51 @@ pub struct CloseSandboxShellResponse {
     pub execution_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SandboxShellProgress {
+    #[prost(string, tag = "1")]
+    pub phase: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenSandboxShellEvent {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(oneof = "open_sandbox_shell_event::Payload", tags = "3, 4")]
+    pub payload: ::core::option::Option<open_sandbox_shell_event::Payload>,
+}
+/// Nested message and enum types in `OpenSandboxShellEvent`.
+pub mod open_sandbox_shell_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "3")]
+        Progress(super::SandboxShellProgress),
+        #[prost(message, tag = "4")]
+        Completion(super::OpenSandboxShellResponse),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CloseSandboxShellEvent {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(oneof = "close_sandbox_shell_event::Payload", tags = "3, 4")]
+    pub payload: ::core::option::Option<close_sandbox_shell_event::Payload>,
+}
+/// Nested message and enum types in `CloseSandboxShellEvent`.
+pub mod close_sandbox_shell_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "3")]
+        Progress(super::SandboxShellProgress),
+        #[prost(message, tag = "4")]
+        Completion(super::CloseSandboxShellResponse),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OpenLeaseRequest {
     #[prost(message, optional, tag = "1")]
     pub metadata: ::core::option::Option<RequestMetadata>,
@@ -1329,7 +1374,7 @@ pub mod sandbox_service_client {
             &mut self,
             request: impl tonic::IntoRequest<super::OpenSandboxShellRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::OpenSandboxShellResponse>,
+            tonic::Response<tonic::codec::Streaming<super::OpenSandboxShellEvent>>,
             tonic::Status,
         > {
             self.inner
@@ -1349,13 +1394,13 @@ pub mod sandbox_service_client {
                 .insert(
                     GrpcMethod::new("vz.runtime.v2.SandboxService", "OpenSandboxShell"),
                 );
-            self.inner.unary(req, path, codec).await
+            self.inner.server_streaming(req, path, codec).await
         }
         pub async fn close_sandbox_shell(
             &mut self,
             request: impl tonic::IntoRequest<super::CloseSandboxShellRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::CloseSandboxShellResponse>,
+            tonic::Response<tonic::codec::Streaming<super::CloseSandboxShellEvent>>,
             tonic::Status,
         > {
             self.inner
@@ -1375,7 +1420,7 @@ pub mod sandbox_service_client {
                 .insert(
                     GrpcMethod::new("vz.runtime.v2.SandboxService", "CloseSandboxShell"),
                 );
-            self.inner.unary(req, path, codec).await
+            self.inner.server_streaming(req, path, codec).await
         }
     }
 }
@@ -3766,18 +3811,30 @@ pub mod sandbox_service_server {
             &self,
             request: tonic::Request<super::TerminateSandboxRequest>,
         ) -> std::result::Result<tonic::Response<super::SandboxResponse>, tonic::Status>;
+        /// Server streaming response type for the OpenSandboxShell method.
+        type OpenSandboxShellStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::OpenSandboxShellEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
         async fn open_sandbox_shell(
             &self,
             request: tonic::Request<super::OpenSandboxShellRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::OpenSandboxShellResponse>,
+            tonic::Response<Self::OpenSandboxShellStream>,
             tonic::Status,
         >;
+        /// Server streaming response type for the CloseSandboxShell method.
+        type CloseSandboxShellStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::CloseSandboxShellEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
         async fn close_sandbox_shell(
             &self,
             request: tonic::Request<super::CloseSandboxShellRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::CloseSandboxShellResponse>,
+            tonic::Response<Self::CloseSandboxShellStream>,
             tonic::Status,
         >;
     }
@@ -4043,11 +4100,13 @@ pub mod sandbox_service_server {
                     struct OpenSandboxShellSvc<T: SandboxService>(pub Arc<T>);
                     impl<
                         T: SandboxService,
-                    > tonic::server::UnaryService<super::OpenSandboxShellRequest>
-                    for OpenSandboxShellSvc<T> {
-                        type Response = super::OpenSandboxShellResponse;
+                    > tonic::server::ServerStreamingService<
+                        super::OpenSandboxShellRequest,
+                    > for OpenSandboxShellSvc<T> {
+                        type Response = super::OpenSandboxShellEvent;
+                        type ResponseStream = T::OpenSandboxShellStream;
                         type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
+                            tonic::Response<Self::ResponseStream>,
                             tonic::Status,
                         >;
                         fn call(
@@ -4079,7 +4138,7 @@ pub mod sandbox_service_server {
                                 max_decoding_message_size,
                                 max_encoding_message_size,
                             );
-                        let res = grpc.unary(method, req).await;
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
@@ -4089,11 +4148,13 @@ pub mod sandbox_service_server {
                     struct CloseSandboxShellSvc<T: SandboxService>(pub Arc<T>);
                     impl<
                         T: SandboxService,
-                    > tonic::server::UnaryService<super::CloseSandboxShellRequest>
-                    for CloseSandboxShellSvc<T> {
-                        type Response = super::CloseSandboxShellResponse;
+                    > tonic::server::ServerStreamingService<
+                        super::CloseSandboxShellRequest,
+                    > for CloseSandboxShellSvc<T> {
+                        type Response = super::CloseSandboxShellEvent;
+                        type ResponseStream = T::CloseSandboxShellStream;
                         type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
+                            tonic::Response<Self::ResponseStream>,
                             tonic::Status,
                         >;
                         fn call(
@@ -4125,7 +4186,7 @@ pub mod sandbox_service_server {
                                 max_decoding_message_size,
                                 max_encoding_message_size,
                             );
-                        let res = grpc.unary(method, req).await;
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

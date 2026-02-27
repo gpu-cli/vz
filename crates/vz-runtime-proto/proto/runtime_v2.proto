@@ -43,8 +43,8 @@ service SandboxService {
   rpc GetSandbox(GetSandboxRequest) returns (SandboxResponse);
   rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
   rpc TerminateSandbox(TerminateSandboxRequest) returns (SandboxResponse);
-  rpc OpenSandboxShell(OpenSandboxShellRequest) returns (OpenSandboxShellResponse);
-  rpc CloseSandboxShell(CloseSandboxShellRequest) returns (CloseSandboxShellResponse);
+  rpc OpenSandboxShell(OpenSandboxShellRequest) returns (stream OpenSandboxShellEvent);
+  rpc CloseSandboxShell(CloseSandboxShellRequest) returns (stream CloseSandboxShellEvent);
 }
 
 message CreateSandboxRequest {
@@ -114,6 +114,29 @@ message CloseSandboxShellResponse {
   string request_id = 1;
   string sandbox_id = 2;
   string execution_id = 3;
+}
+
+message SandboxShellProgress {
+  string phase = 1;
+  string detail = 2;
+}
+
+message OpenSandboxShellEvent {
+  string request_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    SandboxShellProgress progress = 3;
+    OpenSandboxShellResponse completion = 4;
+  }
+}
+
+message CloseSandboxShellEvent {
+  string request_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    SandboxShellProgress progress = 3;
+    CloseSandboxShellResponse completion = 4;
+  }
 }
 
 // ── 2. LeaseService ────────────────────────────────────────────────
