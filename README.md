@@ -215,6 +215,10 @@ Runtime-mutating CLI surfaces (`sandbox`, `stack`, `image`, `file`, `lease`, `ex
 - Transport selector:
   - `VZ_CONTROL_PLANE_TRANSPORT=daemon-grpc` (default)
   - `api-http` is reserved and currently fail-closed
+- Sandbox startup defaults (daemon policy):
+  - `VZ_SANDBOX_DEFAULT_BASE_IMAGE=<image-ref>`
+  - `VZ_SANDBOX_DEFAULT_MAIN_CONTAINER=<command-or-container-hint>`
+  - `VZ_SANDBOX_DISABLE_LEGACY_DEFAULT_BASE_IMAGE=1` disables compatibility fallback (`debian:bookworm`)
 
 ## Architecture
 

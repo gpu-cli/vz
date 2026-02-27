@@ -807,6 +807,11 @@ pub enum SandboxBackend {
 pub const SANDBOX_LABEL_BASE_IMAGE_REF: &str = "vz.sandbox.base_image_ref";
 /// Canonical sandbox label key for main container selection.
 pub const SANDBOX_LABEL_MAIN_CONTAINER: &str = "vz.sandbox.main_container";
+/// Canonical sandbox label key describing how base image defaulting was applied.
+pub const SANDBOX_LABEL_BASE_IMAGE_DEFAULT_SOURCE: &str = "vz.sandbox.base_image_default_source";
+/// Canonical sandbox label key describing how main container defaulting was applied.
+pub const SANDBOX_LABEL_MAIN_CONTAINER_DEFAULT_SOURCE: &str =
+    "vz.sandbox.main_container_default_source";
 
 /// Sandbox resource/network specification.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

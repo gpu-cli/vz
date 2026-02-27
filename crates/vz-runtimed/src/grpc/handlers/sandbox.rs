@@ -827,13 +827,45 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
         };
         let request_hash = create_sandbox_request_hash(&request, cpus);
         let normalized_idempotency_key = normalize_idempotency_key(idempotency_key.as_deref());
-        let labels: BTreeMap<String, String> = request.labels.into_iter().collect();
-        let base_image_ref = labels
+        let mut labels: BTreeMap<String, String> = request.labels.into_iter().collect();
+        // Requesters cannot predeclare default-source audit labels.
+        labels.remove(SANDBOX_LABEL_BASE_IMAGE_DEFAULT_SOURCE);
+        labels.remove(SANDBOX_LABEL_MAIN_CONTAINER_DEFAULT_SOURCE);
+
+        let requested_base_image_ref = labels
             .get(SANDBOX_LABEL_BASE_IMAGE_REF)
             .and_then(|value| normalize_optional_wire_field(value));
-        let main_container = labels
+        let requested_main_container = labels
             .get(SANDBOX_LABEL_MAIN_CONTAINER)
             .and_then(|value| normalize_optional_wire_field(value));
+        let startup_defaults = self
+            .daemon
+            .resolve_sandbox_startup_defaults(requested_base_image_ref, requested_main_container);
+
+        if let Some(base_image_ref) = startup_defaults.base_image_ref.as_deref() {
+            labels.insert(
+                SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
+                base_image_ref.to_string(),
+            );
+        }
+        if let Some(main_container) = startup_defaults.main_container.as_deref() {
+            labels.insert(
+                SANDBOX_LABEL_MAIN_CONTAINER.to_string(),
+                main_container.to_string(),
+            );
+        }
+        if let Some(default_source) = startup_defaults.base_image_default_source {
+            labels.insert(
+                SANDBOX_LABEL_BASE_IMAGE_DEFAULT_SOURCE.to_string(),
+                default_source.as_label_value().to_string(),
+            );
+        }
+        if let Some(default_source) = startup_defaults.main_container_default_source {
+            labels.insert(
+                SANDBOX_LABEL_MAIN_CONTAINER_DEFAULT_SOURCE.to_string(),
+                default_source.as_label_value().to_string(),
+            );
+        }
 
         if let Some(key) = normalized_idempotency_key {
             if let Some(cached_sandbox) = load_idempotent_sandbox_replay(
@@ -886,6 +918,17 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
         } else {
             Some(request.memory_mb)
         };
+        if startup_defaults.base_image_default_source.is_some()
+            || startup_defaults.main_container_default_source.is_some()
+        {
+            sequence += 1;
+            events.push(Ok(create_sandbox_progress_event(
+                &request_id,
+                sequence,
+                "applying_defaults",
+                "applying daemon sandbox startup policy defaults",
+            )));
+        }
         sequence += 1;
         events.push(Ok(create_sandbox_progress_event(
             &request_id,
@@ -910,8 +953,8 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
         let spec = SandboxSpec {
             cpus,
             memory_mb,
-            base_image_ref,
-            main_container,
+            base_image_ref: startup_defaults.base_image_ref,
+            main_container: startup_defaults.main_container,
             network_profile: None,
             volume_mounts: Vec::new(),
         };

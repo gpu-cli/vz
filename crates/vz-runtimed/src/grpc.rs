@@ -17,8 +17,9 @@ use tracing::{debug, warn};
 use vz_runtime_contract::{
     Build, BuildSpec, BuildState, Checkpoint, CheckpointClass, CheckpointState, Container,
     ContainerSpec, ContainerState, Execution, ExecutionSpec, ExecutionState, Lease, LeaseState,
-    MachineError, MachineErrorCode, RuntimeOperation, SANDBOX_LABEL_BASE_IMAGE_REF,
-    SANDBOX_LABEL_MAIN_CONTAINER, Sandbox, SandboxSpec, SandboxState,
+    MachineError, MachineErrorCode, RuntimeOperation, SANDBOX_LABEL_BASE_IMAGE_DEFAULT_SOURCE,
+    SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER,
+    SANDBOX_LABEL_MAIN_CONTAINER_DEFAULT_SOURCE, Sandbox, SandboxSpec, SandboxState,
 };
 use vz_runtime_proto::runtime_v2;
 use vz_runtime_translate::{

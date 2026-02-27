@@ -26,6 +26,40 @@ pub use grpc::{RuntimedServerError, serve_runtime_uds_with_shutdown};
 use placement_scheduler::{PlacementScheduler, PlacementSnapshot};
 
 const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 1;
+const LEGACY_SANDBOX_BASE_IMAGE_REF: &str = "debian:bookworm";
+const SANDBOX_DEFAULT_BASE_IMAGE_ENV: &str = "VZ_SANDBOX_DEFAULT_BASE_IMAGE";
+const SANDBOX_DEFAULT_MAIN_CONTAINER_ENV: &str = "VZ_SANDBOX_DEFAULT_MAIN_CONTAINER";
+const SANDBOX_DISABLE_LEGACY_DEFAULT_ENV: &str = "VZ_SANDBOX_DISABLE_LEGACY_DEFAULT_BASE_IMAGE";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SandboxDefaultSource {
+    PolicyConfig,
+    CompatLegacy,
+}
+
+impl SandboxDefaultSource {
+    pub(crate) const fn as_label_value(self) -> &'static str {
+        match self {
+            Self::PolicyConfig => "policy_config",
+            Self::CompatLegacy => "compat_legacy",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SandboxStartupPolicy {
+    default_base_image_ref: Option<String>,
+    default_main_container: Option<String>,
+    legacy_default_base_image_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SandboxStartupResolution {
+    pub(crate) base_image_ref: Option<String>,
+    pub(crate) base_image_default_source: Option<SandboxDefaultSource>,
+    pub(crate) main_container: Option<String>,
+    pub(crate) main_container_default_source: Option<SandboxDefaultSource>,
+}
 
 #[derive(Default)]
 struct AllowAllPolicyHook;
@@ -93,6 +127,7 @@ pub struct RuntimeDaemon {
     state_store: Mutex<StateStore>,
     execution_sessions: ExecutionSessionRegistry,
     placement_scheduler: PlacementScheduler,
+    sandbox_startup_policy: SandboxStartupPolicy,
     policy_hook: Arc<dyn RuntimePolicyHook>,
     policy_hash: Option<String>,
     daemon_id: String,
@@ -164,6 +199,7 @@ impl RuntimeDaemon {
 
         let manager = build_runtime_manager(&config.runtime_data_dir);
         let placement_scheduler = PlacementScheduler::default();
+        let sandbox_startup_policy = load_sandbox_startup_policy()?;
         placement_scheduler
             .refresh(&state_store, current_unix_secs())
             .map_err(|source| RuntimedError::RefreshPlacementSnapshot {
@@ -189,6 +225,9 @@ impl RuntimeDaemon {
             sqlite_foreign_keys = foreign_keys_enabled,
             sqlite_schema_version = schema_version,
             reconciled_executions = reconciled_execution_count,
+            sandbox_default_base_image_ref = sandbox_startup_policy.default_base_image_ref.as_deref().unwrap_or(""),
+            sandbox_default_main_container = sandbox_startup_policy.default_main_container.as_deref().unwrap_or(""),
+            sandbox_legacy_base_default_enabled = sandbox_startup_policy.legacy_default_base_image_enabled,
             runtime_data_dir = %config.runtime_data_dir.display(),
             socket_path = %config.socket_path.display(),
             "vz-runtimed started"
@@ -200,6 +239,7 @@ impl RuntimeDaemon {
             state_store: Mutex::new(state_store),
             execution_sessions: ExecutionSessionRegistry::default(),
             placement_scheduler,
+            sandbox_startup_policy,
             policy_hook,
             policy_hash,
             daemon_id,
@@ -278,6 +318,18 @@ impl RuntimeDaemon {
 
     pub(crate) fn policy_hash(&self) -> Option<&str> {
         self.policy_hash.as_deref()
+    }
+
+    pub(crate) fn resolve_sandbox_startup_defaults(
+        &self,
+        base_image_ref: Option<String>,
+        main_container: Option<String>,
+    ) -> SandboxStartupResolution {
+        resolve_sandbox_startup_defaults_with_policy(
+            &self.sandbox_startup_policy,
+            base_image_ref,
+            main_container,
+        )
     }
 
     pub(crate) fn execution_sessions(&self) -> &ExecutionSessionRegistry {
@@ -360,6 +412,95 @@ fn build_runtime_manager(data_dir: &Path) -> WorkspaceRuntimeManager<PlatformBac
         ..Default::default()
     });
     WorkspaceRuntimeManager::new(backend)
+}
+
+fn normalize_optional_startup_value(value: Option<&str>) -> Option<String> {
+    let raw = value?.trim();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
+    }
+}
+
+fn resolve_sandbox_startup_defaults_with_policy(
+    policy: &SandboxStartupPolicy,
+    base_image_ref: Option<String>,
+    main_container: Option<String>,
+) -> SandboxStartupResolution {
+    let requested_base_image = normalize_optional_startup_value(base_image_ref.as_deref());
+    let mut base_image_default_source = None;
+    let resolved_base_image = match requested_base_image {
+        Some(value) => Some(value),
+        None => {
+            if let Some(configured_default) = policy.default_base_image_ref.as_deref() {
+                base_image_default_source = Some(SandboxDefaultSource::PolicyConfig);
+                Some(configured_default.to_string())
+            } else if policy.legacy_default_base_image_enabled {
+                base_image_default_source = Some(SandboxDefaultSource::CompatLegacy);
+                Some(LEGACY_SANDBOX_BASE_IMAGE_REF.to_string())
+            } else {
+                None
+            }
+        }
+    };
+
+    let requested_main_container = normalize_optional_startup_value(main_container.as_deref());
+    let mut main_container_default_source = None;
+    let resolved_main_container = match requested_main_container {
+        Some(value) => Some(value),
+        None => policy
+            .default_main_container
+            .as_deref()
+            .map(|configured_default| {
+                main_container_default_source = Some(SandboxDefaultSource::PolicyConfig);
+                configured_default.to_string()
+            }),
+    };
+
+    SandboxStartupResolution {
+        base_image_ref: resolved_base_image,
+        base_image_default_source,
+        main_container: resolved_main_container,
+        main_container_default_source,
+    }
+}
+
+fn parse_env_bool(raw: &str, env_name: &'static str) -> Result<bool, RuntimedError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(RuntimedError::InvalidPolicyEnvValue {
+            env_name,
+            value: raw.to_string(),
+        }),
+    }
+}
+
+fn load_sandbox_startup_policy() -> Result<SandboxStartupPolicy, RuntimedError> {
+    let default_base_image_ref = std::env::var(SANDBOX_DEFAULT_BASE_IMAGE_ENV)
+        .ok()
+        .and_then(|value| normalize_optional_startup_value(Some(value.as_str())));
+    let default_main_container = std::env::var(SANDBOX_DEFAULT_MAIN_CONTAINER_ENV)
+        .ok()
+        .and_then(|value| normalize_optional_startup_value(Some(value.as_str())));
+
+    let disable_legacy_default = match std::env::var(SANDBOX_DISABLE_LEGACY_DEFAULT_ENV) {
+        Ok(value) => parse_env_bool(&value, SANDBOX_DISABLE_LEGACY_DEFAULT_ENV)?,
+        Err(std::env::VarError::NotPresent) => false,
+        Err(std::env::VarError::NotUnicode(value)) => {
+            return Err(RuntimedError::InvalidPolicyEnvValue {
+                env_name: SANDBOX_DISABLE_LEGACY_DEFAULT_ENV,
+                value: value.to_string_lossy().to_string(),
+            });
+        }
+    };
+
+    Ok(SandboxStartupPolicy {
+        default_base_image_ref,
+        default_main_container,
+        legacy_default_base_image_enabled: !disable_legacy_default,
+    })
 }
 
 fn reconcile_orphaned_executions(state_store: &StateStore) -> Result<u64, StackError> {
@@ -542,6 +683,11 @@ pub enum RuntimedError {
         #[source]
         source: StackError,
     },
+    #[error("invalid sandbox startup policy env {env_name}={value}")]
+    InvalidPolicyEnvValue {
+        env_name: &'static str,
+        value: String,
+    },
     #[error("unsupported schema version for {path}: found={found}, max_supported={max_supported}")]
     UnsupportedSchemaVersion {
         path: PathBuf,
@@ -586,6 +732,93 @@ mod tests {
             daemon.startup_lock_path(),
             startup_lock_path(&cfg.state_store_path).as_path()
         );
+    }
+
+    #[test]
+    fn normalize_optional_startup_value_trims_and_drops_empty() {
+        assert_eq!(
+            normalize_optional_startup_value(Some("  debian:bookworm  ")),
+            Some("debian:bookworm".to_string())
+        );
+        assert_eq!(normalize_optional_startup_value(Some("   ")), None);
+        assert_eq!(normalize_optional_startup_value(None), None);
+    }
+
+    #[test]
+    fn parse_env_bool_accepts_common_true_false_values() {
+        assert_eq!(parse_env_bool("true", "TEST_ENV").ok(), Some(true));
+        assert_eq!(parse_env_bool("1", "TEST_ENV").ok(), Some(true));
+        assert_eq!(parse_env_bool("yes", "TEST_ENV").ok(), Some(true));
+        assert_eq!(parse_env_bool("false", "TEST_ENV").ok(), Some(false));
+        assert_eq!(parse_env_bool("0", "TEST_ENV").ok(), Some(false));
+        assert_eq!(parse_env_bool("off", "TEST_ENV").ok(), Some(false));
+    }
+
+    #[test]
+    fn parse_env_bool_rejects_invalid_values() {
+        let err = parse_env_bool("maybe", "TEST_ENV").expect_err("invalid bool env should fail");
+        assert!(matches!(
+            err,
+            RuntimedError::InvalidPolicyEnvValue { env_name, .. } if env_name == "TEST_ENV"
+        ));
+    }
+
+    #[test]
+    fn resolve_sandbox_defaults_applies_policy_and_compat_fallback() {
+        let policy = SandboxStartupPolicy {
+            default_base_image_ref: Some("ubuntu:24.04".to_string()),
+            default_main_container: Some("workspace-main".to_string()),
+            legacy_default_base_image_enabled: true,
+        };
+        let resolved = resolve_sandbox_startup_defaults_with_policy(&policy, None, None);
+        assert_eq!(resolved.base_image_ref.as_deref(), Some("ubuntu:24.04"));
+        assert_eq!(
+            resolved.base_image_default_source,
+            Some(SandboxDefaultSource::PolicyConfig)
+        );
+        assert_eq!(resolved.main_container.as_deref(), Some("workspace-main"));
+        assert_eq!(
+            resolved.main_container_default_source,
+            Some(SandboxDefaultSource::PolicyConfig)
+        );
+
+        let compat_only_policy = SandboxStartupPolicy {
+            default_base_image_ref: None,
+            default_main_container: None,
+            legacy_default_base_image_enabled: true,
+        };
+        let compat_resolved =
+            resolve_sandbox_startup_defaults_with_policy(&compat_only_policy, None, None);
+        assert_eq!(
+            compat_resolved.base_image_ref.as_deref(),
+            Some(LEGACY_SANDBOX_BASE_IMAGE_REF)
+        );
+        assert_eq!(
+            compat_resolved.base_image_default_source,
+            Some(SandboxDefaultSource::CompatLegacy)
+        );
+        assert!(compat_resolved.main_container.is_none());
+    }
+
+    #[test]
+    fn resolve_sandbox_defaults_respects_explicit_request_values() {
+        let policy = SandboxStartupPolicy {
+            default_base_image_ref: Some("ubuntu:24.04".to_string()),
+            default_main_container: Some("workspace-main".to_string()),
+            legacy_default_base_image_enabled: true,
+        };
+        let resolved = resolve_sandbox_startup_defaults_with_policy(
+            &policy,
+            Some("debian:bookworm".to_string()),
+            Some("bash -lc 'echo hi'".to_string()),
+        );
+        assert_eq!(resolved.base_image_ref.as_deref(), Some("debian:bookworm"));
+        assert!(resolved.base_image_default_source.is_none());
+        assert_eq!(
+            resolved.main_container.as_deref(),
+            Some("bash -lc 'echo hi'")
+        );
+        assert!(resolved.main_container_default_source.is_none());
     }
 
     #[test]

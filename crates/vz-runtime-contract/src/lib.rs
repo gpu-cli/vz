@@ -24,10 +24,11 @@ pub use types::{
     IsolationLevel, Lease, LeaseState, MountAccess, MountSpec, MountType, NamespaceConfig,
     NetworkDomain, NetworkDomainState, NetworkServiceConfig, PortMapping, PortProtocol,
     PruneResult, PublishedPort, Receipt, ReceiptResultClassification, RunConfig,
-    RuntimeCapabilities, RuntimeOperation, SANDBOX_LABEL_BASE_IMAGE_REF,
-    SANDBOX_LABEL_MAIN_CONTAINER, Sandbox, SandboxBackend, SandboxSpec, SandboxState,
-    SandboxVolumeMount, SharedVmPhase, SharedVmPhaseTracker, StackResourceHint, StackVolumeMount,
-    Volume, VolumeType, default_namespace_config,
+    RuntimeCapabilities, RuntimeOperation, SANDBOX_LABEL_BASE_IMAGE_DEFAULT_SOURCE,
+    SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER,
+    SANDBOX_LABEL_MAIN_CONTAINER_DEFAULT_SOURCE, Sandbox, SandboxBackend, SandboxSpec,
+    SandboxState, SandboxVolumeMount, SharedVmPhase, SharedVmPhaseTracker, StackResourceHint,
+    StackVolumeMount, Volume, VolumeType, default_namespace_config,
 };
 
 /// Canonical Runtime V2 operation surface expected from implementations.

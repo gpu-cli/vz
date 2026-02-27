@@ -21,7 +21,6 @@ use vz_runtimed_client::DaemonClientError;
 use super::runtime_daemon::{connect_control_plane_for_state_db, default_state_db_path};
 
 const SANDBOX_PROJECT_DIR_LABEL: &str = "project_dir";
-const DEFAULT_SANDBOX_BASE_IMAGE_REF: &str = "debian:bookworm";
 
 fn sandbox_backend_from_wire(backend: &str) -> SandboxBackend {
     match backend.trim().to_ascii_lowercase().as_str() {
@@ -48,6 +47,30 @@ fn normalize_optional_label(value: Option<&String>) -> Option<String> {
         None
     } else {
         Some(raw.to_string())
+    }
+}
+
+fn apply_startup_selection_labels(
+    labels: &mut BTreeMap<String, String>,
+    base_image_ref: Option<String>,
+    main_container: Option<String>,
+) {
+    if let Some(base_image_ref) = base_image_ref.as_deref().map(str::trim)
+        && !base_image_ref.is_empty()
+    {
+        labels.insert(
+            SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
+            base_image_ref.to_string(),
+        );
+    }
+
+    if let Some(main_container) = main_container.as_deref().map(str::trim)
+        && !main_container.is_empty()
+    {
+        labels.insert(
+            SANDBOX_LABEL_MAIN_CONTAINER.to_string(),
+            main_container.to_string(),
+        );
     }
 }
 
@@ -448,12 +471,6 @@ async fn cmd_create_sandbox(
 ) -> anyhow::Result<()> {
     let sandbox_id = generate_sandbox_id();
     let display_name = name.as_deref().unwrap_or(&sandbox_id);
-    let resolved_base_image = base_image_ref
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| DEFAULT_SANDBOX_BASE_IMAGE_REF.to_string());
 
     let mut labels = BTreeMap::new();
     labels.insert(
@@ -464,18 +481,7 @@ async fn cmd_create_sandbox(
     if let Some(ref n) = name {
         labels.insert("name".to_string(), n.clone());
     }
-    labels.insert(
-        SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
-        resolved_base_image.clone(),
-    );
-    if let Some(main_container) = main_container.as_deref().map(str::trim)
-        && !main_container.is_empty()
-    {
-        labels.insert(
-            SANDBOX_LABEL_MAIN_CONTAINER.to_string(),
-            main_container.to_string(),
-        );
-    }
+    apply_startup_selection_labels(&mut labels, base_image_ref, main_container);
 
     // Ensure state directory exists.
     if let Some(parent) = state_db.parent() {
@@ -935,5 +941,31 @@ mod tests {
         assert!(is_detach_confirm(b"Q"));
         assert!(!is_detach_confirm(&[0x10]));
         assert!(!is_detach_confirm(b"x"));
+    }
+
+    #[test]
+    fn startup_selection_labels_do_not_inject_base_image_when_unset() {
+        let mut labels = BTreeMap::new();
+        apply_startup_selection_labels(&mut labels, None, None);
+        assert!(!labels.contains_key(SANDBOX_LABEL_BASE_IMAGE_REF));
+        assert!(!labels.contains_key(SANDBOX_LABEL_MAIN_CONTAINER));
+    }
+
+    #[test]
+    fn startup_selection_labels_include_explicit_base_image_and_main_container() {
+        let mut labels = BTreeMap::new();
+        apply_startup_selection_labels(
+            &mut labels,
+            Some("debian:bookworm".to_string()),
+            Some("workspace-main".to_string()),
+        );
+        assert_eq!(
+            labels.get(SANDBOX_LABEL_BASE_IMAGE_REF).map(String::as_str),
+            Some("debian:bookworm")
+        );
+        assert_eq!(
+            labels.get(SANDBOX_LABEL_MAIN_CONTAINER).map(String::as_str),
+            Some("workspace-main")
+        );
     }
 }

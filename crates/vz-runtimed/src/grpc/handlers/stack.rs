@@ -930,10 +930,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             return Ok(stack_stream_response(events, None));
         }
 
-        let preview_store = match self
-            .daemon
-            .open_dedicated_state_store()
-        {
+        let preview_store = match self.daemon.open_dedicated_state_store() {
             Ok(store) => store,
             Err(error) => {
                 events.push(Err(status_from_stack_error(error, &request_id)));
@@ -1007,20 +1004,14 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             "reconciling",
             "reconciling stack runtime state",
         )));
-        let exec_store = match self
-            .daemon
-            .open_dedicated_state_store()
-        {
+        let exec_store = match self.daemon.open_dedicated_state_store() {
             Ok(store) => store,
             Err(error) => {
                 events.push(Err(status_from_stack_error(error, &request_id)));
                 return Ok(stack_stream_response(events, None));
             }
         };
-        let reconcile_store = match self
-            .daemon
-            .open_dedicated_state_store()
-        {
+        let reconcile_store = match self.daemon.open_dedicated_state_store() {
             Ok(store) => store,
             Err(error) => {
                 events.push(Err(status_from_stack_error(error, &request_id)));
@@ -1045,7 +1036,11 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 return Ok(stack_stream_response(events, None));
             }
         };
-        let observed = match orchestrator.executor().store().load_observed_state(&stack_name) {
+        let observed = match orchestrator
+            .executor()
+            .store()
+            .load_observed_state(&stack_name)
+        {
             Ok(value) => value,
             Err(error) => {
                 events.push(Err(status_from_stack_error(error, &request_id)));
@@ -1231,10 +1226,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 ))));
                 return Ok(stack_stream_response(events, None));
             }
-            let exec_store = match self
-                .daemon
-                .open_dedicated_state_store()
-            {
+            let exec_store = match self.daemon.open_dedicated_state_store() {
                 Ok(store) => store,
                 Err(error) => {
                     events.push(Err(status_from_stack_error(error, &request_id)));

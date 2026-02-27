@@ -362,7 +362,11 @@ async fn read_apply_stack_completion(
     stream: &mut tonic::Streaming<runtime_v2::ApplyStackEvent>,
 ) -> runtime_v2::ApplyStackResponse {
     let mut completion = None;
-    while let Some(event) = stream.message().await.expect("read apply stack stream event") {
+    while let Some(event) = stream
+        .message()
+        .await
+        .expect("read apply stack stream event")
+    {
         if let Some(runtime_v2::apply_stack_event::Payload::Completion(done)) = event.payload {
             completion = Some(done);
         }
@@ -809,10 +813,7 @@ async fn create_sandbox_is_persisted_in_state_store() {
                 stack_name: "stack-a".to_string(),
                 cpus: 2,
                 memory_mb: 1024,
-                labels: std::collections::HashMap::from([(
-                    "env".to_string(),
-                    "test".to_string(),
-                )]),
+                labels: std::collections::HashMap::from([("env".to_string(), "test".to_string())]),
             }))
             .await
             .expect("create sandbox"),
@@ -963,6 +964,224 @@ async fn create_sandbox_stream_slow_consumer_preserves_order_and_completion() {
 }
 
 #[tokio::test]
+async fn create_sandbox_applies_legacy_base_image_default_and_audit_label() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let mut client = connect_sandbox_client(&config.socket_path).await;
+    let mut labels = std::collections::HashMap::new();
+    labels.insert(
+        SANDBOX_LABEL_BASE_IMAGE_DEFAULT_SOURCE.to_string(),
+        "policy_config".to_string(),
+    );
+    let mut stream = client
+        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+            metadata: None,
+            stack_name: "stack-defaults-legacy-fallback".to_string(),
+            cpus: 1,
+            memory_mb: 512,
+            labels,
+        }))
+        .await
+        .expect("create sandbox stream")
+        .into_inner();
+
+    let mut saw_defaults_phase = false;
+    let mut completion = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .expect("read create sandbox stream event")
+    {
+        match event.payload {
+            Some(runtime_v2::create_sandbox_event::Payload::Progress(progress))
+                if progress.phase == "applying_defaults" =>
+            {
+                saw_defaults_phase = true;
+            }
+            Some(runtime_v2::create_sandbox_event::Payload::Completion(done)) => {
+                completion = Some(done);
+            }
+            _ => {}
+        }
+    }
+
+    let created = completion.expect("completion payload");
+    let sandbox = created
+        .response
+        .and_then(|value| value.sandbox)
+        .expect("sandbox payload");
+    assert_eq!(
+        sandbox
+            .labels
+            .get(SANDBOX_LABEL_BASE_IMAGE_REF)
+            .map(String::as_str),
+        Some("debian:bookworm")
+    );
+    assert_eq!(
+        sandbox
+            .labels
+            .get(SANDBOX_LABEL_BASE_IMAGE_DEFAULT_SOURCE)
+            .map(String::as_str),
+        Some("compat_legacy")
+    );
+    assert!(
+        !sandbox
+            .labels
+            .contains_key(SANDBOX_LABEL_MAIN_CONTAINER_DEFAULT_SOURCE),
+        "main container default source should be absent when no default applied"
+    );
+    assert!(
+        saw_defaults_phase,
+        "create sandbox stream should include applying_defaults phase when defaults are injected"
+    );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn create_sandbox_strips_spoofed_default_source_labels_when_defaults_not_applied() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let mut client = connect_sandbox_client(&config.socket_path).await;
+    let mut labels = std::collections::HashMap::new();
+    labels.insert(
+        SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
+        "alpine:3.20".to_string(),
+    );
+    labels.insert(
+        SANDBOX_LABEL_MAIN_CONTAINER.to_string(),
+        "workspace-main".to_string(),
+    );
+    labels.insert(
+        SANDBOX_LABEL_BASE_IMAGE_DEFAULT_SOURCE.to_string(),
+        "compat_legacy".to_string(),
+    );
+    labels.insert(
+        SANDBOX_LABEL_MAIN_CONTAINER_DEFAULT_SOURCE.to_string(),
+        "policy_config".to_string(),
+    );
+    let mut stream = client
+        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+            metadata: None,
+            stack_name: "stack-defaults-explicit-values".to_string(),
+            cpus: 1,
+            memory_mb: 512,
+            labels,
+        }))
+        .await
+        .expect("create sandbox stream")
+        .into_inner();
+
+    let mut saw_defaults_phase = false;
+    let mut completion = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .expect("read create sandbox stream event")
+    {
+        match event.payload {
+            Some(runtime_v2::create_sandbox_event::Payload::Progress(progress))
+                if progress.phase == "applying_defaults" =>
+            {
+                saw_defaults_phase = true;
+            }
+            Some(runtime_v2::create_sandbox_event::Payload::Completion(done)) => {
+                completion = Some(done);
+            }
+            _ => {}
+        }
+    }
+
+    let created = completion.expect("completion payload");
+    let sandbox = created
+        .response
+        .and_then(|value| value.sandbox)
+        .expect("sandbox payload");
+    assert_eq!(
+        sandbox
+            .labels
+            .get(SANDBOX_LABEL_BASE_IMAGE_REF)
+            .map(String::as_str),
+        Some("alpine:3.20")
+    );
+    assert_eq!(
+        sandbox
+            .labels
+            .get(SANDBOX_LABEL_MAIN_CONTAINER)
+            .map(String::as_str),
+        Some("workspace-main")
+    );
+    assert!(
+        !sandbox
+            .labels
+            .contains_key(SANDBOX_LABEL_BASE_IMAGE_DEFAULT_SOURCE),
+        "default source labels should not be trusted from request input"
+    );
+    assert!(
+        !sandbox
+            .labels
+            .contains_key(SANDBOX_LABEL_MAIN_CONTAINER_DEFAULT_SOURCE),
+        "default source labels should not be trusted from request input"
+    );
+    assert!(
+        !saw_defaults_phase,
+        "create sandbox stream should not emit applying_defaults when no defaults are injected"
+    );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
 async fn open_sandbox_shell_creates_container_and_resolves_default_shell() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = RuntimedConfig {
@@ -1010,8 +1229,8 @@ async fn open_sandbox_shell_creates_container_and_resolves_default_shell() {
             .expect("create sandbox"),
     )
     .await
-        .sandbox
-        .expect("sandbox payload");
+    .sandbox
+    .expect("sandbox payload");
 
     let mut opened_stream = sandbox_client
         .open_sandbox_shell(Request::new(runtime_v2::OpenSandboxShellRequest {
@@ -1096,8 +1315,8 @@ async fn open_sandbox_shell_prefers_main_container_command_override() {
             .expect("create sandbox"),
     )
     .await
-        .sandbox
-        .expect("sandbox payload");
+    .sandbox
+    .expect("sandbox payload");
 
     let mut opened_stream = sandbox_client
         .open_sandbox_shell(Request::new(runtime_v2::OpenSandboxShellRequest {
@@ -1168,8 +1387,8 @@ async fn open_sandbox_shell_reuses_existing_active_execution_session() {
             .expect("create sandbox"),
     )
     .await
-        .sandbox
-        .expect("sandbox payload");
+    .sandbox
+    .expect("sandbox payload");
 
     let mut container_client = connect_container_client(&config.socket_path).await;
     let container = container_client
@@ -1286,8 +1505,8 @@ async fn close_sandbox_shell_closes_active_execution_and_clears_session() {
             .expect("create sandbox"),
     )
     .await
-        .sandbox
-        .expect("sandbox payload");
+    .sandbox
+    .expect("sandbox payload");
 
     let mut opened_stream = sandbox_client
         .open_sandbox_shell(Request::new(runtime_v2::OpenSandboxShellRequest {
@@ -3190,8 +3409,8 @@ async fn create_container_then_get_list_and_remove_round_trip() {
             .expect("create sandbox"),
     )
     .await
-        .sandbox
-        .expect("sandbox payload");
+    .sandbox
+    .expect("sandbox payload");
 
     let mut container_client = connect_container_client(&config.socket_path).await;
     let created = container_client
@@ -3325,8 +3544,8 @@ async fn create_container_denied_when_scheduler_capacity_is_exhausted() {
             .expect("create sandbox"),
     )
     .await
-        .sandbox
-        .expect("sandbox payload");
+    .sandbox
+    .expect("sandbox payload");
 
     let mut container_client = connect_container_client(&config.socket_path).await;
     let denied = container_client
@@ -3411,8 +3630,8 @@ async fn create_container_uses_sandbox_startup_defaults_when_request_omits_image
             .expect("create sandbox"),
     )
     .await
-        .sandbox
-        .expect("sandbox payload");
+    .sandbox
+    .expect("sandbox payload");
 
     let mut container_client = connect_container_client(&config.socket_path).await;
     let created = container_client
@@ -3500,8 +3719,8 @@ async fn create_container_preserves_explicit_image_and_cmd_over_sandbox_defaults
             .expect("create sandbox"),
     )
     .await
-        .sandbox
-        .expect("sandbox payload");
+    .sandbox
+    .expect("sandbox payload");
 
     let mut container_client = connect_container_client(&config.socket_path).await;
     let created = container_client
@@ -3768,8 +3987,8 @@ async fn file_service_write_read_list_round_trip_with_receipts() {
             .expect("create sandbox"),
     )
     .await
-        .sandbox
-        .expect("sandbox payload");
+    .sandbox
+    .expect("sandbox payload");
 
     let mut file_client = connect_file_client(&config.socket_path).await;
     let mkdir = file_client
@@ -3895,8 +4114,8 @@ async fn file_service_rejects_path_traversal() {
             .expect("create sandbox"),
     )
     .await
-        .sandbox
-        .expect("sandbox payload");
+    .sandbox
+    .expect("sandbox payload");
 
     let mut file_client = connect_file_client(&config.socket_path).await;
     let error = file_client
@@ -3987,10 +4206,7 @@ async fn terminate_sandbox_honors_idempotency_and_emits_receipt_header() {
         .expect("terminate sandbox");
     assert!(terminated.metadata().get("x-receipt-id").is_some());
     let terminated = read_terminate_sandbox_completion_response(terminated).await;
-    assert_eq!(
-        terminated.sandbox.expect("payload").state,
-        "terminated"
-    );
+    assert_eq!(terminated.sandbox.expect("payload").state, "terminated");
 
     let replay = read_terminate_sandbox_completion_response(
         client
@@ -4251,7 +4467,9 @@ async fn concurrent_create_without_idempotency_returns_conflict_not_internal() {
                 }))
                 .await?;
             let mut stream = response.into_inner();
-            try_read_create_sandbox_completion(&mut stream).await.map(|_| ())
+            try_read_create_sandbox_completion(&mut stream)
+                .await
+                .map(|_| ())
         }));
     }
 
