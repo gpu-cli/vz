@@ -64,9 +64,9 @@ check_no_match "StateStore::open\\(" \
   "crates/vz-api/src/lib.rs" \
   "crates/vz-api/src/daemon_bridge.rs"
 
-check_contains 'api-http` is not implemented yet; use `daemon-grpc`' \
+check_contains "ControlPlaneTransport::ApiHttp => connect_api_http_for_state_db" \
   "crates/vz-cli/src/commands/runtime_daemon.rs" \
-  "unimplemented control-plane transports must fail-closed"
+  "api-http transport selector must route through dedicated api-http connector"
 
 check_contains "legacy local-runtime path removed in daemon-only mode" \
   "crates/vz-cli/src/commands/oci.rs" \

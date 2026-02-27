@@ -42,8 +42,8 @@ cargo test -p vz-runtimed-client
 
 ## Expected Fail-Close Surfaces
 
-Until parity is implemented, these paths are intentionally blocked:
+Current transport note:
 
-- `VZ_CONTROL_PLANE_TRANSPORT=api-http` (CLI transport selector).
+- `VZ_CONTROL_PLANE_TRANSPORT=api-http` is accepted by CLI and currently routes through a compatibility fallback connector while full HTTP control-plane routing is tracked in `vz-pip6`.
 - Legacy local-runtime OCI mutation paths (`vz oci run/create/exec/stop/rm`).
 - Legacy local-runtime image build path (`vz image build`).

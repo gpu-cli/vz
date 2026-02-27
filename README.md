@@ -214,7 +214,7 @@ Runtime-mutating CLI surfaces (`sandbox`, `stack`, `image`, `file`, `lease`, `ex
   - `VZ_RUNTIME_DAEMON_AUTOSTART=0` disables autostart and fails fast when unreachable
 - Transport selector:
   - `VZ_CONTROL_PLANE_TRANSPORT=daemon-grpc` (default)
-  - `api-http` is reserved and currently fail-closed
+  - `VZ_CONTROL_PLANE_TRANSPORT=api-http` is accepted; current CLI execution path uses a compatibility connector while full HTTP control-plane routing is tracked in bead `vz-pip6`
 - Sandbox startup defaults (daemon policy):
   - `VZ_SANDBOX_DEFAULT_BASE_IMAGE=<image-ref>`
   - `VZ_SANDBOX_DEFAULT_MAIN_CONTAINER=<command-or-container-hint>`
