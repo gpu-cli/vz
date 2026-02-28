@@ -1,14 +1,20 @@
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
+use hyper_util::rt::TokioIo;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
+use tonic::transport::{Channel, Endpoint, Uri};
+use tower::service_fn;
 use tracing::warn;
 use vz_linux::LinuxVm;
 
 use super::BuildkitError;
 
 const BUILDKIT_GUEST_TCP_PORT: u16 = 8372;
+const BUILDKIT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct SocketCleanupGuard {
     path: PathBuf,
@@ -24,6 +30,33 @@ impl Drop for SocketCleanupGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// Create a direct tonic gRPC channel to guest BuildKit over port-forwarded vsock.
+pub async fn create_buildkit_channel(vm: Arc<LinuxVm>) -> Result<Channel, BuildkitError> {
+    Endpoint::try_from("http://[::]:50051")
+        .map_err(|error| {
+            BuildkitError::InvalidConfig(format!(
+                "failed to create BuildKit gRPC endpoint: {error}"
+            ))
+        })?
+        .connect_timeout(BUILDKIT_CONNECT_TIMEOUT)
+        .connect_with_connector(service_fn(move |_: Uri| {
+            let vm = Arc::clone(&vm);
+            async move {
+                let stream = vm
+                    .open_port_forward_stream(BUILDKIT_GUEST_TCP_PORT, "tcp", Some("127.0.0.1"))
+                    .await
+                    .map_err(io_error_from_linux)?;
+                Ok::<_, io::Error>(TokioIo::new(stream))
+            }
+        }))
+        .await
+        .map_err(|error| {
+            BuildkitError::InvalidConfig(format!(
+                "failed to connect BuildKit gRPC channel over vsock: {error}"
+            ))
+        })
 }
 
 /// Start a Unix domain socket proxy that forwards to BuildKit in the guest VM.
@@ -84,13 +117,18 @@ async fn relay_unix_connection(
     Ok(())
 }
 
+fn io_error_from_linux(error: vz_linux::LinuxError) -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionAborted, error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
     use tempfile::tempdir;
 
-    use super::prepare_socket_path;
+    use super::{io_error_from_linux, prepare_socket_path};
+    use vz_linux::LinuxError;
 
     #[test]
     fn prepare_socket_path_replaces_existing_socket_file() {
@@ -103,5 +141,11 @@ mod tests {
 
         assert!(socket_path.parent().unwrap().is_dir());
         assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn io_error_from_linux_preserves_original_message() {
+        let error = io_error_from_linux(LinuxError::InvalidConfig("bad vm".to_string()));
+        assert!(error.to_string().contains("bad vm"));
     }
 }

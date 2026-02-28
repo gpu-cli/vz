@@ -3845,6 +3845,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "docker_credential",
+ "hyper-util",
  "oci-distribution",
  "oci-spec",
  "reqwest",
@@ -3855,6 +3856,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tonic",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
  "vz",

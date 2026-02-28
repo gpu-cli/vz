@@ -23,7 +23,7 @@ mod tests;
 
 pub use manager::BuildManager;
 pub use pipeline::{build_image, build_image_with_events, cache_disk_usage, cache_prune};
-pub use proxy::start_unix_proxy;
+pub use proxy::{create_buildkit_channel, start_unix_proxy};
 
 #[cfg(test)]
 pub(crate) use artifacts::import_oci_tar_to_store;
