@@ -584,7 +584,7 @@ fn port_tracker_allocates_explicit_port() {
 }
 
 #[test]
-fn port_tracker_allocates_ephemeral_port() {
+fn port_tracker_skips_internal_only_port_entries() {
     let mut tracker = PortTracker::new();
     let ports = vec![PortSpec {
         protocol: "tcp".to_string(),
@@ -592,11 +592,8 @@ fn port_tracker_allocates_ephemeral_port() {
         host_port: None,
     }];
     let published = tracker.allocate("api", &ports).unwrap();
-    assert_eq!(published.len(), 1);
-    assert_eq!(published[0].container_port, 3000);
-    // Ephemeral port should be assigned.
-    assert!(published[0].host_port > 0);
-    assert!(tracker.in_use().contains(&published[0].host_port));
+    assert!(published.is_empty());
+    assert!(tracker.in_use().is_empty());
 }
 
 #[test]
@@ -1424,6 +1421,54 @@ fn resource_hints_passed_to_create_sandbox() {
     // Verify create_sandbox was called (indicating sandbox was used).
     let calls = executor.runtime.call_log();
     assert!(calls.iter().any(|(op, _)| op == "create_sandbox"));
+}
+
+#[test]
+fn create_sandbox_forwards_only_explicit_host_published_ports() {
+    let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-api"]);
+    let mut executor = make_executor(runtime);
+
+    let spec = stack(
+        "publish-opt-in",
+        vec![
+            ServiceSpec {
+                ports: vec![PortSpec {
+                    protocol: "tcp".to_string(),
+                    container_port: 80,
+                    host_port: Some(18080),
+                }],
+                ..svc("web", "nginx:latest")
+            },
+            ServiceSpec {
+                ports: vec![PortSpec {
+                    protocol: "tcp".to_string(),
+                    container_port: 3000,
+                    host_port: None,
+                }],
+                ..svc("api", "node:20")
+            },
+        ],
+    );
+
+    let actions = vec![
+        Action::ServiceCreate {
+            service_name: "web".to_string(),
+        },
+        Action::ServiceCreate {
+            service_name: "api".to_string(),
+        },
+    ];
+
+    let result = executor.execute(&spec, &actions).unwrap();
+    assert!(result.all_succeeded());
+
+    let calls = executor.runtime.call_log();
+    let create_sandbox_call = calls
+        .iter()
+        .find(|(operation, _)| operation == "create_sandbox")
+        .expect("create_sandbox call should be recorded");
+    assert!(create_sandbox_call.1.contains("18080:80"));
+    assert!(!create_sandbox_call.1.contains("3000:3000"));
 }
 
 // ── Custom network tests ──

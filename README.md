@@ -107,6 +107,10 @@ vz stack logs demo --service web --follow
 vz stack down demo --volumes
 ```
 
+Stack networking defaults to service identity inside the stack network.
+Host-facing port publishing is explicit opt-in via Compose host bindings
+(`HOST:CONTAINER`); container-only ports remain internal.
+
 ### 4. Manage macOS VMs (macOS only)
 
 ```bash

@@ -219,7 +219,7 @@ pub type LogStream = std::sync::mpsc::Receiver<LogLine>;
 /// Tracks host port allocations across services within a stack.
 ///
 /// Ensures no two services bind to the same host port and supports
-/// ephemeral port allocation for ports without an explicit host binding.
+/// explicit host-port publishing only.
 pub struct PortTracker {
     /// Allocated ports keyed by service name.
     allocated: HashMap<String, Vec<PublishedPort>>,
@@ -243,8 +243,8 @@ impl PortTracker {
 
     /// Allocate ports for a service. Returns the resolved port mappings.
     ///
-    /// Explicit host_ports are verified against currently allocated ports.
-    /// `None` host_ports get an ephemeral port assigned.
+    /// Explicit host ports are verified against currently allocated ports.
+    /// `None` host ports are treated as internal-only and are not published.
     ///
     /// If the service already has ports allocated (e.g. from a failed create
     /// being retried), the old allocation is released first so it doesn't
@@ -257,8 +257,13 @@ impl PortTracker {
         // Release any previous allocation for this service so retries don't
         // conflict with their own prior allocation.
         self.allocated.remove(service_name);
+        let explicit_publish_ports: Vec<_> = ports
+            .iter()
+            .filter(|port| port.host_port.is_some())
+            .cloned()
+            .collect();
         let in_use = self.in_use();
-        let resolved = resolve_ports(ports, &in_use)?;
+        let resolved = resolve_ports(&explicit_publish_ports, &in_use)?;
         self.allocated
             .insert(service_name.to_string(), resolved.clone());
         Ok(resolved)

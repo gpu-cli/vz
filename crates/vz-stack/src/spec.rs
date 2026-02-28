@@ -277,7 +277,7 @@ pub struct PortSpec {
     pub protocol: String,
     /// Container port to expose.
     pub container_port: u16,
-    /// Host port to bind. If absent, a random port is assigned.
+    /// Host port to bind. If absent, the port remains internal-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_port: Option<u16>,
 }

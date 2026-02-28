@@ -63,7 +63,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         // because the shared boot already validated all service mounts.
         let _skipped = crate::volume::validate_bind_mounts(&mut resolved_mounts)?;
 
-        // Allocate ports (resolves ephemeral ports, checks conflicts).
+        // Allocate explicit host-published ports and check conflicts.
         let published = match self.ports.allocate(service_name, &svc_spec.ports) {
             Ok(p) => p,
             Err(e) => {

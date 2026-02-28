@@ -35,6 +35,9 @@ pub struct StackArgs {
 #[derive(Subcommand, Debug)]
 pub enum StackCommand {
     /// Start services defined in a compose file.
+    ///
+    /// Host-facing port publishing requires explicit host bindings in Compose
+    /// (`HOST:CONTAINER`). Container-only ports remain internal to stack networking.
     Up(UpArgs),
 
     /// Stop and remove all services in a stack.

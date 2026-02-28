@@ -90,8 +90,8 @@ impl<R: ContainerRuntime> StackExecutor<R> {
     /// with N independent services.
     ///
     /// Port allocation is tracked across services: explicit host ports
-    /// are validated for conflicts, and `None` host ports get ephemeral
-    /// assignments. Ports are released on service removal.
+    /// are validated for conflicts. `None` host ports are treated as
+    /// internal-only and are not published to the host.
     ///
     /// For multi-service stacks, a sandbox is created before spawning
     /// containers, and per-service network namespaces are set up so that
@@ -202,29 +202,29 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 }
             }
 
-            // ── Collect all ports using primary IPs for target_host ──────
-            let all_ports: Vec<vz_runtime_contract::PortMapping> = spec
-                .services
-                .iter()
-                .flat_map(|svc| {
-                    let service_ip = service_primary_ip
-                        .get(&svc.name)
-                        .cloned()
-                        .unwrap_or_else(|| "127.0.0.1".to_string());
-                    svc.ports.iter().map(move |p| {
-                        let protocol = match p.protocol.as_str() {
-                            "udp" => vz_runtime_contract::PortProtocol::Udp,
-                            _ => vz_runtime_contract::PortProtocol::Tcp,
-                        };
-                        vz_runtime_contract::PortMapping {
-                            host: p.host_port.unwrap_or(p.container_port),
-                            container: p.container_port,
-                            protocol,
-                            target_host: Some(service_ip.clone()),
-                        }
-                    })
-                })
-                .collect();
+            // ── Collect explicit host-published ports using service identity ──
+            let mut all_ports = Vec::new();
+            for svc in &spec.services {
+                let Some(service_ip) = service_primary_ip.get(&svc.name) else {
+                    continue;
+                };
+                for port in &svc.ports {
+                    let Some(host_port) = port.host_port else {
+                        // host publish requires explicit opt-in.
+                        continue;
+                    };
+                    let protocol = match port.protocol.as_str() {
+                        "udp" => vz_runtime_contract::PortProtocol::Udp,
+                        _ => vz_runtime_contract::PortProtocol::Tcp,
+                    };
+                    all_ports.push(vz_runtime_contract::PortMapping {
+                        host: host_port,
+                        container: port.container_port,
+                        protocol,
+                        target_host: Some(service_ip.clone()),
+                    });
+                }
+            }
 
             // Collect all bind mounts across services so VirtioFS shares can
             // be configured at VM creation time. Named volumes use a persistent
