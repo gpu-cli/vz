@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -46,6 +47,7 @@ const BUILDKIT_SHARED_OUTPUT_TAG: &str = "build-output";
 const BUILDKIT_SHARED_CONTEXT_TAG: &str = "build-context";
 
 static BUILDKIT_VM_MANAGER: OnceLock<Arc<BuildkitVmManager>> = OnceLock::new();
+static VIRTUALIZATION_ENTITLEMENT_PREFLIGHT: OnceLock<Result<(), String>> = OnceLock::new();
 
 #[derive(Debug, Serialize)]
 struct DockerConfigFile {
@@ -344,6 +346,77 @@ fn buildkit_vm_idle_timeout() -> Duration {
         Some(0) | None => BUILDKIT_VM_IDLE_TIMEOUT,
         Some(seconds) => Duration::from_secs(seconds),
     }
+}
+
+fn ensure_virtualization_entitlement_preflight() -> Result<(), BuildkitError> {
+    let result = VIRTUALIZATION_ENTITLEMENT_PREFLIGHT.get_or_init(|| {
+        let executable = std::env::current_exe().map_err(|error| {
+            format!("failed to resolve current executable for preflight: {error}")
+        })?;
+        let output = Command::new("codesign")
+            .arg("-d")
+            .arg("--entitlements")
+            .arg(":-")
+            .arg(&executable)
+            .output()
+            .map_err(|error| {
+                format!(
+                    "failed to run `codesign --entitlements` for {}: {error}",
+                    executable.display()
+                )
+            })?;
+        let entitlements = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !output.status.success() {
+            return Err(format!(
+                "virtualization entitlement preflight failed for {} (codesign exit: {})\n{}",
+                executable.display(),
+                output.status,
+                entitlement_remediation_message()
+            ));
+        }
+        if !entitlements.contains("com.apple.security.virtualization") {
+            return Err(format!(
+                "missing `com.apple.security.virtualization` entitlement for {}\n{}",
+                executable.display(),
+                entitlement_remediation_message()
+            ));
+        }
+        Ok(())
+    });
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(message) => Err(BuildkitError::InvalidConfig(message.clone())),
+    }
+}
+
+fn map_vm_boot_error(error: BuildkitError) -> BuildkitError {
+    let message = error.to_string().to_ascii_lowercase();
+    if is_virtualization_entitlement_error(&message) {
+        BuildkitError::InvalidConfig(format!(
+            "BuildKit VM startup failed due to virtualization entitlement state.\n{}",
+            entitlement_remediation_message()
+        ))
+    } else {
+        error
+    }
+}
+
+fn is_virtualization_entitlement_error(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("vzerrordomain:2")
+        || normalized.contains("com.apple.security.virtualization")
+        || normalized.contains("virtualization entitlement")
+}
+
+fn entitlement_remediation_message() -> String {
+    "Remediation: re-sign binaries with `./scripts/sign-dev.sh --profile debug` \
+and retry (or use `vz vm self-sign`)."
+        .to_string()
 }
 
 fn block_on_vm_shutdown(vm: &LinuxVm) -> Result<(), BuildkitError> {
@@ -855,6 +928,8 @@ async fn start_buildkit_vm(
     output_root: &Path,
     auth_dir: &Path,
 ) -> Result<LinuxVm, BuildkitError> {
+    ensure_virtualization_entitlement_preflight()?;
+
     let artifacts = ensure_buildkit_artifacts().await?;
     let kernel = ensure_kernel_with_options(EnsureKernelOptions {
         install_dir: config.linux_install_dir.clone(),
@@ -925,8 +1000,14 @@ async fn start_buildkit_vm(
         vm_config.network = Some(NetworkConfig::None);
     }
 
-    let vm = LinuxVm::create(vm_config).await?;
-    vm.start().await?;
+    let vm = LinuxVm::create(vm_config)
+        .await
+        .map_err(BuildkitError::from)
+        .map_err(map_vm_boot_error)?;
+    vm.start()
+        .await
+        .map_err(BuildkitError::from)
+        .map_err(map_vm_boot_error)?;
 
     if let Err(err) = vm.wait_for_agent(config.agent_ready_timeout).await {
         let _ = vm.stop().await;
@@ -1407,6 +1488,26 @@ mod tests {
             Some(requested.as_path())
         ));
         assert!(!context_mount_compatible(None, Some(existing.as_path())));
+    }
+
+    #[test]
+    fn entitlement_error_detection_matches_known_signatures() {
+        assert!(is_virtualization_entitlement_error(
+            "Virtualization.framework error: VZErrorDomain:2"
+        ));
+        assert!(is_virtualization_entitlement_error(
+            "missing com.apple.security.virtualization entitlement"
+        ));
+        assert!(!is_virtualization_entitlement_error(
+            "generic guest-agent startup timeout"
+        ));
+    }
+
+    #[test]
+    fn entitlement_remediation_message_mentions_signing_paths() {
+        let message = entitlement_remediation_message();
+        assert!(message.contains("./scripts/sign-dev.sh"));
+        assert!(message.contains("self-sign"));
     }
 
     #[tokio::test]
