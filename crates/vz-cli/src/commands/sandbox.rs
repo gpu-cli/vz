@@ -43,6 +43,7 @@ use super::space_cache_trust::{
 const SPACE_CONFIG_FILE: &str = "vz.json";
 const SPACE_CACHE_INDEX_FILE: &str = "space-cache-index.json";
 const SPACE_CACHE_ARTIFACTS_DIR: &str = "space-cache-artifacts";
+const SANDBOX_LABEL_SPACE_CACHE_TRUST_PREFIX: &str = "vz.space.cache.trust.";
 
 #[derive(Debug, Clone)]
 struct SpaceConfig {
@@ -55,6 +56,29 @@ struct SpaceConfig {
 struct SpaceCacheDefinition {
     name: String,
     key_inputs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpaceCacheTrustOutcome {
+    LocalHit,
+    LocalMissCold,
+    LocalMissDimensionChange,
+    LocalMissSchemaMismatch,
+    RemoteVerifiedMaterialized,
+    RemoteMissUntrusted,
+}
+
+impl SpaceCacheTrustOutcome {
+    const fn as_label_value(self) -> &'static str {
+        match self {
+            Self::LocalHit => "local_hit",
+            Self::LocalMissCold => "local_miss_cold",
+            Self::LocalMissDimensionChange => "local_miss_dimension_change",
+            Self::LocalMissSchemaMismatch => "local_miss_schema_mismatch",
+            Self::RemoteVerifiedMaterialized => "remote_verified_materialized",
+            Self::RemoteMissUntrusted => "remote_miss_untrusted",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,6 +453,18 @@ fn apply_space_external_secret_labels(
     }
 }
 
+fn apply_space_cache_trust_labels(
+    labels: &mut BTreeMap<String, String>,
+    cache_outcomes: &BTreeMap<String, SpaceCacheTrustOutcome>,
+) {
+    for (cache_name, outcome) in cache_outcomes {
+        labels.insert(
+            format!("{SANDBOX_LABEL_SPACE_CACHE_TRUST_PREFIX}{cache_name}"),
+            outcome.as_label_value().to_string(),
+        );
+    }
+}
+
 fn space_cache_index_path(state_db: &Path) -> PathBuf {
     if let Some(parent) = state_db.parent() {
         parent.join(SPACE_CACHE_INDEX_FILE)
@@ -571,14 +607,18 @@ fn build_space_cache_keys(
     Ok(keys)
 }
 
-fn update_space_cache_index(state_db: &Path, cache_keys: &[SpaceCacheKey]) -> anyhow::Result<()> {
+fn update_space_cache_index(
+    state_db: &Path,
+    cache_keys: &[SpaceCacheKey],
+) -> anyhow::Result<BTreeMap<String, SpaceCacheTrustOutcome>> {
     if cache_keys.is_empty() {
-        return Ok(());
+        return Ok(BTreeMap::new());
     }
 
     let remote_cache_trust = SpaceRemoteCacheTrustConfig::from_env()?;
     let index_path = space_cache_index_path(state_db);
     let mut index = SpaceCacheIndex::load(&index_path)?;
+    let mut trust_outcomes = BTreeMap::new();
     let invalidated = index.invalidate_for_schema(SPACE_CACHE_KEY_SCHEMA_VERSION);
     if invalidated > 0 {
         println!(
@@ -588,6 +628,14 @@ fn update_space_cache_index(state_db: &Path, cache_keys: &[SpaceCacheKey]) -> an
 
     for key in cache_keys {
         let lookup = index.lookup(key);
+        let mut trust_outcome = match lookup {
+            SpaceCacheLookup::Hit => SpaceCacheTrustOutcome::LocalHit,
+            SpaceCacheLookup::MissNotFound => SpaceCacheTrustOutcome::LocalMissCold,
+            SpaceCacheLookup::MissKeyMismatch => SpaceCacheTrustOutcome::LocalMissDimensionChange,
+            SpaceCacheLookup::MissVersionMismatch { .. } => {
+                SpaceCacheTrustOutcome::LocalMissSchemaMismatch
+            }
+        };
         match lookup {
             SpaceCacheLookup::Hit => {
                 println!("[cache:{}] hit {}", key.cache_name, key.digest_hex);
@@ -621,12 +669,14 @@ fn update_space_cache_index(state_db: &Path, cache_keys: &[SpaceCacheKey]) -> an
                                 key.digest_hex,
                                 local_payload_path.display()
                             );
+                            trust_outcome = SpaceCacheTrustOutcome::RemoteVerifiedMaterialized;
                         }
                         Err(error) => {
                             println!(
                                 "[cache:{}] remote miss (materialization failed: {error}) {}",
                                 key.cache_name, key.digest_hex
                             );
+                            trust_outcome = SpaceCacheTrustOutcome::RemoteMissUntrusted;
                         }
                     }
                 }
@@ -637,13 +687,16 @@ fn update_space_cache_index(state_db: &Path, cache_keys: &[SpaceCacheKey]) -> an
                         reason.diagnostic(),
                         key.digest_hex
                     );
+                    trust_outcome = SpaceCacheTrustOutcome::RemoteMissUntrusted;
                 }
             }
         }
+        trust_outcomes.insert(key.cache_name.clone(), trust_outcome);
         index.upsert(key.clone());
     }
 
-    index.save(&index_path)
+    index.save(&index_path)?;
+    Ok(trust_outcomes)
 }
 
 fn git_rev_parse_value(cwd: &Path, arg: &str) -> Option<String> {
@@ -1775,7 +1828,8 @@ async fn cmd_create_sandbox(
         worktree_identity.worktree_id.as_str(),
     )
     .await?;
-    update_space_cache_index(state_db, &cache_keys)?;
+    let cache_trust_outcomes = update_space_cache_index(state_db, &cache_keys)?;
+    apply_space_cache_trust_labels(&mut labels, &cache_trust_outcomes);
 
     // Ensure state directory exists.
     if let Some(parent) = state_db.parent() {
@@ -2805,6 +2859,33 @@ mod tests {
                 .get("vz.space.service_state.redis.key_prefix")
                 .map(String::as_str),
             Some("wt_1a2b3c:")
+        );
+    }
+
+    #[test]
+    fn apply_space_cache_trust_labels_projects_outcomes_to_labels() {
+        let outcomes = BTreeMap::from([
+            (
+                "deps".to_string(),
+                SpaceCacheTrustOutcome::RemoteVerifiedMaterialized,
+            ),
+            (
+                "cargo-target".to_string(),
+                SpaceCacheTrustOutcome::RemoteMissUntrusted,
+            ),
+        ]);
+        let mut labels = BTreeMap::new();
+        apply_space_cache_trust_labels(&mut labels, &outcomes);
+
+        assert_eq!(
+            labels.get("vz.space.cache.trust.deps").map(String::as_str),
+            Some("remote_verified_materialized")
+        );
+        assert_eq!(
+            labels
+                .get("vz.space.cache.trust.cargo-target")
+                .map(String::as_str),
+            Some("remote_miss_untrusted")
         );
     }
 
