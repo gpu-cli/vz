@@ -21,6 +21,14 @@ mod registry;
 use clap::Parser;
 use tracing::error;
 
+const CLI_WORKFLOW_EXAMPLES: &str = "\
+Examples:
+  vz                  Create and attach to a new sandbox
+  vz -c               Continue the most recent sandbox
+  vz -r <name-or-id>  Resume a specific sandbox
+  vz ls               List sandboxes
+  vz <COMMAND>        Run an explicit subcommand";
+
 /// vz — instant sandboxed Linux environments.
 ///
 /// Run `vz` in a project with `vz.json` on btrfs-backed storage to create and
@@ -32,6 +40,7 @@ use tracing::error;
     name = "vz",
     version,
     about = "vz — instant sandboxed Linux environments",
+    after_help = CLI_WORKFLOW_EXAMPLES,
     long_about = None
 )]
 struct Cli {
@@ -239,6 +248,21 @@ mod tests {
     fn cli_debug_assert() {
         // Verify the CLI definition is valid (catches clap config errors)
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn help_includes_sandbox_workflow_examples() {
+        let mut command = Cli::command();
+        let mut help = Vec::new();
+        command
+            .write_long_help(&mut help)
+            .expect("render help text");
+        let text = String::from_utf8(help).expect("help should be valid utf-8");
+
+        assert!(text.contains("Examples:"));
+        assert!(text.contains("vz                  Create and attach to a new sandbox"));
+        assert!(text.contains("vz -c               Continue the most recent sandbox"));
+        assert!(text.contains("vz -r <name-or-id>  Resume a specific sandbox"));
     }
 
     #[test]
