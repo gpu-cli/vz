@@ -99,18 +99,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                             secret_ref.source, service_name,
                         ))
                     })?;
-                let file_path = secret_def.file().ok_or_else(|| {
-                    StackError::InvalidSpec(format!(
-                        "secret '{}' has no file source",
-                        secret_ref.source,
-                    ))
-                })?;
-                let content = std::fs::read(file_path).map_err(|e| {
-                    StackError::InvalidSpec(format!(
-                        "failed to read secret file '{}': {}",
-                        file_path, e,
-                    ))
-                })?;
+                let content = load_secret_source_bytes(secret_def)?;
                 std::fs::write(secrets_dir.join(&secret_ref.source), content)?;
             }
             secrets_to_mounts(&svc_spec.secrets, &secrets_dir)

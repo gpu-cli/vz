@@ -8,8 +8,8 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 use vz_runtime_contract::{
     PolicyDecision, RequestMetadata, RuntimeOperation, RuntimePolicyHook,
-    SANDBOX_LABEL_PROJECT_DIR, SANDBOX_LABEL_SPACE_MODE, SANDBOX_SPACE_MODE_REQUIRED,
-    SandboxBackend,
+    SANDBOX_LABEL_PROJECT_DIR, SANDBOX_LABEL_SPACE_MODE, SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX,
+    SANDBOX_SPACE_MODE_REQUIRED, SandboxBackend,
 };
 
 use super::*;
@@ -1648,6 +1648,183 @@ async fn open_sandbox_shell_reuses_existing_active_execution_session() {
         .with_state_store(|store| store.list_executions())
         .expect("list executions");
     assert_eq!(executions.len(), 1);
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn open_sandbox_shell_persists_external_secret_env_references_only() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let mut labels = std::collections::HashMap::new();
+    labels.insert(
+        SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
+        "debian:bookworm".to_string(),
+    );
+    labels.insert(
+        format!("{SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX}workspace_home"),
+        "HOME".to_string(),
+    );
+
+    let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
+    let sandbox = read_create_sandbox_completion_response(
+        sandbox_client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "stack-open-shell-external-secret".to_string(),
+                cpus: 0,
+                memory_mb: 0,
+                labels,
+            }))
+            .await
+            .expect("create sandbox"),
+    )
+    .await
+    .sandbox
+    .expect("sandbox payload");
+
+    let mut opened_stream = sandbox_client
+        .open_sandbox_shell(Request::new(runtime_v2::OpenSandboxShellRequest {
+            sandbox_id: sandbox.sandbox_id.clone(),
+            metadata: None,
+        }))
+        .await
+        .expect("open sandbox shell")
+        .into_inner();
+    let opened = read_open_sandbox_shell_completion(&mut opened_stream).await;
+
+    let persisted_execution = daemon
+        .with_state_store(|store| store.load_execution(&opened.execution_id))
+        .expect("load execution from state store")
+        .expect("execution should be persisted");
+    let home = std::env::var("HOME").expect("HOME should be set for test");
+    let expected_reference = format!("{SANDBOX_RUNTIME_ENV_REF_PREFIX}HOME");
+    assert_eq!(
+        persisted_execution
+            .exec_spec
+            .env_override
+            .get("workspace_home")
+            .map(String::as_str),
+        Some(expected_reference.as_str())
+    );
+    assert!(
+        persisted_execution
+            .exec_spec
+            .env_override
+            .values()
+            .all(|value| value != home.as_str()),
+        "execution spec should not persist raw secret env values"
+    );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn open_sandbox_shell_rejects_missing_external_secret_env_source() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let missing_env_var = "VZ_RUNTIME_TEST_MISSING_SPACE_SECRET_8319";
+    let mut labels = std::collections::HashMap::new();
+    labels.insert(
+        SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
+        "debian:bookworm".to_string(),
+    );
+    labels.insert(
+        format!("{SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX}db_password"),
+        missing_env_var.to_string(),
+    );
+
+    let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
+    let sandbox = read_create_sandbox_completion_response(
+        sandbox_client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "stack-open-shell-missing-external-secret".to_string(),
+                cpus: 0,
+                memory_mb: 0,
+                labels,
+            }))
+            .await
+            .expect("create sandbox"),
+    )
+    .await
+    .sandbox
+    .expect("sandbox payload");
+
+    let mut opened_stream = sandbox_client
+        .open_sandbox_shell(Request::new(runtime_v2::OpenSandboxShellRequest {
+            sandbox_id: sandbox.sandbox_id,
+            metadata: None,
+        }))
+        .await
+        .expect("open sandbox shell request should be accepted")
+        .into_inner();
+    let status = loop {
+        match opened_stream.message().await {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("expected open_sandbox_shell stream to return an error"),
+            Err(status) => break status,
+        }
+    };
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains(missing_env_var),
+        "error should identify missing env var source"
+    );
+    assert!(
+        !status.message().contains("super-secret"),
+        "error should not leak secret values"
+    );
 
     shutdown.notify_waiters();
     let result = tokio::time::timeout(Duration::from_secs(5), server)

@@ -20,7 +20,8 @@ use vz_runtime_contract::{
     MachineError, MachineErrorCode, RuntimeOperation, SANDBOX_LABEL_BASE_IMAGE_DEFAULT_SOURCE,
     SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER,
     SANDBOX_LABEL_MAIN_CONTAINER_DEFAULT_SOURCE, SANDBOX_LABEL_PROJECT_DIR,
-    SANDBOX_LABEL_SPACE_MODE, SANDBOX_SPACE_MODE_REQUIRED, Sandbox, SandboxSpec, SandboxState,
+    SANDBOX_LABEL_SPACE_MODE, SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX, SANDBOX_SPACE_MODE_REQUIRED,
+    Sandbox, SandboxSpec, SandboxState,
 };
 use vz_runtime_proto::runtime_v2;
 use vz_runtime_translate::{

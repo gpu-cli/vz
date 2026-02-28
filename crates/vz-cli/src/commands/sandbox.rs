@@ -16,8 +16,9 @@ use serde::{Deserialize, Serialize};
 use tonic::Code;
 use vz_runtime_contract::{
     SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER, SANDBOX_LABEL_PROJECT_DIR,
-    SANDBOX_LABEL_SPACE_CONFIG_PATH, SANDBOX_LABEL_SPACE_MODE, SANDBOX_SPACE_MODE_REQUIRED,
-    Sandbox, SandboxBackend, SandboxSpec, SandboxState,
+    SANDBOX_LABEL_SPACE_CONFIG_PATH, SANDBOX_LABEL_SPACE_MODE,
+    SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX, SANDBOX_SPACE_MODE_REQUIRED, Sandbox, SandboxBackend,
+    SandboxSpec, SandboxState,
 };
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed_client::DaemonClientError;
@@ -28,6 +29,12 @@ use super::runtime_daemon::{
 };
 
 const SPACE_CONFIG_FILE: &str = "vz.json";
+
+#[derive(Debug, Clone)]
+struct SpaceConfig {
+    config_path: PathBuf,
+    external_secret_env: BTreeMap<String, String>,
+}
 
 fn sandbox_backend_from_wire(backend: &str) -> SandboxBackend {
     match backend.trim().to_ascii_lowercase().as_str() {
@@ -88,7 +95,7 @@ fn apply_startup_selection_labels(
     }
 }
 
-fn ensure_space_config_exists(cwd: &Path) -> anyhow::Result<PathBuf> {
+fn load_space_config(cwd: &Path) -> anyhow::Result<SpaceConfig> {
     let config_path = cwd.join(SPACE_CONFIG_FILE);
     if !config_path.is_file() {
         bail!(
@@ -105,15 +112,175 @@ fn ensure_space_config_exists(cwd: &Path) -> anyhow::Result<PathBuf> {
             config_path.display()
         )
     })?;
-    serde_json::from_slice::<serde_json::Value>(&raw).with_context(|| {
+    let parsed = serde_json::from_slice::<serde_json::Value>(&raw).with_context(|| {
         format!(
             "invalid `{}` at {}: must contain valid JSON",
             SPACE_CONFIG_FILE,
             config_path.display()
         )
     })?;
+    validate_space_config_has_no_inline_secrets(&parsed)?;
+    let external_secret_env = parse_space_external_secret_env_refs(&parsed)?;
 
-    Ok(config_path)
+    Ok(SpaceConfig {
+        config_path,
+        external_secret_env,
+    })
+}
+
+fn key_looks_secret(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_lowercase();
+    [
+        "secret",
+        "password",
+        "passwd",
+        "token",
+        "api_key",
+        "apikey",
+        "private_key",
+        "access_key",
+        "client_secret",
+        "credential",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn collect_inline_secret_like_paths(
+    value: &serde_json::Value,
+    path: &str,
+    in_external_secret_definitions: bool,
+    violations: &mut Vec<String>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                let child_path = if path == "$" {
+                    format!("$.{key}")
+                } else {
+                    format!("{path}.{key}")
+                };
+                let child_in_external_secret_definitions =
+                    in_external_secret_definitions || (path == "$" && key == "secrets");
+                if !child_in_external_secret_definitions && key_looks_secret(key) {
+                    violations.push(child_path.clone());
+                }
+                collect_inline_secret_like_paths(
+                    child,
+                    &child_path,
+                    child_in_external_secret_definitions,
+                    violations,
+                );
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                let child_path = format!("{path}[{index}]");
+                collect_inline_secret_like_paths(
+                    item,
+                    &child_path,
+                    in_external_secret_definitions,
+                    violations,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn validate_space_config_has_no_inline_secrets(parsed: &serde_json::Value) -> anyhow::Result<()> {
+    let mut violations = Vec::new();
+    collect_inline_secret_like_paths(parsed, "$", false, &mut violations);
+    if violations.is_empty() {
+        return Ok(());
+    }
+
+    let first_path = violations
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "$".to_string());
+    bail!(
+        "spaces mode config `{SPACE_CONFIG_FILE}` must not include inline secrets (first violation: {first_path}). define external secret sources under `secrets.<name>.env` or `secrets.<name>.environment`"
+    );
+}
+
+fn ensure_valid_secret_label_segment(segment: &str, context: &str) -> anyhow::Result<()> {
+    if segment.is_empty() {
+        bail!("spaces mode secret {context} cannot be empty");
+    }
+    if !segment
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        bail!(
+            "spaces mode secret {context} `{segment}` must contain only ASCII letters, digits, `_`, or `-`"
+        );
+    }
+    Ok(())
+}
+
+fn parse_space_external_secret_env_refs(
+    parsed: &serde_json::Value,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let Some(secrets_value) = parsed.get("secrets") else {
+        return Ok(BTreeMap::new());
+    };
+    let secrets_map = secrets_value.as_object().ok_or_else(|| {
+        anyhow!(
+            "spaces mode config `{SPACE_CONFIG_FILE}` field `secrets` must be an object mapping secret names to external references"
+        )
+    })?;
+
+    let mut refs = BTreeMap::new();
+    for (secret_name, secret_def_value) in secrets_map {
+        ensure_valid_secret_label_segment(secret_name, "name")?;
+        let secret_def = secret_def_value.as_object().ok_or_else(|| {
+            anyhow!(
+                "spaces mode config `{SPACE_CONFIG_FILE}` secret `{secret_name}` must be an object with `env` or `environment`"
+            )
+        })?;
+        if secret_def
+            .keys()
+            .any(|key| matches!(key.as_str(), "value" | "inline" | "literal" | "file"))
+        {
+            bail!(
+                "spaces mode config `{SPACE_CONFIG_FILE}` secret `{secret_name}` cannot embed secret material; only external env references are allowed"
+            );
+        }
+        let env_var_name = secret_def
+            .get("env")
+            .or_else(|| secret_def.get("environment"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "spaces mode config `{SPACE_CONFIG_FILE}` secret `{secret_name}` must define non-empty `env` or `environment`"
+                )
+            })?;
+        ensure_valid_secret_label_segment(env_var_name, "env var name")?;
+        for key in secret_def.keys() {
+            if !matches!(key.as_str(), "env" | "environment" | "description") {
+                bail!(
+                    "spaces mode config `{SPACE_CONFIG_FILE}` secret `{secret_name}` has unsupported key `{key}`; allowed keys: env, environment, description"
+                );
+            }
+        }
+        refs.insert(secret_name.to_string(), env_var_name.to_string());
+    }
+    Ok(refs)
+}
+
+fn apply_space_external_secret_labels(
+    labels: &mut BTreeMap<String, String>,
+    external_secret_env: &BTreeMap<String, String>,
+) {
+    for (secret_name, env_var_name) in external_secret_env {
+        labels.insert(
+            format!("{SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX}{secret_name}"),
+            env_var_name.to_string(),
+        );
+    }
 }
 
 fn enforce_btrfs_workspace_preflight(workspace_root: &Path) -> anyhow::Result<()> {
@@ -954,12 +1121,12 @@ pub async fn cmd_default_sandbox(
     }
 
     // Create a new sandbox in spaces mode.
-    let space_config_path = ensure_space_config_exists(&cwd)?;
+    let space_config = load_space_config(&cwd)?;
     enforce_btrfs_workspace_preflight(&cwd)?;
     cmd_create_sandbox(
         &state_db,
         &cwd,
-        &space_config_path,
+        &space_config,
         name,
         cpus,
         memory,
@@ -1033,7 +1200,7 @@ async fn cmd_resume_sandbox(state_db: &Path, target: &str) -> anyhow::Result<()>
 async fn cmd_create_sandbox(
     state_db: &Path,
     cwd: &Path,
-    space_config_path: &Path,
+    space_config: &SpaceConfig,
     name: Option<String>,
     cpus: u8,
     memory: u64,
@@ -1054,8 +1221,9 @@ async fn cmd_create_sandbox(
     );
     labels.insert(
         SANDBOX_LABEL_SPACE_CONFIG_PATH.to_string(),
-        space_config_path.to_string_lossy().to_string(),
+        space_config.config_path.to_string_lossy().to_string(),
     );
+    apply_space_external_secret_labels(&mut labels, &space_config.external_secret_env);
     labels.insert("source".to_string(), "standalone".to_string());
     if let Some(ref n) = name {
         labels.insert("name".to_string(), n.clone());
@@ -1069,7 +1237,10 @@ async fn cmd_create_sandbox(
 
     println!("Booting sandbox {display_name}...");
     println!("Mounting {} → /workspace", cwd.display());
-    println!("Using space definition {}", space_config_path.display());
+    println!(
+        "Using space definition {}",
+        space_config.config_path.display()
+    );
 
     let sandbox =
         daemon_create_sandbox(state_db, &sandbox_id, cpus, memory, labels.clone()).await?;
@@ -1897,10 +2068,9 @@ mod tests {
     }
 
     #[test]
-    fn ensure_space_config_exists_rejects_missing_file() {
+    fn load_space_config_rejects_missing_file() {
         let dir = tempdir().expect("tempdir");
-        let error =
-            ensure_space_config_exists(dir.path()).expect_err("missing vz.json should fail");
+        let error = load_space_config(dir.path()).expect_err("missing vz.json should fail");
         assert!(
             error.to_string().contains("requires `vz.json`"),
             "unexpected error: {error:#}"
@@ -1908,11 +2078,11 @@ mod tests {
     }
 
     #[test]
-    fn ensure_space_config_exists_rejects_invalid_json() {
+    fn load_space_config_rejects_invalid_json() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("vz.json");
         fs::write(&path, "{ invalid json").expect("write invalid config");
-        let error = ensure_space_config_exists(dir.path()).expect_err("invalid JSON should fail");
+        let error = load_space_config(dir.path()).expect_err("invalid JSON should fail");
         assert!(
             error.to_string().contains("invalid `vz.json`"),
             "unexpected error: {error:#}"
@@ -1920,12 +2090,123 @@ mod tests {
     }
 
     #[test]
-    fn ensure_space_config_exists_accepts_valid_json() {
+    fn load_space_config_accepts_valid_json() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("vz.json");
         fs::write(&path, r#"{"image":"ubuntu:24.04"}"#).expect("write config");
-        let resolved = ensure_space_config_exists(dir.path()).expect("valid config should pass");
-        assert_eq!(resolved, path);
+        let resolved = load_space_config(dir.path()).expect("valid config should pass");
+        assert_eq!(resolved.config_path, path);
+        assert!(resolved.external_secret_env.is_empty());
+    }
+
+    #[test]
+    fn load_space_config_rejects_inline_secret_field() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("vz.json");
+        fs::write(
+            &path,
+            r#"{
+                "env": {
+                    "DB_PASSWORD": "super-secret"
+                }
+            }"#,
+        )
+        .expect("write config");
+        let error = load_space_config(dir.path()).expect_err("inline secret field should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("must not include inline secrets"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !error.to_string().contains("super-secret"),
+            "error should not leak raw secret values: {error:#}"
+        );
+    }
+
+    #[test]
+    fn load_space_config_rejects_inline_secret_definition_values() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("vz.json");
+        fs::write(
+            &path,
+            r#"{
+                "secrets": {
+                    "db_password": {
+                        "value": "super-secret"
+                    }
+                }
+            }"#,
+        )
+        .expect("write config");
+        let error = load_space_config(dir.path()).expect_err("inline secret value should fail");
+        assert!(
+            error.to_string().contains("cannot embed secret material"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !error.to_string().contains("super-secret"),
+            "error should not leak raw secret values: {error:#}"
+        );
+    }
+
+    #[test]
+    fn load_space_config_accepts_external_secret_env_references() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("vz.json");
+        fs::write(
+            &path,
+            r#"{
+                "secrets": {
+                    "db_password": {
+                        "env": "DB_PASSWORD"
+                    },
+                    "api_token": {
+                        "environment": "API_TOKEN"
+                    }
+                }
+            }"#,
+        )
+        .expect("write config");
+        let loaded = load_space_config(dir.path()).expect("external refs should be accepted");
+        assert_eq!(loaded.config_path, path);
+        assert_eq!(
+            loaded
+                .external_secret_env
+                .get("db_password")
+                .map(String::as_str),
+            Some("DB_PASSWORD")
+        );
+        assert_eq!(
+            loaded
+                .external_secret_env
+                .get("api_token")
+                .map(String::as_str),
+            Some("API_TOKEN")
+        );
+    }
+
+    #[test]
+    fn apply_space_external_secret_labels_projects_only_env_refs() {
+        let mut labels = BTreeMap::new();
+        let refs = BTreeMap::from([
+            ("db_password".to_string(), "DB_PASSWORD".to_string()),
+            ("api_token".to_string(), "API_TOKEN".to_string()),
+        ]);
+        apply_space_external_secret_labels(&mut labels, &refs);
+        assert_eq!(
+            labels
+                .get("vz.space.secret.env.db_password")
+                .map(String::as_str),
+            Some("DB_PASSWORD")
+        );
+        assert_eq!(
+            labels
+                .get("vz.space.secret.env.api_token")
+                .map(String::as_str),
+            Some("API_TOKEN")
+        );
     }
 
     #[test]

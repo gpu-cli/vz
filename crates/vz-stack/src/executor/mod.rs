@@ -18,9 +18,35 @@ use crate::error::StackError;
 use crate::events::StackEvent;
 use crate::network::{PublishedPort, resolve_ports};
 use crate::reconcile::Action;
-use crate::spec::{ServiceSpec, StackSpec};
+use crate::spec::{SecretDef, SecretSource, ServiceSpec, StackSpec};
 use crate::state_store::{ServiceObservedState, ServicePhase, StateStore};
 use crate::volume::VolumeManager;
+
+fn load_secret_source_bytes(secret_def: &SecretDef) -> Result<Vec<u8>, StackError> {
+    match &secret_def.source {
+        SecretSource::File(path) => std::fs::read(path).map_err(|error| {
+            StackError::InvalidSpec(format!(
+                "failed to read secret file for '{}': {}: {error}",
+                secret_def.name, path
+            ))
+        }),
+        SecretSource::Environment(env_var) => match std::env::var(env_var) {
+            Ok(value) if !value.is_empty() => Ok(value.into_bytes()),
+            Ok(_) => Err(StackError::InvalidSpec(format!(
+                "secret '{}' environment source '{}' resolved to an empty value",
+                secret_def.name, env_var
+            ))),
+            Err(std::env::VarError::NotPresent) => Err(StackError::InvalidSpec(format!(
+                "secret '{}' environment source '{}' is not set",
+                secret_def.name, env_var
+            ))),
+            Err(std::env::VarError::NotUnicode(_)) => Err(StackError::InvalidSpec(format!(
+                "secret '{}' environment source '{}' is not valid UTF-8",
+                secret_def.name, env_var
+            ))),
+        },
+    }
+}
 
 /// Trait abstracting container lifecycle operations.
 ///

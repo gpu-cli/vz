@@ -5,7 +5,10 @@ use super::tests_support::MockContainerRuntime;
 use super::*;
 use crate::reconcile::apply;
 use crate::spec::MountSpec as StackMountSpec;
-use crate::spec::{PortSpec, ResourcesSpec, ServiceKind, StackSpec, VolumeSpec};
+use crate::spec::{
+    PortSpec, ResourcesSpec, SecretDef, SecretSource, ServiceKind, ServiceSecretRef, StackSpec,
+    VolumeSpec,
+};
 use std::collections::HashMap;
 
 fn svc(name: &str, image: &str) -> ServiceSpec {
@@ -43,6 +46,16 @@ fn svc(name: &str, image: &str) -> ServiceSpec {
         stdin_open: false,
         tty: false,
         logging: None,
+    }
+}
+
+fn secret_ref(name: &str) -> ServiceSecretRef {
+    ServiceSecretRef {
+        source: name.to_string(),
+        target: name.to_string(),
+        mode: 0o444,
+        uid: 0,
+        gid: 0,
     }
 }
 
@@ -178,6 +191,83 @@ fn remove_service() {
     let old = observed.iter().find(|o| o.service_name == "old").unwrap();
     assert_eq!(old.phase, ServicePhase::Stopped);
     assert!(old.container_id.is_none());
+}
+
+#[test]
+fn environment_secret_source_is_staged_and_mounted() {
+    let runtime = MockContainerRuntime::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut executor = make_executor_with_dir(runtime, tmp.path());
+
+    let mut app = svc("app", "alpine:latest");
+    app.secrets = vec![secret_ref("runtime_secret")];
+    let spec = StackSpec {
+        name: "env-secret".to_string(),
+        services: vec![app],
+        networks: vec![default_network()],
+        volumes: vec![],
+        secrets: vec![SecretDef {
+            name: "runtime_secret".to_string(),
+            source: SecretSource::Environment("HOME".to_string()),
+        }],
+        disk_size_mb: None,
+    };
+    let actions = vec![Action::ServiceCreate {
+        service_name: "app".to_string(),
+    }];
+
+    let result = executor.execute(&spec, &actions).unwrap();
+    assert!(result.all_succeeded(), "errors: {:?}", result.errors);
+
+    let captured = executor.runtime.captured_configs.lock().unwrap();
+    let (_, app_config) = captured
+        .iter()
+        .find(|(container_id, _)| container_id == "ctr-app")
+        .unwrap();
+    let mount = app_config
+        .mounts
+        .iter()
+        .find(|mount| mount.target == std::path::PathBuf::from("/run/secrets/runtime_secret"))
+        .unwrap();
+    assert_eq!(mount.access, vz_runtime_contract::MountAccess::ReadOnly);
+    let staged_path = mount.source.as_ref().unwrap();
+    let staged = std::fs::read_to_string(staged_path).unwrap();
+    assert_eq!(staged, std::env::var("HOME").unwrap());
+}
+
+#[test]
+fn missing_environment_secret_source_fails_without_secret_material_in_error() {
+    let runtime = MockContainerRuntime::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut executor = make_executor_with_dir(runtime, tmp.path());
+
+    let mut app = svc("app", "alpine:latest");
+    app.secrets = vec![secret_ref("runtime_secret")];
+    let missing_env = "VZ_STACK_TEST_MISSING_SECRET_ENV_9421";
+    let spec = StackSpec {
+        name: "env-secret-missing".to_string(),
+        services: vec![app],
+        networks: vec![default_network()],
+        volumes: vec![],
+        secrets: vec![SecretDef {
+            name: "runtime_secret".to_string(),
+            source: SecretSource::Environment(missing_env.to_string()),
+        }],
+        disk_size_mb: None,
+    };
+    let actions = vec![Action::ServiceCreate {
+        service_name: "app".to_string(),
+    }];
+
+    let error = executor
+        .execute(&spec, &actions)
+        .expect_err("missing environment secret should fail closed")
+        .to_string();
+    assert!(error.contains(missing_env), "unexpected error: {error}");
+    assert!(
+        !error.contains("super-secret"),
+        "error should not leak secret values: {error}"
+    );
 }
 
 #[test]

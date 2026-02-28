@@ -475,6 +475,7 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
         )));
         let execution_id = match ensure_sandbox_shell_execution(
             self.daemon.clone(),
+            &sandbox,
             &container_id,
             &shell_command,
             &shell_args,

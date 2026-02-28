@@ -823,6 +823,7 @@ fn resolve_close_sandbox_shell_execution_id(
 
 async fn ensure_sandbox_shell_execution(
     daemon: Arc<RuntimeDaemon>,
+    sandbox: &Sandbox,
     container_id: &str,
     shell_command: &str,
     shell_args: &[String],
@@ -842,6 +843,10 @@ async fn ensure_sandbox_shell_execution(
     let execution_service = super::execution::ExecutionServiceImpl::new(daemon);
     let mut env_override = std::collections::HashMap::new();
     env_override.insert(SANDBOX_SHELL_SESSION_ENV_KEY.to_string(), "1".to_string());
+    env_override.extend(sandbox_shell_secret_env_reference_overrides(
+        &sandbox.labels,
+        request_id,
+    )?);
     let response = execution_service
         .create_execution(Request::new(runtime_v2::CreateExecutionRequest {
             metadata: Some(runtime_v2::RequestMetadata {
@@ -866,6 +871,89 @@ async fn ensure_sandbox_shell_execution(
         ))
     })?;
     Ok(execution.execution_id)
+}
+
+fn sandbox_shell_secret_env_reference_overrides(
+    labels: &BTreeMap<String, String>,
+    request_id: &str,
+) -> Result<std::collections::HashMap<String, String>, Status> {
+    let mut overrides = std::collections::HashMap::new();
+    for (key, env_var_name) in labels {
+        let Some(secret_name) = key.strip_prefix(SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX) else {
+            continue;
+        };
+        let secret_name = secret_name.trim();
+        if secret_name.is_empty() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                format!("sandbox label key `{key}` is invalid: secret name segment is empty"),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            )));
+        }
+        if !secret_name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                format!(
+                    "sandbox label key `{key}` is invalid: secret name must contain only ASCII letters, digits, `_`, or `-`"
+                ),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            )));
+        }
+        let env_var_name = env_var_name.trim();
+        if env_var_name.is_empty() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                format!(
+                    "sandbox secret `{secret_name}` has an empty external env source label value"
+                ),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            )));
+        }
+        match std::env::var(env_var_name) {
+            Ok(value) if !value.is_empty() => {}
+            Ok(_) => {
+                return Err(status_from_machine_error(MachineError::new(
+                    MachineErrorCode::ValidationError,
+                    format!(
+                        "required external secret source env var `{env_var_name}` for sandbox secret `{secret_name}` is empty"
+                    ),
+                    Some(request_id.to_string()),
+                    BTreeMap::new(),
+                )));
+            }
+            Err(std::env::VarError::NotPresent) => {
+                return Err(status_from_machine_error(MachineError::new(
+                    MachineErrorCode::ValidationError,
+                    format!(
+                        "required external secret source env var `{env_var_name}` for sandbox secret `{secret_name}` is not set"
+                    ),
+                    Some(request_id.to_string()),
+                    BTreeMap::new(),
+                )));
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(status_from_machine_error(MachineError::new(
+                    MachineErrorCode::ValidationError,
+                    format!(
+                        "required external secret source env var `{env_var_name}` for sandbox secret `{secret_name}` is not valid UTF-8"
+                    ),
+                    Some(request_id.to_string()),
+                    BTreeMap::new(),
+                )));
+            }
+        }
+        overrides.insert(
+            secret_name.to_string(),
+            format!("{SANDBOX_RUNTIME_ENV_REF_PREFIX}{env_var_name}"),
+        );
+    }
+    Ok(overrides)
 }
 
 fn execution_is_sandbox_shell_session(

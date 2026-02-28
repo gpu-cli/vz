@@ -169,16 +169,51 @@ fn build_exec_command(spec: &ExecutionSpec) -> Vec<String> {
     command
 }
 
-fn exec_config_from_execution(execution: &Execution) -> vz_runtime_contract::ExecConfig {
-    vz_runtime_contract::ExecConfig {
+fn resolve_runtime_env_override(
+    env_key: &str,
+    value: &str,
+) -> Result<String, vz_runtime_contract::RuntimeError> {
+    let Some(source_env_var) = value.strip_prefix(SANDBOX_RUNTIME_ENV_REF_PREFIX) else {
+        return Ok(value.to_string());
+    };
+
+    let source_env_var = source_env_var.trim();
+    if source_env_var.is_empty() {
+        return Err(vz_runtime_contract::RuntimeError::InvalidConfig(format!(
+            "execution env override `{env_key}` uses an empty runtime env reference source"
+        )));
+    }
+
+    match std::env::var(source_env_var) {
+        Ok(source_value) if !source_value.is_empty() => Ok(source_value),
+        Ok(_) => Err(vz_runtime_contract::RuntimeError::InvalidConfig(format!(
+            "runtime env source `{source_env_var}` for execution env `{env_key}` is empty"
+        ))),
+        Err(std::env::VarError::NotPresent) => {
+            Err(vz_runtime_contract::RuntimeError::InvalidConfig(format!(
+                "runtime env source `{source_env_var}` for execution env `{env_key}` is not set"
+            )))
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(vz_runtime_contract::RuntimeError::InvalidConfig(format!(
+                "runtime env source `{source_env_var}` for execution env `{env_key}` is not valid UTF-8"
+            )))
+        }
+    }
+}
+
+fn exec_config_from_execution(
+    execution: &Execution,
+) -> Result<vz_runtime_contract::ExecConfig, vz_runtime_contract::RuntimeError> {
+    let mut env = Vec::with_capacity(execution.exec_spec.env_override.len());
+    for (key, value) in &execution.exec_spec.env_override {
+        env.push((key.clone(), resolve_runtime_env_override(key, value)?));
+    }
+
+    Ok(vz_runtime_contract::ExecConfig {
         execution_id: Some(execution.execution_id.clone()),
         cmd: build_exec_command(&execution.exec_spec),
-        env: execution
-            .exec_spec
-            .env_override
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
+        env,
         working_dir: None,
         user: None,
         pty: execution.exec_spec.pty,
@@ -196,7 +231,7 @@ fn exec_config_from_execution(execution: &Execution) -> vz_runtime_contract::Exe
             .exec_spec
             .timeout_secs
             .map(std::time::Duration::from_secs),
-    }
+    })
 }
 
 fn should_start_execution_task(
@@ -324,7 +359,7 @@ async fn execute_backend_execution(
         .backend()
         .exec_container_streaming(
             &execution.container_id,
-            exec_config_from_execution(execution),
+            exec_config_from_execution(execution)?,
             |event| match event {
                 vz_oci_macos::InteractiveExecEvent::Stdout(stdout) => {
                     let _ = daemon
@@ -356,7 +391,7 @@ async fn execute_backend_execution(
         .manager()
         .exec_container(
             &execution.container_id,
-            exec_config_from_execution(execution),
+            exec_config_from_execution(execution)?,
         )
         .await?;
     Ok((output, false))
@@ -1418,5 +1453,73 @@ mod tests {
         ));
         assert_eq!(attempts.load(Ordering::Relaxed), 2);
         assert_eq!(session_checks.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn exec_config_from_execution_resolves_runtime_env_references() {
+        let home = std::env::var("HOME").expect("HOME should be set for test");
+        let execution = Execution {
+            execution_id: "exec-runtime-ref".to_string(),
+            container_id: "ctr-runtime-ref".to_string(),
+            exec_spec: ExecutionSpec {
+                cmd: vec!["echo".to_string()],
+                args: vec!["hello".to_string()],
+                env_override: BTreeMap::from([
+                    (
+                        "workspace_home".to_string(),
+                        format!("{SANDBOX_RUNTIME_ENV_REF_PREFIX}HOME"),
+                    ),
+                    ("plain".to_string(), "value".to_string()),
+                ]),
+                pty: false,
+                timeout_secs: None,
+            },
+            state: ExecutionState::Queued,
+            exit_code: None,
+            started_at: None,
+            ended_at: None,
+        };
+
+        let resolved =
+            exec_config_from_execution(&execution).expect("env references should resolve");
+        let resolved_env: BTreeMap<_, _> = resolved.env.into_iter().collect();
+        assert_eq!(
+            resolved_env.get("workspace_home").map(String::as_str),
+            Some(home.as_str())
+        );
+        assert_eq!(resolved_env.get("plain").map(String::as_str), Some("value"));
+    }
+
+    #[test]
+    fn exec_config_from_execution_rejects_missing_runtime_env_reference() {
+        let missing_source = (0..16u8)
+            .map(|attempt| format!("VZ_RUNTIME_ENV_REF_MISSING_{attempt}"))
+            .find(|candidate| std::env::var(candidate).is_err())
+            .expect("expected to find an unset env var");
+        let execution = Execution {
+            execution_id: "exec-runtime-ref-missing".to_string(),
+            container_id: "ctr-runtime-ref-missing".to_string(),
+            exec_spec: ExecutionSpec {
+                cmd: vec!["echo".to_string()],
+                args: Vec::new(),
+                env_override: BTreeMap::from([(
+                    "db_password".to_string(),
+                    format!("{SANDBOX_RUNTIME_ENV_REF_PREFIX}{missing_source}"),
+                )]),
+                pty: false,
+                timeout_secs: None,
+            },
+            state: ExecutionState::Queued,
+            exit_code: None,
+            started_at: None,
+            ended_at: None,
+        };
+
+        let error = exec_config_from_execution(&execution)
+            .expect_err("missing runtime env source should fail execution config resolution");
+        assert!(
+            matches!(error, vz_runtime_contract::RuntimeError::InvalidConfig(message) if message.contains(missing_source.as_str())),
+            "error should mention missing runtime env source"
+        );
     }
 }

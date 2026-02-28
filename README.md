@@ -68,6 +68,15 @@ vz inspect my-workspace
 
 `--base-image` and `--main-container` apply when creating a new sandbox (`vz` with no `-c/-r`).
 Spaces mode requires `vz.json` and Linux btrfs-backed workspace storage.
+`vz.json` must not embed raw secrets; use external env references under `secrets` instead:
+
+```json
+{
+  "secrets": {
+    "db_password": { "env": "DB_PASSWORD" }
+  }
+}
+```
 
 ### 2. Manage sandboxes
 

@@ -263,26 +263,40 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             let secrets_dir = self.data_dir.join("secrets").join(&spec.name);
             for svc in &spec.services {
                 for secret_ref in &svc.secrets {
-                    let secret_def = spec.secrets.iter().find(|d| d.name == secret_ref.source);
-                    if let Some(def) = secret_def {
-                        let secret_path = secrets_dir.join(&secret_ref.source);
-                        if !secret_path.exists() {
-                            if let Some(file_path) = def.file() {
-                                if let Ok(content) = std::fs::read(file_path) {
-                                    let _ = std::fs::create_dir_all(&secrets_dir);
-                                    let _ = std::fs::write(&secret_path, content);
+                    let def = spec
+                        .secrets
+                        .iter()
+                        .find(|d| d.name == secret_ref.source)
+                        .ok_or_else(|| {
+                            StackError::InvalidSpec(format!(
+                                "secret '{}' referenced by service '{}' not defined at top level",
+                                secret_ref.source, svc.name
+                            ))
+                        })?;
+                    let secret_path = secrets_dir.join(&secret_ref.source);
+                    if !secret_path.exists() {
+                        let content = load_secret_source_bytes(def)?;
+                        std::fs::create_dir_all(&secrets_dir).map_err(|error| {
+                            StackError::InvalidSpec(format!(
+                                "failed to create staged secrets directory '{}': {error}",
+                                secrets_dir.display()
+                            ))
+                        })?;
+                        std::fs::write(&secret_path, content).map_err(|error| {
+                            StackError::InvalidSpec(format!(
+                                "failed to write staged secret '{}': {error}",
+                                secret_path.display()
+                            ))
+                        })?;
 
-                                    // Add secret to volume mounts for VirtioFS sharing.
-                                    // Use "vz-mount-" prefix so OCI runtime translates to /mnt/vz-mount-X.
-                                    let idx = all_volume_mounts.len();
-                                    all_volume_mounts.push(vz_runtime_contract::StackVolumeMount {
-                                        tag: format!("vz-mount-{idx}"),
-                                        host_path: secret_path,
-                                        read_only: true,
-                                    });
-                                }
-                            }
-                        }
+                        // Add secret to volume mounts for VirtioFS sharing.
+                        // Use "vz-mount-" prefix so OCI runtime translates to /mnt/vz-mount-X.
+                        let idx = all_volume_mounts.len();
+                        all_volume_mounts.push(vz_runtime_contract::StackVolumeMount {
+                            tag: format!("vz-mount-{idx}"),
+                            host_path: secret_path,
+                            read_only: true,
+                        });
                     }
                 }
             }

@@ -1,6 +1,7 @@
 use vz_runtime_proto::runtime_v2;
 
 pub(in crate::grpc) const SANDBOX_SHELL_SESSION_ENV_KEY: &str = "VZ_SANDBOX_SHELL_SESSION";
+pub(in crate::grpc) const SANDBOX_RUNTIME_ENV_REF_PREFIX: &str = "__VZ_RUNTIME_ENV_REF__:";
 
 pub(in crate::grpc) fn normalize_optional_wire_field(value: &str) -> Option<String> {
     let raw = value.trim();

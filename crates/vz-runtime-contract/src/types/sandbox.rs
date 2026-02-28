@@ -28,6 +28,8 @@ pub const SANDBOX_LABEL_SPACE_MODE: &str = "vz.space.mode";
 pub const SANDBOX_SPACE_MODE_REQUIRED: &str = "required";
 /// Canonical sandbox label key for the checked-in space config path.
 pub const SANDBOX_LABEL_SPACE_CONFIG_PATH: &str = "vz.space.config_path";
+/// Canonical sandbox label key prefix mapping space secret names to external env sources.
+pub const SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX: &str = "vz.space.secret.env.";
 /// Canonical sandbox label key describing how base image defaulting was applied.
 pub const SANDBOX_LABEL_BASE_IMAGE_DEFAULT_SOURCE: &str = "vz.sandbox.base_image_default_source";
 /// Canonical sandbox label key describing how main container defaulting was applied.
