@@ -35,10 +35,14 @@ use super::space_cache_key::{
     SPACE_CACHE_KEY_SCHEMA_VERSION, SpaceCacheIndex, SpaceCacheKey, SpaceCacheKeyMaterial,
     SpaceCacheLookup, SpaceCacheRuntimeIdentity,
 };
-use super::space_cache_trust::{SpaceRemoteCacheTrustConfig, SpaceRemoteCacheVerificationOutcome};
+use super::space_cache_trust::{
+    SpaceRemoteCacheTrustConfig, SpaceRemoteCacheVerificationOutcome,
+    SpaceRemoteCacheVerifiedArtifact,
+};
 
 const SPACE_CONFIG_FILE: &str = "vz.json";
 const SPACE_CACHE_INDEX_FILE: &str = "space-cache-index.json";
+const SPACE_CACHE_ARTIFACTS_DIR: &str = "space-cache-artifacts";
 
 #[derive(Debug, Clone)]
 struct SpaceConfig {
@@ -433,6 +437,61 @@ fn space_cache_index_path(state_db: &Path) -> PathBuf {
     }
 }
 
+fn space_cache_artifact_root(state_db: &Path) -> PathBuf {
+    if let Some(parent) = state_db.parent() {
+        parent.join(SPACE_CACHE_ARTIFACTS_DIR)
+    } else {
+        PathBuf::from(SPACE_CACHE_ARTIFACTS_DIR)
+    }
+}
+
+fn space_cache_artifact_dir(state_db: &Path, key: &SpaceCacheKey) -> PathBuf {
+    space_cache_artifact_root(state_db)
+        .join(&key.cache_name)
+        .join(&key.digest_hex)
+}
+
+fn materialize_verified_remote_cache_artifact(
+    state_db: &Path,
+    key: &SpaceCacheKey,
+    artifact: &SpaceRemoteCacheVerifiedArtifact,
+) -> anyhow::Result<PathBuf> {
+    let target_dir = space_cache_artifact_dir(state_db, key);
+    std::fs::create_dir_all(&target_dir).with_context(|| {
+        format!(
+            "failed to create local spaces cache artifact directory {}",
+            target_dir.display()
+        )
+    })?;
+
+    let target_manifest = target_dir.join("manifest.json");
+    let target_signature = target_dir.join("signature.sig");
+    let target_blob = target_dir.join("payload.tar.zst");
+    std::fs::copy(&artifact.manifest_path, &target_manifest).with_context(|| {
+        format!(
+            "failed to materialize manifest {} -> {}",
+            artifact.manifest_path.display(),
+            target_manifest.display()
+        )
+    })?;
+    std::fs::copy(&artifact.signature_path, &target_signature).with_context(|| {
+        format!(
+            "failed to materialize signature {} -> {}",
+            artifact.signature_path.display(),
+            target_signature.display()
+        )
+    })?;
+    std::fs::copy(&artifact.blob_path, &target_blob).with_context(|| {
+        format!(
+            "failed to materialize payload {} -> {}",
+            artifact.blob_path.display(),
+            target_blob.display()
+        )
+    })?;
+
+    Ok(target_blob)
+}
+
 fn sha256_file_hex(path: &Path) -> anyhow::Result<String> {
     let bytes =
         std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -553,11 +612,23 @@ fn update_space_cache_index(state_db: &Path, cache_keys: &[SpaceCacheKey]) -> an
             && let Some(remote_cache_trust) = remote_cache_trust.as_ref()
         {
             match remote_cache_trust.verify_key(key) {
-                SpaceRemoteCacheVerificationOutcome::Verified { .. } => {
-                    println!(
-                        "[cache:{}] remote verified {}",
-                        key.cache_name, key.digest_hex
-                    );
+                SpaceRemoteCacheVerificationOutcome::Verified { artifact } => {
+                    match materialize_verified_remote_cache_artifact(state_db, key, &artifact) {
+                        Ok(local_payload_path) => {
+                            println!(
+                                "[cache:{}] remote verified + materialized {} ({})",
+                                key.cache_name,
+                                key.digest_hex,
+                                local_payload_path.display()
+                            );
+                        }
+                        Err(error) => {
+                            println!(
+                                "[cache:{}] remote miss (materialization failed: {error}) {}",
+                                key.cache_name, key.digest_hex
+                            );
+                        }
+                    }
                 }
                 SpaceRemoteCacheVerificationOutcome::Miss(reason) => {
                     println!(
@@ -2618,6 +2689,7 @@ fn generate_sandbox_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::space_cache_trust::SpaceRemoteCacheManifestV1;
     use std::fs;
     use tempfile::tempdir;
 
@@ -2820,6 +2892,71 @@ mod tests {
         assert_ne!(
             first.get("redis.key_prefix").map(String::as_str),
             second.get("redis.key_prefix").map(String::as_str)
+        );
+    }
+
+    #[test]
+    fn materialize_verified_remote_cache_artifact_copies_manifest_signature_and_blob() {
+        let dir = tempdir().expect("tempdir");
+        let state_db = dir.path().join("state").join("stack-state.db");
+        fs::create_dir_all(
+            state_db
+                .parent()
+                .expect("state db should always have a parent path"),
+        )
+        .expect("state dir");
+
+        let source_dir = dir.path().join("remote").join("deps").join("abc123");
+        fs::create_dir_all(&source_dir).expect("source dir");
+        let source_manifest = source_dir.join("manifest.json");
+        let source_signature = source_dir.join("signature.sig");
+        let source_blob = source_dir.join("payload.tar.zst");
+
+        let source_manifest_value = SpaceRemoteCacheManifestV1 {
+            schema_version: 1,
+            cache_name: "deps".to_string(),
+            key_digest_hex: "abc123".to_string(),
+            blob_digest_sha256: "f".repeat(64),
+            publisher: "acme-ci".to_string(),
+            signed_at: 1,
+        };
+        fs::write(
+            &source_manifest,
+            serde_json::to_vec(&source_manifest_value).expect("manifest"),
+        )
+        .expect("write manifest");
+        fs::write(&source_signature, [7u8; 64]).expect("write signature");
+        fs::write(&source_blob, b"remote-payload").expect("write blob");
+
+        let key = SpaceCacheKey {
+            schema_version: SPACE_CACHE_KEY_SCHEMA_VERSION,
+            cache_name: "deps".to_string(),
+            digest_hex: "abc123".to_string(),
+            canonical_json: "{}".to_string(),
+        };
+        let artifact = SpaceRemoteCacheVerifiedArtifact {
+            manifest: source_manifest_value,
+            manifest_path: source_manifest.clone(),
+            signature_path: source_signature.clone(),
+            blob_path: source_blob.clone(),
+        };
+        let local_blob = materialize_verified_remote_cache_artifact(&state_db, &key, &artifact)
+            .expect("materialize should succeed");
+        let local_dir = local_blob
+            .parent()
+            .expect("materialized payload should have parent");
+
+        assert_eq!(
+            fs::read(local_dir.join("manifest.json")).expect("read local manifest"),
+            fs::read(&source_manifest).expect("read source manifest")
+        );
+        assert_eq!(
+            fs::read(local_dir.join("signature.sig")).expect("read local signature"),
+            fs::read(&source_signature).expect("read source signature")
+        );
+        assert_eq!(
+            fs::read(&local_blob).expect("read local blob"),
+            fs::read(&source_blob).expect("read source blob")
         );
     }
 

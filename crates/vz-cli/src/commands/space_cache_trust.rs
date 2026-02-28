@@ -26,6 +26,14 @@ pub struct SpaceRemoteCacheManifestV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceRemoteCacheVerifiedArtifact {
+    pub manifest: SpaceRemoteCacheManifestV1,
+    pub manifest_path: PathBuf,
+    pub signature_path: PathBuf,
+    pub blob_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpaceRemoteCacheMissReason {
     NotFound,
     MissingSignature,
@@ -81,7 +89,7 @@ impl SpaceRemoteCacheMissReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpaceRemoteCacheVerificationOutcome {
     Verified {
-        manifest: SpaceRemoteCacheManifestV1,
+        artifact: SpaceRemoteCacheVerifiedArtifact,
     },
     Miss(SpaceRemoteCacheMissReason),
 }
@@ -265,7 +273,14 @@ pub fn verify_remote_cache_artifact(
         );
     }
 
-    SpaceRemoteCacheVerificationOutcome::Verified { manifest }
+    SpaceRemoteCacheVerificationOutcome::Verified {
+        artifact: SpaceRemoteCacheVerifiedArtifact {
+            manifest,
+            manifest_path: manifest_path.to_path_buf(),
+            signature_path: signature_path.to_path_buf(),
+            blob_path: blob_path.to_path_buf(),
+        },
+    }
 }
 
 fn parse_detached_signature(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
