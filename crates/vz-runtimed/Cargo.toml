@@ -32,6 +32,7 @@ vz-oci-macos = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 vz-linux-native = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 hyper-util = { workspace = true, features = ["tokio"] }

@@ -4,7 +4,7 @@
 //! mapping used by `sandbox::rpc` endpoint implementations.
 
 use super::super::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use vz_runtime_contract::{RuntimeBackend, StackResourceHint, StackVolumeMount};
 use vz_runtime_proto::runtime_v2::container_service_server::ContainerService as _;
 use vz_runtime_proto::runtime_v2::execution_service_server::ExecutionService as _;
@@ -250,10 +250,21 @@ fn sandbox_workspace_volume_mount(
     labels: &BTreeMap<String, String>,
     request_id: &str,
 ) -> Result<Option<StackVolumeMount>, Status> {
+    let spaces_mode_required = sandbox_space_mode_required(labels);
     let Some(project_dir) = labels
-        .get("project_dir")
+        .get(SANDBOX_LABEL_PROJECT_DIR)
         .and_then(|value| normalize_optional_wire_field(value))
     else {
+        if spaces_mode_required {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                format!(
+                    "spaces mode requires sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` with an absolute workspace directory path"
+                ),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            )));
+        }
         return Ok(None);
     };
 
@@ -262,7 +273,7 @@ fn sandbox_workspace_volume_mount(
         return Err(status_from_machine_error(MachineError::new(
             MachineErrorCode::ValidationError,
             format!(
-                "sandbox label `project_dir` must be an absolute path: {}",
+                "sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` must be an absolute path: {}",
                 host_path.display()
             ),
             Some(request_id.to_string()),
@@ -273,7 +284,7 @@ fn sandbox_workspace_volume_mount(
         return Err(status_from_machine_error(MachineError::new(
             MachineErrorCode::ValidationError,
             format!(
-                "sandbox label `project_dir` does not exist: {}",
+                "sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` does not exist: {}",
                 host_path.display()
             ),
             Some(request_id.to_string()),
@@ -284,12 +295,15 @@ fn sandbox_workspace_volume_mount(
         return Err(status_from_machine_error(MachineError::new(
             MachineErrorCode::ValidationError,
             format!(
-                "sandbox label `project_dir` must reference a directory: {}",
+                "sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` must reference a directory: {}",
                 host_path.display()
             ),
             Some(request_id.to_string()),
             BTreeMap::new(),
         )));
+    }
+    if spaces_mode_required {
+        enforce_spaces_workspace_storage_preflight(&host_path, request_id)?;
     }
 
     Ok(Some(StackVolumeMount {
@@ -297,6 +311,100 @@ fn sandbox_workspace_volume_mount(
         host_path,
         read_only: false,
     }))
+}
+
+fn sandbox_space_mode_required(labels: &BTreeMap<String, String>) -> bool {
+    labels
+        .get(SANDBOX_LABEL_SPACE_MODE)
+        .and_then(|value| normalize_optional_wire_field(value))
+        .is_some_and(|value| value.eq_ignore_ascii_case(SANDBOX_SPACE_MODE_REQUIRED))
+}
+
+fn enforce_spaces_workspace_storage_preflight(
+    host_path: &Path,
+    request_id: &str,
+) -> Result<(), Status> {
+    #[cfg(target_os = "linux")]
+    {
+        if path_is_on_btrfs(host_path, request_id)? {
+            return Ok(());
+        }
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::UnsupportedOperation,
+            format!(
+                "spaces mode requires btrfs workspace storage; `{}` is not on btrfs",
+                host_path.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::UnsupportedOperation,
+            format!(
+                "spaces mode requires Linux btrfs workspace storage; current platform `{}` is unsupported for workspace `{}`",
+                std::env::consts::OS,
+                host_path.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn path_is_on_btrfs(path: &Path, request_id: &str) -> Result<bool, Status> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    const BTRFS_SUPER_MAGIC: libc::c_long = 0x9123_683E;
+
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::BackendUnavailable,
+            format!(
+                "failed to resolve workspace path {} during btrfs preflight: {error}",
+                path.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })?;
+    let path_cstr = CString::new(canonical.as_os_str().as_bytes()).map_err(|_| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!(
+                "workspace path contains unsupported null byte: {}",
+                canonical.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })?;
+
+    #[allow(unsafe_code)]
+    let f_type = unsafe {
+        let mut stat: libc::statfs = std::mem::zeroed();
+        if libc::statfs(path_cstr.as_ptr(), &mut stat) != 0 {
+            let io_error = std::io::Error::last_os_error();
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::BackendUnavailable,
+                format!(
+                    "failed to inspect workspace filesystem for {}: {}",
+                    canonical.display(),
+                    io_error
+                ),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            )));
+        }
+        stat.f_type as libc::c_long
+    };
+
+    Ok(f_type == BTRFS_SUPER_MAGIC)
 }
 
 async fn boot_runtime_sandbox_resources(

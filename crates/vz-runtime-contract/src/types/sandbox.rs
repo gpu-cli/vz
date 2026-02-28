@@ -20,6 +20,14 @@ pub enum SandboxBackend {
 pub const SANDBOX_LABEL_BASE_IMAGE_REF: &str = "vz.sandbox.base_image_ref";
 /// Canonical sandbox label key for main container selection.
 pub const SANDBOX_LABEL_MAIN_CONTAINER: &str = "vz.sandbox.main_container";
+/// Canonical sandbox label key for project workspace directory mount.
+pub const SANDBOX_LABEL_PROJECT_DIR: &str = "project_dir";
+/// Canonical sandbox label key for spaces mode selection.
+pub const SANDBOX_LABEL_SPACE_MODE: &str = "vz.space.mode";
+/// Canonical sandbox label value indicating spaces mode is required.
+pub const SANDBOX_SPACE_MODE_REQUIRED: &str = "required";
+/// Canonical sandbox label key for the checked-in space config path.
+pub const SANDBOX_LABEL_SPACE_CONFIG_PATH: &str = "vz.space.config_path";
 /// Canonical sandbox label key describing how base image defaulting was applied.
 pub const SANDBOX_LABEL_BASE_IMAGE_DEFAULT_SOURCE: &str = "vz.sandbox.base_image_default_source";
 /// Canonical sandbox label key describing how main container defaulting was applied.

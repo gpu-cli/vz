@@ -23,8 +23,10 @@ use tracing::error;
 
 /// vz — instant sandboxed Linux environments.
 ///
-/// Run `vz` to create and attach to a new sandbox. Use `vz -c` to continue
-/// the most recent sandbox, or `vz -r <name>` to resume a specific one.
+/// Run `vz` in a project with `vz.json` on btrfs-backed storage to create and
+/// attach to a new sandbox.
+/// Use `vz -c` to continue the most recent sandbox, or `vz -r <name>` to resume
+/// a specific one.
 #[derive(Parser, Debug)]
 #[command(
     name = "vz",

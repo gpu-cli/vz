@@ -50,9 +50,16 @@ VM commands require the `com.apple.security.virtualization` entitlement.
 ### 1. Boot an instant sandbox
 
 ```bash
+# Create a required checked-in space definition
+cat > vz.json <<'JSON'
+{
+  "name": "my-workspace"
+}
+JSON
+
 # Create + attach a new sandbox for the current directory
 vz --name my-workspace --cpus 4 --memory 4096 \
-  --base-image alpine:3.20 \
+  --base-image debian:bookworm \
   --main-container workspace-main
 
 # Inspect persisted startup selection
@@ -60,34 +67,24 @@ vz inspect my-workspace
 ```
 
 `--base-image` and `--main-container` apply when creating a new sandbox (`vz` with no `-c/-r`).
+Spaces mode requires `vz.json` and Linux btrfs-backed workspace storage.
 
-### 2. Run OCI containers
-
-```bash
-# Run a one-shot command
-vz run alpine:3.20 -- echo "hello from vz"
-
-# Publish a port
-vz run --publish 8080:80 nginx:alpine
-```
-
-### 3. Create and manage long-lived containers
+### 2. Manage sandboxes
 
 ```bash
-# Start a container in the background
-vz create --name devbox ubuntu:24.04 -- sleep infinity
+# Continue or resume
+vz -c
+vz -r my-workspace
 
-# Inspect and execute commands
-vz ps
-vz exec devbox -- uname -a
-vz logs devbox --tail 50
+# List and inspect
+vz ls
+vz inspect my-workspace
 
-# Stop and remove
-vz stop devbox
-vz rm devbox
+# Remove a sandbox
+vz rm my-workspace
 ```
 
-### 4. Run a Compose stack
+### 3. Run a Compose stack
 
 ```bash
 # Start services
@@ -101,7 +98,7 @@ vz stack logs demo --service web --follow
 vz stack down demo --volumes
 ```
 
-### 5. Manage macOS VMs (macOS only)
+### 4. Manage macOS VMs (macOS only)
 
 ```bash
 # Create a pinned base image from the stable channel
@@ -129,7 +126,7 @@ vz vm save dev --stop
 vz vm run --image ~/.vz/images/base.img --name dev --restore ~/.vz/state/dev.vzsave --headless &
 ```
 
-### 6. Pinned-base automation policy (macOS VM flows)
+### 5. Pinned-base automation policy (macOS VM flows)
 
 - `vz vm init --base <selector>`, `vz vm provision --base-id <selector>`, and `vz vm base verify --base-id <selector>` accept immutable base IDs plus channel aliases (`stable`, `previous`).
 - Base descriptors include support lifecycle metadata (`active` or `retired`); selecting a retired or unknown base fails with explicit fallback guidance.
@@ -145,7 +142,7 @@ vz vm init --allow-unpinned --ipsw ~/Downloads/restore.ipsw
 sudo vz vm provision --image ~/.vz/images/base.img --allow-unpinned
 ```
 
-### 7. Create signed patch bundles
+### 6. Create signed patch bundles
 
 ```bash
 # Generate an Ed25519 signing key (PKCS#8 PEM)
@@ -168,7 +165,7 @@ sudo vz vm patch apply --bundle /tmp/patch-1.vzpatch --image ~/.vz/images/base.i
 
 For advanced CI workflows, `vz vm patch create` also supports `--operations <json>` + `--payload-dir <dir>`.
 
-### 8. Primary image-delta patch flow (sudo once, then sudoless apply)
+### 7. Primary image-delta patch flow (sudo once, then sudoless apply)
 
 ```bash
 # 1) Create a binary image delta from a signed bundle (runs bundle apply on a temp image copy)

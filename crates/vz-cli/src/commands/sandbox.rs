@@ -15,8 +15,9 @@ use reqwest::StatusCode as HttpStatusCode;
 use serde::{Deserialize, Serialize};
 use tonic::Code;
 use vz_runtime_contract::{
-    SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER, Sandbox, SandboxBackend,
-    SandboxSpec, SandboxState,
+    SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER, SANDBOX_LABEL_PROJECT_DIR,
+    SANDBOX_LABEL_SPACE_CONFIG_PATH, SANDBOX_LABEL_SPACE_MODE, SANDBOX_SPACE_MODE_REQUIRED,
+    Sandbox, SandboxBackend, SandboxSpec, SandboxState,
 };
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed_client::DaemonClientError;
@@ -26,7 +27,7 @@ use super::runtime_daemon::{
     default_state_db_path, runtime_api_base_url,
 };
 
-const SANDBOX_PROJECT_DIR_LABEL: &str = "project_dir";
+const SPACE_CONFIG_FILE: &str = "vz.json";
 
 fn sandbox_backend_from_wire(backend: &str) -> SandboxBackend {
     match backend.trim().to_ascii_lowercase().as_str() {
@@ -85,6 +86,95 @@ fn apply_startup_selection_labels(
             main_container.to_string(),
         );
     }
+}
+
+fn ensure_space_config_exists(cwd: &Path) -> anyhow::Result<PathBuf> {
+    let config_path = cwd.join(SPACE_CONFIG_FILE);
+    if !config_path.is_file() {
+        bail!(
+            "spaces mode requires `{}` in {}. add a `{}` and retry",
+            SPACE_CONFIG_FILE,
+            cwd.display(),
+            SPACE_CONFIG_FILE
+        );
+    }
+
+    let raw = std::fs::read(&config_path).with_context(|| {
+        format!(
+            "failed to read required space definition file {}",
+            config_path.display()
+        )
+    })?;
+    serde_json::from_slice::<serde_json::Value>(&raw).with_context(|| {
+        format!(
+            "invalid `{}` at {}: must contain valid JSON",
+            SPACE_CONFIG_FILE,
+            config_path.display()
+        )
+    })?;
+
+    Ok(config_path)
+}
+
+fn enforce_btrfs_workspace_preflight(workspace_root: &Path) -> anyhow::Result<()> {
+    if !workspace_root.is_dir() {
+        bail!(
+            "workspace path is not a directory: {}",
+            workspace_root.display()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if path_is_on_btrfs(workspace_root)? {
+            return Ok(());
+        }
+        bail!(
+            "spaces mode requires btrfs workspace storage; `{}` is not on btrfs",
+            workspace_root.display()
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        bail!(
+            "spaces mode requires Linux btrfs workspace storage; current platform `{}` is unsupported",
+            std::env::consts::OS
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn path_is_on_btrfs(path: &Path) -> anyhow::Result<bool> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    const BTRFS_SUPER_MAGIC: libc::c_long = 0x9123_683E;
+
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("failed to resolve workspace path {}", path.display()))?;
+    let path_cstr = CString::new(canonical.as_os_str().as_bytes()).with_context(|| {
+        format!(
+            "workspace path contains unsupported null byte: {}",
+            canonical.display()
+        )
+    })?;
+
+    #[allow(unsafe_code)]
+    let f_type = unsafe {
+        let mut stat: libc::statfs = std::mem::zeroed();
+        if libc::statfs(path_cstr.as_ptr(), &mut stat) != 0 {
+            let io_error = std::io::Error::last_os_error();
+            return Err(anyhow!(
+                "failed to inspect workspace filesystem for {}: {}",
+                canonical.display(),
+                io_error
+            ));
+        }
+        stat.f_type as libc::c_long
+    };
+
+    Ok(f_type == BTRFS_SUPER_MAGIC)
 }
 
 fn sandbox_from_proto(payload: runtime_v2::SandboxPayload) -> anyhow::Result<Sandbox> {
@@ -863,10 +953,13 @@ pub async fn cmd_default_sandbox(
         return cmd_resume_sandbox(&state_db, target).await;
     }
 
-    // Create a new sandbox.
+    // Create a new sandbox in spaces mode.
+    let space_config_path = ensure_space_config_exists(&cwd)?;
+    enforce_btrfs_workspace_preflight(&cwd)?;
     cmd_create_sandbox(
         &state_db,
         &cwd,
+        &space_config_path,
         name,
         cpus,
         memory,
@@ -885,7 +978,7 @@ async fn cmd_continue_sandbox(state_db: &Path, cwd: &Path) -> anyhow::Result<()>
     let matching: Vec<_> = sandboxes
         .iter()
         .filter(|s| {
-            s.labels.get(SANDBOX_PROJECT_DIR_LABEL).map(|d| d.as_str()) == Some(&*cwd_str)
+            s.labels.get(SANDBOX_LABEL_PROJECT_DIR).map(|d| d.as_str()) == Some(&*cwd_str)
                 && !s.state.is_terminal()
         })
         .collect();
@@ -940,6 +1033,7 @@ async fn cmd_resume_sandbox(state_db: &Path, target: &str) -> anyhow::Result<()>
 async fn cmd_create_sandbox(
     state_db: &Path,
     cwd: &Path,
+    space_config_path: &Path,
     name: Option<String>,
     cpus: u8,
     memory: u64,
@@ -951,8 +1045,16 @@ async fn cmd_create_sandbox(
 
     let mut labels = BTreeMap::new();
     labels.insert(
-        SANDBOX_PROJECT_DIR_LABEL.to_string(),
+        SANDBOX_LABEL_PROJECT_DIR.to_string(),
         cwd.to_string_lossy().to_string(),
+    );
+    labels.insert(
+        SANDBOX_LABEL_SPACE_MODE.to_string(),
+        SANDBOX_SPACE_MODE_REQUIRED.to_string(),
+    );
+    labels.insert(
+        SANDBOX_LABEL_SPACE_CONFIG_PATH.to_string(),
+        space_config_path.to_string_lossy().to_string(),
     );
     labels.insert("source".to_string(), "standalone".to_string());
     if let Some(ref n) = name {
@@ -967,6 +1069,7 @@ async fn cmd_create_sandbox(
 
     println!("Booting sandbox {display_name}...");
     println!("Mounting {} → /workspace", cwd.display());
+    println!("Using space definition {}", space_config_path.display());
 
     let sandbox =
         daemon_create_sandbox(state_db, &sandbox_id, cpus, memory, labels.clone()).await?;
@@ -1632,7 +1735,7 @@ pub async fn cmd_list(args: SandboxListArgs) -> anyhow::Result<()> {
             .to_string();
         let dir = sandbox
             .labels
-            .get(SANDBOX_PROJECT_DIR_LABEL)
+            .get(SANDBOX_LABEL_PROJECT_DIR)
             .map(|d| {
                 // Shorten home dir.
                 if let Ok(home) = std::env::var("HOME") {
@@ -1748,6 +1851,8 @@ fn generate_sandbox_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn detach_prefix_matches_ctrl_p_byte() {
@@ -1788,6 +1893,64 @@ mod tests {
         assert_eq!(
             labels.get(SANDBOX_LABEL_MAIN_CONTAINER).map(String::as_str),
             Some("workspace-main")
+        );
+    }
+
+    #[test]
+    fn ensure_space_config_exists_rejects_missing_file() {
+        let dir = tempdir().expect("tempdir");
+        let error =
+            ensure_space_config_exists(dir.path()).expect_err("missing vz.json should fail");
+        assert!(
+            error.to_string().contains("requires `vz.json`"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn ensure_space_config_exists_rejects_invalid_json() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("vz.json");
+        fs::write(&path, "{ invalid json").expect("write invalid config");
+        let error = ensure_space_config_exists(dir.path()).expect_err("invalid JSON should fail");
+        assert!(
+            error.to_string().contains("invalid `vz.json`"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn ensure_space_config_exists_accepts_valid_json() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("vz.json");
+        fs::write(&path, r#"{"image":"ubuntu:24.04"}"#).expect("write config");
+        let resolved = ensure_space_config_exists(dir.path()).expect("valid config should pass");
+        assert_eq!(resolved, path);
+    }
+
+    #[test]
+    fn btrfs_preflight_rejects_non_directory_paths() {
+        let error = enforce_btrfs_workspace_preflight(Path::new("/definitely/not/a/real/path"))
+            .expect_err("non-directory path should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("workspace path is not a directory"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn btrfs_preflight_rejects_non_linux_platforms() {
+        let dir = tempdir().expect("tempdir");
+        let error =
+            enforce_btrfs_workspace_preflight(dir.path()).expect_err("non-linux should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("requires Linux btrfs workspace storage"),
+            "unexpected error: {error:#}"
         );
     }
 }

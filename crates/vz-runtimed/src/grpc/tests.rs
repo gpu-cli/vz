@@ -7,7 +7,9 @@ use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 use vz_runtime_contract::{
-    PolicyDecision, RequestMetadata, RuntimeOperation, RuntimePolicyHook, SandboxBackend,
+    PolicyDecision, RequestMetadata, RuntimeOperation, RuntimePolicyHook,
+    SANDBOX_LABEL_PROJECT_DIR, SANDBOX_LABEL_SPACE_MODE, SANDBOX_SPACE_MODE_REQUIRED,
+    SandboxBackend,
 };
 
 use super::*;
@@ -538,6 +540,200 @@ async fn create_sandbox_rejects_empty_stack_name() {
         .expect_err("create_sandbox should reject empty stack_name")
         .code();
     assert_eq!(status, tonic::Code::InvalidArgument);
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn create_sandbox_spaces_mode_requires_project_dir_label() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let mut labels = std::collections::HashMap::new();
+    labels.insert(
+        SANDBOX_LABEL_SPACE_MODE.to_string(),
+        SANDBOX_SPACE_MODE_REQUIRED.to_string(),
+    );
+    let mut client = connect_sandbox_client(&config.socket_path).await;
+    let response = client
+        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+            metadata: None,
+            stack_name: "stack-spaces-missing-project-dir".to_string(),
+            cpus: 1,
+            memory_mb: 512,
+            labels,
+        }))
+        .await
+        .expect("create_sandbox call");
+    let mut stream = response.into_inner();
+    let status = try_read_create_sandbox_completion(&mut stream)
+        .await
+        .expect_err("spaces mode should fail without project_dir");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains(SANDBOX_LABEL_PROJECT_DIR),
+        "error should mention missing project_dir label"
+    );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn create_sandbox_spaces_mode_rejects_non_btrfs_workspace_storage() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    #[cfg(target_os = "linux")]
+    let project_dir = "/proc".to_string();
+    #[cfg(not(target_os = "linux"))]
+    let project_dir = {
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+        workspace.to_string_lossy().to_string()
+    };
+
+    let mut labels = std::collections::HashMap::new();
+    labels.insert(
+        SANDBOX_LABEL_SPACE_MODE.to_string(),
+        SANDBOX_SPACE_MODE_REQUIRED.to_string(),
+    );
+    labels.insert(SANDBOX_LABEL_PROJECT_DIR.to_string(), project_dir);
+
+    let mut client = connect_sandbox_client(&config.socket_path).await;
+    let response = client
+        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+            metadata: None,
+            stack_name: "stack-spaces-preflight".to_string(),
+            cpus: 1,
+            memory_mb: 512,
+            labels,
+        }))
+        .await
+        .expect("create_sandbox call");
+    let mut stream = response.into_inner();
+    let status = try_read_create_sandbox_completion(&mut stream)
+        .await
+        .expect_err("spaces mode should fail when btrfs preflight fails");
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
+    assert!(
+        status.message().contains("btrfs workspace storage"),
+        "error should mention btrfs storage requirement"
+    );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn create_sandbox_workspace_label_without_spaces_mode_skips_btrfs_gate() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let workspace_dir = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace_dir).expect("create workspace dir");
+
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let mut labels = std::collections::HashMap::new();
+    labels.insert(
+        SANDBOX_LABEL_PROJECT_DIR.to_string(),
+        workspace_dir.to_string_lossy().to_string(),
+    );
+
+    let mut client = connect_sandbox_client(&config.socket_path).await;
+    let created = read_create_sandbox_completion_response(
+        client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "stack-project-dir-without-spaces-mode".to_string(),
+                cpus: 1,
+                memory_mb: 512,
+                labels,
+            }))
+            .await
+            .expect("create sandbox"),
+    )
+    .await;
+    let payload = created
+        .sandbox
+        .as_ref()
+        .expect("sandbox payload should be present");
+    assert_eq!(
+        payload
+            .labels
+            .get(SANDBOX_LABEL_PROJECT_DIR)
+            .map(String::as_str),
+        Some(workspace_dir.to_string_lossy().as_ref())
+    );
 
     shutdown.notify_waiters();
     let result = tokio::time::timeout(Duration::from_secs(5), server)

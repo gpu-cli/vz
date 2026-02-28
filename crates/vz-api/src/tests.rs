@@ -804,6 +804,55 @@ async fn sandbox_create_stream_terminal_validation_error_maps_to_http_bad_reques
 }
 
 #[tokio::test]
+async fn sandbox_create_spaces_mode_storage_preflight_maps_to_http_not_implemented() {
+    let (app, dir) = test_router();
+
+    #[cfg(target_os = "linux")]
+    let project_dir = "/proc".to_string();
+    #[cfg(not(target_os = "linux"))]
+    let project_dir = {
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        workspace.to_string_lossy().to_string()
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sandboxes")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "stack_name": "sbx-spaces-storage-preflight",
+                        "labels": {
+                            "project_dir": project_dir,
+                            "vz.space.mode": "required"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["error"]["code"].as_str(),
+        Some("unsupported_operation")
+    );
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("btrfs workspace storage")),
+        "error message should include btrfs preflight details"
+    );
+}
+
+#[tokio::test]
 async fn sandbox_list_empty() {
     let (app, _dir) = test_router();
     let response = app
