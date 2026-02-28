@@ -19,6 +19,11 @@ reqwest = { workspace = true, features = ["blocking"] }
 sha2 = { workspace = true }
 flate2 = "1"
 tar = "0.4"
+tonic = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+uuid = { workspace = true }
+bollard-buildkit-proto = { version = "=0.6.0", default-features = false }
 
 [dev-dependencies]
 tempfile = { workspace = true }

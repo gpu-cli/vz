@@ -290,6 +290,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bollard-buildkit-proto"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "519f436400f0e464f95baa6527b779bb5c961ba5411fb9539ca12392d1d5f95f"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tonic",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3825,6 +3836,7 @@ dependencies = [
 name = "vz-oci"
 version = "0.1.0"
 dependencies = [
+ "bollard-buildkit-proto",
  "flate2",
  "oci-spec",
  "reqwest",
@@ -3835,6 +3847,10 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "uuid",
  "vz-image",
  "vz-runtime-contract",
 ]
