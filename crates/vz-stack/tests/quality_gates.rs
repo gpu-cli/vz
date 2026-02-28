@@ -114,6 +114,8 @@ fn quality_gate_docker_compose_shim_mapping_is_stable() {
 services:
   db:
     image: postgres:16
+    healthcheck:
+      test: [\"CMD\", \"pg_isready\", \"-U\", \"postgres\"]
   web:
     image: nginx:latest
     depends_on:
