@@ -7,7 +7,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use docker_credential::{CredentialRetrievalError, DockerCredential, get_credential};
@@ -33,12 +35,17 @@ use super::common::{
 use super::{
     BUILD_OUTPUT_ARCHIVE, BUILDKIT_AUTH_GUEST_CONFIG, BUILDKIT_AUTH_GUEST_DIR, BUILDKIT_AUTH_TAG,
     BUILDKIT_BUILD_TIMEOUT, BUILDKIT_CACHE_KEEP_BYTES, BUILDKIT_CACHE_KEEP_DURATION,
-    BUILDKIT_GUEST_HOST_OUTPUT_ARCHIVE, BUILDKIT_GUEST_OUTPUT_ARCHIVE,
-    BUILDKIT_OUTPUT_COPY_TIMEOUT, BUILDKIT_RUNC_GUEST_PATH, BUILDKIT_SETUP_TIMEOUT,
-    BUILDKIT_SHUTDOWN_TIMEOUT, BUILDKIT_SNAPSHOTTER, BUILDKIT_VM_MEMORY_MB, BUILDKITD_ADDR,
-    BuildEvent, BuildLogStream, BuildOutput, BuildProgress, BuildRequest, BuildResult,
-    BuildkitError, CachePruneOptions,
+    BUILDKIT_RUNC_GUEST_PATH, BUILDKIT_SETUP_TIMEOUT, BUILDKIT_SHUTDOWN_TIMEOUT,
+    BUILDKIT_SNAPSHOTTER, BUILDKIT_VM_MEMORY_MB, BUILDKITD_ADDR, BuildEvent, BuildLogStream,
+    BuildOutput, BuildProgress, BuildRequest, BuildResult, BuildkitError, CachePruneOptions,
 };
+
+const BUILDKIT_VM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const BUILDKIT_VM_RETRY_DELAY: Duration = Duration::from_millis(100);
+const BUILDKIT_SHARED_OUTPUT_TAG: &str = "build-output";
+const BUILDKIT_SHARED_CONTEXT_TAG: &str = "build-context";
+
+static BUILDKIT_VM_MANAGER: OnceLock<Arc<BuildkitVmManager>> = OnceLock::new();
 
 #[derive(Debug, Serialize)]
 struct DockerConfigFile {
@@ -51,6 +58,349 @@ struct DockerConfigAuth {
     auth: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     identitytoken: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BuildkitSharedMounts {
+    output_root: PathBuf,
+    auth_dir: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct BuildOutputArtifact {
+    host_tar_path: PathBuf,
+    guest_tar_path: String,
+    cleanup_dir: PathBuf,
+}
+
+#[derive(Debug)]
+struct ManagedBuildkitVm {
+    vm: Arc<LinuxVm>,
+    config: RuntimeConfig,
+    context_dir: Option<PathBuf>,
+    output_root: PathBuf,
+    auth_dir: PathBuf,
+}
+
+#[derive(Debug)]
+struct BuildkitVmState {
+    managed: Option<ManagedBuildkitVm>,
+    active_leases: usize,
+    activity_generation: u64,
+    last_activity: Instant,
+    idle_timeout: Duration,
+    boot_in_progress: bool,
+}
+
+impl Default for BuildkitVmState {
+    fn default() -> Self {
+        Self {
+            managed: None,
+            active_leases: 0,
+            activity_generation: 0,
+            last_activity: Instant::now(),
+            idle_timeout: buildkit_vm_idle_timeout(),
+            boot_in_progress: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BuildkitVmManager {
+    state: Mutex<BuildkitVmState>,
+}
+
+#[derive(Clone)]
+struct BuildkitVmLease {
+    manager: Arc<BuildkitVmManager>,
+    vm: Arc<LinuxVm>,
+}
+
+impl BuildkitVmLease {
+    fn vm(&self) -> &LinuxVm {
+        self.vm.as_ref()
+    }
+}
+
+impl Drop for BuildkitVmLease {
+    fn drop(&mut self) {
+        BuildkitVmManager::release_arc(&self.manager);
+    }
+}
+
+enum BuildkitVmAcquireAction {
+    Reuse(Arc<LinuxVm>),
+    Boot,
+    Replace(Arc<LinuxVm>),
+    Wait,
+}
+
+impl BuildkitVmManager {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(BuildkitVmState::default()),
+        }
+    }
+
+    async fn acquire(
+        self: &Arc<Self>,
+        config: &RuntimeConfig,
+        context_dir: Option<&Path>,
+        shared_mounts: &BuildkitSharedMounts,
+    ) -> Result<BuildkitVmLease, BuildkitError> {
+        let requested_context = context_dir.map(Path::to_path_buf);
+
+        loop {
+            let action = {
+                let mut state = self.lock_state()?;
+                if let Some((existing_vm, compatible)) = state.managed.as_ref().map(|managed| {
+                    let compatible = managed.config == *config
+                        && managed.output_root == shared_mounts.output_root
+                        && managed.auth_dir == shared_mounts.auth_dir
+                        && context_mount_compatible(managed.context_dir.as_deref(), context_dir);
+                    (Arc::clone(&managed.vm), compatible)
+                }) {
+                    if compatible {
+                        state.active_leases = state.active_leases.saturating_add(1);
+                        state.activity_generation = state.activity_generation.saturating_add(1);
+                        state.last_activity = Instant::now();
+                        BuildkitVmAcquireAction::Reuse(existing_vm)
+                    } else if state.active_leases == 0 && !state.boot_in_progress {
+                        state.boot_in_progress = true;
+                        state.managed = None;
+                        BuildkitVmAcquireAction::Replace(existing_vm)
+                    } else {
+                        BuildkitVmAcquireAction::Wait
+                    }
+                } else if state.boot_in_progress {
+                    BuildkitVmAcquireAction::Wait
+                } else {
+                    state.boot_in_progress = true;
+                    BuildkitVmAcquireAction::Boot
+                }
+            };
+
+            match action {
+                BuildkitVmAcquireAction::Reuse(vm) => {
+                    return Ok(BuildkitVmLease {
+                        manager: Arc::clone(self),
+                        vm,
+                    });
+                }
+                BuildkitVmAcquireAction::Wait => {
+                    tokio::time::sleep(BUILDKIT_VM_RETRY_DELAY).await;
+                }
+                BuildkitVmAcquireAction::Replace(old_vm) => {
+                    if let Err(error) = shutdown_managed_vm(old_vm.as_ref()).await {
+                        let mut state = self.lock_state()?;
+                        state.boot_in_progress = false;
+                        return Err(error);
+                    }
+                    let vm = match start_buildkit_vm(
+                        config,
+                        context_dir,
+                        &shared_mounts.output_root,
+                        &shared_mounts.auth_dir,
+                    )
+                    .await
+                    {
+                        Ok(vm) => Arc::new(vm),
+                        Err(error) => {
+                            let mut state = self.lock_state()?;
+                            state.boot_in_progress = false;
+                            return Err(error);
+                        }
+                    };
+                    let mut state = self.lock_state()?;
+                    state.boot_in_progress = false;
+                    state.managed = Some(ManagedBuildkitVm {
+                        vm: Arc::clone(&vm),
+                        config: config.clone(),
+                        context_dir: requested_context.clone(),
+                        output_root: shared_mounts.output_root.clone(),
+                        auth_dir: shared_mounts.auth_dir.clone(),
+                    });
+                    state.active_leases = 1;
+                    state.activity_generation = state.activity_generation.saturating_add(1);
+                    state.last_activity = Instant::now();
+                    return Ok(BuildkitVmLease {
+                        manager: Arc::clone(self),
+                        vm,
+                    });
+                }
+                BuildkitVmAcquireAction::Boot => {
+                    let vm = match start_buildkit_vm(
+                        config,
+                        context_dir,
+                        &shared_mounts.output_root,
+                        &shared_mounts.auth_dir,
+                    )
+                    .await
+                    {
+                        Ok(vm) => Arc::new(vm),
+                        Err(error) => {
+                            let mut state = self.lock_state()?;
+                            state.boot_in_progress = false;
+                            return Err(error);
+                        }
+                    };
+                    let mut state = self.lock_state()?;
+                    state.boot_in_progress = false;
+                    state.managed = Some(ManagedBuildkitVm {
+                        vm: Arc::clone(&vm),
+                        config: config.clone(),
+                        context_dir: requested_context.clone(),
+                        output_root: shared_mounts.output_root.clone(),
+                        auth_dir: shared_mounts.auth_dir.clone(),
+                    });
+                    state.active_leases = 1;
+                    state.activity_generation = state.activity_generation.saturating_add(1);
+                    state.last_activity = Instant::now();
+                    return Ok(BuildkitVmLease {
+                        manager: Arc::clone(self),
+                        vm,
+                    });
+                }
+            }
+        }
+    }
+
+    fn release_arc(manager: &Arc<Self>) {
+        let (generation, idle_timeout) = {
+            let mut state = match manager.lock_state() {
+                Ok(state) => state,
+                Err(error) => {
+                    warn!(%error, "failed to acquire BuildKit VM manager lock during release");
+                    return;
+                }
+            };
+            state.active_leases = state.active_leases.saturating_sub(1);
+            state.last_activity = Instant::now();
+            state.activity_generation = state.activity_generation.saturating_add(1);
+            (state.activity_generation, state.idle_timeout)
+        };
+
+        let manager = Arc::downgrade(manager);
+        thread::spawn(move || {
+            thread::sleep(idle_timeout);
+            if let Some(manager) = manager.upgrade() {
+                manager.try_idle_shutdown(generation);
+            }
+        });
+    }
+
+    fn try_idle_shutdown(&self, generation: u64) {
+        let vm_to_shutdown = {
+            let mut state = match self.lock_state() {
+                Ok(state) => state,
+                Err(error) => {
+                    warn!(%error, "failed to acquire BuildKit VM manager lock during idle check");
+                    return;
+                }
+            };
+            if state.active_leases != 0 {
+                return;
+            }
+            if state.activity_generation != generation {
+                return;
+            }
+            if state.last_activity.elapsed() < state.idle_timeout {
+                return;
+            }
+            state.managed.take().map(|managed| Arc::clone(&managed.vm))
+        };
+
+        if let Some(vm) = vm_to_shutdown
+            && let Err(error) = block_on_vm_shutdown(vm.as_ref())
+        {
+            warn!(%error, "failed to shutdown idle BuildKit VM");
+        }
+    }
+
+    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, BuildkitVmState>, BuildkitError> {
+        self.state.lock().map_err(|_| {
+            BuildkitError::InvalidConfig("BuildKit VM manager lock poisoned".to_string())
+        })
+    }
+}
+
+fn buildkit_vm_manager() -> Arc<BuildkitVmManager> {
+    Arc::clone(BUILDKIT_VM_MANAGER.get_or_init(|| Arc::new(BuildkitVmManager::new())))
+}
+
+fn context_mount_compatible(existing: Option<&Path>, requested: Option<&Path>) -> bool {
+    match (existing, requested) {
+        (_, None) => true,
+        (Some(existing), Some(requested)) => existing == requested,
+        (None, Some(_)) => false,
+    }
+}
+
+fn buildkit_vm_idle_timeout() -> Duration {
+    let value = std::env::var("VZ_BUILDKIT_VM_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    match value {
+        Some(0) | None => BUILDKIT_VM_IDLE_TIMEOUT,
+        Some(seconds) => Duration::from_secs(seconds),
+    }
+}
+
+fn block_on_vm_shutdown(vm: &LinuxVm) -> Result<(), BuildkitError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(BuildkitError::Io)?;
+    runtime.block_on(async { shutdown_managed_vm(vm).await })
+}
+
+async fn shutdown_managed_vm(vm: &LinuxVm) -> Result<(), BuildkitError> {
+    if let Err(error) = shutdown_guest_buildkitd(vm).await {
+        warn!(%error, "failed to stop buildkitd in guest before VM shutdown");
+    }
+    vm.stop().await?;
+    Ok(())
+}
+
+async fn prepare_shared_mounts() -> Result<BuildkitSharedMounts, BuildkitError> {
+    let runtime_dir = default_buildkit_dir()?.join("runtime");
+    let output_root = runtime_dir.join("output");
+    let auth_dir = runtime_dir.join("auth");
+    tokio::fs::create_dir_all(&output_root).await?;
+    tokio::fs::create_dir_all(&auth_dir).await?;
+    Ok(BuildkitSharedMounts {
+        output_root,
+        auth_dir,
+    })
+}
+
+async fn prepare_output_artifact(
+    output_mode: &BuildOutput,
+    shared_mounts: &BuildkitSharedMounts,
+) -> Result<Option<BuildOutputArtifact>, BuildkitError> {
+    if matches!(output_mode, BuildOutput::RegistryPush) {
+        return Ok(None);
+    }
+
+    let output_dir = unique_dir(shared_mounts.output_root.clone(), "build-output");
+    tokio::fs::create_dir_all(&output_dir).await?;
+    let dir_name = output_dir
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            BuildkitError::InvalidConfig(format!(
+                "invalid output directory: {}",
+                output_dir.display()
+            ))
+        })?;
+    let host_tar_path = output_dir.join(BUILD_OUTPUT_ARCHIVE);
+    let guest_tar_path =
+        format!("/mnt/{BUILDKIT_SHARED_OUTPUT_TAG}/{dir_name}/{BUILD_OUTPUT_ARCHIVE}");
+    Ok(Some(BuildOutputArtifact {
+        host_tar_path,
+        guest_tar_path,
+        cleanup_dir: output_dir,
+    }))
 }
 
 /// Build a Dockerfile and handle the requested output mode.
@@ -85,19 +435,14 @@ where
         ))
     })?;
 
+    let shared_mounts = prepare_shared_mounts().await?;
     let output_mode = request.output.clone();
-    let output_dir = match output_mode {
-        BuildOutput::VzStore | BuildOutput::OciTar { .. } => {
-            let base_dir = default_buildkit_dir()?;
-            let dir = unique_dir(base_dir.join("tmp"), "build-output");
-            tokio::fs::create_dir_all(&dir).await?;
-            Some(dir)
-        }
-        BuildOutput::RegistryPush => None,
-    };
+    let output_artifact = prepare_output_artifact(&output_mode, &shared_mounts).await?;
     let dockerfile_text = tokio::fs::read_to_string(&dockerfile_host).await?;
-    let auth_dir = prepare_buildkit_auth_dir(config, &dockerfile_text, &request).await?;
-    if auth_dir.is_some() {
+    let using_auth =
+        prepare_buildkit_auth_dir(&shared_mounts.auth_dir, config, &dockerfile_text, &request)
+            .await?;
+    if using_auth {
         on_event(BuildEvent::Status {
             message: "Using registry credentials for BuildKit".to_string(),
         });
@@ -105,56 +450,37 @@ where
 
     let result = async {
         on_event(BuildEvent::Status {
-            message: "Booting BuildKit VM".to_string(),
+            message: "Ensuring BuildKit VM is ready".to_string(),
         });
-        let vm = start_buildkit_vm(
-            config,
-            Some(&context_dir),
-            output_dir.as_deref(),
-            auth_dir.as_deref(),
-        )
-        .await?;
+        let vm = buildkit_vm_manager()
+            .acquire(config, Some(&context_dir), &shared_mounts)
+            .await?;
         on_event(BuildEvent::Status {
             message: "Running BuildKit solve".to_string(),
         });
-        let build_result = run_guest_build(
-            &vm,
+        run_guest_build(
+            vm.vm(),
             &request,
             dockerfile_relative,
             "/mnt/build-context",
-            output_dir.as_ref().map(|_| BUILDKIT_GUEST_OUTPUT_ARCHIVE),
+            output_artifact
+                .as_ref()
+                .map(|artifact| artifact.guest_tar_path.as_str()),
             &mut on_event,
         )
-        .await;
-        if build_result.is_ok() && output_dir.is_some() {
-            on_event(BuildEvent::Status {
-                message: "Copying OCI archive from BuildKit VM".to_string(),
-            });
-            copy_guest_output_archive(
-                &vm,
-                BUILDKIT_GUEST_OUTPUT_ARCHIVE,
-                BUILDKIT_GUEST_HOST_OUTPUT_ARCHIVE,
-            )
-            .await?;
-        }
-        if let Err(error) = shutdown_guest_buildkitd(&vm).await {
-            warn!(%error, "failed to stop buildkitd in guest before VM shutdown");
-        }
-        let stop_result = vm.stop().await;
-        if let Err(error) = stop_result {
-            warn!(%error, "failed to stop BuildKit VM cleanly");
-        }
-        build_result?;
+        .await?;
 
         let final_result = match output_mode {
             BuildOutput::VzStore => {
                 on_event(BuildEvent::Status {
                     message: "Importing OCI archive into local store".to_string(),
                 });
-                let output_dir = output_dir.as_ref().ok_or_else(|| {
-                    BuildkitError::InvalidConfig("missing output directory".to_string())
-                })?;
-                let image_tar = output_dir.join(BUILD_OUTPUT_ARCHIVE);
+                let image_tar = output_artifact
+                    .as_ref()
+                    .map(|artifact| artifact.host_tar_path.clone())
+                    .ok_or_else(|| {
+                        BuildkitError::InvalidConfig("missing output artifact".to_string())
+                    })?;
                 if !image_tar.is_file() {
                     return Err(BuildkitError::InvalidOciLayout(format!(
                         "build output archive not found: {}",
@@ -177,10 +503,12 @@ where
                 on_event(BuildEvent::Status {
                     message: "Writing OCI archive output".to_string(),
                 });
-                let output_dir = output_dir.as_ref().ok_or_else(|| {
-                    BuildkitError::InvalidConfig("missing output directory".to_string())
-                })?;
-                let image_tar = output_dir.join(BUILD_OUTPUT_ARCHIVE);
+                let image_tar = output_artifact
+                    .as_ref()
+                    .map(|artifact| artifact.host_tar_path.clone())
+                    .ok_or_else(|| {
+                        BuildkitError::InvalidConfig("missing output artifact".to_string())
+                    })?;
                 if !image_tar.is_file() {
                     return Err(BuildkitError::InvalidOciLayout(format!(
                         "build output archive not found: {}",
@@ -213,11 +541,8 @@ where
     }
     .await;
 
-    if let Some(output_dir) = &output_dir {
-        cleanup_temp_dir(output_dir, "BuildKit output").await;
-    }
-    if let Some(auth_dir) = &auth_dir {
-        cleanup_temp_dir(auth_dir, "BuildKit auth").await;
+    if let Some(output_artifact) = &output_artifact {
+        cleanup_temp_dir(&output_artifact.cleanup_dir, "BuildKit output").await;
     }
 
     result
@@ -225,28 +550,20 @@ where
 
 /// Return a human-readable BuildKit cache usage table (from `buildctl du`).
 pub async fn cache_disk_usage(config: &RuntimeConfig) -> Result<String, BuildkitError> {
-    let vm = start_buildkit_vm(config, None, None, None).await?;
-    let output = async {
-        ensure_guest_buildkit_ready(&vm).await?;
-        run_buildctl(
-            &vm,
-            vec!["du".to_string(), "--verbose".to_string()],
-            BUILDKIT_BUILD_TIMEOUT,
-            None,
-            false,
-        )
-        .await
-    }
-    .await;
-    if let Err(error) = shutdown_guest_buildkitd(&vm).await {
-        warn!(%error, "failed to stop buildkitd in guest before VM shutdown");
-    }
-    let stop_result = vm.stop().await;
-    if let Err(error) = stop_result {
-        warn!(%error, "failed to stop BuildKit VM cleanly");
-    }
+    let shared_mounts = prepare_shared_mounts().await?;
+    let vm = buildkit_vm_manager()
+        .acquire(config, None, &shared_mounts)
+        .await?;
+    ensure_guest_buildkit_ready(vm.vm()).await?;
+    let output = run_buildctl(
+        vm.vm(),
+        vec!["du".to_string(), "--verbose".to_string()],
+        BUILDKIT_BUILD_TIMEOUT,
+        None,
+        false,
+    )
+    .await?;
 
-    let output = output?;
     if output.exit_code != 0 {
         return Err(BuildkitError::BuildFailed {
             exit_code: output.exit_code,
@@ -263,35 +580,26 @@ pub async fn cache_prune(
     config: &RuntimeConfig,
     options: CachePruneOptions,
 ) -> Result<String, BuildkitError> {
-    let vm = start_buildkit_vm(config, None, None, None).await?;
-    let output = async {
-        ensure_guest_buildkit_ready(&vm).await?;
+    let shared_mounts = prepare_shared_mounts().await?;
+    let vm = buildkit_vm_manager()
+        .acquire(config, None, &shared_mounts)
+        .await?;
+    ensure_guest_buildkit_ready(vm.vm()).await?;
 
-        let mut args = vec!["prune".to_string()];
-        if options.all {
-            args.push("--all".to_string());
-        }
-        if let Some(keep_duration) = options.keep_duration {
-            args.push("--keep-duration".to_string());
-            args.push(keep_duration);
-        }
-        if let Some(keep_storage) = options.keep_storage {
-            args.push("--keep-storage".to_string());
-            args.push(keep_storage);
-        }
+    let mut args = vec!["prune".to_string()];
+    if options.all {
+        args.push("--all".to_string());
+    }
+    if let Some(keep_duration) = options.keep_duration {
+        args.push("--keep-duration".to_string());
+        args.push(keep_duration);
+    }
+    if let Some(keep_storage) = options.keep_storage {
+        args.push("--keep-storage".to_string());
+        args.push(keep_storage);
+    }
+    let output = run_buildctl(vm.vm(), args, BUILDKIT_BUILD_TIMEOUT, None, false).await?;
 
-        run_buildctl(&vm, args, BUILDKIT_BUILD_TIMEOUT, None, false).await
-    }
-    .await;
-    if let Err(error) = shutdown_guest_buildkitd(&vm).await {
-        warn!(%error, "failed to stop buildkitd in guest before VM shutdown");
-    }
-    let stop_result = vm.stop().await;
-    if let Err(error) = stop_result {
-        warn!(%error, "failed to stop BuildKit VM cleanly");
-    }
-
-    let output = output?;
     if output.exit_code != 0 {
         return Err(BuildkitError::BuildFailed {
             exit_code: output.exit_code,
@@ -304,10 +612,11 @@ pub async fn cache_prune(
 }
 
 async fn prepare_buildkit_auth_dir(
+    auth_dir: &Path,
     config: &RuntimeConfig,
     dockerfile_text: &str,
     request: &BuildRequest,
-) -> Result<Option<PathBuf>, BuildkitError> {
+) -> Result<bool, BuildkitError> {
     let mut registries = registries_for_build(dockerfile_text, request);
     if registries.is_empty() {
         registries.insert("docker.io".to_string());
@@ -315,7 +624,10 @@ async fn prepare_buildkit_auth_dir(
 
     let mut auths = BTreeMap::new();
     match &config.auth {
-        vz_image::Auth::Anonymous => return Ok(None),
+        vz_image::Auth::Anonymous => {
+            clear_buildkit_auth_config(auth_dir).await?;
+            return Ok(false);
+        }
         vz_image::Auth::Basic { username, password } => {
             let entry = basic_docker_auth(username, password);
             for registry in &registries {
@@ -356,16 +668,15 @@ async fn prepare_buildkit_auth_dir(
     }
 
     if auths.is_empty() {
-        return Ok(None);
+        clear_buildkit_auth_config(auth_dir).await?;
+        return Ok(false);
     }
 
-    let base_dir = default_buildkit_dir()?;
-    let auth_dir = unique_dir(base_dir.join("tmp"), "build-auth");
     tokio::fs::create_dir_all(&auth_dir).await?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&auth_dir, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(auth_dir, std::fs::Permissions::from_mode(0o700))?;
     }
 
     let config_file = DockerConfigFile { auths };
@@ -378,7 +689,16 @@ async fn prepare_buildkit_auth_dir(
         std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600))?;
     }
 
-    Ok(Some(auth_dir))
+    Ok(true)
+}
+
+async fn clear_buildkit_auth_config(auth_dir: &Path) -> Result<(), BuildkitError> {
+    let config_path = auth_dir.join("config.json");
+    match tokio::fs::remove_file(config_path).await {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(BuildkitError::Io(error)),
+    }
 }
 
 pub(crate) fn registries_for_build(
@@ -532,8 +852,8 @@ async fn cleanup_temp_dir(path: &Path, label: &str) {
 async fn start_buildkit_vm(
     config: &RuntimeConfig,
     context_dir: Option<&Path>,
-    output_dir: Option<&Path>,
-    auth_dir: Option<&Path>,
+    output_root: &Path,
+    auth_dir: &Path,
 ) -> Result<LinuxVm, BuildkitError> {
     let artifacts = ensure_buildkit_artifacts().await?;
     let kernel = ensure_kernel_with_options(EnsureKernelOptions {
@@ -584,27 +904,22 @@ async fn start_buildkit_vm(
 
     if let Some(context_dir) = context_dir {
         vm_config.shared_dirs.push(SharedDirConfig {
-            tag: "build-context".to_string(),
+            tag: BUILDKIT_SHARED_CONTEXT_TAG.to_string(),
             source: context_dir.to_path_buf(),
             read_only: true,
         });
     }
 
-    if let Some(output_dir) = output_dir {
-        vm_config.shared_dirs.push(SharedDirConfig {
-            tag: "build-output".to_string(),
-            source: output_dir.to_path_buf(),
-            read_only: false,
-        });
-    }
-
-    if let Some(auth_dir) = auth_dir {
-        vm_config.shared_dirs.push(SharedDirConfig {
-            tag: BUILDKIT_AUTH_TAG.to_string(),
-            source: auth_dir.to_path_buf(),
-            read_only: true,
-        });
-    }
+    vm_config.shared_dirs.push(SharedDirConfig {
+        tag: BUILDKIT_SHARED_OUTPUT_TAG.to_string(),
+        source: output_root.to_path_buf(),
+        read_only: false,
+    });
+    vm_config.shared_dirs.push(SharedDirConfig {
+        tag: BUILDKIT_AUTH_TAG.to_string(),
+        source: auth_dir.to_path_buf(),
+        read_only: true,
+    });
 
     if !config.default_network_enabled {
         vm_config.network = Some(NetworkConfig::None);
@@ -743,35 +1058,6 @@ exit 0
     .await
 }
 
-async fn copy_guest_output_archive(
-    vm: &LinuxVm,
-    source: &str,
-    dest: &str,
-) -> Result<(), BuildkitError> {
-    let copy_script = format!(
-        r#"
-set -eu
-
-if [ ! -f "{source}" ]; then
-  echo "build output archive missing: {source}" >&2
-  exit 1
-fi
-
-/bin/busybox mkdir -p /mnt/build-output
-/bin/busybox cp "{source}" "{dest}"
-"#
-    );
-
-    run_guest_command(
-        vm,
-        "copy build output archive to host mount",
-        "/bin/busybox",
-        vec!["sh".to_string(), "-c".to_string(), copy_script],
-        BUILDKIT_OUTPUT_COPY_TIMEOUT,
-    )
-    .await
-}
-
 async fn ensure_guest_buildkit_ready(vm: &LinuxVm) -> Result<(), BuildkitError> {
     let setup_script = format!(
         r#"
@@ -787,8 +1073,10 @@ if ! /bin/busybox grep -q " /var/lib/buildkit " /proc/mounts; then
     echo "buildkit cache disk /dev/vda is unavailable" >&2
     exit 1
   fi
-  /bin/busybox mke2fs -F /dev/vda >/tmp/buildkit-disk-format.log 2>&1
-  /bin/busybox mount -t ext4 /dev/vda /var/lib/buildkit
+  if ! /bin/busybox mount -t ext4 /dev/vda /var/lib/buildkit 2>/tmp/buildkit-disk-mount.log; then
+    /bin/busybox mke2fs -F /dev/vda >/tmp/buildkit-disk-format.log 2>&1
+    /bin/busybox mount -t ext4 /dev/vda /var/lib/buildkit
+  fi
 fi
 /bin/busybox mkdir -p /var/lib/buildkit/build-output
 /bin/busybox mount -t virtiofs linux-bin /mnt/linux-bin 2>/dev/null || true
@@ -828,10 +1116,12 @@ if [ -f /mnt/host-ssl/cert.pem ]; then
   /bin/busybox cp /mnt/host-ssl/cert.pem /etc/ssl/certs/ca-certificates.crt
   export SSL_CERT_FILE=/mnt/host-ssl/cert.pem
 fi
+/bin/busybox mkdir -p /root/.docker
 if [ -f {BUILDKIT_AUTH_GUEST_CONFIG} ]; then
-  /bin/busybox mkdir -p /root/.docker
   /bin/busybox cp {BUILDKIT_AUTH_GUEST_CONFIG} /root/.docker/config.json
   /bin/busybox chmod 0600 /root/.docker/config.json
+else
+  /bin/busybox rm -f /root/.docker/config.json
 fi
 export HOME=/root
 export DOCKER_CONFIG=/root/.docker
@@ -1092,5 +1382,56 @@ fn host_ssl_dir() -> Option<PathBuf> {
         Some(ssl_dir)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn context_mount_compatibility_allows_cache_without_context() {
+        let existing = PathBuf::from("/tmp/context-a");
+        let requested = PathBuf::from("/tmp/context-b");
+        assert!(context_mount_compatible(Some(existing.as_path()), None));
+        assert!(context_mount_compatible(
+            Some(existing.as_path()),
+            Some(existing.as_path())
+        ));
+        assert!(!context_mount_compatible(
+            Some(existing.as_path()),
+            Some(requested.as_path())
+        ));
+        assert!(!context_mount_compatible(None, Some(existing.as_path())));
+    }
+
+    #[tokio::test]
+    async fn prepare_output_artifact_uses_shared_output_root() {
+        let temp = tempdir().unwrap();
+        let shared_mounts = BuildkitSharedMounts {
+            output_root: temp.path().join("output"),
+            auth_dir: temp.path().join("auth"),
+        };
+        tokio::fs::create_dir_all(&shared_mounts.output_root)
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(&shared_mounts.auth_dir)
+            .await
+            .unwrap();
+
+        let artifact = prepare_output_artifact(&BuildOutput::VzStore, &shared_mounts)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(artifact.cleanup_dir.starts_with(&shared_mounts.output_root));
+        assert_eq!(
+            artifact.host_tar_path,
+            artifact.cleanup_dir.join(BUILD_OUTPUT_ARCHIVE)
+        );
+        assert!(artifact.guest_tar_path.starts_with("/mnt/build-output/"));
     }
 }

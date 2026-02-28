@@ -36,14 +36,14 @@ impl MacosRuntimeBackend {
         &self,
         id: &str,
         config: contract::ExecConfig,
-        mut on_event: F,
+        on_event: F,
     ) -> Result<contract::ExecOutput, RuntimeError>
     where
         F: FnMut(crate::runtime::InteractiveExecEvent),
     {
         let oci_config = exec_config_from_contract(config);
         self.runtime
-            .exec_container_streaming(id, oci_config, |event| on_event(event))
+            .exec_container_streaming(id, oci_config, on_event)
             .await
             .map(exec_output_to_contract)
             .map_err(oci_err)

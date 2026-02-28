@@ -44,7 +44,7 @@ impl OciRuntimeKind {
 }
 
 /// Top-level runtime configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
     /// Base data directory for runtime metadata and caches.
     pub data_dir: PathBuf,

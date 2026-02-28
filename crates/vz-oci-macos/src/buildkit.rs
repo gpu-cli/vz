@@ -43,7 +43,6 @@ const BUILDKITD_ADDR: &str = "tcp://127.0.0.1:8372";
 const BUILDKIT_SETUP_TIMEOUT: Duration = Duration::from_secs(90);
 const BUILDKIT_BUILD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const BUILDKIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
-const BUILDKIT_OUTPUT_COPY_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const BUILDKIT_RUNC_GUEST_PATH: &str = "/tmp/runc";
 const BUILDKIT_AUTH_TAG: &str = "buildkit-auth";
 const BUILDKIT_AUTH_GUEST_DIR: &str = "/mnt/buildkit-auth";
@@ -54,8 +53,6 @@ const BUILDKIT_CACHE_KEEP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const BUILDKIT_CACHE_DISK_IMAGE: &str = "cache.img";
 const BUILDKIT_CACHE_DISK_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const BUILDKIT_VM_MEMORY_MB: u64 = 8192;
-const BUILDKIT_GUEST_OUTPUT_ARCHIVE: &str = "/var/lib/buildkit/build-output/image.tar";
-const BUILDKIT_GUEST_HOST_OUTPUT_ARCHIVE: &str = "/mnt/build-output/image.tar";
 
 /// Destination for built image output.
 #[derive(Debug, Clone, Default)]
