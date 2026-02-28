@@ -7,7 +7,9 @@ mod artifacts;
 mod auth;
 mod client;
 mod filesync;
+mod output;
 mod progress;
+mod session_tunnel;
 
 pub use artifacts::{
     BUILDKIT_VERSION, BuildkitArtifacts, BuildkitError, BuildkitVersionMetadata,
@@ -19,4 +21,7 @@ pub use client::{
     BuildSession, SecretSpec, SshSpec,
 };
 pub use filesync::{FileSyncError, FileSyncService, LocalFileSync};
+pub use output::{
+    BuildOutputError, BuildOutputResult, import_oci_tar_to_store, materialize_build_output,
+};
 pub use progress::{BuildLogStream, BuildProgress, BuildProgressMapper};

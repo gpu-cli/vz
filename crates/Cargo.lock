@@ -3879,6 +3879,7 @@ dependencies = [
  "docker_credential",
  "flate2",
  "ignore",
+ "oci-distribution",
  "oci-spec",
  "reqwest",
  "serde",

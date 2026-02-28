@@ -14,6 +14,7 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 oci-spec = { workspace = true }
+oci-distribution = { workspace = true }
 shell-words = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 sha2 = { workspace = true }

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bollard_buildkit_proto::moby::buildkit::v1::control_client::ControlClient;
@@ -13,13 +13,19 @@ use tonic::metadata::{Ascii, MetadataKey, MetadataMap, MetadataValue};
 use tonic::transport::Channel;
 use uuid::Uuid;
 
+use super::auth::DockerAuthProvider;
+use super::filesync::{FileSyncError, LocalFileSync};
 use super::progress::{BuildProgress, BuildProgressMapper};
+use super::session_tunnel::{SessionCallbackServices, run_session_callback_tunnel};
 
 /// Errors returned by [`BuildClient`] and [`BuildSession`].
 #[derive(Debug, thiserror::Error)]
 pub enum BuildClientError {
     #[error(transparent)]
     GrpcStatus(#[from] tonic::Status),
+
+    #[error(transparent)]
+    FileSync(#[from] FileSyncError),
 
     #[error("build session stream is already attached")]
     SessionAlreadyAttached,
@@ -196,6 +202,38 @@ impl BuildClient {
         Ok(session)
     }
 
+    /// Start session stream and serve callback services over the tunnel.
+    pub async fn start_session_with_callbacks(
+        &mut self,
+        services: SessionCallbackServices,
+    ) -> Result<BuildSession, BuildClientError> {
+        let session = BuildSession::new();
+        let outbound_rx = session.take_outbound_receiver().await?;
+
+        let mut request = tonic::Request::new(ReceiverStream::new(outbound_rx));
+        append_session_metadata(request.metadata_mut(), &session.metadata());
+        let inbound_stream = self.control.session(request).await?.into_inner();
+        let outbound_tx = session.outbound_sender();
+
+        tokio::spawn(async move {
+            let _ = run_session_callback_tunnel(inbound_stream, outbound_tx, services).await;
+        });
+
+        Ok(session)
+    }
+
+    /// Start a build session configured with local file sync + docker auth callbacks.
+    pub async fn start_session_for_build(
+        &mut self,
+        context_dir: &Path,
+    ) -> Result<BuildSession, BuildClientError> {
+        let services = SessionCallbackServices {
+            filesync: LocalFileSync::new(context_dir)?,
+            auth: DockerAuthProvider::new(),
+        };
+        self.start_session_with_callbacks(services).await
+    }
+
     /// Run `Control.Info`.
     pub async fn info(&mut self) -> Result<InfoResponse, BuildClientError> {
         let response = self.control.info(InfoRequest {}).await?;
@@ -244,7 +282,7 @@ impl BuildClient {
 
     /// Build helper that starts a session and submits a solve request.
     pub async fn build(&mut self, request: &BuildRequest) -> Result<BuildResult, BuildClientError> {
-        let session = self.start_session().await?;
+        let session = self.start_session_for_build(&request.context_dir).await?;
         let build_ref = format!("build-{}", Uuid::new_v4());
         let solve_request = request.to_solve_request(build_ref.clone(), Some(session.id()));
 
@@ -331,6 +369,10 @@ impl BuildSession {
     ) -> Result<mpsc::Receiver<BytesMessage>, BuildClientError> {
         let mut guard = self.outbound_rx.lock().await;
         guard.take().ok_or(BuildClientError::SessionAlreadyAttached)
+    }
+
+    fn outbound_sender(&self) -> mpsc::Sender<BytesMessage> {
+        self.outbound_tx.clone()
     }
 
     /// Session identifier to set in `SolveRequest.session`.
