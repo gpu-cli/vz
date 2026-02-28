@@ -1,4 +1,8 @@
 use super::super::*;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use vz_runtime_contract::CheckpointFileEntry;
 pub(in crate::grpc) struct CheckpointServiceImpl {
     daemon: Arc<RuntimeDaemon>,
 }
@@ -20,6 +24,256 @@ fn checkpoint_class_from_wire(value: &str) -> Result<CheckpointClass, MachineErr
             BTreeMap::new(),
         )),
     }
+}
+
+fn checkpoint_snapshot_runtime_fs_root(daemon: &RuntimeDaemon, sandbox_id: &str) -> PathBuf {
+    daemon
+        .runtime_data_dir()
+        .join("sandboxes")
+        .join(sandbox_id)
+        .join("fs")
+}
+
+fn checkpoint_workspace_snapshot_root(
+    daemon: &RuntimeDaemon,
+    sandbox: &Sandbox,
+    request_id: &str,
+) -> Result<Option<PathBuf>, Status> {
+    if let Some(project_dir) = sandbox.labels.get(SANDBOX_LABEL_PROJECT_DIR) {
+        let candidate = PathBuf::from(project_dir.trim());
+        if !candidate.is_absolute() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                format!(
+                    "sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` must be an absolute path: {}",
+                    candidate.display()
+                ),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            )));
+        }
+        if !candidate.exists() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::NotFound,
+                format!(
+                    "sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` does not exist: {}",
+                    candidate.display()
+                ),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            )));
+        }
+        if !candidate.is_dir() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                format!(
+                    "sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` must reference a directory: {}",
+                    candidate.display()
+                ),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            )));
+        }
+        return Ok(Some(candidate));
+    }
+
+    let runtime_root = checkpoint_snapshot_runtime_fs_root(daemon, &sandbox.sandbox_id);
+    if runtime_root.is_dir() {
+        return Ok(Some(runtime_root));
+    }
+
+    Ok(None)
+}
+
+fn resolve_checkpoint_snapshot_root(
+    daemon: &RuntimeDaemon,
+    sandbox_id: &str,
+    request_id: &str,
+) -> Result<Option<PathBuf>, Status> {
+    let sandbox = daemon
+        .with_state_store(|store| store.load_sandbox(sandbox_id))
+        .map_err(|error| status_from_stack_error(error, request_id))?;
+    if let Some(sandbox) = sandbox {
+        return checkpoint_workspace_snapshot_root(daemon, &sandbox, request_id);
+    }
+
+    let runtime_root = checkpoint_snapshot_runtime_fs_root(daemon, sandbox_id);
+    if runtime_root.is_dir() {
+        return Ok(Some(runtime_root));
+    }
+
+    Ok(None)
+}
+
+fn hash_file_bytes(path: &Path) -> Result<String, std::io::Error> {
+    let bytes = std::fs::read(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn hash_symlink_target(path: &Path) -> Result<String, std::io::Error> {
+    let target = std::fs::read_link(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(target.to_string_lossy().as_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn checkpoint_relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn collect_checkpoint_file_entries(
+    root: &Path,
+    request_id: &str,
+) -> Result<Vec<CheckpointFileEntry>, Status> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut entries = Vec::new();
+
+    while let Some(dir) = pending.pop() {
+        let read_dir = std::fs::read_dir(&dir).map_err(|error| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::InternalError,
+                format!(
+                    "failed to read checkpoint snapshot directory {}: {error}",
+                    dir.display()
+                ),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            ))
+        })?;
+
+        for item in read_dir {
+            let item = item.map_err(|error| {
+                status_from_machine_error(MachineError::new(
+                    MachineErrorCode::InternalError,
+                    format!(
+                        "failed to iterate checkpoint snapshot directory {}: {error}",
+                        dir.display()
+                    ),
+                    Some(request_id.to_string()),
+                    BTreeMap::new(),
+                ))
+            })?;
+            let path = item.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                status_from_machine_error(MachineError::new(
+                    MachineErrorCode::InternalError,
+                    format!(
+                        "failed to stat checkpoint snapshot path {}: {error}",
+                        path.display()
+                    ),
+                    Some(request_id.to_string()),
+                    BTreeMap::new(),
+                ))
+            })?;
+            if metadata.is_dir() {
+                pending.push(path);
+                continue;
+            }
+
+            let digest_sha256 = if metadata.file_type().is_symlink() {
+                hash_symlink_target(&path).map_err(|error| {
+                    status_from_machine_error(MachineError::new(
+                        MachineErrorCode::InternalError,
+                        format!(
+                            "failed to hash checkpoint symlink target {}: {error}",
+                            path.display()
+                        ),
+                        Some(request_id.to_string()),
+                        BTreeMap::new(),
+                    ))
+                })?
+            } else if metadata.is_file() {
+                hash_file_bytes(&path).map_err(|error| {
+                    status_from_machine_error(MachineError::new(
+                        MachineErrorCode::InternalError,
+                        format!("failed to hash checkpoint file {}: {error}", path.display()),
+                        Some(request_id.to_string()),
+                        BTreeMap::new(),
+                    ))
+                })?
+            } else {
+                // Skip unsupported entry kinds (sockets/devices/fifos) for now.
+                continue;
+            };
+
+            entries.push(CheckpointFileEntry {
+                path: checkpoint_relative_path(root, &path),
+                digest_sha256,
+                size: metadata.len(),
+            });
+        }
+    }
+
+    entries.sort_by(|lhs, rhs| lhs.path.cmp(&rhs.path));
+    Ok(entries)
+}
+
+fn collect_checkpoint_snapshot_entries(
+    daemon: &RuntimeDaemon,
+    sandbox_id: &str,
+    request_id: &str,
+) -> Result<Vec<CheckpointFileEntry>, Status> {
+    let Some(root) = resolve_checkpoint_snapshot_root(daemon, sandbox_id, request_id)? else {
+        return Ok(Vec::new());
+    };
+    collect_checkpoint_file_entries(&root, request_id)
+}
+
+fn diff_checkpoint_file_entries(
+    from_entries: &[CheckpointFileEntry],
+    to_entries: &[CheckpointFileEntry],
+) -> Vec<runtime_v2::CheckpointFileDiffPayload> {
+    let from_map: BTreeMap<&str, &CheckpointFileEntry> = from_entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect();
+    let to_map: BTreeMap<&str, &CheckpointFileEntry> = to_entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect();
+
+    let mut all_paths: BTreeSet<&str> = BTreeSet::new();
+    all_paths.extend(from_map.keys().copied());
+    all_paths.extend(to_map.keys().copied());
+
+    let mut diffs = Vec::new();
+    for path in all_paths {
+        match (from_map.get(path), to_map.get(path)) {
+            (Some(before), Some(after))
+                if before.digest_sha256 == after.digest_sha256 && before.size == after.size => {}
+            (Some(before), Some(after)) => diffs.push(runtime_v2::CheckpointFileDiffPayload {
+                path: path.to_string(),
+                change: "M".to_string(),
+                before_digest_sha256: before.digest_sha256.clone(),
+                after_digest_sha256: after.digest_sha256.clone(),
+                before_size: before.size,
+                after_size: after.size,
+            }),
+            (Some(before), None) => diffs.push(runtime_v2::CheckpointFileDiffPayload {
+                path: path.to_string(),
+                change: "D".to_string(),
+                before_digest_sha256: before.digest_sha256.clone(),
+                after_digest_sha256: String::new(),
+                before_size: before.size,
+                after_size: 0,
+            }),
+            (None, Some(after)) => diffs.push(runtime_v2::CheckpointFileDiffPayload {
+                path: path.to_string(),
+                change: "A".to_string(),
+                before_digest_sha256: String::new(),
+                after_digest_sha256: after.digest_sha256.clone(),
+                before_size: 0,
+                after_size: after.size,
+            }),
+            (None, None) => {}
+        }
+    }
+    diffs
 }
 
 #[tonic::async_trait]
@@ -127,10 +381,19 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
                 ))
             })?;
 
+        let checkpoint_file_entries = collect_checkpoint_snapshot_entries(
+            self.daemon.as_ref(),
+            checkpoint.sandbox_id.as_str(),
+            &request_id,
+        )?;
         let receipt_id = generate_receipt_id();
         let persist_result = self.daemon.with_state_store(|store| {
             store.with_immediate_transaction(|tx| {
                 tx.save_checkpoint(&checkpoint)?;
+                tx.replace_checkpoint_file_entries(
+                    checkpoint.checkpoint_id.as_str(),
+                    &checkpoint_file_entries,
+                )?;
                 tx.emit_event(
                     &checkpoint.sandbox_id,
                     &StackEvent::CheckpointReady {
@@ -246,6 +509,73 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
         Ok(Response::new(runtime_v2::ListCheckpointsResponse {
             request_id,
             checkpoints,
+        }))
+    }
+
+    async fn diff_checkpoints(
+        &self,
+        request: Request<runtime_v2::DiffCheckpointsRequest>,
+    ) -> Result<Response<runtime_v2::DiffCheckpointsResponse>, Status> {
+        let intercepted_request_id = request_id_from_extensions(&request);
+        let request = request.into_inner();
+        let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
+        let request_id = metadata
+            .request_id
+            .clone()
+            .unwrap_or_else(generate_request_id);
+
+        let from_checkpoint_id = request.from_checkpoint_id.trim().to_string();
+        if from_checkpoint_id.is_empty() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                "from_checkpoint_id cannot be empty".to_string(),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        let to_checkpoint_id = request.to_checkpoint_id.trim().to_string();
+        if to_checkpoint_id.is_empty() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                "to_checkpoint_id cannot be empty".to_string(),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        let (from_checkpoint, to_checkpoint, from_entries, to_entries) = self
+            .daemon
+            .with_state_store(|store| {
+                Ok((
+                    store.load_checkpoint(&from_checkpoint_id)?,
+                    store.load_checkpoint(&to_checkpoint_id)?,
+                    store.load_checkpoint_file_entries(&from_checkpoint_id)?,
+                    store.load_checkpoint_file_entries(&to_checkpoint_id)?,
+                ))
+            })
+            .map_err(|error| status_from_stack_error(error, &request_id))?;
+
+        if from_checkpoint.is_none() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::NotFound,
+                format!("checkpoint not found: {from_checkpoint_id}"),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+        if to_checkpoint.is_none() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::NotFound,
+                format!("checkpoint not found: {to_checkpoint_id}"),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        Ok(Response::new(runtime_v2::DiffCheckpointsResponse {
+            request_id,
+            files: diff_checkpoint_file_entries(&from_entries, &to_entries),
         }))
     }
 
@@ -489,5 +819,50 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
             response.metadata_mut().insert("x-receipt-id", value);
         }
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(path: &str, digest_sha256: &str, size: u64) -> CheckpointFileEntry {
+        CheckpointFileEntry {
+            path: path.to_string(),
+            digest_sha256: digest_sha256.to_string(),
+            size,
+        }
+    }
+
+    #[test]
+    fn checkpoint_file_diff_detects_add_delete_modify_and_rename() {
+        let from_entries = vec![
+            entry("old-name.txt", "digest-rename", 10),
+            entry("deleted.txt", "digest-delete", 4),
+            entry("modified.txt", "digest-before", 5),
+            entry("unchanged.txt", "digest-same", 7),
+        ];
+        let to_entries = vec![
+            entry("new-name.txt", "digest-rename", 10),
+            entry("added.txt", "digest-add", 3),
+            entry("modified.txt", "digest-after", 8),
+            entry("unchanged.txt", "digest-same", 7),
+        ];
+
+        let diffs = diff_checkpoint_file_entries(&from_entries, &to_entries);
+        let rendered: Vec<(String, String)> = diffs
+            .iter()
+            .map(|item| (item.path.clone(), item.change.clone()))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                ("added.txt".to_string(), "A".to_string()),
+                ("deleted.txt".to_string(), "D".to_string()),
+                ("modified.txt".to_string(), "M".to_string()),
+                ("new-name.txt".to_string(), "A".to_string()),
+                ("old-name.txt".to_string(), "D".to_string()),
+            ]
+        );
     }
 }

@@ -733,6 +733,37 @@ pub struct ForkCheckpointRequest {
     pub metadata: ::core::option::Option<RequestMetadata>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DiffCheckpointsRequest {
+    #[prost(string, tag = "1")]
+    pub from_checkpoint_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub to_checkpoint_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub metadata: ::core::option::Option<RequestMetadata>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CheckpointFileDiffPayload {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub change: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub before_digest_sha256: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub after_digest_sha256: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "5")]
+    pub before_size: u64,
+    #[prost(uint64, tag = "6")]
+    pub after_size: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DiffCheckpointsResponse {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub files: ::prost::alloc::vec::Vec<CheckpointFileDiffPayload>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StartBuildRequest {
     #[prost(message, optional, tag = "1")]
     pub metadata: ::core::option::Option<RequestMetadata>,
@@ -2675,6 +2706,32 @@ pub mod checkpoint_service_client {
             req.extensions_mut()
                 .insert(
                     GrpcMethod::new("vz.runtime.v2.CheckpointService", "ForkCheckpoint"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn diff_checkpoints(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DiffCheckpointsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DiffCheckpointsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.runtime.v2.CheckpointService/DiffCheckpoints",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("vz.runtime.v2.CheckpointService", "DiffCheckpoints"),
                 );
             self.inner.unary(req, path, codec).await
         }
@@ -6061,6 +6118,13 @@ pub mod checkpoint_service_server {
             tonic::Response<super::CheckpointResponse>,
             tonic::Status,
         >;
+        async fn diff_checkpoints(
+            &self,
+            request: tonic::Request<super::DiffCheckpointsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DiffCheckpointsResponse>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct CheckpointServiceServer<T> {
@@ -6356,6 +6420,52 @@ pub mod checkpoint_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ForkCheckpointSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.runtime.v2.CheckpointService/DiffCheckpoints" => {
+                    #[allow(non_camel_case_types)]
+                    struct DiffCheckpointsSvc<T: CheckpointService>(pub Arc<T>);
+                    impl<
+                        T: CheckpointService,
+                    > tonic::server::UnaryService<super::DiffCheckpointsRequest>
+                    for DiffCheckpointsSvc<T> {
+                        type Response = super::DiffCheckpointsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DiffCheckpointsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as CheckpointService>::diff_checkpoints(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DiffCheckpointsSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

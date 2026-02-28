@@ -111,6 +111,17 @@ pub struct Checkpoint {
     pub compatibility_fingerprint: String,
 }
 
+/// Canonical file-level snapshot entry captured for a checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointFileEntry {
+    /// Relative file path from workspace root.
+    pub path: String,
+    /// SHA-256 digest of file content (or symlink target bytes).
+    pub digest_sha256: String,
+    /// Logical file size in bytes.
+    pub size: u64,
+}
+
 impl Checkpoint {
     /// Transition to a new checkpoint state if allowed.
     pub fn transition_to(&mut self, next: CheckpointState) -> Result<(), ContractInvariantError> {

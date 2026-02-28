@@ -1595,6 +1595,72 @@ fn checkpoint_delete_removes() {
 }
 
 #[test]
+fn checkpoint_file_entries_round_trip_replaces_and_orders_by_path() {
+    let store = StateStore::in_memory().unwrap();
+    let checkpoint = sample_checkpoint("ckpt-files", "sb-1");
+    store.save_checkpoint(&checkpoint).unwrap();
+
+    store
+        .replace_checkpoint_file_entries(
+            "ckpt-files",
+            &[
+                CheckpointFileEntry {
+                    path: "z.txt".to_string(),
+                    digest_sha256: "digest-z".to_string(),
+                    size: 3,
+                },
+                CheckpointFileEntry {
+                    path: "a.txt".to_string(),
+                    digest_sha256: "digest-a".to_string(),
+                    size: 1,
+                },
+            ],
+        )
+        .unwrap();
+
+    let loaded = store.load_checkpoint_file_entries("ckpt-files").unwrap();
+    let paths: Vec<_> = loaded.iter().map(|entry| entry.path.as_str()).collect();
+    assert_eq!(paths, vec!["a.txt", "z.txt"]);
+
+    store
+        .replace_checkpoint_file_entries(
+            "ckpt-files",
+            &[CheckpointFileEntry {
+                path: "m.txt".to_string(),
+                digest_sha256: "digest-m".to_string(),
+                size: 2,
+            }],
+        )
+        .unwrap();
+    let replaced = store.load_checkpoint_file_entries("ckpt-files").unwrap();
+    assert_eq!(replaced.len(), 1);
+    assert_eq!(replaced[0].path, "m.txt");
+}
+
+#[test]
+fn checkpoint_delete_cascades_checkpoint_file_entries() {
+    let store = StateStore::in_memory().unwrap();
+    let checkpoint = sample_checkpoint("ckpt-del-files", "sb-1");
+    store.save_checkpoint(&checkpoint).unwrap();
+    store
+        .replace_checkpoint_file_entries(
+            "ckpt-del-files",
+            &[CheckpointFileEntry {
+                path: "artifact.bin".to_string(),
+                digest_sha256: "digest-artifact".to_string(),
+                size: 42,
+            }],
+        )
+        .unwrap();
+
+    store.delete_checkpoint("ckpt-del-files").unwrap();
+    let loaded = store
+        .load_checkpoint_file_entries("ckpt-del-files")
+        .unwrap();
+    assert!(loaded.is_empty());
+}
+
+#[test]
 fn checkpoint_null_parent_round_trips() {
     let store = StateStore::in_memory().unwrap();
     let checkpoint = sample_checkpoint("ckpt-null-parent", "sb-1");

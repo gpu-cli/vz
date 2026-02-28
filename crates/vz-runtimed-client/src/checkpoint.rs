@@ -109,4 +109,25 @@ impl DaemonClient {
             .await
             .map_err(|status| status_to_client_error(&self.config.socket_path, status))
     }
+
+    /// Call Runtime V2 `DiffCheckpoints`.
+    pub async fn diff_checkpoints(
+        &mut self,
+        request: runtime_v2::DiffCheckpointsRequest,
+    ) -> Result<runtime_v2::DiffCheckpointsResponse> {
+        let response = self.diff_checkpoints_with_metadata(request).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Call Runtime V2 `DiffCheckpoints` and preserve gRPC response metadata.
+    pub async fn diff_checkpoints_with_metadata(
+        &mut self,
+        mut request: runtime_v2::DiffCheckpointsRequest,
+    ) -> Result<tonic::Response<runtime_v2::DiffCheckpointsResponse>> {
+        Self::ensure_metadata(&mut request.metadata);
+        self.checkpoint_client
+            .diff_checkpoints(Request::new(request))
+            .await
+            .map_err(|status| status_to_client_error(&self.config.socket_path, status))
+    }
 }

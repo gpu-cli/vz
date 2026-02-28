@@ -1,9 +1,7 @@
-//! `vz diff` — deterministic diff contract over checkpoint metadata.
+//! `vz diff` — deterministic, versioned checkpoint diff contract.
 //!
-//! This provides the first versioned diff contract while backend file-level
-//! checkpoint deltas are still unavailable. Default mode emits a deterministic
-//! file-summary projection; expanded modes expose structured system/patch
-//! evidence from checkpoint metadata differences.
+//! In daemon mode this consumes runtime-owned file-level checkpoint deltas.
+//! API mode retains metadata projection fallback until API parity is complete.
 
 #![allow(clippy::print_stdout)]
 
@@ -23,6 +21,8 @@ use super::runtime_daemon::{
 };
 
 const DIFF_SCHEMA_VERSION: u16 = 1;
+const EVIDENCE_SOURCE_CHECKPOINT_FILE_SNAPSHOT: &str = "checkpoint_file_snapshot";
+const EVIDENCE_SOURCE_CHECKPOINT_METADATA: &str = "checkpoint_metadata";
 
 /// Compare two checkpoints using the versioned diff contract.
 #[derive(Args, Debug)]
@@ -114,10 +114,22 @@ struct SystemDiffEntry {
     after: String,
 }
 
+#[derive(Debug, Clone)]
+struct DiffEvidence {
+    evidence_source: String,
+    file_diffs: Vec<runtime_v2::CheckpointFileDiffPayload>,
+}
+
 pub async fn run(args: DiffArgs) -> anyhow::Result<()> {
     let from = load_checkpoint(args.state_db.as_path(), args.from_checkpoint_id.as_str()).await?;
     let to = load_checkpoint(args.state_db.as_path(), args.to_checkpoint_id.as_str()).await?;
-    let envelope = build_diff_envelope(&from, &to, args.mode);
+    let evidence = load_diff_evidence(
+        args.state_db.as_path(),
+        args.from_checkpoint_id.as_str(),
+        args.to_checkpoint_id.as_str(),
+    )
+    .await?;
+    let envelope = build_diff_envelope(&from, &to, args.mode, &evidence);
 
     if args.json {
         let json =
@@ -133,14 +145,16 @@ pub async fn run(args: DiffArgs) -> anyhow::Result<()> {
         envelope.to_checkpoint_id,
         envelope.mode
     );
-    if envelope.file_summary.is_empty() {
+    if envelope.file_summary.is_empty() && envelope.patch.is_empty() && envelope.system.is_empty() {
         println!("No differences.");
         return Ok(());
     }
 
-    println!("Files:");
-    for entry in &envelope.file_summary {
-        println!("  {} {}", entry.change, entry.path);
+    if !envelope.file_summary.is_empty() {
+        println!("Files:");
+        for entry in &envelope.file_summary {
+            println!("  {} {}", entry.change, entry.path);
+        }
     }
     if matches!(args.mode, DiffMode::Patch) {
         println!("Patch:");
@@ -249,6 +263,47 @@ async fn load_checkpoint(
     }
 }
 
+async fn load_diff_evidence(
+    state_db: &std::path::Path,
+    from_checkpoint_id: &str,
+    to_checkpoint_id: &str,
+) -> anyhow::Result<DiffEvidence> {
+    match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let mut client = connect_control_plane_for_state_db(state_db).await?;
+            match client
+                .diff_checkpoints(runtime_v2::DiffCheckpointsRequest {
+                    from_checkpoint_id: from_checkpoint_id.to_string(),
+                    to_checkpoint_id: to_checkpoint_id.to_string(),
+                    metadata: None,
+                })
+                .await
+            {
+                Ok(response) => Ok(DiffEvidence {
+                    evidence_source: EVIDENCE_SOURCE_CHECKPOINT_FILE_SNAPSHOT.to_string(),
+                    file_diffs: response.files,
+                }),
+                Err(DaemonClientError::Grpc(status)) if status.code() == Code::Unimplemented => {
+                    Ok(DiffEvidence {
+                        evidence_source: EVIDENCE_SOURCE_CHECKPOINT_METADATA.to_string(),
+                        file_diffs: Vec::new(),
+                    })
+                }
+                Err(DaemonClientError::Grpc(status)) if status.code() == Code::NotFound => {
+                    bail!("checkpoint diff target not found: {}", status.message())
+                }
+                Err(error) => {
+                    Err(anyhow!(error).context("failed to load checkpoint diff via daemon"))
+                }
+            }
+        }
+        ControlPlaneTransport::ApiHttp => Ok(DiffEvidence {
+            evidence_source: EVIDENCE_SOURCE_CHECKPOINT_METADATA.to_string(),
+            file_diffs: Vec::new(),
+        }),
+    }
+}
+
 fn normalize_opt(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -301,27 +356,83 @@ fn collect_system_diffs(
     diffs
 }
 
+fn normalize_change(value: &str) -> &'static str {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "A" => "A",
+        "D" => "D",
+        _ => "M",
+    }
+}
+
+fn sorted_file_diffs(
+    file_diffs: &[runtime_v2::CheckpointFileDiffPayload],
+) -> Vec<&runtime_v2::CheckpointFileDiffPayload> {
+    let mut sorted: Vec<_> = file_diffs.iter().collect();
+    sorted.sort_by(|lhs, rhs| {
+        lhs.path
+            .cmp(&rhs.path)
+            .then_with(|| normalize_change(&lhs.change).cmp(normalize_change(&rhs.change)))
+    });
+    sorted
+}
+
+fn format_patch_snapshot(digest_sha256: &str, size: u64) -> String {
+    let digest = digest_sha256.trim();
+    if digest.is_empty() {
+        "<missing>".to_string()
+    } else {
+        format!("{digest} ({size} bytes)")
+    }
+}
+
 fn build_diff_envelope(
     from: &runtime_v2::CheckpointPayload,
     to: &runtime_v2::CheckpointPayload,
     mode: DiffMode,
+    evidence: &DiffEvidence,
 ) -> DiffEnvelopeV1 {
     let system = collect_system_diffs(from, to);
-    let file_summary: Vec<FileSummaryEntry> = system
-        .iter()
-        .map(|entry| FileSummaryEntry {
-            path: format!("/.system/checkpoint/{}", entry.field),
-            change: "M".to_string(),
-        })
-        .collect();
-    let patch: Vec<PatchEntry> = system
-        .iter()
-        .map(|entry| PatchEntry {
-            path: format!("/.system/checkpoint/{}", entry.field),
-            before: entry.before.clone(),
-            after: entry.after.clone(),
-        })
-        .collect();
+    let (file_summary, patch) = if evidence.evidence_source
+        == EVIDENCE_SOURCE_CHECKPOINT_FILE_SNAPSHOT
+    {
+        let sorted_file_diffs = sorted_file_diffs(&evidence.file_diffs);
+        let file_summary = sorted_file_diffs
+            .iter()
+            .map(|entry| FileSummaryEntry {
+                path: entry.path.clone(),
+                change: normalize_change(entry.change.as_str()).to_string(),
+            })
+            .collect();
+        let patch = sorted_file_diffs
+            .iter()
+            .map(|entry| PatchEntry {
+                path: entry.path.clone(),
+                before: format_patch_snapshot(
+                    entry.before_digest_sha256.as_str(),
+                    entry.before_size,
+                ),
+                after: format_patch_snapshot(entry.after_digest_sha256.as_str(), entry.after_size),
+            })
+            .collect();
+        (file_summary, patch)
+    } else {
+        let file_summary = system
+            .iter()
+            .map(|entry| FileSummaryEntry {
+                path: format!("/.system/checkpoint/{}", entry.field),
+                change: "M".to_string(),
+            })
+            .collect();
+        let patch = system
+            .iter()
+            .map(|entry| PatchEntry {
+                path: format!("/.system/checkpoint/{}", entry.field),
+                before: entry.before.clone(),
+                after: entry.after.clone(),
+            })
+            .collect();
+        (file_summary, patch)
+    };
 
     DiffEnvelopeV1 {
         schema_version: DIFF_SCHEMA_VERSION,
@@ -330,7 +441,7 @@ fn build_diff_envelope(
             DiffMode::Patch => "patch".to_string(),
             DiffMode::System => "system".to_string(),
         },
-        evidence_source: "checkpoint_metadata".to_string(),
+        evidence_source: evidence.evidence_source.clone(),
         from_checkpoint_id: from.checkpoint_id.clone(),
         to_checkpoint_id: to.checkpoint_id.clone(),
         file_summary,
@@ -372,46 +483,110 @@ mod tests {
     fn diff_envelope_schema_version_is_stable() {
         let from = payload("cp-a", "fs_quick", "ready", "fp-1");
         let to = payload("cp-b", "vm_full", "ready", "fp-2");
-        let envelope = build_diff_envelope(&from, &to, DiffMode::FileSummary);
+        let envelope = build_diff_envelope(
+            &from,
+            &to,
+            DiffMode::FileSummary,
+            &DiffEvidence {
+                evidence_source: EVIDENCE_SOURCE_CHECKPOINT_METADATA.to_string(),
+                file_diffs: Vec::new(),
+            },
+        );
         assert_eq!(envelope.schema_version, DIFF_SCHEMA_VERSION);
         assert_eq!(envelope.mode, "file_summary");
-        assert_eq!(envelope.evidence_source, "checkpoint_metadata");
+        assert_eq!(
+            envelope.evidence_source,
+            EVIDENCE_SOURCE_CHECKPOINT_METADATA
+        );
     }
 
     #[test]
     fn file_summary_order_is_deterministic() {
-        let from = payload("cp-a", "fs_quick", "creating", "fp-1");
-        let mut to = payload("cp-b", "vm_full", "ready", "fp-2");
-        to.sandbox_id = "sandbox-z".to_string();
-        to.parent_checkpoint_id = "".to_string();
-        to.created_at = 5;
-
-        let envelope = build_diff_envelope(&from, &to, DiffMode::FileSummary);
+        let from = payload("cp-a", "fs_quick", "ready", "fp-1");
+        let to = payload("cp-b", "fs_quick", "ready", "fp-1");
+        let envelope = build_diff_envelope(
+            &from,
+            &to,
+            DiffMode::FileSummary,
+            &DiffEvidence {
+                evidence_source: EVIDENCE_SOURCE_CHECKPOINT_FILE_SNAPSHOT.to_string(),
+                file_diffs: vec![
+                    runtime_v2::CheckpointFileDiffPayload {
+                        path: "/c.txt".to_string(),
+                        change: "M".to_string(),
+                        before_digest_sha256: "before-c".to_string(),
+                        after_digest_sha256: "after-c".to_string(),
+                        before_size: 3,
+                        after_size: 4,
+                    },
+                    runtime_v2::CheckpointFileDiffPayload {
+                        path: "/a.txt".to_string(),
+                        change: "A".to_string(),
+                        before_digest_sha256: String::new(),
+                        after_digest_sha256: "after-a".to_string(),
+                        before_size: 0,
+                        after_size: 1,
+                    },
+                    runtime_v2::CheckpointFileDiffPayload {
+                        path: "/b.txt".to_string(),
+                        change: "D".to_string(),
+                        before_digest_sha256: "before-b".to_string(),
+                        after_digest_sha256: String::new(),
+                        before_size: 2,
+                        after_size: 0,
+                    },
+                ],
+            },
+        );
         let paths: Vec<_> = envelope
             .file_summary
             .iter()
             .map(|e| e.path.as_str())
             .collect();
-        assert_eq!(
-            paths,
-            vec![
-                "/.system/checkpoint/checkpoint_class",
-                "/.system/checkpoint/compatibility_fingerprint",
-                "/.system/checkpoint/created_at",
-                "/.system/checkpoint/parent_checkpoint_id",
-                "/.system/checkpoint/sandbox_id",
-                "/.system/checkpoint/state",
-            ]
-        );
+        assert_eq!(paths, vec!["/a.txt", "/b.txt", "/c.txt"]);
     }
 
     #[test]
     fn system_mode_emits_structured_field_diffs() {
         let from = payload("cp-a", "fs_quick", "creating", "fp-1");
         let to = payload("cp-b", "vm_full", "ready", "fp-2");
-        let envelope = build_diff_envelope(&from, &to, DiffMode::System);
+        let envelope = build_diff_envelope(
+            &from,
+            &to,
+            DiffMode::System,
+            &DiffEvidence {
+                evidence_source: EVIDENCE_SOURCE_CHECKPOINT_FILE_SNAPSHOT.to_string(),
+                file_diffs: Vec::new(),
+            },
+        );
         assert!(!envelope.system.is_empty());
         assert!(envelope.patch.is_empty());
         assert_eq!(envelope.system[0].field, "checkpoint_class".to_string());
+    }
+
+    #[test]
+    fn patch_mode_uses_file_level_before_after_when_data_plane_is_available() {
+        let from = payload("cp-a", "fs_quick", "ready", "fp-1");
+        let to = payload("cp-b", "fs_quick", "ready", "fp-1");
+        let envelope = build_diff_envelope(
+            &from,
+            &to,
+            DiffMode::Patch,
+            &DiffEvidence {
+                evidence_source: EVIDENCE_SOURCE_CHECKPOINT_FILE_SNAPSHOT.to_string(),
+                file_diffs: vec![runtime_v2::CheckpointFileDiffPayload {
+                    path: "/changed.txt".to_string(),
+                    change: "M".to_string(),
+                    before_digest_sha256: "deadbeef".to_string(),
+                    after_digest_sha256: "cafebabe".to_string(),
+                    before_size: 10,
+                    after_size: 12,
+                }],
+            },
+        );
+        assert_eq!(envelope.patch.len(), 1);
+        assert_eq!(envelope.patch[0].path, "/changed.txt");
+        assert_eq!(envelope.patch[0].before, "deadbeef (10 bytes)");
+        assert_eq!(envelope.patch[0].after, "cafebabe (12 bytes)");
     }
 }

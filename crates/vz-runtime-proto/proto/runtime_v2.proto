@@ -473,6 +473,7 @@ service CheckpointService {
   rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
   rpc RestoreCheckpoint(RestoreCheckpointRequest) returns (CheckpointResponse);
   rpc ForkCheckpoint(ForkCheckpointRequest) returns (CheckpointResponse);
+  rpc DiffCheckpoints(DiffCheckpointsRequest) returns (DiffCheckpointsResponse);
 }
 
 message CreateCheckpointRequest {
@@ -522,6 +523,26 @@ message ForkCheckpointRequest {
   string checkpoint_id = 1;
   string new_sandbox_id = 2;
   RequestMetadata metadata = 3;
+}
+
+message DiffCheckpointsRequest {
+  string from_checkpoint_id = 1;
+  string to_checkpoint_id = 2;
+  RequestMetadata metadata = 3;
+}
+
+message CheckpointFileDiffPayload {
+  string path = 1;
+  string change = 2;
+  string before_digest_sha256 = 3;
+  string after_digest_sha256 = 4;
+  uint64 before_size = 5;
+  uint64 after_size = 6;
+}
+
+message DiffCheckpointsResponse {
+  string request_id = 1;
+  repeated CheckpointFileDiffPayload files = 2;
 }
 
 // ── 6. BuildService ───────────────────────────────────────────────

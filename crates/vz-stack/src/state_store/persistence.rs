@@ -1119,8 +1119,93 @@ impl StateStore {
         Ok(checkpoints)
     }
 
+    /// Replace file snapshot entries for a checkpoint.
+    pub fn replace_checkpoint_file_entries(
+        &self,
+        checkpoint_id: &str,
+        entries: &[CheckpointFileEntry],
+    ) -> Result<(), StackError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        self.conn.execute(
+            "DELETE FROM checkpoint_file_entries WHERE checkpoint_id = ?1",
+            params![checkpoint_id],
+        )?;
+
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO checkpoint_file_entries (checkpoint_id, path, digest_sha256, size, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(checkpoint_id, path) DO UPDATE SET
+                digest_sha256 = excluded.digest_sha256,
+                size = excluded.size,
+                updated_at = excluded.updated_at",
+        )?;
+        for entry in entries {
+            let size_i64 = i64::try_from(entry.size).map_err(|_| StackError::Machine {
+                code: MachineErrorCode::ValidationError,
+                message: format!(
+                    "checkpoint file entry `{}` size exceeds sqlite integer range",
+                    entry.path
+                ),
+            })?;
+            stmt.execute(params![
+                checkpoint_id,
+                entry.path,
+                entry.digest_sha256,
+                size_i64,
+                now,
+                now,
+            ])?;
+        }
+        Ok(())
+    }
+
+    /// Load file snapshot entries for a checkpoint ordered by path.
+    pub fn load_checkpoint_file_entries(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Vec<CheckpointFileEntry>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, digest_sha256, size
+             FROM checkpoint_file_entries
+             WHERE checkpoint_id = ?1
+             ORDER BY path ASC",
+        )?;
+        let rows = stmt.query_map(params![checkpoint_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            let (path, digest_sha256, size_i64) = row?;
+            let size = u64::try_from(size_i64).map_err(|_| StackError::Machine {
+                code: MachineErrorCode::InternalError,
+                message: format!(
+                    "checkpoint file entry `{path}` has negative size {size_i64} in state store"
+                ),
+            })?;
+            entries.push(CheckpointFileEntry {
+                path,
+                digest_sha256,
+                size,
+            });
+        }
+        Ok(entries)
+    }
+
     /// Delete a checkpoint by its identifier.
     pub fn delete_checkpoint(&self, checkpoint_id: &str) -> Result<(), StackError> {
+        self.conn.execute(
+            "DELETE FROM checkpoint_file_entries WHERE checkpoint_id = ?1",
+            params![checkpoint_id],
+        )?;
         self.conn.execute(
             "DELETE FROM checkpoint_state WHERE checkpoint_id = ?1",
             params![checkpoint_id],

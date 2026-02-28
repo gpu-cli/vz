@@ -4323,6 +4323,127 @@ async fn create_checkpoint_then_get_and_list_round_trip() {
 }
 
 #[tokio::test]
+async fn diff_checkpoints_returns_real_file_level_deltas() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let workspace_root = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+    std::fs::write(workspace_root.join("deleted.txt"), b"deleted").expect("seed deleted file");
+    std::fs::write(workspace_root.join("modified.txt"), b"before").expect("seed modified file");
+    std::fs::write(workspace_root.join("rename-old.txt"), b"rename").expect("seed rename file");
+
+    let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
+    let sandbox = read_create_sandbox_completion_response(
+        sandbox_client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "stack-checkpoint-diff".to_string(),
+                cpus: 0,
+                memory_mb: 0,
+                labels: std::collections::HashMap::from([(
+                    SANDBOX_LABEL_PROJECT_DIR.to_string(),
+                    workspace_root.to_string_lossy().to_string(),
+                )]),
+            }))
+            .await
+            .expect("create sandbox"),
+    )
+    .await
+    .sandbox
+    .expect("sandbox payload");
+
+    let mut checkpoint_client = connect_checkpoint_client(&config.socket_path).await;
+    let from_checkpoint_id = checkpoint_client
+        .create_checkpoint(Request::new(runtime_v2::CreateCheckpointRequest {
+            metadata: None,
+            sandbox_id: sandbox.sandbox_id.clone(),
+            checkpoint_class: "fs_quick".to_string(),
+            compatibility_fingerprint: "fp-a".to_string(),
+        }))
+        .await
+        .expect("create from checkpoint")
+        .into_inner()
+        .checkpoint
+        .expect("from checkpoint payload")
+        .checkpoint_id;
+
+    std::fs::remove_file(workspace_root.join("deleted.txt")).expect("remove deleted file");
+    std::fs::write(workspace_root.join("modified.txt"), b"after").expect("rewrite modified file");
+    std::fs::rename(
+        workspace_root.join("rename-old.txt"),
+        workspace_root.join("rename-new.txt"),
+    )
+    .expect("rename file");
+    std::fs::write(workspace_root.join("added.txt"), b"added").expect("write added file");
+
+    let to_checkpoint_id = checkpoint_client
+        .create_checkpoint(Request::new(runtime_v2::CreateCheckpointRequest {
+            metadata: None,
+            sandbox_id: sandbox.sandbox_id.clone(),
+            checkpoint_class: "fs_quick".to_string(),
+            compatibility_fingerprint: "fp-b".to_string(),
+        }))
+        .await
+        .expect("create to checkpoint")
+        .into_inner()
+        .checkpoint
+        .expect("to checkpoint payload")
+        .checkpoint_id;
+
+    let diff = checkpoint_client
+        .diff_checkpoints(Request::new(runtime_v2::DiffCheckpointsRequest {
+            from_checkpoint_id: from_checkpoint_id.clone(),
+            to_checkpoint_id: to_checkpoint_id.clone(),
+            metadata: None,
+        }))
+        .await
+        .expect("diff checkpoints")
+        .into_inner();
+    let rendered: Vec<(String, String)> = diff
+        .files
+        .iter()
+        .map(|item| (item.path.clone(), item.change.clone()))
+        .collect();
+    assert_eq!(
+        rendered,
+        vec![
+            ("added.txt".to_string(), "A".to_string()),
+            ("deleted.txt".to_string(), "D".to_string()),
+            ("modified.txt".to_string(), "M".to_string()),
+            ("rename-new.txt".to_string(), "A".to_string()),
+            ("rename-old.txt".to_string(), "D".to_string()),
+        ]
+    );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
 async fn file_service_write_read_list_round_trip_with_receipts() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = RuntimedConfig {

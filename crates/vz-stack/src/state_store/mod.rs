@@ -13,9 +13,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use vz_runtime_contract::{
-    Build, BuildSpec, BuildState, Checkpoint, CheckpointClass, CheckpointState, Container,
-    ContainerSpec, ContainerState, Execution, ExecutionSpec, ExecutionState, Lease, LeaseState,
-    Sandbox, SandboxBackend, SandboxSpec, SandboxState,
+    Build, BuildSpec, BuildState, Checkpoint, CheckpointClass, CheckpointFileEntry,
+    CheckpointState, Container, ContainerSpec, ContainerState, Execution, ExecutionSpec,
+    ExecutionState, Lease, LeaseState, MachineErrorCode, Sandbox, SandboxBackend, SandboxSpec,
+    SandboxState,
 };
 
 use crate::StackSpec;
@@ -601,6 +602,18 @@ impl StateStore {
             );
             CREATE INDEX IF NOT EXISTS idx_checkpoint_sandbox ON checkpoint_state(sandbox_id);
             CREATE INDEX IF NOT EXISTS idx_checkpoint_parent ON checkpoint_state(parent_checkpoint_id);
+
+            CREATE TABLE IF NOT EXISTS checkpoint_file_entries (
+                checkpoint_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                digest_sha256 TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (checkpoint_id, path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_checkpoint_file_entries_checkpoint
+                ON checkpoint_file_entries(checkpoint_id);
 
             CREATE TABLE IF NOT EXISTS container_state (
                 container_id TEXT PRIMARY KEY,
