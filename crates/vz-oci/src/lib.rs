@@ -7,10 +7,15 @@
 
 #![forbid(unsafe_code)]
 
+pub mod buildkit;
 pub mod bundle;
 pub mod container_store;
 pub mod error;
 
+pub use buildkit::{
+    BUILDKIT_VERSION, BuildkitArtifacts, BuildkitError, BuildkitVersionMetadata,
+    ensure_buildkit_artifacts,
+};
 pub use bundle::CONTAINER_LOG_FILE;
 pub use container_store::{ContainerInfo, ContainerStatus, ContainerStore};
 pub use error::OciError;
