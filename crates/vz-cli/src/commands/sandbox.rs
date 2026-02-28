@@ -19,10 +19,10 @@ use tonic::Code;
 use vz_runtime_contract::{
     SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER, SANDBOX_LABEL_PROJECT_DIR,
     SANDBOX_LABEL_SPACE_CONFIG_PATH, SANDBOX_LABEL_SPACE_LIFECYCLE, SANDBOX_LABEL_SPACE_MODE,
-    SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX, SANDBOX_LABEL_SPACE_WORKTREE_ID,
-    SANDBOX_LABEL_SPACE_WORKTREE_NAMESPACE, SANDBOX_SPACE_LIFECYCLE_EPHEMERAL,
-    SANDBOX_SPACE_LIFECYCLE_PERSISTENT, SANDBOX_SPACE_MODE_REQUIRED, Sandbox, SandboxBackend,
-    SandboxSpec, SandboxState,
+    SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX, SANDBOX_LABEL_SPACE_SERVICE_STATE_PREFIX,
+    SANDBOX_LABEL_SPACE_WORKTREE_ID, SANDBOX_LABEL_SPACE_WORKTREE_NAMESPACE,
+    SANDBOX_SPACE_LIFECYCLE_EPHEMERAL, SANDBOX_SPACE_LIFECYCLE_PERSISTENT,
+    SANDBOX_SPACE_MODE_REQUIRED, Sandbox, SandboxBackend, SandboxSpec, SandboxState,
 };
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed_client::DaemonClientError;
@@ -57,6 +57,14 @@ struct SpaceWorktreeIdentity {
     root_path: PathBuf,
     worktree_id: String,
     service_namespace: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorktreeNamespaceCollision {
+    sandbox_id: String,
+    namespace: String,
+    existing_worktree_id: String,
+    existing_project_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -607,15 +615,82 @@ fn derive_space_worktree_identity(cwd: &Path) -> anyhow::Result<SpaceWorktreeIde
     })
 }
 
-fn default_worktree_service_state_defaults(
-    service_namespace: &str,
-) -> BTreeMap<&'static str, String> {
+fn default_worktree_service_state_defaults(service_namespace: &str) -> BTreeMap<String, String> {
     let namespace = sanitize_namespace_segment(service_namespace);
     BTreeMap::from([
-        ("postgres.schema", namespace.clone()),
-        ("mysql.database", namespace.clone()),
-        ("redis.key_prefix", format!("{namespace}:")),
+        ("postgres.schema".to_string(), namespace.clone()),
+        ("mysql.database".to_string(), namespace.clone()),
+        ("redis.key_prefix".to_string(), format!("{namespace}:")),
     ])
+}
+
+fn service_state_label_key(suffix: &str) -> String {
+    format!("{SANDBOX_LABEL_SPACE_SERVICE_STATE_PREFIX}{suffix}")
+}
+
+fn apply_worktree_service_state_labels(
+    labels: &mut BTreeMap<String, String>,
+    service_state_defaults: &BTreeMap<String, String>,
+) {
+    for (suffix, value) in service_state_defaults {
+        labels.insert(service_state_label_key(suffix), value.clone());
+    }
+}
+
+fn find_worktree_namespace_collision(
+    sandboxes: &[Sandbox],
+    namespace: &str,
+    worktree_id: &str,
+) -> Option<WorktreeNamespaceCollision> {
+    for sandbox in sandboxes {
+        if sandbox.state.is_terminal() {
+            continue;
+        }
+        let Some(existing_namespace) = sandbox.labels.get(SANDBOX_LABEL_SPACE_WORKTREE_NAMESPACE)
+        else {
+            continue;
+        };
+        if existing_namespace != namespace {
+            continue;
+        }
+        let Some(existing_worktree_id) = sandbox.labels.get(SANDBOX_LABEL_SPACE_WORKTREE_ID) else {
+            continue;
+        };
+        if existing_worktree_id == worktree_id {
+            continue;
+        }
+
+        return Some(WorktreeNamespaceCollision {
+            sandbox_id: sandbox.sandbox_id.clone(),
+            namespace: existing_namespace.to_string(),
+            existing_worktree_id: existing_worktree_id.to_string(),
+            existing_project_dir: sandbox.labels.get(SANDBOX_LABEL_PROJECT_DIR).cloned(),
+        });
+    }
+    None
+}
+
+async fn ensure_worktree_namespace_not_colliding(
+    state_db: &Path,
+    namespace: &str,
+    worktree_id: &str,
+) -> anyhow::Result<()> {
+    let sandboxes = daemon_list_sandboxes(state_db).await?;
+    let Some(collision) = find_worktree_namespace_collision(&sandboxes, namespace, worktree_id)
+    else {
+        return Ok(());
+    };
+
+    let project_dir = collision
+        .existing_project_dir
+        .as_deref()
+        .unwrap_or("<unknown>");
+    bail!(
+        "worktree namespace collision detected for `{namespace}`. active sandbox `{}` already owns this namespace with worktree id `{}` (project `{project_dir}`). terminate that sandbox before retrying (`vz rm {}`) to avoid shared-service state bleed",
+        collision.sandbox_id,
+        collision.existing_worktree_id,
+        collision.sandbox_id
+    );
 }
 
 fn enforce_btrfs_workspace_preflight(workspace_root: &Path) -> anyhow::Result<()> {
@@ -1581,6 +1656,7 @@ async fn cmd_create_sandbox(
         SANDBOX_LABEL_SPACE_WORKTREE_NAMESPACE.to_string(),
         worktree_identity.service_namespace.to_string(),
     );
+    apply_worktree_service_state_labels(&mut labels, &worktree_service_defaults);
     labels.insert(
         SANDBOX_LABEL_SPACE_LIFECYCLE.to_string(),
         lifecycle_mode.as_label_value().to_string(),
@@ -1599,6 +1675,12 @@ async fn cmd_create_sandbox(
         labels.get(SANDBOX_LABEL_BASE_IMAGE_REF).map(String::as_str),
         labels.get(SANDBOX_LABEL_MAIN_CONTAINER).map(String::as_str),
     )?;
+    ensure_worktree_namespace_not_colliding(
+        state_db,
+        worktree_identity.service_namespace.as_str(),
+        worktree_identity.worktree_id.as_str(),
+    )
+    .await?;
     update_space_cache_index(state_db, &cache_keys)?;
 
     // Ensure state directory exists.
@@ -2516,6 +2598,22 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    fn sandbox_with_labels(
+        sandbox_id: &str,
+        state: SandboxState,
+        labels: BTreeMap<String, String>,
+    ) -> Sandbox {
+        Sandbox {
+            sandbox_id: sandbox_id.to_string(),
+            backend: SandboxBackend::MacosVz,
+            spec: SandboxSpec::default(),
+            state,
+            created_at: 1,
+            updated_at: 1,
+            labels,
+        }
+    }
+
     #[test]
     fn detach_prefix_matches_ctrl_p_byte() {
         assert!(is_detach_prefix(&[0x10]));
@@ -2586,6 +2684,119 @@ mod tests {
         assert_eq!(
             defaults.get("redis.key_prefix").map(String::as_str),
             Some("wt_abc123:")
+        );
+    }
+
+    #[test]
+    fn apply_worktree_service_state_labels_projects_defaults_to_labels() {
+        let defaults = default_worktree_service_state_defaults("wt_1a2b3c");
+        let mut labels = BTreeMap::new();
+        apply_worktree_service_state_labels(&mut labels, &defaults);
+
+        assert_eq!(
+            labels
+                .get("vz.space.service_state.postgres.schema")
+                .map(String::as_str),
+            Some("wt_1a2b3c")
+        );
+        assert_eq!(
+            labels
+                .get("vz.space.service_state.mysql.database")
+                .map(String::as_str),
+            Some("wt_1a2b3c")
+        );
+        assert_eq!(
+            labels
+                .get("vz.space.service_state.redis.key_prefix")
+                .map(String::as_str),
+            Some("wt_1a2b3c:")
+        );
+    }
+
+    #[test]
+    fn find_worktree_namespace_collision_detects_active_conflict() {
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            SANDBOX_LABEL_SPACE_WORKTREE_NAMESPACE.to_string(),
+            "wt_deadbeef0001".to_string(),
+        );
+        labels.insert(
+            SANDBOX_LABEL_SPACE_WORKTREE_ID.to_string(),
+            "main-deadbeef0001".to_string(),
+        );
+        labels.insert(
+            SANDBOX_LABEL_PROJECT_DIR.to_string(),
+            "/workspace/project-a".to_string(),
+        );
+        let sandboxes = vec![sandbox_with_labels("vz-a1", SandboxState::Ready, labels)];
+
+        let collision =
+            find_worktree_namespace_collision(&sandboxes, "wt_deadbeef0001", "main-bbbbbbbbbbbb")
+                .expect("collision should be detected");
+        assert_eq!(collision.sandbox_id, "vz-a1");
+        assert_eq!(collision.namespace, "wt_deadbeef0001");
+        assert_eq!(collision.existing_worktree_id, "main-deadbeef0001");
+        assert_eq!(
+            collision.existing_project_dir.as_deref(),
+            Some("/workspace/project-a")
+        );
+    }
+
+    #[test]
+    fn find_worktree_namespace_collision_allows_same_worktree_identity() {
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            SANDBOX_LABEL_SPACE_WORKTREE_NAMESPACE.to_string(),
+            "wt_deadbeef0002".to_string(),
+        );
+        labels.insert(
+            SANDBOX_LABEL_SPACE_WORKTREE_ID.to_string(),
+            "main-deadbeef0002".to_string(),
+        );
+        let sandboxes = vec![sandbox_with_labels("vz-a2", SandboxState::Ready, labels)];
+
+        let collision =
+            find_worktree_namespace_collision(&sandboxes, "wt_deadbeef0002", "main-deadbeef0002");
+        assert!(collision.is_none());
+    }
+
+    #[test]
+    fn find_worktree_namespace_collision_ignores_terminal_sandbox() {
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            SANDBOX_LABEL_SPACE_WORKTREE_NAMESPACE.to_string(),
+            "wt_deadbeef0003".to_string(),
+        );
+        labels.insert(
+            SANDBOX_LABEL_SPACE_WORKTREE_ID.to_string(),
+            "main-deadbeef0003".to_string(),
+        );
+        let sandboxes = vec![sandbox_with_labels(
+            "vz-a3",
+            SandboxState::Terminated,
+            labels,
+        )];
+
+        let collision =
+            find_worktree_namespace_collision(&sandboxes, "wt_deadbeef0003", "main-ffffffffffff");
+        assert!(collision.is_none());
+    }
+
+    #[test]
+    fn worktree_service_defaults_do_not_bleed_between_worktrees() {
+        let first = default_worktree_service_state_defaults("wt_aaaa1111bbbb");
+        let second = default_worktree_service_state_defaults("wt_cccc2222dddd");
+        assert_ne!(
+            first.get("postgres.schema").map(String::as_str),
+            second.get("postgres.schema").map(String::as_str)
+        );
+        assert_ne!(
+            first.get("mysql.database").map(String::as_str),
+            second.get("mysql.database").map(String::as_str)
+        );
+        assert_ne!(
+            first.get("redis.key_prefix").map(String::as_str),
+            second.get("redis.key_prefix").map(String::as_str)
         );
     }
 

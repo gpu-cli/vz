@@ -36,6 +36,8 @@ pub const SANDBOX_SPACE_LIFECYCLE_EPHEMERAL: &str = "ephemeral";
 pub const SANDBOX_LABEL_SPACE_WORKTREE_ID: &str = "vz.space.worktree.id";
 /// Canonical sandbox label key for deterministic shared-service namespace.
 pub const SANDBOX_LABEL_SPACE_WORKTREE_NAMESPACE: &str = "vz.space.worktree.namespace";
+/// Canonical sandbox label key prefix for shared-service logical state settings.
+pub const SANDBOX_LABEL_SPACE_SERVICE_STATE_PREFIX: &str = "vz.space.service_state.";
 /// Canonical sandbox label key for the checked-in space config path.
 pub const SANDBOX_LABEL_SPACE_CONFIG_PATH: &str = "vz.space.config_path";
 /// Canonical sandbox label key prefix mapping space secret names to external env sources.
