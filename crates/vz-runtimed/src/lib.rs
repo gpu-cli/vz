@@ -23,7 +23,7 @@ use vz_stack::{StackError, StackEvent, StateStore, StateStorePragmas};
 
 pub(crate) use execution_sessions::{ExecutionSessionRegistry, ExecutionSessionRegistryError};
 pub use grpc::{RuntimedServerError, serve_runtime_uds_with_shutdown};
-use placement_scheduler::{PlacementScheduler, PlacementSnapshot};
+use placement_scheduler::{BackendPlacementCandidate, PlacementScheduler, PlacementSnapshot};
 
 const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 const LEGACY_SANDBOX_BASE_IMAGE_REF: &str = "debian:bookworm";
@@ -365,8 +365,13 @@ impl RuntimeDaemon {
     ) -> Result<(), MachineError> {
         self.refresh_placement_snapshot()
             .map_err(|error| placement_internal_machine_error(error, request_id))?;
+        let candidates = [BackendPlacementCandidate::available(
+            self.backend_name().to_string(),
+            self.capabilities(),
+        )];
         self.placement_scheduler
-            .evaluate_create_sandbox(self.capabilities(), request_id)
+            .evaluate_create_sandbox(&candidates, request_id)
+            .map(|_| ())
     }
 
     pub(crate) fn enforce_create_container_placement(
@@ -375,8 +380,13 @@ impl RuntimeDaemon {
     ) -> Result<(), MachineError> {
         self.refresh_placement_snapshot()
             .map_err(|error| placement_internal_machine_error(error, request_id))?;
+        let candidates = [BackendPlacementCandidate::available(
+            self.backend_name().to_string(),
+            self.capabilities(),
+        )];
         self.placement_scheduler
-            .evaluate_create_container(self.capabilities(), request_id)
+            .evaluate_create_container(&candidates, request_id)
+            .map(|_| ())
     }
 
     #[cfg(test)]
