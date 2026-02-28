@@ -373,6 +373,8 @@ pub(crate) struct CreateCheckpointRequest {
     pub(crate) class: Option<String>,
     #[serde(default)]
     pub(crate) compatibility_fingerprint: Option<String>,
+    #[serde(default)]
+    pub(crate) retention_tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -390,6 +392,13 @@ pub(crate) struct CheckpointPayload {
     pub(crate) state: String,
     pub(crate) compatibility_fingerprint: String,
     pub(crate) created_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) retention_tag: Option<String>,
+    pub(crate) retention_protected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) retention_gc_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) retention_expires_at: Option<u64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -511,6 +520,10 @@ pub(crate) struct ReceiptPayload {
     pub(crate) status: String,
     pub(crate) created_at: u64,
     pub(crate) metadata: serde_json::Value,
+    pub(crate) retention_expires_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) retention_gc_reason: Option<String>,
+    pub(crate) retention_policy: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

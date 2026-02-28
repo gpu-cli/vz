@@ -161,6 +161,34 @@ async fn run_maintenance_loop(daemon: Arc<RuntimeDaemon>, shutdown: Arc<tokio::s
                         warn!(error = %error, "daemon maintenance: failed to clean expired idempotency keys");
                     }
                 }
+                match daemon.with_state_store(|store| store.compact_checkpoints_default()) {
+                    Ok(report) => {
+                        if !report.is_empty() {
+                            debug!(
+                                deleted_checkpoint_age = report.deleted_by_age.len(),
+                                deleted_checkpoint_count = report.deleted_by_count.len(),
+                                "daemon maintenance: compacted checkpoints by retention policy"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "daemon maintenance: failed to compact checkpoints");
+                    }
+                }
+                match daemon.with_state_store(|store| store.compact_receipts_default()) {
+                    Ok(report) => {
+                        if !report.is_empty() {
+                            debug!(
+                                deleted_receipt_age = report.deleted_by_age.len(),
+                                deleted_receipt_count = report.deleted_by_count.len(),
+                                "daemon maintenance: compacted receipts by retention policy"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "daemon maintenance: failed to compact receipts");
+                    }
+                }
                 match reconcile_orphaned_shell_executions(daemon.as_ref()) {
                     Ok(reconciled) => {
                         if reconciled > 0 {

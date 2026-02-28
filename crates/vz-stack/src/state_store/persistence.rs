@@ -1119,6 +1119,213 @@ impl StateStore {
         Ok(checkpoints)
     }
 
+    /// Persist a retention tag for a checkpoint.
+    pub fn save_checkpoint_retention_tag(
+        &self,
+        checkpoint_id: &str,
+        tag: &str,
+    ) -> Result<(), StackError> {
+        let checkpoint_id = checkpoint_id.trim();
+        if checkpoint_id.is_empty() {
+            return Err(StackError::Machine {
+                code: MachineErrorCode::ValidationError,
+                message: "checkpoint_id cannot be empty when tagging checkpoint".to_string(),
+            });
+        }
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return Err(StackError::Machine {
+                code: MachineErrorCode::ValidationError,
+                message: "checkpoint retention tag cannot be empty".to_string(),
+            });
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.conn.execute(
+            "INSERT INTO checkpoint_retention_tags (checkpoint_id, tag, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(checkpoint_id) DO UPDATE SET
+                tag = excluded.tag,
+                updated_at = excluded.updated_at",
+            params![checkpoint_id, tag, now, now],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a retention tag from a checkpoint.
+    pub fn delete_checkpoint_retention_tag(&self, checkpoint_id: &str) -> Result<(), StackError> {
+        self.conn.execute(
+            "DELETE FROM checkpoint_retention_tags WHERE checkpoint_id = ?1",
+            params![checkpoint_id],
+        )?;
+        Ok(())
+    }
+
+    /// Load the retention tag for a checkpoint, when present.
+    pub fn load_checkpoint_retention_tag(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Option<String>, StackError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tag FROM checkpoint_retention_tags WHERE checkpoint_id = ?1")?;
+        let mut rows = stmt.query(params![checkpoint_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get::<_, String>(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Load all checkpoint retention tags keyed by checkpoint id.
+    pub fn list_checkpoint_retention_tags(&self) -> Result<HashMap<String, String>, StackError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT checkpoint_id, tag FROM checkpoint_retention_tags")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut tags = HashMap::new();
+        for row in rows {
+            let (checkpoint_id, tag) = row?;
+            tags.insert(checkpoint_id, tag);
+        }
+        Ok(tags)
+    }
+
+    /// Evaluate effective retention state for every checkpoint.
+    pub fn checkpoint_retention_state_map(
+        &self,
+        policy: CheckpointRetentionPolicy,
+        now: u64,
+    ) -> Result<HashMap<String, CheckpointRetentionState>, StackError> {
+        let checkpoints = self.list_checkpoints()?;
+        let tags = self.list_checkpoint_retention_tags()?;
+        let (age_deleted, count_deleted) =
+            Self::compute_checkpoint_gc_plan(&checkpoints, &tags, policy, now);
+        let age_set: std::collections::HashSet<_> = age_deleted.into_iter().collect();
+        let count_set: std::collections::HashSet<_> = count_deleted.into_iter().collect();
+
+        let mut states = HashMap::new();
+        for checkpoint in checkpoints {
+            let tag = tags.get(&checkpoint.checkpoint_id).cloned();
+            let protected = tag.is_some();
+            let gc_reason = if age_set.contains(&checkpoint.checkpoint_id) {
+                Some(RetentionGcReason::AgeLimit)
+            } else if count_set.contains(&checkpoint.checkpoint_id) {
+                Some(RetentionGcReason::CountLimit)
+            } else {
+                None
+            };
+            states.insert(
+                checkpoint.checkpoint_id,
+                CheckpointRetentionState {
+                    tag,
+                    protected,
+                    expires_at: if protected {
+                        None
+                    } else {
+                        Some(checkpoint.created_at.saturating_add(policy.max_age_secs))
+                    },
+                    gc_reason,
+                },
+            );
+        }
+        Ok(states)
+    }
+
+    /// Run checkpoint GC with an explicit policy.
+    pub fn compact_checkpoints_with_policy(
+        &self,
+        policy: CheckpointRetentionPolicy,
+    ) -> Result<CheckpointGcReport, StackError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.compact_checkpoints_with_policy_at(policy, now)
+    }
+
+    /// Run checkpoint GC with default policy.
+    pub fn compact_checkpoints_default(&self) -> Result<CheckpointGcReport, StackError> {
+        self.compact_checkpoints_with_policy(CheckpointRetentionPolicy::default())
+    }
+
+    pub(crate) fn compact_checkpoints_with_policy_at(
+        &self,
+        policy: CheckpointRetentionPolicy,
+        now: u64,
+    ) -> Result<CheckpointGcReport, StackError> {
+        let checkpoints = self.list_checkpoints()?;
+        let tags = self.list_checkpoint_retention_tags()?;
+        let (deleted_by_age, deleted_by_count) =
+            Self::compute_checkpoint_gc_plan(&checkpoints, &tags, policy, now);
+        let to_delete: Vec<String> = deleted_by_age
+            .iter()
+            .chain(deleted_by_count.iter())
+            .cloned()
+            .collect();
+        if to_delete.is_empty() {
+            return Ok(CheckpointGcReport {
+                deleted_by_age,
+                deleted_by_count,
+            });
+        }
+
+        self.with_immediate_transaction(|tx| {
+            for checkpoint_id in &to_delete {
+                tx.delete_checkpoint(checkpoint_id)?;
+            }
+            Ok(())
+        })?;
+
+        Ok(CheckpointGcReport {
+            deleted_by_age,
+            deleted_by_count,
+        })
+    }
+
+    fn compute_checkpoint_gc_plan(
+        checkpoints: &[Checkpoint],
+        tags: &HashMap<String, String>,
+        policy: CheckpointRetentionPolicy,
+        now: u64,
+    ) -> (Vec<String>, Vec<String>) {
+        let cutoff = now.saturating_sub(policy.max_age_secs);
+        let mut untagged: Vec<&Checkpoint> = checkpoints
+            .iter()
+            .filter(|checkpoint| !tags.contains_key(&checkpoint.checkpoint_id))
+            .collect();
+        untagged.sort_by(|lhs, rhs| {
+            lhs.created_at
+                .cmp(&rhs.created_at)
+                .then_with(|| lhs.checkpoint_id.cmp(&rhs.checkpoint_id))
+        });
+
+        let mut deleted_by_age = Vec::new();
+        let mut retained_after_age = Vec::new();
+        for checkpoint in untagged {
+            if checkpoint.created_at <= cutoff {
+                deleted_by_age.push(checkpoint.checkpoint_id.clone());
+            } else {
+                retained_after_age.push(checkpoint);
+            }
+        }
+
+        let overflow = retained_after_age
+            .len()
+            .saturating_sub(policy.max_untagged_count);
+        let deleted_by_count = retained_after_age
+            .into_iter()
+            .take(overflow)
+            .map(|checkpoint| checkpoint.checkpoint_id.clone())
+            .collect();
+
+        (deleted_by_age, deleted_by_count)
+    }
+
     /// Replace file snapshot entries for a checkpoint.
     pub fn replace_checkpoint_file_entries(
         &self,
@@ -1204,6 +1411,10 @@ impl StateStore {
     pub fn delete_checkpoint(&self, checkpoint_id: &str) -> Result<(), StackError> {
         self.conn.execute(
             "DELETE FROM checkpoint_file_entries WHERE checkpoint_id = ?1",
+            params![checkpoint_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM checkpoint_retention_tags WHERE checkpoint_id = ?1",
             params![checkpoint_id],
         )?;
         self.conn.execute(
@@ -1571,6 +1782,176 @@ impl StateStore {
             });
         }
         Ok(receipts)
+    }
+
+    /// List all receipts ordered by creation time.
+    pub fn list_receipts(&self) -> Result<Vec<Receipt>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT receipt_id, operation, entity_id, entity_type, request_id, status, created_at, metadata_json
+             FROM receipt_state
+             ORDER BY created_at ASC, receipt_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+
+        let mut receipts = Vec::new();
+        for row in rows {
+            let (
+                receipt_id,
+                operation,
+                entity_id,
+                entity_type,
+                request_id,
+                status,
+                created_at,
+                metadata_str,
+            ) = row?;
+            let metadata: serde_json::Value = serde_json::from_str(&metadata_str)?;
+            receipts.push(Receipt {
+                receipt_id,
+                operation,
+                entity_id,
+                entity_type,
+                request_id,
+                status,
+                created_at: created_at as u64,
+                metadata,
+            });
+        }
+        Ok(receipts)
+    }
+
+    /// Delete a receipt by identifier.
+    pub fn delete_receipt(&self, receipt_id: &str) -> Result<(), StackError> {
+        self.conn.execute(
+            "DELETE FROM receipt_state WHERE receipt_id = ?1",
+            params![receipt_id],
+        )?;
+        Ok(())
+    }
+
+    /// Evaluate effective retention state for every receipt.
+    pub fn receipt_retention_state_map(
+        &self,
+        policy: ReceiptRetentionPolicy,
+        now: u64,
+    ) -> Result<HashMap<String, ReceiptRetentionState>, StackError> {
+        let receipts = self.list_receipts()?;
+        let (age_deleted, count_deleted) = Self::compute_receipt_gc_plan(&receipts, policy, now);
+        let age_set: std::collections::HashSet<_> = age_deleted.into_iter().collect();
+        let count_set: std::collections::HashSet<_> = count_deleted.into_iter().collect();
+
+        let mut states = HashMap::new();
+        for receipt in receipts {
+            let gc_reason = if age_set.contains(&receipt.receipt_id) {
+                Some(RetentionGcReason::AgeLimit)
+            } else if count_set.contains(&receipt.receipt_id) {
+                Some(RetentionGcReason::CountLimit)
+            } else {
+                None
+            };
+            states.insert(
+                receipt.receipt_id,
+                ReceiptRetentionState {
+                    expires_at: receipt.created_at.saturating_add(policy.max_age_secs),
+                    gc_reason,
+                },
+            );
+        }
+        Ok(states)
+    }
+
+    /// Run receipt GC with an explicit policy.
+    pub fn compact_receipts_with_policy(
+        &self,
+        policy: ReceiptRetentionPolicy,
+    ) -> Result<ReceiptGcReport, StackError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.compact_receipts_with_policy_at(policy, now)
+    }
+
+    /// Run receipt GC with default policy.
+    pub fn compact_receipts_default(&self) -> Result<ReceiptGcReport, StackError> {
+        self.compact_receipts_with_policy(ReceiptRetentionPolicy::default())
+    }
+
+    pub(crate) fn compact_receipts_with_policy_at(
+        &self,
+        policy: ReceiptRetentionPolicy,
+        now: u64,
+    ) -> Result<ReceiptGcReport, StackError> {
+        let receipts = self.list_receipts()?;
+        let (deleted_by_age, deleted_by_count) =
+            Self::compute_receipt_gc_plan(&receipts, policy, now);
+        let to_delete: Vec<String> = deleted_by_age
+            .iter()
+            .chain(deleted_by_count.iter())
+            .cloned()
+            .collect();
+        if to_delete.is_empty() {
+            return Ok(ReceiptGcReport {
+                deleted_by_age,
+                deleted_by_count,
+            });
+        }
+
+        self.with_immediate_transaction(|tx| {
+            for receipt_id in &to_delete {
+                tx.delete_receipt(receipt_id)?;
+            }
+            Ok(())
+        })?;
+
+        Ok(ReceiptGcReport {
+            deleted_by_age,
+            deleted_by_count,
+        })
+    }
+
+    fn compute_receipt_gc_plan(
+        receipts: &[Receipt],
+        policy: ReceiptRetentionPolicy,
+        now: u64,
+    ) -> (Vec<String>, Vec<String>) {
+        let cutoff = now.saturating_sub(policy.max_age_secs);
+        let mut ordered: Vec<&Receipt> = receipts.iter().collect();
+        ordered.sort_by(|lhs, rhs| {
+            lhs.created_at
+                .cmp(&rhs.created_at)
+                .then_with(|| lhs.receipt_id.cmp(&rhs.receipt_id))
+        });
+
+        let mut deleted_by_age = Vec::new();
+        let mut retained_after_age = Vec::new();
+        for receipt in ordered {
+            if receipt.created_at <= cutoff {
+                deleted_by_age.push(receipt.receipt_id.clone());
+            } else {
+                retained_after_age.push(receipt);
+            }
+        }
+
+        let overflow = retained_after_age.len().saturating_sub(policy.max_count);
+        let deleted_by_count = retained_after_age
+            .into_iter()
+            .take(overflow)
+            .map(|receipt| receipt.receipt_id.clone())
+            .collect();
+
+        (deleted_by_age, deleted_by_count)
     }
 
     /// Deserialize a receipt from a rusqlite row.

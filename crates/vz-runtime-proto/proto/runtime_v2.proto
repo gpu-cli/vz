@@ -482,6 +482,8 @@ message CreateCheckpointRequest {
   // Checkpoint class: "fs_quick" or "vm_full".
   string checkpoint_class = 3;
   string compatibility_fingerprint = 4;
+  // Optional retention tag; tagged checkpoints are protected from policy GC.
+  string retention_tag = 5;
 }
 
 message CheckpointPayload {
@@ -493,6 +495,14 @@ message CheckpointPayload {
   string state = 5;
   string compatibility_fingerprint = 6;
   uint64 created_at = 7;
+  // Non-empty when checkpoint is explicitly retained.
+  string retention_tag = 8;
+  // True when checkpoint is protected from policy GC.
+  bool retention_protected = 9;
+  // Empty or one of: "age_limit", "count_limit".
+  string retention_gc_reason = 10;
+  // Age-based expiry for untagged checkpoints; 0 for tagged.
+  uint64 retention_expires_at = 11;
 }
 
 message CheckpointResponse {
@@ -622,6 +632,12 @@ message ReceiptPayload {
   string status = 6;
   uint64 created_at = 7;
   string metadata_json = 8;
+  // Age-based expiry for receipt retention policy.
+  uint64 retention_expires_at = 9;
+  // Empty or one of: "age_limit", "count_limit".
+  string retention_gc_reason = 10;
+  // Stable policy identifier for current daemon defaults.
+  string retention_policy = 11;
 }
 
 message ReceiptResponse {

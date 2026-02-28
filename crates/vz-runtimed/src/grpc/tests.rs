@@ -4243,11 +4243,20 @@ async fn create_checkpoint_then_get_and_list_round_trip() {
             sandbox_id: "sbx-ckpt-test".to_string(),
             checkpoint_class: "fs_quick".to_string(),
             compatibility_fingerprint: "fp-test".to_string(),
+            retention_tag: String::new(),
         }))
         .await
         .expect("create checkpoint");
     assert!(created.metadata().get("x-receipt-id").is_some());
     let created = created.into_inner();
+    let created_payload = created.checkpoint.as_ref().expect("checkpoint payload");
+    assert!(!created_payload.retention_protected);
+    assert!(created_payload.retention_tag.is_empty());
+    assert!(created_payload.retention_gc_reason.is_empty());
+    assert!(
+        created_payload.retention_expires_at > created_payload.created_at,
+        "untagged checkpoint should expose age-based retention deadline"
+    );
     let checkpoint_id = created
         .checkpoint
         .as_ref()
@@ -4271,10 +4280,19 @@ async fn create_checkpoint_then_get_and_list_round_trip() {
     assert_eq!(
         fetched
             .checkpoint
+            .as_ref()
             .expect("checkpoint payload")
             .checkpoint_id,
         checkpoint_id,
         "checkpoint id should round-trip"
+    );
+    assert!(
+        fetched
+            .checkpoint
+            .as_ref()
+            .expect("checkpoint payload")
+            .retention_expires_at
+            > 0
     );
 
     let listed = checkpoint_client
@@ -4285,6 +4303,8 @@ async fn create_checkpoint_then_get_and_list_round_trip() {
         .expect("list checkpoints")
         .into_inner();
     assert_eq!(listed.checkpoints.len(), 1);
+    assert!(!listed.checkpoints[0].retention_protected);
+    assert!(listed.checkpoints[0].retention_tag.is_empty());
 
     let checkpoint_receipts = daemon
         .with_state_store(|store| store.list_receipts_for_entity("checkpoint", &checkpoint_id))
@@ -4313,6 +4333,61 @@ async fn create_checkpoint_then_get_and_list_round_trip() {
             .get("idempotency_key")
             .is_some_and(serde_json::Value::is_null)
     );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn create_checkpoint_with_retention_tag_is_protected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let mut checkpoint_client = connect_checkpoint_client(&config.socket_path).await;
+    let created = checkpoint_client
+        .create_checkpoint(Request::new(runtime_v2::CreateCheckpointRequest {
+            metadata: Some(runtime_v2::RequestMetadata {
+                request_id: "req-ckpt-tagged".to_string(),
+                idempotency_key: String::new(),
+                trace_id: String::new(),
+            }),
+            sandbox_id: "sbx-ckpt-tagged".to_string(),
+            checkpoint_class: "fs_quick".to_string(),
+            compatibility_fingerprint: "fp-tagged".to_string(),
+            retention_tag: "pre-session".to_string(),
+        }))
+        .await
+        .expect("create checkpoint")
+        .into_inner();
+
+    let checkpoint = created.checkpoint.expect("checkpoint payload");
+    assert_eq!(checkpoint.retention_tag, "pre-session");
+    assert!(checkpoint.retention_protected);
+    assert_eq!(checkpoint.retention_expires_at, 0);
+    assert!(checkpoint.retention_gc_reason.is_empty());
 
     shutdown.notify_waiters();
     let result = tokio::time::timeout(Duration::from_secs(5), server)
@@ -4379,6 +4454,7 @@ async fn diff_checkpoints_returns_real_file_level_deltas() {
             sandbox_id: sandbox.sandbox_id.clone(),
             checkpoint_class: "fs_quick".to_string(),
             compatibility_fingerprint: "fp-a".to_string(),
+            retention_tag: String::new(),
         }))
         .await
         .expect("create from checkpoint")
@@ -4402,6 +4478,7 @@ async fn diff_checkpoints_returns_real_file_level_deltas() {
             sandbox_id: sandbox.sandbox_id.clone(),
             checkpoint_class: "fs_quick".to_string(),
             compatibility_fingerprint: "fp-b".to_string(),
+            retention_tag: String::new(),
         }))
         .await
         .expect("create to checkpoint")
@@ -4905,6 +4982,107 @@ async fn maintenance_loop_cleans_expired_idempotency_keys() {
         }
         if tokio::time::Instant::now() >= cleanup_deadline {
             panic!("expired idempotency key was not cleaned by maintenance loop");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn maintenance_loop_compacts_checkpoints_and_receipts() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    daemon
+        .with_state_store(|store| {
+            store.save_checkpoint(&vz_runtime_contract::Checkpoint {
+                checkpoint_id: "ckpt-old".to_string(),
+                sandbox_id: "sbx-retention".to_string(),
+                parent_checkpoint_id: None,
+                class: vz_runtime_contract::CheckpointClass::FsQuick,
+                state: vz_runtime_contract::CheckpointState::Ready,
+                created_at: 0,
+                compatibility_fingerprint: "fp-old".to_string(),
+            })?;
+            store.save_checkpoint(&vz_runtime_contract::Checkpoint {
+                checkpoint_id: "ckpt-tagged".to_string(),
+                sandbox_id: "sbx-retention".to_string(),
+                parent_checkpoint_id: None,
+                class: vz_runtime_contract::CheckpointClass::FsQuick,
+                state: vz_runtime_contract::CheckpointState::Ready,
+                created_at: 0,
+                compatibility_fingerprint: "fp-tagged".to_string(),
+            })?;
+            store.save_checkpoint_retention_tag("ckpt-tagged", "golden")?;
+            store.save_receipt(&Receipt {
+                receipt_id: "rcp-old".to_string(),
+                operation: "create_sandbox".to_string(),
+                entity_id: "sbx-retention".to_string(),
+                entity_type: "sandbox".to_string(),
+                request_id: "req-old".to_string(),
+                status: "success".to_string(),
+                created_at: 0,
+                metadata: serde_json::json!({}),
+            })?;
+            store.save_receipt(&Receipt {
+                receipt_id: "rcp-fresh".to_string(),
+                operation: "create_sandbox".to_string(),
+                entity_id: "sbx-retention".to_string(),
+                entity_type: "sandbox".to_string(),
+                request_id: "req-fresh".to_string(),
+                status: "success".to_string(),
+                created_at: current_unix_secs(),
+                metadata: serde_json::json!({}),
+            })?;
+            Ok(())
+        })
+        .expect("seed retention records");
+
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let (old_checkpoint_exists, tagged_exists, old_receipt_exists, fresh_receipt_exists) =
+            daemon
+                .with_state_store(|store| {
+                    Ok((
+                        store.load_checkpoint("ckpt-old")?.is_some(),
+                        store.load_checkpoint("ckpt-tagged")?.is_some(),
+                        store.load_receipt("rcp-old")?.is_some(),
+                        store.load_receipt("rcp-fresh")?.is_some(),
+                    ))
+                })
+                .expect("query retention cleanup state");
+        if !old_checkpoint_exists && !old_receipt_exists {
+            assert!(tagged_exists, "tagged checkpoint must be preserved");
+            assert!(fresh_receipt_exists, "fresh receipt must be preserved");
+            break;
+        }
+        if tokio::time::Instant::now() >= cleanup_deadline {
+            panic!("checkpoint/receipt retention cleanup did not complete in maintenance loop");
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }

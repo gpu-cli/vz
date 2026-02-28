@@ -2038,8 +2038,7 @@ fn transport_parity_entity_payload_field_consistency() {
         "ExecutionPayload.ended_at missing"
     );
 
-    // CheckpointPayload fields: checkpoint_id, sandbox_id, parent_checkpoint_id,
-    // class, state, compatibility_fingerprint, created_at.
+    // CheckpointPayload fields include retention state for GC visibility.
     let ckpt = &schemas["CheckpointPayload"]["properties"];
     assert!(
         ckpt["checkpoint_id"].is_object(),
@@ -2062,6 +2061,37 @@ fn transport_parity_entity_payload_field_consistency() {
     assert!(
         ckpt["created_at"].is_object(),
         "CheckpointPayload.created_at missing"
+    );
+    assert!(
+        ckpt["retention_tag"].is_object(),
+        "CheckpointPayload.retention_tag missing"
+    );
+    assert!(
+        ckpt["retention_protected"].is_object(),
+        "CheckpointPayload.retention_protected missing"
+    );
+    assert!(
+        ckpt["retention_gc_reason"].is_object(),
+        "CheckpointPayload.retention_gc_reason missing"
+    );
+    assert!(
+        ckpt["retention_expires_at"].is_object(),
+        "CheckpointPayload.retention_expires_at missing"
+    );
+
+    // Receipt payload retention fields.
+    let receipt = &schemas["ReceiptPayload"]["properties"];
+    assert!(
+        receipt["retention_expires_at"].is_object(),
+        "ReceiptPayload.retention_expires_at missing"
+    );
+    assert!(
+        receipt["retention_gc_reason"].is_object(),
+        "ReceiptPayload.retention_gc_reason missing"
+    );
+    assert!(
+        receipt["retention_policy"].is_object(),
+        "ReceiptPayload.retention_policy missing"
     );
 }
 

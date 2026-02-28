@@ -671,6 +671,9 @@ pub struct CreateCheckpointRequest {
     pub checkpoint_class: ::prost::alloc::string::String,
     #[prost(string, tag = "4")]
     pub compatibility_fingerprint: ::prost::alloc::string::String,
+    /// Optional retention tag; tagged checkpoints are protected from policy GC.
+    #[prost(string, tag = "5")]
+    pub retention_tag: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CheckpointPayload {
@@ -689,6 +692,18 @@ pub struct CheckpointPayload {
     pub compatibility_fingerprint: ::prost::alloc::string::String,
     #[prost(uint64, tag = "7")]
     pub created_at: u64,
+    /// Non-empty when checkpoint is explicitly retained.
+    #[prost(string, tag = "8")]
+    pub retention_tag: ::prost::alloc::string::String,
+    /// True when checkpoint is protected from policy GC.
+    #[prost(bool, tag = "9")]
+    pub retention_protected: bool,
+    /// Empty or one of: "age_limit", "count_limit".
+    #[prost(string, tag = "10")]
+    pub retention_gc_reason: ::prost::alloc::string::String,
+    /// Age-based expiry for untagged checkpoints; 0 for tagged.
+    #[prost(uint64, tag = "11")]
+    pub retention_expires_at: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CheckpointResponse {
@@ -861,6 +876,15 @@ pub struct ReceiptPayload {
     pub created_at: u64,
     #[prost(string, tag = "8")]
     pub metadata_json: ::prost::alloc::string::String,
+    /// Age-based expiry for receipt retention policy.
+    #[prost(uint64, tag = "9")]
+    pub retention_expires_at: u64,
+    /// Empty or one of: "age_limit", "count_limit".
+    #[prost(string, tag = "10")]
+    pub retention_gc_reason: ::prost::alloc::string::String,
+    /// Stable policy identifier for current daemon defaults.
+    #[prost(string, tag = "11")]
+    pub retention_policy: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReceiptResponse {

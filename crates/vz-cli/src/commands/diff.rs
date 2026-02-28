@@ -75,6 +75,10 @@ struct ApiCheckpointPayload {
     state: String,
     compatibility_fingerprint: String,
     created_at: u64,
+    retention_tag: Option<String>,
+    retention_protected: Option<bool>,
+    retention_gc_reason: Option<String>,
+    retention_expires_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -183,6 +187,10 @@ fn checkpoint_from_api(payload: ApiCheckpointPayload) -> runtime_v2::CheckpointP
         state: payload.state,
         compatibility_fingerprint: payload.compatibility_fingerprint,
         created_at: payload.created_at,
+        retention_tag: payload.retention_tag.unwrap_or_default(),
+        retention_protected: payload.retention_protected.unwrap_or(false),
+        retention_gc_reason: payload.retention_gc_reason.unwrap_or_default(),
+        retention_expires_at: payload.retention_expires_at.unwrap_or_default(),
     }
 }
 
@@ -476,6 +484,10 @@ mod tests {
             state: state.to_string(),
             compatibility_fingerprint: fingerprint.to_string(),
             created_at: 1,
+            retention_tag: String::new(),
+            retention_protected: false,
+            retention_gc_reason: String::new(),
+            retention_expires_at: 0,
         }
     }
 

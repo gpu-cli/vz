@@ -282,6 +282,126 @@ pub struct Receipt {
     pub metadata: serde_json::Value,
 }
 
+/// Deterministic reason why a record is selected for retention GC.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionGcReason {
+    /// Exceeded age-based retention threshold.
+    AgeLimit,
+    /// Exceeded count-based retention threshold.
+    CountLimit,
+}
+
+impl RetentionGcReason {
+    /// Stable wire/storage string.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AgeLimit => "age_limit",
+            Self::CountLimit => "count_limit",
+        }
+    }
+}
+
+/// Retention policy for checkpoints.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointRetentionPolicy {
+    /// Maximum retained untagged checkpoints.
+    pub max_untagged_count: usize,
+    /// Maximum age for untagged checkpoints in seconds.
+    pub max_age_secs: u64,
+}
+
+impl Default for CheckpointRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            max_untagged_count: 128,
+            max_age_secs: 30 * 24 * 3600,
+        }
+    }
+}
+
+/// Retention policy for receipts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReceiptRetentionPolicy {
+    /// Maximum retained receipts.
+    pub max_count: usize,
+    /// Maximum age for receipts in seconds.
+    pub max_age_secs: u64,
+}
+
+impl Default for ReceiptRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            max_count: 20_000,
+            max_age_secs: 14 * 24 * 3600,
+        }
+    }
+}
+
+/// Effective retention state for a checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointRetentionState {
+    /// Tag value when checkpoint is explicitly retained.
+    pub tag: Option<String>,
+    /// Whether the checkpoint is protected from policy GC.
+    pub protected: bool,
+    /// Age-based retention deadline for untagged checkpoints.
+    pub expires_at: Option<u64>,
+    /// Current GC eligibility reason, if any.
+    pub gc_reason: Option<RetentionGcReason>,
+}
+
+/// Effective retention state for a receipt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReceiptRetentionState {
+    /// Age-based retention deadline.
+    pub expires_at: u64,
+    /// Current GC eligibility reason, if any.
+    pub gc_reason: Option<RetentionGcReason>,
+}
+
+/// Checkpoint GC result summary.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointGcReport {
+    /// Checkpoints deleted by age policy.
+    pub deleted_by_age: Vec<String>,
+    /// Checkpoints deleted by count policy.
+    pub deleted_by_count: Vec<String>,
+}
+
+impl CheckpointGcReport {
+    /// Total deleted checkpoints.
+    pub fn total_deleted(&self) -> usize {
+        self.deleted_by_age.len() + self.deleted_by_count.len()
+    }
+
+    /// Whether no records were deleted.
+    pub fn is_empty(&self) -> bool {
+        self.total_deleted() == 0
+    }
+}
+
+/// Receipt GC result summary.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReceiptGcReport {
+    /// Receipts deleted by age policy.
+    pub deleted_by_age: Vec<String>,
+    /// Receipts deleted by count policy.
+    pub deleted_by_count: Vec<String>,
+}
+
+impl ReceiptGcReport {
+    /// Total deleted receipts.
+    pub fn total_deleted(&self) -> usize {
+        self.deleted_by_age.len() + self.deleted_by_count.len()
+    }
+
+    /// Whether no records were deleted.
+    pub fn is_empty(&self) -> bool {
+        self.total_deleted() == 0
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)] // serde-serialized names; renaming would break stored data
 #[serde(rename_all = "snake_case")]
@@ -602,6 +722,16 @@ impl StateStore {
             );
             CREATE INDEX IF NOT EXISTS idx_checkpoint_sandbox ON checkpoint_state(sandbox_id);
             CREATE INDEX IF NOT EXISTS idx_checkpoint_parent ON checkpoint_state(parent_checkpoint_id);
+            CREATE INDEX IF NOT EXISTS idx_checkpoint_created_at ON checkpoint_state(created_at);
+
+            CREATE TABLE IF NOT EXISTS checkpoint_retention_tags (
+                checkpoint_id TEXT PRIMARY KEY,
+                tag TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_checkpoint_retention_tag
+                ON checkpoint_retention_tags(tag);
 
             CREATE TABLE IF NOT EXISTS checkpoint_file_entries (
                 checkpoint_id TEXT NOT NULL,
@@ -649,6 +779,7 @@ impl StateStore {
             );
             CREATE INDEX IF NOT EXISTS idx_receipt_entity ON receipt_state(entity_type, entity_id);
             CREATE INDEX IF NOT EXISTS idx_receipt_request ON receipt_state(request_id);
+            CREATE INDEX IF NOT EXISTS idx_receipt_created_at ON receipt_state(created_at);
 
             CREATE TABLE IF NOT EXISTS build_state (
                 build_id TEXT PRIMARY KEY,

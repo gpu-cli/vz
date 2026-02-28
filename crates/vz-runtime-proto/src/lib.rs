@@ -335,11 +335,17 @@ mod tests {
             state: "ready".into(),
             compatibility_fingerprint: "kernel-6.1-arm64".into(),
             created_at: 1_700_000_000,
+            retention_tag: "pre-session".into(),
+            retention_protected: true,
+            retention_gc_reason: String::new(),
+            retention_expires_at: 0,
         };
         let encoded = payload.encode_to_vec();
         let decoded = CheckpointPayload::decode(encoded.as_slice()).unwrap();
         assert_eq!(decoded.checkpoint_id, "ckpt-test");
         assert_eq!(decoded.compatibility_fingerprint, "kernel-6.1-arm64");
         assert_eq!(decoded.parent_checkpoint_id, "ckpt-parent");
+        assert_eq!(decoded.retention_tag, "pre-session");
+        assert!(decoded.retention_protected);
     }
 }

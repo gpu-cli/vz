@@ -20,12 +20,14 @@ pub(in crate::grpc) fn create_checkpoint_request_hash(
     sandbox_id: &str,
     checkpoint_class: &str,
     compatibility_fingerprint: &str,
+    retention_tag: &str,
 ) -> String {
     format!(
-        "sandbox_id={};class={};fingerprint={}",
+        "sandbox_id={};class={};fingerprint={};retention_tag={}",
         sandbox_id,
         checkpoint_class.trim(),
-        compatibility_fingerprint.trim()
+        compatibility_fingerprint.trim(),
+        retention_tag.trim()
     )
 }
 

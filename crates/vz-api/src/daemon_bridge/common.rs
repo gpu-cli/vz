@@ -122,6 +122,14 @@ pub(crate) fn checkpoint_payload_from_runtime_proto(
         state: payload.state,
         compatibility_fingerprint: payload.compatibility_fingerprint,
         created_at: payload.created_at,
+        retention_tag: normalize_optional_wire_field(&payload.retention_tag),
+        retention_protected: payload.retention_protected,
+        retention_gc_reason: normalize_optional_wire_field(&payload.retention_gc_reason),
+        retention_expires_at: if payload.retention_expires_at == 0 {
+            None
+        } else {
+            Some(payload.retention_expires_at)
+        },
     }
 }
 
@@ -184,6 +192,14 @@ pub(crate) fn receipt_payload_from_runtime_proto(
         status: payload.status,
         created_at: payload.created_at,
         metadata,
+        retention_expires_at: if payload.retention_expires_at == 0 {
+            payload.created_at
+        } else {
+            payload.retention_expires_at
+        },
+        retention_gc_reason: normalize_optional_wire_field(&payload.retention_gc_reason),
+        retention_policy: normalize_optional_wire_field(&payload.retention_policy)
+            .unwrap_or_else(|| "bounded_age_count".to_string()),
     }
 }
 

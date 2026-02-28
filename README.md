@@ -229,6 +229,10 @@ Runtime-mutating CLI surfaces (`sandbox`, `stack`, `image`, `file`, `lease`, `ex
   - `VZ_SANDBOX_DEFAULT_BASE_IMAGE=<image-ref>`
   - `VZ_SANDBOX_DEFAULT_MAIN_CONTAINER=<command-or-container-hint>`
   - `VZ_SANDBOX_DISABLE_LEGACY_DEFAULT_BASE_IMAGE=1` disables compatibility fallback (`debian:bookworm`)
+- Retention policy defaults (daemon-owned GC):
+  - Untagged checkpoints: max `128` retained, max age `30` days
+  - Tagged checkpoints (`--tag`): retained until explicit deletion
+  - Receipts: max `20_000` retained, max age `14` days
 
 ## Architecture
 

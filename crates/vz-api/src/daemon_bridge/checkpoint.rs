@@ -68,6 +68,7 @@ pub(crate) async fn try_create_checkpoint_via_daemon(
         compatibility_fingerprint: body
             .compatibility_fingerprint
             .unwrap_or_else(|| "unset".to_string()),
+        retention_tag: body.retention_tag.unwrap_or_default(),
     };
     match client.create_checkpoint_with_metadata(grpc_request).await {
         Ok(grpc_response) => {

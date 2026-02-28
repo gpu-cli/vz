@@ -249,6 +249,10 @@ pub fn checkpoint_to_proto_payload(checkpoint: &Checkpoint) -> runtime_v2::Check
         state: checkpoint_state_to_wire(checkpoint.state).to_string(),
         compatibility_fingerprint: checkpoint.compatibility_fingerprint.clone(),
         created_at: checkpoint.created_at,
+        retention_tag: String::new(),
+        retention_protected: false,
+        retention_gc_reason: String::new(),
+        retention_expires_at: 0,
     }
 }
 
@@ -971,6 +975,10 @@ mod tests {
             state: "ready".to_string(),
             compatibility_fingerprint: String::new(),
             created_at: 0,
+            retention_tag: String::new(),
+            retention_protected: false,
+            retention_gc_reason: String::new(),
+            retention_expires_at: 0,
         };
 
         let err = checkpoint_from_proto_payload(&payload).expect_err("unknown class should fail");
@@ -993,6 +1001,10 @@ mod tests {
             state: "restoring".to_string(),
             compatibility_fingerprint: String::new(),
             created_at: 0,
+            retention_tag: String::new(),
+            retention_protected: false,
+            retention_gc_reason: String::new(),
+            retention_expires_at: 0,
         };
 
         let err = checkpoint_from_proto_payload(&payload).expect_err("unknown state should fail");

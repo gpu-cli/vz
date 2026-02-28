@@ -58,9 +58,11 @@ pub use spec::{
     ServiceSecretRef, ServiceSpec, StackSpec, VolumeSpec,
 };
 pub use state_store::{
-    AllocatorSnapshot, DriftFinding, DriftSeverity, IDEMPOTENCY_TTL_SECS, IdempotencyRecord,
-    ImageRecord, Receipt, ReconcileAuditEntry, ReconcileSession, ReconcileSessionStatus,
-    ServiceObservedState, ServicePhase, StateStore, StateStorePragmas,
+    AllocatorSnapshot, CheckpointGcReport, CheckpointRetentionPolicy, CheckpointRetentionState,
+    DriftFinding, DriftSeverity, IDEMPOTENCY_TTL_SECS, IdempotencyRecord, ImageRecord, Receipt,
+    ReceiptGcReport, ReceiptRetentionPolicy, ReceiptRetentionState, ReconcileAuditEntry,
+    ReconcileSession, ReconcileSessionStatus, RetentionGcReason, ServiceObservedState,
+    ServicePhase, StateStore, StateStorePragmas,
 };
 pub use volume::{
     ResolvedMount, ResolvedMountKind, SkippedMount, VolumeManager, mounts_changed,

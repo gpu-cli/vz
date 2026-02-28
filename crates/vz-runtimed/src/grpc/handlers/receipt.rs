@@ -10,7 +10,10 @@ impl ReceiptServiceImpl {
     }
 }
 
-fn receipt_to_proto_payload(receipt: &Receipt) -> Result<runtime_v2::ReceiptPayload, Status> {
+fn receipt_to_proto_payload(
+    receipt: &Receipt,
+    retention: Option<&vz_stack::ReceiptRetentionState>,
+) -> Result<runtime_v2::ReceiptPayload, Status> {
     let metadata_json = serde_json::to_string(&receipt.metadata).map_err(|error| {
         status_from_machine_error(MachineError::new(
             MachineErrorCode::InternalError,
@@ -22,6 +25,17 @@ fn receipt_to_proto_payload(receipt: &Receipt) -> Result<runtime_v2::ReceiptPayl
             BTreeMap::new(),
         ))
     })?;
+    let default_policy = vz_stack::ReceiptRetentionPolicy::default();
+    let retention_expires_at = retention.map(|state| state.expires_at).unwrap_or_else(|| {
+        receipt
+            .created_at
+            .saturating_add(default_policy.max_age_secs)
+    });
+    let retention_gc_reason = retention
+        .and_then(|state| state.gc_reason)
+        .map(vz_stack::RetentionGcReason::as_str)
+        .unwrap_or_default()
+        .to_string();
     Ok(runtime_v2::ReceiptPayload {
         receipt_id: receipt.receipt_id.clone(),
         operation: receipt.operation.clone(),
@@ -31,6 +45,9 @@ fn receipt_to_proto_payload(receipt: &Receipt) -> Result<runtime_v2::ReceiptPayl
         status: receipt.status.clone(),
         created_at: receipt.created_at,
         metadata_json,
+        retention_expires_at,
+        retention_gc_reason,
+        retention_policy: "bounded_age_count".to_string(),
     })
 }
 
@@ -70,10 +87,22 @@ impl runtime_v2::receipt_service_server::ReceiptService for ReceiptServiceImpl {
                     BTreeMap::new(),
                 ))
             })?;
+        let retention_states = self
+            .daemon
+            .with_state_store(|store| {
+                store.receipt_retention_state_map(
+                    vz_stack::ReceiptRetentionPolicy::default(),
+                    current_unix_secs(),
+                )
+            })
+            .map_err(|error| status_from_stack_error(error, &request_id))?;
 
         Ok(Response::new(runtime_v2::ReceiptResponse {
             request_id,
-            receipt: Some(receipt_to_proto_payload(&receipt)?),
+            receipt: Some(receipt_to_proto_payload(
+                &receipt,
+                retention_states.get(&receipt.receipt_id),
+            )?),
         }))
     }
 }

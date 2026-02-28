@@ -1682,6 +1682,95 @@ fn checkpoint_vm_full_class_persists() {
     assert_eq!(loaded.class, CheckpointClass::VmFull);
 }
 
+#[test]
+fn checkpoint_retention_tag_round_trip() {
+    let store = StateStore::in_memory().unwrap();
+    let checkpoint = sample_checkpoint("ckpt-tagged", "sb-1");
+    store.save_checkpoint(&checkpoint).unwrap();
+
+    store
+        .save_checkpoint_retention_tag("ckpt-tagged", "pre-session")
+        .unwrap();
+    let loaded = store
+        .load_checkpoint_retention_tag("ckpt-tagged")
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded, "pre-session");
+
+    store
+        .delete_checkpoint_retention_tag("ckpt-tagged")
+        .unwrap();
+    assert!(
+        store
+            .load_checkpoint_retention_tag("ckpt-tagged")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn checkpoint_gc_respects_tags_and_is_idempotent() {
+    let store = StateStore::in_memory().unwrap();
+
+    let mut old_age = sample_checkpoint("ckpt-age", "sb-1");
+    old_age.created_at = 10;
+    let mut old_count = sample_checkpoint("ckpt-count", "sb-1");
+    old_count.created_at = 61;
+    let mut tagged = sample_checkpoint("ckpt-tagged", "sb-1");
+    tagged.created_at = 20;
+    let mut newest = sample_checkpoint("ckpt-keep", "sb-1");
+    newest.created_at = 62;
+
+    store.save_checkpoint(&old_age).unwrap();
+    store.save_checkpoint(&old_count).unwrap();
+    store.save_checkpoint(&tagged).unwrap();
+    store.save_checkpoint(&newest).unwrap();
+    store
+        .save_checkpoint_retention_tag("ckpt-tagged", "golden")
+        .unwrap();
+
+    let policy = CheckpointRetentionPolicy {
+        max_untagged_count: 1,
+        max_age_secs: 40,
+    };
+    let state_map = store.checkpoint_retention_state_map(policy, 100).unwrap();
+    assert_eq!(
+        state_map.get("ckpt-age").and_then(|s| s.gc_reason),
+        Some(RetentionGcReason::AgeLimit)
+    );
+    assert_eq!(
+        state_map.get("ckpt-count").and_then(|s| s.gc_reason),
+        Some(RetentionGcReason::CountLimit)
+    );
+    assert_eq!(state_map.get("ckpt-tagged").and_then(|s| s.gc_reason), None);
+    assert_eq!(
+        state_map.get("ckpt-tagged").map(|s| s.protected),
+        Some(true)
+    );
+
+    let report = store
+        .compact_checkpoints_with_policy_at(policy, 100)
+        .unwrap();
+    assert_eq!(report.deleted_by_age, vec!["ckpt-age".to_string()]);
+    assert_eq!(report.deleted_by_count, vec!["ckpt-count".to_string()]);
+
+    let remaining_ids: Vec<_> = store
+        .list_checkpoints()
+        .unwrap()
+        .into_iter()
+        .map(|checkpoint| checkpoint.checkpoint_id)
+        .collect();
+    assert_eq!(
+        remaining_ids,
+        vec!["ckpt-tagged".to_string(), "ckpt-keep".to_string()]
+    );
+
+    let second = store
+        .compact_checkpoints_with_policy_at(policy, 100)
+        .unwrap();
+    assert!(second.is_empty());
+}
+
 // ── Receipt persistence tests (from agent-a03881b1) ──
 
 fn sample_receipt(receipt_id: &str, entity_id: &str) -> Receipt {
@@ -1801,6 +1890,52 @@ fn receipt_upsert_updates() {
 
     let loaded = store.load_receipt("rcp-upsert").unwrap().unwrap();
     assert_eq!(loaded.status, "completed");
+}
+
+#[test]
+fn receipt_gc_applies_age_then_count_and_is_idempotent() {
+    let store = StateStore::in_memory().unwrap();
+
+    let mut r1 = sample_receipt("rcp-age", "sbx-1");
+    r1.created_at = 10;
+    let mut r2 = sample_receipt("rcp-count", "sbx-1");
+    r2.created_at = 20;
+    let mut r3 = sample_receipt("rcp-keep", "sbx-1");
+    r3.created_at = 30;
+
+    store.save_receipt(&r1).unwrap();
+    store.save_receipt(&r2).unwrap();
+    store.save_receipt(&r3).unwrap();
+
+    let policy = ReceiptRetentionPolicy {
+        max_count: 1,
+        max_age_secs: 60,
+    };
+    let state_map = store.receipt_retention_state_map(policy, 70).unwrap();
+    assert_eq!(
+        state_map.get("rcp-age").and_then(|s| s.gc_reason),
+        Some(RetentionGcReason::AgeLimit)
+    );
+    assert_eq!(
+        state_map.get("rcp-count").and_then(|s| s.gc_reason),
+        Some(RetentionGcReason::CountLimit)
+    );
+    assert_eq!(state_map.get("rcp-keep").and_then(|s| s.gc_reason), None);
+
+    let report = store.compact_receipts_with_policy_at(policy, 70).unwrap();
+    assert_eq!(report.deleted_by_age, vec!["rcp-age".to_string()]);
+    assert_eq!(report.deleted_by_count, vec!["rcp-count".to_string()]);
+
+    let remaining_ids: Vec<_> = store
+        .list_receipts()
+        .unwrap()
+        .into_iter()
+        .map(|receipt| receipt.receipt_id)
+        .collect();
+    assert_eq!(remaining_ids, vec!["rcp-keep".to_string()]);
+
+    let second = store.compact_receipts_with_policy_at(policy, 70).unwrap();
+    assert!(second.is_empty());
 }
 
 // ── Scoped event listing tests (from agent-a03881b1) ──

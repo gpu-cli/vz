@@ -80,6 +80,10 @@ pub struct CheckpointCreateArgs {
     #[arg(long, default_value = "unset")]
     fingerprint: String,
 
+    /// Optional retention tag. Tagged checkpoints are protected from policy GC.
+    #[arg(long)]
+    tag: Option<String>,
+
     /// Path to the state database.
     #[arg(long, default_value = "stack-state.db")]
     state_db: PathBuf,
@@ -115,6 +119,10 @@ struct ApiCheckpointPayload {
     state: String,
     compatibility_fingerprint: String,
     created_at: u64,
+    retention_tag: Option<String>,
+    retention_protected: Option<bool>,
+    retention_gc_reason: Option<String>,
+    retention_expires_at: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,6 +142,8 @@ struct ApiCreateCheckpointRequest {
     class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compatibility_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retention_tag: Option<String>,
 }
 
 fn checkpoint_payload_from_api(payload: ApiCheckpointPayload) -> runtime_v2::CheckpointPayload {
@@ -145,6 +155,10 @@ fn checkpoint_payload_from_api(payload: ApiCheckpointPayload) -> runtime_v2::Che
         state: payload.state,
         compatibility_fingerprint: payload.compatibility_fingerprint,
         created_at: payload.created_at,
+        retention_tag: payload.retention_tag.unwrap_or_default(),
+        retention_protected: payload.retention_protected.unwrap_or(false),
+        retention_gc_reason: payload.retention_gc_reason.unwrap_or_default(),
+        retention_expires_at: payload.retention_expires_at.unwrap_or_default(),
     }
 }
 
@@ -219,12 +233,14 @@ async fn api_create_checkpoint(
     sandbox_id: String,
     checkpoint_class: String,
     fingerprint: String,
+    retention_tag: Option<String>,
 ) -> anyhow::Result<runtime_v2::CheckpointPayload> {
     let url = runtime_api_url("/v1/checkpoints")?;
     let body = ApiCreateCheckpointRequest {
         sandbox_id,
         class: Some(checkpoint_class),
         compatibility_fingerprint: Some(fingerprint),
+        retention_tag,
     };
     let response = reqwest::Client::new()
         .post(url)
@@ -255,6 +271,22 @@ fn checkpoint_json(payload: &runtime_v2::CheckpointPayload) -> serde_json::Value
         "state": payload.state,
         "compatibility_fingerprint": payload.compatibility_fingerprint,
         "created_at": payload.created_at,
+        "retention_tag": if payload.retention_tag.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(payload.retention_tag.clone())
+        },
+        "retention_protected": payload.retention_protected,
+        "retention_gc_reason": if payload.retention_gc_reason.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(payload.retention_gc_reason.clone())
+        },
+        "retention_expires_at": if payload.retention_expires_at == 0 {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::Number(payload.retention_expires_at.into())
+        },
     })
 }
 
@@ -289,8 +321,8 @@ async fn cmd_list(args: CheckpointListArgs) -> anyhow::Result<()> {
     }
 
     println!(
-        "{:<40} {:<40} {:<12} {:<10} {:<20}",
-        "CHECKPOINT ID", "SANDBOX ID", "CLASS", "STATE", "FINGERPRINT"
+        "{:<34} {:<22} {:<10} {:<9} {:<20} {:<10} {:<12}",
+        "CHECKPOINT ID", "SANDBOX ID", "CLASS", "STATE", "FINGERPRINT", "TAG", "GC REASON"
     );
     for payload in &checkpoints {
         let class = if payload.checkpoint_class.trim().is_empty() {
@@ -308,9 +340,19 @@ async fn cmd_list(args: CheckpointListArgs) -> anyhow::Result<()> {
         } else {
             payload.compatibility_fingerprint.clone()
         };
+        let tag = if payload.retention_tag.trim().is_empty() {
+            "-"
+        } else {
+            payload.retention_tag.as_str()
+        };
+        let gc_reason = if payload.retention_gc_reason.trim().is_empty() {
+            "-"
+        } else {
+            payload.retention_gc_reason.as_str()
+        };
         println!(
-            "{:<40} {:<40} {:<12} {:<10} {:<20}",
-            payload.checkpoint_id, payload.sandbox_id, class, state, fingerprint
+            "{:<34} {:<22} {:<10} {:<9} {:<20} {:<10} {:<12}",
+            payload.checkpoint_id, payload.sandbox_id, class, state, fingerprint, tag, gc_reason
         );
     }
 
@@ -370,6 +412,7 @@ async fn cmd_create(args: CheckpointCreateArgs) -> anyhow::Result<()> {
                     sandbox_id: args.sandbox_id,
                     checkpoint_class,
                     compatibility_fingerprint: args.fingerprint,
+                    retention_tag: args.tag.unwrap_or_default(),
                 })
                 .await
                 .context("failed to create checkpoint via daemon")?;
@@ -378,7 +421,13 @@ async fn cmd_create(args: CheckpointCreateArgs) -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow!("daemon returned missing checkpoint payload"))?
         }
         ControlPlaneTransport::ApiHttp => {
-            api_create_checkpoint(args.sandbox_id, checkpoint_class, args.fingerprint).await?
+            api_create_checkpoint(
+                args.sandbox_id,
+                checkpoint_class,
+                args.fingerprint,
+                args.tag,
+            )
+            .await?
         }
     };
     let state = if payload.state.trim().is_empty() {

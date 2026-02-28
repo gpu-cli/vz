@@ -1,6 +1,6 @@
 use super::super::*;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use vz_runtime_contract::CheckpointFileEntry;
 pub(in crate::grpc) struct CheckpointServiceImpl {
@@ -276,6 +276,54 @@ fn diff_checkpoint_file_entries(
     diffs
 }
 
+fn normalize_checkpoint_retention_tag(tag: &str) -> Result<Option<String>, MachineError> {
+    let normalized = tag.trim();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    if normalized.len() > 128 {
+        return Err(MachineError::new(
+            MachineErrorCode::ValidationError,
+            "checkpoint retention tag must be 128 characters or fewer".to_string(),
+            None,
+            BTreeMap::new(),
+        ));
+    }
+    Ok(Some(normalized.to_string()))
+}
+
+fn load_checkpoint_retention_states(
+    daemon: &RuntimeDaemon,
+    request_id: &str,
+) -> Result<HashMap<String, vz_stack::CheckpointRetentionState>, Status> {
+    daemon
+        .with_state_store(|store| {
+            store.checkpoint_retention_state_map(
+                vz_stack::CheckpointRetentionPolicy::default(),
+                current_unix_secs(),
+            )
+        })
+        .map_err(|error| status_from_stack_error(error, request_id))
+}
+
+fn checkpoint_to_proto_with_retention(
+    checkpoint: &Checkpoint,
+    retention: Option<&vz_stack::CheckpointRetentionState>,
+) -> runtime_v2::CheckpointPayload {
+    let mut payload = checkpoint_to_proto_payload(checkpoint);
+    if let Some(retention) = retention {
+        payload.retention_tag = retention.tag.clone().unwrap_or_default();
+        payload.retention_protected = retention.protected;
+        payload.retention_gc_reason = retention
+            .gc_reason
+            .map(vz_stack::RetentionGcReason::as_str)
+            .unwrap_or_default()
+            .to_string();
+        payload.retention_expires_at = retention.expires_at.unwrap_or_default();
+    }
+    payload
+}
+
 #[tonic::async_trait]
 impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServiceImpl {
     async fn create_checkpoint(
@@ -312,7 +360,17 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
             &sandbox_id,
             &request.checkpoint_class,
             &request.compatibility_fingerprint,
+            &request.retention_tag,
         );
+        let retention_tag =
+            normalize_checkpoint_retention_tag(&request.retention_tag).map_err(|error| {
+                status_from_machine_error(MachineError::new(
+                    error.code,
+                    error.message,
+                    Some(request_id.clone()),
+                    BTreeMap::new(),
+                ))
+            })?;
 
         let class = checkpoint_class_from_wire(&request.checkpoint_class).map_err(|error| {
             status_from_machine_error(MachineError::new(
@@ -353,9 +411,14 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
                 &request_hash,
                 &request_id,
             )? {
+                let retention_states =
+                    load_checkpoint_retention_states(self.daemon.as_ref(), &request_id)?;
                 return Ok(Response::new(runtime_v2::CheckpointResponse {
                     request_id: request_id.clone(),
-                    checkpoint: Some(checkpoint_to_proto_payload(&cached_checkpoint)),
+                    checkpoint: Some(checkpoint_to_proto_with_retention(
+                        &cached_checkpoint,
+                        retention_states.get(&cached_checkpoint.checkpoint_id),
+                    )),
                 }));
             }
         }
@@ -390,6 +453,9 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
         let persist_result = self.daemon.with_state_store(|store| {
             store.with_immediate_transaction(|tx| {
                 tx.save_checkpoint(&checkpoint)?;
+                if let Some(tag) = retention_tag.as_deref() {
+                    tx.save_checkpoint_retention_tag(checkpoint.checkpoint_id.as_str(), tag)?;
+                }
                 tx.replace_checkpoint_file_entries(
                     checkpoint.checkpoint_id.as_str(),
                     &checkpoint_file_entries,
@@ -437,18 +503,27 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
                     &request_hash,
                     &request_id,
                 )? {
+                    let retention_states =
+                        load_checkpoint_retention_states(self.daemon.as_ref(), &request_id)?;
                     return Ok(Response::new(runtime_v2::CheckpointResponse {
                         request_id,
-                        checkpoint: Some(checkpoint_to_proto_payload(&cached_checkpoint)),
+                        checkpoint: Some(checkpoint_to_proto_with_retention(
+                            &cached_checkpoint,
+                            retention_states.get(&cached_checkpoint.checkpoint_id),
+                        )),
                     }));
                 }
             }
             return Err(status_from_stack_error(error, &request_id));
         }
 
+        let retention_states = load_checkpoint_retention_states(self.daemon.as_ref(), &request_id)?;
         let mut response = Response::new(runtime_v2::CheckpointResponse {
-            request_id,
-            checkpoint: Some(checkpoint_to_proto_payload(&checkpoint)),
+            request_id: request_id.clone(),
+            checkpoint: Some(checkpoint_to_proto_with_retention(
+                &checkpoint,
+                retention_states.get(&checkpoint.checkpoint_id),
+            )),
         });
         if let Ok(value) = MetadataValue::try_from(receipt_id.as_str()) {
             response.metadata_mut().insert("x-receipt-id", value);
@@ -479,10 +554,14 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
                     BTreeMap::new(),
                 ))
             })?;
+        let retention_states = load_checkpoint_retention_states(self.daemon.as_ref(), &request_id)?;
 
         Ok(Response::new(runtime_v2::CheckpointResponse {
             request_id,
-            checkpoint: Some(checkpoint_to_proto_payload(&checkpoint)),
+            checkpoint: Some(checkpoint_to_proto_with_retention(
+                &checkpoint,
+                retention_states.get(&checkpoint.checkpoint_id),
+            )),
         }))
     }
 
@@ -502,8 +581,17 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
             .daemon
             .with_state_store(|store| store.list_checkpoints())
             .map_err(|error| status_from_stack_error(error, &request_id))?
+            .into_iter()
+            .collect::<Vec<_>>();
+        let retention_states = load_checkpoint_retention_states(self.daemon.as_ref(), &request_id)?;
+        let checkpoints = checkpoints
             .iter()
-            .map(checkpoint_to_proto_payload)
+            .map(|checkpoint| {
+                checkpoint_to_proto_with_retention(
+                    checkpoint,
+                    retention_states.get(&checkpoint.checkpoint_id),
+                )
+            })
             .collect();
 
         Ok(Response::new(runtime_v2::ListCheckpointsResponse {
@@ -646,9 +734,13 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
             })
             .map_err(|error| status_from_stack_error(error, &request_id))?;
 
+        let retention_states = load_checkpoint_retention_states(self.daemon.as_ref(), &request_id)?;
         let mut response = Response::new(runtime_v2::CheckpointResponse {
-            request_id,
-            checkpoint: Some(checkpoint_to_proto_payload(&checkpoint)),
+            request_id: request_id.clone(),
+            checkpoint: Some(checkpoint_to_proto_with_retention(
+                &checkpoint,
+                retention_states.get(&checkpoint.checkpoint_id),
+            )),
         });
         if let Ok(value) = MetadataValue::try_from(receipt_id.as_str()) {
             response.metadata_mut().insert("x-receipt-id", value);
@@ -698,9 +790,14 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
                 &request_hash,
                 &request_id,
             )? {
+                let retention_states =
+                    load_checkpoint_retention_states(self.daemon.as_ref(), &request_id)?;
                 return Ok(Response::new(runtime_v2::CheckpointResponse {
                     request_id: request_id.clone(),
-                    checkpoint: Some(checkpoint_to_proto_payload(&cached_checkpoint)),
+                    checkpoint: Some(checkpoint_to_proto_with_retention(
+                        &cached_checkpoint,
+                        retention_states.get(&cached_checkpoint.checkpoint_id),
+                    )),
                 }));
             }
         }
@@ -802,18 +899,27 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
                     &request_hash,
                     &request_id,
                 )? {
+                    let retention_states =
+                        load_checkpoint_retention_states(self.daemon.as_ref(), &request_id)?;
                     return Ok(Response::new(runtime_v2::CheckpointResponse {
                         request_id,
-                        checkpoint: Some(checkpoint_to_proto_payload(&cached_checkpoint)),
+                        checkpoint: Some(checkpoint_to_proto_with_retention(
+                            &cached_checkpoint,
+                            retention_states.get(&cached_checkpoint.checkpoint_id),
+                        )),
                     }));
                 }
             }
             return Err(status_from_stack_error(error, &request_id));
         }
 
+        let retention_states = load_checkpoint_retention_states(self.daemon.as_ref(), &request_id)?;
         let mut response = Response::new(runtime_v2::CheckpointResponse {
-            request_id,
-            checkpoint: Some(checkpoint_to_proto_payload(&forked)),
+            request_id: request_id.clone(),
+            checkpoint: Some(checkpoint_to_proto_with_retention(
+                &forked,
+                retention_states.get(&forked.checkpoint_id),
+            )),
         });
         if let Ok(value) = MetadataValue::try_from(receipt_id.as_str()) {
             response.metadata_mut().insert("x-receipt-id", value);
