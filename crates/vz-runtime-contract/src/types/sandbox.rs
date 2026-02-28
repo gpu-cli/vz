@@ -26,6 +26,12 @@ pub const SANDBOX_LABEL_PROJECT_DIR: &str = "project_dir";
 pub const SANDBOX_LABEL_SPACE_MODE: &str = "vz.space.mode";
 /// Canonical sandbox label value indicating spaces mode is required.
 pub const SANDBOX_SPACE_MODE_REQUIRED: &str = "required";
+/// Canonical sandbox label key for declared spaces lifecycle mode.
+pub const SANDBOX_LABEL_SPACE_LIFECYCLE: &str = "vz.space.lifecycle";
+/// Canonical sandbox label value for persistent spaces (default mode).
+pub const SANDBOX_SPACE_LIFECYCLE_PERSISTENT: &str = "persistent";
+/// Canonical sandbox label value for explicit ephemeral spaces.
+pub const SANDBOX_SPACE_LIFECYCLE_EPHEMERAL: &str = "ephemeral";
 /// Canonical sandbox label key for the checked-in space config path.
 pub const SANDBOX_LABEL_SPACE_CONFIG_PATH: &str = "vz.space.config_path";
 /// Canonical sandbox label key prefix mapping space secret names to external env sources.

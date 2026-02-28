@@ -63,6 +63,13 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["continue_last", "resume"])]
     name: Option<String>,
 
+    /// Create an explicit ephemeral sandbox that is auto-cleaned only when safe.
+    #[arg(
+        long,
+        conflicts_with_all = ["continue_last", "resume", "name"]
+    )]
+    ephemeral: bool,
+
     /// Number of virtual CPUs for new sandboxes.
     #[arg(long, default_value = "2")]
     cpus: u8,
@@ -183,6 +190,7 @@ fn main() -> anyhow::Result<()> {
                     cli.continue_last,
                     cli.resume,
                     cli.name,
+                    cli.ephemeral,
                     cli.cpus,
                     cli.memory,
                     cli.base_image,
@@ -233,6 +241,7 @@ mod tests {
         assert!(!cli.continue_last);
         assert!(cli.resume.is_none());
         assert!(cli.name.is_none());
+        assert!(!cli.ephemeral);
     }
 
     #[test]
@@ -252,6 +261,12 @@ mod tests {
     fn parse_named_sandbox() {
         let cli = Cli::try_parse_from(["vz", "--name", "my-project"]).expect("parse");
         assert_eq!(cli.name.as_deref(), Some("my-project"));
+    }
+
+    #[test]
+    fn parse_ephemeral_sandbox() {
+        let cli = Cli::try_parse_from(["vz", "--ephemeral"]).expect("parse");
+        assert!(cli.ephemeral);
     }
 
     #[test]
@@ -290,6 +305,12 @@ mod tests {
     #[test]
     fn parse_continue_conflicts_with_resume() {
         let result = Cli::try_parse_from(["vz", "-c", "-r", "foo"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_ephemeral_conflicts_with_name() {
+        let result = Cli::try_parse_from(["vz", "--ephemeral", "--name", "feature"]);
         assert!(result.is_err());
     }
 

@@ -16,8 +16,9 @@ use serde::{Deserialize, Serialize};
 use tonic::Code;
 use vz_runtime_contract::{
     SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER, SANDBOX_LABEL_PROJECT_DIR,
-    SANDBOX_LABEL_SPACE_CONFIG_PATH, SANDBOX_LABEL_SPACE_MODE,
-    SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX, SANDBOX_SPACE_MODE_REQUIRED, Sandbox, SandboxBackend,
+    SANDBOX_LABEL_SPACE_CONFIG_PATH, SANDBOX_LABEL_SPACE_LIFECYCLE, SANDBOX_LABEL_SPACE_MODE,
+    SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX, SANDBOX_SPACE_LIFECYCLE_EPHEMERAL,
+    SANDBOX_SPACE_LIFECYCLE_PERSISTENT, SANDBOX_SPACE_MODE_REQUIRED, Sandbox, SandboxBackend,
     SandboxSpec, SandboxState,
 };
 use vz_runtime_proto::runtime_v2;
@@ -34,6 +35,29 @@ const SPACE_CONFIG_FILE: &str = "vz.json";
 struct SpaceConfig {
     config_path: PathBuf,
     external_secret_env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpaceLifecycleMode {
+    Persistent,
+    Ephemeral,
+}
+
+impl SpaceLifecycleMode {
+    const fn from_ephemeral_flag(ephemeral: bool) -> Self {
+        if ephemeral {
+            Self::Ephemeral
+        } else {
+            Self::Persistent
+        }
+    }
+
+    const fn as_label_value(self) -> &'static str {
+        match self {
+            Self::Persistent => SANDBOX_SPACE_LIFECYCLE_PERSISTENT,
+            Self::Ephemeral => SANDBOX_SPACE_LIFECYCLE_EPHEMERAL,
+        }
+    }
 }
 
 fn sandbox_backend_from_wire(backend: &str) -> SandboxBackend {
@@ -1099,6 +1123,7 @@ pub async fn cmd_default_sandbox(
     continue_last: bool,
     resume: Option<String>,
     name: Option<String>,
+    ephemeral: bool,
     cpus: u8,
     memory: u64,
     base_image_ref: Option<String>,
@@ -1107,6 +1132,9 @@ pub async fn cmd_default_sandbox(
     let state_db = default_state_db_path();
     let cwd = std::env::current_dir().context("failed to get current directory")?;
 
+    if (continue_last || resume.is_some()) && ephemeral {
+        bail!("--ephemeral is only valid when creating a new sandbox");
+    }
     if (continue_last || resume.is_some()) && (base_image_ref.is_some() || main_container.is_some())
     {
         bail!("--base-image and --main-container are only valid when creating a new sandbox");
@@ -1128,6 +1156,7 @@ pub async fn cmd_default_sandbox(
         &cwd,
         &space_config,
         name,
+        SpaceLifecycleMode::from_ephemeral_flag(ephemeral),
         cpus,
         memory,
         base_image_ref,
@@ -1152,7 +1181,9 @@ async fn cmd_continue_sandbox(state_db: &Path, cwd: &Path) -> anyhow::Result<()>
 
     if let Some(sandbox) = matching.last() {
         println!("Resuming sandbox {}...", sandbox.sandbox_id);
-        return attach_to_sandbox_by_id(state_db, &sandbox.sandbox_id).await;
+        return attach_to_sandbox_by_id(state_db, &sandbox.sandbox_id)
+            .await
+            .map(|_| ());
     }
 
     // Fall back to most recent non-terminal sandbox.
@@ -1161,7 +1192,9 @@ async fn cmd_continue_sandbox(state_db: &Path, cwd: &Path) -> anyhow::Result<()>
     match most_recent {
         Some(sandbox) => {
             println!("Resuming sandbox {}...", sandbox.sandbox_id);
-            attach_to_sandbox_by_id(state_db, &sandbox.sandbox_id).await
+            attach_to_sandbox_by_id(state_db, &sandbox.sandbox_id)
+                .await
+                .map(|_| ())
         }
         None => bail!("no active sandboxes found; run `vz` to create one"),
     }
@@ -1175,7 +1208,7 @@ async fn cmd_resume_sandbox(state_db: &Path, target: &str) -> anyhow::Result<()>
             bail!("sandbox {target} is in terminal state");
         }
         println!("Resuming sandbox {target}...");
-        return attach_to_sandbox_by_id(state_db, target).await;
+        return attach_to_sandbox_by_id(state_db, target).await.map(|_| ());
     }
 
     // Try name label match.
@@ -1190,7 +1223,9 @@ async fn cmd_resume_sandbox(state_db: &Path, target: &str) -> anyhow::Result<()>
     match by_name.last() {
         Some(sandbox) => {
             println!("Resuming sandbox {} ({target})...", sandbox.sandbox_id);
-            attach_to_sandbox_by_id(state_db, &sandbox.sandbox_id).await
+            attach_to_sandbox_by_id(state_db, &sandbox.sandbox_id)
+                .await
+                .map(|_| ())
         }
         None => bail!("sandbox {target} not found"),
     }
@@ -1202,6 +1237,7 @@ async fn cmd_create_sandbox(
     cwd: &Path,
     space_config: &SpaceConfig,
     name: Option<String>,
+    lifecycle_mode: SpaceLifecycleMode,
     cpus: u8,
     memory: u64,
     base_image_ref: Option<String>,
@@ -1222,6 +1258,10 @@ async fn cmd_create_sandbox(
     labels.insert(
         SANDBOX_LABEL_SPACE_CONFIG_PATH.to_string(),
         space_config.config_path.to_string_lossy().to_string(),
+    );
+    labels.insert(
+        SANDBOX_LABEL_SPACE_LIFECYCLE.to_string(),
+        lifecycle_mode.as_label_value().to_string(),
     );
     apply_space_external_secret_labels(&mut labels, &space_config.external_secret_env);
     labels.insert("source".to_string(), "standalone".to_string());
@@ -1244,12 +1284,105 @@ async fn cmd_create_sandbox(
 
     let sandbox =
         daemon_create_sandbox(state_db, &sandbox_id, cpus, memory, labels.clone()).await?;
-    match attach_to_sandbox_by_id(state_db, &sandbox.sandbox_id).await {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = daemon_terminate_sandbox(state_db, &sandbox.sandbox_id).await;
-            Err(error)
+    let attach_result = attach_to_sandbox_by_id(state_db, &sandbox.sandbox_id).await;
+
+    match lifecycle_mode {
+        SpaceLifecycleMode::Persistent => {
+            if let Err(error) = attach_result {
+                print_space_recovery_guidance(
+                    &sandbox.sandbox_id,
+                    "space preserved after attach failure",
+                );
+                return Err(error);
+            }
+            Ok(())
         }
+        SpaceLifecycleMode::Ephemeral => {
+            let session_completion = match &attach_result {
+                Ok(SandboxAttachOutcome::ExitedClean) => EphemeralSessionCompletion::CleanExit,
+                Ok(SandboxAttachOutcome::Detached) => EphemeralSessionCompletion::Detached,
+                Err(_) => EphemeralSessionCompletion::Failed,
+            };
+            let sandbox_snapshot = if session_completion == EphemeralSessionCompletion::CleanExit {
+                daemon_get_sandbox(state_db, &sandbox.sandbox_id).await?
+            } else {
+                None
+            };
+            let decision =
+                evaluate_ephemeral_cleanup_decision(session_completion, sandbox_snapshot.as_ref());
+            match decision {
+                EphemeralCleanupDecision::AutoCleanup => {
+                    let _ = daemon_terminate_sandbox(state_db, &sandbox.sandbox_id).await?;
+                    println!("Ephemeral sandbox {} cleaned up.", sandbox.sandbox_id);
+                }
+                EphemeralCleanupDecision::Preserve { reason } => {
+                    eprintln!("Ephemeral cleanup skipped: {reason}");
+                    print_space_recovery_guidance(&sandbox.sandbox_id, "space preserved");
+                }
+            }
+
+            match attach_result {
+                Ok(_) => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxAttachOutcome {
+    ExitedClean,
+    Detached,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EphemeralSessionCompletion {
+    CleanExit,
+    Detached,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EphemeralCleanupDecision {
+    AutoCleanup,
+    Preserve { reason: String },
+}
+
+fn evaluate_ephemeral_cleanup_decision(
+    session_completion: EphemeralSessionCompletion,
+    sandbox: Option<&Sandbox>,
+) -> EphemeralCleanupDecision {
+    match session_completion {
+        EphemeralSessionCompletion::Detached => EphemeralCleanupDecision::Preserve {
+            reason: "session detached and remains active".to_string(),
+        },
+        EphemeralSessionCompletion::Failed => EphemeralCleanupDecision::Preserve {
+            reason: "session ended with an error".to_string(),
+        },
+        EphemeralSessionCompletion::CleanExit => match sandbox {
+            Some(sandbox) if !sandbox.state.is_terminal() => EphemeralCleanupDecision::AutoCleanup,
+            Some(_) => EphemeralCleanupDecision::Preserve {
+                reason: "sandbox is already terminal".to_string(),
+            },
+            None => EphemeralCleanupDecision::Preserve {
+                reason: "sandbox no longer exists".to_string(),
+            },
+        },
+    }
+}
+
+fn sandbox_recovery_commands(sandbox_id: &str) -> [String; 3] {
+    [
+        format!("vz attach {sandbox_id}"),
+        format!("vz inspect {sandbox_id}"),
+        format!("vz rm {sandbox_id}"),
+    ]
+}
+
+fn print_space_recovery_guidance(sandbox_id: &str, context: &str) {
+    eprintln!("Recovery ({context}):");
+    for command in sandbox_recovery_commands(sandbox_id) {
+        eprintln!("  {command}");
     }
 }
 
@@ -1262,7 +1395,7 @@ enum AttachInputEvent {
 async fn attach_to_execution_interactive(
     state_db: &Path,
     execution_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<SandboxAttachOutcome> {
     match control_plane_transport()? {
         ControlPlaneTransport::DaemonGrpc => {
             attach_to_execution_interactive_daemon(state_db, execution_id).await
@@ -1274,7 +1407,7 @@ async fn attach_to_execution_interactive(
 async fn attach_to_execution_interactive_daemon(
     state_db: &Path,
     execution_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<SandboxAttachOutcome> {
     use crossterm::event::{self, Event};
     use crossterm::terminal;
     use std::io::Write;
@@ -1502,7 +1635,7 @@ async fn attach_to_execution_interactive_daemon(
 
     if detached {
         eprintln!("\nDetached (Ctrl-P Ctrl-Q). Session remains active.");
-        return Ok(());
+        return Ok(SandboxAttachOutcome::Detached);
     }
 
     if let Some(exit_code) = terminal_exit_code
@@ -1512,7 +1645,7 @@ async fn attach_to_execution_interactive_daemon(
     }
 
     println!();
-    Ok(())
+    Ok(SandboxAttachOutcome::ExitedClean)
 }
 
 fn handle_api_execution_stream_event(
@@ -1584,7 +1717,9 @@ fn handle_api_execution_stream_event(
     bail!("received unrecognized execution stream payload from api: {payload_json}");
 }
 
-async fn attach_to_execution_interactive_api(execution_id: &str) -> anyhow::Result<()> {
+async fn attach_to_execution_interactive_api(
+    execution_id: &str,
+) -> anyhow::Result<SandboxAttachOutcome> {
     use crossterm::event::{self, Event};
     use crossterm::terminal;
     use std::sync::{
@@ -1787,7 +1922,7 @@ async fn attach_to_execution_interactive_api(execution_id: &str) -> anyhow::Resu
 
     if detached {
         eprintln!("\nDetached (Ctrl-P Ctrl-Q). Session remains active.");
-        return Ok(());
+        return Ok(SandboxAttachOutcome::Detached);
     }
 
     if let Some(exit_code) = terminal_exit_code
@@ -1797,7 +1932,7 @@ async fn attach_to_execution_interactive_api(execution_id: &str) -> anyhow::Resu
     }
 
     println!();
-    Ok(())
+    Ok(SandboxAttachOutcome::ExitedClean)
 }
 
 /// Convert a crossterm key event to the byte sequence the terminal expects.
@@ -1986,7 +2121,9 @@ pub async fn cmd_terminate(args: SandboxTerminateArgs) -> anyhow::Result<()> {
 /// Attach to an existing sandbox (`vz attach`).
 pub async fn cmd_attach(args: SandboxAttachArgs) -> anyhow::Result<()> {
     let state_db = args.state_db.unwrap_or_else(default_state_db_path);
-    attach_to_sandbox_by_id(&state_db, &args.sandbox_id).await
+    attach_to_sandbox_by_id(&state_db, &args.sandbox_id)
+        .await
+        .map(|_| ())
 }
 
 /// Close an active sandbox shell session (`vz close-shell`).
@@ -2003,7 +2140,10 @@ pub async fn cmd_close_shell(args: SandboxCloseShellArgs) -> anyhow::Result<()> 
 }
 
 /// Attach to a sandbox by its ID (shared helper).
-async fn attach_to_sandbox_by_id(state_db: &Path, sandbox_id: &str) -> anyhow::Result<()> {
+async fn attach_to_sandbox_by_id(
+    state_db: &Path,
+    sandbox_id: &str,
+) -> anyhow::Result<SandboxAttachOutcome> {
     let opened = daemon_open_sandbox_shell(state_db, sandbox_id).await?;
     let execution_id = opened.execution_id.trim();
     if execution_id.is_empty() {
@@ -2039,6 +2179,83 @@ mod tests {
         assert!(is_detach_confirm(b"Q"));
         assert!(!is_detach_confirm(&[0x10]));
         assert!(!is_detach_confirm(b"x"));
+    }
+
+    #[test]
+    fn space_lifecycle_mode_defaults_to_persistent() {
+        let lifecycle = SpaceLifecycleMode::from_ephemeral_flag(false);
+        assert_eq!(lifecycle, SpaceLifecycleMode::Persistent);
+        assert_eq!(
+            lifecycle.as_label_value(),
+            SANDBOX_SPACE_LIFECYCLE_PERSISTENT
+        );
+    }
+
+    #[test]
+    fn space_lifecycle_mode_maps_ephemeral_flag() {
+        let lifecycle = SpaceLifecycleMode::from_ephemeral_flag(true);
+        assert_eq!(lifecycle, SpaceLifecycleMode::Ephemeral);
+        assert_eq!(
+            lifecycle.as_label_value(),
+            SANDBOX_SPACE_LIFECYCLE_EPHEMERAL
+        );
+    }
+
+    #[test]
+    fn ephemeral_cleanup_decision_allows_clean_exit_for_non_terminal_space() {
+        let sandbox = Sandbox {
+            sandbox_id: "sandbox-ephemeral-clean".to_string(),
+            backend: SandboxBackend::MacosVz,
+            spec: SandboxSpec::default(),
+            state: SandboxState::Ready,
+            created_at: 1,
+            updated_at: 1,
+            labels: BTreeMap::new(),
+        };
+        let decision = evaluate_ephemeral_cleanup_decision(
+            EphemeralSessionCompletion::CleanExit,
+            Some(&sandbox),
+        );
+        assert_eq!(decision, EphemeralCleanupDecision::AutoCleanup);
+    }
+
+    #[test]
+    fn ephemeral_cleanup_decision_preserves_dirty_paths() {
+        let detached = evaluate_ephemeral_cleanup_decision(
+            EphemeralSessionCompletion::Detached,
+            Some(&Sandbox {
+                sandbox_id: "sandbox-ephemeral-detached".to_string(),
+                backend: SandboxBackend::MacosVz,
+                spec: SandboxSpec::default(),
+                state: SandboxState::Ready,
+                created_at: 1,
+                updated_at: 1,
+                labels: BTreeMap::new(),
+            }),
+        );
+        assert!(matches!(
+            detached,
+            EphemeralCleanupDecision::Preserve { reason } if reason.contains("detached")
+        ));
+
+        let failed = evaluate_ephemeral_cleanup_decision(EphemeralSessionCompletion::Failed, None);
+        assert!(matches!(
+            failed,
+            EphemeralCleanupDecision::Preserve { reason } if reason.contains("error")
+        ));
+    }
+
+    #[test]
+    fn sandbox_recovery_commands_are_deterministic() {
+        let commands = sandbox_recovery_commands("space-123");
+        assert_eq!(
+            commands,
+            [
+                "vz attach space-123".to_string(),
+                "vz inspect space-123".to_string(),
+                "vz rm space-123".to_string(),
+            ]
+        );
     }
 
     #[test]
