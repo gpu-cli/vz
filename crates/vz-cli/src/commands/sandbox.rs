@@ -8,10 +8,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::Args;
+use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::StatusCode as HttpStatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1336,6 +1338,79 @@ async fn api_stream_exec_output(execution_id: &str) -> anyhow::Result<reqwest::R
     Ok(response)
 }
 
+struct SpinnerProgress {
+    progress: ProgressBar,
+    started_at: Instant,
+}
+
+impl SpinnerProgress {
+    fn start(message: impl Into<String>) -> Self {
+        let progress = ProgressBar::new_spinner();
+        progress.enable_steady_tick(Duration::from_millis(100));
+        if let Ok(style) = ProgressStyle::default_spinner().template("{spinner:.cyan} {msg}") {
+            progress.set_style(style);
+        }
+        progress.set_message(message.into());
+        Self {
+            progress,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn set_message(&self, message: impl Into<String>) {
+        self.progress.set_message(message.into());
+    }
+
+    fn finish_with_elapsed(self, message: impl Into<String>) {
+        let elapsed = self.started_at.elapsed().as_secs_f32();
+        self.progress
+            .finish_with_message(format!("{} ({elapsed:.1}s)", message.into()));
+    }
+
+    fn abandon(self, message: impl Into<String>) {
+        self.progress.abandon_with_message(message.into());
+    }
+}
+
+fn sanitize_progress_detail(detail: &str) -> String {
+    let trimmed = detail.trim();
+    if trimmed.is_empty() {
+        return "working".to_string();
+    }
+    let lowercase = trimmed.to_ascii_lowercase();
+    if lowercase.contains("waiting for guest agent") {
+        return "waiting for guest agent".to_string();
+    }
+    if let Some((prefix, _)) = trimmed.split_once("(attempt") {
+        let cleaned = prefix.trim().trim_end_matches(':').trim();
+        if !cleaned.is_empty() {
+            return cleaned.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn create_sandbox_progress_message(phase: &str, detail: &str) -> String {
+    match phase {
+        "validating" => "Validating sandbox request".to_string(),
+        "idempotency_replay" => "Replaying cached sandbox result".to_string(),
+        "applying_defaults" => "Applying sandbox defaults".to_string(),
+        "booting_runtime" => "Booting runtime resources".to_string(),
+        "persisting" => "Persisting sandbox state".to_string(),
+        _ => sanitize_progress_detail(detail),
+    }
+}
+
+fn open_sandbox_shell_progress_message(phase: &str, detail: &str) -> String {
+    match phase {
+        "validating" => "Validating shell request".to_string(),
+        "ensuring_container" => "Ensuring workspace container".to_string(),
+        "resolving_command" => "Resolving shell command".to_string(),
+        "ensuring_execution" => "Preparing interactive shell session".to_string(),
+        _ => sanitize_progress_detail(detail),
+    }
+}
+
 async fn daemon_grpc_list_sandboxes(state_db: &Path) -> anyhow::Result<Vec<Sandbox>> {
     let mut client = connect_control_plane_for_state_db(state_db).await?;
     let response = client
@@ -1374,6 +1449,7 @@ async fn daemon_grpc_get_sandbox(
 
 async fn daemon_grpc_create_sandbox(
     state_db: &Path,
+    display_name: &str,
     sandbox_id: &str,
     cpus: u8,
     memory: u64,
@@ -1390,15 +1466,25 @@ async fn daemon_grpc_create_sandbox(
         })
         .await
         .context("failed to create sandbox via daemon")?;
+    let spinner = SpinnerProgress::start(format!("Booting sandbox {display_name}"));
     let mut completion = None;
-    while let Some(event) = stream
-        .message()
-        .await
-        .context("failed reading create sandbox stream")?
-    {
+    loop {
+        let maybe_event = match stream.message().await {
+            Ok(event) => event,
+            Err(error) => {
+                spinner.abandon(format!("Sandbox {display_name} boot failed"));
+                return Err(anyhow!(error).context("failed reading create sandbox stream"));
+            }
+        };
+        let Some(event) = maybe_event else {
+            break;
+        };
         match event.payload {
             Some(runtime_v2::create_sandbox_event::Payload::Progress(progress)) => {
-                println!("[{}] {}", progress.phase, progress.detail);
+                spinner.set_message(create_sandbox_progress_message(
+                    progress.phase.as_str(),
+                    progress.detail.as_str(),
+                ));
             }
             Some(runtime_v2::create_sandbox_event::Payload::Completion(done)) => {
                 completion = Some(done);
@@ -1406,8 +1492,13 @@ async fn daemon_grpc_create_sandbox(
             None => {}
         }
     }
-    let completion = completion
-        .ok_or_else(|| anyhow!("daemon create_sandbox stream ended without completion"))?;
+    let Some(completion) = completion else {
+        spinner.abandon(format!("Sandbox {display_name} boot failed"));
+        return Err(anyhow!(
+            "daemon create_sandbox stream ended without completion"
+        ));
+    };
+    spinner.finish_with_elapsed(format!("Sandbox {display_name} ready"));
     if !completion.receipt_id.trim().is_empty() {
         println!("Receipt: {}", completion.receipt_id.trim());
     }
@@ -1484,6 +1575,7 @@ async fn daemon_get_sandbox(state_db: &Path, sandbox_id: &str) -> anyhow::Result
 
 async fn daemon_create_sandbox(
     state_db: &Path,
+    display_name: &str,
     sandbox_id: &str,
     cpus: u8,
     memory: u64,
@@ -1491,7 +1583,8 @@ async fn daemon_create_sandbox(
 ) -> anyhow::Result<Sandbox> {
     match control_plane_transport()? {
         ControlPlaneTransport::DaemonGrpc => {
-            daemon_grpc_create_sandbox(state_db, sandbox_id, cpus, memory, labels).await
+            daemon_grpc_create_sandbox(state_db, display_name, sandbox_id, cpus, memory, labels)
+                .await
         }
         ControlPlaneTransport::ApiHttp => {
             api_create_sandbox(sandbox_id, cpus, memory, labels).await
@@ -1525,15 +1618,28 @@ async fn daemon_open_sandbox_shell(
                 })
                 .await
                 .context("failed to open sandbox shell via daemon")?;
+            let spinner =
+                SpinnerProgress::start(format!("Preparing shell session for {sandbox_id}"));
             let mut completion = None;
-            while let Some(event) = stream
-                .message()
-                .await
-                .context("failed reading open sandbox shell stream")?
-            {
+            loop {
+                let maybe_event = match stream.message().await {
+                    Ok(event) => event,
+                    Err(error) => {
+                        spinner.abandon(format!("Shell session failed for {sandbox_id}"));
+                        return Err(
+                            anyhow!(error).context("failed reading open sandbox shell stream")
+                        );
+                    }
+                };
+                let Some(event) = maybe_event else {
+                    break;
+                };
                 match event.payload {
                     Some(runtime_v2::open_sandbox_shell_event::Payload::Progress(progress)) => {
-                        println!("[{}] {}", progress.phase, progress.detail);
+                        spinner.set_message(open_sandbox_shell_progress_message(
+                            progress.phase.as_str(),
+                            progress.detail.as_str(),
+                        ));
                     }
                     Some(runtime_v2::open_sandbox_shell_event::Payload::Completion(done)) => {
                         completion = Some(done);
@@ -1541,8 +1647,14 @@ async fn daemon_open_sandbox_shell(
                     None => {}
                 }
             }
-            completion
-                .ok_or_else(|| anyhow!("daemon open_sandbox_shell stream ended without completion"))
+            let Some(response) = completion else {
+                spinner.abandon(format!("Shell session failed for {sandbox_id}"));
+                return Err(anyhow!(
+                    "daemon open_sandbox_shell stream ended without completion"
+                ));
+            };
+            spinner.finish_with_elapsed(format!("Shell session ready for {sandbox_id}"));
+            Ok(response)
         }
         ControlPlaneTransport::ApiHttp => api_open_sandbox_shell(sandbox_id).await,
     }
@@ -1869,8 +1981,17 @@ async fn cmd_create_sandbox(
         space_config.config_path.display()
     );
 
-    let sandbox =
-        daemon_create_sandbox(state_db, &sandbox_id, cpus, memory, labels.clone()).await?;
+    let sandbox = daemon_create_sandbox(
+        state_db,
+        display_name,
+        &sandbox_id,
+        cpus,
+        memory,
+        labels.clone(),
+    )
+    .await?;
+    println!("Sandbox {} ready. Launching shell...", sandbox.sandbox_id);
+    println!();
     let attach_result = attach_to_sandbox_by_id(state_db, &sandbox.sandbox_id).await;
 
     match lifecycle_mode {
@@ -2757,6 +2878,29 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[test]
+    fn sanitize_progress_detail_collapses_guest_agent_attempt_noise() {
+        let detail =
+            "waiting for guest agent (attempt 5: failed to connect to vsock port 5000: timeout)";
+        assert_eq!(sanitize_progress_detail(detail), "waiting for guest agent");
+    }
+
+    #[test]
+    fn create_progress_message_uses_stable_phase_labels() {
+        assert_eq!(
+            create_sandbox_progress_message("booting_runtime", "booting sandbox runtime resources"),
+            "Booting runtime resources"
+        );
+    }
+
+    #[test]
+    fn open_shell_progress_message_uses_stable_phase_labels() {
+        assert_eq!(
+            open_sandbox_shell_progress_message("ensuring_execution", "ensuring shell execution"),
+            "Preparing interactive shell session"
+        );
+    }
 
     fn sandbox_with_labels(
         sandbox_id: &str,
