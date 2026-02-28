@@ -368,4 +368,38 @@ mod tests {
         let existing = load_existing_artifacts(&buildkit_dir).unwrap();
         assert!(existing.is_none());
     }
+
+    #[test]
+    fn buildkit_artifact_paths_are_correct() {
+        let artifacts = BuildkitArtifacts {
+            bin_dir: PathBuf::from("/tmp/vz/buildkit/bin"),
+            cache_dir: PathBuf::from("/tmp/vz/buildkit/cache"),
+            version: BUILDKIT_VERSION.to_string(),
+        };
+        assert_eq!(
+            artifacts.buildkitd_path(),
+            PathBuf::from("/tmp/vz/buildkit/bin").join(BUILDKITD_BINARY)
+        );
+        assert_eq!(
+            artifacts.buildkit_runc_path(),
+            PathBuf::from("/tmp/vz/buildkit/bin").join(BUILDKIT_RUNC_BINARY)
+        );
+    }
+
+    #[test]
+    #[ignore = "downloads BuildKit release from GitHub"]
+    fn ensure_buildkit_artifacts_downloads_real_release() {
+        let temp = tempdir().unwrap();
+        let buildkit_dir = temp.path().join(".vz").join("buildkit");
+        let artifacts = ensure_buildkit_artifacts_in_dir(&buildkit_dir).unwrap();
+
+        assert!(artifacts.buildkitd_path().exists());
+        assert!(artifacts.buildkit_runc_path().exists());
+        assert_eq!(artifacts.version, BUILDKIT_VERSION);
+
+        let buildkitd = std::fs::read(artifacts.buildkitd_path()).unwrap();
+        let buildkit_runc = std::fs::read(artifacts.buildkit_runc_path()).unwrap();
+        assert!(buildkitd.starts_with(b"\x7fELF"));
+        assert!(buildkit_runc.starts_with(b"\x7fELF"));
+    }
 }
