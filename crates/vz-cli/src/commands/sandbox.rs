@@ -9,10 +9,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+use std::{
+    cmp::Reverse,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::Args;
+use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::StatusCode as HttpStatusCode;
 use serde::{Deserialize, Serialize};
@@ -2709,12 +2714,97 @@ fn is_detach_confirm(bytes: &[u8]) -> bool {
     matches!(bytes, [0x11] | [b'q'] | [b'Q'])
 }
 
+#[derive(Debug, Clone)]
+struct SandboxListRow {
+    sandbox: String,
+    state_plain: String,
+    state_styled: String,
+    cpus: String,
+    memory_mb: String,
+    age: String,
+    updated: String,
+    dir: String,
+    source: String,
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn format_relative_age(unix_secs: u64, now_unix_secs: u64) -> String {
+    if unix_secs == 0 {
+        return "-".to_string();
+    }
+    if now_unix_secs <= unix_secs {
+        return "just now".to_string();
+    }
+    let delta = now_unix_secs - unix_secs;
+    if delta < 60 {
+        return format!("{delta}s ago");
+    }
+    if delta < 3_600 {
+        return format!("{}m ago", delta / 60);
+    }
+    if delta < 86_400 {
+        return format!("{}h ago", delta / 3_600);
+    }
+    if delta < 604_800 {
+        return format!("{}d ago", delta / 86_400);
+    }
+    if delta < 2_592_000 {
+        return format!("{}w ago", delta / 604_800);
+    }
+    format!("{}mo ago", delta / 2_592_000)
+}
+
+fn shorten_home_path(path: &str) -> String {
+    if let Ok(home) = std::env::var("HOME")
+        && let Some(rest) = path.strip_prefix(&home)
+    {
+        return format!("~{rest}");
+    }
+    path.to_string()
+}
+
+fn state_label(state: SandboxState) -> &'static str {
+    match state {
+        SandboxState::Creating => "creating",
+        SandboxState::Ready => "running",
+        SandboxState::Draining => "draining",
+        SandboxState::Terminated => "stopped",
+        SandboxState::Failed => "failed",
+    }
+}
+
+fn style_state_label(state: SandboxState, label: &str) -> String {
+    match state {
+        SandboxState::Ready => style(label).green().to_string(),
+        SandboxState::Creating => style(label).cyan().to_string(),
+        SandboxState::Draining => style(label).yellow().to_string(),
+        SandboxState::Failed => style(label).red().to_string(),
+        SandboxState::Terminated => style(label).dim().to_string(),
+    }
+}
+
+fn sandbox_display_name(sandbox: &Sandbox) -> String {
+    sandbox.labels.get("name").cloned().unwrap_or_else(|| {
+        if sandbox.sandbox_id.len() > 20 {
+            format!("{}…", &sandbox.sandbox_id[..19])
+        } else {
+            sandbox.sandbox_id.clone()
+        }
+    })
+}
+
 // ── Top-level sandbox commands ──────────────────────────────────
 
 /// List all sandboxes (`vz ls`).
 pub async fn cmd_list(args: SandboxListArgs) -> anyhow::Result<()> {
     let state_db = args.state_db.unwrap_or_else(default_state_db_path);
-    let sandboxes = daemon_list_sandboxes(&state_db).await?;
+    let mut sandboxes = daemon_list_sandboxes(&state_db).await?;
 
     if args.json {
         let json =
@@ -2724,60 +2814,127 @@ pub async fn cmd_list(args: SandboxListArgs) -> anyhow::Result<()> {
     }
 
     if sandboxes.is_empty() {
-        println!("No sandboxes found.");
+        println!("No sandboxes.");
+        println!("Run `vz` to create and attach to a new sandbox.");
         return Ok(());
     }
 
-    println!(
-        "{:<16} {:<12} {:<6} {:<10} {:<30} {:<12}",
-        "SANDBOX", "STATE", "CPUS", "MEMORY MB", "DIR", "SOURCE"
-    );
-    for sandbox in &sandboxes {
-        let cpus = sandbox
-            .spec
-            .cpus
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let memory = sandbox
-            .spec
-            .memory_mb
-            .map(|m| m.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let state = serde_json::to_string(&sandbox.state)
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string();
-        let dir = sandbox
-            .labels
-            .get(SANDBOX_LABEL_PROJECT_DIR)
-            .map(|d| {
-                // Shorten home dir.
-                if let Ok(home) = std::env::var("HOME") {
-                    if let Some(rest) = d.strip_prefix(&home) {
-                        return format!("~{rest}");
-                    }
-                }
-                d.clone()
-            })
-            .unwrap_or_else(|| "-".to_string());
-        let source = sandbox
-            .labels
-            .get("source")
-            .cloned()
-            .unwrap_or_else(|| "-".to_string());
+    sandboxes.sort_by_key(|sandbox| Reverse(sandbox.updated_at));
+    let now = now_unix_secs();
+    let rows: Vec<SandboxListRow> = sandboxes
+        .iter()
+        .map(|sandbox| {
+            let cpus = sandbox
+                .spec
+                .cpus
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let memory_mb = sandbox
+                .spec
+                .memory_mb
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let state_plain = state_label(sandbox.state).to_string();
+            let state_styled = style_state_label(sandbox.state, state_plain.as_str());
+            let dir = sandbox
+                .labels
+                .get(SANDBOX_LABEL_PROJECT_DIR)
+                .map(|path| shorten_home_path(path))
+                .unwrap_or_else(|| "-".to_string());
+            let source = sandbox
+                .labels
+                .get("source")
+                .cloned()
+                .unwrap_or_else(|| "-".to_string());
 
-        // Use name label if available, otherwise truncate sandbox_id.
-        let display_id = sandbox.labels.get("name").cloned().unwrap_or_else(|| {
-            if sandbox.sandbox_id.len() > 14 {
-                format!("{}…", &sandbox.sandbox_id[..13])
-            } else {
-                sandbox.sandbox_id.clone()
+            SandboxListRow {
+                sandbox: sandbox_display_name(sandbox),
+                state_plain,
+                state_styled,
+                cpus,
+                memory_mb,
+                age: format_relative_age(sandbox.created_at, now),
+                updated: format_relative_age(sandbox.updated_at, now),
+                dir,
+                source,
             }
-        });
+        })
+        .collect();
 
+    let sandbox_width = rows
+        .iter()
+        .map(|row| row.sandbox.len())
+        .max()
+        .unwrap_or(7)
+        .max("SANDBOX".len());
+    let state_width = rows
+        .iter()
+        .map(|row| row.state_plain.len())
+        .max()
+        .unwrap_or(5)
+        .max("STATE".len());
+    let cpus_width = rows
+        .iter()
+        .map(|row| row.cpus.len())
+        .max()
+        .unwrap_or(4)
+        .max("CPUS".len());
+    let memory_width = rows
+        .iter()
+        .map(|row| row.memory_mb.len())
+        .max()
+        .unwrap_or(9)
+        .max("MEMORY".len());
+    let age_width = rows
+        .iter()
+        .map(|row| row.age.len())
+        .max()
+        .unwrap_or(3)
+        .max("AGE".len());
+    let updated_width = rows
+        .iter()
+        .map(|row| row.updated.len())
+        .max()
+        .unwrap_or(7)
+        .max("UPDATED".len());
+    let source_width = rows
+        .iter()
+        .map(|row| row.source.len())
+        .max()
+        .unwrap_or(6)
+        .max("SOURCE".len());
+
+    println!(
+        "{}",
+        style(format!(
+            "{:<sandbox_width$}  {:<state_width$}  {:>cpus_width$}  {:>memory_width$}  {:<age_width$}  {:<updated_width$}  {:<source_width$}  {}",
+            "SANDBOX",
+            "STATE",
+            "CPUS",
+            "MEMORY",
+            "AGE",
+            "UPDATED",
+            "SOURCE",
+            "DIR",
+        ))
+        .bold()
+    );
+    for row in &rows {
+        let state_cell = format!(
+            "{}{}",
+            row.state_styled,
+            " ".repeat(state_width.saturating_sub(row.state_plain.len()))
+        );
         println!(
-            "{:<16} {:<12} {:<6} {:<10} {:<30} {:<12}",
-            display_id, state, cpus, memory, dir, source
+            "{:<sandbox_width$}  {}  {:>cpus_width$}  {:>memory_width$}  {:<age_width$}  {:<updated_width$}  {:<source_width$}  {}",
+            row.sandbox,
+            state_cell,
+            row.cpus,
+            row.memory_mb,
+            row.age,
+            row.updated,
+            row.source,
+            row.dir,
         );
     }
 
@@ -2900,6 +3057,14 @@ mod tests {
             open_sandbox_shell_progress_message("ensuring_execution", "ensuring shell execution"),
             "Preparing interactive shell session"
         );
+    }
+
+    #[test]
+    fn relative_age_formats_human_readable_units() {
+        assert_eq!(format_relative_age(1_000, 1_030), "30s ago");
+        assert_eq!(format_relative_age(1_000, 1_120), "2m ago");
+        assert_eq!(format_relative_age(1_000, 4_600), "1h ago");
+        assert_eq!(format_relative_age(1_000, 87_400), "1d ago");
     }
 
     fn sandbox_with_labels(
