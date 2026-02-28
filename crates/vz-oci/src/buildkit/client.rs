@@ -13,6 +13,8 @@ use tonic::metadata::{Ascii, MetadataKey, MetadataMap, MetadataValue};
 use tonic::transport::Channel;
 use uuid::Uuid;
 
+use super::progress::{BuildProgress, BuildProgressMapper};
+
 /// Errors returned by [`BuildClient`] and [`BuildSession`].
 #[derive(Debug, thiserror::Error)]
 pub enum BuildClientError {
@@ -73,6 +75,9 @@ pub struct BuildResult {
     pub build_ref: String,
     pub exporter_response: HashMap<String, String>,
 }
+
+/// Stream of typed build progress events.
+pub type BuildProgressStream = ReceiverStream<Result<BuildProgress, BuildClientError>>;
 
 impl BuildRequest {
     /// Convert this request to a BuildKit solve payload.
@@ -262,6 +267,37 @@ impl BuildClient {
             })
             .await?;
         Ok(response.into_inner())
+    }
+
+    /// Open and map `Control.Status` to typed build progress events.
+    pub async fn progress_stream(
+        &mut self,
+        build_ref: impl Into<String>,
+    ) -> Result<BuildProgressStream, BuildClientError> {
+        let mut status_stream = self.status(build_ref).await?;
+        let (tx, rx) = mpsc::channel(256);
+
+        tokio::spawn(async move {
+            let mut mapper = BuildProgressMapper::default();
+            loop {
+                match status_stream.message().await {
+                    Ok(Some(status)) => {
+                        for event in mapper.map_status(status) {
+                            if tx.send(Ok(event)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(error) => {
+                        let _ = tx.send(Err(BuildClientError::GrpcStatus(error))).await;
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(ReceiverStream::new(rx))
     }
 
     /// Mutable access to the raw generated control client.
