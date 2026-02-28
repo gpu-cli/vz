@@ -24,6 +24,8 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 uuid = { workspace = true }
 bollard-buildkit-proto = { version = "=0.6.0", default-features = false }
+ignore = "0.4"
+docker_credential = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
