@@ -9,6 +9,7 @@ pub mod checkpoint;
 #[cfg(target_os = "macos")]
 pub mod cleanup;
 pub mod debug;
+pub mod diff;
 pub mod docker;
 #[cfg(target_os = "macos")]
 pub mod exec;

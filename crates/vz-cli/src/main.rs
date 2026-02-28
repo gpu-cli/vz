@@ -116,6 +116,10 @@ enum Commands {
     /// OCI image management (pull, build, list, prune).
     Image(commands::image::ImageArgs),
 
+    // ── Diff contract ──
+    /// Compare two checkpoints with the versioned diff contract.
+    Diff(commands::diff::DiffArgs),
+
     // ── Debug/advanced (hidden) ──
     /// Advanced debugging and low-level operations.
     #[command(hide = true)]
@@ -211,6 +215,9 @@ fn main() -> anyhow::Result<()> {
 
             // Image management
             Some(Commands::Image(args)) => commands::image::run(args).await,
+
+            // Diff contract
+            Some(Commands::Diff(args)) => commands::diff::run(args).await,
 
             // Debug/advanced
             Some(Commands::Debug(args)) => commands::debug::run(*args).await,
@@ -364,6 +371,13 @@ mod tests {
     fn parse_attach_subcommand() {
         let cli = Cli::try_parse_from(["vz", "attach", "sbx-123"]).expect("parse");
         assert!(matches!(cli.command, Some(Commands::Attach(_))));
+    }
+
+    #[test]
+    fn parse_diff_subcommand() {
+        let cli = Cli::try_parse_from(["vz", "diff", "cp-001", "cp-002", "--mode", "system"])
+            .expect("parse");
+        assert!(matches!(cli.command, Some(Commands::Diff(_))));
     }
 
     #[test]
