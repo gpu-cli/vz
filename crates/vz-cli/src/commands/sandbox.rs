@@ -2750,7 +2750,12 @@ fn generate_sandbox_id() -> String {
 mod tests {
     use super::*;
     use crate::commands::space_cache_trust::SpaceRemoteCacheManifestV1;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use ring::rand::SystemRandom;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use std::ffi::OsString;
     use std::fs;
+    use std::path::Path;
     use tempfile::tempdir;
 
     fn sandbox_with_labels(
@@ -2767,6 +2772,67 @@ mod tests {
             updated_at: 1,
             labels,
         }
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            #[allow(unsafe_code)]
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            #[allow(unsafe_code)]
+            unsafe {
+                match self.previous.take() {
+                    Some(previous) => std::env::set_var(self.key, previous),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn write_signed_remote_cache_artifact(
+        root: &Path,
+        cache_name: &str,
+        digest_hex: &str,
+        blob_bytes: &[u8],
+    ) -> Vec<u8> {
+        let artifact_dir = root.join(cache_name).join(digest_hex);
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+
+        let mut blob_hasher = Sha256::new();
+        blob_hasher.update(blob_bytes);
+        let blob_digest = format!("{:x}", blob_hasher.finalize());
+        let manifest = SpaceRemoteCacheManifestV1 {
+            schema_version: 1,
+            cache_name: cache_name.to_string(),
+            key_digest_hex: digest_hex.to_string(),
+            blob_digest_sha256: blob_digest,
+            publisher: "acme-ci".to_string(),
+            signed_at: 1_746_000_000,
+        };
+        let manifest_bytes = serde_json::to_vec(&manifest).expect("manifest json");
+
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("pkcs8");
+        let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("keypair");
+        let signature = key_pair.sign(&manifest_bytes);
+
+        fs::write(artifact_dir.join("manifest.json"), manifest_bytes).expect("manifest");
+        fs::write(artifact_dir.join("signature.sig"), signature.as_ref()).expect("signature");
+        fs::write(artifact_dir.join("payload.tar.zst"), blob_bytes).expect("blob");
+        key_pair.public_key().as_ref().to_vec()
     }
 
     #[test]
@@ -3045,6 +3111,101 @@ mod tests {
             fs::read(&local_blob).expect("read local blob"),
             fs::read(&source_blob).expect("read source blob")
         );
+    }
+
+    #[test]
+    fn update_space_cache_index_reports_remote_verified_materialized_outcome() {
+        let dir = tempdir().expect("tempdir");
+        let state_db = dir.path().join("state").join("stack-state.db");
+        fs::create_dir_all(
+            state_db
+                .parent()
+                .expect("state db should always have a parent path"),
+        )
+        .expect("state dir");
+        let remote_root = dir.path().join("remote-cache");
+        let public_key = write_signed_remote_cache_artifact(
+            &remote_root,
+            "deps",
+            "abc123",
+            b"remote-cache-payload",
+        );
+        let encoded_public_key = BASE64_STANDARD.encode(public_key);
+        let _remote_root_guard =
+            EnvGuard::set("VZ_SPACE_REMOTE_CACHE_DIR", &remote_root.to_string_lossy());
+        let _pubkey_guard = EnvGuard::set("VZ_SPACE_REMOTE_CACHE_PUBKEY", &encoded_public_key);
+
+        let key = SpaceCacheKey {
+            schema_version: SPACE_CACHE_KEY_SCHEMA_VERSION,
+            cache_name: "deps".to_string(),
+            digest_hex: "abc123".to_string(),
+            canonical_json: "{}".to_string(),
+        };
+        let outcomes =
+            update_space_cache_index(&state_db, &[key]).expect("cache update should succeed");
+        assert_eq!(
+            outcomes.get("deps"),
+            Some(&SpaceCacheTrustOutcome::RemoteVerifiedMaterialized)
+        );
+        let local_payload = dir
+            .path()
+            .join("state")
+            .join("space-cache-artifacts")
+            .join("deps")
+            .join("abc123")
+            .join("payload.tar.zst");
+        assert!(local_payload.is_file());
+    }
+
+    #[test]
+    fn update_space_cache_index_reports_remote_miss_when_signature_missing() {
+        let dir = tempdir().expect("tempdir");
+        let state_db = dir.path().join("state").join("stack-state.db");
+        fs::create_dir_all(
+            state_db
+                .parent()
+                .expect("state db should always have a parent path"),
+        )
+        .expect("state dir");
+        let remote_root = dir.path().join("remote-cache");
+        let public_key = write_signed_remote_cache_artifact(
+            &remote_root,
+            "deps",
+            "abc123",
+            b"remote-cache-payload",
+        );
+        fs::remove_file(
+            remote_root
+                .join("deps")
+                .join("abc123")
+                .join("signature.sig"),
+        )
+        .expect("remove signature");
+        let encoded_public_key = BASE64_STANDARD.encode(public_key);
+        let _remote_root_guard =
+            EnvGuard::set("VZ_SPACE_REMOTE_CACHE_DIR", &remote_root.to_string_lossy());
+        let _pubkey_guard = EnvGuard::set("VZ_SPACE_REMOTE_CACHE_PUBKEY", &encoded_public_key);
+
+        let key = SpaceCacheKey {
+            schema_version: SPACE_CACHE_KEY_SCHEMA_VERSION,
+            cache_name: "deps".to_string(),
+            digest_hex: "abc123".to_string(),
+            canonical_json: "{}".to_string(),
+        };
+        let outcomes =
+            update_space_cache_index(&state_db, &[key]).expect("cache update should succeed");
+        assert_eq!(
+            outcomes.get("deps"),
+            Some(&SpaceCacheTrustOutcome::RemoteMissUntrusted)
+        );
+        let local_payload = dir
+            .path()
+            .join("state")
+            .join("space-cache-artifacts")
+            .join("deps")
+            .join("abc123")
+            .join("payload.tar.zst");
+        assert!(!local_payload.exists());
     }
 
     #[test]
