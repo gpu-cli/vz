@@ -5,7 +5,7 @@
 
 #![allow(clippy::print_stdout)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
@@ -13,6 +13,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::Args;
 use reqwest::StatusCode as HttpStatusCode;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tonic::Code;
 use vz_runtime_contract::{
     SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER, SANDBOX_LABEL_PROJECT_DIR,
@@ -28,13 +29,25 @@ use super::runtime_daemon::{
     ControlPlaneTransport, connect_control_plane_for_state_db, control_plane_transport,
     default_state_db_path, runtime_api_base_url,
 };
+use super::space_cache_key::{
+    SPACE_CACHE_KEY_SCHEMA_VERSION, SpaceCacheIndex, SpaceCacheKey, SpaceCacheKeyMaterial,
+    SpaceCacheLookup, SpaceCacheRuntimeIdentity,
+};
 
 const SPACE_CONFIG_FILE: &str = "vz.json";
+const SPACE_CACHE_INDEX_FILE: &str = "space-cache-index.json";
 
 #[derive(Debug, Clone)]
 struct SpaceConfig {
     config_path: PathBuf,
     external_secret_env: BTreeMap<String, String>,
+    cache_definitions: Vec<SpaceCacheDefinition>,
+}
+
+#[derive(Debug, Clone)]
+struct SpaceCacheDefinition {
+    name: String,
+    key_inputs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,10 +158,12 @@ fn load_space_config(cwd: &Path) -> anyhow::Result<SpaceConfig> {
     })?;
     validate_space_config_has_no_inline_secrets(&parsed)?;
     let external_secret_env = parse_space_external_secret_env_refs(&parsed)?;
+    let cache_definitions = parse_space_cache_definitions(&parsed)?;
 
     Ok(SpaceConfig {
         config_path,
         external_secret_env,
+        cache_definitions,
     })
 }
 
@@ -230,14 +245,14 @@ fn validate_space_config_has_no_inline_secrets(parsed: &serde_json::Value) -> an
 
 fn ensure_valid_secret_label_segment(segment: &str, context: &str) -> anyhow::Result<()> {
     if segment.is_empty() {
-        bail!("spaces mode secret {context} cannot be empty");
+        bail!("spaces mode {context} cannot be empty");
     }
     if !segment
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
     {
         bail!(
-            "spaces mode secret {context} `{segment}` must contain only ASCII letters, digits, `_`, or `-`"
+            "spaces mode {context} `{segment}` must contain only ASCII letters, digits, `_`, or `-`"
         );
     }
     Ok(())
@@ -257,7 +272,7 @@ fn parse_space_external_secret_env_refs(
 
     let mut refs = BTreeMap::new();
     for (secret_name, secret_def_value) in secrets_map {
-        ensure_valid_secret_label_segment(secret_name, "name")?;
+        ensure_valid_secret_label_segment(secret_name, "secret name")?;
         let secret_def = secret_def_value.as_object().ok_or_else(|| {
             anyhow!(
                 "spaces mode config `{SPACE_CONFIG_FILE}` secret `{secret_name}` must be an object with `env` or `environment`"
@@ -282,7 +297,7 @@ fn parse_space_external_secret_env_refs(
                     "spaces mode config `{SPACE_CONFIG_FILE}` secret `{secret_name}` must define non-empty `env` or `environment`"
                 )
             })?;
-        ensure_valid_secret_label_segment(env_var_name, "env var name")?;
+        ensure_valid_secret_label_segment(env_var_name, "secret env var name")?;
         for key in secret_def.keys() {
             if !matches!(key.as_str(), "env" | "environment" | "description") {
                 bail!(
@@ -295,6 +310,91 @@ fn parse_space_external_secret_env_refs(
     Ok(refs)
 }
 
+fn parse_space_cache_definitions(
+    parsed: &serde_json::Value,
+) -> anyhow::Result<Vec<SpaceCacheDefinition>> {
+    let Some(caches_value) = parsed.get("caches") else {
+        return Ok(Vec::new());
+    };
+    let caches_array = caches_value.as_array().ok_or_else(|| {
+        anyhow!(
+            "spaces mode config `{SPACE_CONFIG_FILE}` field `caches` must be an array of cache definitions"
+        )
+    })?;
+
+    let mut names = BTreeSet::new();
+    let mut definitions = Vec::new();
+
+    for (index, cache_value) in caches_array.iter().enumerate() {
+        let cache = cache_value.as_object().ok_or_else(|| {
+            anyhow!(
+                "spaces mode config `{SPACE_CONFIG_FILE}` cache at index {index} must be an object"
+            )
+        })?;
+        let name = cache
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "spaces mode config `{SPACE_CONFIG_FILE}` cache at index {index} must define non-empty `name`"
+                )
+            })?;
+        ensure_valid_secret_label_segment(name, "cache name")?;
+        if !names.insert(name.to_string()) {
+            bail!("spaces mode config `{SPACE_CONFIG_FILE}` defines duplicate cache name `{name}`");
+        }
+
+        let key_value = cache.get("key").ok_or_else(|| {
+            anyhow!(
+                "spaces mode config `{SPACE_CONFIG_FILE}` cache `{name}` must define `key` as a path string or array of path strings"
+            )
+        })?;
+        let raw_inputs: Vec<String> = match key_value {
+            serde_json::Value::String(path) => vec![path.clone()],
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(|item| {
+                    item.as_str().map(str::to_string).ok_or_else(|| {
+                        anyhow!(
+                            "spaces mode config `{SPACE_CONFIG_FILE}` cache `{name}` key entries must be strings"
+                        )
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            _ => {
+                bail!(
+                    "spaces mode config `{SPACE_CONFIG_FILE}` cache `{name}` has invalid `key`; expected string or array of strings"
+                )
+            }
+        };
+        if raw_inputs.is_empty() {
+            bail!(
+                "spaces mode config `{SPACE_CONFIG_FILE}` cache `{name}` must define at least one key input path"
+            );
+        }
+
+        let mut normalized_inputs = BTreeSet::new();
+        for raw in raw_inputs {
+            let normalized = raw.trim();
+            if normalized.is_empty() {
+                bail!(
+                    "spaces mode config `{SPACE_CONFIG_FILE}` cache `{name}` key paths cannot be empty"
+                );
+            }
+            normalized_inputs.insert(normalized.to_string());
+        }
+
+        definitions.push(SpaceCacheDefinition {
+            name: name.to_string(),
+            key_inputs: normalized_inputs.into_iter().collect(),
+        });
+    }
+
+    Ok(definitions)
+}
+
 fn apply_space_external_secret_labels(
     labels: &mut BTreeMap<String, String>,
     external_secret_env: &BTreeMap<String, String>,
@@ -305,6 +405,134 @@ fn apply_space_external_secret_labels(
             env_var_name.to_string(),
         );
     }
+}
+
+fn space_cache_index_path(state_db: &Path) -> PathBuf {
+    if let Some(parent) = state_db.parent() {
+        parent.join(SPACE_CACHE_INDEX_FILE)
+    } else {
+        PathBuf::from(SPACE_CACHE_INDEX_FILE)
+    }
+}
+
+fn sha256_file_hex(path: &Path) -> anyhow::Result<String> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn build_space_cache_keys(
+    cwd: &Path,
+    space_config: &SpaceConfig,
+    cpus: u8,
+    memory_mb: u64,
+    base_image_ref: Option<&str>,
+    main_container: Option<&str>,
+) -> anyhow::Result<Vec<SpaceCacheKey>> {
+    if space_config.cache_definitions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let canonical_project_root = std::fs::canonicalize(cwd)
+        .with_context(|| format!("failed to resolve workspace root {}", cwd.display()))?;
+    let canonical_config_path =
+        std::fs::canonicalize(&space_config.config_path).with_context(|| {
+            format!(
+                "failed to resolve space config path {}",
+                space_config.config_path.display()
+            )
+        })?;
+
+    let runtime_identity = SpaceCacheRuntimeIdentity {
+        base_image_ref: base_image_ref
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        main_container: main_container
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        cpus,
+        memory_mb,
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+    };
+
+    let mut keys = Vec::new();
+    for cache in &space_config.cache_definitions {
+        let mut input_hashes = BTreeMap::new();
+        for key_input in &cache.key_inputs {
+            let key_path = cwd.join(key_input);
+            if !key_path.is_file() {
+                bail!(
+                    "spaces cache `{}` key input `{}` is missing or not a file",
+                    cache.name,
+                    key_path.display()
+                );
+            }
+            let digest = sha256_file_hex(&key_path).with_context(|| {
+                format!(
+                    "failed to hash spaces cache key input `{}` for cache `{}`",
+                    key_path.display(),
+                    cache.name
+                )
+            })?;
+            input_hashes.insert(key_input.to_string(), digest);
+        }
+
+        keys.push(SpaceCacheKey::from_material(SpaceCacheKeyMaterial {
+            cache_name: cache.name.to_string(),
+            project_root: canonical_project_root.to_string_lossy().to_string(),
+            config_path: canonical_config_path.to_string_lossy().to_string(),
+            input_hashes,
+            runtime: runtime_identity.clone(),
+        })?);
+    }
+
+    Ok(keys)
+}
+
+fn update_space_cache_index(state_db: &Path, cache_keys: &[SpaceCacheKey]) -> anyhow::Result<()> {
+    if cache_keys.is_empty() {
+        return Ok(());
+    }
+
+    let index_path = space_cache_index_path(state_db);
+    let mut index = SpaceCacheIndex::load(&index_path)?;
+    let invalidated = index.invalidate_for_schema(SPACE_CACHE_KEY_SCHEMA_VERSION);
+    if invalidated > 0 {
+        println!(
+            "[cache] invalidated {invalidated} entries due to schema v{SPACE_CACHE_KEY_SCHEMA_VERSION}"
+        );
+    }
+
+    for key in cache_keys {
+        match index.lookup(key) {
+            SpaceCacheLookup::Hit => {
+                println!("[cache:{}] hit {}", key.cache_name, key.digest_hex);
+            }
+            SpaceCacheLookup::MissNotFound => {
+                println!("[cache:{}] miss (cold) {}", key.cache_name, key.digest_hex);
+            }
+            SpaceCacheLookup::MissKeyMismatch => {
+                println!(
+                    "[cache:{}] miss (dimension change) {}",
+                    key.cache_name, key.digest_hex
+                );
+            }
+            SpaceCacheLookup::MissVersionMismatch { requested, stored } => {
+                println!(
+                    "[cache:{}] miss (schema mismatch stored=v{stored} requested=v{requested}) {}",
+                    key.cache_name, key.digest_hex
+                );
+            }
+        }
+        index.upsert(key.clone());
+    }
+
+    index.save(&index_path)
 }
 
 fn enforce_btrfs_workspace_preflight(workspace_root: &Path) -> anyhow::Result<()> {
@@ -1269,6 +1497,15 @@ async fn cmd_create_sandbox(
         labels.insert("name".to_string(), n.clone());
     }
     apply_startup_selection_labels(&mut labels, base_image_ref, main_container);
+    let cache_keys = build_space_cache_keys(
+        cwd,
+        space_config,
+        cpus,
+        memory,
+        labels.get(SANDBOX_LABEL_BASE_IMAGE_REF).map(String::as_str),
+        labels.get(SANDBOX_LABEL_MAIN_CONTAINER).map(String::as_str),
+    )?;
+    update_space_cache_index(state_db, &cache_keys)?;
 
     // Ensure state directory exists.
     if let Some(parent) = state_db.parent() {
@@ -2314,6 +2551,7 @@ mod tests {
         let resolved = load_space_config(dir.path()).expect("valid config should pass");
         assert_eq!(resolved.config_path, path);
         assert!(resolved.external_secret_env.is_empty());
+        assert!(resolved.cache_definitions.is_empty());
     }
 
     #[test]
@@ -2401,6 +2639,63 @@ mod tests {
                 .get("api_token")
                 .map(String::as_str),
             Some("API_TOKEN")
+        );
+        assert!(loaded.cache_definitions.is_empty());
+    }
+
+    #[test]
+    fn load_space_config_parses_cache_definitions() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("vz.json");
+        fs::write(
+            &path,
+            r#"{
+                "caches": [
+                    {
+                        "name": "deps",
+                        "key": "package-lock.json"
+                    },
+                    {
+                        "name": "build",
+                        "key": ["Cargo.lock", "rust-toolchain.toml", "Cargo.lock"]
+                    }
+                ]
+            }"#,
+        )
+        .expect("write config");
+
+        let loaded = load_space_config(dir.path()).expect("cache definitions should parse");
+        assert_eq!(loaded.cache_definitions.len(), 2);
+        assert_eq!(loaded.cache_definitions[0].name, "deps");
+        assert_eq!(
+            loaded.cache_definitions[0].key_inputs,
+            vec!["package-lock.json".to_string()]
+        );
+        assert_eq!(loaded.cache_definitions[1].name, "build");
+        assert_eq!(
+            loaded.cache_definitions[1].key_inputs,
+            vec!["Cargo.lock".to_string(), "rust-toolchain.toml".to_string(),]
+        );
+    }
+
+    #[test]
+    fn load_space_config_rejects_duplicate_cache_names() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("vz.json");
+        fs::write(
+            &path,
+            r#"{
+                "caches": [
+                    {"name": "deps", "key": "package-lock.json"},
+                    {"name": "deps", "key": "Cargo.lock"}
+                ]
+            }"#,
+        )
+        .expect("write config");
+        let error = load_space_config(dir.path()).expect_err("duplicate cache names should fail");
+        assert!(
+            error.to_string().contains("duplicate cache name"),
+            "unexpected error: {error:#}"
         );
     }
 

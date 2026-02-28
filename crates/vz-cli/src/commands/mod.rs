@@ -35,6 +35,7 @@ pub mod sandbox;
 pub mod save;
 #[cfg(target_os = "macos")]
 pub mod self_sign;
+pub(crate) mod space_cache_key;
 pub mod stack;
 #[cfg(target_os = "macos")]
 pub mod stop;
