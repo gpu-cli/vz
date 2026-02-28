@@ -1408,6 +1408,9 @@ async fn daemon_grpc_create_sandbox(
     }
     let completion = completion
         .ok_or_else(|| anyhow!("daemon create_sandbox stream ended without completion"))?;
+    if !completion.receipt_id.trim().is_empty() {
+        println!("Receipt: {}", completion.receipt_id.trim());
+    }
     let response = completion
         .response
         .ok_or_else(|| anyhow!("daemon create_sandbox completion missing response payload"))?;
@@ -1449,6 +1452,9 @@ async fn daemon_grpc_terminate_sandbox(
             let completion = completion.ok_or_else(|| {
                 anyhow!("daemon terminate_sandbox stream ended without completion")
             })?;
+            if !completion.receipt_id.trim().is_empty() {
+                println!("Receipt: {}", completion.receipt_id.trim());
+            }
             let response = completion.response.ok_or_else(|| {
                 anyhow!("daemon terminate_sandbox completion missing response payload")
             })?;
