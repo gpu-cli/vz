@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -18,7 +19,8 @@ use tonic::Code;
 use vz_runtime_contract::{
     SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER, SANDBOX_LABEL_PROJECT_DIR,
     SANDBOX_LABEL_SPACE_CONFIG_PATH, SANDBOX_LABEL_SPACE_LIFECYCLE, SANDBOX_LABEL_SPACE_MODE,
-    SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX, SANDBOX_SPACE_LIFECYCLE_EPHEMERAL,
+    SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX, SANDBOX_LABEL_SPACE_WORKTREE_ID,
+    SANDBOX_LABEL_SPACE_WORKTREE_NAMESPACE, SANDBOX_SPACE_LIFECYCLE_EPHEMERAL,
     SANDBOX_SPACE_LIFECYCLE_PERSISTENT, SANDBOX_SPACE_MODE_REQUIRED, Sandbox, SandboxBackend,
     SandboxSpec, SandboxState,
 };
@@ -48,6 +50,13 @@ struct SpaceConfig {
 struct SpaceCacheDefinition {
     name: String,
     key_inputs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpaceWorktreeIdentity {
+    root_path: PathBuf,
+    worktree_id: String,
+    service_namespace: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -533,6 +542,80 @@ fn update_space_cache_index(state_db: &Path, cache_keys: &[SpaceCacheKey]) -> an
     }
 
     index.save(&index_path)
+}
+
+fn git_rev_parse_value(cwd: &Path, arg: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("rev-parse")
+        .arg(arg)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(output.stdout).ok()?;
+    let normalized = raw.trim();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized.to_string())
+    }
+}
+
+fn sanitize_namespace_segment(raw: &str) -> String {
+    let mut sanitized = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            sanitized.push(ch.to_ascii_lowercase());
+        } else {
+            sanitized.push('_');
+        }
+    }
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        "space".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn derive_space_worktree_identity(cwd: &Path) -> anyhow::Result<SpaceWorktreeIdentity> {
+    let root_hint = git_rev_parse_value(cwd, "--show-toplevel")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cwd.to_path_buf());
+    let root_path = std::fs::canonicalize(&root_hint)
+        .with_context(|| format!("failed to resolve worktree root {}", root_hint.display()))?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(root_path.to_string_lossy().as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    let short = &digest[..12];
+    let root_leaf = root_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("space");
+    let root_segment = sanitize_namespace_segment(root_leaf);
+    let worktree_id = format!("{root_segment}-{short}");
+    let service_namespace = format!("wt_{short}");
+
+    Ok(SpaceWorktreeIdentity {
+        root_path,
+        worktree_id,
+        service_namespace,
+    })
+}
+
+fn default_worktree_service_state_defaults(
+    service_namespace: &str,
+) -> BTreeMap<&'static str, String> {
+    let namespace = sanitize_namespace_segment(service_namespace);
+    BTreeMap::from([
+        ("postgres.schema", namespace.clone()),
+        ("mysql.database", namespace.clone()),
+        ("redis.key_prefix", format!("{namespace}:")),
+    ])
 }
 
 fn enforce_btrfs_workspace_preflight(workspace_root: &Path) -> anyhow::Result<()> {
@@ -1473,6 +1556,9 @@ async fn cmd_create_sandbox(
 ) -> anyhow::Result<()> {
     let sandbox_id = generate_sandbox_id();
     let display_name = name.as_deref().unwrap_or(&sandbox_id);
+    let worktree_identity = derive_space_worktree_identity(cwd)?;
+    let worktree_service_defaults =
+        default_worktree_service_state_defaults(worktree_identity.service_namespace.as_str());
 
     let mut labels = BTreeMap::new();
     labels.insert(
@@ -1486,6 +1572,14 @@ async fn cmd_create_sandbox(
     labels.insert(
         SANDBOX_LABEL_SPACE_CONFIG_PATH.to_string(),
         space_config.config_path.to_string_lossy().to_string(),
+    );
+    labels.insert(
+        SANDBOX_LABEL_SPACE_WORKTREE_ID.to_string(),
+        worktree_identity.worktree_id.to_string(),
+    );
+    labels.insert(
+        SANDBOX_LABEL_SPACE_WORKTREE_NAMESPACE.to_string(),
+        worktree_identity.service_namespace.to_string(),
     );
     labels.insert(
         SANDBOX_LABEL_SPACE_LIFECYCLE.to_string(),
@@ -1514,6 +1608,26 @@ async fn cmd_create_sandbox(
 
     println!("Booting sandbox {display_name}...");
     println!("Mounting {} → /workspace", cwd.display());
+    println!(
+        "Resolved worktree root {}",
+        worktree_identity.root_path.display()
+    );
+    println!("Worktree namespace {}", worktree_identity.service_namespace);
+    println!(
+        "Shared service defaults: postgres.schema={}, mysql.database={}, redis.key_prefix={}",
+        worktree_service_defaults
+            .get("postgres.schema")
+            .map(String::as_str)
+            .unwrap_or_default(),
+        worktree_service_defaults
+            .get("mysql.database")
+            .map(String::as_str)
+            .unwrap_or_default(),
+        worktree_service_defaults
+            .get("redis.key_prefix")
+            .map(String::as_str)
+            .unwrap_or_default(),
+    );
     println!(
         "Using space definition {}",
         space_config.config_path.display()
@@ -2435,6 +2549,43 @@ mod tests {
         assert_eq!(
             lifecycle.as_label_value(),
             SANDBOX_SPACE_LIFECYCLE_EPHEMERAL
+        );
+    }
+
+    #[test]
+    fn sanitize_namespace_segment_normalizes_to_safe_ascii() {
+        assert_eq!(sanitize_namespace_segment("Feature/Auth"), "feature_auth");
+        assert_eq!(sanitize_namespace_segment("___"), "space");
+        assert_eq!(sanitize_namespace_segment("Main_Worktree"), "main_worktree");
+    }
+
+    #[test]
+    fn derive_space_worktree_identity_is_stable_for_same_path() {
+        let dir = tempdir().expect("tempdir");
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace dir");
+
+        let first = derive_space_worktree_identity(&workspace).expect("first identity");
+        let second = derive_space_worktree_identity(&workspace).expect("second identity");
+        assert_eq!(first.worktree_id, second.worktree_id);
+        assert_eq!(first.service_namespace, second.service_namespace);
+        assert_eq!(first.root_path, second.root_path);
+    }
+
+    #[test]
+    fn default_worktree_service_state_defaults_cover_common_services() {
+        let defaults = default_worktree_service_state_defaults("wt_abc123");
+        assert_eq!(
+            defaults.get("postgres.schema").map(String::as_str),
+            Some("wt_abc123")
+        );
+        assert_eq!(
+            defaults.get("mysql.database").map(String::as_str),
+            Some("wt_abc123")
+        );
+        assert_eq!(
+            defaults.get("redis.key_prefix").map(String::as_str),
+            Some("wt_abc123:")
         );
     }
 
