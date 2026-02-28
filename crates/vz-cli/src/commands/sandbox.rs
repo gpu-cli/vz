@@ -35,6 +35,7 @@ use super::space_cache_key::{
     SPACE_CACHE_KEY_SCHEMA_VERSION, SpaceCacheIndex, SpaceCacheKey, SpaceCacheKeyMaterial,
     SpaceCacheLookup, SpaceCacheRuntimeIdentity,
 };
+use super::space_cache_trust::{SpaceRemoteCacheTrustConfig, SpaceRemoteCacheVerificationOutcome};
 
 const SPACE_CONFIG_FILE: &str = "vz.json";
 const SPACE_CACHE_INDEX_FILE: &str = "space-cache-index.json";
@@ -516,6 +517,7 @@ fn update_space_cache_index(state_db: &Path, cache_keys: &[SpaceCacheKey]) -> an
         return Ok(());
     }
 
+    let remote_cache_trust = SpaceRemoteCacheTrustConfig::from_env()?;
     let index_path = space_cache_index_path(state_db);
     let mut index = SpaceCacheIndex::load(&index_path)?;
     let invalidated = index.invalidate_for_schema(SPACE_CACHE_KEY_SCHEMA_VERSION);
@@ -526,7 +528,8 @@ fn update_space_cache_index(state_db: &Path, cache_keys: &[SpaceCacheKey]) -> an
     }
 
     for key in cache_keys {
-        match index.lookup(key) {
+        let lookup = index.lookup(key);
+        match lookup {
             SpaceCacheLookup::Hit => {
                 println!("[cache:{}] hit {}", key.cache_name, key.digest_hex);
             }
@@ -544,6 +547,26 @@ fn update_space_cache_index(state_db: &Path, cache_keys: &[SpaceCacheKey]) -> an
                     "[cache:{}] miss (schema mismatch stored=v{stored} requested=v{requested}) {}",
                     key.cache_name, key.digest_hex
                 );
+            }
+        }
+        if !matches!(lookup, SpaceCacheLookup::Hit)
+            && let Some(remote_cache_trust) = remote_cache_trust.as_ref()
+        {
+            match remote_cache_trust.verify_key(key) {
+                SpaceRemoteCacheVerificationOutcome::Verified { .. } => {
+                    println!(
+                        "[cache:{}] remote verified {}",
+                        key.cache_name, key.digest_hex
+                    );
+                }
+                SpaceRemoteCacheVerificationOutcome::Miss(reason) => {
+                    println!(
+                        "[cache:{}] remote miss ({}) {}",
+                        key.cache_name,
+                        reason.diagnostic(),
+                        key.digest_hex
+                    );
+                }
             }
         }
         index.upsert(key.clone());
