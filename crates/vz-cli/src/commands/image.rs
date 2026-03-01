@@ -371,12 +371,7 @@ pub async fn run(args: ImageArgs) -> anyhow::Result<()> {
     match args.action {
         ImageCommand::Pull(pull_args) => run_pull_stream(pull_args).await,
         #[cfg(target_os = "macos")]
-        ImageCommand::Build(_build_args) => {
-            bail!(
-                "`vz image build` local-runtime path has been removed in daemon-only mode; \
-                 use daemon-backed stack/build flows"
-            )
-        }
+        ImageCommand::Build(build_args) => super::build::run(*build_args).await,
         ImageCommand::Ls(_images_args) => {
             let images = match control_plane_transport()? {
                 ControlPlaneTransport::DaemonGrpc => {

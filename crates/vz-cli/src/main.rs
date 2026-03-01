@@ -422,6 +422,13 @@ mod tests {
         assert!(matches!(cli.command, Some(Commands::Image(_))));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_image_build() {
+        let cli = Cli::try_parse_from(["vz", "image", "build"]).expect("parse");
+        assert!(matches!(cli.command, Some(Commands::Image(_))));
+    }
+
     #[test]
     fn parse_stack_up() {
         let cli = Cli::try_parse_from(["vz", "stack", "up", "--file", "docker-compose.yaml"])

@@ -38,7 +38,7 @@ runtime_cli_control_plane_files=(
   "crates/vz-cli/src/commands/file.rs"
   "crates/vz-cli/src/commands/lease.rs"
   "crates/vz-cli/src/commands/sandbox.rs"
-  "crates/vz-cli/src/commands/stack.rs"
+  "crates/vz-cli/src/commands/stack/commands.rs"
 )
 
 runtime_cli_files=(
@@ -76,9 +76,9 @@ check_contains "legacy local-runtime path removed in daemon-only mode" \
   "crates/vz-cli/src/commands/oci.rs" \
   "legacy oci mutation commands must remain fail-closed in daemon mode"
 
-check_contains "local-runtime path has been removed in daemon-only mode" \
+check_contains "super::build::run\\(\\*build_args\\)\\.await" \
   "crates/vz-cli/src/commands/image.rs" \
-  "legacy image build command path must remain fail-closed in daemon mode"
+  "vz image build command must dispatch to build command implementation"
 
 coverage_output=""
 if ! coverage_output="$("$ROOT/scripts/check-runtime-v2-rpc-test-coverage.sh" 2>&1)"; then
