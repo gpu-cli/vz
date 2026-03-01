@@ -9,13 +9,19 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+use anyhow::Context;
 use clap::{Args, Subcommand, ValueEnum};
 #[cfg(target_os = "macos")]
 use console::style;
 #[cfg(target_os = "macos")]
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+#[cfg(target_os = "macos")]
+use vz_runtime_proto::runtime_v2;
 
 use super::oci::ContainerOpts;
+#[cfg(target_os = "macos")]
+use super::runtime_daemon::{connect_control_plane_for_state_db, default_state_db_path};
 
 /// Build a Dockerfile or manage BuildKit cache.
 #[derive(Args, Debug)]
@@ -128,56 +134,94 @@ impl From<ProgressArg> for vz_oci_macos::buildkit::BuildProgress {
 pub async fn run(args: BuildArgs) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let config = super::oci::build_macos_runtime_config(&args.opts)?;
-
         if let Some(subcommand) = args.subcommand {
+            let config = super::oci::build_macos_runtime_config(&args.opts)?;
             return run_subcommand(config, subcommand).await;
         }
+        let _ = parse_secrets(&args.secrets)?;
+        let _ = parse_output_mode(args.push, args.output.as_deref())?;
+        ensure_daemon_supported_build_args(&args)?;
 
         let context_dir = expand_home_dir(&args.context);
         let tag = args.tag.unwrap_or_else(|| default_tag(&context_dir));
         let build_args = parse_build_args(&args.build_args)?;
-        let secrets = parse_secrets(&args.secrets)?;
-        let output = parse_output_mode(args.push, args.output.as_deref())?;
         let progress = args.progress;
         let stderr_is_tty = std::io::stderr().is_terminal();
-        let (request_progress, ui_mode) = resolve_progress_mode(progress, stderr_is_tty);
+        let (_, ui_mode) = resolve_progress_mode(progress, stderr_is_tty);
         let display_tag = tag.clone();
-
-        let request = vz_oci_macos::BuildRequest {
-            context_dir,
-            dockerfile: args.dockerfile,
-            tag,
-            target: args.target,
-            cache_from: Vec::new(),
-            build_args,
-            secrets,
-            no_cache: args.no_cache,
-            output,
-            progress: request_progress,
-        };
+        let state_db = default_state_db_path();
+        let sandbox_id = daemon_build_sandbox_id(&context_dir);
+        let dockerfile = args.dockerfile.to_string_lossy().to_string();
+        let context = context_dir.to_string_lossy().to_string();
+        let mut client = connect_control_plane_for_state_db(&state_db).await?;
 
         let mut streamer = BuildEventStreamer::new(ui_mode, display_tag)?;
-        let result = vz_oci_macos::buildkit::build_image_with_events(&config, request, |event| {
-            streamer.handle(event)
-        })
-        .await;
-        streamer.finish(result.is_ok());
-        let result = result?;
-        match (&result.image_id, &result.output_path, result.pushed) {
-            (Some(image_id), _, _) => println!("Built {} as {}", result.tag, image_id.0),
-            (_, Some(path), _) => {
-                println!(
-                    "Built {} and wrote OCI archive to {}",
-                    result.tag,
-                    path.display()
-                )
+        let started = client
+            .start_build_with_metadata(runtime_v2::StartBuildRequest {
+                metadata: None,
+                sandbox_id,
+                context,
+                dockerfile,
+                args: build_args.into_iter().collect(),
+            })
+            .await
+            .context("failed to start daemon-backed build")?;
+        let receipt_id = started
+            .metadata()
+            .get("x-receipt-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let started = started.into_inner();
+        let build = started
+            .build
+            .context("daemon start_build response was missing build payload")?;
+
+        {
+            let mut stream = client
+                .stream_build_events(runtime_v2::StreamBuildEventsRequest {
+                    build_id: build.build_id.clone(),
+                    metadata: None,
+                })
+                .await
+                .context("failed to stream daemon build events")?;
+
+            while let Some(event) = stream.message().await? {
+                streamer.handle(daemon_build_event_to_local(event));
             }
-            (_, _, true) => println!("Built and pushed {}", result.tag),
-            _ => println!("Built {}", result.tag),
         }
 
-        Ok(())
+        let result = client
+            .get_build(runtime_v2::GetBuildRequest {
+                build_id: build.build_id.clone(),
+                metadata: None,
+            })
+            .await
+            .context("failed to fetch daemon build result")?;
+        let final_build = result
+            .build
+            .context("daemon get_build response was missing build payload")?;
+        let succeeded = final_build.state == "succeeded";
+        streamer.finish(succeeded);
+
+        if succeeded {
+            if final_build.result_digest.trim().is_empty() {
+                println!("Built {}", tag);
+            } else {
+                println!("Built {} as {}", tag, final_build.result_digest);
+            }
+            if let Some(receipt_id) = receipt_id
+                && !receipt_id.trim().is_empty()
+            {
+                println!("Receipt: {receipt_id}");
+            }
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "daemon build {} finished in state `{}`",
+            build.build_id,
+            final_build.state
+        )
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -220,6 +264,64 @@ fn resolve_progress_mode(
             }
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_daemon_supported_build_args(args: &BuildArgs) -> anyhow::Result<()> {
+    if args.target.is_some() {
+        anyhow::bail!("`vz build --target` is not wired through daemon RPC yet");
+    }
+    if !args.secrets.is_empty() {
+        anyhow::bail!("`vz build --secret` is not wired through daemon RPC yet");
+    }
+    if args.no_cache {
+        anyhow::bail!("`vz build --no-cache` is not wired through daemon RPC yet");
+    }
+    if args.push {
+        anyhow::bail!("`vz build --push` is not wired through daemon RPC yet");
+    }
+    if args.output.is_some() {
+        anyhow::bail!("`vz build --output` is not wired through daemon RPC yet");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn daemon_build_sandbox_id(context_dir: &Path) -> String {
+    let name = context_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("workspace");
+    let slug: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let normalized = slug.trim_matches('-');
+    if normalized.is_empty() {
+        "cli-build-workspace".to_string()
+    } else {
+        format!("cli-build-{normalized}")
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn daemon_build_event_to_local(
+    event: runtime_v2::BuildEvent,
+) -> vz_oci_macos::buildkit::BuildEvent {
+    let message = if event.message.trim().is_empty() {
+        event.event_type
+    } else {
+        event.message
+    };
+    vz_oci_macos::buildkit::BuildEvent::Status { message }
 }
 
 #[cfg(target_os = "macos")]

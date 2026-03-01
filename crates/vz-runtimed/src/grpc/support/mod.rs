@@ -14,9 +14,8 @@ pub(super) use idempotency::{
     normalize_idempotency_key,
 };
 pub(super) use ids::{
-    current_unix_secs, generate_build_id, generate_checkpoint_id, generate_container_id,
-    generate_execution_id, generate_fork_sandbox_id, generate_lease_id, generate_receipt_id,
-    generate_request_id,
+    current_unix_secs, generate_checkpoint_id, generate_container_id, generate_execution_id,
+    generate_fork_sandbox_id, generate_lease_id, generate_receipt_id, generate_request_id,
 };
 pub(super) use metadata::{
     daemon_backend, insert_health_headers, normalize_metadata, request_id_from_extensions,

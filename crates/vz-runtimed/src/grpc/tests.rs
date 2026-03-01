@@ -2352,6 +2352,111 @@ async fn start_build_then_get_and_cancel_round_trip() {
 }
 
 #[tokio::test]
+async fn stream_build_events_emits_queued_and_canceled_events() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let mut build_client = connect_build_client(&config.socket_path).await;
+    let mut cancel_client = connect_build_client(&config.socket_path).await;
+
+    let started = build_client
+        .start_build(Request::new(runtime_v2::StartBuildRequest {
+            metadata: Some(runtime_v2::RequestMetadata {
+                request_id: "req-build-stream-start".to_string(),
+                idempotency_key: String::new(),
+                trace_id: String::new(),
+            }),
+            sandbox_id: "sbx-build-stream".to_string(),
+            context: ".".to_string(),
+            dockerfile: "Dockerfile".to_string(),
+            args: std::collections::HashMap::new(),
+        }))
+        .await
+        .expect("start build")
+        .into_inner();
+    let build_id = started
+        .build
+        .as_ref()
+        .expect("build payload")
+        .build_id
+        .clone();
+
+    let mut stream = build_client
+        .stream_build_events(Request::new(runtime_v2::StreamBuildEventsRequest {
+            build_id: build_id.clone(),
+            metadata: Some(runtime_v2::RequestMetadata {
+                request_id: "req-build-stream".to_string(),
+                idempotency_key: String::new(),
+                trace_id: String::new(),
+            }),
+        }))
+        .await
+        .expect("stream build events")
+        .into_inner();
+
+    let first = tokio::time::timeout(Duration::from_secs(2), stream.message())
+        .await
+        .expect("queued stream timeout")
+        .expect("queued stream read")
+        .expect("queued event");
+    assert!(
+        first.event_type.contains("queued"),
+        "expected queued event type, got {}",
+        first.event_type
+    );
+
+    cancel_client
+        .cancel_build(Request::new(runtime_v2::CancelBuildRequest {
+            build_id,
+            metadata: None,
+        }))
+        .await
+        .expect("cancel build");
+
+    let mut saw_canceled = false;
+    for _ in 0..16 {
+        let next = tokio::time::timeout(Duration::from_secs(2), stream.message())
+            .await
+            .expect("canceled stream timeout")
+            .expect("canceled stream read");
+        let Some(event) = next else {
+            break;
+        };
+        if event.event_type.contains("canceled") {
+            saw_canceled = true;
+            break;
+        }
+    }
+    assert!(saw_canceled, "expected canceled build event");
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
 async fn apply_stack_dry_run_multiservice_round_trip() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = RuntimedConfig {

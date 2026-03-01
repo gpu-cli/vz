@@ -25,11 +25,6 @@ pub(in crate::grpc) fn generate_lease_id() -> String {
     format!("ls-{}-{counter}", current_unix_secs())
 }
 
-pub(in crate::grpc) fn generate_build_id() -> String {
-    let counter = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("bld-{}-{counter}", current_unix_secs())
-}
-
 pub(in crate::grpc) fn generate_container_id() -> String {
     let counter = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("ctr-{}-{counter}", current_unix_secs())
