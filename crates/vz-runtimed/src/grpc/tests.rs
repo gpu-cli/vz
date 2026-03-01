@@ -2513,6 +2513,137 @@ async fn stream_build_events_emits_queued_and_canceled_events() {
 }
 
 #[tokio::test]
+async fn build_endpoints_recover_persisted_state_after_daemon_restart() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    std::fs::create_dir_all(config.state_store_path.parent().expect("state parent"))
+        .expect("create state directory");
+    let store = vz_stack::StateStore::open(&config.state_store_path).expect("state store");
+    let spec = vz_runtime_contract::BuildSpec {
+        context: ".".to_string(),
+        dockerfile: Some("Dockerfile".to_string()),
+        target: None,
+        args: BTreeMap::new(),
+        cache_from: Vec::new(),
+        image_tag: Some("example:restart".to_string()),
+        secrets: Vec::new(),
+        no_cache: false,
+        push: false,
+        output_oci_tar_dest: None,
+    };
+    store
+        .save_build(&vz_runtime_contract::Build {
+            build_id: "build-restart-running".to_string(),
+            sandbox_id: "sbx-build-restart".to_string(),
+            build_spec: spec.clone(),
+            state: vz_runtime_contract::BuildState::Running,
+            result_digest: None,
+            started_at: 1,
+            ended_at: None,
+        })
+        .expect("save running build");
+    store
+        .save_build(&vz_runtime_contract::Build {
+            build_id: "build-restart-succeeded".to_string(),
+            sandbox_id: "sbx-build-restart".to_string(),
+            build_spec: spec,
+            state: vz_runtime_contract::BuildState::Succeeded,
+            result_digest: Some("sha256:feedface".to_string()),
+            started_at: 2,
+            ended_at: Some(3),
+        })
+        .expect("save succeeded build");
+    drop(store);
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let reconciled = daemon
+        .with_state_store(|store| store.load_build("build-restart-running"))
+        .expect("load reconciled build")
+        .expect("reconciled build should exist");
+    assert_eq!(reconciled.state, vz_runtime_contract::BuildState::Failed);
+    let persisted_succeeded = daemon
+        .with_state_store(|store| store.load_build("build-restart-succeeded"))
+        .expect("load succeeded build")
+        .expect("succeeded build should exist");
+    assert_eq!(
+        persisted_succeeded.state,
+        vz_runtime_contract::BuildState::Succeeded
+    );
+
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let mut build_client = connect_build_client(&config.socket_path).await;
+
+    let reconciled_build = build_client
+        .get_build(Request::new(runtime_v2::GetBuildRequest {
+            build_id: "build-restart-running".to_string(),
+            metadata: None,
+        }))
+        .await
+        .expect("get reconciled build")
+        .into_inner()
+        .build
+        .expect("build payload");
+    assert_eq!(reconciled_build.state, "failed");
+
+    let canceled_terminal = build_client
+        .cancel_build(Request::new(runtime_v2::CancelBuildRequest {
+            build_id: "build-restart-succeeded".to_string(),
+            metadata: None,
+        }))
+        .await
+        .expect("cancel terminal build")
+        .into_inner()
+        .build
+        .expect("build payload");
+    assert_eq!(canceled_terminal.state, "succeeded");
+    assert_eq!(canceled_terminal.result_digest, "sha256:feedface");
+
+    let mut stream = build_client
+        .stream_build_events(Request::new(runtime_v2::StreamBuildEventsRequest {
+            build_id: "build-restart-running".to_string(),
+            metadata: None,
+        }))
+        .await
+        .expect("stream reconciled build events")
+        .into_inner();
+    let first = stream
+        .message()
+        .await
+        .expect("stream read should succeed")
+        .expect("stream should emit at least one event");
+    assert!(
+        first.event_type.contains("build_failed"),
+        "expected build_failed event type, got {}",
+        first.event_type
+    );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
 async fn apply_stack_dry_run_multiservice_round_trip() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = RuntimedConfig {

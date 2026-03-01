@@ -219,12 +219,22 @@ impl runtime_v2::build_service_server::BuildService for BuildServiceImpl {
             )));
         }
 
-        let build = self
-            .daemon
-            .manager()
-            .cancel_build(&build_id)
-            .await
-            .map_err(|error| status_from_runtime_error("cancel_build", error, &request_id))?;
+        let build = self.daemon.manager().cancel_build(&build_id).await;
+        let build = match build {
+            Ok(build) => build,
+            Err(error) if error.machine_code() == MachineErrorCode::NotFound => self
+                .daemon
+                .with_state_store(|store| store.load_build(&build_id))
+                .map_err(|store_error| status_from_stack_error(store_error, &request_id))?
+                .ok_or_else(|| build_not_found_status(&build_id, &request_id))?,
+            Err(error) => {
+                return Err(status_from_runtime_error(
+                    "cancel_build",
+                    error,
+                    &request_id,
+                ));
+            }
+        };
 
         let now = current_unix_secs();
         let receipt_id = generate_receipt_id();
@@ -289,13 +299,35 @@ impl runtime_v2::build_service_server::BuildService for BuildServiceImpl {
             )));
         }
 
-        let initial_build = self
-            .daemon
-            .manager()
-            .get_build(&build_id)
-            .await
-            .map_err(|error| status_from_runtime_error("get_build", error, &request_id))?;
-        persist_build_snapshot(self.daemon.as_ref(), &initial_build, &request_id)?;
+        let (initial_build, managed_by_backend) =
+            match self.daemon.manager().get_build(&build_id).await {
+                Ok(build) => {
+                    persist_build_snapshot(self.daemon.as_ref(), &build, &request_id)?;
+                    (build, true)
+                }
+                Err(error) if error.machine_code() == MachineErrorCode::NotFound => {
+                    let build = self
+                        .daemon
+                        .with_state_store(|store| store.load_build(&build_id))
+                        .map_err(|store_error| status_from_stack_error(store_error, &request_id))?
+                        .ok_or_else(|| build_not_found_status(&build_id, &request_id))?;
+                    (build, false)
+                }
+                Err(error) => {
+                    return Err(status_from_runtime_error("get_build", error, &request_id));
+                }
+            };
+
+        if !managed_by_backend {
+            let (tx, rx) = tokio::sync::mpsc::channel(2);
+            let build_event = build_snapshot_event_to_proto(&initial_build);
+            tokio::spawn(async move {
+                let _ = tx.send(Ok(build_event)).await;
+            });
+            return Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+                rx,
+            )));
+        }
 
         let daemon = self.daemon.clone();
         let request_id_for_stream = request_id.clone();
@@ -421,6 +453,34 @@ fn build_state_event_type(state: BuildState) -> &'static str {
         BuildState::Succeeded => "build_succeeded",
         BuildState::Failed => "build_failed",
         BuildState::Canceled => "build_canceled",
+    }
+}
+
+fn build_snapshot_event_to_proto(build: &Build) -> runtime_v2::BuildEvent {
+    let message = match build.state {
+        BuildState::Queued => format!(
+            "build {} is queued in persisted state (live backend session unavailable)",
+            build.build_id
+        ),
+        BuildState::Running => format!(
+            "build {} was running before restart (live backend session unavailable)",
+            build.build_id
+        ),
+        BuildState::Succeeded => {
+            if let Some(digest) = build.result_digest.as_deref() {
+                format!("build {} succeeded as {}", build.build_id, digest)
+            } else {
+                format!("build {} succeeded", build.build_id)
+            }
+        }
+        BuildState::Failed => format!("build {} failed", build.build_id),
+        BuildState::Canceled => format!("build {} canceled", build.build_id),
+    };
+
+    runtime_v2::BuildEvent {
+        event_type: build_state_event_type(build.state).to_string(),
+        message,
+        timestamp: current_unix_secs(),
     }
 }
 

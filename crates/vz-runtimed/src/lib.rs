@@ -15,11 +15,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::info;
 use vz_runtime_contract::{
-    ExecutionState, MachineError, MachineErrorCode, PolicyDecision, RequestMetadata,
+    BuildState, ExecutionState, MachineError, MachineErrorCode, PolicyDecision, RequestMetadata,
     RuntimeCapabilities, RuntimeError, RuntimeOperation, RuntimePolicyHook,
     WorkspaceRuntimeManager, enforce_runtime_policy_hook,
 };
-use vz_stack::{StackError, StackEvent, StateStore, StateStorePragmas};
+use vz_stack::{Receipt, StackError, StackEvent, StateStore, StateStorePragmas};
 
 pub(crate) use execution_sessions::{ExecutionSessionRegistry, ExecutionSessionRegistryError};
 pub use grpc::{RuntimedServerError, serve_runtime_uds_with_shutdown};
@@ -30,6 +30,9 @@ const LEGACY_SANDBOX_BASE_IMAGE_REF: &str = "debian:bookworm";
 const SANDBOX_DEFAULT_BASE_IMAGE_ENV: &str = "VZ_SANDBOX_DEFAULT_BASE_IMAGE";
 const SANDBOX_DEFAULT_MAIN_CONTAINER_ENV: &str = "VZ_SANDBOX_DEFAULT_MAIN_CONTAINER";
 const SANDBOX_DISABLE_LEGACY_DEFAULT_ENV: &str = "VZ_SANDBOX_DISABLE_LEGACY_DEFAULT_BASE_IMAGE";
+const BUILD_RESTART_RECONCILE_ERROR: &str = "build reconciled after daemon restart";
+const BUILD_RESTART_RECONCILE_OPERATION: &str = "reconcile_build_after_restart";
+const BUILD_RESTART_RECONCILE_REQUEST_PREFIX: &str = "req-build-reconcile";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SandboxDefaultSource {
@@ -196,6 +199,12 @@ impl RuntimeDaemon {
                     source,
                 }
             })?;
+        let reconciled_build_count = reconcile_orphaned_builds(&state_store).map_err(|source| {
+            RuntimedError::ReconcileBuildState {
+                path: config.state_store_path.clone(),
+                source,
+            }
+        })?;
 
         let manager = build_runtime_manager(&config.runtime_data_dir);
         let placement_scheduler = PlacementScheduler::default();
@@ -225,6 +234,7 @@ impl RuntimeDaemon {
             sqlite_foreign_keys = foreign_keys_enabled,
             sqlite_schema_version = schema_version,
             reconciled_executions = reconciled_execution_count,
+            reconciled_builds = reconciled_build_count,
             sandbox_default_base_image_ref = sandbox_startup_policy.default_base_image_ref.as_deref().unwrap_or(""),
             sandbox_default_main_container = sandbox_startup_policy.default_main_container.as_deref().unwrap_or(""),
             sandbox_legacy_base_default_enabled = sandbox_startup_policy.legacy_default_base_image_enabled,
@@ -553,6 +563,67 @@ fn reconcile_orphaned_executions(state_store: &StateStore) -> Result<u64, StackE
     Ok(reconciled)
 }
 
+#[derive(serde::Serialize)]
+struct BuildRestartReconcileReceiptMetadata<'a> {
+    event_type: &'static str,
+    reason: &'a str,
+}
+
+fn reconcile_orphaned_builds(state_store: &StateStore) -> Result<u64, StackError> {
+    let mut reconciled: u64 = 0;
+    for mut build in state_store.list_builds()? {
+        if !matches!(build.state, BuildState::Queued | BuildState::Running) {
+            continue;
+        }
+
+        let now = current_unix_secs();
+        build.ended_at = Some(now);
+        build.result_digest = None;
+        build
+            .transition_to(BuildState::Failed)
+            .map_err(|error| StackError::Machine {
+                code: MachineErrorCode::StateConflict,
+                message: error.to_string(),
+            })?;
+
+        let receipt_id = format!("rcp-build-reconcile-{}-{now}", build.build_id);
+        let request_id = format!(
+            "{BUILD_RESTART_RECONCILE_REQUEST_PREFIX}-{}",
+            build.build_id
+        );
+        let receipt_metadata = serde_json::to_value(BuildRestartReconcileReceiptMetadata {
+            event_type: "build_failed",
+            reason: BUILD_RESTART_RECONCILE_ERROR,
+        })
+        .map_err(StackError::from)?;
+
+        state_store.with_immediate_transaction(|tx| {
+            tx.save_build(&build)?;
+            tx.emit_event(
+                &build.sandbox_id,
+                &StackEvent::BuildFailed {
+                    build_id: build.build_id.clone(),
+                    error: BUILD_RESTART_RECONCILE_ERROR.to_string(),
+                },
+            )?;
+            tx.save_receipt(&Receipt {
+                receipt_id: receipt_id.clone(),
+                operation: BUILD_RESTART_RECONCILE_OPERATION.to_string(),
+                entity_id: build.build_id.clone(),
+                entity_type: "build".to_string(),
+                request_id: request_id.clone(),
+                status: "success".to_string(),
+                created_at: now,
+                metadata: receipt_metadata.clone(),
+            })?;
+            Ok(())
+        })?;
+        reconciled = reconciled.saturating_add(1);
+    }
+
+    Ok(reconciled)
+}
+
 fn ensure_parent_dir(path: &Path) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -687,6 +758,12 @@ pub enum RuntimedError {
         #[source]
         source: StackError,
     },
+    #[error("failed to reconcile build state from {path}: {source}")]
+    ReconcileBuildState {
+        path: PathBuf,
+        #[source]
+        source: StackError,
+    },
     #[error("failed to refresh placement snapshot from {path}: {source}")]
     RefreshPlacementSnapshot {
         path: PathBuf,
@@ -711,7 +788,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use vz_runtime_contract::{Execution, ExecutionSpec, ExecutionState};
+    use vz_runtime_contract::{
+        Build, BuildSpec, BuildState, Execution, ExecutionSpec, ExecutionState,
+    };
 
     #[test]
     fn default_config_has_expected_paths() {
@@ -1020,5 +1099,134 @@ mod tests {
             .expect("exited execution should exist");
         assert_eq!(exited.state, ExecutionState::Exited);
         assert_eq!(exited.exit_code, Some(0));
+    }
+
+    #[test]
+    fn daemon_start_reconciles_non_terminal_builds_to_failed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = RuntimedConfig {
+            state_store_path: tmp.path().join("state").join("stack-state.db"),
+            runtime_data_dir: tmp.path().join("runtime"),
+            socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+        };
+
+        std::fs::create_dir_all(cfg.state_store_path.parent().expect("state parent"))
+            .expect("create state directory");
+        let store = StateStore::open(&cfg.state_store_path).expect("state store");
+        let sample_spec = BuildSpec {
+            context: ".".to_string(),
+            dockerfile: Some("Dockerfile".to_string()),
+            target: None,
+            args: BTreeMap::new(),
+            cache_from: Vec::new(),
+            image_tag: None,
+            secrets: Vec::new(),
+            no_cache: false,
+            push: false,
+            output_oci_tar_dest: None,
+        };
+        store
+            .save_build(&Build {
+                build_id: "build-queued".to_string(),
+                sandbox_id: "sbx-build-queued".to_string(),
+                build_spec: sample_spec.clone(),
+                state: BuildState::Queued,
+                result_digest: None,
+                started_at: 1,
+                ended_at: None,
+            })
+            .expect("save queued build");
+        store
+            .save_build(&Build {
+                build_id: "build-running".to_string(),
+                sandbox_id: "sbx-build-running".to_string(),
+                build_spec: sample_spec.clone(),
+                state: BuildState::Running,
+                result_digest: None,
+                started_at: 2,
+                ended_at: None,
+            })
+            .expect("save running build");
+        store
+            .save_build(&Build {
+                build_id: "build-succeeded".to_string(),
+                sandbox_id: "sbx-build-succeeded".to_string(),
+                build_spec: sample_spec,
+                state: BuildState::Succeeded,
+                result_digest: Some("sha256:deadbeef".to_string()),
+                started_at: 3,
+                ended_at: Some(4),
+            })
+            .expect("save succeeded build");
+        drop(store);
+
+        let daemon = RuntimeDaemon::start(cfg).expect("daemon should start");
+
+        let queued = daemon
+            .with_state_store(|store| store.load_build("build-queued"))
+            .expect("load queued build")
+            .expect("queued build should exist");
+        assert_eq!(queued.state, BuildState::Failed);
+        assert!(queued.ended_at.is_some());
+        assert!(queued.result_digest.is_none());
+
+        let running = daemon
+            .with_state_store(|store| store.load_build("build-running"))
+            .expect("load running build")
+            .expect("running build should exist");
+        assert_eq!(running.state, BuildState::Failed);
+        assert!(running.ended_at.is_some());
+        assert!(running.result_digest.is_none());
+
+        let succeeded = daemon
+            .with_state_store(|store| store.load_build("build-succeeded"))
+            .expect("load succeeded build")
+            .expect("succeeded build should exist");
+        assert_eq!(succeeded.state, BuildState::Succeeded);
+        assert_eq!(succeeded.result_digest.as_deref(), Some("sha256:deadbeef"));
+
+        let queued_receipts = daemon
+            .with_state_store(|store| store.list_receipts_for_entity("build", "build-queued"))
+            .expect("load queued build receipts");
+        assert_eq!(queued_receipts.len(), 1);
+        assert_eq!(
+            queued_receipts[0].operation,
+            BUILD_RESTART_RECONCILE_OPERATION
+        );
+
+        let running_receipts = daemon
+            .with_state_store(|store| store.list_receipts_for_entity("build", "build-running"))
+            .expect("load running build receipts");
+        assert_eq!(running_receipts.len(), 1);
+        assert_eq!(
+            running_receipts[0].operation,
+            BUILD_RESTART_RECONCILE_OPERATION
+        );
+
+        let queued_events = daemon
+            .with_state_store(|store| {
+                store.load_events_by_scope("sbx-build-queued", "build_", None, 20)
+            })
+            .expect("load queued build events");
+        assert!(queued_events.iter().any(|record| {
+            matches!(
+                &record.event,
+                StackEvent::BuildFailed { build_id, error }
+                if build_id == "build-queued" && error == BUILD_RESTART_RECONCILE_ERROR
+            )
+        }));
+
+        let running_events = daemon
+            .with_state_store(|store| {
+                store.load_events_by_scope("sbx-build-running", "build_", None, 20)
+            })
+            .expect("load running build events");
+        assert!(running_events.iter().any(|record| {
+            matches!(
+                &record.event,
+                StackEvent::BuildFailed { build_id, error }
+                if build_id == "build-running" && error == BUILD_RESTART_RECONCILE_ERROR
+            )
+        }));
     }
 }
