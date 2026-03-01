@@ -285,6 +285,10 @@ fn test_build_spec(arg_value: &str) -> BuildSpec {
         args: BTreeMap::from([("ARG".to_string(), arg_value.to_string())]),
         cache_from: Vec::new(),
         image_tag: None,
+        secrets: Vec::new(),
+        no_cache: false,
+        push: false,
+        output_oci_tar_dest: None,
     }
 }
 

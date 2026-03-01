@@ -659,6 +659,10 @@ async fn run_compose_builds_with_runner(
                     args: build_spec.args.clone(),
                     cache_from: build_spec.cache_from.clone(),
                     image_tag: Some(service.image.clone()),
+                    secrets: Vec::new(),
+                    no_cache: false,
+                    push: false,
+                    output_oci_tar_dest: None,
                 },
             )
             .await

@@ -2291,6 +2291,9 @@ async fn start_build_then_get_and_cancel_round_trip() {
     wait_for_socket(&config.socket_path).await;
 
     let mut build_client = connect_build_client(&config.socket_path).await;
+    let mut build_args = std::collections::HashMap::new();
+    build_args.insert("FOO".to_string(), "bar".to_string());
+    let secret_spec = "id=token,src=/tmp/token".to_string();
 
     let started = build_client
         .start_build(Request::new(runtime_v2::StartBuildRequest {
@@ -2302,7 +2305,13 @@ async fn start_build_then_get_and_cancel_round_trip() {
             sandbox_id: "sbx-build-test".to_string(),
             context: ".".to_string(),
             dockerfile: "Dockerfile".to_string(),
-            args: std::collections::HashMap::new(),
+            args: build_args,
+            target: "release".to_string(),
+            image_tag: "example:latest".to_string(),
+            secrets: vec![secret_spec.clone()],
+            no_cache: true,
+            push: false,
+            output_oci_tar_dest: "/tmp/build.oci.tar".to_string(),
         }))
         .await
         .expect("start build");
@@ -2328,6 +2337,47 @@ async fn start_build_then_get_and_cancel_round_trip() {
         fetched.build.expect("build payload").build_id,
         build_id,
         "build id should round-trip"
+    );
+    let persisted_build = daemon
+        .with_state_store(|store| store.load_build(&build_id))
+        .expect("load persisted build")
+        .expect("persisted build");
+    assert_eq!(
+        persisted_build.build_spec.target.as_deref(),
+        Some("release"),
+        "target should persist from gRPC request"
+    );
+    assert_eq!(
+        persisted_build.build_spec.image_tag.as_deref(),
+        Some("example:latest"),
+        "image tag should persist from gRPC request"
+    );
+    assert_eq!(
+        persisted_build
+            .build_spec
+            .args
+            .get("FOO")
+            .map(String::as_str),
+        Some("bar"),
+        "build args should persist from gRPC request"
+    );
+    assert_eq!(
+        persisted_build.build_spec.secrets,
+        vec![secret_spec],
+        "secrets should persist from gRPC request"
+    );
+    assert!(
+        persisted_build.build_spec.no_cache,
+        "no_cache should persist from gRPC request"
+    );
+    assert_eq!(
+        persisted_build.build_spec.output_oci_tar_dest.as_deref(),
+        Some("/tmp/build.oci.tar"),
+        "output destination should persist from gRPC request"
+    );
+    assert!(
+        !persisted_build.build_spec.push,
+        "push should remain disabled when explicit OCI tar output is selected"
     );
 
     let canceled = build_client
@@ -2389,6 +2439,12 @@ async fn stream_build_events_emits_queued_and_canceled_events() {
             context: ".".to_string(),
             dockerfile: "Dockerfile".to_string(),
             args: std::collections::HashMap::new(),
+            target: String::new(),
+            image_tag: String::new(),
+            secrets: Vec::new(),
+            no_cache: false,
+            push: false,
+            output_oci_tar_dest: String::new(),
         }))
         .await
         .expect("start build")

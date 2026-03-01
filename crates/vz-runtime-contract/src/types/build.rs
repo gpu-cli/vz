@@ -58,6 +58,17 @@ pub struct BuildSpec {
     ///
     /// When unset, backends may derive a deterministic internal tag.
     pub image_tag: Option<String>,
+    /// Build secrets forwarded to builder (`id=...,src=...`).
+    #[serde(default)]
+    pub secrets: Vec<String>,
+    /// Disable builder cache for this build request.
+    #[serde(default)]
+    pub no_cache: bool,
+    /// Push built image to registry instead of local import.
+    #[serde(default)]
+    pub push: bool,
+    /// Optional OCI tar output destination path on host.
+    pub output_oci_tar_dest: Option<String>,
 }
 
 /// Build lifecycle states.

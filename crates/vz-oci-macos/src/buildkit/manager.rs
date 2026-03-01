@@ -114,6 +114,10 @@ struct NormalizedStartBuildRequest<'a> {
     cache_from: Vec<String>,
     image_tag: Option<String>,
     args: &'a BTreeMap<String, String>,
+    secrets: Vec<String>,
+    no_cache: bool,
+    push: bool,
+    output_oci_tar_dest: Option<String>,
 }
 
 impl Default for BuildManagerState {
@@ -527,6 +531,13 @@ fn normalize_start_build_request(
     sandbox_id: &str,
     build_spec: &BuildSpec,
 ) -> Result<String, BuildManagerError> {
+    let output_oci_tar_dest =
+        normalize_optional_request_component(build_spec.output_oci_tar_dest.as_deref());
+    if build_spec.push && output_oci_tar_dest.is_some() {
+        return Err(BuildManagerError::RequestNormalization {
+            details: "push and output_oci_tar_dest cannot be set together".to_string(),
+        });
+    }
     let request = NormalizedStartBuildRequest {
         sandbox_id: sandbox_id.trim(),
         context: normalize_request_component(&build_spec.context, "."),
@@ -538,6 +549,10 @@ fn normalize_start_build_request(
         cache_from: normalize_cache_from_entries(&build_spec.cache_from),
         image_tag: normalize_optional_request_component(build_spec.image_tag.as_deref()),
         args: &build_spec.args,
+        secrets: normalize_secret_entries(&build_spec.secrets),
+        no_cache: build_spec.no_cache,
+        push: build_spec.push,
+        output_oci_tar_dest,
     };
     serde_json::to_string(&request).map_err(|error| BuildManagerError::RequestNormalization {
         details: error.to_string(),
@@ -569,6 +584,15 @@ fn normalize_cache_from_entries(entries: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn normalize_secret_entries(entries: &[String]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| entry.trim())
+        .filter(|entry| !entry.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 fn normalize_idempotency_key(key: Option<String>) -> Option<String> {
     key.and_then(|key| {
         let normalized = key.trim();
@@ -579,6 +603,17 @@ fn normalize_idempotency_key(key: Option<String>) -> Option<String> {
 fn build_request_from_spec(build: &Build) -> BuildRequest {
     let image_tag = normalize_optional_request_component(build.build_spec.image_tag.as_deref())
         .unwrap_or_else(|| format!("vz-build:{}", build.build_id));
+    let output_oci_tar_dest =
+        normalize_optional_request_component(build.build_spec.output_oci_tar_dest.as_deref());
+    let output = if build.build_spec.push {
+        BuildOutput::RegistryPush
+    } else if let Some(dest) = output_oci_tar_dest {
+        BuildOutput::OciTar {
+            dest: PathBuf::from(dest),
+        }
+    } else {
+        BuildOutput::VzStore
+    };
 
     BuildRequest {
         context_dir: PathBuf::from(normalize_request_component(&build.build_spec.context, ".")),
@@ -594,9 +629,9 @@ fn build_request_from_spec(build: &Build) -> BuildRequest {
         target: normalize_optional_request_component(build.build_spec.target.as_deref()),
         cache_from: normalize_cache_from_entries(&build.build_spec.cache_from),
         build_args: build.build_spec.args.clone(),
-        secrets: Vec::new(),
-        no_cache: false,
-        output: BuildOutput::VzStore,
+        secrets: normalize_secret_entries(&build.build_spec.secrets),
+        no_cache: build.build_spec.no_cache,
+        output,
         progress: BuildProgress::RawJson,
     }
 }

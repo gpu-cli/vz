@@ -793,6 +793,18 @@ pub struct StartBuildRequest {
         ::prost::alloc::string::String,
         ::prost::alloc::string::String,
     >,
+    #[prost(string, tag = "6")]
+    pub target: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub image_tag: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "8")]
+    pub secrets: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bool, tag = "9")]
+    pub no_cache: bool,
+    #[prost(bool, tag = "10")]
+    pub push: bool,
+    #[prost(string, tag = "11")]
+    pub output_oci_tar_dest: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BuildPayload {

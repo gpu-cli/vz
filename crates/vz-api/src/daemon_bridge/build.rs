@@ -27,6 +27,12 @@ pub(crate) async fn try_start_build_via_daemon(
             .unwrap_or_default()
             .into_iter()
             .collect::<HashMap<_, _>>(),
+        target: body.target.clone().unwrap_or_default(),
+        image_tag: body.image_tag.clone().unwrap_or_default(),
+        secrets: body.secrets.clone().unwrap_or_default(),
+        no_cache: body.no_cache.unwrap_or(false),
+        push: body.push.unwrap_or(false),
+        output_oci_tar_dest: body.output_oci_tar_dest.clone().unwrap_or_default(),
     };
 
     match client.start_build_with_metadata(grpc_request).await {

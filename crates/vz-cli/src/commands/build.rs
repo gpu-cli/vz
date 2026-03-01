@@ -138,13 +138,12 @@ pub async fn run(args: BuildArgs) -> anyhow::Result<()> {
             let config = super::oci::build_macos_runtime_config(&args.opts)?;
             return run_subcommand(config, subcommand).await;
         }
-        let _ = parse_secrets(&args.secrets)?;
-        let _ = parse_output_mode(args.push, args.output.as_deref())?;
-        ensure_daemon_supported_build_args(&args)?;
 
         let context_dir = expand_home_dir(&args.context);
         let tag = args.tag.unwrap_or_else(|| default_tag(&context_dir));
         let build_args = parse_build_args(&args.build_args)?;
+        let secrets = parse_secrets(&args.secrets)?;
+        let output = parse_output_mode(args.push, args.output.as_deref())?;
         let progress = args.progress;
         let stderr_is_tty = std::io::stderr().is_terminal();
         let (_, ui_mode) = resolve_progress_mode(progress, stderr_is_tty);
@@ -153,6 +152,9 @@ pub async fn run(args: BuildArgs) -> anyhow::Result<()> {
         let sandbox_id = daemon_build_sandbox_id(&context_dir);
         let dockerfile = args.dockerfile.to_string_lossy().to_string();
         let context = context_dir.to_string_lossy().to_string();
+        let target = args.target.unwrap_or_default();
+        let output_oci_tar_dest = build_output_oci_tar_dest(&output);
+        let push = matches!(output, vz_oci_macos::buildkit::BuildOutput::RegistryPush);
         let mut client = connect_control_plane_for_state_db(&state_db).await?;
 
         let mut streamer = BuildEventStreamer::new(ui_mode, display_tag)?;
@@ -163,6 +165,12 @@ pub async fn run(args: BuildArgs) -> anyhow::Result<()> {
                 context,
                 dockerfile,
                 args: build_args.into_iter().collect(),
+                target,
+                image_tag: tag.clone(),
+                secrets,
+                no_cache: args.no_cache,
+                push,
+                output_oci_tar_dest,
             })
             .await
             .context("failed to start daemon-backed build")?;
@@ -267,26 +275,6 @@ fn resolve_progress_mode(
 }
 
 #[cfg(target_os = "macos")]
-fn ensure_daemon_supported_build_args(args: &BuildArgs) -> anyhow::Result<()> {
-    if args.target.is_some() {
-        anyhow::bail!("`vz build --target` is not wired through daemon RPC yet");
-    }
-    if !args.secrets.is_empty() {
-        anyhow::bail!("`vz build --secret` is not wired through daemon RPC yet");
-    }
-    if args.no_cache {
-        anyhow::bail!("`vz build --no-cache` is not wired through daemon RPC yet");
-    }
-    if args.push {
-        anyhow::bail!("`vz build --push` is not wired through daemon RPC yet");
-    }
-    if args.output.is_some() {
-        anyhow::bail!("`vz build --output` is not wired through daemon RPC yet");
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
 fn daemon_build_sandbox_id(context_dir: &Path) -> String {
     let name = context_dir
         .file_name()
@@ -322,6 +310,14 @@ fn daemon_build_event_to_local(
         event.message
     };
     vz_oci_macos::buildkit::BuildEvent::Status { message }
+}
+
+#[cfg(target_os = "macos")]
+fn build_output_oci_tar_dest(output: &vz_oci_macos::buildkit::BuildOutput) -> String {
+    match output {
+        vz_oci_macos::buildkit::BuildOutput::OciTar { dest } => dest.display().to_string(),
+        _ => String::new(),
+    }
 }
 
 #[cfg(target_os = "macos")]

@@ -57,11 +57,28 @@ impl runtime_v2::build_service_server::BuildService for BuildServiceImpl {
         let build_spec = BuildSpec {
             context,
             dockerfile: normalize_optional_wire_field(&request.dockerfile),
-            target: None,
+            target: normalize_optional_wire_field(&request.target),
             args: request.args.into_iter().collect(),
             cache_from: Vec::new(),
-            image_tag: None,
+            image_tag: normalize_optional_wire_field(&request.image_tag),
+            secrets: request
+                .secrets
+                .into_iter()
+                .map(|entry| entry.trim().to_string())
+                .filter(|entry| !entry.is_empty())
+                .collect(),
+            no_cache: request.no_cache,
+            push: request.push,
+            output_oci_tar_dest: normalize_optional_wire_field(&request.output_oci_tar_dest),
         };
+        if build_spec.push && build_spec.output_oci_tar_dest.is_some() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                "push and output_oci_tar_dest cannot be set together".to_string(),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
         let build = self
             .daemon
             .manager()

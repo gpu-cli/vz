@@ -542,6 +542,18 @@ pub(crate) struct StartBuildRequest {
     pub(crate) dockerfile: Option<String>,
     #[serde(default)]
     pub(crate) args: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub(crate) target: Option<String>,
+    #[serde(default)]
+    pub(crate) image_tag: Option<String>,
+    #[serde(default)]
+    pub(crate) secrets: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) no_cache: Option<bool>,
+    #[serde(default)]
+    pub(crate) push: Option<bool>,
+    #[serde(default)]
+    pub(crate) output_oci_tar_dest: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

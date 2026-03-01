@@ -571,6 +571,12 @@ message StartBuildRequest {
   string context = 3;
   string dockerfile = 4;
   map<string, string> args = 5;
+  string target = 6;
+  string image_tag = 7;
+  repeated string secrets = 8;
+  bool no_cache = 9;
+  bool push = 10;
+  string output_oci_tar_dest = 11;
 }
 
 message BuildPayload {
