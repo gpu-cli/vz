@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
+use tonic::Code;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 use vz_runtime_contract::{
@@ -4628,6 +4629,87 @@ async fn create_checkpoint_then_get_and_list_round_trip() {
             .metadata
             .get("idempotency_key")
             .is_some_and(serde_json::Value::is_null)
+    );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tokio::test]
+async fn create_checkpoint_spaces_mode_fails_closed_without_linux_btrfs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let workspace_root = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+
+    let now = current_unix_secs();
+    daemon
+        .with_state_store(|store| {
+            store.with_immediate_transaction(|tx| {
+                tx.save_sandbox(&Sandbox {
+                    sandbox_id: "sbx-space-btrfs-checkpoint".to_string(),
+                    backend: SandboxBackend::MacosVz,
+                    spec: SandboxSpec::default(),
+                    state: SandboxState::Ready,
+                    created_at: now,
+                    updated_at: now,
+                    labels: BTreeMap::from([
+                        (
+                            SANDBOX_LABEL_SPACE_MODE.to_string(),
+                            SANDBOX_SPACE_MODE_REQUIRED.to_string(),
+                        ),
+                        (
+                            SANDBOX_LABEL_PROJECT_DIR.to_string(),
+                            workspace_root.to_string_lossy().to_string(),
+                        ),
+                    ]),
+                })?;
+                Ok(())
+            })
+        })
+        .expect("seed spaces-mode sandbox");
+
+    let mut checkpoint_client = connect_checkpoint_client(&config.socket_path).await;
+    let status = checkpoint_client
+        .create_checkpoint(Request::new(runtime_v2::CreateCheckpointRequest {
+            metadata: None,
+            sandbox_id: "sbx-space-btrfs-checkpoint".to_string(),
+            checkpoint_class: "fs_quick".to_string(),
+            compatibility_fingerprint: "fp-space".to_string(),
+            retention_tag: String::new(),
+        }))
+        .await
+        .expect_err("non-linux runtimed should fail-closed for spaces btrfs checkpointing");
+    assert_eq!(status.code(), Code::Unimplemented);
+    assert!(
+        status.message().contains("Linux btrfs"),
+        "error should explain linux btrfs requirement: {}",
+        status.message()
     );
 
     shutdown.notify_waiters();

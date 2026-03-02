@@ -2,6 +2,8 @@ use super::super::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::process::Command;
 use vz_runtime_contract::CheckpointFileEntry;
 pub(in crate::grpc) struct CheckpointServiceImpl {
     daemon: Arc<RuntimeDaemon>,
@@ -32,6 +34,384 @@ fn checkpoint_snapshot_runtime_fs_root(daemon: &RuntimeDaemon, sandbox_id: &str)
         .join("sandboxes")
         .join(sandbox_id)
         .join("fs")
+}
+
+fn checkpoint_workspace_snapshot_subvolume_path(
+    daemon: &RuntimeDaemon,
+    checkpoint_id: &str,
+) -> PathBuf {
+    daemon
+        .runtime_data_dir()
+        .join("checkpoints")
+        .join("workspace-subvolumes")
+        .join(checkpoint_id)
+}
+
+fn sandbox_space_mode_required(labels: &BTreeMap<String, String>) -> bool {
+    labels
+        .get(SANDBOX_LABEL_SPACE_MODE)
+        .and_then(|value| normalize_optional_wire_field(value))
+        .is_some_and(|value| value.eq_ignore_ascii_case(SANDBOX_SPACE_MODE_REQUIRED))
+}
+
+fn sandbox_workspace_project_dir(
+    labels: &BTreeMap<String, String>,
+    request_id: &str,
+) -> Result<Option<PathBuf>, Status> {
+    let Some(project_dir) = labels
+        .get(SANDBOX_LABEL_PROJECT_DIR)
+        .and_then(|value| normalize_optional_wire_field(value))
+    else {
+        return Ok(None);
+    };
+
+    let candidate = PathBuf::from(project_dir);
+    if !candidate.is_absolute() {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!(
+                "sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` must be an absolute path: {}",
+                candidate.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+    if !candidate.exists() {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::NotFound,
+            format!(
+                "sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` does not exist: {}",
+                candidate.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+    if !candidate.is_dir() {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!(
+                "sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` must reference a directory: {}",
+                candidate.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+    Ok(Some(candidate))
+}
+
+#[cfg(target_os = "linux")]
+fn path_is_on_btrfs(path: &Path, request_id: &str) -> Result<bool, Status> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    const BTRFS_SUPER_MAGIC: libc::c_long = 0x9123_683E;
+
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::BackendUnavailable,
+            format!(
+                "failed to resolve checkpoint workspace path {}: {error}",
+                path.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })?;
+    let path_cstr = CString::new(canonical.as_os_str().as_bytes()).map_err(|_| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!(
+                "workspace path contains unsupported null byte: {}",
+                canonical.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })?;
+
+    #[allow(unsafe_code)]
+    let f_type = unsafe {
+        let mut stat: libc::statfs = std::mem::zeroed();
+        if libc::statfs(path_cstr.as_ptr(), &mut stat) != 0 {
+            let io_error = std::io::Error::last_os_error();
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::BackendUnavailable,
+                format!(
+                    "failed to inspect workspace filesystem for {}: {}",
+                    canonical.display(),
+                    io_error
+                ),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            )));
+        }
+        stat.f_type as libc::c_long
+    };
+
+    Ok(f_type == BTRFS_SUPER_MAGIC)
+}
+
+#[cfg(target_os = "linux")]
+fn run_btrfs_command(args: &[&str], request_id: &str, operation: &str) -> Result<(), Status> {
+    let output = Command::new("btrfs").args(args).output().map_err(|error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::BackendUnavailable,
+            format!("failed to execute btrfs for {operation}: {error}"),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let detail = if stderr.is_empty() {
+        "no stderr output".to_string()
+    } else {
+        stderr
+    };
+    Err(status_from_machine_error(MachineError::new(
+        MachineErrorCode::BackendUnavailable,
+        format!("btrfs {operation} failed: {detail}"),
+        Some(request_id.to_string()),
+        BTreeMap::new(),
+    )))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_workspace_checkpoint_subvolume(
+    _daemon: &RuntimeDaemon,
+    _checkpoint: &Checkpoint,
+    _workspace_root: &Path,
+    request_id: &str,
+) -> Result<(), Status> {
+    Err(status_from_machine_error(MachineError::new(
+        MachineErrorCode::UnsupportedOperation,
+        format!(
+            "spaces checkpoint snapshots require Linux btrfs; current platform `{}` is unsupported",
+            std::env::consts::OS
+        ),
+        Some(request_id.to_string()),
+        BTreeMap::new(),
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn create_workspace_checkpoint_subvolume(
+    daemon: &RuntimeDaemon,
+    checkpoint: &Checkpoint,
+    workspace_root: &Path,
+    request_id: &str,
+) -> Result<(), Status> {
+    if !path_is_on_btrfs(workspace_root, request_id)? {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::UnsupportedOperation,
+            format!(
+                "spaces checkpoint snapshots require btrfs workspace storage; `{}` is not on btrfs",
+                workspace_root.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+
+    let snapshot_root =
+        checkpoint_workspace_snapshot_subvolume_path(daemon, &checkpoint.checkpoint_id);
+    if snapshot_root.exists() {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::StateConflict,
+            format!(
+                "workspace checkpoint snapshot already exists: {}",
+                snapshot_root.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+
+    if let Some(parent) = snapshot_root.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::BackendUnavailable,
+                format!(
+                    "failed to prepare workspace checkpoint directory {}: {error}",
+                    parent.display()
+                ),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            ))
+        })?;
+    }
+
+    run_btrfs_command(
+        &[
+            "subvolume",
+            "snapshot",
+            "-r",
+            &workspace_root.display().to_string(),
+            &snapshot_root.display().to_string(),
+        ],
+        request_id,
+        "create workspace checkpoint snapshot",
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn restore_workspace_from_checkpoint_subvolume(
+    _daemon: &RuntimeDaemon,
+    _checkpoint: &Checkpoint,
+    _workspace_root: &Path,
+    request_id: &str,
+) -> Result<(), Status> {
+    Err(status_from_machine_error(MachineError::new(
+        MachineErrorCode::UnsupportedOperation,
+        format!(
+            "spaces checkpoint restore requires Linux btrfs; current platform `{}` is unsupported",
+            std::env::consts::OS
+        ),
+        Some(request_id.to_string()),
+        BTreeMap::new(),
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn restore_workspace_from_checkpoint_subvolume(
+    daemon: &RuntimeDaemon,
+    checkpoint: &Checkpoint,
+    workspace_root: &Path,
+    request_id: &str,
+) -> Result<(), Status> {
+    if !path_is_on_btrfs(workspace_root, request_id)? {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::UnsupportedOperation,
+            format!(
+                "spaces checkpoint restore requires btrfs workspace storage; `{}` is not on btrfs",
+                workspace_root.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+
+    let snapshot_root =
+        checkpoint_workspace_snapshot_subvolume_path(daemon, &checkpoint.checkpoint_id);
+    if !snapshot_root.is_dir() {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::NotFound,
+            format!(
+                "workspace checkpoint snapshot is missing for restore: {}",
+                snapshot_root.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+
+    run_btrfs_command(
+        &["subvolume", "delete", &workspace_root.display().to_string()],
+        request_id,
+        "delete workspace subvolume before restore",
+    )?;
+
+    run_btrfs_command(
+        &[
+            "subvolume",
+            "snapshot",
+            &snapshot_root.display().to_string(),
+            &workspace_root.display().to_string(),
+        ],
+        request_id,
+        "restore workspace snapshot",
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fork_workspace_checkpoint_subvolume(
+    _daemon: &RuntimeDaemon,
+    _parent_checkpoint_id: &str,
+    _fork_checkpoint_id: &str,
+    request_id: &str,
+) -> Result<(), Status> {
+    Err(status_from_machine_error(MachineError::new(
+        MachineErrorCode::UnsupportedOperation,
+        format!(
+            "spaces checkpoint fork requires Linux btrfs; current platform `{}` is unsupported",
+            std::env::consts::OS
+        ),
+        Some(request_id.to_string()),
+        BTreeMap::new(),
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn fork_workspace_checkpoint_subvolume(
+    daemon: &RuntimeDaemon,
+    parent_checkpoint_id: &str,
+    fork_checkpoint_id: &str,
+    request_id: &str,
+) -> Result<(), Status> {
+    let parent_snapshot =
+        checkpoint_workspace_snapshot_subvolume_path(daemon, parent_checkpoint_id);
+    if !parent_snapshot.is_dir() {
+        return Ok(());
+    }
+    let fork_snapshot = checkpoint_workspace_snapshot_subvolume_path(daemon, fork_checkpoint_id);
+    if fork_snapshot.exists() {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::StateConflict,
+            format!(
+                "workspace fork snapshot already exists: {}",
+                fork_snapshot.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+    if let Some(parent) = fork_snapshot.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::BackendUnavailable,
+                format!(
+                    "failed to prepare workspace fork checkpoint directory {}: {error}",
+                    parent.display()
+                ),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            ))
+        })?;
+    }
+
+    run_btrfs_command(
+        &[
+            "subvolume",
+            "snapshot",
+            "-r",
+            &parent_snapshot.display().to_string(),
+            &fork_snapshot.display().to_string(),
+        ],
+        request_id,
+        "fork workspace checkpoint snapshot",
+    )
+}
+
+fn maybe_space_workspace_root_for_checkpoint(
+    daemon: &RuntimeDaemon,
+    sandbox_id: &str,
+    request_id: &str,
+) -> Result<Option<PathBuf>, Status> {
+    let sandbox = daemon
+        .with_state_store(|store| store.load_sandbox(sandbox_id))
+        .map_err(|error| status_from_stack_error(error, request_id))?;
+    let Some(sandbox) = sandbox else {
+        return Ok(None);
+    };
+    if !sandbox_space_mode_required(&sandbox.labels) {
+        return Ok(None);
+    }
+    sandbox_workspace_project_dir(&sandbox.labels, request_id)
 }
 
 fn checkpoint_workspace_snapshot_root(
@@ -444,11 +824,30 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
                 ))
             })?;
 
-        let checkpoint_file_entries = collect_checkpoint_snapshot_entries(
-            self.daemon.as_ref(),
-            checkpoint.sandbox_id.as_str(),
-            &request_id,
-        )?;
+        let checkpoint_file_entries = if let Some(workspace_root) =
+            maybe_space_workspace_root_for_checkpoint(
+                self.daemon.as_ref(),
+                checkpoint.sandbox_id.as_str(),
+                &request_id,
+            )? {
+            create_workspace_checkpoint_subvolume(
+                self.daemon.as_ref(),
+                &checkpoint,
+                &workspace_root,
+                &request_id,
+            )?;
+            let snapshot_root = checkpoint_workspace_snapshot_subvolume_path(
+                self.daemon.as_ref(),
+                checkpoint.checkpoint_id.as_str(),
+            );
+            collect_checkpoint_file_entries(&snapshot_root, &request_id)?
+        } else {
+            collect_checkpoint_snapshot_entries(
+                self.daemon.as_ref(),
+                checkpoint.sandbox_id.as_str(),
+                &request_id,
+            )?
+        };
         let receipt_id = generate_receipt_id();
         let persist_result = self.daemon.with_state_store(|store| {
             store.with_immediate_transaction(|tx| {
@@ -707,6 +1106,19 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
             )));
         }
 
+        if let Some(workspace_root) = maybe_space_workspace_root_for_checkpoint(
+            self.daemon.as_ref(),
+            checkpoint.sandbox_id.as_str(),
+            &request_id,
+        )? {
+            restore_workspace_from_checkpoint_subvolume(
+                self.daemon.as_ref(),
+                &checkpoint,
+                &workspace_root,
+                &request_id,
+            )?;
+        }
+
         let now = current_unix_secs();
         let receipt_id = generate_receipt_id();
         self.daemon
@@ -849,6 +1261,13 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
                     BTreeMap::new(),
                 ))
             })?;
+
+        fork_workspace_checkpoint_subvolume(
+            self.daemon.as_ref(),
+            parent.checkpoint_id.as_str(),
+            forked.checkpoint_id.as_str(),
+            &request_id,
+        )?;
 
         let receipt_id = generate_receipt_id();
         let persist_result = self.daemon.with_state_store(|store| {
