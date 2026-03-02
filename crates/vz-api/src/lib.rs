@@ -7,17 +7,20 @@ use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_stream::stream;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::middleware;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use tracing::Instrument;
 use uuid::Uuid;
 use vz_runtime_contract::{
     RuntimeCapabilities, SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER,
@@ -45,11 +48,13 @@ mod daemon_bridge;
 mod handlers;
 mod models;
 mod openapi_doc;
+mod observability;
 
 use daemon_bridge::*;
 use handlers::*;
 use models::*;
 use openapi_doc::openapi_document;
+use observability::{ApiObservability, normalize_http_path_for_metrics};
 
 /// API adapter configuration.
 #[derive(Debug, Clone)]
@@ -93,6 +98,7 @@ struct ApiState {
     capabilities: RuntimeCapabilities,
     event_poll_interval: Duration,
     default_event_page_size: usize,
+    observability: Arc<ApiObservability>,
 }
 
 impl From<ApiConfig> for ApiState {
@@ -105,6 +111,7 @@ impl From<ApiConfig> for ApiState {
             capabilities: config.capabilities,
             event_poll_interval: config.event_poll_interval,
             default_event_page_size: config.default_event_page_size.clamp(1, MAX_EVENT_PAGE_SIZE),
+            observability: Arc::new(ApiObservability::default()),
         }
     }
 }
@@ -159,11 +166,47 @@ fn extract_idempotency_key(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+async fn observability_middleware(
+    State(observability): State<Arc<ApiObservability>>,
+    mut request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let started_at = Instant::now();
+    let method = request.method().as_str().to_string();
+    let path = request.uri().path().to_string();
+    let request_id = request_id_from_headers(request.headers());
+    let request_id_header_present = request.headers().contains_key("x-request-id");
+
+    if !request_id_header_present && let Ok(value) = HeaderValue::try_from(request_id.as_str()) {
+        request.headers_mut().insert("x-request-id", value);
+    }
+
+    let span = tracing::info_span!(
+        "api_http_request",
+        request_id = %request_id,
+        method = %method,
+        path = %path
+    );
+    let mut response = next.run(request).instrument(span).await;
+    let route = normalize_http_path_for_metrics(&path);
+    observability.record_http_request(&method, &route, response.status(), started_at.elapsed());
+
+    if !response.headers().contains_key("x-request-id")
+        && let Ok(value) = HeaderValue::try_from(request_id.as_str())
+    {
+        response.headers_mut().insert("x-request-id", value);
+    }
+
+    response
+}
+
 /// Build the Runtime V2 API router.
 pub fn router(config: ApiConfig) -> Router {
     let state: ApiState = config.into();
+    let observability = state.observability.clone();
     Router::new()
         .route("/openapi.json", get(openapi_json))
+        .route("/metrics", get(metrics_prometheus))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/stacks/apply", post(apply_stack))
         .route("/v1/stacks/teardown", post(teardown_stack))
@@ -268,6 +311,10 @@ pub fn router(config: ApiConfig) -> Router {
         .route("/v1/files/copy", post(copy_path))
         .route("/v1/files/chmod", post(chmod_path))
         .route("/v1/files/chown", post(chown_path))
+        .layer(middleware::from_fn_with_state(
+            observability,
+            observability_middleware,
+        ))
         .with_state(state)
 }
 

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod handlers;
+mod observability;
 mod support;
 
 use thiserror::Error;
@@ -44,6 +45,7 @@ use handlers::lease::LeaseServiceImpl;
 use handlers::receipt::ReceiptServiceImpl;
 use handlers::sandbox::SandboxServiceImpl;
 use handlers::stack::StackServiceImpl;
+use observability::{GrpcMetricsLayer, GrpcObservability};
 use support::*;
 
 #[derive(Debug, Error)]
@@ -62,6 +64,15 @@ const IDEMPOTENCY_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const ORPHAN_SHELL_EXECUTION_GRACE_SECS: u64 = 1;
 #[cfg(not(test))]
 const ORPHAN_SHELL_EXECUTION_GRACE_SECS: u64 = 300;
+const METRICS_SNAPSHOT_FILENAME: &str = "runtimed-grpc-metrics.prom";
+
+fn persist_metrics_snapshot(
+    daemon: &RuntimeDaemon,
+    observability: &GrpcObservability,
+) -> std::io::Result<()> {
+    let metrics_path = daemon.runtime_data_dir().join(METRICS_SNAPSHOT_FILENAME);
+    std::fs::write(metrics_path, observability.render_prometheus())
+}
 
 fn reconcile_orphaned_shell_executions(daemon: &RuntimeDaemon) -> Result<u64, StackError> {
     let now = current_unix_secs();
@@ -131,7 +142,11 @@ fn reconcile_orphaned_shell_executions(daemon: &RuntimeDaemon) -> Result<u64, St
     Ok(reconciled)
 }
 
-async fn run_maintenance_loop(daemon: Arc<RuntimeDaemon>, shutdown: Arc<tokio::sync::Notify>) {
+async fn run_maintenance_loop(
+    daemon: Arc<RuntimeDaemon>,
+    _observability: Arc<GrpcObservability>,
+    shutdown: Arc<tokio::sync::Notify>,
+) {
     let mut ticker = tokio::time::interval(IDEMPOTENCY_CLEANUP_INTERVAL);
     loop {
         tokio::select! {
@@ -202,6 +217,12 @@ async fn run_maintenance_loop(daemon: Arc<RuntimeDaemon>, shutdown: Arc<tokio::s
                         warn!(error = %error, "daemon maintenance: failed to reconcile orphaned shell executions");
                     }
                 }
+                #[cfg(not(test))]
+                if let Err(error) =
+                    persist_metrics_snapshot(daemon.as_ref(), _observability.as_ref())
+                {
+                    warn!(error = %error, "daemon maintenance: failed to persist metrics snapshot");
+                }
             }
         }
     }
@@ -230,9 +251,14 @@ where
     }
 
     let incoming = UnixListenerStream::new(listener);
+    let grpc_observability = Arc::new(GrpcObservability::default());
+    if let Err(error) = persist_metrics_snapshot(daemon.as_ref(), grpc_observability.as_ref()) {
+        warn!(error = %error, "failed to persist initial metrics snapshot");
+    }
     let maintenance_shutdown = Arc::new(tokio::sync::Notify::new());
     let maintenance_task = tokio::spawn(run_maintenance_loop(
         daemon.clone(),
+        grpc_observability.clone(),
         maintenance_shutdown.clone(),
     ));
 
@@ -293,6 +319,7 @@ where
 
     debug!(socket_path = %socket_path.display(), "starting runtime UDS gRPC server");
     let server_result = Server::builder()
+        .layer(GrpcMetricsLayer::new(grpc_observability))
         .add_service(sandbox_service)
         .add_service(lease_service)
         .add_service(container_service)

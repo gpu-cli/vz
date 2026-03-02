@@ -786,6 +786,8 @@ pub enum RuntimedError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     use super::*;
     use vz_runtime_contract::{
@@ -821,6 +823,57 @@ mod tests {
             daemon.startup_lock_path(),
             startup_lock_path(&cfg.state_store_path).as_path()
         );
+    }
+
+    #[tokio::test]
+    async fn server_writes_initial_metrics_snapshot_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = RuntimedConfig {
+            state_store_path: tmp.path().join("state").join("stack-state.db"),
+            runtime_data_dir: tmp.path().join("runtime"),
+            socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+        };
+
+        let daemon = Arc::new(RuntimeDaemon::start(cfg.clone()).expect("daemon should start"));
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown_task = shutdown.clone();
+        let daemon_task = daemon.clone();
+        let socket_path = cfg.socket_path.clone();
+
+        let server = tokio::spawn(async move {
+            serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+                shutdown_task.notified().await;
+            })
+            .await
+        });
+
+        let socket_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < socket_deadline {
+            if cfg.socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(cfg.socket_path.exists(), "daemon socket should be created");
+
+        let metrics_path = cfg.runtime_data_dir.join("runtimed-grpc-metrics.prom");
+        let metrics_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < metrics_deadline {
+            if metrics_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(metrics_path.exists(), "metrics snapshot file should be created");
+        let metrics_text = std::fs::read_to_string(&metrics_path).expect("read metrics snapshot");
+        assert!(metrics_text.contains("vz_runtimed_grpc_requests_total"));
+
+        shutdown.notify_waiters();
+        let result = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server join timeout")
+            .expect("server join should succeed");
+        assert!(result.is_ok(), "server should stop cleanly");
     }
 
     #[test]

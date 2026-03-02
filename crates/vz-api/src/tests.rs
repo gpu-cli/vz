@@ -3401,6 +3401,67 @@ async fn authz_request_id_generated_when_not_provided() {
     );
 }
 
+#[tokio::test]
+async fn authz_request_id_is_included_as_response_header_when_not_provided() {
+    let (app, _dir) = test_router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/capabilities")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        request_id.starts_with("req_"),
+        "response x-request-id should be generated when absent, got: {request_id}"
+    );
+}
+
+#[tokio::test]
+async fn observability_metrics_endpoint_reports_http_counters() {
+    let (app, _dir) = test_router();
+
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/capabilities")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; version=0.0.4; charset=utf-8")
+    );
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload = String::from_utf8(body.to_vec()).unwrap();
+    assert!(payload.contains("vz_api_http_requests_total"));
+    assert!(payload.contains("route=\"/v1/capabilities\""));
+    assert!(payload.contains("status_class=\"2xx\""));
+    assert!(payload.contains("vz_api_http_request_duration_seconds_count"));
+}
+
 // -- Scenario 10: Receipt generation for mutating operations --
 
 #[tokio::test]

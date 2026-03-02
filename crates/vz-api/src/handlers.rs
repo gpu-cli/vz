@@ -27,6 +27,17 @@ pub(super) async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
     Json(openapi_document())
 }
 
+pub(super) async fn metrics_prometheus(State(state): State<ApiState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        state.observability.render_prometheus(),
+    )
+}
+
 pub(super) async fn capabilities(
     State(state): State<ApiState>,
     headers: HeaderMap,
