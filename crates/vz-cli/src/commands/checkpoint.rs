@@ -37,6 +37,12 @@ pub enum CheckpointCommand {
 
     /// Create a new checkpoint.
     Create(CheckpointCreateArgs),
+
+    /// Restore a checkpoint.
+    Restore(CheckpointRestoreArgs),
+
+    /// Fork a checkpoint into a new sandbox snapshot lineage.
+    Fork(CheckpointForkArgs),
 }
 
 /// Arguments for `vz checkpoint list`.
@@ -89,12 +95,40 @@ pub struct CheckpointCreateArgs {
     state_db: PathBuf,
 }
 
+/// Arguments for `vz checkpoint restore`.
+#[derive(Args, Debug)]
+pub struct CheckpointRestoreArgs {
+    /// Checkpoint identifier.
+    pub checkpoint_id: String,
+
+    /// Path to the state database.
+    #[arg(long, default_value = "stack-state.db")]
+    state_db: PathBuf,
+}
+
+/// Arguments for `vz checkpoint fork`.
+#[derive(Args, Debug)]
+pub struct CheckpointForkArgs {
+    /// Parent checkpoint identifier.
+    pub checkpoint_id: String,
+
+    /// Optional explicit sandbox identifier for the fork target.
+    #[arg(long)]
+    pub new_sandbox_id: Option<String>,
+
+    /// Path to the state database.
+    #[arg(long, default_value = "stack-state.db")]
+    state_db: PathBuf,
+}
+
 /// Run the checkpoint subcommand.
 pub async fn run(args: CheckpointArgs) -> anyhow::Result<()> {
     match args.action {
         CheckpointCommand::List(list_args) => cmd_list(list_args).await,
         CheckpointCommand::Inspect(inspect_args) => cmd_inspect(inspect_args).await,
         CheckpointCommand::Create(create_args) => cmd_create(create_args).await,
+        CheckpointCommand::Restore(restore_args) => cmd_restore(restore_args).await,
+        CheckpointCommand::Fork(fork_args) => cmd_fork(fork_args).await,
     }
 }
 
@@ -144,6 +178,12 @@ struct ApiCreateCheckpointRequest {
     compatibility_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retention_tag: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiForkCheckpointRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_sandbox_id: Option<String>,
 }
 
 fn checkpoint_payload_from_api(payload: ApiCheckpointPayload) -> runtime_v2::CheckpointPayload {
@@ -255,6 +295,48 @@ async fn api_create_checkpoint(
         .json()
         .await
         .context("failed to decode api create checkpoint response")?;
+    Ok(checkpoint_payload_from_api(payload.checkpoint))
+}
+
+async fn api_restore_checkpoint(
+    checkpoint_id: &str,
+) -> anyhow::Result<runtime_v2::CheckpointPayload> {
+    let url = runtime_api_url(&format!("/v1/checkpoints/{checkpoint_id}/restore"))?;
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .context("failed to call api restore checkpoint")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to restore checkpoint via api").await);
+    }
+    let payload: ApiCheckpointResponse = response
+        .json()
+        .await
+        .context("failed to decode api restore checkpoint response")?;
+    Ok(checkpoint_payload_from_api(payload.checkpoint))
+}
+
+async fn api_fork_checkpoint(
+    checkpoint_id: &str,
+    new_sandbox_id: Option<String>,
+) -> anyhow::Result<runtime_v2::CheckpointPayload> {
+    let url = runtime_api_url(&format!("/v1/checkpoints/{checkpoint_id}/fork"))?;
+    let body = ApiForkCheckpointRequest { new_sandbox_id };
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .context("failed to call api fork checkpoint")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to fork checkpoint via api").await);
+    }
+    let payload: ApiCheckpointResponse = response
+        .json()
+        .await
+        .context("failed to decode api fork checkpoint response")?;
     Ok(checkpoint_payload_from_api(payload.checkpoint))
 }
 
@@ -440,5 +522,56 @@ async fn cmd_create(args: CheckpointCreateArgs) -> anyhow::Result<()> {
         payload.checkpoint_id
     );
 
+    Ok(())
+}
+
+async fn cmd_restore(args: CheckpointRestoreArgs) -> anyhow::Result<()> {
+    let payload = match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+            let response = client
+                .restore_checkpoint(runtime_v2::RestoreCheckpointRequest {
+                    checkpoint_id: args.checkpoint_id.clone(),
+                    metadata: None,
+                })
+                .await
+                .context("failed to restore checkpoint via daemon")?;
+            response
+                .checkpoint
+                .ok_or_else(|| anyhow!("daemon returned missing checkpoint payload"))?
+        }
+        ControlPlaneTransport::ApiHttp => api_restore_checkpoint(&args.checkpoint_id).await?,
+    };
+    println!(
+        "Checkpoint {} restored for sandbox {}.",
+        payload.checkpoint_id, payload.sandbox_id
+    );
+    Ok(())
+}
+
+async fn cmd_fork(args: CheckpointForkArgs) -> anyhow::Result<()> {
+    let payload = match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+            let response = client
+                .fork_checkpoint(runtime_v2::ForkCheckpointRequest {
+                    checkpoint_id: args.checkpoint_id.clone(),
+                    new_sandbox_id: args.new_sandbox_id.unwrap_or_default(),
+                    metadata: None,
+                })
+                .await
+                .context("failed to fork checkpoint via daemon")?;
+            response
+                .checkpoint
+                .ok_or_else(|| anyhow!("daemon returned missing checkpoint payload"))?
+        }
+        ControlPlaneTransport::ApiHttp => {
+            api_fork_checkpoint(&args.checkpoint_id, args.new_sandbox_id).await?
+        }
+    };
+    println!(
+        "Checkpoint {} forked to sandbox {} as checkpoint {}.",
+        args.checkpoint_id, payload.sandbox_id, payload.checkpoint_id
+    );
     Ok(())
 }

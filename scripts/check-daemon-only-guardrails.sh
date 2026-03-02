@@ -62,7 +62,8 @@ check_no_match "StateStore::open\\(|rusqlite::|Connection::open\\(" \
 check_no_match "StateStore::open\\(" \
   "vz-api production surfaces must not open sqlite directly" \
   "crates/vz-api/src/lib.rs" \
-  "crates/vz-api/src/daemon_bridge.rs"
+  "crates/vz-api/src/handlers.rs" \
+  "crates/vz-api/src/daemon_bridge"
 
 check_no_match "connect_api_http_for_state_db|falls back to daemon-grpc" \
   "api-http transport daemon fallback shim must not exist" \

@@ -32,6 +32,16 @@ Current daemon-backed integration coverage includes:
   - `cargo test -p vz-runtimed-client create_sandbox_stream_emits_progress_and_completion`
 - Stack apply/status/events/teardown:
   - `cargo test -p vz-runtimed-client stack_apply_and_teardown_round_trip_via_daemon_client`
+- API daemon-backed sandbox lifecycle smoke:
+  - `cargo test -p vz-api --test server_smoke runtime_api_server_smoke_sandbox_crud_and_file_ops`
+
+## Restart/Reconcile Validation
+
+Daemon startup reconcile and post-restart attach semantics are validated with:
+
+- `cargo test -p vz-runtimed daemon_start_reconciles_non_terminal_executions_to_failed`
+- `cargo test -p vz-runtimed daemon_start_reconciles_non_terminal_builds_to_failed`
+- `cargo test -p vz-runtimed --lib stream_exec_output_after_restart_reconcile_returns_terminal_failure_event`
 
 Run the complete client integration suite:
 
@@ -44,6 +54,6 @@ cargo test -p vz-runtimed-client
 
 Current transport note:
 
-- `VZ_CONTROL_PLANE_TRANSPORT=api-http` is accepted by CLI and currently routes through a compatibility fallback connector while full HTTP control-plane routing is tracked in `vz-pip6`.
+- `VZ_CONTROL_PLANE_TRANSPORT=api-http` is accepted by CLI and must route through API HTTP client helpers (no direct daemon-gRPC fallback shim).
 - Legacy local-runtime OCI mutation paths (`vz oci run/create/exec/stop/rm`).
 - Legacy local-runtime image build path (`vz image build`).

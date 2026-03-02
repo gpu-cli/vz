@@ -129,6 +129,9 @@ enum Commands {
     /// Compare two checkpoints with the versioned diff contract.
     Diff(commands::diff::DiffArgs),
 
+    /// Checkpoint lifecycle management (list, inspect, create, restore, fork).
+    Checkpoint(commands::checkpoint::CheckpointArgs),
+
     // ── Debug/advanced (hidden) ──
     /// Advanced debugging and low-level operations.
     #[command(hide = true)]
@@ -227,6 +230,9 @@ fn main() -> anyhow::Result<()> {
 
             // Diff contract
             Some(Commands::Diff(args)) => commands::diff::run(args).await,
+
+            // Checkpoint lifecycle
+            Some(Commands::Checkpoint(args)) => commands::checkpoint::run(args).await,
 
             // Debug/advanced
             Some(Commands::Debug(args)) => commands::debug::run(*args).await,
