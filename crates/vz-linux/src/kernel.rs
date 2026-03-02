@@ -34,6 +34,8 @@ pub struct KernelVersion {
     pub busybox: String,
     /// Guest-agent version used in initramfs.
     pub agent: String,
+    /// Guest-agent protocol compatibility revision used for host startup gating.
+    pub agent_protocol_revision: Option<u32>,
     /// Pinned youki runtime version.
     pub youki: String,
     /// Build timestamp (optional).
@@ -55,7 +57,11 @@ pub struct EnsureKernelOptions {
     ///
     /// If unset, `VZ_LINUX_BUNDLE_DIR` is used when present.
     pub bundle_dir: Option<PathBuf>,
-    /// Require `version.json.agent == CARGO_PKG_VERSION`.
+    /// Require strict host/guest compatibility checks from `version.json`.
+    ///
+    /// Enforces both:
+    /// - `agent == CARGO_PKG_VERSION`
+    /// - `agent_protocol_revision == vz_agent_proto::AGENT_PROTOCOL_REVISION`
     pub require_exact_agent_version: bool,
 }
 
@@ -94,6 +100,7 @@ pub async fn ensure_kernel_with_options(
         None => default_linux_dir()?,
     };
     let expected_agent = env!("CARGO_PKG_VERSION").to_string();
+    let expected_protocol_revision = vz_agent_proto::AGENT_PROTOCOL_REVISION;
     let mut bundle_dir = options
         .bundle_dir
         .or_else(|| std::env::var_os("VZ_LINUX_BUNDLE_DIR").map(PathBuf::from));
@@ -106,6 +113,7 @@ pub async fn ensure_kernel_with_options(
         validate_agent_version(
             &bundle.version,
             &expected_agent,
+            expected_protocol_revision,
             options.require_exact_agent_version,
         )?;
         validate_artifact_checksums(&bundle).await?;
@@ -114,6 +122,7 @@ pub async fn ensure_kernel_with_options(
             let version_ok = validate_agent_version(
                 &installed.version,
                 &expected_agent,
+                expected_protocol_revision,
                 options.require_exact_agent_version,
             )
             .is_ok();
@@ -129,6 +138,7 @@ pub async fn ensure_kernel_with_options(
         validate_agent_version(
             &installed.version,
             &expected_agent,
+            expected_protocol_revision,
             options.require_exact_agent_version,
         )?;
         validate_artifact_checksums(&installed).await?;
@@ -139,6 +149,7 @@ pub async fn ensure_kernel_with_options(
         validate_agent_version(
             &installed.version,
             &expected_agent,
+            expected_protocol_revision,
             options.require_exact_agent_version,
         )?;
         validate_artifact_checksums(&installed).await?;
@@ -204,6 +215,7 @@ async fn install_from_bundle(bundle_dir: &Path, install_dir: &Path) -> Result<()
 fn validate_agent_version(
     version: &KernelVersion,
     expected_agent: &str,
+    expected_protocol_revision: u32,
     require_exact_agent_version: bool,
 ) -> Result<(), LinuxError> {
     if !require_exact_agent_version {
@@ -213,6 +225,18 @@ fn validate_agent_version(
         return Err(LinuxError::VersionMismatch {
             expected: expected_agent.to_string(),
             found: version.agent.clone(),
+        });
+    }
+    let found_protocol_revision =
+        version
+            .agent_protocol_revision
+            .ok_or(LinuxError::MissingProtocolRevision {
+                expected: expected_protocol_revision,
+            })?;
+    if found_protocol_revision != expected_protocol_revision {
+        return Err(LinuxError::ProtocolRevisionMismatch {
+            expected: expected_protocol_revision,
+            found: found_protocol_revision,
         });
     }
     Ok(())
@@ -311,6 +335,7 @@ mod tests {
             kernel: "6.12.11".to_string(),
             busybox: "1.37.0".to_string(),
             agent,
+            agent_protocol_revision: Some(vz_agent_proto::AGENT_PROTOCOL_REVISION),
             youki: "0.5.7".to_string(),
             built: None,
             sha256_vmlinux: None,
@@ -449,6 +474,70 @@ mod tests {
         .expect("ensure kernel from newer bundle");
 
         assert_eq!(paths.version.built.as_deref(), Some("2026-02-18T00:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn ensure_kernel_rejects_missing_protocol_revision() {
+        let temp = tempdir().expect("tempdir");
+        let install = temp.path().join("linux");
+        let expected = env!("CARGO_PKG_VERSION").to_string();
+        write_artifacts(&install, expected).await;
+
+        let mut version: KernelVersion = serde_json::from_str(
+            &tokio::fs::read_to_string(install.join(VERSION_FILE))
+                .await
+                .expect("read version"),
+        )
+        .expect("parse version");
+        version.agent_protocol_revision = None;
+        tokio::fs::write(
+            install.join(VERSION_FILE),
+            serde_json::to_string_pretty(&version).expect("version json"),
+        )
+        .await
+        .expect("write version");
+
+        let err = ensure_kernel_with_options(EnsureKernelOptions {
+            install_dir: Some(install),
+            bundle_dir: None,
+            require_exact_agent_version: true,
+        })
+        .await
+        .expect_err("must fail missing protocol revision");
+
+        assert!(matches!(err, LinuxError::MissingProtocolRevision { .. }));
+    }
+
+    #[tokio::test]
+    async fn ensure_kernel_rejects_mismatched_protocol_revision() {
+        let temp = tempdir().expect("tempdir");
+        let install = temp.path().join("linux");
+        let expected = env!("CARGO_PKG_VERSION").to_string();
+        write_artifacts(&install, expected).await;
+
+        let mut version: KernelVersion = serde_json::from_str(
+            &tokio::fs::read_to_string(install.join(VERSION_FILE))
+                .await
+                .expect("read version"),
+        )
+        .expect("parse version");
+        version.agent_protocol_revision = Some(vz_agent_proto::AGENT_PROTOCOL_REVISION + 1);
+        tokio::fs::write(
+            install.join(VERSION_FILE),
+            serde_json::to_string_pretty(&version).expect("version json"),
+        )
+        .await
+        .expect("write version");
+
+        let err = ensure_kernel_with_options(EnsureKernelOptions {
+            install_dir: Some(install),
+            bundle_dir: None,
+            require_exact_agent_version: true,
+        })
+        .await
+        .expect_err("must fail protocol revision mismatch");
+
+        assert!(matches!(err, LinuxError::ProtocolRevisionMismatch { .. }));
     }
 
     #[tokio::test]

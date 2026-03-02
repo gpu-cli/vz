@@ -29,6 +29,26 @@ pub enum LinuxError {
         found: String,
     },
 
+    /// Kernel artifact metadata is missing protocol revision information.
+    #[error(
+        "kernel artifact metadata missing agent protocol revision; expected revision {expected}. Rebuild artifacts to refresh version.json"
+    )]
+    MissingProtocolRevision {
+        /// Host-required protocol revision.
+        expected: u32,
+    },
+
+    /// Kernel artifact metadata protocol revision does not match host expectations.
+    #[error(
+        "kernel artifact protocol revision mismatch: expected {expected}, found {found}; rebuild guest artifacts"
+    )]
+    ProtocolRevisionMismatch {
+        /// Host-required protocol revision.
+        expected: u32,
+        /// Artifact-declared protocol revision.
+        found: u32,
+    },
+
     /// Artifact file digest did not match `version.json` checksum.
     #[error(
         "kernel artifact checksum mismatch for {artifact} at {path}: expected {expected}, found {found}"
