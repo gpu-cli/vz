@@ -1608,7 +1608,7 @@ async fn checkpoint_fork_from_non_ready_returns_409() {
         parent_checkpoint_id: None,
         class: CheckpointClass::FsQuick,
         state: CheckpointState::Creating,
-        created_at: 1000,
+        created_at: now_epoch_secs(),
         compatibility_fingerprint: "fp-1".to_string(),
     };
     store.save_checkpoint(&checkpoint).unwrap();
@@ -1650,7 +1650,7 @@ async fn checkpoint_children_returns_forked_children() {
         parent_checkpoint_id: None,
         class: CheckpointClass::FsQuick,
         state: CheckpointState::Creating,
-        created_at: 1000,
+        created_at: now_epoch_secs(),
         compatibility_fingerprint: "fp-parent".to_string(),
     };
     parent.transition_to(CheckpointState::Ready).unwrap();
@@ -1663,7 +1663,7 @@ async fn checkpoint_children_returns_forked_children() {
         parent_checkpoint_id: Some("ckpt-parent".to_string()),
         class: CheckpointClass::FsQuick,
         state: CheckpointState::Creating,
-        created_at: 2000,
+        created_at: now_epoch_secs(),
         compatibility_fingerprint: "fp-parent".to_string(),
     };
     child.transition_to(CheckpointState::Ready).unwrap();
@@ -1726,7 +1726,7 @@ async fn checkpoint_restore_includes_fingerprint_metadata() {
         parent_checkpoint_id: None,
         class: CheckpointClass::FsQuick,
         state: CheckpointState::Creating,
-        created_at: 1000,
+        created_at: now_epoch_secs(),
         compatibility_fingerprint: "kernel-6.1-arm64".to_string(),
     };
     checkpoint.transition_to(CheckpointState::Ready).unwrap();
@@ -2417,7 +2417,7 @@ async fn authz_fork_checkpoint_rejects_invalid_json() {
         parent_checkpoint_id: None,
         class: CheckpointClass::FsQuick,
         state: CheckpointState::Creating,
-        created_at: 1000,
+        created_at: now_epoch_secs(),
         compatibility_fingerprint: "fp-1".to_string(),
     };
     ckpt.transition_to(CheckpointState::Ready).unwrap();
@@ -2903,10 +2903,15 @@ async fn authz_checkpoint_restore_not_ready_returns_409() {
         parent_checkpoint_id: None,
         class: CheckpointClass::FsQuick,
         state: CheckpointState::Creating,
-        created_at: 1000,
+        created_at: now_epoch_secs(),
         compatibility_fingerprint: "fp-1".to_string(),
     };
     store.save_checkpoint(&ckpt).unwrap();
+    assert!(
+        store.load_checkpoint("ckpt-not-ready").unwrap().is_some(),
+        "checkpoint fixture should be persisted before daemon restore call"
+    );
+    drop(store);
 
     let app = router(test_config(state_path));
     let response = app
