@@ -594,6 +594,7 @@ impl Runtime {
     pub(super) async fn finalize_one_off_cleanup(&self, container_id: &str, auto_remove: bool) {
         self.active_lifecycle.lock().await.remove(container_id);
         self.stop_log_rotation_task(container_id).await;
+        self.container_exec_env.lock().await.remove(container_id);
 
         if auto_remove {
             if let Err(err) = self.remove_container(container_id).await {

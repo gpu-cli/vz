@@ -154,6 +154,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             // `service_primary_ip` maps service_name -> first assigned IP
             // (used for port forwarding target_host).
             let mut service_primary_ip: HashMap<String, String> = HashMap::new();
+            let mut service_network_ips: HashMap<String, HashMap<String, String>> = HashMap::new();
             let mut network_services: Vec<vz_runtime_contract::NetworkServiceConfig> = Vec::new();
 
             for net in &spec.networks {
@@ -189,7 +190,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                         // First IP assigned becomes the primary (for port forwarding).
                         service_primary_ip
                             .entry(replica_name.clone())
-                            .or_insert(ip_no_prefix);
+                            .or_insert(ip_no_prefix.clone());
+                        service_network_ips
+                            .entry(replica_name.clone())
+                            .or_default()
+                            .insert(net.name.clone(), ip_no_prefix.clone());
 
                         network_services.push(vz_runtime_contract::NetworkServiceConfig {
                             name: replica_name,
@@ -294,7 +299,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                         let idx = all_volume_mounts.len();
                         all_volume_mounts.push(vz_runtime_contract::StackVolumeMount {
                             tag: format!("vz-mount-{idx}"),
-                            host_path: secret_path,
+                            host_path: secrets_dir.clone(),
                             read_only: true,
                         });
                     }
@@ -397,6 +402,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
             // Store primary IPs for use in prepare_create.
             self.service_ips = service_primary_ip;
+            self.service_network_ips = service_network_ips;
 
             // Persist allocator state after VM boot + network setup.
             self.persist_allocator_state(&spec.name)?;

@@ -169,11 +169,11 @@ pub fn secrets_to_mounts(
     secrets
         .iter()
         .map(|s| vz_runtime_contract::MountSpec {
-            source: Some(staged_dir.join(&s.source)),
+            source: Some(staged_dir.to_path_buf()),
             target: PathBuf::from(format!("/run/secrets/{}", s.target)),
             mount_type: vz_runtime_contract::MountType::Bind,
             access: vz_runtime_contract::MountAccess::ReadOnly,
-            subpath: None,
+            subpath: Some(s.source.clone()),
         })
         .collect()
 }

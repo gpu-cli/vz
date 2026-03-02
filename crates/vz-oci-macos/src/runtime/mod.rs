@@ -173,6 +173,11 @@ pub struct Runtime {
     log_rotation_tasks: Arc<Mutex<HashMap<String, LogRotationTask>>>,
     /// Active interactive execution sessions keyed by daemon execution_id.
     exec_sessions: Arc<Mutex<HashMap<String, InteractiveExecSession>>>,
+    /// Resolved container environment captured at create/start time.
+    ///
+    /// Used to provide docker-compatible exec behavior where ad-hoc exec
+    /// commands inherit the container's configured environment by default.
+    container_exec_env: Arc<Mutex<HashMap<String, Vec<(String, String)>>>>,
     /// VM instances that already ran interactive PTY prerequisite setup.
     ///
     /// Keyed by `Arc<LinuxVm>` pointer identity (`Arc::as_ptr` cast to usize)
@@ -203,6 +208,7 @@ impl Runtime {
             active_lifecycle: Arc::new(Mutex::new(HashMap::new())),
             log_rotation_tasks: Arc::new(Mutex::new(HashMap::new())),
             exec_sessions: Arc::new(Mutex::new(HashMap::new())),
+            container_exec_env: Arc::new(Mutex::new(HashMap::new())),
             interactive_pty_prep_vms: Arc::new(Mutex::new(HashSet::new())),
         };
 
@@ -288,6 +294,7 @@ impl Runtime {
             pf.shutdown().await;
         }
         self.stop_log_rotation_task(id).await;
+        self.container_exec_env.lock().await.remove(id);
 
         // Best-effort OCI delete via guest runtime if VM is still up.
         // Try the per-container handle first; fall back to the shared stack VM
@@ -360,6 +367,7 @@ impl Runtime {
         if !matches!(container.status, ContainerStatus::Running) {
             self.active_lifecycle.lock().await.remove(id);
             self.stop_log_rotation_task(id).await;
+            self.container_exec_env.lock().await.remove(id);
             return Ok(container);
         }
 
@@ -379,6 +387,7 @@ impl Runtime {
         let exit_code = stop_via_oci_runtime(&*vm, id, force, effective_grace, signal).await?;
         let lifecycle = self.active_lifecycle.lock().await.remove(id);
         self.stop_log_rotation_task(id).await;
+        self.container_exec_env.lock().await.remove(id);
 
         // Best-effort OCI delete.
         match vm.oci_delete(id.to_string(), true).await {
@@ -652,6 +661,10 @@ impl Runtime {
                     .map_err(OciError::from)?;
                 self.track_active_lifecycle(container_id.clone(), lifecycle)
                     .await;
+                self.container_exec_env
+                    .lock()
+                    .await
+                    .insert(container_id.clone(), run.env.clone());
                 Ok(container_id)
             }
             Err(err) => {

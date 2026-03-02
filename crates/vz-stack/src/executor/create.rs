@@ -160,13 +160,19 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 continue;
             }
             // Only add if the sibling shares at least one network.
-            let shares_network = svc
+            let shared_network = svc
                 .networks
                 .iter()
-                .any(|n| my_networks.contains(n.as_str()));
-            if shares_network {
-                if let Some(ip) = self.service_ips.get(&svc.name) {
-                    run_config.extra_hosts.push((svc.name.clone(), ip.clone()));
+                .find(|n| my_networks.contains(n.as_str()));
+            if let Some(shared_network) = shared_network {
+                let peer_ip = self
+                    .service_network_ips
+                    .get(&svc.name)
+                    .and_then(|ips| ips.get(shared_network))
+                    .cloned()
+                    .or_else(|| self.service_ips.get(&svc.name).cloned());
+                if let Some(ip) = peer_ip {
+                    run_config.extra_hosts.push((svc.name.clone(), ip));
                 }
             }
         }

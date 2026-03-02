@@ -313,6 +313,11 @@ pub struct StackExecutor<R: ContainerRuntime> {
     /// Per-service primary IP (first network IP, used for port forwarding and /etc/hosts).
     /// Populated during shared VM boot / network setup.
     service_ips: HashMap<String, String>,
+    /// Per-service IP addresses keyed by network name.
+    ///
+    /// Used to resolve peer hostnames on a shared network when a service is
+    /// attached to multiple networks with different IPs.
+    service_network_ips: HashMap<String, HashMap<String, String>>,
     /// Per-service VirtioFS mount tag offset for shared VM mode.
     ///
     /// In a shared VM, all services' bind mounts are configured as VirtioFS
@@ -367,6 +372,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             volumes: VolumeManager::new(data_dir),
             ports: PortTracker::new(),
             service_ips: HashMap::new(),
+            service_network_ips: HashMap::new(),
             mount_tag_offsets: HashMap::new(),
         }
     }
@@ -424,6 +430,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         if let Some(snapshot) = self.store.load_allocator_state(stack_name)? {
             self.service_ips = snapshot.service_ips;
             self.mount_tag_offsets = snapshot.mount_tag_offsets;
+            self.service_network_ips.clear();
             for (name, ports) in snapshot.ports {
                 self.ports.restore(name, ports);
             }

@@ -526,6 +526,10 @@ impl Runtime {
             .map_err(OciError::from)?;
         self.track_active_lifecycle(container_id.clone(), lifecycle)
             .await;
+        self.container_exec_env
+            .lock()
+            .await
+            .insert(container_id.clone(), run.env.clone());
 
         // Step 5: Write /etc/hosts inside the running container via oci_exec.
         // This writes directly into the container's mount namespace after
@@ -617,10 +621,12 @@ impl Runtime {
             let mut vm_handles = self.vm_handles.lock().await;
             let mut cs = self.container_stack.lock().await;
             let mut active_lifecycle = self.active_lifecycle.lock().await;
+            let mut container_exec_env = self.container_exec_env.lock().await;
             for cid in &stack_containers {
                 vm_handles.remove(cid);
                 cs.remove(cid);
                 active_lifecycle.remove(cid);
+                container_exec_env.remove(cid);
             }
         }
 

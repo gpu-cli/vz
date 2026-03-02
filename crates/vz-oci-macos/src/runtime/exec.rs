@@ -214,6 +214,21 @@ impl Runtime {
             return result;
         }
 
+        let mut merged_env = self
+            .container_exec_env
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .unwrap_or_default();
+        for (key, value) in exec.env.clone() {
+            if let Some((_, existing_value)) = merged_env.iter_mut().find(|(k, _)| *k == key) {
+                *existing_value = value;
+            } else {
+                merged_env.push((key, value));
+            }
+        }
+
         let result = tokio::time::timeout(
             timeout,
             vm.oci_exec(
@@ -221,7 +236,7 @@ impl Runtime {
                 command.clone(),
                 args.to_vec(),
                 OciExecOptions {
-                    env: exec.env,
+                    env: merged_env,
                     cwd: exec.working_dir,
                     user: exec.user,
                 },
