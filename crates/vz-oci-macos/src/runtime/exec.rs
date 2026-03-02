@@ -2,6 +2,17 @@ use super::networking::ensure_interactive_exec_pty_prerequisites;
 use super::oci_lifecycle::parse_signal_number;
 use super::*;
 
+fn exec_control_debug_enabled() -> bool {
+    std::env::var("VZ_OCI_EXEC_CONTROL_DEBUG")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 impl Runtime {
     pub async fn exec_container(&self, id: &str, exec: ExecConfig) -> Result<ExecOutput, OciError> {
         self.exec_container_streaming(id, exec, |_| {}).await
@@ -18,6 +29,7 @@ impl Runtime {
     where
         F: FnMut(InteractiveExecEvent),
     {
+        let debug = exec_control_debug_enabled();
         let vm = self
             .vm_handles
             .lock()
@@ -46,12 +58,22 @@ impl Runtime {
                 });
             };
 
+            if debug {
+                eprintln!(
+                    "[vz-oci-macos exec-control] interactive exec resolving container state execution_id={execution_id} container_id={id}"
+                );
+            }
             let state = vm.oci_state(id.to_string()).await?;
             let Some(pid) = state.pid else {
                 return Err(OciError::InvalidConfig(format!(
                     "container '{id}' has no running pid for interactive exec"
                 )));
             };
+            if debug {
+                eprintln!(
+                    "[vz-oci-macos exec-control] interactive exec container pid resolved execution_id={execution_id} container_id={id} pid={pid}"
+                );
+            }
 
             let mut nsenter_args: Vec<String> = vec![
                 "nsenter".to_string(),
@@ -75,8 +97,37 @@ impl Runtime {
             let term_rows = u32::from(exec.term_rows.unwrap_or(DEFAULT_INTERACTIVE_EXEC_ROWS));
             let term_cols = u32::from(exec.term_cols.unwrap_or(DEFAULT_INTERACTIVE_EXEC_COLS));
 
-            ensure_interactive_exec_pty_prerequisites(vm.as_ref(), timeout).await;
+            let vm_key = Arc::as_ptr(&vm) as usize;
+            let should_prepare_pty = {
+                let mut prepared = self.interactive_pty_prep_vms.lock().await;
+                prepared.insert(vm_key)
+            };
 
+            if should_prepare_pty {
+                if debug {
+                    eprintln!(
+                        "[vz-oci-macos exec-control] interactive exec preparing pty prerequisites execution_id={execution_id} timeout_secs={:.3}",
+                        timeout.as_secs_f64()
+                    );
+                }
+                ensure_interactive_exec_pty_prerequisites(vm.as_ref(), timeout).await;
+                if debug {
+                    eprintln!(
+                        "[vz-oci-macos exec-control] interactive exec prerequisite step complete execution_id={execution_id}"
+                    );
+                }
+            } else if debug {
+                eprintln!(
+                    "[vz-oci-macos exec-control] interactive exec skipping pty prerequisite step execution_id={execution_id}"
+                );
+            }
+
+            if debug {
+                eprintln!(
+                    "[vz-oci-macos exec-control] interactive exec invoking guest exec RPC execution_id={execution_id} command={:?} args={:?} rows={} cols={}",
+                    "/bin/busybox", nsenter_arg_refs, term_rows, term_cols
+                );
+            }
             let (mut stream, guest_exec_id) = tokio::time::timeout(
                 timeout,
                 vm.exec_interactive(
@@ -94,6 +145,11 @@ impl Runtime {
                     timeout.as_secs_f64()
                 ))
             })??;
+            if debug {
+                eprintln!(
+                    "[vz-oci-macos exec-control] interactive exec guest exec RPC ready execution_id={execution_id} guest_exec_id={guest_exec_id}"
+                );
+            }
 
             self.exec_sessions.lock().await.insert(
                 execution_id.clone(),
@@ -200,6 +256,13 @@ impl Runtime {
 
     /// Write stdin bytes into an active interactive execution session.
     pub async fn write_exec_stdin(&self, execution_id: &str, data: &[u8]) -> Result<(), OciError> {
+        let debug = exec_control_debug_enabled();
+        if debug {
+            eprintln!(
+                "[vz-oci-macos exec-control] write_exec_stdin start execution_id={execution_id} bytes={}",
+                data.len()
+            );
+        }
         let session = self.require_exec_session(execution_id).await?;
         if !session.pty_enabled {
             return Err(OciError::ExecutionControlUnsupported {
@@ -207,11 +270,24 @@ impl Runtime {
                 reason: "execution session is not interactive".to_string(),
             });
         }
-        session
+        let write_result = session
             .vm
             .stdin_write(session.guest_exec_id, data)
             .await
-            .map_err(OciError::from)
+            .map_err(OciError::from);
+        if debug {
+            match &write_result {
+                Ok(()) => eprintln!(
+                    "[vz-oci-macos exec-control] write_exec_stdin complete execution_id={execution_id} guest_exec_id={}",
+                    session.guest_exec_id
+                ),
+                Err(error) => eprintln!(
+                    "[vz-oci-macos exec-control] write_exec_stdin failed execution_id={execution_id} guest_exec_id={} error={error}",
+                    session.guest_exec_id
+                ),
+            }
+        }
+        write_result
     }
 
     /// Send a signal into an active interactive execution session.

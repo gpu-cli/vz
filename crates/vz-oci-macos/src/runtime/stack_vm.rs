@@ -291,6 +291,11 @@ impl Runtime {
             })?;
         tracing::debug!("step 2 OK");
         let run = resolve_run_config(image_config, run, &container_id)?;
+        tracing::debug!(
+            container_id = %container_id,
+            working_dir = ?run.working_dir,
+            "resolved container run configuration"
+        );
         let lifecycle = resolve_container_lifecycle(
             &run.oci_annotations,
             ContainerLifecycleClass::Service,

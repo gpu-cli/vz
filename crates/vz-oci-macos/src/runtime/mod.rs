@@ -173,6 +173,11 @@ pub struct Runtime {
     log_rotation_tasks: Arc<Mutex<HashMap<String, LogRotationTask>>>,
     /// Active interactive execution sessions keyed by daemon execution_id.
     exec_sessions: Arc<Mutex<HashMap<String, InteractiveExecSession>>>,
+    /// VM instances that already ran interactive PTY prerequisite setup.
+    ///
+    /// Keyed by `Arc<LinuxVm>` pointer identity (`Arc::as_ptr` cast to usize)
+    /// so prep runs once per live VM instance.
+    interactive_pty_prep_vms: Arc<Mutex<HashSet<usize>>>,
 }
 
 impl Runtime {
@@ -198,6 +203,7 @@ impl Runtime {
             active_lifecycle: Arc::new(Mutex::new(HashMap::new())),
             log_rotation_tasks: Arc::new(Mutex::new(HashMap::new())),
             exec_sessions: Arc::new(Mutex::new(HashMap::new())),
+            interactive_pty_prep_vms: Arc::new(Mutex::new(HashSet::new())),
         };
 
         runtime.reconcile_stale_containers();

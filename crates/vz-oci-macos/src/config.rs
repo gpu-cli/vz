@@ -79,6 +79,15 @@ pub struct RuntimeConfig {
     pub exec_timeout: Duration,
 }
 
+fn env_duration_secs(key: &str, default_secs: u64) -> Duration {
+    let parsed = std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_secs);
+    Duration::from_secs(parsed)
+}
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
@@ -93,7 +102,9 @@ impl Default for RuntimeConfig {
             default_cpus: 2,
             default_memory_mb: 512,
             default_network_enabled: true,
-            agent_ready_timeout: Duration::from_secs(8),
+            // Cold boots on loaded hosts can exceed 8s; keep this conservative
+            // and allow overrides via `VZ_AGENT_READY_TIMEOUT_SECS`.
+            agent_ready_timeout: env_duration_secs("VZ_AGENT_READY_TIMEOUT_SECS", 20),
             exec_timeout: Duration::from_secs(30),
         }
     }

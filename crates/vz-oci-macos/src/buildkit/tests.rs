@@ -422,3 +422,173 @@ async fn build_manager_streams_events_in_order() {
     assert!(!tail.is_empty());
     assert!(tail.iter().all(|event| event.event_id > cursor));
 }
+
+#[cfg(target_os = "macos")]
+fn parse_opt_in_env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(raw) => matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn buildkit_e2e_opted_in() -> bool {
+    parse_opt_in_env_flag("VZ_TEST_BUILDKIT_E2E")
+}
+
+#[cfg(target_os = "macos")]
+fn buildkit_e2e_registry_push_ref() -> Option<String> {
+    let value = std::env::var("VZ_TEST_BUILDKIT_E2E_PUSH_REF").ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_buildkit_e2e_preconditions(test_name: &str) -> bool {
+    if !buildkit_e2e_opted_in() {
+        eprintln!("skipping {test_name}: set VZ_TEST_BUILDKIT_E2E=1 to opt in");
+        return false;
+    }
+    if std::env::consts::ARCH != "aarch64" {
+        eprintln!(
+            "skipping {test_name}: requires Apple Silicon (found architecture {})",
+            std::env::consts::ARCH
+        );
+        return false;
+    }
+    true
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires Apple Silicon/macOS virtualization; opt in via VZ_TEST_BUILDKIT_E2E=1"]
+async fn buildkit_e2e_oci_tar_output_builds_context_and_streams_events() {
+    let test_name = "buildkit_e2e_oci_tar_output_builds_context_and_streams_events";
+    if !ensure_buildkit_e2e_preconditions(test_name) {
+        return;
+    }
+
+    let tmp = tempdir().unwrap();
+    let context_dir = tmp.path().join("context");
+    fs::create_dir_all(&context_dir).unwrap();
+    fs::write(context_dir.join("payload.txt"), "callback-file-sync\n").unwrap();
+    fs::write(
+        context_dir.join("Dockerfile"),
+        "FROM alpine:3.20\nCOPY payload.txt /payload.txt\nRUN test -f /payload.txt\n",
+    )
+    .unwrap();
+
+    let output_tar = tmp.path().join("output").join("image.tar");
+    let request = BuildRequest {
+        context_dir: context_dir.clone(),
+        dockerfile: PathBuf::from("Dockerfile"),
+        tag: "buildkit-e2e-oci:latest".to_string(),
+        target: None,
+        cache_from: Vec::new(),
+        build_args: BTreeMap::new(),
+        secrets: Vec::new(),
+        no_cache: true,
+        output: BuildOutput::OciTar {
+            dest: output_tar.clone(),
+        },
+        progress: BuildProgress::RawJson,
+    };
+
+    let runtime_config = RuntimeConfig {
+        data_dir: tmp.path().join("runtime"),
+        ..RuntimeConfig::default()
+    };
+    let events = Arc::new(Mutex::new(Vec::<BuildEvent>::new()));
+    let events_sink = events.clone();
+    let mut on_event = move |event: BuildEvent| {
+        events_sink.lock().unwrap().push(event);
+    };
+    let result = build_image_with_events(&runtime_config, request, &mut on_event)
+        .await
+        .unwrap();
+
+    assert_eq!(result.output_path.as_deref(), Some(output_tar.as_path()));
+    assert!(
+        output_tar.is_file(),
+        "expected OCI tar output at {:?}",
+        output_tar
+    );
+    let captured = events.lock().unwrap();
+    assert!(
+        captured
+            .iter()
+            .any(|event| matches!(event, BuildEvent::SolveStatus { .. })),
+        "expected rawjson solve status callbacks during e2e build"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires private registry + credentials; opt in via VZ_TEST_BUILDKIT_E2E=1 and VZ_TEST_BUILDKIT_E2E_PUSH_REF=<registry/ref:tag>"]
+async fn buildkit_e2e_registry_push_mode_supports_auth_and_push_flow() {
+    let test_name = "buildkit_e2e_registry_push_mode_supports_auth_and_push_flow";
+    if !ensure_buildkit_e2e_preconditions(test_name) {
+        return;
+    }
+    let Some(push_ref) = buildkit_e2e_registry_push_ref() else {
+        eprintln!("skipping {test_name}: set VZ_TEST_BUILDKIT_E2E_PUSH_REF=<registry/ref:tag>");
+        return;
+    };
+
+    let tmp = tempdir().unwrap();
+    let context_dir = tmp.path().join("context");
+    fs::create_dir_all(&context_dir).unwrap();
+    fs::write(
+        context_dir.join("Dockerfile"),
+        "FROM alpine:3.20\nRUN echo pushed > /push-check.txt\n",
+    )
+    .unwrap();
+
+    let request = BuildRequest {
+        context_dir,
+        dockerfile: PathBuf::from("Dockerfile"),
+        tag: push_ref,
+        target: None,
+        cache_from: Vec::new(),
+        build_args: BTreeMap::new(),
+        secrets: Vec::new(),
+        no_cache: true,
+        output: BuildOutput::RegistryPush,
+        progress: BuildProgress::RawJson,
+    };
+
+    let runtime_config = RuntimeConfig {
+        data_dir: tmp.path().join("runtime"),
+        ..RuntimeConfig::default()
+    };
+    let events = Arc::new(Mutex::new(Vec::<BuildEvent>::new()));
+    let events_sink = events.clone();
+    let mut on_event = move |event: BuildEvent| {
+        events_sink.lock().unwrap().push(event);
+    };
+    let result = build_image_with_events(&runtime_config, request, &mut on_event)
+        .await
+        .unwrap();
+
+    assert!(
+        result.pushed,
+        "expected registry push mode to mark pushed=true"
+    );
+    if parse_opt_in_env_flag("VZ_TEST_BUILDKIT_E2E_EXPECT_AUTH_STATUS") {
+        let captured = events.lock().unwrap();
+        assert!(
+            captured.iter().any(|event| matches!(
+                event,
+                BuildEvent::Status { message } if message.contains("Using registry credentials")
+            )),
+            "expected auth status callback while pushing with credentials"
+        );
+    }
+}

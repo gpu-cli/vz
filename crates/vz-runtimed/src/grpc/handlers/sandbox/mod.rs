@@ -29,6 +29,17 @@ type CreateSandboxEventStream =
 type TerminateSandboxEventStream =
     tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::TerminateSandboxEvent, Status>>;
 
+fn sandbox_exec_control_debug_enabled() -> bool {
+    std::env::var("VZ_RUNTIMED_EXEC_CONTROL_DEBUG")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn sandbox_shell_stream_from_events<T>(
     events: Vec<Result<T, Status>>,
 ) -> tokio_stream::wrappers::ReceiverStream<Result<T, Status>>
@@ -533,6 +544,7 @@ fn resolve_sandbox_shell_command(
     request_id: &str,
     sandbox: &Sandbox,
 ) -> Result<(String, Vec<String>), Status> {
+    let debug = sandbox_exec_control_debug_enabled();
     let main_container_hint = sandbox
         .spec
         .main_container
@@ -549,6 +561,12 @@ fn resolve_sandbox_shell_command(
         && let Some((command, args)) =
             parse_main_container_startup_command(request_id, &main_container)?
     {
+        if debug {
+            eprintln!(
+                "[vz-runtimed exec-control] resolved sandbox shell command from main_container sandbox_id={} request_id={} command={:?} args={:?}",
+                sandbox.sandbox_id, request_id, command, args
+            );
+        }
         return Ok((command, args));
     }
 
@@ -563,10 +581,14 @@ fn resolve_sandbox_shell_command(
                 .get(SANDBOX_LABEL_BASE_IMAGE_REF)
                 .and_then(|value| normalize_optional_wire_field(value))
         });
-    Ok((
-        default_shell_for_base_image(base_image_ref.as_deref()).to_string(),
-        Vec::new(),
-    ))
+    let command = default_shell_for_base_image(base_image_ref.as_deref()).to_string();
+    if debug {
+        eprintln!(
+            "[vz-runtimed exec-control] resolved sandbox shell command from base_image sandbox_id={} request_id={} base_image_ref={:?} command={:?}",
+            sandbox.sandbox_id, request_id, base_image_ref, command
+        );
+    }
+    Ok((command, Vec::new()))
 }
 
 fn find_attachable_sandbox_container(
@@ -634,7 +656,10 @@ async fn ensure_sandbox_shell_container(
             image_digest: image_ref,
             cmd: default_keepalive_container_cmd(),
             env: std::collections::HashMap::new(),
-            cwd: "/workspace".to_string(),
+            // Keep shell container startup portable across base images.
+            // If no workspace mount exists, forcing `/workspace` can fail
+            // container creation (`ENOENT`) on images that do not ship it.
+            cwd: String::new(),
             user: String::new(),
         }))
         .await?;
@@ -673,28 +698,59 @@ fn find_attachable_sandbox_shell_execution(
     shell_args: &[String],
     request_id: &str,
 ) -> Result<Option<Execution>, Status> {
+    let debug = sandbox_exec_control_debug_enabled();
     let mut executions = daemon
         .with_state_store(|store| store.list_executions())
         .map_err(|error| status_from_stack_error(error, request_id))?
         .into_iter()
         .filter(|execution| {
-            execution.container_id == container_id
-                && !execution.state.is_terminal()
-                && execution_is_sandbox_shell_session(execution, shell_command, shell_args)
+            execution.container_id == container_id && !execution.state.is_terminal()
         })
         .collect::<Vec<_>>();
     executions.sort_by_key(|execution| execution.started_at.unwrap_or_default());
 
     for execution in executions.into_iter().rev() {
+        if !execution_is_sandbox_shell_session(&execution, shell_command, shell_args) {
+            if debug {
+                let shell_env_flag = execution
+                    .exec_spec
+                    .env_override
+                    .get(SANDBOX_SHELL_SESSION_ENV_KEY)
+                    .map(|value| value.as_str());
+                eprintln!(
+                    "[vz-runtimed exec-control] execution not reusable as sandbox shell execution_id={} request_id={} expected_cmd={:?} expected_args={:?} actual_cmd={:?} actual_args={:?} shell_env={:?}",
+                    execution.execution_id,
+                    request_id,
+                    shell_command,
+                    shell_args,
+                    execution.exec_spec.cmd,
+                    execution.exec_spec.args,
+                    shell_env_flag
+                );
+            }
+            continue;
+        }
         let has_session = daemon
             .execution_sessions()
             .contains(&execution.execution_id)
             .map_err(|error| session_registry_status(error, request_id))?;
+        if debug {
+            eprintln!(
+                "[vz-runtimed exec-control] sandbox shell reuse candidate execution_id={} request_id={} has_session={} state={:?}",
+                execution.execution_id, request_id, has_session, execution.state
+            );
+        }
         if has_session {
             return Ok(Some(execution));
         }
     }
 
+    if debug {
+        eprintln!(
+            "[vz-runtimed exec-control] no reusable sandbox shell execution found container_id={} request_id={} expected_cmd={:?} expected_args={:?}",
+            container_id, request_id, shell_command, shell_args
+        );
+    }
     Ok(None)
 }
 
@@ -821,6 +877,66 @@ fn resolve_close_sandbox_shell_execution_id(
     Ok(execution.execution_id)
 }
 
+async fn wait_for_shell_execution_control_ready(
+    daemon: &RuntimeDaemon,
+    execution_id: &str,
+    request_id: &str,
+) -> Result<(), Status> {
+    let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match daemon.manager().write_exec_stdin(execution_id, &[]).await {
+            Ok(()) => return Ok(()),
+            Err(vz_runtime_contract::RuntimeError::UnsupportedOperation { .. }) => {
+                // Some test/backends do not implement interactive execution control.
+                // In those cases, do not block shell-open on stdin readiness probes.
+                return Ok(());
+            }
+            Err(vz_runtime_contract::RuntimeError::ContainerNotFound { id })
+                if id == execution_id =>
+            {
+                let execution = daemon
+                    .with_state_store(|store| store.load_execution(execution_id))
+                    .map_err(|error| status_from_stack_error(error, request_id))?;
+                let Some(execution) = execution else {
+                    return Err(status_from_machine_error(MachineError::new(
+                        MachineErrorCode::NotFound,
+                        format!("execution not found: {execution_id}"),
+                        Some(request_id.to_string()),
+                        BTreeMap::new(),
+                    )));
+                };
+                if execution.state.is_terminal() {
+                    return Err(status_from_machine_error(MachineError::new(
+                        MachineErrorCode::StateConflict,
+                        format!("execution {execution_id} is in terminal state"),
+                        Some(request_id.to_string()),
+                        BTreeMap::new(),
+                    )));
+                }
+                if std::time::Instant::now() >= retry_deadline {
+                    return Err(status_from_machine_error(MachineError::new(
+                        MachineErrorCode::Timeout,
+                        format!(
+                            "execution session did not become stdin-ready in time: {execution_id}"
+                        ),
+                        Some(request_id.to_string()),
+                        BTreeMap::new(),
+                    )));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            Err(error) => {
+                return Err(status_from_machine_error(MachineError::new(
+                    error.machine_code(),
+                    format!("runtime operation `write_exec_stdin` failed: {error}"),
+                    Some(request_id.to_string()),
+                    BTreeMap::new(),
+                )));
+            }
+        }
+    }
+}
+
 async fn ensure_sandbox_shell_execution(
     daemon: Arc<RuntimeDaemon>,
     sandbox: &Sandbox,
@@ -837,10 +953,37 @@ async fn ensure_sandbox_shell_execution(
         shell_args,
         request_id,
     )? {
-        return Ok(existing.execution_id);
+        let existing_execution_id = existing.execution_id.clone();
+        match wait_for_shell_execution_control_ready(
+            daemon.as_ref(),
+            &existing_execution_id,
+            request_id,
+        )
+        .await
+        {
+            Ok(()) => return Ok(existing_execution_id),
+            Err(error) => {
+                warn!(
+                    execution_id = %existing_execution_id,
+                    request_id = %request_id,
+                    error = %error,
+                    "existing sandbox shell execution is not control-ready; creating replacement"
+                );
+                match daemon.execution_sessions().remove(&existing_execution_id) {
+                    Ok(()) | Err(crate::ExecutionSessionRegistryError::NotFound { .. }) => {}
+                    Err(other) => return Err(session_registry_status(other, request_id)),
+                }
+            }
+        }
+    }
+    if sandbox_exec_control_debug_enabled() {
+        eprintln!(
+            "[vz-runtimed exec-control] creating new sandbox shell execution container_id={} request_id={} command={:?} args={:?}",
+            container_id, request_id, shell_command, shell_args
+        );
     }
 
-    let execution_service = super::execution::ExecutionServiceImpl::new(daemon);
+    let execution_service = super::execution::ExecutionServiceImpl::new(daemon.clone());
     let mut env_override = std::collections::HashMap::new();
     env_override.insert(SANDBOX_SHELL_SESSION_ENV_KEY.to_string(), "1".to_string());
     env_override.extend(sandbox_shell_secret_env_reference_overrides(
@@ -870,6 +1013,8 @@ async fn ensure_sandbox_shell_execution(
             BTreeMap::new(),
         ))
     })?;
+    wait_for_shell_execution_control_ready(daemon.as_ref(), &execution.execution_id, request_id)
+        .await?;
     Ok(execution.execution_id)
 }
 

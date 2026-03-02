@@ -104,7 +104,21 @@ fn runtime_operation_status(
     ))
 }
 
-const EXEC_CONTROL_STARTUP_RETRY_MAX_ATTEMPTS: usize = 240;
+fn exec_control_debug_enabled() -> bool {
+    std::env::var("VZ_RUNTIMED_EXEC_CONTROL_DEBUG")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+// Keep daemon-side startup retries short so a single stdin/resize/signal
+// request does not block for many seconds. Clients already implement their
+// own retry loops with execution status checks.
+const EXEC_CONTROL_STARTUP_RETRY_MAX_ATTEMPTS: usize = 32;
 const EXEC_CONTROL_STARTUP_RETRY_DELAY_MS: u64 = 25;
 
 fn is_retryable_exec_control_error(
@@ -354,6 +368,13 @@ async fn execute_backend_execution(
     execution: &Execution,
 ) -> Result<(vz_runtime_contract::ExecOutput, bool), vz_runtime_contract::RuntimeError> {
     let execution_id = execution.execution_id.clone();
+    let debug = exec_control_debug_enabled();
+    if debug {
+        eprintln!(
+            "[vz-runtimed exec-control] execute_backend_execution start execution_id={} container_id={} pty={}",
+            execution.execution_id, execution.container_id, execution.exec_spec.pty
+        );
+    }
     let output = daemon
         .manager()
         .backend()
@@ -379,6 +400,12 @@ async fn execute_backend_execution(
             },
         )
         .await?;
+    if debug {
+        eprintln!(
+            "[vz-runtimed exec-control] execute_backend_execution complete execution_id={} exit_code={}",
+            execution.execution_id, output.exit_code
+        );
+    }
     Ok((output, true))
 }
 
@@ -398,6 +425,12 @@ async fn execute_backend_execution(
 }
 
 async fn run_execution_task(daemon: Arc<RuntimeDaemon>, execution_id: String) {
+    let debug = exec_control_debug_enabled();
+    if debug {
+        eprintln!(
+            "[vz-runtimed exec-control] run_execution_task start execution_id={execution_id}"
+        );
+    }
     let running_execution = match update_execution_running(daemon.as_ref(), &execution_id) {
         Ok(execution) => execution,
         Err(error) => {
@@ -418,8 +451,26 @@ async fn run_execution_task(daemon: Arc<RuntimeDaemon>, execution_id: String) {
         let _ = daemon.execution_sessions().remove(&execution_id);
         return;
     };
+    if debug {
+        eprintln!(
+            "[vz-runtimed exec-control] run_execution_task execution running execution_id={} container_id={}",
+            execution.execution_id, execution.container_id
+        );
+    }
 
     let result = execute_backend_execution(daemon.as_ref(), &execution).await;
+    if debug {
+        match &result {
+            Ok((output, _)) => eprintln!(
+                "[vz-runtimed exec-control] run_execution_task backend result ok execution_id={} exit_code={}",
+                execution.execution_id, output.exit_code
+            ),
+            Err(error) => eprintln!(
+                "[vz-runtimed exec-control] run_execution_task backend result error execution_id={} error={error}",
+                execution.execution_id
+            ),
+        }
+    }
 
     match result {
         Ok((output, emitted_live_events)) => {
@@ -482,9 +533,15 @@ fn maybe_spawn_execution_task(
     execution: &Execution,
     request_id: &str,
 ) -> Result<(), Status> {
-    if !should_start_execution_task(daemon.as_ref(), execution)
-        .map_err(|error| status_from_stack_error(error, request_id))?
-    {
+    let should_start = should_start_execution_task(daemon.as_ref(), execution)
+        .map_err(|error| status_from_stack_error(error, request_id))?;
+    if !should_start {
+        if exec_control_debug_enabled() {
+            eprintln!(
+                "[vz-runtimed exec-control] skipping execution task spawn execution_id={} container_id={} state={:?} (container missing)",
+                execution.execution_id, execution.container_id, execution.state
+            );
+        }
         match daemon.execution_sessions().remove(&execution.execution_id) {
             Ok(()) | Err(crate::ExecutionSessionRegistryError::NotFound { .. }) => {}
             Err(error) => return Err(session_registry_status(error, request_id)),
@@ -796,18 +853,40 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
         };
 
         if execution.state == ExecutionState::Running {
-            let cancel_result = self
-                .daemon
-                .manager()
-                .cancel_exec(&execution.execution_id)
-                .await;
-            if let Err(error) = cancel_result
-                && (!matches!(
-                    error,
-                    vz_runtime_contract::RuntimeError::UnsupportedOperation { .. }
-                ) || !task_abort_result)
-            {
-                return Err(runtime_operation_status(error, "cancel_exec", &request_id));
+            let cancel_result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.daemon.manager().cancel_exec(&execution.execution_id),
+            )
+            .await;
+            match cancel_result {
+                Ok(Ok(())) => {}
+                Ok(Err(error))
+                    if !matches!(
+                        error,
+                        vz_runtime_contract::RuntimeError::UnsupportedOperation { .. }
+                    ) || !task_abort_result =>
+                {
+                    return Err(runtime_operation_status(error, "cancel_exec", &request_id));
+                }
+                Ok(Err(_)) => {}
+                Err(_) if !task_abort_result => {
+                    return Err(status_from_machine_error(MachineError::new(
+                        MachineErrorCode::Timeout,
+                        format!(
+                            "timed out canceling running execution {}",
+                            execution.execution_id
+                        ),
+                        Some(request_id.clone()),
+                        BTreeMap::new(),
+                    )));
+                }
+                Err(_) => {
+                    warn!(
+                        request_id = %request_id,
+                        execution_id = %execution.execution_id,
+                        "cancel_exec timed out; continuing because execution task was already aborted"
+                    );
+                }
             }
         }
 
@@ -980,6 +1059,14 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
             .request_id
             .clone()
             .unwrap_or_else(generate_request_id);
+        let debug = exec_control_debug_enabled();
+        if debug {
+            eprintln!(
+                "[vz-runtimed exec-control] write_exec_stdin received request_id={request_id} execution_id={} bytes={}",
+                request.execution_id,
+                request.data.len()
+            );
+        }
         enforce_mutation_policy_preflight(
             self.daemon.as_ref(),
             RuntimeOperation::WriteExecStdin,
@@ -1028,7 +1115,13 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
         let manager = self.daemon.manager();
         let daemon = self.daemon.clone();
         let data = request.data.clone();
-        run_exec_control_with_startup_retry(
+        if debug {
+            eprintln!(
+                "[vz-runtimed exec-control] write_exec_stdin dispatching to backend request_id={request_id} execution_id={execution_id} bytes={}",
+                data.len()
+            );
+        }
+        let write_result = run_exec_control_with_startup_retry(
             &execution_id,
             "write_exec_stdin",
             || match daemon.execution_sessions().contains(&execution_id) {
@@ -1044,8 +1137,19 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
             },
             || manager.write_exec_stdin(&execution_id, &data),
         )
-        .await
-        .map_err(|error| runtime_operation_status(error, "write_exec_stdin", &request_id))?;
+        .await;
+        if debug {
+            match &write_result {
+                Ok(()) => eprintln!(
+                    "[vz-runtimed exec-control] write_exec_stdin backend call completed request_id={request_id} execution_id={execution_id}"
+                ),
+                Err(error) => eprintln!(
+                    "[vz-runtimed exec-control] write_exec_stdin backend call failed request_id={request_id} execution_id={execution_id} error={error}"
+                ),
+            }
+        }
+        write_result
+            .map_err(|error| runtime_operation_status(error, "write_exec_stdin", &request_id))?;
 
         let now = current_unix_secs();
         let receipt_id = generate_receipt_id();

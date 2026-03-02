@@ -1,4 +1,16 @@
 use super::*;
+
+fn exec_control_debug_enabled() -> bool {
+    std::env::var("VZ_API_EXEC_CONTROL_DEBUG")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 pub(crate) async fn try_create_execution_via_daemon(
     state: &ApiState,
     headers: &HeaderMap,
@@ -349,9 +361,21 @@ pub(crate) async fn try_write_execution_stdin_via_daemon(
     body: &WriteExecStdinRequest,
     request_id: &str,
 ) -> Option<Response> {
+    let debug = exec_control_debug_enabled();
+    if debug {
+        eprintln!(
+            "[vz-api exec-control] write_exec_stdin request_id={request_id} execution_id={execution_id} bytes={}",
+            body.data.len()
+        );
+    }
     let mut client = match DaemonClient::connect_with_config(daemon_client_config(state)).await {
         Ok(client) => client,
         Err(error) => {
+            if debug {
+                eprintln!(
+                    "[vz-api exec-control] daemon connect failed request_id={request_id} execution_id={execution_id} error={error}"
+                );
+            }
             return Some(json_error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "daemon_unavailable",
@@ -366,9 +390,24 @@ pub(crate) async fn try_write_execution_stdin_via_daemon(
         data: body.data.as_bytes().to_vec(),
         metadata: Some(daemon_request_metadata(request_id, None)),
     };
+    if debug {
+        eprintln!(
+            "[vz-api exec-control] forwarding write_exec_stdin to daemon request_id={request_id} execution_id={execution_id}"
+        );
+    }
     match client.write_exec_stdin(grpc_request).await {
         Ok(grpc_response) => {
+            if debug {
+                eprintln!(
+                    "[vz-api exec-control] write_exec_stdin daemon response ok request_id={request_id} execution_id={execution_id}"
+                );
+            }
             let Some(payload) = grpc_response.execution else {
+                if debug {
+                    eprintln!(
+                        "[vz-api exec-control] daemon returned missing execution payload request_id={request_id} execution_id={execution_id}"
+                    );
+                }
                 return Some(json_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal_error",
@@ -392,14 +431,26 @@ pub(crate) async fn try_write_execution_stdin_via_daemon(
             )
         }
         Err(DaemonClientError::Grpc(status)) => {
+            if debug {
+                eprintln!(
+                    "[vz-api exec-control] write_exec_stdin daemon grpc error request_id={request_id} execution_id={execution_id} status={status}"
+                );
+            }
             Some(daemon_status_to_http_response(status, request_id))
         }
-        Err(error) => Some(json_error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "daemon_unavailable",
-            &error.to_string(),
-            request_id,
-        )),
+        Err(error) => {
+            if debug {
+                eprintln!(
+                    "[vz-api exec-control] write_exec_stdin daemon transport error request_id={request_id} execution_id={execution_id} error={error}"
+                );
+            }
+            Some(json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon_unavailable",
+                &error.to_string(),
+                request_id,
+            ))
+        }
     }
 }
 

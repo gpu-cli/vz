@@ -1648,6 +1648,7 @@ async fn daemon_open_sandbox_shell(
                     }
                     Some(runtime_v2::open_sandbox_shell_event::Payload::Completion(done)) => {
                         completion = Some(done);
+                        break;
                     }
                     None => {}
                 }
@@ -1661,7 +1662,17 @@ async fn daemon_open_sandbox_shell(
             spinner.finish_with_elapsed(format!("Shell session ready for {sandbox_id}"));
             Ok(response)
         }
-        ControlPlaneTransport::ApiHttp => api_open_sandbox_shell(sandbox_id).await,
+        ControlPlaneTransport::ApiHttp => {
+            let debug_marker_enabled = std::env::var_os("VZ_ATTACH_READY_MARKER").is_some();
+            if debug_marker_enabled {
+                eprintln!("__VZ_ATTACH_OPEN_SHELL_BEGIN__");
+            }
+            let response = api_open_sandbox_shell(sandbox_id).await;
+            if debug_marker_enabled {
+                eprintln!("__VZ_ATTACH_OPEN_SHELL_END__");
+            }
+            response
+        }
     }
 }
 
@@ -1693,6 +1704,7 @@ async fn daemon_close_sandbox_shell(
                     }
                     Some(runtime_v2::close_sandbox_shell_event::Payload::Completion(done)) => {
                         completion = Some(done);
+                        break;
                     }
                     None => {}
                 }
@@ -2105,6 +2117,459 @@ enum AttachInputEvent {
     Detach,
 }
 
+fn attach_debug_enabled() -> bool {
+    std::env::var("VZ_ATTACH_DEBUG")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn attach_debug_log(message: impl std::fmt::Display) {
+    if attach_debug_enabled() {
+        eprintln!("[vz attach debug] {message}");
+    }
+}
+
+fn format_debug_bytes(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "[]".to_string();
+    }
+
+    let rendered = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("[{rendered}]")
+}
+
+fn attach_input_event_summary(event: &AttachInputEvent) -> String {
+    match event {
+        AttachInputEvent::Bytes(bytes) => {
+            format!(
+                "bytes(len={}, data={})",
+                bytes.len(),
+                format_debug_bytes(bytes)
+            )
+        }
+        AttachInputEvent::Resize { cols, rows } => format!("resize(cols={cols}, rows={rows})"),
+        AttachInputEvent::Detach => "detach".to_string(),
+    }
+}
+
+fn forward_attach_input_via_stdin_bytes(
+    stop_input: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    input_tx: &tokio::sync::mpsc::UnboundedSender<AttachInputEvent>,
+    mut detach_prefix_pending: bool,
+) {
+    use crossterm::event::{self, Event, KeyEventKind};
+    use std::sync::atomic::Ordering;
+
+    let debug = attach_debug_enabled();
+    if debug {
+        eprintln!(
+            "[vz attach debug] input worker started; detach_prefix_pending={detach_prefix_pending}"
+        );
+    }
+
+    while !stop_input.load(Ordering::Relaxed) {
+        let has_event = match event::poll(std::time::Duration::from_millis(100)) {
+            Ok(has_event) => has_event,
+            Err(error) => {
+                if debug {
+                    eprintln!("[vz attach debug] input poll failed: {error}");
+                }
+                break;
+            }
+        };
+        if !has_event {
+            continue;
+        }
+
+        let event = match event::read() {
+            Ok(event) => event,
+            Err(error) => {
+                if debug {
+                    eprintln!("[vz attach debug] input read failed: {error}");
+                }
+                break;
+            }
+        };
+
+        match event {
+            Event::Key(key_event)
+                if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+            {
+                let bytes = key_event_to_bytes(&key_event);
+                if debug {
+                    eprintln!(
+                        "[vz attach debug] key event kind={:?} code={:?} modifiers={:?} -> {}",
+                        key_event.kind,
+                        key_event.code,
+                        key_event.modifiers,
+                        format_debug_bytes(&bytes)
+                    );
+                }
+                if bytes.is_empty() {
+                    if debug {
+                        eprintln!("[vz attach debug] key event mapped to empty byte sequence");
+                    }
+                    continue;
+                }
+
+                let mut forwarded = Vec::with_capacity(bytes.len() + 1);
+                for byte in bytes {
+                    if detach_prefix_pending {
+                        detach_prefix_pending = false;
+                        if is_detach_confirm(&[byte]) {
+                            if debug {
+                                eprintln!(
+                                    "[vz attach debug] detach confirm detected with byte {}",
+                                    format_debug_bytes(&[byte])
+                                );
+                            }
+                            if input_tx.send(AttachInputEvent::Detach).is_err() {
+                                if debug {
+                                    eprintln!(
+                                        "[vz attach debug] failed sending detach event to attach loop"
+                                    );
+                                }
+                                return;
+                            }
+                            continue;
+                        }
+                        if debug {
+                            eprintln!(
+                                "[vz attach debug] detach prefix canceled by non-confirm byte {}; forwarding literal ctrl-p",
+                                format_debug_bytes(&[byte])
+                            );
+                        }
+                        forwarded.push(0x10);
+                    } else if is_detach_prefix(&[byte]) {
+                        detach_prefix_pending = true;
+                        if debug {
+                            eprintln!(
+                                "[vz attach debug] detach prefix detected; waiting for confirm"
+                            );
+                        }
+                        continue;
+                    }
+                    forwarded.push(byte);
+                }
+
+                if !forwarded.is_empty() {
+                    if debug {
+                        eprintln!(
+                            "[vz attach debug] forwarding input bytes {}",
+                            format_debug_bytes(&forwarded)
+                        );
+                    }
+                    if input_tx.send(AttachInputEvent::Bytes(forwarded)).is_err() {
+                        if debug {
+                            eprintln!(
+                                "[vz attach debug] failed sending byte input event to attach loop"
+                            );
+                        }
+                        return;
+                    }
+                }
+            }
+            Event::Resize(cols, rows) => {
+                if detach_prefix_pending {
+                    detach_prefix_pending = false;
+                    if debug {
+                        eprintln!(
+                            "[vz attach debug] resize observed while detach prefix pending; forwarding literal ctrl-p"
+                        );
+                    }
+                    if input_tx.send(AttachInputEvent::Bytes(vec![0x10])).is_err() {
+                        if debug {
+                            eprintln!(
+                                "[vz attach debug] failed sending ctrl-p fallback before resize"
+                            );
+                        }
+                        return;
+                    }
+                }
+                if debug {
+                    eprintln!("[vz attach debug] resize event cols={cols}, rows={rows}");
+                }
+                if input_tx
+                    .send(AttachInputEvent::Resize { cols, rows })
+                    .is_err()
+                {
+                    if debug {
+                        eprintln!("[vz attach debug] failed sending resize event to attach loop");
+                    }
+                    return;
+                }
+            }
+            other => {
+                if debug {
+                    eprintln!("[vz attach debug] ignoring non-key input event: {other:?}");
+                }
+            }
+        }
+    }
+
+    if detach_prefix_pending {
+        if debug {
+            eprintln!(
+                "[vz attach debug] input worker exiting with pending detach prefix; forwarding literal ctrl-p"
+            );
+        }
+        let _ = input_tx.send(AttachInputEvent::Bytes(vec![0x10]));
+    }
+    if debug {
+        eprintln!("[vz attach debug] input worker stopped");
+    }
+}
+
+fn emit_attach_ready_marker_if_configured() {
+    if let Ok(marker) = std::env::var("VZ_ATTACH_READY_MARKER")
+        && !marker.trim().is_empty()
+    {
+        attach_debug_log(format!("emitting attach ready marker `{}`", marker.trim()));
+        eprintln!("{marker}");
+    }
+}
+
+fn redirect_stdin_to_devnull_for_attach_shutdown() {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        if let Ok(devnull) = std::fs::File::open("/dev/null") {
+            #[allow(unsafe_code)]
+            unsafe {
+                let _ = libc::dup2(devnull.as_raw_fd(), libc::STDIN_FILENO);
+            }
+        }
+    }
+}
+
+fn should_ignore_api_attach_control_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("api error not_found")
+        || message.contains("api error failed_precondition")
+        || message.contains("api error state_conflict")
+        || message.contains("execution session is not active")
+        || message.contains("container not found")
+}
+
+fn should_retry_daemon_attach_control_error(error: &DaemonClientError) -> bool {
+    matches!(
+        error,
+        DaemonClientError::Grpc(status)
+            if matches!(
+                status.code(),
+                Code::FailedPrecondition | Code::NotFound | Code::Unavailable
+            )
+    )
+}
+
+async fn write_exec_stdin_with_retry_daemon(
+    client: &mut vz_runtimed_client::DaemonClient,
+    execution_id: &str,
+    bytes: Vec<u8>,
+) -> Result<Option<i32>, DaemonClientError> {
+    let retry_deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let write_result = client
+            .write_exec_stdin(runtime_v2::WriteExecStdinRequest {
+                execution_id: execution_id.to_string(),
+                data: bytes.clone(),
+                metadata: None,
+            })
+            .await;
+        match write_result {
+            Ok(_) => return Ok(None),
+            Err(error) => {
+                if should_retry_daemon_attach_control_error(&error) {
+                    if let Ok(response) = client
+                        .get_execution(runtime_v2::GetExecutionRequest {
+                            execution_id: execution_id.to_string(),
+                            metadata: None,
+                        })
+                        .await
+                        && let Some(execution) = response.execution
+                        && execution_state_is_terminal(execution.state.as_str())
+                    {
+                        return Ok(Some(execution.exit_code));
+                    }
+                    if Instant::now() < retry_deadline {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+async fn resize_exec_pty_with_retry_daemon(
+    client: &mut vz_runtimed_client::DaemonClient,
+    execution_id: &str,
+    cols: u16,
+    rows: u16,
+) -> Result<Option<i32>, DaemonClientError> {
+    let retry_deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let resize_result = client
+            .resize_exec_pty(runtime_v2::ResizeExecPtyRequest {
+                execution_id: execution_id.to_string(),
+                cols: u32::from(cols),
+                rows: u32::from(rows),
+                metadata: None,
+            })
+            .await;
+        match resize_result {
+            Ok(_) => return Ok(None),
+            Err(error) => {
+                if should_retry_daemon_attach_control_error(&error) {
+                    if let Ok(response) = client
+                        .get_execution(runtime_v2::GetExecutionRequest {
+                            execution_id: execution_id.to_string(),
+                            metadata: None,
+                        })
+                        .await
+                        && let Some(execution) = response.execution
+                        && execution_state_is_terminal(execution.state.as_str())
+                    {
+                        return Ok(Some(execution.exit_code));
+                    }
+                    if Instant::now() < retry_deadline {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+async fn write_exec_stdin_with_retry_api(
+    execution_id: &str,
+    bytes: Vec<u8>,
+) -> anyhow::Result<Option<i32>> {
+    let retry_deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let write_result = api_write_exec_stdin(execution_id, bytes.clone()).await;
+        match write_result {
+            Ok(()) => return Ok(None),
+            Err(error) => {
+                if let Ok(Some(execution)) = api_get_execution(execution_id).await
+                    && execution_state_is_terminal(execution.state.as_str())
+                {
+                    return Ok(execution.exit_code);
+                }
+                if should_ignore_api_attach_control_error(&error) && Instant::now() < retry_deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+async fn wait_for_attach_control_ready_daemon(
+    client: &mut vz_runtimed_client::DaemonClient,
+    execution_id: &str,
+) -> Result<(), DaemonClientError> {
+    let retry_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let write_result = client
+            .write_exec_stdin(runtime_v2::WriteExecStdinRequest {
+                execution_id: execution_id.to_string(),
+                data: Vec::new(),
+                metadata: None,
+            })
+            .await;
+        match write_result {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                if let Ok(response) = client
+                    .get_execution(runtime_v2::GetExecutionRequest {
+                        execution_id: execution_id.to_string(),
+                        metadata: None,
+                    })
+                    .await
+                    && let Some(execution) = response.execution
+                    && execution_state_is_terminal(execution.state.as_str())
+                {
+                    return Ok(());
+                }
+
+                if should_retry_daemon_attach_control_error(&error)
+                    && Instant::now() < retry_deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+async fn wait_for_attach_control_ready_api(execution_id: &str) -> anyhow::Result<()> {
+    let retry_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let write_result = api_write_exec_stdin(execution_id, Vec::new()).await;
+        match write_result {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if let Ok(Some(execution)) = api_get_execution(execution_id).await
+                    && execution_state_is_terminal(execution.state.as_str())
+                {
+                    return Ok(());
+                }
+
+                if should_ignore_api_attach_control_error(&error) && Instant::now() < retry_deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+async fn resize_exec_pty_with_retry_api(
+    execution_id: &str,
+    cols: u16,
+    rows: u16,
+) -> anyhow::Result<Option<i32>> {
+    let retry_deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let resize_result = api_resize_exec_pty(execution_id, cols, rows).await;
+        match resize_result {
+            Ok(()) => return Ok(None),
+            Err(error) => {
+                if let Ok(Some(execution)) = api_get_execution(execution_id).await
+                    && execution_state_is_terminal(execution.state.as_str())
+                {
+                    return Ok(execution.exit_code);
+                }
+                if should_ignore_api_attach_control_error(&error) && Instant::now() < retry_deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
 async fn attach_to_execution_interactive(
     state_db: &Path,
     execution_id: &str,
@@ -2121,7 +2586,6 @@ async fn attach_to_execution_interactive_daemon(
     state_db: &Path,
     execution_id: &str,
 ) -> anyhow::Result<SandboxAttachOutcome> {
-    use crossterm::event::{self, Event};
     use crossterm::terminal;
     use std::io::Write;
     use std::sync::{
@@ -2131,6 +2595,7 @@ async fn attach_to_execution_interactive_daemon(
 
     let mut client = connect_control_plane_for_state_db(state_db).await?;
     let execution_id = execution_id.to_string();
+    let debug = attach_debug_enabled();
     let mut stream = client
         .stream_exec_output(runtime_v2::StreamExecOutputRequest {
             execution_id: execution_id.clone(),
@@ -2140,162 +2605,166 @@ async fn attach_to_execution_interactive_daemon(
         .with_context(|| {
             format!("failed to stream sandbox execution output for `{execution_id}`")
         })?;
+    if debug {
+        eprintln!("[vz attach debug] daemon attach stream opened for execution `{execution_id}`");
+    }
 
     terminal::enable_raw_mode().context("failed to enable raw mode")?;
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<AttachInputEvent>();
     let stop_input = Arc::new(AtomicBool::new(false));
     let stop_input_worker = Arc::clone(&stop_input);
     let input_handle = tokio::task::spawn_blocking(move || {
-        let mut detach_prefix_pending = false;
-        loop {
-            if stop_input_worker.load(Ordering::Relaxed) {
-                break;
-            }
-
-            match event::poll(std::time::Duration::from_millis(100)) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(_) => break,
-            }
-
-            match event::read() {
-                Ok(Event::Key(key_event)) => {
-                    let bytes = key_event_to_bytes(&key_event);
-                    if detach_prefix_pending {
-                        detach_prefix_pending = false;
-                        if is_detach_confirm(bytes.as_slice()) {
-                            if input_tx.send(AttachInputEvent::Detach).is_err() {
-                                break;
-                            }
-                            continue;
-                        }
-                        if input_tx.send(AttachInputEvent::Bytes(vec![0x10])).is_err() {
-                            break;
-                        }
-                    } else if is_detach_prefix(bytes.as_slice()) {
-                        detach_prefix_pending = true;
-                        continue;
-                    }
-
-                    if bytes.is_empty() {
-                        continue;
-                    }
-                    if input_tx.send(AttachInputEvent::Bytes(bytes)).is_err() {
-                        break;
-                    }
-                }
-                Ok(Event::Resize(new_cols, new_rows)) => {
-                    if input_tx
-                        .send(AttachInputEvent::Resize {
-                            cols: new_cols,
-                            rows: new_rows,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
+        forward_attach_input_via_stdin_bytes(&stop_input_worker, &input_tx, false);
     });
+    if debug {
+        eprintln!(
+            "[vz attach debug] waiting for daemon attach control readiness for `{execution_id}`"
+        );
+    }
+    wait_for_attach_control_ready_daemon(&mut client, &execution_id)
+        .await
+        .with_context(|| format!("failed to prepare stdin control for `{execution_id}`"))?;
+    if debug {
+        eprintln!("[vz attach debug] daemon attach control ready for `{execution_id}`");
+    }
+    emit_attach_ready_marker_if_configured();
 
     let interaction_result = async {
         let mut stdout = std::io::stdout();
         let mut stderr = std::io::stderr();
         let mut detached = false;
         let mut terminal_exit_code: Option<i32> = None;
+        let mut input_closed = false;
+        let mut status_poll = tokio::time::interval(std::time::Duration::from_millis(500));
+        status_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        if debug {
+            eprintln!("[vz attach debug] daemon attach loop entered for `{execution_id}`");
+        }
         loop {
             tokio::select! {
-                maybe_input = input_rx.recv() => {
+                maybe_input = input_rx.recv(), if !input_closed => {
                     let Some(input) = maybe_input else {
+                        input_closed = true;
+                        if debug {
+                            eprintln!("[vz attach debug] daemon attach input channel closed");
+                        }
                         continue;
                     };
+                    if debug {
+                        eprintln!(
+                            "[vz attach debug] daemon attach input event: {}",
+                            attach_input_event_summary(&input)
+                        );
+                    }
                     match input {
                         AttachInputEvent::Bytes(bytes) => {
-                            let write_result = client
-                                .write_exec_stdin(runtime_v2::WriteExecStdinRequest {
-                                    execution_id: execution_id.clone(),
-                                    data: bytes,
-                                    metadata: None,
-                                })
-                                .await;
-                            if let Err(status) = write_result {
-                                if matches!(
-                                    status,
-                                    DaemonClientError::Grpc(ref grpc_status)
-                                        if matches!(
-                                            grpc_status.code(),
-                                            Code::FailedPrecondition | Code::NotFound
-                                        )
-                                ) {
-                                    if let Ok(response) = client
-                                        .get_execution(runtime_v2::GetExecutionRequest {
-                                            execution_id: execution_id.clone(),
-                                            metadata: None,
-                                        })
-                                        .await
-                                        && let Some(execution) = response.execution
-                                        && execution_state_is_terminal(execution.state.as_str())
-                                    {
-                                        terminal_exit_code = Some(execution.exit_code);
-                                        break;
+                            let write_result = write_exec_stdin_with_retry_daemon(
+                                &mut client,
+                                &execution_id,
+                                bytes,
+                            )
+                            .await;
+                            match write_result {
+                                Ok(Some(exit_code)) => {
+                                    if debug {
+                                        eprintln!("[vz attach debug] stdin write observed terminal execution with exit_code={exit_code}");
+                                    }
+                                    terminal_exit_code = Some(exit_code);
+                                    break;
+                                }
+                                Ok(None) => {
+                                    if debug {
+                                        eprintln!("[vz attach debug] stdin write succeeded");
                                     }
                                 }
-                                return Err(status)
-                                    .with_context(|| format!("failed to write stdin to `{execution_id}`"));
+                                Err(status) => {
+                                    if debug {
+                                        eprintln!("[vz attach debug] stdin write failed: {status}");
+                                    }
+                                    return Err(status).with_context(|| {
+                                        format!("failed to write stdin to `{execution_id}`")
+                                    });
+                                }
                             }
                         }
                         AttachInputEvent::Resize { cols, rows } => {
-                            let resize_result = client
-                                .resize_exec_pty(runtime_v2::ResizeExecPtyRequest {
-                                    execution_id: execution_id.clone(),
-                                    cols: u32::from(cols),
-                                    rows: u32::from(rows),
-                                    metadata: None,
-                                })
-                                .await;
-                            if let Err(status) = resize_result {
-                                if matches!(
-                                    status,
-                                    DaemonClientError::Grpc(ref grpc_status)
-                                        if matches!(
-                                            grpc_status.code(),
-                                            Code::FailedPrecondition | Code::NotFound
-                                        )
-                                ) {
-                                    if let Ok(response) = client
-                                        .get_execution(runtime_v2::GetExecutionRequest {
-                                            execution_id: execution_id.clone(),
-                                            metadata: None,
-                                        })
-                                        .await
-                                        && let Some(execution) = response.execution
-                                        && execution_state_is_terminal(execution.state.as_str())
-                                    {
-                                        terminal_exit_code = Some(execution.exit_code);
-                                        break;
+                            let resize_result = resize_exec_pty_with_retry_daemon(
+                                &mut client,
+                                &execution_id,
+                                cols,
+                                rows,
+                            )
+                            .await;
+                            match resize_result {
+                                Ok(Some(exit_code)) => {
+                                    if debug {
+                                        eprintln!("[vz attach debug] resize observed terminal execution with exit_code={exit_code}");
+                                    }
+                                    terminal_exit_code = Some(exit_code);
+                                    break;
+                                }
+                                Ok(None) => {
+                                    if debug {
+                                        eprintln!("[vz attach debug] resize request succeeded");
                                     }
                                 }
-                                return Err(status)
-                                    .with_context(|| format!("failed to resize PTY for `{execution_id}`"));
+                                Err(status) => {
+                                    if debug {
+                                        eprintln!("[vz attach debug] resize request failed: {status}");
+                                    }
+                                    return Err(status).with_context(|| {
+                                        format!("failed to resize PTY for `{execution_id}`")
+                                    });
+                                }
                             }
                         }
                         AttachInputEvent::Detach => {
+                            if debug {
+                                eprintln!("[vz attach debug] detach event received; exiting attach loop");
+                            }
                             detached = true;
                             break;
                         }
+                    }
+                }
+                _ = status_poll.tick() => {
+                    if let Ok(response) = client
+                        .get_execution(runtime_v2::GetExecutionRequest {
+                            execution_id: execution_id.clone(),
+                            metadata: None,
+                        })
+                        .await
+                        && let Some(execution) = response.execution
+                        && execution_state_is_terminal(execution.state.as_str())
+                    {
+                        if debug {
+                            eprintln!(
+                                "[vz attach debug] status poll observed terminal execution state={} exit_code={}",
+                                execution.state,
+                                execution.exit_code
+                            );
+                        }
+                        terminal_exit_code = Some(execution.exit_code);
+                        break;
                     }
                 }
                 maybe_event = stream.message() => {
                     let maybe_event = maybe_event
                         .with_context(|| format!("failed reading stream for `{execution_id}`"))?;
                     let Some(event) = maybe_event else {
+                        if debug {
+                            eprintln!("[vz attach debug] daemon attach stream ended");
+                        }
                         break;
                     };
                     match event.payload {
                         Some(runtime_v2::exec_output_event::Payload::Stdout(chunk)) => {
+                            if debug {
+                                eprintln!(
+                                    "[vz attach debug] daemon stream stdout chunk len={}",
+                                    chunk.len()
+                                );
+                            }
                             if !chunk.is_empty() {
                                 stdout
                                     .write_all(&chunk)
@@ -2304,6 +2773,12 @@ async fn attach_to_execution_interactive_daemon(
                             }
                         }
                         Some(runtime_v2::exec_output_event::Payload::Stderr(chunk)) => {
+                            if debug {
+                                eprintln!(
+                                    "[vz attach debug] daemon stream stderr chunk len={}",
+                                    chunk.len()
+                                );
+                            }
                             if !chunk.is_empty() {
                                 stderr
                                     .write_all(&chunk)
@@ -2312,16 +2787,29 @@ async fn attach_to_execution_interactive_daemon(
                             }
                         }
                         Some(runtime_v2::exec_output_event::Payload::ExitCode(code)) => {
+                            if debug {
+                                eprintln!("[vz attach debug] daemon stream exit code event={code}");
+                            }
                             terminal_exit_code = Some(code);
                             break;
                         }
                         Some(runtime_v2::exec_output_event::Payload::Error(message)) => {
+                            if debug {
+                                eprintln!("[vz attach debug] daemon stream error event: {message}");
+                            }
                             bail!("sandbox execution `{execution_id}` reported error: {message}");
                         }
                         None => {}
                     }
                 }
             }
+        }
+        if debug {
+            eprintln!(
+                "[vz attach debug] daemon attach loop leaving detached={} terminal_exit_code={:?}",
+                detached,
+                terminal_exit_code
+            );
         }
 
         if terminal_exit_code.is_none() && !detached {
@@ -2333,6 +2821,13 @@ async fn attach_to_execution_interactive_daemon(
                 .await
                 && let Some(execution) = response.execution
             {
+                if debug {
+                    eprintln!(
+                        "[vz attach debug] daemon attach final status check state={} exit_code={}",
+                        execution.state,
+                        execution.exit_code
+                    );
+                }
                 terminal_exit_code = Some(execution.exit_code);
             }
         }
@@ -2343,6 +2838,7 @@ async fn attach_to_execution_interactive_daemon(
 
     terminal::disable_raw_mode().ok();
     stop_input.store(true, Ordering::Relaxed);
+    redirect_stdin_to_devnull_for_attach_shutdown();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), input_handle).await;
     let (detached, terminal_exit_code) = interaction_result?;
 
@@ -2433,7 +2929,6 @@ fn handle_api_execution_stream_event(
 async fn attach_to_execution_interactive_api(
     execution_id: &str,
 ) -> anyhow::Result<SandboxAttachOutcome> {
-    use crossterm::event::{self, Event};
     use crossterm::terminal;
     use std::sync::{
         Arc,
@@ -2441,71 +2936,35 @@ async fn attach_to_execution_interactive_api(
     };
 
     let execution_id = execution_id.to_string();
+    let debug = attach_debug_enabled();
     let mut stream = api_stream_exec_output(&execution_id)
         .await
         .with_context(|| {
             format!("failed to stream sandbox execution output for `{execution_id}`")
         })?;
+    if debug {
+        eprintln!("[vz attach debug] api attach stream opened for execution `{execution_id}`");
+    }
 
     terminal::enable_raw_mode().context("failed to enable raw mode")?;
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<AttachInputEvent>();
     let stop_input = Arc::new(AtomicBool::new(false));
     let stop_input_worker = Arc::clone(&stop_input);
     let input_handle = tokio::task::spawn_blocking(move || {
-        let mut detach_prefix_pending = false;
-        loop {
-            if stop_input_worker.load(Ordering::Relaxed) {
-                break;
-            }
-
-            match event::poll(std::time::Duration::from_millis(100)) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(_) => break,
-            }
-
-            match event::read() {
-                Ok(Event::Key(key_event)) => {
-                    let bytes = key_event_to_bytes(&key_event);
-                    if detach_prefix_pending {
-                        detach_prefix_pending = false;
-                        if is_detach_confirm(bytes.as_slice()) {
-                            if input_tx.send(AttachInputEvent::Detach).is_err() {
-                                break;
-                            }
-                            continue;
-                        }
-                        if input_tx.send(AttachInputEvent::Bytes(vec![0x10])).is_err() {
-                            break;
-                        }
-                    } else if is_detach_prefix(bytes.as_slice()) {
-                        detach_prefix_pending = true;
-                        continue;
-                    }
-
-                    if bytes.is_empty() {
-                        continue;
-                    }
-                    if input_tx.send(AttachInputEvent::Bytes(bytes)).is_err() {
-                        break;
-                    }
-                }
-                Ok(Event::Resize(new_cols, new_rows)) => {
-                    if input_tx
-                        .send(AttachInputEvent::Resize {
-                            cols: new_cols,
-                            rows: new_rows,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
+        forward_attach_input_via_stdin_bytes(&stop_input_worker, &input_tx, false);
     });
+    if debug {
+        eprintln!(
+            "[vz attach debug] waiting for api attach control readiness for `{execution_id}`"
+        );
+    }
+    wait_for_attach_control_ready_api(&execution_id)
+        .await
+        .with_context(|| format!("failed to prepare stdin control for `{execution_id}`"))?;
+    if debug {
+        eprintln!("[vz attach debug] api attach control ready for `{execution_id}`");
+    }
+    emit_attach_ready_marker_if_configured();
 
     let interaction_result = async {
         let mut stdout = std::io::stdout();
@@ -2514,50 +2973,118 @@ async fn attach_to_execution_interactive_api(
         let mut terminal_exit_code: Option<i32> = None;
         let mut pending = Vec::<u8>::new();
         let mut event_data = String::new();
+        let mut input_closed = false;
+        let mut status_poll = tokio::time::interval(std::time::Duration::from_millis(500));
+        status_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        if debug {
+            eprintln!("[vz attach debug] api attach loop entered for `{execution_id}`");
+        }
 
         loop {
             tokio::select! {
-                maybe_input = input_rx.recv() => {
+                maybe_input = input_rx.recv(), if !input_closed => {
                     let Some(input) = maybe_input else {
+                        input_closed = true;
+                        if debug {
+                            eprintln!("[vz attach debug] api attach input channel closed");
+                        }
                         continue;
                     };
+                    if debug {
+                        eprintln!(
+                            "[vz attach debug] api attach input event: {}",
+                            attach_input_event_summary(&input)
+                        );
+                    }
                     match input {
                         AttachInputEvent::Bytes(bytes) => {
-                            let write_result = api_write_exec_stdin(&execution_id, bytes).await;
-                            if let Err(error) = write_result {
-                                if let Ok(Some(execution)) = api_get_execution(&execution_id).await
-                                    && execution_state_is_terminal(execution.state.as_str())
-                                {
-                                    terminal_exit_code = execution.exit_code;
+                            let write_result =
+                                write_exec_stdin_with_retry_api(&execution_id, bytes).await;
+                            match write_result {
+                                Ok(Some(exit_code)) => {
+                                    if debug {
+                                        eprintln!("[vz attach debug] api stdin write observed terminal execution with exit_code={exit_code}");
+                                    }
+                                    terminal_exit_code = Some(exit_code);
                                     break;
                                 }
-                                return Err(error).with_context(|| format!("failed to write stdin to `{execution_id}`"));
+                                Ok(None) => {
+                                    if debug {
+                                        eprintln!("[vz attach debug] api stdin write succeeded");
+                                    }
+                                }
+                                Err(error) => {
+                                    if debug {
+                                        eprintln!("[vz attach debug] api stdin write failed: {error:#}");
+                                    }
+                                    return Err(error).with_context(|| {
+                                        format!("failed to write stdin to `{execution_id}`")
+                                    });
+                                }
                             }
                         }
                         AttachInputEvent::Resize { cols, rows } => {
-                            let resize_result = api_resize_exec_pty(&execution_id, cols, rows).await;
-                            if let Err(error) = resize_result {
-                                if let Ok(Some(execution)) = api_get_execution(&execution_id).await
-                                    && execution_state_is_terminal(execution.state.as_str())
-                                {
-                                    terminal_exit_code = execution.exit_code;
+                            let resize_result =
+                                resize_exec_pty_with_retry_api(&execution_id, cols, rows).await;
+                            match resize_result {
+                                Ok(Some(exit_code)) => {
+                                    if debug {
+                                        eprintln!("[vz attach debug] api resize observed terminal execution with exit_code={exit_code}");
+                                    }
+                                    terminal_exit_code = Some(exit_code);
                                     break;
                                 }
-                                return Err(error).with_context(|| format!("failed to resize PTY for `{execution_id}`"));
+                                Ok(None) => {
+                                    if debug {
+                                        eprintln!("[vz attach debug] api resize request succeeded");
+                                    }
+                                }
+                                Err(error) => {
+                                    if debug {
+                                        eprintln!("[vz attach debug] api resize request failed: {error:#}");
+                                    }
+                                    return Err(error).with_context(|| {
+                                        format!("failed to resize PTY for `{execution_id}`")
+                                    });
+                                }
                             }
                         }
                         AttachInputEvent::Detach => {
+                            if debug {
+                                eprintln!("[vz attach debug] api detach event received; exiting attach loop");
+                            }
                             detached = true;
                             break;
                         }
+                    }
+                }
+                _ = status_poll.tick() => {
+                    if let Ok(Some(execution)) = api_get_execution(&execution_id).await
+                        && execution_state_is_terminal(execution.state.as_str())
+                    {
+                        if debug {
+                            eprintln!(
+                                "[vz attach debug] api status poll observed terminal execution state={} exit_code={:?}",
+                                execution.state,
+                                execution.exit_code
+                            );
+                        }
+                        terminal_exit_code = execution.exit_code;
+                        break;
                     }
                 }
                 maybe_chunk = stream.chunk() => {
                     let maybe_chunk = maybe_chunk
                         .with_context(|| format!("failed reading stream for `{execution_id}`"))?;
                     let Some(chunk) = maybe_chunk else {
+                        if debug {
+                            eprintln!("[vz attach debug] api attach stream ended");
+                        }
                         break;
                     };
+                    if debug {
+                        eprintln!("[vz attach debug] api stream chunk len={}", chunk.len());
+                    }
 
                     pending.extend_from_slice(&chunk);
                     while let Some(line_end) = pending.iter().position(|byte| *byte == b'\n') {
@@ -2582,6 +3109,13 @@ async fn attach_to_execution_interactive_api(
                                     &mut stderr,
                                     &mut terminal_exit_code,
                                 )?;
+                                if debug {
+                                    eprintln!(
+                                        "[vz attach debug] api stream event parsed done={} terminal_exit_code={:?}",
+                                        done,
+                                        terminal_exit_code
+                                    );
+                                }
                                 event_data.clear();
                                 if done {
                                     break;
@@ -2607,6 +3141,13 @@ async fn attach_to_execution_interactive_api(
                 }
             }
         }
+        if debug {
+            eprintln!(
+                "[vz attach debug] api attach loop leaving detached={} terminal_exit_code={:?}",
+                detached,
+                terminal_exit_code
+            );
+        }
 
         if terminal_exit_code.is_none() && !detached {
             if !event_data.is_empty() {
@@ -2620,6 +3161,13 @@ async fn attach_to_execution_interactive_api(
             }
 
             if let Ok(Some(execution)) = api_get_execution(&execution_id).await {
+                if debug {
+                    eprintln!(
+                        "[vz attach debug] api attach final status check state={} exit_code={:?}",
+                        execution.state,
+                        execution.exit_code
+                    );
+                }
                 terminal_exit_code = execution.exit_code;
             }
         }
@@ -2630,6 +3178,7 @@ async fn attach_to_execution_interactive_api(
 
     terminal::disable_raw_mode().ok();
     stop_input.store(true, Ordering::Relaxed);
+    redirect_stdin_to_devnull_for_attach_shutdown();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), input_handle).await;
     let (detached, terminal_exit_code) = interaction_result?;
 

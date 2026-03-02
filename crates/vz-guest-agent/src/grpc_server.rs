@@ -33,9 +33,10 @@ struct PtyMasterHandle {
     master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
-static PTY_HANDLES: OnceLock<StdMutex<HashMap<u64, PtyMasterHandle>>> = OnceLock::new();
+static PTY_HANDLES: OnceLock<StdMutex<HashMap<u64, Arc<StdMutex<PtyMasterHandle>>>>> =
+    OnceLock::new();
 
-fn pty_handles() -> &'static StdMutex<HashMap<u64, PtyMasterHandle>> {
+fn pty_handles() -> &'static StdMutex<HashMap<u64, Arc<StdMutex<PtyMasterHandle>>>> {
     PTY_HANDLES.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
@@ -357,19 +358,27 @@ impl AgentServiceImpl {
 
         let exit_table = process_table;
         tokio::spawn(async move {
-            let exit_code = {
-                let mut table = exit_table.lock().await;
-                if let Some(entry) = table.get_mut(exec_id) {
-                    match entry.child.wait().await {
-                        Ok(status) => status.code().unwrap_or(-1),
-                        Err(e) => {
-                            warn!(exec_id, error = %e, "grpc: wait error");
-                            -1
+            // Never hold the global process table lock while waiting for process exit.
+            // Otherwise a slow/hung non-PTY command can block unrelated PTY exec setup.
+            let exit_code = loop {
+                let poll = {
+                    let mut table = exit_table.lock().await;
+                    let Some(entry) = table.get_mut(exec_id) else {
+                        break -1;
+                    };
+                    match entry.child.try_wait() {
+                        Ok(Some(status)) => Some(status.code().unwrap_or(-1)),
+                        Ok(None) => None,
+                        Err(error) => {
+                            warn!(exec_id, error = %error, "grpc: wait error");
+                            Some(-1)
                         }
                     }
-                } else {
-                    -1
+                };
+                if let Some(code) = poll {
+                    break code;
                 }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             };
 
             let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
@@ -407,6 +416,13 @@ impl AgentServiceImpl {
         use portable_pty::{CommandBuilder, PtySize, native_pty_system};
         use std::io::Read;
 
+        info!(
+            request_id = %request_id,
+            command = %req.command,
+            args = ?req.args,
+            "grpc: pty exec request received"
+        );
+
         let rows = if req.term_rows == 0 {
             24
         } else {
@@ -422,6 +438,12 @@ impl AgentServiceImpl {
         ensure_devpts_ready()?;
 
         let pty_system = native_pty_system();
+        info!(
+            request_id = %request_id,
+            rows,
+            cols,
+            "grpc: opening PTY pair"
+        );
         let pair = pty_system
             .openpty(PtySize {
                 rows: rows as u16,
@@ -430,6 +452,7 @@ impl AgentServiceImpl {
                 pixel_height: 0,
             })
             .map_err(|e| Status::internal(format!("openpty failed: {e}")))?;
+        info!(request_id = %request_id, "grpc: PTY pair opened");
 
         let mut cmd = CommandBuilder::new(&req.command);
         cmd.args(&req.args);
@@ -443,10 +466,16 @@ impl AgentServiceImpl {
             cmd.env(key, value);
         }
 
+        info!(
+            request_id = %request_id,
+            command = %req.command,
+            "grpc: spawning PTY process"
+        );
         let child = pair.slave.spawn_command(cmd).map_err(|e| {
             warn!(command = %req.command, error = %e, "grpc: pty exec spawn failed");
             Status::internal(format!("failed to spawn PTY process: {e}"))
         })?;
+        info!(request_id = %request_id, "grpc: PTY process spawned");
 
         // Drop slave — only the child uses it.
         drop(pair.slave);
@@ -472,10 +501,10 @@ impl AgentServiceImpl {
             let mut handles = pty_handles().lock().unwrap_or_else(|p| p.into_inner());
             handles.insert(
                 exec_id,
-                PtyMasterHandle {
+                Arc::new(StdMutex::new(PtyMasterHandle {
                     writer,
                     master: pair.master,
-                },
+                })),
             );
         }
 
@@ -491,12 +520,14 @@ impl AgentServiceImpl {
         register_exec_order_context(exec_id, ExecOrderContext::new(tx.clone(), request_id));
 
         // Send the first event with exec_id so the client can correlate.
+        info!(exec_id, "grpc: sending initial PTY exec event");
         if let Err(()) =
             send_ordered_exec_event_with_id(exec_id, exec_event::Event::Stdout(Vec::new()), exec_id)
                 .await
         {
             warn!(exec_id, "grpc: failed to send initial pty exec event");
         }
+        info!(exec_id, "grpc: initial PTY exec event sent");
 
         // Spawn blocking reader task. portable-pty gives us a synchronous Read,
         // so we read in a blocking thread and forward chunks as exec events.
@@ -661,6 +692,12 @@ impl agent_service_server::AgentService for AgentServiceImpl {
     ) -> Result<Response<Self::ExecStream>, Status> {
         let req = request.into_inner();
         let request_id = request_id_from_metadata(req.metadata.as_ref(), "exec");
+        info!(
+            request_id = %request_id,
+            allocate_pty = req.allocate_pty,
+            command = %req.command,
+            "grpc: exec request routing"
+        );
 
         if req.allocate_pty {
             self.exec_pty(req, request_id).await
@@ -686,16 +723,23 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         }
 
         // For PTY sessions, write to the master PTY writer.
-        {
-            let mut handles = pty_handles().lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(handle) = handles.get_mut(&req.exec_id) {
+        let pty_handle = {
+            let handles = pty_handles().lock().unwrap_or_else(|p| p.into_inner());
+            handles.get(&req.exec_id).cloned()
+        };
+        if let Some(handle) = pty_handle {
+            let data = req.data.clone();
+            tokio::task::spawn_blocking(move || -> Result<(), Status> {
                 use std::io::Write;
-                handle
+                let mut guard = handle.lock().unwrap_or_else(|p| p.into_inner());
+                guard
                     .writer
-                    .write_all(&req.data)
-                    .map_err(|e| Status::internal(format!("pty write failed: {e}")))?;
-                return Ok(Response::new(StdinWriteResponse {}));
-            }
+                    .write_all(&data)
+                    .map_err(|e| Status::internal(format!("pty write failed: {e}")))
+            })
+            .await
+            .map_err(|error| Status::internal(format!("pty write task failed: {error}")))??;
+            return Ok(Response::new(StdinWriteResponse {}));
         }
 
         let mut table = self.state.process_table.lock().await;
@@ -872,20 +916,28 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         use portable_pty::PtySize;
 
         let req = request.into_inner();
-        let mut handles = pty_handles().lock().unwrap_or_else(|p| p.into_inner());
-        let handle = handles
-            .get_mut(&req.exec_id)
-            .ok_or_else(|| Status::not_found(format!("no PTY for exec {}", req.exec_id)))?;
+        let handle = {
+            let handles = pty_handles().lock().unwrap_or_else(|p| p.into_inner());
+            handles.get(&req.exec_id).cloned()
+        }
+        .ok_or_else(|| Status::not_found(format!("no PTY for exec {}", req.exec_id)))?;
 
-        handle
-            .master
-            .resize(PtySize {
-                rows: req.rows as u16,
-                cols: req.cols as u16,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| Status::internal(format!("pty resize failed: {e}")))?;
+        let rows = req.rows as u16;
+        let cols = req.cols as u16;
+        tokio::task::spawn_blocking(move || -> Result<(), Status> {
+            let guard = handle.lock().unwrap_or_else(|p| p.into_inner());
+            guard
+                .master
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| Status::internal(format!("pty resize failed: {e}")))
+        })
+        .await
+        .map_err(|error| Status::internal(format!("pty resize task failed: {error}")))??;
 
         info!(
             exec_id = req.exec_id,

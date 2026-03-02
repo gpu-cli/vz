@@ -355,6 +355,7 @@ pub(crate) async fn try_open_sandbox_shell_via_daemon(
                     event.payload
                 {
                     completion = Some(done);
+                    break;
                 }
             }
             Ok(None) => break,
@@ -465,6 +466,7 @@ pub(crate) async fn try_close_sandbox_shell_via_daemon(
                     event.payload
                 {
                     completion = Some(done);
+                    break;
                 }
             }
             Ok(None) => break,

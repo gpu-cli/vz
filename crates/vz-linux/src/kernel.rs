@@ -88,14 +88,18 @@ pub async fn ensure_kernel() -> Result<KernelPaths, LinuxError> {
 pub async fn ensure_kernel_with_options(
     options: EnsureKernelOptions,
 ) -> Result<KernelPaths, LinuxError> {
+    let should_probe_workspace_bundle = options.install_dir.is_none();
     let install_dir = match options.install_dir {
         Some(path) => path,
         None => default_linux_dir()?,
     };
     let expected_agent = env!("CARGO_PKG_VERSION").to_string();
-    let bundle_dir = options
+    let mut bundle_dir = options
         .bundle_dir
         .or_else(|| std::env::var_os("VZ_LINUX_BUNDLE_DIR").map(PathBuf::from));
+    if bundle_dir.is_none() && should_probe_workspace_bundle {
+        bundle_dir = workspace_bundle_dir();
+    }
 
     if let Some(bundle_dir) = bundle_dir {
         let bundle = read_kernel_paths(&bundle_dir).await?;
@@ -142,6 +146,25 @@ pub async fn ensure_kernel_with_options(
     }
 
     Err(LinuxError::MissingKernelArtifacts { dir: install_dir })
+}
+
+fn workspace_bundle_dir() -> Option<PathBuf> {
+    workspace_bundle_dir_from_manifest_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
+}
+
+fn workspace_bundle_dir_from_manifest_dir(manifest_dir: &Path) -> Option<PathBuf> {
+    let candidate = manifest_dir.join("../../linux/out");
+    if looks_like_kernel_bundle_dir(&candidate) {
+        std::fs::canonicalize(&candidate).ok().or(Some(candidate))
+    } else {
+        None
+    }
+}
+
+fn looks_like_kernel_bundle_dir(dir: &Path) -> bool {
+    [KERNEL_FILE, INITRAMFS_FILE, YOUKI_FILE, VERSION_FILE]
+        .into_iter()
+        .all(|name| dir.join(name).is_file())
 }
 
 async fn install_from_bundle(bundle_dir: &Path, install_dir: &Path) -> Result<(), LinuxError> {
@@ -523,5 +546,44 @@ mod tests {
         assert_eq!(installed_kernel, b"kernel");
         assert_eq!(paths.version.sha256_vmlinux, Some(sha256(b"kernel")));
         assert_eq!(paths.version.sha256_youki, Some(sha256(b"youki")));
+    }
+
+    #[tokio::test]
+    async fn workspace_bundle_dir_discovery_uses_manifest_relative_linux_out() {
+        let temp = tempdir().expect("tempdir");
+        let manifest_dir = temp.path().join("crates/vz-linux");
+        let bundle = temp.path().join("linux/out");
+        tokio::fs::create_dir_all(&manifest_dir)
+            .await
+            .expect("manifest dir");
+        let expected = env!("CARGO_PKG_VERSION").to_string();
+        write_artifacts(&bundle, expected).await;
+
+        let discovered = workspace_bundle_dir_from_manifest_dir(&manifest_dir);
+        assert_eq!(
+            discovered
+                .as_deref()
+                .and_then(|path| path.canonicalize().ok()),
+            bundle.canonicalize().ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_bundle_dir_discovery_ignores_incomplete_bundle_dir() {
+        let temp = tempdir().expect("tempdir");
+        let manifest_dir = temp.path().join("crates/vz-linux");
+        let bundle = temp.path().join("linux/out");
+        tokio::fs::create_dir_all(&manifest_dir)
+            .await
+            .expect("manifest dir");
+        tokio::fs::create_dir_all(&bundle)
+            .await
+            .expect("bundle dir");
+        tokio::fs::write(bundle.join(KERNEL_FILE), b"kernel")
+            .await
+            .expect("kernel");
+
+        let discovered = workspace_bundle_dir_from_manifest_dir(&manifest_dir);
+        assert!(discovered.is_none());
     }
 }

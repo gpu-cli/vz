@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -24,6 +25,7 @@ use vz_runtimed::{RuntimeDaemon, RuntimedConfig, serve_runtime_uds_with_shutdown
 struct CreateSandboxRequest {
     cpus: u8,
     memory_mb: u64,
+    labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,6 +93,7 @@ async fn start_daemon_for_state_store(
 ) -> Result<(
     Arc<tokio::sync::Notify>,
     tokio::task::JoinHandle<Result<(), vz_runtimed::RuntimedServerError>>,
+    PathBuf,
 )> {
     let runtime_data_dir = state_store_path
         .parent()
@@ -121,11 +124,12 @@ async fn start_daemon_for_state_store(
     });
 
     wait_for_socket(daemon.socket_path()).await?;
-    Ok((shutdown, server))
+    Ok((shutdown, server, daemon.socket_path().to_path_buf()))
 }
 
 async fn start_api_server(
     state_store_path: PathBuf,
+    daemon_socket_path: PathBuf,
 ) -> Result<(
     String,
     tokio::sync::oneshot::Sender<()>,
@@ -133,9 +137,9 @@ async fn start_api_server(
 )> {
     let app = router(ApiConfig {
         state_store_path,
-        daemon_socket_path: None,
-        daemon_runtime_data_dir: None,
-        daemon_auto_spawn: true,
+        daemon_socket_path: Some(daemon_socket_path.clone()),
+        daemon_runtime_data_dir: daemon_socket_path.parent().map(Path::to_path_buf),
+        daemon_auto_spawn: false,
         capabilities: RuntimeCapabilities::default(),
         event_poll_interval: Duration::from_millis(10),
         default_event_page_size: 10,
@@ -167,6 +171,10 @@ async fn create_sandbox_via_api(api_base_url: &str) -> Result<String> {
         .json(&CreateSandboxRequest {
             cpus: 2,
             memory_mb: 512,
+            labels: BTreeMap::from([(
+                "vz.sandbox.base_image_ref".to_string(),
+                "alpine:3.20".to_string(),
+            )]),
         })
         .send()
         .await
@@ -284,42 +292,20 @@ fn transcript_contains(transcript: &Arc<Mutex<Vec<u8>>>, needle: &str) -> bool {
     }
 }
 
+fn transcript_occurrences(transcript: &Arc<Mutex<Vec<u8>>>, needle: &str) -> usize {
+    match transcript.lock() {
+        Ok(buffer) => String::from_utf8_lossy(&buffer)
+            .match_indices(needle)
+            .count(),
+        Err(_) => 0,
+    }
+}
+
 fn transcript_string(transcript: &Arc<Mutex<Vec<u8>>>) -> String {
     match transcript.lock() {
         Ok(buffer) => String::from_utf8_lossy(&buffer).to_string(),
         Err(_) => "<poisoned transcript>".to_string(),
     }
-}
-
-fn wait_for_transcript_contains(
-    transcript: &Arc<Mutex<Vec<u8>>>,
-    needle: &str,
-    timeout: Duration,
-) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if transcript_contains(transcript, needle) {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    bail!("timed out waiting for transcript marker: {needle}");
-}
-
-fn wait_for_pty_exit(
-    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
-    timeout: Duration,
-) -> Result<portable_pty::ExitStatus> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().context("poll pty child status")? {
-            return Ok(status);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    let _ = child.kill();
-    bail!("timed out waiting for attach process to exit");
 }
 
 fn run_attach_detach_flow(
@@ -344,6 +330,9 @@ fn run_attach_detach_flow(
     command.env("VZ_CONTROL_PLANE_TRANSPORT", "api-http");
     command.env("VZ_RUNTIME_API_BASE_URL", api_base_url);
     command.env("HOME", home_dir);
+    command.env("VZ_ATTACH_DEBUG", "1");
+    let attach_ready_marker = "__VZ_ATTACH_READY__";
+    command.env("VZ_ATTACH_READY_MARKER", attach_ready_marker);
 
     let mut child = pair
         .slave
@@ -372,12 +361,48 @@ fn run_attach_detach_flow(
     });
 
     let mut writer = pair.master.take_writer().context("open pty writer")?;
+    let ready_deadline = Instant::now() + Duration::from_secs(180);
+    while Instant::now() < ready_deadline {
+        if let Some(status) = child
+            .try_wait()
+            .context("poll attach process during ready wait")?
+        {
+            bail!(
+                "attach process exited before ready marker with status {}:\n{}",
+                status,
+                transcript_string(&transcript)
+            );
+        }
+        if transcript_contains(&transcript, attach_ready_marker) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if !transcript_contains(&transcript, attach_ready_marker) {
+        bail!(
+            "timed out waiting for attach ready marker:\n{}",
+            transcript_string(&transcript)
+        );
+    }
+
     let token = "__VZ_ATTACH_STREAM_OK__";
     writer
-        .write_all(format!("echo {token}\n").as_bytes())
+        .write_all(format!("printf '{token}\\n{token}\\n'\n").as_bytes())
         .context("write attach stream command")?;
     writer.flush().context("flush attach stream command")?;
-    wait_for_transcript_contains(&transcript, token, Duration::from_secs(10))?;
+    let output_deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < output_deadline {
+        if transcript_occurrences(&transcript, token) >= 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if transcript_occurrences(&transcript, token) < 2 {
+        bail!(
+            "timed out waiting for attach shell command output marker:\n{}",
+            transcript_string(&transcript)
+        );
+    }
 
     writer
         .write_all(&[0x10])
@@ -385,12 +410,26 @@ fn run_attach_detach_flow(
     writer.flush().context("flush detach prefix")?;
     std::thread::sleep(Duration::from_millis(150));
     writer
-        .write_all(&[0x11])
-        .context("send detach confirm Ctrl-Q")?;
+        .write_all(b"q")
+        .context("send detach confirm fallback q")?;
     writer.flush().context("flush detach confirm")?;
     drop(writer);
 
-    let status = wait_for_pty_exit(&mut child, Duration::from_secs(10))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().context("poll pty child status")? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let transcript = transcript_string(&transcript);
+            let _ = child.kill();
+            bail!(
+                "timed out waiting for attach process to exit; transcript so far:\n{}",
+                transcript
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     if !status.success() {
         bail!(
             "detach attach flow should exit successfully, got status {}",
@@ -428,6 +467,9 @@ fn run_attach_non_zero_exit_flow(
     command.env("VZ_CONTROL_PLANE_TRANSPORT", "api-http");
     command.env("VZ_RUNTIME_API_BASE_URL", api_base_url);
     command.env("HOME", home_dir);
+    command.env("VZ_ATTACH_DEBUG", "1");
+    let attach_ready_marker = "__VZ_ATTACH_READY_NONZERO__";
+    command.env("VZ_ATTACH_READY_MARKER", attach_ready_marker);
 
     let mut child = pair
         .slave
@@ -456,13 +498,54 @@ fn run_attach_non_zero_exit_flow(
     });
 
     let mut writer = pair.master.take_writer().context("open pty writer")?;
+    let ready_deadline = Instant::now() + Duration::from_secs(180);
+    while Instant::now() < ready_deadline {
+        if let Some(status) = child
+            .try_wait()
+            .context("poll non-zero attach process during ready wait")?
+        {
+            bail!(
+                "non-zero attach process exited before ready marker with status {}:\n{}",
+                status,
+                transcript_string(&transcript)
+            );
+        }
+        if transcript_contains(&transcript, attach_ready_marker) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if !transcript_contains(&transcript, attach_ready_marker) {
+        bail!(
+            "timed out waiting for non-zero attach ready marker:\n{}",
+            transcript_string(&transcript)
+        );
+    }
+
     writer
         .write_all(b"exit 7\n")
         .context("write non-zero exit command")?;
     writer.flush().context("flush non-zero exit command")?;
-    drop(writer);
 
-    let status = wait_for_pty_exit(&mut child, Duration::from_secs(10))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("poll non-zero attach child status")?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let transcript = transcript_string(&transcript);
+            let _ = child.kill();
+            bail!(
+                "timed out waiting for non-zero attach process to exit; transcript so far:\n{}",
+                transcript
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    drop(writer);
     drop(pair.master);
     reader_handle
         .join()
@@ -482,9 +565,10 @@ async fn cli_api_http_mode_end_to_end_sandbox_and_attach_flow() -> Result<()> {
     std::fs::create_dir_all(&home_dir).context("create isolated HOME directory")?;
     let state_store_path = temp_dir.path().join("state.db");
 
-    let (daemon_shutdown, daemon_server) = start_daemon_for_state_store(&state_store_path).await?;
+    let (daemon_shutdown, daemon_server, daemon_socket_path) =
+        start_daemon_for_state_store(&state_store_path).await?;
     let (api_base_url, api_shutdown_tx, api_server) =
-        start_api_server(state_store_path.clone()).await?;
+        start_api_server(state_store_path.clone(), daemon_socket_path).await?;
 
     let sandbox_id = create_sandbox_via_api(&api_base_url).await?;
     let vz_bin = resolve_vz_binary()?;
@@ -559,7 +643,15 @@ async fn cli_api_http_mode_end_to_end_sandbox_and_attach_flow() -> Result<()> {
         bail!("inspect output sandbox_id mismatch");
     }
 
-    let detach_transcript = run_attach_detach_flow(&vz_bin, &api_base_url, &home_dir, &sandbox_id)?;
+    let detach_transcript = tokio::task::spawn_blocking({
+        let vz_bin = vz_bin.clone();
+        let api_base_url = api_base_url.clone();
+        let home_dir = home_dir.clone();
+        let sandbox_id = sandbox_id.clone();
+        move || run_attach_detach_flow(&vz_bin, &api_base_url, &home_dir, &sandbox_id)
+    })
+    .await
+    .context("join detach attach flow task")??;
     if !detach_transcript.contains("Detached (Ctrl-P Ctrl-Q). Session remains active.") {
         bail!(
             "detach transcript missing detach confirmation:\n{}",
@@ -582,8 +674,15 @@ async fn cli_api_http_mode_end_to_end_sandbox_and_attach_flow() -> Result<()> {
         );
     }
 
-    let (non_zero_status, non_zero_transcript) =
-        run_attach_non_zero_exit_flow(&vz_bin, &api_base_url, &home_dir, &sandbox_id)?;
+    let (non_zero_status, non_zero_transcript) = tokio::task::spawn_blocking({
+        let vz_bin = vz_bin.clone();
+        let api_base_url = api_base_url.clone();
+        let home_dir = home_dir.clone();
+        let sandbox_id = sandbox_id.clone();
+        move || run_attach_non_zero_exit_flow(&vz_bin, &api_base_url, &home_dir, &sandbox_id)
+    })
+    .await
+    .context("join non-zero attach flow task")??;
     if non_zero_status.success() {
         bail!("non-zero attach flow unexpectedly succeeded");
     }

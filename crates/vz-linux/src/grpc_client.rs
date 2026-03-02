@@ -43,6 +43,17 @@ const GUEST_BUILDCTL_BINARY: &str = "/mnt/buildkit-bin/buildctl";
 /// Timeout for establishing the vsock connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn exec_control_debug_enabled() -> bool {
+    std::env::var("VZ_LINUX_EXEC_CONTROL_DEBUG")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Options for guest command execution.
 #[derive(Debug, Clone, Default)]
 pub struct ExecOptions {
@@ -373,14 +384,38 @@ impl GrpcAgentClient {
 
     /// Query runtime state for an OCI container.
     pub async fn oci_state(&mut self, id: String) -> Result<OciContainerState, LinuxError> {
+        let debug = exec_control_debug_enabled();
         let metadata = self.next_transport_metadata(None);
-        let response = self
+        let request_id = metadata.request_id.clone();
+        if debug {
+            eprintln!(
+                "[vz-linux grpc-client] oci_state rpc start container_id={} request_id={}",
+                id, request_id
+            );
+        }
+        let response_result = self
             .oci
             .state(OciStateRequest {
-                container_id: id,
+                container_id: id.clone(),
                 metadata: Some(metadata),
             })
-            .await?;
+            .await;
+        if debug {
+            match &response_result {
+                Ok(response) => {
+                    let state = response.get_ref();
+                    eprintln!(
+                        "[vz-linux grpc-client] oci_state rpc complete container_id={} request_id={} status={} pid={}",
+                        id, request_id, state.status, state.pid
+                    );
+                }
+                Err(error) => eprintln!(
+                    "[vz-linux grpc-client] oci_state rpc failed container_id={} request_id={} error={error}",
+                    id, request_id
+                ),
+            }
+        }
+        let response = response_result?;
         let state = response.into_inner();
         Ok(OciContainerState {
             id: state.container_id,
@@ -521,14 +556,33 @@ impl GrpcAgentClient {
 
     /// Write data to a running exec's stdin.
     pub async fn stdin_write(&mut self, exec_id: u64, data: &[u8]) -> Result<(), LinuxError> {
+        let debug = exec_control_debug_enabled();
+        if debug {
+            eprintln!(
+                "[vz-linux grpc-client] stdin_write rpc start exec_id={exec_id} bytes={}",
+                data.len()
+            );
+        }
         let metadata = self.next_transport_metadata(None);
-        self.agent
+        let rpc_result = self
+            .agent
             .stdin_write(StdinWriteRequest {
                 exec_id,
                 data: data.to_vec(),
                 metadata: Some(metadata),
             })
-            .await?;
+            .await;
+        if debug {
+            match &rpc_result {
+                Ok(_) => {
+                    eprintln!("[vz-linux grpc-client] stdin_write rpc complete exec_id={exec_id}")
+                }
+                Err(error) => eprintln!(
+                    "[vz-linux grpc-client] stdin_write rpc failed exec_id={exec_id} error={error}"
+                ),
+            }
+        }
+        rpc_result?;
         Ok(())
     }
 
@@ -588,13 +642,23 @@ impl GrpcAgentClient {
         rows: u32,
         cols: u32,
     ) -> Result<(GrpcExecStream, u64), LinuxError> {
+        let debug = exec_control_debug_enabled();
         let env = options.env.into_iter().collect::<HashMap<String, String>>();
         let metadata = self.next_transport_metadata(Some(RuntimeOperation::ExecContainer));
+        let request_id = metadata.request_id.clone();
         let expected_request_id = if metadata.request_id.is_empty() {
             None
         } else {
             Some(metadata.request_id.clone())
         };
+        let command_debug = command.clone();
+        let args_debug = args.clone();
+        if debug {
+            eprintln!(
+                "[vz-linux grpc-client] exec_stream_interactive rpc start request_id={} command={:?} args={:?} rows={} cols={}",
+                request_id, command_debug, args_debug, rows, cols
+            );
+        }
 
         let request = ProtoExecRequest {
             command,
@@ -608,17 +672,70 @@ impl GrpcAgentClient {
             term_cols: cols,
         };
 
-        let response = self.agent.exec(request).await?;
+        let response_result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), self.agent.exec(request))
+                .await;
+        if debug {
+            match &response_result {
+                Ok(Ok(_)) => eprintln!(
+                    "[vz-linux grpc-client] exec_stream_interactive rpc accepted request_id={}",
+                    request_id
+                ),
+                Ok(Err(error)) => eprintln!(
+                    "[vz-linux grpc-client] exec_stream_interactive rpc failed request_id={} error={error}",
+                    request_id
+                ),
+                Err(_) => eprintln!(
+                    "[vz-linux grpc-client] exec_stream_interactive rpc timeout waiting for headers request_id={}",
+                    request_id
+                ),
+            }
+        }
+        let response = match response_result {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => {
+                return Err(LinuxError::Protocol(
+                    "timeout waiting for interactive exec RPC headers from guest".to_string(),
+                ));
+            }
+        };
         let inner_stream = response.into_inner();
 
-        let (stream, exec_id) = tokio::time::timeout(
+        let interactive_result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             GrpcExecStream::new_interactive(inner_stream, expected_request_id),
         )
-        .await
-        .map_err(|_| {
-            LinuxError::Protocol("timeout waiting for initial exec event from guest".to_string())
-        })??;
+        .await;
+        let (stream, exec_id) = match interactive_result {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => {
+                if debug {
+                    eprintln!(
+                        "[vz-linux grpc-client] exec_stream_interactive initial event error request_id={} error={error}",
+                        request_id
+                    );
+                }
+                return Err(error);
+            }
+            Err(_) => {
+                if debug {
+                    eprintln!(
+                        "[vz-linux grpc-client] exec_stream_interactive initial event timeout request_id={}",
+                        request_id
+                    );
+                }
+                return Err(LinuxError::Protocol(
+                    "timeout waiting for initial exec event from guest".to_string(),
+                ));
+            }
+        };
+        if debug {
+            eprintln!(
+                "[vz-linux grpc-client] exec_stream_interactive ready request_id={} exec_id={}",
+                request_id, exec_id
+            );
+        }
 
         Ok((stream, exec_id))
     }

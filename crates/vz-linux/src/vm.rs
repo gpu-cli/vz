@@ -14,6 +14,17 @@ const AGENT_POLL_INITIAL: Duration = Duration::from_millis(50);
 const AGENT_POLL_MAX: Duration = Duration::from_secs(1);
 const AGENT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 
+fn exec_control_debug_enabled() -> bool {
+    std::env::var("VZ_LINUX_EXEC_CONTROL_DEBUG")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Linux VM wrapper with guest-agent readiness helpers.
 ///
 /// Internally holds a [`GrpcAgentClient`] for all guest communication.
@@ -376,12 +387,29 @@ impl LinuxVm {
 
     /// Query container state from the guest OCI runtime.
     pub async fn oci_state(&self, id: String) -> Result<OciContainerState, LinuxError> {
+        let debug = exec_control_debug_enabled();
+        if debug {
+            eprintln!("[vz-linux exec-control] oci_state start container_id={id}");
+        }
         self.ensure_grpc().await?;
         let mut grpc = self.grpc.lock().await;
         let client = grpc
             .as_mut()
             .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
-        client.oci_state(id).await
+        let state_result = client.oci_state(id.clone()).await;
+        if debug {
+            match &state_result {
+                Ok(state) => eprintln!(
+                    "[vz-linux exec-control] oci_state complete container_id={} status={} pid={:?}",
+                    id, state.status, state.pid
+                ),
+                Err(error) => eprintln!(
+                    "[vz-linux exec-control] oci_state failed container_id={} error={error}",
+                    id
+                ),
+            }
+        }
+        state_result
     }
 
     /// Execute a command in a running guest OCI container.
@@ -467,29 +495,63 @@ impl LinuxVm {
         rows: u32,
         cols: u32,
     ) -> Result<(crate::grpc_client::GrpcExecStream, u64), LinuxError> {
-        self.ensure_grpc().await?;
-        let mut grpc = self.grpc.lock().await;
-        let client = grpc
-            .as_mut()
-            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
+        let debug = exec_control_debug_enabled();
+        if debug {
+            eprintln!(
+                "[vz-linux exec-control] exec_interactive start command={:?} args={:?} rows={} cols={} cwd={:?}",
+                command, args, rows, cols, working_dir
+            );
+        }
+        let mut client =
+            GrpcAgentClient::connect(Arc::clone(&self.vm), vz::protocol::AGENT_PORT).await?;
+        client.ping().await?;
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let options = ExecOptions {
             working_dir: working_dir.map(|s| s.to_string()),
             ..ExecOptions::default()
         };
-        client
+        let interactive_result = client
             .exec_stream_interactive(command.to_string(), args_owned, options, rows, cols)
-            .await
+            .await;
+        if debug {
+            match &interactive_result {
+                Ok((_, exec_id)) => {
+                    eprintln!("[vz-linux exec-control] exec_interactive complete exec_id={exec_id}")
+                }
+                Err(error) => {
+                    eprintln!("[vz-linux exec-control] exec_interactive failed error={error}")
+                }
+            }
+        }
+        interactive_result
     }
 
     /// Write data to a running exec's stdin (or PTY master).
     pub async fn stdin_write(&self, exec_id: u64, data: &[u8]) -> Result<(), LinuxError> {
+        let debug = exec_control_debug_enabled();
+        if debug {
+            eprintln!(
+                "[vz-linux exec-control] stdin_write start exec_id={exec_id} bytes={}",
+                data.len()
+            );
+        }
         self.ensure_grpc().await?;
         let mut grpc = self.grpc.lock().await;
         let client = grpc
             .as_mut()
             .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
-        client.stdin_write(exec_id, data).await
+        let write_result = client.stdin_write(exec_id, data).await;
+        if debug {
+            match &write_result {
+                Ok(()) => {
+                    eprintln!("[vz-linux exec-control] stdin_write complete exec_id={exec_id}")
+                }
+                Err(error) => eprintln!(
+                    "[vz-linux exec-control] stdin_write failed exec_id={exec_id} error={error}"
+                ),
+            }
+        }
+        write_result
     }
 
     /// Close a running exec's stdin.

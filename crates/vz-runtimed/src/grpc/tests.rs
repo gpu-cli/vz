@@ -1449,6 +1449,10 @@ async fn open_sandbox_shell_creates_container_and_resolves_default_shell() {
         .expect("load container from state store")
         .expect("container should be persisted");
     assert_eq!(persisted.sandbox_id, sandbox.sandbox_id);
+    assert!(
+        persisted.container_spec.cwd.is_none(),
+        "sandbox shell keepalive container should not force `/workspace` cwd when no workspace mount is configured"
+    );
     let persisted_execution = daemon
         .with_state_store(|store| store.load_execution(&opened.execution_id))
         .expect("load execution from state store")
