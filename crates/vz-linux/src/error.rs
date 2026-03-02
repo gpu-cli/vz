@@ -48,6 +48,17 @@ pub enum LinuxError {
     #[error("guest agent reported unexpected os: {0}")]
     UnexpectedGuestOs(String),
 
+    /// Guest protocol revision does not match host expectations.
+    #[error(
+        "guest agent protocol revision mismatch: expected {expected}, found {found}; rebuild guest artifacts (e.g. `make -C linux initramfs`) and ensure runtime uses updated bundle"
+    )]
+    GuestProtocolRevisionMismatch {
+        /// Host-required protocol revision.
+        expected: u32,
+        /// Guest-reported protocol revision.
+        found: u32,
+    },
+
     /// Guest agent did not become reachable in time.
     #[error("guest agent unreachable after {attempts} attempts: {last_error}")]
     AgentUnreachable {

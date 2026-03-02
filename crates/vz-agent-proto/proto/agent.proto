@@ -88,6 +88,9 @@ message SystemInfoResponse {
   uint64 memory_bytes = 2;
   uint64 disk_free_bytes = 3;
   string os_version = 4;
+  // Explicit host/guest compatibility revision for startup gating.
+  // Hosts should fail fast when this does not match expected value.
+  uint32 agent_protocol_revision = 5;
 }
 
 message ResourceStatsRequest {}

@@ -661,6 +661,7 @@ impl agent_service_server::AgentService for AgentServiceImpl {
             memory_bytes,
             disk_free_bytes,
             os_version,
+            agent_protocol_revision: vz_agent_proto::AGENT_PROTOCOL_REVISION,
         }))
     }
 

@@ -14,6 +14,12 @@ pub mod vz {
 /// Convenience re-export so consumers can write `use vz_agent_proto::*`.
 pub use vz::agent::v1::*;
 
+/// Host/guest protocol compatibility revision.
+///
+/// Increment this when startup-time host assumptions require a newer guest
+/// agent capability/behavior, even if crate semver remains unchanged.
+pub const AGENT_PROTOCOL_REVISION: u32 = 1;
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -38,6 +44,7 @@ mod tests {
             memory_bytes: 8_589_934_592,
             disk_free_bytes: 50_000_000_000,
             os_version: "Linux 6.1".to_string(),
+            agent_protocol_revision: AGENT_PROTOCOL_REVISION,
         };
         let encoded = msg.encode_to_vec();
         let decoded = SystemInfoResponse::decode(encoded.as_slice()).unwrap();

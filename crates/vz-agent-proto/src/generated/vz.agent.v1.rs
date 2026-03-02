@@ -15,6 +15,10 @@ pub struct SystemInfoResponse {
     pub disk_free_bytes: u64,
     #[prost(string, tag = "4")]
     pub os_version: ::prost::alloc::string::String,
+    /// Explicit host/guest compatibility revision for startup gating.
+    /// Hosts should fail fast when this does not match expected value.
+    #[prost(uint32, tag = "5")]
+    pub agent_protocol_revision: u32,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct ResourceStatsRequest {}

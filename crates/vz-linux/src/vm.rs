@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 use vz::Vm;
 use vz::protocol::{ExecEvent, ExecOutput, NetworkServiceConfig, OciContainerState, OciExecResult};
+use vz_agent_proto::SystemInfoResponse;
 
 use crate::grpc_client::{GrpcAgentClient, GrpcPortForwardStream};
 use crate::{ExecOptions, LinuxError, LinuxVmConfig, OciExecOptions};
@@ -23,6 +24,22 @@ fn exec_control_debug_enabled() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn validate_guest_system_info(info: &SystemInfoResponse) -> Result<(), LinuxError> {
+    if !info.os_version.to_lowercase().contains("linux") {
+        return Err(LinuxError::UnexpectedGuestOs(info.os_version.clone()));
+    }
+
+    let expected_revision = vz_agent_proto::AGENT_PROTOCOL_REVISION;
+    if info.agent_protocol_revision != expected_revision {
+        return Err(LinuxError::GuestProtocolRevisionMismatch {
+            expected: expected_revision,
+            found: info.agent_protocol_revision,
+        });
+    }
+
+    Ok(())
 }
 
 /// Linux VM wrapper with guest-agent readiness helpers.
@@ -176,11 +193,9 @@ impl LinuxVm {
 
                 // Verify guest OS via system_info.
                 let info = client.system_info().await?;
-                if !info.os_version.to_lowercase().contains("linux") {
-                    return Err(LinuxError::UnexpectedGuestOs(info.os_version));
-                }
+                validate_guest_system_info(&info)?;
 
-                Ok(client)
+                Ok::<GrpcAgentClient, LinuxError>(client)
             })
             .await;
 
@@ -229,6 +244,8 @@ impl LinuxVm {
             let mut client =
                 GrpcAgentClient::connect(Arc::clone(&self.vm), vz::protocol::AGENT_PORT).await?;
             client.ping().await?;
+            let info = client.system_info().await?;
+            validate_guest_system_info(&info)?;
             *grpc = Some(client);
         }
         Ok(())
@@ -505,6 +522,8 @@ impl LinuxVm {
         let mut client =
             GrpcAgentClient::connect(Arc::clone(&self.vm), vz::protocol::AGENT_PORT).await?;
         client.ping().await?;
+        let info = client.system_info().await?;
+        validate_guest_system_info(&info)?;
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let options = ExecOptions {
             working_dir: working_dir.map(|s| s.to_string()),
@@ -602,5 +621,47 @@ impl LinuxVm {
     /// Borrow the Linux VM config.
     pub fn config(&self) -> &LinuxVmConfig {
         &self.config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    fn sample_info() -> SystemInfoResponse {
+        SystemInfoResponse {
+            cpu_count: 4,
+            memory_bytes: 8_589_934_592,
+            disk_free_bytes: 50_000_000_000,
+            os_version: "Linux 6.12".to_string(),
+            agent_protocol_revision: vz_agent_proto::AGENT_PROTOCOL_REVISION,
+        }
+    }
+
+    #[test]
+    fn validate_guest_system_info_accepts_expected_revision_and_linux_os() {
+        let info = sample_info();
+        validate_guest_system_info(&info).expect("valid guest system info");
+    }
+
+    #[test]
+    fn validate_guest_system_info_rejects_non_linux_os() {
+        let mut info = sample_info();
+        info.os_version = "Darwin 25.0".to_string();
+        let error = validate_guest_system_info(&info).expect_err("must reject non-linux guest");
+        assert!(matches!(error, LinuxError::UnexpectedGuestOs(_)));
+    }
+
+    #[test]
+    fn validate_guest_system_info_rejects_protocol_revision_mismatch() {
+        let mut info = sample_info();
+        info.agent_protocol_revision = vz_agent_proto::AGENT_PROTOCOL_REVISION.saturating_add(1);
+        let error = validate_guest_system_info(&info).expect_err("must reject revision mismatch");
+        assert!(matches!(
+            error,
+            LinuxError::GuestProtocolRevisionMismatch { .. }
+        ));
     }
 }
