@@ -34,28 +34,21 @@ pub(crate) async fn try_create_sandbox_via_daemon(
             }
         }
     };
-    let mut labels: HashMap<String, String> = body.labels.into_iter().collect();
-    let project_dir = body
-        .project_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            labels
-                .get(SANDBOX_LABEL_PROJECT_DIR)
-                .map(String::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        });
-    if let Some(project_dir) = project_dir {
-        labels.insert(SANDBOX_LABEL_PROJECT_DIR.to_string(), project_dir);
-        labels.insert(
-            SANDBOX_LABEL_SPACE_MODE.to_string(),
-            SANDBOX_SPACE_MODE_REQUIRED.to_string(),
-        );
+    let project_dir = body.project_dir.trim();
+    if project_dir.is_empty() {
+        return Some(json_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "project_dir is required and cannot be empty",
+            request_id,
+        ));
     }
+    let mut labels: HashMap<String, String> = body.labels.into_iter().collect();
+    labels.insert(SANDBOX_LABEL_PROJECT_DIR.to_string(), project_dir.to_string());
+    labels.insert(
+        SANDBOX_LABEL_SPACE_MODE.to_string(),
+        SANDBOX_SPACE_MODE_REQUIRED.to_string(),
+    );
     if let Some(original_stack_name) = body.stack_name.clone() {
         labels.insert("stack_name".to_string(), original_stack_name);
     }

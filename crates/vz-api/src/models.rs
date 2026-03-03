@@ -183,8 +183,7 @@ pub(crate) struct StackRunContainerResponse {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct CreateSandboxRequest {
-    #[serde(default)]
-    pub(crate) project_dir: Option<String>,
+    pub(crate) project_dir: String,
     #[serde(default)]
     pub(crate) stack_name: Option<String>,
     #[serde(default)]
