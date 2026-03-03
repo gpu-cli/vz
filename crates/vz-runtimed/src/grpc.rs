@@ -189,7 +189,10 @@ async fn run_maintenance_loop(
                         warn!(error = %error, "daemon maintenance: failed to clean expired idempotency keys");
                     }
                 }
-                match daemon.with_state_store(|store| store.compact_checkpoints_default()) {
+                let checkpoint_policy = daemon.checkpoint_retention_policy();
+                match daemon
+                    .with_state_store(|store| store.compact_checkpoints_with_policy(checkpoint_policy))
+                {
                     Ok(report) => {
                         if !report.is_empty() {
                             debug!(

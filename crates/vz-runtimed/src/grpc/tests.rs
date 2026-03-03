@@ -6504,6 +6504,71 @@ async fn maintenance_loop_compacts_checkpoints_and_receipts() {
     assert!(result.is_ok());
 }
 
+#[tokio::test]
+async fn maintenance_loop_uses_configured_checkpoint_retention_policy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(
+        RuntimeDaemon::start_with_checkpoint_retention_policy(
+            config.clone(),
+            vz_stack::CheckpointRetentionPolicy {
+                max_untagged_count: usize::MAX,
+                max_age_secs: u64::MAX,
+            },
+        )
+        .expect("daemon start"),
+    );
+    daemon
+        .with_state_store(|store| {
+            store.save_checkpoint(&vz_runtime_contract::Checkpoint {
+                checkpoint_id: "ckpt-ancient".to_string(),
+                sandbox_id: "sbx-retention".to_string(),
+                parent_checkpoint_id: None,
+                class: vz_runtime_contract::CheckpointClass::FsQuick,
+                state: vz_runtime_contract::CheckpointState::Ready,
+                created_at: 1,
+                compatibility_fingerprint: "fp-ancient".to_string(),
+            })?;
+            Ok(())
+        })
+        .expect("seed retention records");
+
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let checkpoint_exists = daemon
+        .with_state_store(|store| Ok(store.load_checkpoint("ckpt-ancient")?.is_some()))
+        .expect("query retention cleanup state");
+    assert!(
+        checkpoint_exists,
+        "custom checkpoint retention policy was not honored by maintenance loop"
+    );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_create_without_idempotency_returns_conflict_not_internal() {
     let tmp = tempfile::tempdir().expect("tempdir");

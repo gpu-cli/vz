@@ -134,6 +134,7 @@ pub struct RuntimeDaemon {
     state_store: Mutex<StateStore>,
     execution_sessions: ExecutionSessionRegistry,
     placement_scheduler: PlacementScheduler,
+    checkpoint_retention_policy: vz_stack::CheckpointRetentionPolicy,
     sandbox_startup_policy: SandboxStartupPolicy,
     policy_hook: Arc<dyn RuntimePolicyHook>,
     policy_hash: Option<String>,
@@ -146,13 +147,46 @@ pub struct RuntimeDaemon {
 impl RuntimeDaemon {
     /// Start the daemon runtime owner with the host platform backend.
     pub fn start(config: RuntimedConfig) -> Result<Self, RuntimedError> {
-        Self::start_with_policy_hook(config, Arc::new(AllowAllPolicyHook), None)
+        Self::start_with_policy_hook_and_retention(
+            config,
+            Arc::new(AllowAllPolicyHook),
+            None,
+            vz_stack::CheckpointRetentionPolicy::default(),
+        )
     }
 
+    /// Start the daemon with an explicit checkpoint retention policy.
+    pub fn start_with_checkpoint_retention_policy(
+        config: RuntimedConfig,
+        checkpoint_retention_policy: vz_stack::CheckpointRetentionPolicy,
+    ) -> Result<Self, RuntimedError> {
+        Self::start_with_policy_hook_and_retention(
+            config,
+            Arc::new(AllowAllPolicyHook),
+            None,
+            checkpoint_retention_policy,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-backend"))]
     pub(crate) fn start_with_policy_hook(
         config: RuntimedConfig,
         policy_hook: Arc<dyn RuntimePolicyHook>,
         policy_hash: Option<String>,
+    ) -> Result<Self, RuntimedError> {
+        Self::start_with_policy_hook_and_retention(
+            config,
+            policy_hook,
+            policy_hash,
+            vz_stack::CheckpointRetentionPolicy::default(),
+        )
+    }
+
+    pub(crate) fn start_with_policy_hook_and_retention(
+        config: RuntimedConfig,
+        policy_hook: Arc<dyn RuntimePolicyHook>,
+        policy_hash: Option<String>,
+        checkpoint_retention_policy: vz_stack::CheckpointRetentionPolicy,
     ) -> Result<Self, RuntimedError> {
         ensure_parent_dir(&config.state_store_path).map_err(|source| {
             RuntimedError::CreateStateStoreDir {
@@ -276,6 +310,8 @@ impl RuntimeDaemon {
             sandbox_default_base_image_ref = sandbox_startup_policy.default_base_image_ref.as_deref().unwrap_or(""),
             sandbox_default_main_container = sandbox_startup_policy.default_main_container.as_deref().unwrap_or(""),
             sandbox_legacy_base_default_enabled = sandbox_startup_policy.legacy_default_base_image_enabled,
+            checkpoint_retention_max_untagged_count = checkpoint_retention_policy.max_untagged_count,
+            checkpoint_retention_max_age_secs = checkpoint_retention_policy.max_age_secs,
             runtime_data_dir = %config.runtime_data_dir.display(),
             socket_path = %config.socket_path.display(),
             "vz-runtimed started"
@@ -287,6 +323,7 @@ impl RuntimeDaemon {
             state_store: Mutex::new(state_store),
             execution_sessions: ExecutionSessionRegistry::default(),
             placement_scheduler,
+            checkpoint_retention_policy,
             sandbox_startup_policy,
             policy_hook,
             policy_hash,
@@ -400,6 +437,10 @@ impl RuntimeDaemon {
             self.state_store_path(),
             StateStorePragmas::daemon_defaults(),
         )
+    }
+
+    pub(crate) fn checkpoint_retention_policy(&self) -> vz_stack::CheckpointRetentionPolicy {
+        self.checkpoint_retention_policy
     }
 
     pub(crate) fn refresh_placement_snapshot(&self) -> Result<PlacementSnapshot, StackError> {

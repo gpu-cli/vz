@@ -799,12 +799,10 @@ fn load_checkpoint_retention_states(
     daemon: &RuntimeDaemon,
     request_id: &str,
 ) -> Result<HashMap<String, vz_stack::CheckpointRetentionState>, Status> {
+    let checkpoint_policy = daemon.checkpoint_retention_policy();
     daemon
         .with_state_store(|store| {
-            store.checkpoint_retention_state_map(
-                vz_stack::CheckpointRetentionPolicy::default(),
-                current_unix_secs(),
-            )
+            store.checkpoint_retention_state_map(checkpoint_policy, current_unix_secs())
         })
         .map_err(|error| status_from_stack_error(error, request_id))
 }

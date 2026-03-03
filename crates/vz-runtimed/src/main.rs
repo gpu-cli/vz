@@ -9,6 +9,7 @@ use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use vz_runtimed::{RuntimeDaemon, RuntimedConfig, serve_runtime_uds_with_shutdown};
+use vz_stack::CheckpointRetentionPolicy;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -28,6 +29,14 @@ struct Cli {
     /// Unix domain socket path for Runtime V2 gRPC.
     #[arg(long, default_value = ".vz-runtime/runtimed.sock")]
     socket_path: PathBuf,
+
+    /// Maximum retained untagged checkpoints in daemon GC loop.
+    #[arg(long, default_value_t = 128)]
+    checkpoint_retention_max_untagged_count: usize,
+
+    /// Maximum age (seconds) for untagged checkpoints in daemon GC loop.
+    #[arg(long, default_value_t = 30 * 24 * 3600)]
+    checkpoint_retention_max_age_secs: u64,
 }
 
 #[tokio::main]
@@ -36,11 +45,17 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let daemon = Arc::new(
-        RuntimeDaemon::start(RuntimedConfig {
-            state_store_path: cli.state_store_path,
-            runtime_data_dir: cli.runtime_data_dir,
-            socket_path: cli.socket_path,
-        })
+        RuntimeDaemon::start_with_checkpoint_retention_policy(
+            RuntimedConfig {
+                state_store_path: cli.state_store_path,
+                runtime_data_dir: cli.runtime_data_dir,
+                socket_path: cli.socket_path,
+            },
+            CheckpointRetentionPolicy {
+                max_untagged_count: cli.checkpoint_retention_max_untagged_count,
+                max_age_secs: cli.checkpoint_retention_max_age_secs,
+            },
+        )
         .context("failed to start runtime daemon")?,
     );
 
