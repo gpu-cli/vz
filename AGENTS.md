@@ -43,3 +43,9 @@ bd sync               # Sync with git
 - NEVER stop before pushing - that leaves work stranded locally
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
+
+## Verification Standard for Beads/Tasks
+
+- Do NOT consider any bead/task complete based only on unit tests.
+- Completion requires real verification in a Linux VM with end-to-end testing of the implemented behavior.
+- If Linux VM end-to-end verification has not been run and passed, keep the bead/task open.

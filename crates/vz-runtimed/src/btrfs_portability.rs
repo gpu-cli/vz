@@ -1,12 +1,12 @@
-use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
-use std::{collections::HashSet, ffi::OsString};
-#[cfg(target_os = "linux")]
 use std::fs::File;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
+#[cfg(target_os = "linux")]
+use std::{collections::HashSet, ffi::OsString};
 
 use vz_runtime_contract::MachineErrorCode;
 use vz_stack::StackError;
@@ -103,7 +103,10 @@ pub fn import_subvolume_receive_stream(
     if !stream_path.is_file() {
         return Err(machine_error(
             MachineErrorCode::ValidationError,
-            format!("btrfs receive stream file not found: {}", stream_path.display()),
+            format!(
+                "btrfs receive stream file not found: {}",
+                stream_path.display()
+            ),
         ));
     }
     fs::create_dir_all(receive_parent).map_err(StackError::from)?;

@@ -545,9 +545,7 @@ fn rename_netns_interface_with_retry(ns_path: &str, from: &str, to: &str) -> io:
     if let Some(error) = last_error {
         Err(io::Error::new(
             error.kind(),
-            format!(
-                "failed to rename netns interface `{from}` -> `{to}` in {ns_path}: {error}"
-            ),
+            format!("failed to rename netns interface `{from}` -> `{to}` in {ns_path}: {error}"),
         ))
     } else {
         Err(io::Error::other(format!(

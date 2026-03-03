@@ -1,6 +1,6 @@
 use tonic::Request;
-use tonic::metadata::MetadataValue;
 use tonic::Status;
+use tonic::metadata::MetadataValue;
 use vz_runtime_proto::runtime_v2;
 
 use crate::stream_completion::{

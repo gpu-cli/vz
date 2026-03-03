@@ -158,6 +158,12 @@ Design documents live in `planning/`:
 - Use `cargo nextest` (not `cargo test`) for better output and parallelism
 - E2E tests need `codesign --force --sign - --entitlements entitlements/vz-cli.entitlements.plist` for Virtualization.framework entitlement
 
+### Completion Verification Standard (Beads/Tasks)
+
+- Do NOT consider any bead/task complete based only on unit tests.
+- Completion requires real verification in a Linux VM with end-to-end testing of the implemented behavior.
+- If Linux VM end-to-end verification has not been run and passed, keep the bead/task open.
+
 ### Testing Linux-Native Code via VMs (Dogfooding)
 
 The `vz-linux-native` crate targets Linux but we develop on macOS. We test it by running inside our own Linux VMs via Virtualization.framework:

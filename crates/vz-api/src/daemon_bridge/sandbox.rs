@@ -44,7 +44,10 @@ pub(crate) async fn try_create_sandbox_via_daemon(
         ));
     }
     let mut labels: HashMap<String, String> = body.labels.into_iter().collect();
-    labels.insert(SANDBOX_LABEL_PROJECT_DIR.to_string(), project_dir.to_string());
+    labels.insert(
+        SANDBOX_LABEL_PROJECT_DIR.to_string(),
+        project_dir.to_string(),
+    );
     labels.insert(
         SANDBOX_LABEL_SPACE_MODE.to_string(),
         SANDBOX_SPACE_MODE_REQUIRED.to_string(),
