@@ -283,6 +283,14 @@ pub(super) fn format_event_summary(event: &StackEvent) -> String {
             new_checkpoint_id,
             ..
         } => format!("checkpoint forked: {parent_checkpoint_id} -> {new_checkpoint_id}"),
+        StackEvent::CheckpointGcCompacted {
+            stack_name,
+            deleted_by_age,
+            deleted_by_count,
+            deleted_by_lineage,
+        } => format!(
+            "checkpoint gc compacted: {stack_name} (age={deleted_by_age}, count={deleted_by_count}, lineage={deleted_by_lineage})"
+        ),
         StackEvent::BuildQueued {
             sandbox_id,
             build_id,

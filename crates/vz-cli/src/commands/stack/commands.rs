@@ -635,6 +635,7 @@ pub(super) fn event_service_name(event: &StackEvent) -> Option<&str> {
         | StackEvent::CheckpointFailed { .. }
         | StackEvent::CheckpointRestored { .. }
         | StackEvent::CheckpointForked { .. }
+        | StackEvent::CheckpointGcCompacted { .. }
         | StackEvent::BuildQueued { .. }
         | StackEvent::BuildRunning { .. }
         | StackEvent::BuildSucceeded { .. }

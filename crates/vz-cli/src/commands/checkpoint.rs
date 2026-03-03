@@ -503,6 +503,18 @@ fn checkpoint_json(payload: &runtime_v2::CheckpointPayload) -> serde_json::Value
     })
 }
 
+fn display_retention_tag(tag: &str) -> &str {
+    if tag.trim().is_empty() { "-" } else { tag }
+}
+
+fn display_retention_gc_reason(reason: &str) -> &str {
+    if reason.trim().is_empty() {
+        "-"
+    } else {
+        reason
+    }
+}
+
 async fn cmd_list(args: CheckpointListArgs) -> anyhow::Result<()> {
     let mut checkpoints = match control_plane_transport()? {
         ControlPlaneTransport::DaemonGrpc => {
@@ -553,16 +565,8 @@ async fn cmd_list(args: CheckpointListArgs) -> anyhow::Result<()> {
         } else {
             payload.compatibility_fingerprint.clone()
         };
-        let tag = if payload.retention_tag.trim().is_empty() {
-            "-"
-        } else {
-            payload.retention_tag.as_str()
-        };
-        let gc_reason = if payload.retention_gc_reason.trim().is_empty() {
-            "-"
-        } else {
-            payload.retention_gc_reason.as_str()
-        };
+        let tag = display_retention_tag(payload.retention_tag.as_str());
+        let gc_reason = display_retention_gc_reason(payload.retention_gc_reason.as_str());
         println!(
             "{:<34} {:<22} {:<10} {:<9} {:<20} {:<10} {:<12}",
             payload.checkpoint_id, payload.sandbox_id, class, state, fingerprint, tag, gc_reason
@@ -654,6 +658,42 @@ async fn cmd_create(args: CheckpointCreateArgs) -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_retention_gc_reason_renders_lineage_value() {
+        assert_eq!(
+            display_retention_gc_reason("lineage_cascade"),
+            "lineage_cascade"
+        );
+        assert_eq!(display_retention_gc_reason(""), "-");
+    }
+
+    #[test]
+    fn checkpoint_json_preserves_lineage_gc_reason() {
+        let payload = runtime_v2::CheckpointPayload {
+            checkpoint_id: "ckpt-1".to_string(),
+            sandbox_id: "sbx-1".to_string(),
+            parent_checkpoint_id: String::new(),
+            checkpoint_class: "fs_quick".to_string(),
+            state: "ready".to_string(),
+            compatibility_fingerprint: "fp-1".to_string(),
+            created_at: 1,
+            retention_tag: String::new(),
+            retention_protected: false,
+            retention_gc_reason: "lineage_cascade".to_string(),
+            retention_expires_at: 0,
+        };
+        let value = checkpoint_json(&payload);
+        assert_eq!(
+            value.get("retention_gc_reason").and_then(|v| v.as_str()),
+            Some("lineage_cascade")
+        );
+    }
 }
 
 async fn cmd_restore(args: CheckpointRestoreArgs) -> anyhow::Result<()> {

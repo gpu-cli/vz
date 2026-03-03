@@ -51,6 +51,28 @@ API transport parity for checkpoint evidence is provided via `GET /v1/checkpoint
 (`from_checkpoint_id` + `to_checkpoint_id` query parameters), and `vz diff` now uses that
 endpoint when `VZ_CONTROL_PLANE_TRANSPORT=api-http`.
 
+## Checkpoint Retention Lineage Semantics
+
+Checkpoint retention now applies lineage-aware behavior for fork trees:
+
+- Tagged checkpoints are protected from GC.
+- Ancestors of tagged checkpoints are also protected.
+- When a checkpoint is selected for deletion, descendants are deleted via
+  lineage cascade.
+
+Visibility surfaces:
+
+- API checkpoint payload field `retention_gc_reason` may be:
+  - `age_limit`
+  - `count_limit`
+  - `lineage_cascade`
+- CLI `vz checkpoint list` shows the same reason in the `GC REASON` column.
+- Maintenance audit records include:
+  - event type `checkpoint_gc_compacted`
+  - receipt operation `checkpoint_gc_compact`
+  - reason-bucket arrays in receipt metadata:
+    `deleted_by_age`, `deleted_by_count`, `deleted_by_lineage`
+
 ## Release Scope: No Live Host Mounts
 
 Spaces R1 excludes live host mount features in sandbox lifecycle surfaces.

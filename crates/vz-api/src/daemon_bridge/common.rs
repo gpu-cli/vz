@@ -347,4 +347,27 @@ mod tests {
         assert_eq!(metadata.idempotency_key, "");
         assert_eq!(metadata.trace_id, "");
     }
+
+    #[test]
+    fn checkpoint_payload_maps_lineage_cascade_retention_reason() {
+        let wire = runtime_v2::CheckpointPayload {
+            checkpoint_id: "ckpt-1".to_string(),
+            sandbox_id: "sbx-1".to_string(),
+            parent_checkpoint_id: String::new(),
+            checkpoint_class: "fs_quick".to_string(),
+            state: "ready".to_string(),
+            compatibility_fingerprint: "fp-1".to_string(),
+            created_at: 1,
+            retention_tag: String::new(),
+            retention_protected: false,
+            retention_gc_reason: "lineage_cascade".to_string(),
+            retention_expires_at: 0,
+        };
+
+        let payload = checkpoint_payload_from_runtime_proto(wire);
+        assert_eq!(
+            payload.retention_gc_reason.as_deref(),
+            Some("lineage_cascade")
+        );
+    }
 }
