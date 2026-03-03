@@ -197,18 +197,42 @@ async fn connect_checkpoint_client(
     socket_path: &Path,
 ) -> runtime_v2::checkpoint_service_client::CheckpointServiceClient<Channel> {
     let socket_path = socket_path.to_path_buf();
-    let channel = Endpoint::try_from("http://[::]:50051")
-        .expect("endpoint")
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let socket_path = socket_path.clone();
-            async move {
-                tokio::net::UnixStream::connect(socket_path)
-                    .await
-                    .map(TokioIo::new)
+    let mut connect_error = None;
+    let mut connected_channel = None;
+    for _ in 0..40 {
+        let connect = Endpoint::try_from("http://[::]:50051")
+            .expect("endpoint")
+            .connect_with_connector(service_fn({
+                let socket_path = socket_path.clone();
+                move |_: Uri| {
+                    let socket_path = socket_path.clone();
+                    async move {
+                        tokio::net::UnixStream::connect(socket_path)
+                            .await
+                            .map(TokioIo::new)
+                    }
+                }
+            }))
+            .await;
+        match connect {
+            Ok(channel) => {
+                connected_channel = Some(channel);
+                break;
             }
-        }))
-        .await
-        .expect("connect channel");
+            Err(error) => {
+                connect_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+    let channel = connected_channel.unwrap_or_else(|| {
+        panic!(
+            "connect channel: {}",
+            connect_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "unknown connection error".to_string())
+        )
+    });
     runtime_v2::checkpoint_service_client::CheckpointServiceClient::new(channel)
 }
 
@@ -4892,6 +4916,111 @@ async fn restore_checkpoint_rejects_runtime_fingerprint_mismatch() {
         .expect("server join timeout")
         .expect("server join should succeed");
     assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn checkpoint_state_survives_daemon_restart() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+    wait_for_socket(&config.socket_path).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut checkpoint_client = connect_checkpoint_client(&config.socket_path).await;
+    let created = checkpoint_client
+        .create_checkpoint(Request::new(runtime_v2::CreateCheckpointRequest {
+            metadata: None,
+            sandbox_id: "sbx-restart-checkpoint".to_string(),
+            checkpoint_class: "fs_quick".to_string(),
+            compatibility_fingerprint: String::new(),
+            retention_tag: String::new(),
+        }))
+        .await
+        .expect("create checkpoint before restart")
+        .into_inner()
+        .checkpoint
+        .expect("checkpoint payload");
+    let checkpoint_id = created.checkpoint_id.clone();
+    let fingerprint = created.compatibility_fingerprint.clone();
+    assert!(
+        fingerprint.starts_with("runtime:backend="),
+        "daemon should persist runtime-scoped compatibility fingerprint"
+    );
+    drop(checkpoint_client);
+
+    shutdown.notify_waiters();
+    let first_result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(first_result.is_ok());
+    drop(daemon);
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon restart"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+    wait_for_socket(&config.socket_path).await;
+
+    let mut checkpoint_client = connect_checkpoint_client(&config.socket_path).await;
+    let listed = checkpoint_client
+        .list_checkpoints(Request::new(runtime_v2::ListCheckpointsRequest {
+            metadata: None,
+        }))
+        .await
+        .expect("list checkpoints after restart")
+        .into_inner();
+    let restored_checkpoint = listed
+        .checkpoints
+        .into_iter()
+        .find(|checkpoint| checkpoint.checkpoint_id == checkpoint_id)
+        .expect("checkpoint should persist across daemon restart");
+    assert_eq!(restored_checkpoint.compatibility_fingerprint, fingerprint);
+
+    let restored = checkpoint_client
+        .restore_checkpoint(Request::new(runtime_v2::RestoreCheckpointRequest {
+            checkpoint_id: checkpoint_id.clone(),
+            metadata: None,
+        }))
+        .await
+        .expect("restore checkpoint after restart")
+        .into_inner();
+    assert_eq!(
+        restored
+            .checkpoint
+            .expect("restored checkpoint payload")
+            .checkpoint_id,
+        checkpoint_id
+    );
+
+    shutdown.notify_waiters();
+    let second_result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(second_result.is_ok());
 }
 
 #[tokio::test]
