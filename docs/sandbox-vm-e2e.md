@@ -168,6 +168,9 @@ The harness signs:
 - `crates/target/<profile>/vz-guest-agent`
 - each selected VM E2E test binary (with virtualization entitlement)
 
+For BuildKit suites/scenarios, the harness also sets `VZ_BUILDKIT_DIR` to a
+per-run artifact directory so stale host cache state does not bleed across runs.
+
 ## CI
 
 Self-hosted VM E2E automation is in:

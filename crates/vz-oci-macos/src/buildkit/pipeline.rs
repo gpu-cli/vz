@@ -1243,14 +1243,24 @@ while [ "$i" -lt 60 ]; do
     exit 0
   fi
 
-  if [ "$recovered_bolt" -eq 0 ] && [ -f /tmp/buildkitd.log ] && /bin/busybox grep -q "invalid freelist page" /tmp/buildkitd.log; then
+  if [ "$recovered_bolt" -eq 0 ] && [ -f /tmp/buildkitd.log ] && \
+     ( /bin/busybox grep -q "invalid freelist page" /tmp/buildkitd.log || \
+       /bin/busybox grep -q "^panic:" /tmp/buildkitd.log || \
+       /bin/busybox grep -q "page type is unknown" /tmp/buildkitd.log ); then
     if [ -f /tmp/buildkitd.pid ]; then
       pid=$(/bin/busybox cat /tmp/buildkitd.pid 2>/dev/null || true)
       if [ -n "$pid" ]; then
         /bin/busybox kill "$pid" 2>/dev/null || true
+        /bin/busybox sleep 1
+        /bin/busybox kill -9 "$pid" 2>/dev/null || true
       fi
     fi
-    /bin/busybox rm -f /var/lib/buildkit/cache.db /tmp/buildkitd.log /tmp/buildkitd.pid
+    # Corrupted BuildKit root state cannot always be recovered by deleting only
+    # cache.db; reset the worker root and let BuildKit bootstrap cleanly.
+    /bin/busybox rm -rf /var/lib/buildkit/*
+    /bin/busybox mkdir -p /var/lib/buildkit/build-output
+    /bin/busybox sync
+    /bin/busybox rm -f /tmp/buildkitd.log /tmp/buildkitd.pid
     recovered_bolt=1
     start_buildkitd
   fi

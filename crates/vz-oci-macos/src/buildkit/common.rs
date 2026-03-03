@@ -45,6 +45,11 @@ pub(super) fn expand_home_dir(path: &Path) -> PathBuf {
 }
 
 pub(super) fn default_buildkit_dir() -> Result<PathBuf, BuildkitError> {
+    if let Some(override_dir) = std::env::var_os("VZ_BUILDKIT_DIR")
+        && !override_dir.is_empty()
+    {
+        return Ok(PathBuf::from(override_dir));
+    }
     let home = std::env::var_os("HOME").ok_or(BuildkitError::HomeDirectoryUnavailable)?;
     Ok(PathBuf::from(home).join(".vz").join("buildkit"))
 }

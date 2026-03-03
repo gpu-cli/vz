@@ -407,11 +407,20 @@ run_and_log() {
     shift 3
     local args=("$@")
     local log_file="$RUN_DIR/${label}.log"
+    local cmd_env=()
+
+    # BuildKit tests are sensitive to stale shared cache state under ~/.vz/buildkit.
+    # Pin a per-run directory so CI/local harness executions are deterministic.
+    if [[ "$suite" == "buildkit" ]]; then
+        local buildkit_dir="$RUN_DIR/buildkit-home"
+        mkdir -p "$buildkit_dir"
+        cmd_env+=("VZ_BUILDKIT_DIR=$buildkit_dir")
+    fi
 
     echo "running [$label/$suite]: $binary ${args[*]}"
 
     set +e
-    "$binary" "${args[@]}" 2>&1 | tee "$log_file"
+    env "${cmd_env[@]}" "$binary" "${args[@]}" 2>&1 | tee "$log_file"
     local status=${PIPESTATUS[0]}
     set -e
 
