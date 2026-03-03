@@ -112,6 +112,30 @@ Each run creates a timestamped directory containing:
 
 A `latest` symlink points to the most recent run.
 
+## Spaces Release Gate
+
+For Spaces R1 btrfs checkpoint release-gating, run the signed VM snapshot scenario in
+`release` profile and require a green summary with non-zero executed tests.
+
+Command:
+
+```bash
+./scripts/run-sandbox-vm-e2e.sh --profile release --scenario stack-snapshot-restore
+```
+
+Mandatory pass criteria:
+
+- `summary.txt` contains `passed=stack-snapshot-restore`
+- `summary.txt` contains `failed=none`
+- `stack-snapshot-restore.log` contains `running 1 test`
+- artifacts are archived from `.artifacts/sandbox-vm-e2e/<timestamp>/`
+
+Recommended pre-release evidence bundle:
+
+- `<timestamp>/run-info.txt`
+- `<timestamp>/summary.txt`
+- `<timestamp>/stack-snapshot-restore.log`
+
 ## Signing Behavior
 
 The harness signs:
