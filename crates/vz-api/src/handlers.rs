@@ -396,6 +396,25 @@ pub(super) async fn create_sandbox(
     )
 }
 
+pub(super) async fn prepare_space_cache(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_prepare_space_cache_via_daemon(&state, &headers, raw_body.as_ref(), &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "sandbox operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
 pub(super) async fn list_sandboxes(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     let request_id = request_id_from_headers(&headers);
 

@@ -1,4 +1,3 @@
-pub use vz_runtime_contract::{
-    SPACE_CACHE_KEY_SCHEMA_VERSION, SpaceCacheIndex, SpaceCacheKey, SpaceCacheKeyMaterial,
-    SpaceCacheLookup, SpaceCacheRuntimeIdentity,
-};
+#[cfg(test)]
+pub use vz_runtime_contract::{SPACE_CACHE_KEY_SCHEMA_VERSION, SpaceCacheIndex, SpaceCacheLookup};
+pub use vz_runtime_contract::{SpaceCacheKey, SpaceCacheKeyMaterial, SpaceCacheRuntimeIdentity};

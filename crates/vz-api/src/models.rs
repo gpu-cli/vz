@@ -257,6 +257,33 @@ pub(crate) struct CloseSandboxShellResponse {
     pub(crate) shell: CloseSandboxShellPayload,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct PrepareSpaceCacheKeyRequest {
+    pub(crate) schema_version: u16,
+    pub(crate) cache_name: String,
+    pub(crate) digest_hex: String,
+    pub(crate) canonical_json: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct PrepareSpaceCacheRequest {
+    pub(crate) keys: Vec<PrepareSpaceCacheKeyRequest>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct PrepareSpaceCacheOutcomePayload {
+    pub(crate) cache_name: String,
+    pub(crate) digest_hex: String,
+    pub(crate) outcome: String,
+    pub(crate) detail: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct PrepareSpaceCacheResponse {
+    pub(crate) request_id: String,
+    pub(crate) outcomes: Vec<PrepareSpaceCacheOutcomePayload>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ExecutionOutputStreamEventPayload {
     pub(crate) sequence: u64,

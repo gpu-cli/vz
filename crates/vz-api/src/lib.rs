@@ -238,6 +238,7 @@ pub fn router(config: ApiConfig) -> Router {
         .route("/v1/events/{stack_name}/stream", get(stream_events_sse))
         .route("/v1/events/{stack_name}/ws", get(stream_events_ws))
         .route("/v1/sandboxes", get(list_sandboxes).post(create_sandbox))
+        .route("/v1/spaces/cache/prepare", post(prepare_space_cache))
         .route(
             "/v1/sandboxes/{sandbox_id}",
             get(get_sandbox).delete(terminate_sandbox),

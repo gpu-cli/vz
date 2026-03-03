@@ -38,17 +38,19 @@ use super::runtime_daemon::{
     ControlPlaneTransport, connect_control_plane_for_state_db, control_plane_transport,
     default_state_db_path, runtime_api_base_url,
 };
-use super::space_cache_key::{
-    SPACE_CACHE_KEY_SCHEMA_VERSION, SpaceCacheIndex, SpaceCacheKey, SpaceCacheKeyMaterial,
-    SpaceCacheLookup, SpaceCacheRuntimeIdentity,
-};
+use super::space_cache_key::{SpaceCacheKey, SpaceCacheKeyMaterial, SpaceCacheRuntimeIdentity};
+#[cfg(test)]
+use super::space_cache_key::{SPACE_CACHE_KEY_SCHEMA_VERSION, SpaceCacheIndex, SpaceCacheLookup};
+#[cfg(test)]
 use super::space_cache_trust::{
     SpaceRemoteCacheTrustConfig, SpaceRemoteCacheVerificationOutcome,
     SpaceRemoteCacheVerifiedArtifact,
 };
 
 const SPACE_CONFIG_FILE: &str = "vz.json";
+#[cfg(test)]
 const SPACE_CACHE_INDEX_FILE: &str = "space-cache-index.json";
+#[cfg(test)]
 const SPACE_CACHE_ARTIFACTS_DIR: &str = "space-cache-artifacts";
 const SANDBOX_LABEL_SPACE_CACHE_TRUST_PREFIX: &str = "vz.space.cache.trust.";
 
@@ -472,6 +474,7 @@ fn apply_space_cache_trust_labels(
     }
 }
 
+#[cfg(test)]
 fn space_cache_index_path(state_db: &Path) -> PathBuf {
     if let Some(parent) = state_db.parent() {
         parent.join(SPACE_CACHE_INDEX_FILE)
@@ -480,6 +483,7 @@ fn space_cache_index_path(state_db: &Path) -> PathBuf {
     }
 }
 
+#[cfg(test)]
 fn space_cache_artifact_root(state_db: &Path) -> PathBuf {
     if let Some(parent) = state_db.parent() {
         parent.join(SPACE_CACHE_ARTIFACTS_DIR)
@@ -488,12 +492,14 @@ fn space_cache_artifact_root(state_db: &Path) -> PathBuf {
     }
 }
 
+#[cfg(test)]
 fn space_cache_artifact_dir(state_db: &Path, key: &SpaceCacheKey) -> PathBuf {
     space_cache_artifact_root(state_db)
         .join(&key.cache_name)
         .join(&key.digest_hex)
 }
 
+#[cfg(test)]
 fn materialize_verified_remote_cache_artifact(
     state_db: &Path,
     key: &SpaceCacheKey,
@@ -614,6 +620,7 @@ fn build_space_cache_keys(
     Ok(keys)
 }
 
+#[cfg(test)]
 fn update_space_cache_index(
     state_db: &Path,
     cache_keys: &[SpaceCacheKey],
@@ -1017,6 +1024,30 @@ struct ApiCloseSandboxShellResponse {
     shell: ApiCloseSandboxShellPayload,
 }
 
+#[derive(Debug, Serialize)]
+struct ApiPrepareSpaceCacheKeyRequest {
+    schema_version: u16,
+    cache_name: String,
+    digest_hex: String,
+    canonical_json: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiPrepareSpaceCacheRequest {
+    keys: Vec<ApiPrepareSpaceCacheKeyRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiPrepareSpaceCacheOutcomePayload {
+    cache_name: String,
+    outcome: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiPrepareSpaceCacheResponse {
+    outcomes: Vec<ApiPrepareSpaceCacheOutcomePayload>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ApiExecutionPayload {
     state: String,
@@ -1224,6 +1255,53 @@ async fn api_terminate_sandbox(sandbox_id: &str) -> anyhow::Result<Option<Sandbo
         .await
         .context("failed to decode api terminate sandbox response")?;
     Ok(Some(sandbox_from_api_payload(payload.sandbox)?))
+}
+
+async fn api_prepare_space_cache(
+    cache_keys: &[SpaceCacheKey],
+) -> anyhow::Result<BTreeMap<String, SpaceCacheTrustOutcome>> {
+    if cache_keys.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let url = runtime_api_url("/v1/spaces/cache/prepare")?;
+    let request = ApiPrepareSpaceCacheRequest {
+        keys: cache_keys
+            .iter()
+            .map(|key| ApiPrepareSpaceCacheKeyRequest {
+                schema_version: key.schema_version,
+                cache_name: key.cache_name.clone(),
+                digest_hex: key.digest_hex.clone(),
+                canonical_json: key.canonical_json.clone(),
+            })
+            .collect(),
+    };
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&request)
+        .send()
+        .await
+        .context("failed to call api prepare space cache")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to prepare space cache via api").await);
+    }
+    let payload: ApiPrepareSpaceCacheResponse = response
+        .json()
+        .await
+        .context("failed to decode api prepare space cache response")?;
+    let mut outcomes = BTreeMap::new();
+    for outcome in payload.outcomes {
+        let mapped = match outcome.outcome.as_str() {
+            "local_hit" => SpaceCacheTrustOutcome::LocalHit,
+            "local_miss_cold" => SpaceCacheTrustOutcome::LocalMissCold,
+            "local_miss_dimension_change" => SpaceCacheTrustOutcome::LocalMissDimensionChange,
+            "local_miss_schema_mismatch" => SpaceCacheTrustOutcome::LocalMissSchemaMismatch,
+            "remote_verified_materialized" => SpaceCacheTrustOutcome::RemoteVerifiedMaterialized,
+            "remote_miss_untrusted" => SpaceCacheTrustOutcome::RemoteMissUntrusted,
+            _ => SpaceCacheTrustOutcome::RemoteMissUntrusted,
+        };
+        outcomes.insert(outcome.cache_name, mapped);
+    }
+    Ok(outcomes)
 }
 
 async fn api_open_sandbox_shell(
@@ -1717,7 +1795,7 @@ async fn daemon_prepare_space_cache(
         ControlPlaneTransport::DaemonGrpc => {
             daemon_grpc_prepare_space_cache(state_db, cache_keys).await
         }
-        ControlPlaneTransport::ApiHttp => update_space_cache_index(state_db, cache_keys),
+        ControlPlaneTransport::ApiHttp => api_prepare_space_cache(cache_keys).await,
     }
 }
 

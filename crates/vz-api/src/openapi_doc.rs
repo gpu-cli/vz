@@ -10,10 +10,11 @@ use super::{
     ExportCheckpointResponse, FileMutationResponse, ForkCheckpointRequest, ImageListResponse,
     ImageResponse, ImportCheckpointRequest, LeaseListResponse, LeaseResponse, ListFilesRequest,
     ListFilesResponse, MakeDirRequest, MovePathRequest, OpenLeaseRequest, OpenSandboxShellResponse,
-    PruneImagesResponse, PullImageRequest, PullImageResponse, ReadFileRequest, ReadFileResponse,
-    ReceiptResponse, RemovePathRequest, ResizeExecRequest, RestoreCheckpointResponse,
-    SandboxListResponse, SandboxResponse, SignalExecRequest, StartBuildRequest,
-    WriteExecStdinRequest, WriteFileRequest, WriteFileResponse,
+    PrepareSpaceCacheRequest, PrepareSpaceCacheResponse, PruneImagesResponse, PullImageRequest,
+    PullImageResponse, ReadFileRequest, ReadFileResponse, ReceiptResponse, RemovePathRequest,
+    ResizeExecRequest, RestoreCheckpointResponse, SandboxListResponse, SandboxResponse,
+    SignalExecRequest, StartBuildRequest, WriteExecStdinRequest, WriteFileRequest,
+    WriteFileResponse,
 };
 use utoipa::OpenApi;
 
@@ -111,6 +112,24 @@ fn stream_events_ws() {}
     )
 )]
 fn create_sandbox() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/spaces/cache/prepare",
+    operation_id = "prepareSpaceCache",
+    summary = "Prepare shared space cache keys and materialize trusted remote artifacts",
+    params(
+        ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY_KEY_DESCRIPTION),
+        ("X-Request-Id" = Option<String>, Header, description = REQUEST_ID_DESCRIPTION),
+    ),
+    request_body = PrepareSpaceCacheRequest,
+    responses(
+        (status = 200, description = "Cache preparation result", body = PrepareSpaceCacheResponse),
+        (status = 400, description = "Invalid request body", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn prepare_space_cache() {}
 
 #[utoipa::path(
     get,
@@ -927,6 +946,7 @@ fn chown_path() {}
         stream_events_sse,
         stream_events_ws,
         create_sandbox,
+        prepare_space_cache,
         list_sandboxes,
         get_sandbox,
         terminate_sandbox,
@@ -982,6 +1002,10 @@ fn chown_path() {}
         crate::EventsResponse,
         crate::CapabilitiesResponse,
         crate::CreateSandboxRequest,
+        crate::PrepareSpaceCacheKeyRequest,
+        crate::PrepareSpaceCacheRequest,
+        crate::PrepareSpaceCacheOutcomePayload,
+        crate::PrepareSpaceCacheResponse,
         crate::SandboxPayload,
         crate::SandboxResponse,
         crate::SandboxListResponse,
