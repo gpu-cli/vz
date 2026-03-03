@@ -184,6 +184,8 @@ pub(crate) struct StackRunContainerResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct CreateSandboxRequest {
     #[serde(default)]
+    pub(crate) project_dir: Option<String>,
+    #[serde(default)]
     pub(crate) stack_name: Option<String>,
     #[serde(default)]
     pub(crate) cpus: Option<u8>,

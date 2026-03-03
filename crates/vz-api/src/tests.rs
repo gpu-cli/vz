@@ -788,7 +788,7 @@ async fn sandbox_create_stream_terminal_validation_error_maps_to_http_bad_reques
                 .uri("/v1/sandboxes")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"stack_name":"sbx-invalid-project-dir","labels":{"project_dir":"relative/not-absolute"}}"#,
+                    r#"{"stack_name":"sbx-invalid-project-dir","project_dir":"relative/not-absolute"}"#,
                 ))
                 .unwrap(),
         )
@@ -829,10 +829,7 @@ async fn sandbox_create_spaces_mode_storage_preflight_maps_to_http_not_implement
                 .body(Body::from(
                     serde_json::json!({
                         "stack_name": "sbx-spaces-storage-preflight",
-                        "labels": {
-                            "project_dir": project_dir,
-                            "vz.space.mode": "required"
-                        }
+                        "project_dir": project_dir
                     })
                     .to_string(),
                 ))

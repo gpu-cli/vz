@@ -24,6 +24,7 @@ use tracing::Instrument;
 use uuid::Uuid;
 use vz_runtime_contract::{
     RuntimeCapabilities, SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER,
+    SANDBOX_LABEL_PROJECT_DIR, SANDBOX_LABEL_SPACE_MODE, SANDBOX_SPACE_MODE_REQUIRED,
 };
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed_client::{DaemonClient, DaemonClientConfig, DaemonClientError};

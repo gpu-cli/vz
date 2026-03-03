@@ -977,6 +977,7 @@ struct ApiSandboxListResponse {
 
 #[derive(Debug, Serialize)]
 struct ApiCreateSandboxRequest {
+    project_dir: String,
     stack_name: String,
     cpus: u8,
     memory_mb: u64,
@@ -1173,8 +1174,15 @@ async fn api_create_sandbox(
     memory: u64,
     labels: BTreeMap<String, String>,
 ) -> anyhow::Result<Sandbox> {
+    let project_dir = labels
+        .get(SANDBOX_LABEL_PROJECT_DIR)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("sandbox create requires `{SANDBOX_LABEL_PROJECT_DIR}` label"))?
+        .to_string();
     let url = runtime_api_url("/v1/sandboxes")?;
     let request = ApiCreateSandboxRequest {
+        project_dir,
         stack_name: sandbox_id.to_string(),
         cpus,
         memory_mb: memory,
