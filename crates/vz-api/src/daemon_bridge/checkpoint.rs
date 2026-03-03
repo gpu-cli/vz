@@ -276,7 +276,9 @@ pub(crate) async fn try_restore_checkpoint_via_daemon(
                         },
                         checkpoint,
                         compatibility_fingerprint,
-                        restore_note: "Backend-level restore is delegated to the runtime; fingerprint validation is the caller's responsibility".to_string(),
+                        restore_note:
+                            "Restore is enforced by vz-runtimed runtime compatibility checks."
+                                .to_string(),
                     }),
                 )
                     .into_response(),

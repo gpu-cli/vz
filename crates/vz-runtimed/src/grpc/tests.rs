@@ -4776,6 +4776,125 @@ async fn create_checkpoint_with_retention_tag_is_protected() {
 }
 
 #[tokio::test]
+async fn create_checkpoint_defaults_runtime_compatibility_fingerprint_when_unset() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let mut checkpoint_client = connect_checkpoint_client(&config.socket_path).await;
+    let created = checkpoint_client
+        .create_checkpoint(Request::new(runtime_v2::CreateCheckpointRequest {
+            metadata: None,
+            sandbox_id: "sbx-ckpt-default-fp".to_string(),
+            checkpoint_class: "fs_quick".to_string(),
+            compatibility_fingerprint: String::new(),
+            retention_tag: String::new(),
+        }))
+        .await
+        .expect("create checkpoint")
+        .into_inner();
+    let checkpoint = created.checkpoint.expect("checkpoint payload");
+    assert!(
+        checkpoint
+            .compatibility_fingerprint
+            .starts_with("runtime:backend="),
+        "default fingerprint should be daemon runtime scoped"
+    );
+    assert_ne!(checkpoint.compatibility_fingerprint, "unset");
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn restore_checkpoint_rejects_runtime_fingerprint_mismatch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+
+    wait_for_socket(&config.socket_path).await;
+
+    let now = current_unix_secs();
+    daemon
+        .with_state_store(|store| {
+            store.with_immediate_transaction(|tx| {
+                let checkpoint = Checkpoint {
+                    checkpoint_id: "ckpt-runtime-mismatch".to_string(),
+                    sandbox_id: "sbx-runtime-mismatch".to_string(),
+                    parent_checkpoint_id: None,
+                    class: CheckpointClass::FsQuick,
+                    state: CheckpointState::Ready,
+                    created_at: now,
+                    compatibility_fingerprint: "runtime:backend=other;daemon=0.0.0".to_string(),
+                };
+                tx.save_checkpoint(&checkpoint)?;
+                Ok(())
+            })
+        })
+        .expect("seed mismatched checkpoint");
+
+    let mut checkpoint_client = connect_checkpoint_client(&config.socket_path).await;
+    let status = checkpoint_client
+        .restore_checkpoint(Request::new(runtime_v2::RestoreCheckpointRequest {
+            checkpoint_id: "ckpt-runtime-mismatch".to_string(),
+            metadata: None,
+        }))
+        .await
+        .expect_err("restore should reject runtime fingerprint mismatch");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status
+            .message()
+            .contains("compatibility fingerprint mismatch")
+    );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
 async fn diff_checkpoints_returns_real_file_level_deltas() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = RuntimedConfig {

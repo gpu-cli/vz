@@ -36,6 +36,59 @@ fn checkpoint_snapshot_runtime_fs_root(daemon: &RuntimeDaemon, sandbox_id: &str)
         .join("fs")
 }
 
+fn runtime_compatibility_fingerprint(daemon: &RuntimeDaemon) -> String {
+    format!(
+        "runtime:backend={};daemon={}",
+        daemon.backend_name(),
+        daemon.daemon_version()
+    )
+}
+
+fn resolve_checkpoint_compatibility_fingerprint(daemon: &RuntimeDaemon, requested: &str) -> String {
+    let normalized = requested.trim();
+    if normalized.is_empty() || normalized.eq_ignore_ascii_case("unset") {
+        runtime_compatibility_fingerprint(daemon)
+    } else {
+        normalized.to_string()
+    }
+}
+
+fn enforce_restore_checkpoint_compatibility(
+    daemon: &RuntimeDaemon,
+    checkpoint: &Checkpoint,
+    request_id: &str,
+) -> Result<(), Status> {
+    let checkpoint_fingerprint = checkpoint.compatibility_fingerprint.trim();
+    if checkpoint_fingerprint.is_empty() || checkpoint_fingerprint.eq_ignore_ascii_case("unset") {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!(
+                "checkpoint {} is missing compatibility fingerprint metadata",
+                checkpoint.checkpoint_id
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+
+    if checkpoint_fingerprint.starts_with("runtime:") {
+        let expected = runtime_compatibility_fingerprint(daemon);
+        if checkpoint_fingerprint != expected {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                format!(
+                    "checkpoint {} compatibility fingerprint mismatch: expected `{expected}`, got `{checkpoint_fingerprint}`",
+                    checkpoint.checkpoint_id
+                ),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn checkpoint_workspace_snapshot_subvolume_path(
     daemon: &RuntimeDaemon,
     checkpoint_id: &str,
@@ -811,7 +864,10 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
             class,
             state: CheckpointState::Creating,
             created_at: now,
-            compatibility_fingerprint: request.compatibility_fingerprint,
+            compatibility_fingerprint: resolve_checkpoint_compatibility_fingerprint(
+                self.daemon.as_ref(),
+                request.compatibility_fingerprint.as_str(),
+            ),
         };
         checkpoint
             .transition_to(CheckpointState::Ready)
@@ -1105,6 +1161,8 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
                 BTreeMap::new(),
             )));
         }
+
+        enforce_restore_checkpoint_compatibility(self.daemon.as_ref(), &checkpoint, &request_id)?;
 
         if let Some(workspace_root) = maybe_space_workspace_root_for_checkpoint(
             self.daemon.as_ref(),
