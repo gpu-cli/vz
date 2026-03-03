@@ -100,13 +100,6 @@ fn checkpoint_workspace_snapshot_subvolume_path(
         .join(checkpoint_id)
 }
 
-fn sandbox_space_mode_required(labels: &BTreeMap<String, String>) -> bool {
-    labels
-        .get(SANDBOX_LABEL_SPACE_MODE)
-        .and_then(|value| normalize_optional_wire_field(value))
-        .is_some_and(|value| value.eq_ignore_ascii_case(SANDBOX_SPACE_MODE_REQUIRED))
-}
-
 fn sandbox_workspace_project_dir(
     labels: &BTreeMap<String, String>,
     request_id: &str,
@@ -115,7 +108,14 @@ fn sandbox_workspace_project_dir(
         .get(SANDBOX_LABEL_PROJECT_DIR)
         .and_then(|value| normalize_optional_wire_field(value))
     else {
-        return Ok(None);
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!(
+                "spaces mode requires sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` with an absolute workspace directory path"
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
     };
 
     let candidate = PathBuf::from(project_dir);
@@ -461,9 +461,6 @@ fn maybe_space_workspace_root_for_checkpoint(
     let Some(sandbox) = sandbox else {
         return Ok(None);
     };
-    if !sandbox_space_mode_required(&sandbox.labels) {
-        return Ok(None);
-    }
     sandbox_workspace_project_dir(&sandbox.labels, request_id)
 }
 

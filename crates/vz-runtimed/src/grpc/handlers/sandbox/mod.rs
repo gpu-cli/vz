@@ -261,22 +261,19 @@ fn sandbox_workspace_volume_mount(
     labels: &BTreeMap<String, String>,
     request_id: &str,
 ) -> Result<Option<StackVolumeMount>, Status> {
-    let spaces_mode_required = sandbox_space_mode_required(labels);
+    validate_spaces_mode_label(labels, request_id)?;
     let Some(project_dir) = labels
         .get(SANDBOX_LABEL_PROJECT_DIR)
         .and_then(|value| normalize_optional_wire_field(value))
     else {
-        if spaces_mode_required {
-            return Err(status_from_machine_error(MachineError::new(
-                MachineErrorCode::ValidationError,
-                format!(
-                    "spaces mode requires sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` with an absolute workspace directory path"
-                ),
-                Some(request_id.to_string()),
-                BTreeMap::new(),
-            )));
-        }
-        return Ok(None);
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!(
+                "spaces mode requires sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` with an absolute workspace directory path"
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
     };
 
     let host_path = PathBuf::from(project_dir.trim());
@@ -313,9 +310,7 @@ fn sandbox_workspace_volume_mount(
             BTreeMap::new(),
         )));
     }
-    if spaces_mode_required {
-        enforce_spaces_workspace_storage_preflight(&host_path, request_id)?;
-    }
+    enforce_spaces_workspace_storage_preflight(&host_path, request_id)?;
 
     Ok(Some(StackVolumeMount {
         tag: "vz-mount-0".to_string(),
@@ -324,11 +319,26 @@ fn sandbox_workspace_volume_mount(
     }))
 }
 
-fn sandbox_space_mode_required(labels: &BTreeMap<String, String>) -> bool {
-    labels
+fn validate_spaces_mode_label(
+    labels: &BTreeMap<String, String>,
+    request_id: &str,
+) -> Result<(), Status> {
+    let mode = labels
         .get(SANDBOX_LABEL_SPACE_MODE)
-        .and_then(|value| normalize_optional_wire_field(value))
-        .is_some_and(|value| value.eq_ignore_ascii_case(SANDBOX_SPACE_MODE_REQUIRED))
+        .and_then(|value| normalize_optional_wire_field(value));
+    if let Some(mode) = mode
+        && !mode.eq_ignore_ascii_case(SANDBOX_SPACE_MODE_REQUIRED)
+    {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!(
+                "unsupported sandbox label `{SANDBOX_LABEL_SPACE_MODE}` value `{mode}`; only `{SANDBOX_SPACE_MODE_REQUIRED}` is supported"
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+    Ok(())
 }
 
 fn enforce_spaces_workspace_storage_preflight(

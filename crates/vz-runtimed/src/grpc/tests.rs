@@ -577,7 +577,7 @@ async fn create_sandbox_rejects_empty_stack_name() {
 }
 
 #[tokio::test]
-async fn create_sandbox_spaces_mode_requires_project_dir_label() {
+async fn create_sandbox_requires_project_dir_label() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = RuntimedConfig {
         state_store_path: tmp.path().join("state").join("stack-state.db"),
@@ -600,11 +600,6 @@ async fn create_sandbox_spaces_mode_requires_project_dir_label() {
 
     wait_for_socket(&config.socket_path).await;
 
-    let mut labels = std::collections::HashMap::new();
-    labels.insert(
-        SANDBOX_LABEL_SPACE_MODE.to_string(),
-        SANDBOX_SPACE_MODE_REQUIRED.to_string(),
-    );
     let mut client = connect_sandbox_client(&config.socket_path).await;
     let response = client
         .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
@@ -612,7 +607,7 @@ async fn create_sandbox_spaces_mode_requires_project_dir_label() {
             stack_name: "stack-spaces-missing-project-dir".to_string(),
             cpus: 1,
             memory_mb: 512,
-            labels,
+            labels: std::collections::HashMap::new(),
         }))
         .await
         .expect("create_sandbox call");
@@ -704,7 +699,7 @@ async fn create_sandbox_spaces_mode_rejects_non_btrfs_workspace_storage() {
 }
 
 #[tokio::test]
-async fn create_sandbox_workspace_label_without_spaces_mode_skips_btrfs_gate() {
+async fn create_sandbox_rejects_non_spaces_mode_label_value() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let workspace_dir = tmp.path().join("workspace");
     std::fs::create_dir_all(&workspace_dir).expect("create workspace dir");
@@ -731,36 +726,29 @@ async fn create_sandbox_workspace_label_without_spaces_mode_skips_btrfs_gate() {
     wait_for_socket(&config.socket_path).await;
 
     let mut labels = std::collections::HashMap::new();
+    labels.insert(SANDBOX_LABEL_SPACE_MODE.to_string(), "legacy".to_string());
     labels.insert(
         SANDBOX_LABEL_PROJECT_DIR.to_string(),
         workspace_dir.to_string_lossy().to_string(),
     );
 
     let mut client = connect_sandbox_client(&config.socket_path).await;
-    let created = read_create_sandbox_completion_response(
-        client
-            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
-                metadata: None,
-                stack_name: "stack-project-dir-without-spaces-mode".to_string(),
-                cpus: 1,
-                memory_mb: 512,
-                labels,
-            }))
-            .await
-            .expect("create sandbox"),
-    )
-    .await;
-    let payload = created
-        .sandbox
-        .as_ref()
-        .expect("sandbox payload should be present");
-    assert_eq!(
-        payload
-            .labels
-            .get(SANDBOX_LABEL_PROJECT_DIR)
-            .map(String::as_str),
-        Some(workspace_dir.to_string_lossy().as_ref())
-    );
+    let response = client
+        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+            metadata: None,
+            stack_name: "stack-invalid-spaces-mode".to_string(),
+            cpus: 1,
+            memory_mb: 512,
+            labels,
+        }))
+        .await
+        .expect("create_sandbox call");
+    let mut stream = response.into_inner();
+    let status = try_read_create_sandbox_completion(&mut stream)
+        .await
+        .expect_err("invalid spaces mode should be rejected");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(status.message().contains(SANDBOX_LABEL_SPACE_MODE));
 
     shutdown.notify_waiters();
     let result = tokio::time::timeout(Duration::from_secs(5), server)

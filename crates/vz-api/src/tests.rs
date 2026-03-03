@@ -750,7 +750,7 @@ fn test_router() -> (Router, tempfile::TempDir) {
 }
 
 #[tokio::test]
-async fn sandbox_create_returns_201() {
+async fn sandbox_create_requires_project_dir_label() {
     let (app, _dir) = test_router();
     let response = app
         .oneshot(
@@ -763,15 +763,17 @@ async fn sandbox_create_returns_201() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let sandbox_id = payload["sandbox"]["sandbox_id"].as_str().unwrap();
-    assert!(sandbox_id.starts_with("sbx-"), "id should start with sbx-");
-    assert_eq!(payload["sandbox"]["state"].as_str().unwrap(), "ready");
-    assert_eq!(payload["sandbox"]["cpus"].as_u64().unwrap(), 2);
-    assert_eq!(payload["sandbox"]["memory_mb"].as_u64().unwrap(), 1024);
+    assert_eq!(payload["error"]["code"].as_str(), Some("invalid_request"));
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("project_dir")),
+        "error message should include project_dir requirement"
+    );
 }
 
 #[tokio::test]
@@ -889,30 +891,28 @@ async fn sandbox_get_404() {
 
 #[tokio::test]
 async fn sandbox_create_then_get() {
-    let (app, _dir) = test_router();
-
-    let create_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/sandboxes")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"cpus": 4}"#))
-                .unwrap(),
-        )
-        .await
+    let (app, dir) = test_router();
+    let state_path = dir.path().join("state.db");
+    let store = StateStore::open(&state_path).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let sandbox_id = "sbx-test-get-1".to_string();
+    store
+        .save_sandbox(&Sandbox {
+            sandbox_id: sandbox_id.clone(),
+            backend: SandboxBackend::MacosVz,
+            spec: SandboxSpec {
+                cpus: Some(4),
+                ..SandboxSpec::default()
+            },
+            state: SandboxState::Ready,
+            created_at: now,
+            updated_at: now,
+            labels: BTreeMap::new(),
+        })
         .unwrap();
-    assert_eq!(create_response.status(), StatusCode::CREATED);
-
-    let create_body = to_bytes(create_response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let create_payload: serde_json::Value = serde_json::from_slice(&create_body).unwrap();
-    let sandbox_id = create_payload["sandbox"]["sandbox_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
 
     let get_response = app
         .oneshot(
@@ -938,33 +938,34 @@ async fn sandbox_create_then_get() {
 
 #[tokio::test]
 async fn sandbox_create_with_startup_selection_round_trips() {
-    let (app, _dir) = test_router();
-
-    let create_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/sandboxes")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"base_image_ref":"alpine:3.20","main_container":"workspace-main"}"#,
-                ))
-                .unwrap(),
-        )
-        .await
+    let (app, dir) = test_router();
+    let state_path = dir.path().join("state.db");
+    let store = StateStore::open(&state_path).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let sandbox_id = "sbx-test-startup-1".to_string();
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
+        "alpine:3.20".to_string(),
+    );
+    labels.insert(
+        SANDBOX_LABEL_MAIN_CONTAINER.to_string(),
+        "workspace-main".to_string(),
+    );
+    store
+        .save_sandbox(&Sandbox {
+            sandbox_id: sandbox_id.clone(),
+            backend: SandboxBackend::MacosVz,
+            spec: SandboxSpec::default(),
+            state: SandboxState::Ready,
+            created_at: now,
+            updated_at: now,
+            labels,
+        })
         .unwrap();
-    assert_eq!(create_response.status(), StatusCode::CREATED);
-
-    let create_body = to_bytes(create_response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let create_payload: serde_json::Value = serde_json::from_slice(&create_body).unwrap();
-    let sandbox = &create_payload["sandbox"];
-    let sandbox_id = sandbox["sandbox_id"].as_str().unwrap().to_string();
-
-    assert_eq!(sandbox["base_image_ref"].as_str(), Some("alpine:3.20"));
-    assert_eq!(sandbox["main_container"].as_str(), Some("workspace-main"));
 
     let get_response = app
         .clone()
@@ -3442,7 +3443,12 @@ async fn observability_metrics_endpoint_reports_http_counters() {
         .unwrap();
 
     let response = app
-        .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
