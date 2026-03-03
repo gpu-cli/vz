@@ -36,4 +36,23 @@
   - `/metrics` endpoint and metric families
 - `cargo test -p vz-runtimed` verifies:
   - gRPC metric registry rendering
-  - daemon metrics snapshot file creation on server start
+- daemon metrics snapshot file creation on server start
+
+## Btrfs Health Metrics (Daemon)
+
+`vz-runtimed` now publishes btrfs maintenance probe metrics from its maintenance loop:
+
+- `vz_runtimed_btrfs_health_status{component="scrub|balance"}`
+  - values: `1` healthy, `0` warning, `-1` error, `-2` unsupported
+- `vz_runtimed_btrfs_health_failures_total{component="scrub|balance"}`
+- `vz_runtimed_btrfs_health_last_probe_unix_seconds{component="scrub|balance"}`
+
+Probe state transitions are also persisted as:
+
+- structured runtime events (`drift_detected`, category `btrfs_health`)
+- receipts (`operation=btrfs_health_probe`, `entity_type=maintenance`)
+
+Recommended alerts:
+
+- fire when `vz_runtimed_btrfs_health_status{component="scrub"} < 1`
+- fire when `vz_runtimed_btrfs_health_status{component="balance"} < 1`

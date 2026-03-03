@@ -16,6 +16,7 @@ use vz_runtime_contract::{
 };
 
 use super::*;
+use crate::btrfs_health::{BtrfsHealthProbe, BtrfsHealthSeverity};
 use crate::{RuntimeDaemon, RuntimedConfig};
 
 #[cfg(target_os = "macos")]
@@ -293,6 +294,44 @@ async fn connect_file_client(
         .await
         .expect("connect channel");
     runtime_v2::file_service_client::FileServiceClient::new(channel)
+}
+
+#[test]
+fn persist_btrfs_health_probe_writes_drift_event_and_receipt() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+    let daemon = RuntimeDaemon::start(config).expect("daemon start");
+    let probe = BtrfsHealthProbe {
+        component: "scrub",
+        severity: BtrfsHealthSeverity::Warning,
+        detail: "no prior scrub stats available".to_string(),
+    };
+
+    super::persist_btrfs_health_probe(&daemon, &probe, tmp.path(), current_unix_secs())
+        .expect("persist btrfs health probe");
+
+    let events = daemon
+        .with_state_store(|store| store.load_events_since("daemon", 0))
+        .expect("load daemon events");
+    assert!(
+        events
+            .iter()
+            .any(|record| matches!(record.event, StackEvent::DriftDetected { ref category, .. } if category == "btrfs_health")),
+        "should emit drift_detected event for btrfs health"
+    );
+    let receipts = daemon
+        .with_state_store(|store| store.list_receipts())
+        .expect("list receipts");
+    assert!(
+        receipts.iter().any(
+            |receipt| receipt.operation == "btrfs_health_probe" && receipt.entity_id == "scrub"
+        ),
+        "should emit btrfs health receipt"
+    );
 }
 
 async fn read_open_sandbox_shell_completion(

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod btrfs_health;
 pub mod btrfs_portability;
 mod execution_sessions;
 mod grpc;
@@ -178,8 +179,7 @@ impl RuntimeDaemon {
                     source,
                 }
             })?;
-        let migrate_legacy_checkpoint_artifacts =
-            load_legacy_checkpoint_migration_mode_enabled()?;
+        let migrate_legacy_checkpoint_artifacts = load_legacy_checkpoint_migration_mode_enabled()?;
 
         let startup_lock = StartupLock::acquire(startup_lock_path(&config.state_store_path))?;
         let state_store = StateStore::open_with_pragmas(
@@ -196,9 +196,11 @@ impl RuntimeDaemon {
                     &config.runtime_data_dir,
                     &legacy_checkpoint_artifacts,
                 )
-                .map_err(|source| RuntimedError::MigrateLegacyCheckpointArtifacts {
-                    runtime_data_dir: config.runtime_data_dir.clone(),
-                    source,
+                .map_err(|source| {
+                    RuntimedError::MigrateLegacyCheckpointArtifacts {
+                        runtime_data_dir: config.runtime_data_dir.clone(),
+                        source,
+                    }
                 })?;
                 persist_legacy_checkpoint_migration_audit(&state_store, &report).map_err(
                     |source| RuntimedError::RecordLegacyCheckpointMigration {
@@ -1035,7 +1037,11 @@ mod tests {
             runtime_data_dir: tmp.path().join("runtime"),
             socket_path: tmp.path().join("runtime").join("runtimed.sock"),
         };
-        let legacy_root = cfg.runtime_data_dir.join("sandboxes").join("sbx-legacy").join("fs");
+        let legacy_root = cfg
+            .runtime_data_dir
+            .join("sandboxes")
+            .join("sbx-legacy")
+            .join("fs");
         std::fs::create_dir_all(&legacy_root).expect("create legacy checkpoint root");
 
         let error = match RuntimeDaemon::start(cfg.clone()) {
@@ -1059,8 +1065,14 @@ mod tests {
     fn migrate_legacy_checkpoint_artifacts_archives_paths() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let runtime_data_dir = tmp.path().join("runtime");
-        let legacy_one = runtime_data_dir.join("sandboxes").join("sbx-one").join("fs");
-        let legacy_two = runtime_data_dir.join("sandboxes").join("sbx-two").join("fs");
+        let legacy_one = runtime_data_dir
+            .join("sandboxes")
+            .join("sbx-one")
+            .join("fs");
+        let legacy_two = runtime_data_dir
+            .join("sandboxes")
+            .join("sbx-two")
+            .join("fs");
         std::fs::create_dir_all(&legacy_one).expect("create legacy one");
         std::fs::create_dir_all(&legacy_two).expect("create legacy two");
 
@@ -1081,7 +1093,11 @@ mod tests {
             "legacy roots should be moved to archive"
         );
         for archived in &report.migrated_paths {
-            assert!(archived.is_dir(), "archived path should exist: {}", archived.display());
+            assert!(
+                archived.is_dir(),
+                "archived path should exist: {}",
+                archived.display()
+            );
             assert!(
                 archived.starts_with(&report.archive_root),
                 "archived path should remain under archive root"
@@ -1096,7 +1112,11 @@ mod tests {
         std::fs::create_dir_all(state_store_path.parent().expect("parent")).expect("state parent");
         let store = StateStore::open(&state_store_path).expect("state store");
         let report = LegacyCheckpointMigrationReport {
-            archive_root: tmp.path().join("runtime").join("checkpoints").join("legacy-artifacts"),
+            archive_root: tmp
+                .path()
+                .join("runtime")
+                .join("checkpoints")
+                .join("legacy-artifacts"),
             migrated_paths: vec![tmp.path().join("runtime").join("legacy-a")],
         };
 
@@ -1139,7 +1159,11 @@ mod tests {
             runtime_data_dir: tmp.path().join("runtime"),
             socket_path: tmp.path().join("runtime").join("runtimed.sock"),
         };
-        let legacy_root = cfg.runtime_data_dir.join("sandboxes").join("sbx-legacy").join("fs");
+        let legacy_root = cfg
+            .runtime_data_dir
+            .join("sandboxes")
+            .join("sbx-legacy")
+            .join("fs");
         std::fs::create_dir_all(&legacy_root).expect("create legacy checkpoint root");
 
         let first_start_error = match RuntimeDaemon::start(cfg.clone()) {

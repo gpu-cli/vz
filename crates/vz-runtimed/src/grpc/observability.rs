@@ -21,6 +21,9 @@ pub(in crate::grpc) struct GrpcObservability {
 struct GrpcObservabilityInner {
     request_counts: BTreeMap<RequestCountKey, u64>,
     request_durations: BTreeMap<String, Histogram>,
+    btrfs_health_status: BTreeMap<String, i64>,
+    btrfs_health_failures_total: BTreeMap<String, u64>,
+    btrfs_health_last_probe_unix: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -134,7 +137,70 @@ impl GrpcObservability {
             ));
         }
 
+        output.push_str(
+            "# HELP vz_runtimed_btrfs_health_status Btrfs maintenance component health status (1=healthy,0=warning,-1=error,-2=unsupported).\n",
+        );
+        output.push_str("# TYPE vz_runtimed_btrfs_health_status gauge\n");
+        for (component, status) in &guard.btrfs_health_status {
+            output.push_str(&format!(
+                "vz_runtimed_btrfs_health_status{{component=\"{}\"}} {status}\n",
+                escape_label_value(component)
+            ));
+        }
+
+        output.push_str(
+            "# HELP vz_runtimed_btrfs_health_failures_total Total failed btrfs maintenance probe samples per component.\n",
+        );
+        output.push_str("# TYPE vz_runtimed_btrfs_health_failures_total counter\n");
+        for (component, failures) in &guard.btrfs_health_failures_total {
+            output.push_str(&format!(
+                "vz_runtimed_btrfs_health_failures_total{{component=\"{}\"}} {failures}\n",
+                escape_label_value(component)
+            ));
+        }
+
+        output.push_str(
+            "# HELP vz_runtimed_btrfs_health_last_probe_unix_seconds Unix timestamp of the most recent btrfs health probe by component.\n",
+        );
+        output.push_str("# TYPE vz_runtimed_btrfs_health_last_probe_unix_seconds gauge\n");
+        for (component, timestamp) in &guard.btrfs_health_last_probe_unix {
+            output.push_str(&format!(
+                "vz_runtimed_btrfs_health_last_probe_unix_seconds{{component=\"{}\"}} {timestamp}\n",
+                escape_label_value(component)
+            ));
+        }
+
         output
+    }
+
+    pub(in crate::grpc) fn record_btrfs_health_probe(
+        &self,
+        component: &str,
+        status: i64,
+        failed_sample: bool,
+        probe_unix_secs: u64,
+    ) {
+        let mut guard = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .btrfs_health_status
+            .insert(component.to_string(), status);
+        guard
+            .btrfs_health_last_probe_unix
+            .insert(component.to_string(), probe_unix_secs);
+        if failed_sample {
+            *guard
+                .btrfs_health_failures_total
+                .entry(component.to_string())
+                .or_insert(0) += 1;
+        } else {
+            guard
+                .btrfs_health_failures_total
+                .entry(component.to_string())
+                .or_insert(0);
+        }
     }
 }
 
@@ -259,6 +325,17 @@ mod tests {
         );
         assert!(output.contains(
             "vz_runtimed_grpc_request_duration_seconds_count{rpc_method=\"/vz.runtime.v2.SandboxService/CreateSandbox\"} 1"
+        ));
+        observability.record_btrfs_health_probe("scrub", 1, false, 1_700_000_000);
+        observability.record_btrfs_health_probe("balance", -1, true, 1_700_000_001);
+        let output = observability.render_prometheus();
+        assert!(output.contains("vz_runtimed_btrfs_health_status{component=\"scrub\"} 1"));
+        assert!(output.contains("vz_runtimed_btrfs_health_status{component=\"balance\"} -1"));
+        assert!(
+            output.contains("vz_runtimed_btrfs_health_failures_total{component=\"balance\"} 1")
+        );
+        assert!(output.contains(
+            "vz_runtimed_btrfs_health_last_probe_unix_seconds{component=\"scrub\"} 1700000000"
         ));
     }
 

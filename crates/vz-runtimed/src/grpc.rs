@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
@@ -33,6 +33,7 @@ use vz_runtime_translate::{
 use vz_stack::{IDEMPOTENCY_TTL_SECS, IdempotencyRecord, Receipt, StackError, StackEvent};
 
 use crate::RuntimeDaemon;
+use crate::btrfs_health::{BtrfsHealthProbe, BtrfsHealthSeverity, collect_btrfs_health_probes};
 use handlers::build::BuildServiceImpl;
 use handlers::capability::CapabilityServiceImpl;
 use handlers::checkpoint::CheckpointServiceImpl;
@@ -65,6 +66,17 @@ const ORPHAN_SHELL_EXECUTION_GRACE_SECS: u64 = 1;
 #[cfg(not(test))]
 const ORPHAN_SHELL_EXECUTION_GRACE_SECS: u64 = 300;
 const METRICS_SNAPSHOT_FILENAME: &str = "runtimed-grpc-metrics.prom";
+const BTRFS_HEALTH_EVENT_STACK: &str = "daemon";
+const BTRFS_HEALTH_OPERATION: &str = "btrfs_health_probe";
+
+#[derive(Debug, serde::Serialize)]
+struct BtrfsHealthReceiptMetadata<'a> {
+    event_type: &'static str,
+    component: &'a str,
+    severity: &'a str,
+    detail: &'a str,
+    target_path: String,
+}
 
 fn persist_metrics_snapshot(
     daemon: &RuntimeDaemon,
@@ -144,10 +156,11 @@ fn reconcile_orphaned_shell_executions(daemon: &RuntimeDaemon) -> Result<u64, St
 
 async fn run_maintenance_loop(
     daemon: Arc<RuntimeDaemon>,
-    _observability: Arc<GrpcObservability>,
+    observability: Arc<GrpcObservability>,
     shutdown: Arc<tokio::sync::Notify>,
 ) {
     let mut ticker = tokio::time::interval(IDEMPOTENCY_CLEANUP_INTERVAL);
+    let mut previous_severity: HashMap<&'static str, BtrfsHealthSeverity> = HashMap::new();
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,
@@ -217,15 +230,106 @@ async fn run_maintenance_loop(
                         warn!(error = %error, "daemon maintenance: failed to reconcile orphaned shell executions");
                     }
                 }
+                let target_path = daemon.runtime_data_dir().to_path_buf();
+                let probe_at = current_unix_secs();
+                let probes = collect_btrfs_health_probes(&target_path);
+                for probe in probes {
+                    observability.record_btrfs_health_probe(
+                        probe.component,
+                        probe.severity.metric_value(),
+                        matches!(probe.severity, BtrfsHealthSeverity::Error),
+                        probe_at,
+                    );
+                    let should_emit = previous_severity
+                        .get(probe.component)
+                        .is_none_or(|previous| previous != &probe.severity);
+                    if should_emit {
+                        if let Err(error) = persist_btrfs_health_probe(
+                            daemon.as_ref(),
+                            &probe,
+                            &target_path,
+                            probe_at,
+                        ) {
+                            warn!(
+                                error = %error,
+                                component = probe.component,
+                                severity = probe.severity.as_str(),
+                                "daemon maintenance: failed to persist btrfs health probe"
+                            );
+                        }
+                    }
+                    previous_severity.insert(probe.component, probe.severity.clone());
+                }
                 #[cfg(not(test))]
                 if let Err(error) =
-                    persist_metrics_snapshot(daemon.as_ref(), _observability.as_ref())
+                    persist_metrics_snapshot(daemon.as_ref(), observability.as_ref())
                 {
                     warn!(error = %error, "daemon maintenance: failed to persist metrics snapshot");
                 }
             }
         }
     }
+}
+
+fn persist_btrfs_health_probe(
+    daemon: &RuntimeDaemon,
+    probe: &BtrfsHealthProbe,
+    target_path: &Path,
+    now: u64,
+) -> Result<(), StackError> {
+    let request_id = format!("req-btrfs-health-{}-{now}", probe.component);
+    let receipt_id = format!("rcp-btrfs-health-{}-{now}", probe.component);
+    let metadata = serde_json::to_value(BtrfsHealthReceiptMetadata {
+        event_type: "drift_detected",
+        component: probe.component,
+        severity: probe.severity.as_str(),
+        detail: probe.detail.as_str(),
+        target_path: target_path.display().to_string(),
+    })
+    .map_err(StackError::from)?;
+    let event_description = format!(
+        "btrfs {} probe status={} detail={} target={}",
+        probe.component,
+        probe.severity.as_str(),
+        probe.detail,
+        target_path.display()
+    );
+    let event_severity = match probe.severity {
+        BtrfsHealthSeverity::Healthy => "info".to_string(),
+        BtrfsHealthSeverity::Warning => "warning".to_string(),
+        BtrfsHealthSeverity::Error => "error".to_string(),
+        BtrfsHealthSeverity::Unsupported => "warning".to_string(),
+    };
+    let receipt_status = match probe.severity {
+        BtrfsHealthSeverity::Error => "error".to_string(),
+        BtrfsHealthSeverity::Warning | BtrfsHealthSeverity::Unsupported => "warning".to_string(),
+        BtrfsHealthSeverity::Healthy => "success".to_string(),
+    };
+
+    daemon.with_state_store(|store| {
+        store.with_immediate_transaction(|tx| {
+            tx.emit_event(
+                BTRFS_HEALTH_EVENT_STACK,
+                &StackEvent::DriftDetected {
+                    stack_name: BTRFS_HEALTH_EVENT_STACK.to_string(),
+                    category: "btrfs_health".to_string(),
+                    description: event_description.clone(),
+                    severity: event_severity.clone(),
+                },
+            )?;
+            tx.save_receipt(&Receipt {
+                receipt_id,
+                operation: BTRFS_HEALTH_OPERATION.to_string(),
+                entity_id: probe.component.to_string(),
+                entity_type: "maintenance".to_string(),
+                request_id,
+                status: receipt_status,
+                created_at: now,
+                metadata,
+            })?;
+            Ok(())
+        })
+    })
 }
 
 /// Run Runtime V2 gRPC services on a Unix socket with graceful shutdown.
