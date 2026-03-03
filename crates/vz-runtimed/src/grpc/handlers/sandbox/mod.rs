@@ -398,17 +398,7 @@ fn daemon_materialize_verified_remote_cache_artifact(
     artifact: &SpaceRemoteCacheVerifiedArtifact,
 ) -> Result<PathBuf, Status> {
     let target_dir = daemon_space_cache_artifact_dir(daemon, key);
-    std::fs::create_dir_all(&target_dir).map_err(|error| {
-        status_from_machine_error(MachineError::new(
-            MachineErrorCode::InternalError,
-            format!(
-                "failed to create daemon spaces cache artifact directory {}: {error}",
-                target_dir.display()
-            ),
-            None,
-            BTreeMap::new(),
-        ))
-    })?;
+    ensure_cache_artifact_directory_layout(&target_dir)?;
     let target_manifest = target_dir.join("manifest.json");
     let target_signature = target_dir.join("signature.sig");
     let target_blob = target_dir.join("payload.tar.zst");
@@ -449,6 +439,118 @@ fn daemon_materialize_verified_remote_cache_artifact(
         ))
     })?;
     Ok(target_blob)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_cache_artifact_directory_layout(target_dir: &Path) -> Result<(), Status> {
+    std::fs::create_dir_all(target_dir).map_err(|error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::InternalError,
+            format!(
+                "failed to create daemon spaces cache artifact directory {}: {error}",
+                target_dir.display()
+            ),
+            None,
+            BTreeMap::new(),
+        ))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_cache_artifact_directory_layout(target_dir: &Path) -> Result<(), Status> {
+    let request_id = "req-space-cache-materialize-layout";
+    let parent = target_dir.parent().ok_or_else(|| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!(
+                "cache artifact target path has no parent directory: {}",
+                target_dir.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::InternalError,
+            format!(
+                "failed to create cache artifact parent directory {}: {error}",
+                parent.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })?;
+
+    let parent_on_btrfs = path_is_on_btrfs(parent, request_id)?;
+    if !parent_on_btrfs {
+        std::fs::create_dir_all(target_dir).map_err(|error| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::InternalError,
+                format!(
+                    "failed to create daemon spaces cache artifact directory {}: {error}",
+                    target_dir.display()
+                ),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            ))
+        })?;
+        return Ok(());
+    }
+
+    if target_dir.exists() {
+        let output = std::process::Command::new("btrfs")
+            .args(["subvolume", "show", target_dir.to_string_lossy().as_ref()])
+            .output()
+            .map_err(|error| {
+                status_from_machine_error(MachineError::new(
+                    MachineErrorCode::BackendUnavailable,
+                    format!("failed to inspect cache artifact subvolume layout: {error}"),
+                    Some(request_id.to_string()),
+                    BTreeMap::new(),
+                ))
+            })?;
+        if output.status.success() {
+            return Ok(());
+        }
+        std::fs::remove_dir_all(target_dir).map_err(|error| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::InternalError,
+                format!(
+                    "failed to clear non-subvolume cache artifact directory {}: {error}",
+                    target_dir.display()
+                ),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            ))
+        })?;
+    }
+
+    let output = std::process::Command::new("btrfs")
+        .args(["subvolume", "create", target_dir.to_string_lossy().as_ref()])
+        .output()
+        .map_err(|error| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::BackendUnavailable,
+                format!("failed to create cache artifact subvolume: {error}"),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            ))
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::BackendUnavailable,
+            format!(
+                "btrfs subvolume create failed for {}: {}",
+                target_dir.display(),
+                stderr.trim()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+    Ok(())
 }
 
 async fn terminate_runtime_sandbox_resources(

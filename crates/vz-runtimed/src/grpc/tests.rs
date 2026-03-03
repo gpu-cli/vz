@@ -399,6 +399,58 @@ async fn read_prepare_space_cache_completion(
     completion.expect("expected terminal prepare space cache completion event")
 }
 
+#[cfg(target_os = "linux")]
+async fn read_export_space_cache_completion(
+    stream: &mut tonic::Streaming<runtime_v2::ExportSpaceCacheEvent>,
+) -> runtime_v2::ExportSpaceCacheCompletion {
+    let mut completion = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .expect("read export space cache stream event")
+    {
+        if let Some(runtime_v2::export_space_cache_event::Payload::Completion(done)) = event.payload
+        {
+            completion = Some(done);
+        }
+    }
+    completion.expect("expected terminal export space cache completion event")
+}
+
+#[cfg(target_os = "linux")]
+async fn read_export_space_cache_completion_response(
+    response: tonic::Response<tonic::Streaming<runtime_v2::ExportSpaceCacheEvent>>,
+) -> runtime_v2::ExportSpaceCacheCompletion {
+    let mut stream = response.into_inner();
+    read_export_space_cache_completion(&mut stream).await
+}
+
+#[cfg(target_os = "linux")]
+async fn read_import_space_cache_completion(
+    stream: &mut tonic::Streaming<runtime_v2::ImportSpaceCacheEvent>,
+) -> runtime_v2::ImportSpaceCacheCompletion {
+    let mut completion = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .expect("read import space cache stream event")
+    {
+        if let Some(runtime_v2::import_space_cache_event::Payload::Completion(done)) = event.payload
+        {
+            completion = Some(done);
+        }
+    }
+    completion.expect("expected terminal import space cache completion event")
+}
+
+#[cfg(target_os = "linux")]
+async fn read_import_space_cache_completion_response(
+    response: tonic::Response<tonic::Streaming<runtime_v2::ImportSpaceCacheEvent>>,
+) -> runtime_v2::ImportSpaceCacheCompletion {
+    let mut stream = response.into_inner();
+    read_import_space_cache_completion(&mut stream).await
+}
+
 async fn read_close_sandbox_shell_completion(
     stream: &mut tonic::Streaming<runtime_v2::CloseSandboxShellEvent>,
 ) -> runtime_v2::CloseSandboxShellResponse {
@@ -5746,6 +5798,132 @@ async fn checkpoint_export_import_round_trip_preserves_workspace_snapshot() {
                 "subvolume",
                 "delete",
                 workspace_root.to_string_lossy().as_ref(),
+            ])
+            .output();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires VZ_TEST_BTRFS_WORKSPACE on a host btrfs filesystem"]
+async fn space_cache_export_import_round_trip_preserves_payload() {
+    fn run_btrfs(args: &[&str]) {
+        let output = Command::new("btrfs")
+            .args(args)
+            .output()
+            .expect("run btrfs");
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("btrfs command failed ({args:?}): {stderr}");
+        }
+    }
+
+    let workspace_root_base = std::env::var("VZ_TEST_BTRFS_WORKSPACE")
+        .expect("VZ_TEST_BTRFS_WORKSPACE must point at a btrfs path");
+    let test_root = PathBuf::from(workspace_root_base)
+        .join(format!("vz-cache-portability-{}", current_unix_secs()));
+    let parent = test_root.parent().expect("test root parent should exist");
+    std::fs::create_dir_all(parent).expect("create test root parent");
+    run_btrfs(&["subvolume", "create", test_root.to_string_lossy().as_ref()]);
+
+    let config = RuntimedConfig {
+        state_store_path: test_root.join("state").join("stack-state.db"),
+        runtime_data_dir: test_root.join("runtime"),
+        socket_path: test_root.join("runtime").join("runtimed.sock"),
+    };
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+    wait_for_socket(&config.socket_path).await;
+
+    let source_cache_subvolume = config
+        .state_store_path
+        .parent()
+        .expect("state store parent")
+        .join("space-cache-artifacts")
+        .join("deps")
+        .join("abc123");
+    std::fs::create_dir_all(
+        source_cache_subvolume
+            .parent()
+            .expect("source cache parent should exist"),
+    )
+    .expect("create source cache parent");
+    run_btrfs(&[
+        "subvolume",
+        "create",
+        source_cache_subvolume.to_string_lossy().as_ref(),
+    ]);
+    let payload_path = source_cache_subvolume.join("payload.tar.zst");
+    std::fs::write(&payload_path, b"portable-cache-payload").expect("write cache payload");
+
+    let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
+    let stream_path = test_root.join("portable").join("cache.send");
+    let export_completion = read_export_space_cache_completion_response(
+        sandbox_client
+            .export_space_cache(Request::new(runtime_v2::ExportSpaceCacheRequest {
+                cache_name: "deps".to_string(),
+                digest_hex: "abc123".to_string(),
+                stream_path: stream_path.to_string_lossy().to_string(),
+                metadata: None,
+            }))
+            .await
+            .expect("export space cache"),
+    )
+    .await;
+    assert_eq!(export_completion.cache_name, "deps");
+    assert_eq!(export_completion.digest_hex, "abc123");
+    assert_eq!(
+        export_completion.stream_path,
+        stream_path.to_string_lossy().to_string()
+    );
+    assert!(stream_path.exists(), "cache send stream should exist");
+
+    let import_response = sandbox_client
+        .import_space_cache(Request::new(runtime_v2::ImportSpaceCacheRequest {
+            cache_name: "deps".to_string(),
+            digest_hex: "def456".to_string(),
+            stream_path: stream_path.to_string_lossy().to_string(),
+            metadata: None,
+        }))
+        .await
+        .expect("import space cache");
+    assert!(
+        import_response.metadata().get("x-receipt-id").is_some(),
+        "import should return receipt header"
+    );
+    let import_completion = read_import_space_cache_completion_response(import_response).await;
+    assert_eq!(import_completion.cache_name, "deps");
+    assert_eq!(import_completion.digest_hex, "def456");
+    let received_path = PathBuf::from(import_completion.received_subvolume_path);
+    assert!(received_path.exists(), "imported cache path should exist");
+    assert_eq!(
+        std::fs::read(received_path.join("payload.tar.zst")).expect("read imported payload"),
+        b"portable-cache-payload"
+    );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+
+    if test_root.exists() {
+        let _ = Command::new("btrfs")
+            .args([
+                "subvolume",
+                "delete",
+                "-R",
+                test_root.to_string_lossy().as_ref(),
             ])
             .output();
     }
