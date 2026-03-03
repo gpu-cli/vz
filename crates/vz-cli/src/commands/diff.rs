@@ -1,7 +1,6 @@
 //! `vz diff` — deterministic, versioned checkpoint diff contract.
 //!
-//! In daemon mode this consumes runtime-owned file-level checkpoint deltas.
-//! API mode retains metadata projection fallback until API parity is complete.
+//! Both daemon-gRPC and API-HTTP modes consume runtime-owned file-level checkpoint deltas.
 
 #![allow(clippy::print_stdout)]
 
@@ -84,6 +83,21 @@ struct ApiCheckpointPayload {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ApiCheckpointResponse {
     checkpoint: ApiCheckpointPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ApiCheckpointFileDiffPayload {
+    path: String,
+    change: String,
+    before_digest_sha256: String,
+    after_digest_sha256: String,
+    before_size: u64,
+    after_size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ApiDiffCheckpointsResponse {
+    files: Vec<ApiCheckpointFileDiffPayload>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -242,6 +256,48 @@ async fn api_get_checkpoint(
     Ok(Some(checkpoint_from_api(payload.checkpoint)))
 }
 
+fn checkpoint_file_diff_from_api(
+    payload: ApiCheckpointFileDiffPayload,
+) -> runtime_v2::CheckpointFileDiffPayload {
+    runtime_v2::CheckpointFileDiffPayload {
+        path: payload.path,
+        change: payload.change,
+        before_digest_sha256: payload.before_digest_sha256,
+        after_digest_sha256: payload.after_digest_sha256,
+        before_size: payload.before_size,
+        after_size: payload.after_size,
+    }
+}
+
+async fn api_diff_checkpoints(
+    from_checkpoint_id: &str,
+    to_checkpoint_id: &str,
+) -> anyhow::Result<Vec<runtime_v2::CheckpointFileDiffPayload>> {
+    let url = runtime_api_url("/v1/checkpoints/diff")?;
+    let response = reqwest::Client::new()
+        .get(url)
+        .query(&[
+            ("from_checkpoint_id", from_checkpoint_id),
+            ("to_checkpoint_id", to_checkpoint_id),
+        ])
+        .send()
+        .await
+        .context("failed to call api diff checkpoints")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to diff checkpoints via api").await);
+    }
+
+    let payload: ApiDiffCheckpointsResponse = response
+        .json()
+        .await
+        .context("failed to decode api diff checkpoints response")?;
+    Ok(payload
+        .files
+        .into_iter()
+        .map(checkpoint_file_diff_from_api)
+        .collect())
+}
+
 async fn load_checkpoint(
     state_db: &std::path::Path,
     checkpoint_id: &str,
@@ -305,10 +361,13 @@ async fn load_diff_evidence(
                 }
             }
         }
-        ControlPlaneTransport::ApiHttp => Ok(DiffEvidence {
-            evidence_source: EVIDENCE_SOURCE_CHECKPOINT_METADATA.to_string(),
-            file_diffs: Vec::new(),
-        }),
+        ControlPlaneTransport::ApiHttp => {
+            let file_diffs = api_diff_checkpoints(from_checkpoint_id, to_checkpoint_id).await?;
+            Ok(DiffEvidence {
+                evidence_source: EVIDENCE_SOURCE_CHECKPOINT_FILE_SNAPSHOT.to_string(),
+                file_diffs,
+            })
+        }
     }
 }
 

@@ -133,6 +133,19 @@ pub(crate) fn checkpoint_payload_from_runtime_proto(
     }
 }
 
+pub(crate) fn checkpoint_file_diff_payload_from_runtime_proto(
+    payload: runtime_v2::CheckpointFileDiffPayload,
+) -> CheckpointFileDiffPayload {
+    CheckpointFileDiffPayload {
+        path: payload.path,
+        change: payload.change,
+        before_digest_sha256: payload.before_digest_sha256,
+        after_digest_sha256: payload.after_digest_sha256,
+        before_size: payload.before_size,
+        after_size: payload.after_size,
+    }
+}
+
 pub(crate) fn container_payload_from_runtime_proto(
     payload: runtime_v2::ContainerPayload,
 ) -> ContainerPayload {

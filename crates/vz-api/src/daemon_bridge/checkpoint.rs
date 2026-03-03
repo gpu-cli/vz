@@ -226,6 +226,60 @@ pub(crate) async fn try_get_checkpoint_via_daemon(
     }
 }
 
+pub(crate) async fn try_diff_checkpoints_via_daemon(
+    state: &ApiState,
+    from_checkpoint_id: &str,
+    to_checkpoint_id: &str,
+    request_id: &str,
+) -> Option<Response> {
+    let mut client = match DaemonClient::connect_with_config(daemon_client_config(state)).await {
+        Ok(client) => client,
+        Err(error) => {
+            return Some(json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon_unavailable",
+                &error.to_string(),
+                request_id,
+            ));
+        }
+    };
+
+    let grpc_request = runtime_v2::DiffCheckpointsRequest {
+        from_checkpoint_id: from_checkpoint_id.to_string(),
+        to_checkpoint_id: to_checkpoint_id.to_string(),
+        metadata: Some(daemon_request_metadata(request_id, None)),
+    };
+    match client.diff_checkpoints(grpc_request).await {
+        Ok(grpc_response) => Some(
+            (
+                StatusCode::OK,
+                Json(DiffCheckpointsResponse {
+                    request_id: if grpc_response.request_id.trim().is_empty() {
+                        request_id.to_string()
+                    } else {
+                        grpc_response.request_id
+                    },
+                    files: grpc_response
+                        .files
+                        .into_iter()
+                        .map(checkpoint_file_diff_payload_from_runtime_proto)
+                        .collect(),
+                }),
+            )
+                .into_response(),
+        ),
+        Err(DaemonClientError::Grpc(status)) => {
+            Some(daemon_status_to_http_response(status, request_id))
+        }
+        Err(error) => Some(json_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon_unavailable",
+            &error.to_string(),
+            request_id,
+        )),
+    }
+}
+
 pub(crate) async fn try_restore_checkpoint_via_daemon(
     state: &ApiState,
     checkpoint_id: &str,

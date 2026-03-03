@@ -276,6 +276,7 @@ pub fn router(config: ApiConfig) -> Router {
             get(list_checkpoints).post(create_checkpoint),
         )
         .route("/v1/checkpoints/import", post(import_checkpoint))
+        .route("/v1/checkpoints/diff", get(diff_checkpoints))
         .route("/v1/checkpoints/{checkpoint_id}", get(get_checkpoint))
         .route(
             "/v1/checkpoints/{checkpoint_id}/export",

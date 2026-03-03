@@ -5,15 +5,15 @@ use super::{
     CheckpointResponse, ChmodPathRequest, ChownPathRequest, CloseSandboxShellRequest,
     CloseSandboxShellResponse, ContainerListResponse, ContainerResponse, CopyPathRequest,
     CreateCheckpointRequest, CreateContainerRequest, CreateExecutionRequest, CreateSandboxRequest,
-    ErrorResponse, EventsResponse, ExecutionListResponse, ExecutionOutputStreamEventPayload,
-    ExecutionResponse, ExportCheckpointRequest, ExportCheckpointResponse, FileMutationResponse,
-    ForkCheckpointRequest, ImageListResponse, ImageResponse, ImportCheckpointRequest,
-    LeaseListResponse, LeaseResponse, ListFilesRequest, ListFilesResponse, MakeDirRequest,
-    MovePathRequest, OpenLeaseRequest, OpenSandboxShellResponse, PruneImagesResponse,
-    PullImageRequest, PullImageResponse, ReadFileRequest, ReadFileResponse, ReceiptResponse,
-    RemovePathRequest, ResizeExecRequest, RestoreCheckpointResponse, SandboxListResponse,
-    SandboxResponse, SignalExecRequest, StartBuildRequest, WriteExecStdinRequest,
-    WriteFileRequest, WriteFileResponse,
+    DiffCheckpointsResponse, ErrorResponse, EventsResponse, ExecutionListResponse,
+    ExecutionOutputStreamEventPayload, ExecutionResponse, ExportCheckpointRequest,
+    ExportCheckpointResponse, FileMutationResponse, ForkCheckpointRequest, ImageListResponse,
+    ImageResponse, ImportCheckpointRequest, LeaseListResponse, LeaseResponse, ListFilesRequest,
+    ListFilesResponse, MakeDirRequest, MovePathRequest, OpenLeaseRequest, OpenSandboxShellResponse,
+    PruneImagesResponse, PullImageRequest, PullImageResponse, ReadFileRequest, ReadFileResponse,
+    ReceiptResponse, RemovePathRequest, ResizeExecRequest, RestoreCheckpointResponse,
+    SandboxListResponse, SandboxResponse, SignalExecRequest, StartBuildRequest,
+    WriteExecStdinRequest, WriteFileRequest, WriteFileResponse,
 };
 use utoipa::OpenApi;
 
@@ -467,6 +467,23 @@ fn list_checkpoints() {}
     )
 )]
 fn get_checkpoint() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/checkpoints/diff",
+    operation_id = "diffCheckpoints",
+    summary = "Diff two checkpoints and return file-level evidence",
+    params(
+        ("from_checkpoint_id" = String, Query, description = "Base checkpoint identifier"),
+        ("to_checkpoint_id" = String, Query, description = "Target checkpoint identifier"),
+    ),
+    responses(
+        (status = 200, description = "Checkpoint file-level diff", body = DiffCheckpointsResponse),
+        (status = 404, description = "Checkpoint not found", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn diff_checkpoints() {}
 
 #[utoipa::path(
     post,
@@ -931,6 +948,7 @@ fn chown_path() {}
         create_checkpoint,
         list_checkpoints,
         get_checkpoint,
+        diff_checkpoints,
         restore_checkpoint,
         fork_checkpoint,
         export_checkpoint,
@@ -990,6 +1008,8 @@ fn chown_path() {}
         crate::ExportCheckpointResponse,
         crate::ImportCheckpointRequest,
         crate::ForkCheckpointRequest,
+        crate::CheckpointFileDiffPayload,
+        crate::DiffCheckpointsResponse,
         crate::CheckpointPayload,
         crate::CheckpointResponse,
         crate::RestoreCheckpointResponse,

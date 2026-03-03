@@ -852,6 +852,30 @@ pub(super) async fn get_checkpoint(
     )
 }
 
+pub(super) async fn diff_checkpoints(
+    State(state): State<ApiState>,
+    Query(query): Query<DiffCheckpointsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = try_diff_checkpoints_via_daemon(
+        &state,
+        &query.from_checkpoint_id,
+        &query.to_checkpoint_id,
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "checkpoint operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
 pub(super) async fn restore_checkpoint(
     State(state): State<ApiState>,
     Path(checkpoint_id): Path<String>,

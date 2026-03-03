@@ -154,6 +154,7 @@ fn openapi_document_contains_required_paths() {
     assert!(paths.contains_key("/v1/executions/{execution_id}/signal"));
     assert!(paths.contains_key("/v1/checkpoints"));
     assert!(paths.contains_key("/v1/checkpoints/import"));
+    assert!(paths.contains_key("/v1/checkpoints/diff"));
     assert!(paths.contains_key("/v1/checkpoints/{checkpoint_id}"));
     assert!(paths.contains_key("/v1/checkpoints/{checkpoint_id}/export"));
     assert!(paths.contains_key("/v1/checkpoints/{checkpoint_id}/children"));
@@ -1712,6 +1713,40 @@ async fn checkpoint_children_404_for_unknown_parent() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn checkpoint_diff_404_for_unknown_checkpoints() {
+    let (app, _dir) = test_router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/checkpoints/diff?from_checkpoint_id=ckpt-a&to_checkpoint_id=ckpt-b")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn checkpoint_diff_requires_query_parameters() {
+    let (app, _dir) = test_router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/checkpoints/diff")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

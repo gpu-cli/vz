@@ -35,6 +35,22 @@ Current daemon-backed integration coverage includes:
 - API daemon-backed sandbox lifecycle smoke:
   - `cargo test -p vz-api --test server_smoke runtime_api_server_smoke_sandbox_crud_and_file_ops`
 
+## Mission Evidence Workflow (Spaces)
+
+Default evidence flow for checkpointed spaces combines runtime file/system evidence and git delta:
+
+```bash
+# Runtime-owned file/system evidence between checkpoints.
+vz diff <from-checkpoint-id> <to-checkpoint-id> --mode patch
+
+# Code-level working tree delta in the checked-out project.
+git diff
+```
+
+API transport parity for checkpoint evidence is provided via `GET /v1/checkpoints/diff`
+(`from_checkpoint_id` + `to_checkpoint_id` query parameters), and `vz diff` now uses that
+endpoint when `VZ_CONTROL_PLANE_TRANSPORT=api-http`.
+
 ## Restart/Reconcile Validation
 
 Daemon startup reconcile and post-restart attach semantics are validated with:

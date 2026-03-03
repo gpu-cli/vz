@@ -408,6 +408,28 @@ pub(crate) struct ImportCheckpointRequest {
     pub(crate) retention_tag: Option<String>,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct DiffCheckpointsQuery {
+    pub(crate) from_checkpoint_id: String,
+    pub(crate) to_checkpoint_id: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct CheckpointFileDiffPayload {
+    pub(crate) path: String,
+    pub(crate) change: String,
+    pub(crate) before_digest_sha256: String,
+    pub(crate) after_digest_sha256: String,
+    pub(crate) before_size: u64,
+    pub(crate) after_size: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct DiffCheckpointsResponse {
+    pub(crate) request_id: String,
+    pub(crate) files: Vec<CheckpointFileDiffPayload>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct CheckpointPayload {
     pub(crate) checkpoint_id: String,
