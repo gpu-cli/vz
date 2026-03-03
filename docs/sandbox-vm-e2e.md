@@ -145,6 +145,23 @@ harness on a Linux host/VM with a real btrfs workspace path:
 VZ_TEST_BTRFS_WORKSPACE=/mnt/vz-btrfs ./scripts/run-linux-btrfs-e2e.sh
 ```
 
+For dedicated remote `vz` Linux environments (SSH-accessible), use the remote wrapper:
+
+```bash
+./scripts/run-linux-btrfs-e2e-remote.sh \
+  --host user@vz-linux-host \
+  --workspace /mnt/vz-btrfs \
+  --remote-repo ~/workspace/vz \
+  --profile release
+```
+
+The remote wrapper runs the same gate script on the remote host and copies the resulting artifact
+directory back under:
+
+```text
+.artifacts/linux-btrfs-e2e-remote/<timestamp>/
+```
+
 Mandatory pass criteria:
 
 - `summary.txt` contains:
