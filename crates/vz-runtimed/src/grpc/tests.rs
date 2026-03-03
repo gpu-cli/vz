@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hyper_util::rt::TokioIo;
 use tonic::Code;
@@ -790,6 +790,76 @@ async fn prepare_space_cache_stream_persists_receipt_and_returns_outcomes() {
             .iter()
             .any(|receipt| receipt.operation == "prepare_space_cache"),
         "prepare_space_cache receipt should be persisted"
+    );
+
+    shutdown.notify_waiters();
+    server.await.expect("server join").expect("server result");
+}
+
+#[tokio::test]
+async fn prepare_space_cache_cold_then_warm_hit_benchmark_smoke() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+    let shutdown_task = shutdown.clone();
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+    wait_for_socket(&config.socket_path).await;
+
+    let request = runtime_v2::PrepareSpaceCacheRequest {
+        metadata: None,
+        keys: vec![runtime_v2::SpaceCacheKeyPayload {
+            schema_version: u32::from(SPACE_CACHE_KEY_SCHEMA_VERSION),
+            cache_name: "deps".to_string(),
+            digest_hex: "abc123".to_string(),
+            canonical_json: "{}".to_string(),
+        }],
+    };
+
+    let mut client = connect_sandbox_client(&config.socket_path).await;
+    let cold_started = Instant::now();
+    let cold_response = client
+        .prepare_space_cache(Request::new(request.clone()))
+        .await
+        .expect("cold prepare_space_cache");
+    let cold_ms = cold_started.elapsed().as_millis();
+    let mut cold_stream = cold_response.into_inner();
+    let cold_completion = read_prepare_space_cache_completion(&mut cold_stream).await;
+    assert_eq!(cold_completion.outcomes.len(), 1);
+    assert_eq!(
+        cold_completion.outcomes[0].outcome,
+        runtime_v2::SpaceCacheTrustOutcome::LocalMissCold as i32
+    );
+
+    let mut client = connect_sandbox_client(&config.socket_path).await;
+    let warm_started = Instant::now();
+    let warm_response = client
+        .prepare_space_cache(Request::new(request))
+        .await
+        .expect("warm prepare_space_cache");
+    let warm_ms = warm_started.elapsed().as_millis();
+    let mut warm_stream = warm_response.into_inner();
+    let warm_completion = read_prepare_space_cache_completion(&mut warm_stream).await;
+    assert_eq!(warm_completion.outcomes.len(), 1);
+    assert_eq!(
+        warm_completion.outcomes[0].outcome,
+        runtime_v2::SpaceCacheTrustOutcome::LocalHit as i32
+    );
+
+    println!(
+        "BENCH space_cache_prepare cold_ms={} warm_ms={} key=deps:abc123",
+        cold_ms, warm_ms
     );
 
     shutdown.notify_waiters();

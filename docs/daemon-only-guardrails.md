@@ -73,6 +73,38 @@ Visibility surfaces:
   - reason-bucket arrays in receipt metadata:
     `deleted_by_age`, `deleted_by_count`, `deleted_by_lineage`
 
+## Spaces Cache Lifecycle And GC
+
+Daemon-owned spaces cache state currently uses:
+
+- index file: `<state-store-parent>/space-cache-index.json`
+- artifact root: `<state-store-parent>/space-cache-artifacts/<cache-name>/<digest-hex>/`
+
+Lifecycle behavior:
+
+- Cache identity is deterministic from canonical key material (`SpaceCacheKey` schema).
+- First prepare is expected `local_miss_cold`; subsequent prepare with identical key is `local_hit`.
+- Schema-version mismatch invalidates stale index entries during prepare.
+- Remote verified artifacts are materialized only through daemon paths.
+
+Portability and storage policy:
+
+- Cache artifact materialization is fail-closed unless daemon state storage is Linux+btrfs.
+- Linux non-btrfs daemon state parents are rejected for cache artifact materialization.
+- Non-Linux platforms are rejected for cache artifact materialization.
+
+Benchmark/evidence workflow:
+
+```bash
+./scripts/run-space-cache-benchmark.sh
+```
+
+Artifacts are written to `.artifacts/space-cache-bench/<timestamp>/` with:
+
+- `run-info.txt` (host/profile/test metadata)
+- `<test>.log` (raw command output)
+- `summary.txt` (benchmark marker line)
+
 ## Release Scope: No Live Host Mounts
 
 Spaces R1 excludes live host mount features in sandbox lifecycle surfaces.
