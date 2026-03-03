@@ -141,14 +141,6 @@ fn checkpoint_class_from_wire(value: &str) -> Result<CheckpointClass, MachineErr
     }
 }
 
-fn checkpoint_snapshot_runtime_fs_root(daemon: &RuntimeDaemon, sandbox_id: &str) -> PathBuf {
-    daemon
-        .runtime_data_dir()
-        .join("sandboxes")
-        .join(sandbox_id)
-        .join("fs")
-}
-
 fn runtime_compatibility_fingerprint(daemon: &RuntimeDaemon) -> String {
     format!(
         "runtime:backend={};daemon={}",
@@ -522,7 +514,15 @@ fn fork_workspace_checkpoint_subvolume(
     let parent_snapshot =
         checkpoint_workspace_snapshot_subvolume_path(daemon, parent_checkpoint_id);
     if !parent_snapshot.is_dir() {
-        return Ok(());
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::NotFound,
+            format!(
+                "workspace parent checkpoint snapshot is missing for fork: {}",
+                parent_snapshot.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
     }
     let fork_snapshot = checkpoint_workspace_snapshot_subvolume_path(daemon, fork_checkpoint_id);
     if fork_snapshot.exists() {
@@ -563,89 +563,34 @@ fn fork_workspace_checkpoint_subvolume(
     )
 }
 
-fn maybe_space_workspace_root_for_checkpoint(
+fn required_space_workspace_root_for_checkpoint(
     daemon: &RuntimeDaemon,
     sandbox_id: &str,
     request_id: &str,
-) -> Result<Option<PathBuf>, Status> {
+) -> Result<PathBuf, Status> {
     let sandbox = daemon
         .with_state_store(|store| store.load_sandbox(sandbox_id))
         .map_err(|error| status_from_stack_error(error, request_id))?;
-    let Some(sandbox) = sandbox else {
-        return Ok(None);
-    };
-    sandbox_workspace_project_dir(&sandbox.labels, request_id)
-}
-
-fn checkpoint_workspace_snapshot_root(
-    daemon: &RuntimeDaemon,
-    sandbox: &Sandbox,
-    request_id: &str,
-) -> Result<Option<PathBuf>, Status> {
-    if let Some(project_dir) = sandbox.labels.get(SANDBOX_LABEL_PROJECT_DIR) {
-        let candidate = PathBuf::from(project_dir.trim());
-        if !candidate.is_absolute() {
-            return Err(status_from_machine_error(MachineError::new(
+    let sandbox = sandbox.ok_or_else(|| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::NotFound,
+            format!("sandbox not found: {sandbox_id}"),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })?;
+    sandbox_workspace_project_dir(&sandbox.labels, request_id).and_then(|value| {
+        value.ok_or_else(|| {
+            status_from_machine_error(MachineError::new(
                 MachineErrorCode::ValidationError,
                 format!(
-                    "sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` must be an absolute path: {}",
-                    candidate.display()
+                    "spaces mode requires sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` with an absolute workspace directory path"
                 ),
                 Some(request_id.to_string()),
                 BTreeMap::new(),
-            )));
-        }
-        if !candidate.exists() {
-            return Err(status_from_machine_error(MachineError::new(
-                MachineErrorCode::NotFound,
-                format!(
-                    "sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` does not exist: {}",
-                    candidate.display()
-                ),
-                Some(request_id.to_string()),
-                BTreeMap::new(),
-            )));
-        }
-        if !candidate.is_dir() {
-            return Err(status_from_machine_error(MachineError::new(
-                MachineErrorCode::ValidationError,
-                format!(
-                    "sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` must reference a directory: {}",
-                    candidate.display()
-                ),
-                Some(request_id.to_string()),
-                BTreeMap::new(),
-            )));
-        }
-        return Ok(Some(candidate));
-    }
-
-    let runtime_root = checkpoint_snapshot_runtime_fs_root(daemon, &sandbox.sandbox_id);
-    if runtime_root.is_dir() {
-        return Ok(Some(runtime_root));
-    }
-
-    Ok(None)
-}
-
-fn resolve_checkpoint_snapshot_root(
-    daemon: &RuntimeDaemon,
-    sandbox_id: &str,
-    request_id: &str,
-) -> Result<Option<PathBuf>, Status> {
-    let sandbox = daemon
-        .with_state_store(|store| store.load_sandbox(sandbox_id))
-        .map_err(|error| status_from_stack_error(error, request_id))?;
-    if let Some(sandbox) = sandbox {
-        return checkpoint_workspace_snapshot_root(daemon, &sandbox, request_id);
-    }
-
-    let runtime_root = checkpoint_snapshot_runtime_fs_root(daemon, sandbox_id);
-    if runtime_root.is_dir() {
-        return Ok(Some(runtime_root));
-    }
-
-    Ok(None)
+            ))
+        })
+    })
 }
 
 fn hash_file_bytes(path: &Path) -> Result<String, std::io::Error> {
@@ -754,17 +699,6 @@ fn collect_checkpoint_file_entries(
 
     entries.sort_by(|lhs, rhs| lhs.path.cmp(&rhs.path));
     Ok(entries)
-}
-
-fn collect_checkpoint_snapshot_entries(
-    daemon: &RuntimeDaemon,
-    sandbox_id: &str,
-    request_id: &str,
-) -> Result<Vec<CheckpointFileEntry>, Status> {
-    let Some(root) = resolve_checkpoint_snapshot_root(daemon, sandbox_id, request_id)? else {
-        return Ok(Vec::new());
-    };
-    collect_checkpoint_file_entries(&root, request_id)
 }
 
 fn diff_checkpoint_file_entries(
@@ -1019,30 +953,22 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
                 ))
             })?;
 
-        let checkpoint_file_entries = if let Some(workspace_root) =
-            maybe_space_workspace_root_for_checkpoint(
-                self.daemon.as_ref(),
-                checkpoint.sandbox_id.as_str(),
-                &request_id,
-            )? {
-            create_workspace_checkpoint_subvolume(
-                self.daemon.as_ref(),
-                &checkpoint,
-                &workspace_root,
-                &request_id,
-            )?;
-            let snapshot_root = checkpoint_workspace_snapshot_subvolume_path(
-                self.daemon.as_ref(),
-                checkpoint.checkpoint_id.as_str(),
-            );
-            collect_checkpoint_file_entries(&snapshot_root, &request_id)?
-        } else {
-            collect_checkpoint_snapshot_entries(
-                self.daemon.as_ref(),
-                checkpoint.sandbox_id.as_str(),
-                &request_id,
-            )?
-        };
+        let workspace_root = required_space_workspace_root_for_checkpoint(
+            self.daemon.as_ref(),
+            checkpoint.sandbox_id.as_str(),
+            &request_id,
+        )?;
+        create_workspace_checkpoint_subvolume(
+            self.daemon.as_ref(),
+            &checkpoint,
+            &workspace_root,
+            &request_id,
+        )?;
+        let snapshot_root = checkpoint_workspace_snapshot_subvolume_path(
+            self.daemon.as_ref(),
+            checkpoint.checkpoint_id.as_str(),
+        );
+        let checkpoint_file_entries = collect_checkpoint_file_entries(&snapshot_root, &request_id)?;
         let receipt_id = generate_receipt_id();
         let persist_result = self.daemon.with_state_store(|store| {
             store.with_immediate_transaction(|tx| {
@@ -1250,6 +1176,33 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
             return Err(status_from_machine_error(MachineError::new(
                 MachineErrorCode::NotFound,
                 format!("checkpoint not found: {to_checkpoint_id}"),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        let from_snapshot =
+            checkpoint_workspace_snapshot_subvolume_path(self.daemon.as_ref(), &from_checkpoint_id);
+        if !from_snapshot.is_dir() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::NotFound,
+                format!(
+                    "workspace checkpoint snapshot is missing for diff: {}",
+                    from_snapshot.display()
+                ),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+        let to_snapshot =
+            checkpoint_workspace_snapshot_subvolume_path(self.daemon.as_ref(), &to_checkpoint_id);
+        if !to_snapshot.is_dir() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::NotFound,
+                format!(
+                    "workspace checkpoint snapshot is missing for diff: {}",
+                    to_snapshot.display()
+                ),
                 Some(request_id),
                 BTreeMap::new(),
             )));
@@ -1624,18 +1577,17 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
 
         enforce_restore_checkpoint_compatibility(self.daemon.as_ref(), &checkpoint, &request_id)?;
 
-        if let Some(workspace_root) = maybe_space_workspace_root_for_checkpoint(
+        let workspace_root = required_space_workspace_root_for_checkpoint(
             self.daemon.as_ref(),
             checkpoint.sandbox_id.as_str(),
             &request_id,
-        )? {
-            restore_workspace_from_checkpoint_subvolume(
-                self.daemon.as_ref(),
-                &checkpoint,
-                &workspace_root,
-                &request_id,
-            )?;
-        }
+        )?;
+        restore_workspace_from_checkpoint_subvolume(
+            self.daemon.as_ref(),
+            &checkpoint,
+            &workspace_root,
+            &request_id,
+        )?;
 
         let now = current_unix_secs();
         let receipt_id = generate_receipt_id();

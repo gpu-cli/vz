@@ -4519,7 +4519,7 @@ async fn list_events_returns_persisted_stack_events() {
 }
 
 #[tokio::test]
-async fn create_checkpoint_then_get_and_list_round_trip() {
+async fn create_checkpoint_requires_existing_sandbox_workspace() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = RuntimedConfig {
         state_store_path: tmp.path().join("state").join("stack-state.db"),
@@ -4544,7 +4544,7 @@ async fn create_checkpoint_then_get_and_list_round_trip() {
 
     let mut checkpoint_client = connect_checkpoint_client(&config.socket_path).await;
 
-    let created = checkpoint_client
+    let status = checkpoint_client
         .create_checkpoint(Request::new(runtime_v2::CreateCheckpointRequest {
             metadata: Some(runtime_v2::RequestMetadata {
                 request_id: "req-ckpt-create".to_string(),
@@ -4557,93 +4557,9 @@ async fn create_checkpoint_then_get_and_list_round_trip() {
             retention_tag: String::new(),
         }))
         .await
-        .expect("create checkpoint");
-    assert!(created.metadata().get("x-receipt-id").is_some());
-    let created = created.into_inner();
-    let created_payload = created.checkpoint.as_ref().expect("checkpoint payload");
-    assert!(!created_payload.retention_protected);
-    assert!(created_payload.retention_tag.is_empty());
-    assert!(created_payload.retention_gc_reason.is_empty());
-    assert!(
-        created_payload.retention_expires_at > created_payload.created_at,
-        "untagged checkpoint should expose age-based retention deadline"
-    );
-    let checkpoint_id = created
-        .checkpoint
-        .as_ref()
-        .expect("checkpoint payload")
-        .checkpoint_id
-        .clone();
-    assert_eq!(
-        created.checkpoint.expect("checkpoint payload").state,
-        "ready",
-        "checkpoint should advance to ready"
-    );
-
-    let fetched = checkpoint_client
-        .get_checkpoint(Request::new(runtime_v2::GetCheckpointRequest {
-            checkpoint_id: checkpoint_id.clone(),
-            metadata: None,
-        }))
-        .await
-        .expect("get checkpoint")
-        .into_inner();
-    assert_eq!(
-        fetched
-            .checkpoint
-            .as_ref()
-            .expect("checkpoint payload")
-            .checkpoint_id,
-        checkpoint_id,
-        "checkpoint id should round-trip"
-    );
-    assert!(
-        fetched
-            .checkpoint
-            .as_ref()
-            .expect("checkpoint payload")
-            .retention_expires_at
-            > 0
-    );
-
-    let listed = checkpoint_client
-        .list_checkpoints(Request::new(runtime_v2::ListCheckpointsRequest {
-            metadata: None,
-        }))
-        .await
-        .expect("list checkpoints")
-        .into_inner();
-    assert_eq!(listed.checkpoints.len(), 1);
-    assert!(!listed.checkpoints[0].retention_protected);
-    assert!(listed.checkpoints[0].retention_tag.is_empty());
-
-    let checkpoint_receipts = daemon
-        .with_state_store(|store| store.list_receipts_for_entity("checkpoint", &checkpoint_id))
-        .expect("list checkpoint receipts");
-    let create_receipt = checkpoint_receipts
-        .iter()
-        .find(|receipt| receipt.operation == "create_checkpoint")
-        .expect("create_checkpoint receipt");
-    assert_eq!(
-        create_receipt
-            .metadata
-            .get("event_type")
-            .and_then(serde_json::Value::as_str),
-        Some("checkpoint_ready")
-    );
-    assert!(
-        create_receipt
-            .metadata
-            .get("request_hash")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|hash| !hash.is_empty())
-    );
-    assert!(
-        create_receipt
-            .metadata
-            .get("idempotency_key")
-            .is_some_and(serde_json::Value::is_null)
-    );
+        .expect_err("missing sandbox should fail checkpoint creation");
+    assert_eq!(status.code(), Code::NotFound);
+    assert!(status.message().contains("sandbox not found"));
 
     shutdown.notify_waiters();
     let result = tokio::time::timeout(Duration::from_secs(5), server)
@@ -5279,6 +5195,150 @@ async fn diff_checkpoints_returns_real_file_level_deltas() {
             ("rename-old.txt".to_string(), "D".to_string()),
         ]
     );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn diff_checkpoints_fails_closed_when_workspace_snapshot_missing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+    wait_for_socket(&config.socket_path).await;
+
+    let now = current_unix_secs();
+    daemon
+        .with_state_store(|store| {
+            store.with_immediate_transaction(|tx| {
+                tx.save_checkpoint(&Checkpoint {
+                    checkpoint_id: "ckpt-diff-a".to_string(),
+                    sandbox_id: "sbx-diff".to_string(),
+                    parent_checkpoint_id: None,
+                    class: CheckpointClass::FsQuick,
+                    state: CheckpointState::Ready,
+                    created_at: now,
+                    compatibility_fingerprint: "fp-a".to_string(),
+                })?;
+                tx.save_checkpoint(&Checkpoint {
+                    checkpoint_id: "ckpt-diff-b".to_string(),
+                    sandbox_id: "sbx-diff".to_string(),
+                    parent_checkpoint_id: None,
+                    class: CheckpointClass::FsQuick,
+                    state: CheckpointState::Ready,
+                    created_at: now,
+                    compatibility_fingerprint: "fp-b".to_string(),
+                })?;
+                Ok(())
+            })
+        })
+        .expect("seed checkpoints");
+
+    let mut checkpoint_client = connect_checkpoint_client(&config.socket_path).await;
+    let status = checkpoint_client
+        .diff_checkpoints(Request::new(runtime_v2::DiffCheckpointsRequest {
+            from_checkpoint_id: "ckpt-diff-a".to_string(),
+            to_checkpoint_id: "ckpt-diff-b".to_string(),
+            metadata: None,
+        }))
+        .await
+        .expect_err("missing snapshot subvolumes should fail diff");
+    assert_eq!(status.code(), Code::NotFound);
+    assert!(
+        status.message().contains("snapshot is missing"),
+        "error should identify missing workspace snapshot: {}",
+        status.message()
+    );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn fork_checkpoint_fails_closed_when_parent_snapshot_missing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+    wait_for_socket(&config.socket_path).await;
+
+    let now = current_unix_secs();
+    daemon
+        .with_state_store(|store| {
+            store.with_immediate_transaction(|tx| {
+                tx.save_checkpoint(&Checkpoint {
+                    checkpoint_id: "ckpt-parent-missing-subvol".to_string(),
+                    sandbox_id: "sbx-parent".to_string(),
+                    parent_checkpoint_id: None,
+                    class: CheckpointClass::FsQuick,
+                    state: CheckpointState::Ready,
+                    created_at: now,
+                    compatibility_fingerprint: "fp-parent".to_string(),
+                })?;
+                Ok(())
+            })
+        })
+        .expect("seed parent checkpoint");
+
+    let mut checkpoint_client = connect_checkpoint_client(&config.socket_path).await;
+    let status = checkpoint_client
+        .fork_checkpoint(Request::new(runtime_v2::ForkCheckpointRequest {
+            checkpoint_id: "ckpt-parent-missing-subvol".to_string(),
+            new_sandbox_id: "sbx-fork".to_string(),
+            metadata: None,
+        }))
+        .await
+        .expect_err("missing parent snapshot subvolume should fail fork");
+    assert!(
+        status.code() == Code::NotFound || status.code() == Code::Unimplemented,
+        "unexpected status code for missing parent snapshot: {} ({})",
+        status.code(),
+        status.message()
+    );
+    if status.code() == Code::NotFound {
+        assert!(
+            status.message().contains("snapshot is missing"),
+            "error should identify missing workspace parent snapshot: {}",
+            status.message()
+        );
+    }
 
     shutdown.notify_waiters();
     let result = tokio::time::timeout(Duration::from_secs(5), server)

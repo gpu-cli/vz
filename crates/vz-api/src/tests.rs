@@ -1526,7 +1526,7 @@ async fn checkpoint_create_vm_full_rejected_when_capability_disabled() {
 }
 
 #[tokio::test]
-async fn checkpoint_create_fs_quick_succeeds_when_capability_enabled() {
+async fn checkpoint_create_fs_quick_requires_existing_sandbox() {
     let temp_dir = tempdir().unwrap();
     let state_path = temp_dir.path().join("state.db");
     StateStore::open(&state_path).unwrap();
@@ -1554,16 +1554,16 @@ async fn checkpoint_create_fs_quick_succeeds_when_capability_enabled() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["error"]["code"].as_str().unwrap(), "not_found");
     assert!(
-        payload["checkpoint"]["checkpoint_id"]
+        payload["error"]["message"]
             .as_str()
-            .unwrap()
-            .starts_with("ckpt-")
+            .is_some_and(|message| message.contains("sandbox not found")),
+        "error should explain missing sandbox: {payload}"
     );
-    assert_eq!(payload["checkpoint"]["class"].as_str().unwrap(), "fs_quick");
 }
 
 #[tokio::test]
