@@ -41,6 +41,8 @@ message ErrorDetail {
 service SandboxService {
   rpc CreateSandbox(CreateSandboxRequest) returns (stream CreateSandboxEvent);
   rpc PrepareSpaceCache(PrepareSpaceCacheRequest) returns (stream PrepareSpaceCacheEvent);
+  rpc ExportSpaceCache(ExportSpaceCacheRequest) returns (stream ExportSpaceCacheEvent);
+  rpc ImportSpaceCache(ImportSpaceCacheRequest) returns (stream ImportSpaceCacheEvent);
   rpc GetSandbox(GetSandboxRequest) returns (SandboxResponse);
   rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
   rpc TerminateSandbox(TerminateSandboxRequest) returns (stream TerminateSandboxEvent);
@@ -205,6 +207,56 @@ message PrepareSpaceCacheEvent {
   oneof payload {
     PrepareSpaceCacheProgress progress = 3;
     PrepareSpaceCacheCompletion completion = 4;
+  }
+}
+
+message ExportSpaceCacheRequest {
+  string cache_name = 1;
+  string digest_hex = 2;
+  string stream_path = 3;
+  RequestMetadata metadata = 4;
+}
+
+message ImportSpaceCacheRequest {
+  string cache_name = 1;
+  string digest_hex = 2;
+  string stream_path = 3;
+  RequestMetadata metadata = 4;
+}
+
+message SpaceCachePortabilityProgress {
+  string phase = 1;
+  string detail = 2;
+}
+
+message ExportSpaceCacheCompletion {
+  string cache_name = 1;
+  string digest_hex = 2;
+  string stream_path = 3;
+}
+
+message ImportSpaceCacheCompletion {
+  string cache_name = 1;
+  string digest_hex = 2;
+  string received_subvolume_path = 3;
+  string receipt_id = 4;
+}
+
+message ExportSpaceCacheEvent {
+  string request_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    SpaceCachePortabilityProgress progress = 3;
+    ExportSpaceCacheCompletion completion = 4;
+  }
+}
+
+message ImportSpaceCacheEvent {
+  string request_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    SpaceCachePortabilityProgress progress = 3;
+    ImportSpaceCacheCompletion completion = 4;
   }
 }
 

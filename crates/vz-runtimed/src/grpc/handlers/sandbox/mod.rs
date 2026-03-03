@@ -4,6 +4,7 @@
 //! mapping used by `sandbox::rpc` endpoint implementations.
 
 use super::super::*;
+use crate::btrfs_portability::{export_subvolume_send_stream, import_subvolume_receive_stream};
 use std::path::{Path, PathBuf};
 use vz_runtime_contract::{
     RuntimeBackend, SPACE_CACHE_KEY_SCHEMA_VERSION, SpaceCacheIndex, SpaceCacheKey,
@@ -32,6 +33,10 @@ type CreateSandboxEventStream =
     tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::CreateSandboxEvent, Status>>;
 type PrepareSpaceCacheEventStream =
     tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::PrepareSpaceCacheEvent, Status>>;
+type ExportSpaceCacheEventStream =
+    tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::ExportSpaceCacheEvent, Status>>;
+type ImportSpaceCacheEventStream =
+    tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::ImportSpaceCacheEvent, Status>>;
 type TerminateSandboxEventStream =
     tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::TerminateSandboxEvent, Status>>;
 
@@ -163,6 +168,84 @@ fn prepare_space_cache_completion_event(
     }
 }
 
+fn export_space_cache_progress_event(
+    request_id: &str,
+    sequence: u64,
+    phase: &str,
+    detail: &str,
+) -> runtime_v2::ExportSpaceCacheEvent {
+    runtime_v2::ExportSpaceCacheEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::export_space_cache_event::Payload::Progress(
+            runtime_v2::SpaceCachePortabilityProgress {
+                phase: phase.to_string(),
+                detail: detail.to_string(),
+            },
+        )),
+    }
+}
+
+fn export_space_cache_completion_event(
+    request_id: &str,
+    sequence: u64,
+    cache_name: &str,
+    digest_hex: &str,
+    stream_path: &str,
+) -> runtime_v2::ExportSpaceCacheEvent {
+    runtime_v2::ExportSpaceCacheEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::export_space_cache_event::Payload::Completion(
+            runtime_v2::ExportSpaceCacheCompletion {
+                cache_name: cache_name.to_string(),
+                digest_hex: digest_hex.to_string(),
+                stream_path: stream_path.to_string(),
+            },
+        )),
+    }
+}
+
+fn import_space_cache_progress_event(
+    request_id: &str,
+    sequence: u64,
+    phase: &str,
+    detail: &str,
+) -> runtime_v2::ImportSpaceCacheEvent {
+    runtime_v2::ImportSpaceCacheEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::import_space_cache_event::Payload::Progress(
+            runtime_v2::SpaceCachePortabilityProgress {
+                phase: phase.to_string(),
+                detail: detail.to_string(),
+            },
+        )),
+    }
+}
+
+fn import_space_cache_completion_event(
+    request_id: &str,
+    sequence: u64,
+    cache_name: &str,
+    digest_hex: &str,
+    received_subvolume_path: &str,
+    receipt_id: &str,
+) -> runtime_v2::ImportSpaceCacheEvent {
+    runtime_v2::ImportSpaceCacheEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::import_space_cache_event::Payload::Completion(
+            runtime_v2::ImportSpaceCacheCompletion {
+                cache_name: cache_name.to_string(),
+                digest_hex: digest_hex.to_string(),
+                received_subvolume_path: received_subvolume_path.to_string(),
+                receipt_id: receipt_id.to_string(),
+            },
+        )),
+    }
+}
+
 fn terminate_sandbox_progress_event(
     request_id: &str,
     sequence: u64,
@@ -285,6 +368,27 @@ fn daemon_space_cache_artifact_dir(daemon: &RuntimeDaemon, key: &SpaceCacheKey) 
             PathBuf::from(SPACE_CACHE_ARTIFACTS_DIR)
                 .join(&key.cache_name)
                 .join(&key.digest_hex)
+        })
+}
+
+fn daemon_space_cache_artifact_dir_for_identity(
+    daemon: &RuntimeDaemon,
+    cache_name: &str,
+    digest_hex: &str,
+) -> PathBuf {
+    daemon
+        .state_store_path()
+        .parent()
+        .map(|parent| {
+            parent
+                .join(SPACE_CACHE_ARTIFACTS_DIR)
+                .join(cache_name)
+                .join(digest_hex)
+        })
+        .unwrap_or_else(|| {
+            PathBuf::from(SPACE_CACHE_ARTIFACTS_DIR)
+                .join(cache_name)
+                .join(digest_hex)
         })
 }
 

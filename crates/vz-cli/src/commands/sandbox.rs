@@ -38,9 +38,9 @@ use super::runtime_daemon::{
     ControlPlaneTransport, connect_control_plane_for_state_db, control_plane_transport,
     default_state_db_path, runtime_api_base_url,
 };
-use super::space_cache_key::{SpaceCacheKey, SpaceCacheKeyMaterial, SpaceCacheRuntimeIdentity};
 #[cfg(test)]
 use super::space_cache_key::{SPACE_CACHE_KEY_SCHEMA_VERSION, SpaceCacheIndex, SpaceCacheLookup};
+use super::space_cache_key::{SpaceCacheKey, SpaceCacheKeyMaterial, SpaceCacheRuntimeIdentity};
 #[cfg(test)]
 use super::space_cache_trust::{
     SpaceRemoteCacheTrustConfig, SpaceRemoteCacheVerificationOutcome,

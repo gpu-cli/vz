@@ -69,6 +69,48 @@ pub(crate) async fn read_prepare_space_cache_completion(
     ))
 }
 
+pub(crate) async fn read_export_space_cache_completion(
+    socket_path: &Path,
+    stream: &mut tonic::Streaming<runtime_v2::ExportSpaceCacheEvent>,
+) -> Result<runtime_v2::ExportSpaceCacheCompletion> {
+    while let Some(event) = stream
+        .message()
+        .await
+        .map_err(|status| status_to_client_error(socket_path, status))?
+    {
+        if let Some(runtime_v2::export_space_cache_event::Payload::Completion(completion)) =
+            event.payload
+        {
+            return Ok(completion);
+        }
+    }
+    Err(status_to_client_error(
+        socket_path,
+        Status::internal("export_space_cache stream ended without terminal completion event"),
+    ))
+}
+
+pub(crate) async fn read_import_space_cache_completion(
+    socket_path: &Path,
+    stream: &mut tonic::Streaming<runtime_v2::ImportSpaceCacheEvent>,
+) -> Result<runtime_v2::ImportSpaceCacheCompletion> {
+    while let Some(event) = stream
+        .message()
+        .await
+        .map_err(|status| status_to_client_error(socket_path, status))?
+    {
+        if let Some(runtime_v2::import_space_cache_event::Payload::Completion(completion)) =
+            event.payload
+        {
+            return Ok(completion);
+        }
+    }
+    Err(status_to_client_error(
+        socket_path,
+        Status::internal("import_space_cache stream ended without terminal completion event"),
+    ))
+}
+
 pub(crate) async fn read_apply_stack_completion(
     socket_path: &Path,
     stream: &mut tonic::Streaming<runtime_v2::ApplyStackEvent>,

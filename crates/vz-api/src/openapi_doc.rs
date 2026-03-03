@@ -7,14 +7,15 @@ use super::{
     CreateCheckpointRequest, CreateContainerRequest, CreateExecutionRequest, CreateSandboxRequest,
     DiffCheckpointsResponse, ErrorResponse, EventsResponse, ExecutionListResponse,
     ExecutionOutputStreamEventPayload, ExecutionResponse, ExportCheckpointRequest,
-    ExportCheckpointResponse, FileMutationResponse, ForkCheckpointRequest, ImageListResponse,
-    ImageResponse, ImportCheckpointRequest, LeaseListResponse, LeaseResponse, ListFilesRequest,
-    ListFilesResponse, MakeDirRequest, MovePathRequest, OpenLeaseRequest, OpenSandboxShellResponse,
-    PrepareSpaceCacheRequest, PrepareSpaceCacheResponse, PruneImagesResponse, PullImageRequest,
-    PullImageResponse, ReadFileRequest, ReadFileResponse, ReceiptResponse, RemovePathRequest,
-    ResizeExecRequest, RestoreCheckpointResponse, SandboxListResponse, SandboxResponse,
-    SignalExecRequest, StartBuildRequest, WriteExecStdinRequest, WriteFileRequest,
-    WriteFileResponse,
+    ExportCheckpointResponse, ExportSpaceCacheRequest, ExportSpaceCacheResponse,
+    FileMutationResponse, ForkCheckpointRequest, ImageListResponse, ImageResponse,
+    ImportCheckpointRequest, ImportSpaceCacheRequest, ImportSpaceCacheResponse, LeaseListResponse,
+    LeaseResponse, ListFilesRequest, ListFilesResponse, MakeDirRequest, MovePathRequest,
+    OpenLeaseRequest, OpenSandboxShellResponse, PrepareSpaceCacheRequest,
+    PrepareSpaceCacheResponse, PruneImagesResponse, PullImageRequest, PullImageResponse,
+    ReadFileRequest, ReadFileResponse, ReceiptResponse, RemovePathRequest, ResizeExecRequest,
+    RestoreCheckpointResponse, SandboxListResponse, SandboxResponse, SignalExecRequest,
+    StartBuildRequest, WriteExecStdinRequest, WriteFileRequest, WriteFileResponse,
 };
 use utoipa::OpenApi;
 
@@ -130,6 +131,39 @@ fn create_sandbox() {}
     )
 )]
 fn prepare_space_cache() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/spaces/cache/export",
+    operation_id = "exportSpaceCache",
+    summary = "Export a shared space cache artifact as a btrfs send stream",
+    params(("X-Request-Id" = Option<String>, Header, description = REQUEST_ID_DESCRIPTION)),
+    request_body = ExportSpaceCacheRequest,
+    responses(
+        (status = 200, description = "Space cache export completed", body = ExportSpaceCacheResponse),
+        (status = 400, description = "Invalid request body", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn export_space_cache() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/spaces/cache/import",
+    operation_id = "importSpaceCache",
+    summary = "Import a shared space cache artifact from a btrfs send stream",
+    params(
+        ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY_KEY_DESCRIPTION),
+        ("X-Request-Id" = Option<String>, Header, description = REQUEST_ID_DESCRIPTION),
+    ),
+    request_body = ImportSpaceCacheRequest,
+    responses(
+        (status = 200, description = "Space cache import completed", body = ImportSpaceCacheResponse),
+        (status = 400, description = "Invalid request body", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn import_space_cache() {}
 
 #[utoipa::path(
     get,
@@ -947,6 +981,8 @@ fn chown_path() {}
         stream_events_ws,
         create_sandbox,
         prepare_space_cache,
+        export_space_cache,
+        import_space_cache,
         list_sandboxes,
         get_sandbox,
         terminate_sandbox,
@@ -1006,6 +1042,10 @@ fn chown_path() {}
         crate::PrepareSpaceCacheRequest,
         crate::PrepareSpaceCacheOutcomePayload,
         crate::PrepareSpaceCacheResponse,
+        crate::ExportSpaceCacheRequest,
+        crate::ExportSpaceCacheResponse,
+        crate::ImportSpaceCacheRequest,
+        crate::ImportSpaceCacheResponse,
         crate::SandboxPayload,
         crate::SandboxResponse,
         crate::SandboxListResponse,

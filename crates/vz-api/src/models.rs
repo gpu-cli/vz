@@ -284,6 +284,36 @@ pub(crate) struct PrepareSpaceCacheResponse {
     pub(crate) outcomes: Vec<PrepareSpaceCacheOutcomePayload>,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct ExportSpaceCacheRequest {
+    pub(crate) cache_name: String,
+    pub(crate) digest_hex: String,
+    pub(crate) stream_path: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ExportSpaceCacheResponse {
+    pub(crate) request_id: String,
+    pub(crate) cache_name: String,
+    pub(crate) digest_hex: String,
+    pub(crate) stream_path: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct ImportSpaceCacheRequest {
+    pub(crate) cache_name: String,
+    pub(crate) digest_hex: String,
+    pub(crate) stream_path: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ImportSpaceCacheResponse {
+    pub(crate) request_id: String,
+    pub(crate) cache_name: String,
+    pub(crate) digest_hex: String,
+    pub(crate) received_subvolume_path: String,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ExecutionOutputStreamEventPayload {
     pub(crate) sequence: u64,

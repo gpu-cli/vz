@@ -4,6 +4,8 @@ use super::*;
 impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
     type CreateSandboxStream = CreateSandboxEventStream;
     type PrepareSpaceCacheStream = PrepareSpaceCacheEventStream;
+    type ExportSpaceCacheStream = ExportSpaceCacheEventStream;
+    type ImportSpaceCacheStream = ImportSpaceCacheEventStream;
     type TerminateSandboxStream = TerminateSandboxEventStream;
     type OpenSandboxShellStream = OpenSandboxShellEventStream;
     type CloseSandboxShellStream = CloseSandboxShellEventStream;
@@ -596,6 +598,281 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
             &request_id,
             sequence,
             outcomes,
+            receipt_id.as_str(),
+        )));
+        Ok(sandbox_stream_response(events, Some(receipt_id.as_str())))
+    }
+
+    async fn export_space_cache(
+        &self,
+        request: Request<runtime_v2::ExportSpaceCacheRequest>,
+    ) -> Result<Response<Self::ExportSpaceCacheStream>, Status> {
+        let intercepted_request_id = request_id_from_extensions(&request);
+        let request = request.into_inner();
+        let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
+        let request_id = metadata
+            .request_id
+            .clone()
+            .unwrap_or_else(generate_request_id);
+        enforce_mutation_policy_preflight(
+            self.daemon.as_ref(),
+            RuntimeOperation::CreateSandbox,
+            &metadata,
+            &request_id,
+        )?;
+
+        let cache_name = request.cache_name.trim().to_string();
+        let digest_hex = request.digest_hex.trim().to_string();
+        let stream_path = request.stream_path.trim().to_string();
+        if cache_name.is_empty() || digest_hex.is_empty() || stream_path.is_empty() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                "cache_name, digest_hex, and stream_path are required".to_string(),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        let mut sequence = 1u64;
+        let mut events = vec![Ok(export_space_cache_progress_event(
+            &request_id,
+            sequence,
+            "validating",
+            "validating cache export request",
+        ))];
+
+        let source_path = daemon_space_cache_artifact_dir_for_identity(
+            self.daemon.as_ref(),
+            cache_name.as_str(),
+            digest_hex.as_str(),
+        );
+        if !source_path.is_dir() {
+            events.push(Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::NotFound,
+                format!("cache artifact not found at {}", source_path.display()),
+                Some(request_id),
+                BTreeMap::new(),
+            ))));
+            return Ok(sandbox_stream_response(events, None));
+        }
+        let stream_path_buf = PathBuf::from(stream_path.clone());
+        if let Some(parent) = stream_path_buf.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            events.push(Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                format!(
+                    "failed to create export stream parent directory {}: {error}",
+                    parent.display()
+                ),
+                Some(request_id),
+                BTreeMap::new(),
+            ))));
+            return Ok(sandbox_stream_response(events, None));
+        }
+
+        sequence += 1;
+        events.push(Ok(export_space_cache_progress_event(
+            &request_id,
+            sequence,
+            "exporting",
+            "streaming btrfs send payload",
+        )));
+        if let Err(error) = export_subvolume_send_stream(&source_path, &stream_path_buf) {
+            events.push(Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::BackendUnavailable,
+                format!("failed to export cache artifact via btrfs send: {error}"),
+                Some(request_id),
+                BTreeMap::new(),
+            ))));
+            return Ok(sandbox_stream_response(events, None));
+        }
+
+        sequence += 1;
+        events.push(Ok(export_space_cache_completion_event(
+            &request_id,
+            sequence,
+            cache_name.as_str(),
+            digest_hex.as_str(),
+            stream_path.as_str(),
+        )));
+        Ok(sandbox_stream_response(events, None))
+    }
+
+    async fn import_space_cache(
+        &self,
+        request: Request<runtime_v2::ImportSpaceCacheRequest>,
+    ) -> Result<Response<Self::ImportSpaceCacheStream>, Status> {
+        let intercepted_request_id = request_id_from_extensions(&request);
+        let request = request.into_inner();
+        let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
+        let request_id = metadata
+            .request_id
+            .clone()
+            .unwrap_or_else(generate_request_id);
+        enforce_mutation_policy_preflight(
+            self.daemon.as_ref(),
+            RuntimeOperation::CreateSandbox,
+            &metadata,
+            &request_id,
+        )?;
+
+        let cache_name = request.cache_name.trim().to_string();
+        let digest_hex = request.digest_hex.trim().to_string();
+        let stream_path = request.stream_path.trim().to_string();
+        if cache_name.is_empty() || digest_hex.is_empty() || stream_path.is_empty() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                "cache_name, digest_hex, and stream_path are required".to_string(),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        let mut sequence = 1u64;
+        let mut events = vec![Ok(import_space_cache_progress_event(
+            &request_id,
+            sequence,
+            "validating",
+            "validating cache import request",
+        ))];
+        let stream_path_buf = PathBuf::from(stream_path.clone());
+        if !stream_path_buf.is_file() {
+            events.push(Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::NotFound,
+                format!("cache stream path not found: {}", stream_path_buf.display()),
+                Some(request_id),
+                BTreeMap::new(),
+            ))));
+            return Ok(sandbox_stream_response(events, None));
+        }
+
+        let destination_root = self
+            .daemon
+            .state_store_path()
+            .parent()
+            .map(|parent| {
+                parent
+                    .join(SPACE_CACHE_ARTIFACTS_DIR)
+                    .join(cache_name.as_str())
+            })
+            .unwrap_or_else(|| PathBuf::from(SPACE_CACHE_ARTIFACTS_DIR).join(cache_name.as_str()));
+        if let Err(error) = std::fs::create_dir_all(&destination_root) {
+            events.push(Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                format!(
+                    "failed to create cache destination root {}: {error}",
+                    destination_root.display()
+                ),
+                Some(request_id),
+                BTreeMap::new(),
+            ))));
+            return Ok(sandbox_stream_response(events, None));
+        }
+
+        sequence += 1;
+        events.push(Ok(import_space_cache_progress_event(
+            &request_id,
+            sequence,
+            "importing",
+            "receiving btrfs send payload",
+        )));
+        let received_subvolume =
+            match import_subvolume_receive_stream(&stream_path_buf, &destination_root) {
+                Ok(path) => path,
+                Err(error) => {
+                    events.push(Err(status_from_machine_error(MachineError::new(
+                        MachineErrorCode::BackendUnavailable,
+                        format!("failed to import cache artifact via btrfs receive: {error}"),
+                        Some(request_id),
+                        BTreeMap::new(),
+                    ))));
+                    return Ok(sandbox_stream_response(events, None));
+                }
+            };
+
+        let expected_path = daemon_space_cache_artifact_dir_for_identity(
+            self.daemon.as_ref(),
+            &cache_name,
+            &digest_hex,
+        );
+        if received_subvolume != expected_path {
+            if expected_path.exists()
+                && let Err(error) = std::fs::remove_dir_all(&expected_path)
+            {
+                events.push(Err(status_from_machine_error(MachineError::new(
+                    MachineErrorCode::InternalError,
+                    format!(
+                        "failed to remove pre-existing cache artifact {} before rename: {error}",
+                        expected_path.display()
+                    ),
+                    Some(request_id),
+                    BTreeMap::new(),
+                ))));
+                return Ok(sandbox_stream_response(events, None));
+            }
+            if let Err(error) = std::fs::rename(&received_subvolume, &expected_path) {
+                events.push(Err(status_from_machine_error(MachineError::new(
+                    MachineErrorCode::InternalError,
+                    format!(
+                        "failed to normalize imported cache path {} -> {}: {error}",
+                        received_subvolume.display(),
+                        expected_path.display()
+                    ),
+                    Some(request_id),
+                    BTreeMap::new(),
+                ))));
+                return Ok(sandbox_stream_response(events, None));
+            }
+        }
+
+        let receipt_id = generate_receipt_id();
+        let now = current_unix_secs();
+        let metadata = serde_json::json!({
+            "event_type": "space_cache_imported",
+            "cache_name": cache_name,
+            "digest_hex": digest_hex,
+            "stream_path": stream_path,
+            "received_subvolume_path": expected_path.display().to_string(),
+        });
+        if let Err(error) = self.daemon.with_state_store(|store| {
+            store.with_immediate_transaction(|tx| {
+                tx.emit_event(
+                    "daemon",
+                    &StackEvent::DriftDetected {
+                        stack_name: "daemon".to_string(),
+                        category: "space_cache_import".to_string(),
+                        description: format!(
+                            "imported space cache artifact {}:{} from {}",
+                            cache_name, digest_hex, stream_path
+                        ),
+                        severity: "info".to_string(),
+                    },
+                )?;
+                tx.save_receipt(&Receipt {
+                    receipt_id: receipt_id.clone(),
+                    operation: "import_space_cache".to_string(),
+                    entity_id: format!("{cache_name}:{digest_hex}"),
+                    entity_type: "cache".to_string(),
+                    request_id: request_id.clone(),
+                    status: "success".to_string(),
+                    created_at: now,
+                    metadata,
+                })?;
+                Ok(())
+            })
+        }) {
+            events.push(Err(status_from_stack_error(error, &request_id)));
+            return Ok(sandbox_stream_response(events, None));
+        }
+
+        sequence += 1;
+        events.push(Ok(import_space_cache_completion_event(
+            &request_id,
+            sequence,
+            cache_name.as_str(),
+            digest_hex.as_str(),
+            expected_path.display().to_string().as_str(),
             receipt_id.as_str(),
         )));
         Ok(sandbox_stream_response(events, Some(receipt_id.as_str())))

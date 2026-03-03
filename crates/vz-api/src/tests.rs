@@ -137,6 +137,8 @@ fn openapi_document_contains_required_paths() {
     assert!(paths.contains_key("/v1/sandboxes/{sandbox_id}/shell/open"));
     assert!(paths.contains_key("/v1/sandboxes/{sandbox_id}/shell/close"));
     assert!(paths.contains_key("/v1/spaces/cache/prepare"));
+    assert!(paths.contains_key("/v1/spaces/cache/export"));
+    assert!(paths.contains_key("/v1/spaces/cache/import"));
     assert!(paths.contains_key("/v1/leases"));
     assert!(paths.contains_key("/v1/leases/{lease_id}"));
     assert!(paths.contains_key("/v1/images"));
@@ -1867,6 +1869,52 @@ async fn prepare_space_cache_rejects_invalid_json() {
     );
 }
 
+#[tokio::test]
+async fn export_space_cache_rejects_invalid_json() {
+    let (app, _dir) = test_router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/spaces/cache/export")
+                .header("content-type", "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["error"]["code"].as_str().unwrap(),
+        "invalid_request"
+    );
+}
+
+#[tokio::test]
+async fn import_space_cache_rejects_invalid_json() {
+    let (app, _dir) = test_router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/spaces/cache/import")
+                .header("content-type", "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["error"]["code"].as_str().unwrap(),
+        "invalid_request"
+    );
+}
+
 // ── Cross-transport behavior parity tests ──────────────────────
 
 #[test]
@@ -1893,6 +1941,9 @@ fn transport_parity_openapi_operations_match_grpc_rpcs() {
     let grpc_rpcs = [
         // SandboxService
         "CreateSandbox",
+        "PrepareSpaceCache",
+        "ExportSpaceCache",
+        "ImportSpaceCache",
         "GetSandbox",
         "ListSandboxes",
         "PrepareSpaceCache",

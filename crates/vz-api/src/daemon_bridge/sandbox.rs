@@ -263,6 +263,138 @@ pub(crate) async fn try_prepare_space_cache_via_daemon(
     }
 }
 
+pub(crate) async fn try_export_space_cache_via_daemon(
+    state: &ApiState,
+    raw_body: &[u8],
+    request_id: &str,
+) -> Option<Response> {
+    let body: ExportSpaceCacheRequest = match serde_json::from_slice(raw_body) {
+        Ok(body) => body,
+        Err(error) => {
+            return Some(json_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &format!("invalid JSON body: {error}"),
+                request_id,
+            ));
+        }
+    };
+    let mut client = match DaemonClient::connect_with_config(daemon_client_config(state)).await {
+        Ok(client) => client,
+        Err(error) => {
+            return Some(json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon_unavailable",
+                &error.to_string(),
+                request_id,
+            ));
+        }
+    };
+    let grpc_request = runtime_v2::ExportSpaceCacheRequest {
+        cache_name: body.cache_name,
+        digest_hex: body.digest_hex,
+        stream_path: body.stream_path,
+        metadata: Some(daemon_request_metadata(request_id, None)),
+    };
+    match client.export_space_cache(grpc_request).await {
+        Ok(completion) => Some(
+            (
+                StatusCode::OK,
+                Json(ExportSpaceCacheResponse {
+                    request_id: request_id.to_string(),
+                    cache_name: completion.cache_name,
+                    digest_hex: completion.digest_hex,
+                    stream_path: completion.stream_path,
+                }),
+            )
+                .into_response(),
+        ),
+        Err(DaemonClientError::Grpc(status)) => {
+            Some(daemon_status_to_http_response(status, request_id))
+        }
+        Err(error) => Some(json_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon_unavailable",
+            &error.to_string(),
+            request_id,
+        )),
+    }
+}
+
+pub(crate) async fn try_import_space_cache_via_daemon(
+    state: &ApiState,
+    headers: &HeaderMap,
+    raw_body: &[u8],
+    request_id: &str,
+) -> Option<Response> {
+    let body: ImportSpaceCacheRequest = match serde_json::from_slice(raw_body) {
+        Ok(body) => body,
+        Err(error) => {
+            return Some(json_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &format!("invalid JSON body: {error}"),
+                request_id,
+            ));
+        }
+    };
+    let mut client = match DaemonClient::connect_with_config(daemon_client_config(state)).await {
+        Ok(client) => client,
+        Err(error) => {
+            return Some(json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon_unavailable",
+                &error.to_string(),
+                request_id,
+            ));
+        }
+    };
+    let grpc_request = runtime_v2::ImportSpaceCacheRequest {
+        cache_name: body.cache_name,
+        digest_hex: body.digest_hex,
+        stream_path: body.stream_path,
+        metadata: Some(daemon_request_metadata(
+            request_id,
+            extract_idempotency_key(headers),
+        )),
+    };
+    match client.import_space_cache_with_metadata(grpc_request).await {
+        Ok(grpc_response) => {
+            let receipt_id = grpc_response
+                .metadata()
+                .get("x-receipt-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let completion = grpc_response.into_inner();
+            let mut response = (
+                StatusCode::OK,
+                Json(ImportSpaceCacheResponse {
+                    request_id: request_id.to_string(),
+                    cache_name: completion.cache_name,
+                    digest_hex: completion.digest_hex,
+                    received_subvolume_path: completion.received_subvolume_path,
+                }),
+            )
+                .into_response();
+            if let Some(receipt_id) = receipt_id
+                && let Ok(value) = axum::http::HeaderValue::from_str(&receipt_id)
+            {
+                response.headers_mut().insert("x-receipt-id", value);
+            }
+            Some(response)
+        }
+        Err(DaemonClientError::Grpc(status)) => {
+            Some(daemon_status_to_http_response(status, request_id))
+        }
+        Err(error) => Some(json_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon_unavailable",
+            &error.to_string(),
+            request_id,
+        )),
+    }
+}
+
 pub(crate) async fn try_get_sandbox_via_daemon(
     state: &ApiState,
     sandbox_id: &str,

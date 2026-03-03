@@ -7,7 +7,8 @@ use vz_runtime_proto::runtime_v2;
 use vz_runtime_translate::request_metadata_to_proto;
 
 use crate::stream_completion::{
-    read_create_sandbox_completion, read_prepare_space_cache_completion,
+    read_create_sandbox_completion, read_export_space_cache_completion,
+    read_import_space_cache_completion, read_prepare_space_cache_completion,
     read_terminate_sandbox_completion,
 };
 use crate::transport::status_to_client_error;
@@ -139,6 +140,106 @@ impl DaemonClient {
         Self::ensure_metadata(&mut request.metadata);
         self.sandbox_client
             .prepare_space_cache(Request::new(request))
+            .await
+            .map_err(|status| status_to_client_error(&self.config.socket_path, status))
+    }
+
+    /// Call Runtime V2 `ExportSpaceCache`.
+    pub async fn export_space_cache(
+        &mut self,
+        request: runtime_v2::ExportSpaceCacheRequest,
+    ) -> Result<runtime_v2::ExportSpaceCacheCompletion> {
+        let response = self.export_space_cache_with_metadata(request).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Call Runtime V2 `ExportSpaceCache` and preserve gRPC response metadata.
+    pub async fn export_space_cache_with_metadata(
+        &mut self,
+        request: runtime_v2::ExportSpaceCacheRequest,
+    ) -> Result<tonic::Response<runtime_v2::ExportSpaceCacheCompletion>> {
+        let response = self
+            .export_space_cache_stream_with_metadata(request)
+            .await?;
+        let mut stream = response.into_inner();
+        let completion =
+            read_export_space_cache_completion(&self.config.socket_path, &mut stream).await?;
+        Ok(tonic::Response::new(completion))
+    }
+
+    /// Call Runtime V2 `ExportSpaceCache` as a server stream.
+    pub async fn export_space_cache_stream(
+        &mut self,
+        request: runtime_v2::ExportSpaceCacheRequest,
+    ) -> Result<tonic::Streaming<runtime_v2::ExportSpaceCacheEvent>> {
+        let response = self
+            .export_space_cache_stream_with_metadata(request)
+            .await?;
+        Ok(response.into_inner())
+    }
+
+    /// Call Runtime V2 `ExportSpaceCache` as a server stream and preserve metadata.
+    pub async fn export_space_cache_stream_with_metadata(
+        &mut self,
+        mut request: runtime_v2::ExportSpaceCacheRequest,
+    ) -> Result<tonic::Response<tonic::Streaming<runtime_v2::ExportSpaceCacheEvent>>> {
+        Self::ensure_metadata(&mut request.metadata);
+        self.sandbox_client
+            .export_space_cache(Request::new(request))
+            .await
+            .map_err(|status| status_to_client_error(&self.config.socket_path, status))
+    }
+
+    /// Call Runtime V2 `ImportSpaceCache`.
+    pub async fn import_space_cache(
+        &mut self,
+        request: runtime_v2::ImportSpaceCacheRequest,
+    ) -> Result<runtime_v2::ImportSpaceCacheCompletion> {
+        let response = self.import_space_cache_with_metadata(request).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Call Runtime V2 `ImportSpaceCache` and preserve gRPC response metadata.
+    pub async fn import_space_cache_with_metadata(
+        &mut self,
+        request: runtime_v2::ImportSpaceCacheRequest,
+    ) -> Result<tonic::Response<runtime_v2::ImportSpaceCacheCompletion>> {
+        let response = self
+            .import_space_cache_stream_with_metadata(request)
+            .await?;
+        let mut stream = response.into_inner();
+        let completion =
+            read_import_space_cache_completion(&self.config.socket_path, &mut stream).await?;
+
+        let receipt_id = completion.receipt_id.clone();
+        let mut grpc_response = tonic::Response::new(completion);
+        if !receipt_id.trim().is_empty()
+            && let Ok(value) = MetadataValue::try_from(receipt_id.as_str())
+        {
+            grpc_response.metadata_mut().insert("x-receipt-id", value);
+        }
+        Ok(grpc_response)
+    }
+
+    /// Call Runtime V2 `ImportSpaceCache` as a server stream.
+    pub async fn import_space_cache_stream(
+        &mut self,
+        request: runtime_v2::ImportSpaceCacheRequest,
+    ) -> Result<tonic::Streaming<runtime_v2::ImportSpaceCacheEvent>> {
+        let response = self
+            .import_space_cache_stream_with_metadata(request)
+            .await?;
+        Ok(response.into_inner())
+    }
+
+    /// Call Runtime V2 `ImportSpaceCache` as a server stream and preserve metadata.
+    pub async fn import_space_cache_stream_with_metadata(
+        &mut self,
+        mut request: runtime_v2::ImportSpaceCacheRequest,
+    ) -> Result<tonic::Response<tonic::Streaming<runtime_v2::ImportSpaceCacheEvent>>> {
+        Self::ensure_metadata(&mut request.metadata);
+        self.sandbox_client
+            .import_space_cache(Request::new(request))
             .await
             .map_err(|status| status_to_client_error(&self.config.socket_path, status))
     }
