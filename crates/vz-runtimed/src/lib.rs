@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod btrfs_portability;
 mod execution_sessions;
 mod grpc;
 mod placement_scheduler;
@@ -864,7 +865,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(metrics_path.exists(), "metrics snapshot file should be created");
+        assert!(
+            metrics_path.exists(),
+            "metrics snapshot file should be created"
+        );
         let metrics_text = std::fs::read_to_string(&metrics_path).expect("read metrics snapshot");
         assert!(metrics_text.contains("vz_runtimed_grpc_requests_total"));
 
