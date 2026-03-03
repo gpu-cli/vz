@@ -132,7 +132,7 @@ expand_scenario_token() {
         case "$part" in
             "")
                 ;;
-            runtime-smoke|runtime-lifecycle|runtime-port-forwarding|runtime-shared-vm-net|stack-real-services|stack-control-socket|stack-port-forwarding|stack-snapshot-restore|buildkit-roundtrip)
+            runtime-smoke|runtime-lifecycle|runtime-port-forwarding|runtime-shared-vm-net|stack-real-services|stack-control-socket|stack-port-forwarding|stack-snapshot-restore|stack-user-journey-checkpoint|buildkit-roundtrip)
                 append_unique_scenario "$part"
                 ;;
             sandbox-usecases)
@@ -170,6 +170,9 @@ scenario_suite() {
         stack-real-services|stack-control-socket|stack-port-forwarding|stack-snapshot-restore)
             echo "stack"
             ;;
+        stack-user-journey-checkpoint)
+            echo "stack"
+            ;;
         buildkit-roundtrip)
             echo "buildkit"
             ;;
@@ -203,6 +206,9 @@ scenario_test_filter() {
             echo "stack_port_forwarding"
             ;;
         stack-snapshot-restore)
+            echo "complex_stack_snapshot_restore_rewinds_shared_vm_state"
+            ;;
+        stack-user-journey-checkpoint)
             echo "complex_stack_snapshot_restore_rewinds_shared_vm_state"
             ;;
         buildkit-roundtrip)
