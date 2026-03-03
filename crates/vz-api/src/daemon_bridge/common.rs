@@ -312,3 +312,26 @@ pub(crate) fn daemon_request_metadata(
         trace_id: String::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_request_metadata_preserves_request_id_and_idempotency_key() {
+        let metadata = daemon_request_metadata("req-42", Some("idem-42".to_string()));
+
+        assert_eq!(metadata.request_id, "req-42");
+        assert_eq!(metadata.idempotency_key, "idem-42");
+        assert_eq!(metadata.trace_id, "");
+    }
+
+    #[test]
+    fn daemon_request_metadata_uses_empty_idempotency_key_when_absent() {
+        let metadata = daemon_request_metadata("req-99", None);
+
+        assert_eq!(metadata.request_id, "req-99");
+        assert_eq!(metadata.idempotency_key, "");
+        assert_eq!(metadata.trace_id, "");
+    }
+}

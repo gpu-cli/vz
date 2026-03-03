@@ -86,3 +86,65 @@ pub(in crate::grpc) fn insert_health_headers(
     metadata.insert("x-vz-runtimed-started-at", started_at);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use tonic::Request;
+    use vz_runtime_proto::runtime_v2;
+
+    use super::*;
+
+    #[test]
+    fn normalize_metadata_prefers_wire_request_id() {
+        let wire = runtime_v2::RequestMetadata {
+            request_id: "wire-req".to_string(),
+            idempotency_key: "idem-1".to_string(),
+            trace_id: "trace-1".to_string(),
+        };
+
+        let metadata = normalize_metadata(Some(&wire), Some("fallback-req".to_string()));
+        assert_eq!(metadata.request_id.as_deref(), Some("wire-req"));
+        assert_eq!(metadata.idempotency_key.as_deref(), Some("idem-1"));
+        assert_eq!(metadata.trace_id.as_deref(), Some("trace-1"));
+    }
+
+    #[test]
+    fn normalize_metadata_uses_fallback_when_wire_request_id_missing() {
+        let wire = runtime_v2::RequestMetadata {
+            request_id: String::new(),
+            idempotency_key: String::new(),
+            trace_id: String::new(),
+        };
+
+        let metadata = normalize_metadata(Some(&wire), Some("fallback-req".to_string()));
+        assert_eq!(metadata.request_id.as_deref(), Some("fallback-req"));
+    }
+
+    #[test]
+    fn request_metadata_interceptor_uses_header_request_id() {
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            "x-request-id",
+            "header-req".parse().expect("valid metadata"),
+        );
+
+        let intercepted =
+            request_metadata_interceptor(request).expect("interceptor should accept request");
+        assert_eq!(
+            request_id_from_extensions(&intercepted).as_deref(),
+            Some("header-req")
+        );
+    }
+
+    #[test]
+    fn request_metadata_interceptor_generates_request_id_when_header_missing() {
+        let request = Request::new(());
+
+        let intercepted =
+            request_metadata_interceptor(request).expect("interceptor should accept request");
+        let request_id =
+            request_id_from_extensions(&intercepted).expect("request id should be present");
+        assert!(!request_id.trim().is_empty());
+        assert!(request_id.starts_with("req-"));
+    }
+}
