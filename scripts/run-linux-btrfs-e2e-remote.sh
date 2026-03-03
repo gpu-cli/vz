@@ -49,6 +49,7 @@ Options:
 Notes:
   - The remote repo must be a valid git checkout with rust/cargo installed.
   - The remote host must have btrfs tooling and a writable btrfs workspace path.
+  - Target must be a real remote Linux VM environment (not localhost/Docker-on-mac).
   - If no flags are passed, values are loaded from config/env.
 
 Environment overrides:
@@ -65,6 +66,23 @@ USAGE
 err() {
     echo "error: $*" >&2
     exit 1
+}
+
+validate_non_local_host() {
+    local host="$1"
+    local host_part="$host"
+    if [[ "$host_part" == *"@"* ]]; then
+        host_part="${host_part##*@}"
+    fi
+    if [[ "$host_part" == *":"* ]]; then
+        host_part="${host_part%%:*}"
+    fi
+
+    case "${host_part,,}" in
+        localhost|127.0.0.1|::1)
+            err "localhost targets are not allowed for this harness; use a real remote vz Linux VM host"
+            ;;
+    esac
 }
 
 write_default_config() {
@@ -169,6 +187,7 @@ fi
 [[ -n "$WORKSPACE" ]] || err "--workspace is required (flag, config, or VZ_LINUX_BTRFS_E2E_WORKSPACE)"
 [[ -n "$REMOTE_REPO" ]] || err "--remote-repo is required (flag, config, or VZ_LINUX_BTRFS_E2E_REMOTE_REPO)"
 [[ "$PROFILE" == "debug" || "$PROFILE" == "release" ]] || err "--profile must be debug|release"
+validate_non_local_host "$HOST"
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_DIR="$LOCAL_OUTPUT_ROOT/$timestamp"

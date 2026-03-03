@@ -163,6 +163,11 @@ $EDITOR .config/vz-linux-btrfs-e2e.env
   --profile release
 ```
 
+Policy:
+
+- Use real `vz` Linux VM hosts only for this portability gate.
+- Localhost/Docker-backed targets are intentionally rejected by the remote wrapper.
+
 The remote wrapper runs the same gate script on the remote host and copies the resulting artifact
 directory back under:
 
