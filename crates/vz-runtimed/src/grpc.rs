@@ -68,6 +68,8 @@ const ORPHAN_SHELL_EXECUTION_GRACE_SECS: u64 = 300;
 const METRICS_SNAPSHOT_FILENAME: &str = "runtimed-grpc-metrics.prom";
 const BTRFS_HEALTH_EVENT_STACK: &str = "daemon";
 const BTRFS_HEALTH_OPERATION: &str = "btrfs_health_probe";
+const CHECKPOINT_GC_EVENT_STACK: &str = "daemon";
+const CHECKPOINT_GC_OPERATION: &str = "checkpoint_gc_compact";
 
 #[derive(Debug, serde::Serialize)]
 struct BtrfsHealthReceiptMetadata<'a> {
@@ -76,6 +78,16 @@ struct BtrfsHealthReceiptMetadata<'a> {
     severity: &'a str,
     detail: &'a str,
     target_path: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CheckpointGcReceiptMetadata {
+    event_type: &'static str,
+    policy_max_untagged_count: usize,
+    policy_max_age_secs: u64,
+    deleted_by_age: Vec<String>,
+    deleted_by_count: Vec<String>,
+    deleted_by_lineage: Vec<String>,
 }
 
 fn persist_metrics_snapshot(
@@ -190,9 +202,11 @@ async fn run_maintenance_loop(
                     }
                 }
                 let checkpoint_policy = daemon.checkpoint_retention_policy();
-                match daemon
-                    .with_state_store(|store| store.compact_checkpoints_with_policy(checkpoint_policy))
-                {
+                match compact_checkpoints_and_persist_audit(
+                    daemon.as_ref(),
+                    checkpoint_policy,
+                    current_unix_secs(),
+                ) {
                     Ok(report) => {
                         if !report.is_empty() {
                             debug!(
@@ -328,6 +342,51 @@ fn persist_btrfs_health_probe(
                 entity_type: "maintenance".to_string(),
                 request_id,
                 status: receipt_status,
+                created_at: now,
+                metadata,
+            })?;
+            Ok(())
+        })
+    })
+}
+
+fn compact_checkpoints_and_persist_audit(
+    daemon: &RuntimeDaemon,
+    policy: vz_stack::CheckpointRetentionPolicy,
+    now: u64,
+) -> Result<vz_stack::CheckpointGcReport, StackError> {
+    daemon.with_state_store(|store| {
+        store.compact_checkpoints_with_policy_at_and_then(policy, now, |tx, report| {
+            if report.is_empty() {
+                return Ok(());
+            }
+            let request_id = format!("req-checkpoint-gc-{now}");
+            let receipt_id = format!("rcp-checkpoint-gc-{now}");
+            let metadata = serde_json::to_value(CheckpointGcReceiptMetadata {
+                event_type: "checkpoint_gc_compacted",
+                policy_max_untagged_count: policy.max_untagged_count,
+                policy_max_age_secs: policy.max_age_secs,
+                deleted_by_age: report.deleted_by_age.clone(),
+                deleted_by_count: report.deleted_by_count.clone(),
+                deleted_by_lineage: report.deleted_by_lineage.clone(),
+            })
+            .map_err(StackError::from)?;
+            tx.emit_event(
+                CHECKPOINT_GC_EVENT_STACK,
+                &StackEvent::CheckpointGcCompacted {
+                    stack_name: CHECKPOINT_GC_EVENT_STACK.to_string(),
+                    deleted_by_age: report.deleted_by_age.len(),
+                    deleted_by_count: report.deleted_by_count.len(),
+                    deleted_by_lineage: report.deleted_by_lineage.len(),
+                },
+            )?;
+            tx.save_receipt(&Receipt {
+                receipt_id,
+                operation: CHECKPOINT_GC_OPERATION.to_string(),
+                entity_id: "checkpoint_retention".to_string(),
+                entity_type: "maintenance".to_string(),
+                request_id,
+                status: "success".to_string(),
                 created_at: now,
                 metadata,
             })?;

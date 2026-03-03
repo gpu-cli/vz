@@ -6496,6 +6496,49 @@ async fn maintenance_loop_compacts_checkpoints_and_receipts() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
+    let (gc_event_found, gc_receipt_found, gc_receipt_has_lineage_bucket) = daemon
+        .with_state_store(|store| {
+            let gc_event_found = store
+                .load_events_since(CHECKPOINT_GC_EVENT_STACK, 0)?
+                .into_iter()
+                .any(|record| {
+                    matches!(
+                        record.event,
+                        StackEvent::CheckpointGcCompacted {
+                            deleted_by_age,
+                            deleted_by_count: _,
+                            deleted_by_lineage: _,
+                            ..
+                        } if deleted_by_age >= 1
+                    )
+                });
+            let mut gc_receipt_found = false;
+            let mut gc_receipt_has_lineage_bucket = false;
+            for receipt in store.list_receipts()? {
+                if receipt.operation != CHECKPOINT_GC_OPERATION {
+                    continue;
+                }
+                gc_receipt_found = true;
+                if let Some(metadata) = receipt.metadata.as_object()
+                    && metadata.contains_key("deleted_by_lineage")
+                {
+                    gc_receipt_has_lineage_bucket = true;
+                }
+            }
+            Ok((
+                gc_event_found,
+                gc_receipt_found,
+                gc_receipt_has_lineage_bucket,
+            ))
+        })
+        .expect("query checkpoint gc audit records");
+    assert!(gc_event_found, "checkpoint gc event should be emitted");
+    assert!(gc_receipt_found, "checkpoint gc receipt should be emitted");
+    assert!(
+        gc_receipt_has_lineage_bucket,
+        "checkpoint gc receipt metadata should include lineage bucket"
+    );
+
     shutdown.notify_waiters();
     let result = tokio::time::timeout(Duration::from_secs(5), server)
         .await

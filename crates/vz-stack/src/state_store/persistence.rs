@@ -1263,38 +1263,53 @@ impl StateStore {
         policy: CheckpointRetentionPolicy,
         now: u64,
     ) -> Result<CheckpointGcReport, StackError> {
+        self.compact_checkpoints_with_policy_at_and_then(policy, now, |_tx, _report| Ok(()))
+    }
+
+    /// Run checkpoint GC at a fixed timestamp and execute an in-transaction callback
+    /// after deletes are applied but before commit.
+    pub fn compact_checkpoints_with_policy_at_and_then<F>(
+        &self,
+        policy: CheckpointRetentionPolicy,
+        now: u64,
+        on_compacted: F,
+    ) -> Result<CheckpointGcReport, StackError>
+    where
+        F: FnOnce(&StateStore, &CheckpointGcReport) -> Result<(), StackError>,
+    {
         let checkpoints = self.list_checkpoints()?;
         let tags = self.list_checkpoint_retention_tags()?;
         let plan = Self::compute_checkpoint_gc_plan(&checkpoints, &tags, policy, now);
         let deleted_by_age = plan.deleted_by_age;
         let deleted_by_count = plan.deleted_by_count;
         let deleted_by_lineage = plan.deleted_by_lineage;
-        let to_delete: Vec<String> = deleted_by_age
-            .iter()
-            .chain(deleted_by_count.iter())
-            .chain(deleted_by_lineage.iter())
-            .cloned()
-            .collect();
-        if to_delete.is_empty() {
-            return Ok(CheckpointGcReport {
-                deleted_by_age,
-                deleted_by_count,
-                deleted_by_lineage,
-            });
-        }
-
-        self.with_immediate_transaction(|tx| {
-            for checkpoint_id in &to_delete {
-                tx.delete_checkpoint(checkpoint_id)?;
-            }
-            Ok(())
-        })?;
-
-        Ok(CheckpointGcReport {
+        let report = CheckpointGcReport {
             deleted_by_age,
             deleted_by_count,
             deleted_by_lineage,
-        })
+        };
+        let to_delete: Vec<String> = report
+            .deleted_by_age
+            .iter()
+            .chain(report.deleted_by_count.iter())
+            .chain(report.deleted_by_lineage.iter())
+            .cloned()
+            .collect();
+        if to_delete.is_empty() {
+            return Ok(report);
+        }
+        let mut callback = Some(on_compacted);
+        let callback_report = report.clone();
+        self.with_immediate_transaction(move |tx| {
+            for checkpoint_id in &to_delete {
+                tx.delete_checkpoint(checkpoint_id)?;
+            }
+            if let Some(callback) = callback.take() {
+                callback(tx, &callback_report)?;
+            }
+            Ok(())
+        })?;
+        Ok(report)
     }
 
     fn compute_checkpoint_gc_plan(

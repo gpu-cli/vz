@@ -395,6 +395,18 @@ pub enum StackEvent {
         /// Severity level ("info", "warning", "error").
         severity: String,
     },
+    /// Checkpoint retention GC compacted one or more records.
+    #[serde(rename = "checkpoint_gc_compacted")]
+    CheckpointGcCompacted {
+        /// Stack name.
+        stack_name: String,
+        /// Number of checkpoints compacted by age policy.
+        deleted_by_age: usize,
+        /// Number of checkpoints compacted by count policy.
+        deleted_by_count: usize,
+        /// Number of checkpoints compacted by lineage cascade.
+        deleted_by_lineage: usize,
+    },
     /// An orphaned container was cleaned up during startup recovery.
     #[serde(rename = "orphan_cleaned")]
     OrphanCleaned {
@@ -690,6 +702,12 @@ mod tests {
                 category: "desired_state".to_string(),
                 description: "desired state without observations".to_string(),
                 severity: "warning".to_string(),
+            },
+            StackEvent::CheckpointGcCompacted {
+                stack_name: "myapp".to_string(),
+                deleted_by_age: 1,
+                deleted_by_count: 2,
+                deleted_by_lineage: 3,
             },
             StackEvent::OrphanCleaned {
                 stack_name: "myapp".to_string(),
@@ -1027,6 +1045,15 @@ mod tests {
                     severity: "warning".to_string(),
                 },
                 "drift_detected",
+            ),
+            (
+                StackEvent::CheckpointGcCompacted {
+                    stack_name: "t".to_string(),
+                    deleted_by_age: 1,
+                    deleted_by_count: 2,
+                    deleted_by_lineage: 3,
+                },
+                "checkpoint_gc_compacted",
             ),
             (
                 StackEvent::OrphanCleaned {
