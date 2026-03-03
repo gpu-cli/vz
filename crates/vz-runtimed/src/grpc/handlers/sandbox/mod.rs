@@ -443,17 +443,17 @@ fn daemon_materialize_verified_remote_cache_artifact(
 
 #[cfg(not(target_os = "linux"))]
 fn ensure_cache_artifact_directory_layout(target_dir: &Path) -> Result<(), Status> {
-    std::fs::create_dir_all(target_dir).map_err(|error| {
-        status_from_machine_error(MachineError::new(
-            MachineErrorCode::InternalError,
-            format!(
-                "failed to create daemon spaces cache artifact directory {}: {error}",
-                target_dir.display()
-            ),
-            None,
-            BTreeMap::new(),
-        ))
-    })
+    let request_id = "req-space-cache-materialize-layout";
+    Err(status_from_machine_error(MachineError::new(
+        MachineErrorCode::UnsupportedOperation,
+        format!(
+            "spaces cache materialization requires Linux btrfs storage; current platform `{}` is unsupported for {}",
+            std::env::consts::OS,
+            target_dir.display()
+        ),
+        Some(request_id.to_string()),
+        BTreeMap::new(),
+    )))
 }
 
 #[cfg(target_os = "linux")]
@@ -484,18 +484,15 @@ fn ensure_cache_artifact_directory_layout(target_dir: &Path) -> Result<(), Statu
 
     let parent_on_btrfs = path_is_on_btrfs(parent, request_id)?;
     if !parent_on_btrfs {
-        std::fs::create_dir_all(target_dir).map_err(|error| {
-            status_from_machine_error(MachineError::new(
-                MachineErrorCode::InternalError,
-                format!(
-                    "failed to create daemon spaces cache artifact directory {}: {error}",
-                    target_dir.display()
-                ),
-                Some(request_id.to_string()),
-                BTreeMap::new(),
-            ))
-        })?;
-        return Ok(());
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::UnsupportedOperation,
+            format!(
+                "spaces cache artifacts require btrfs-backed daemon state storage; `{}` is not on btrfs",
+                parent.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
     }
 
     if target_dir.exists() {
@@ -853,6 +850,28 @@ fn default_shell_for_base_image(base_image_ref: Option<&str>) -> &'static str {
         "/bin/bash"
     } else {
         "/bin/sh"
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod tests {
+    use super::ensure_cache_artifact_directory_layout;
+
+    #[test]
+    fn cache_artifact_layout_rejects_non_linux_platforms() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp
+            .path()
+            .join("space-cache-artifacts")
+            .join("deps")
+            .join("abc123");
+        let status = ensure_cache_artifact_directory_layout(&target)
+            .expect_err("non-linux cache layout should fail closed");
+        assert!(
+            status.message().contains("requires Linux btrfs storage"),
+            "status should explain Linux+btrfs requirement: {}",
+            status.message()
+        );
     }
 }
 
