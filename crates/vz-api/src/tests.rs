@@ -153,7 +153,9 @@ fn openapi_document_contains_required_paths() {
     assert!(paths.contains_key("/v1/executions/{execution_id}/stdin"));
     assert!(paths.contains_key("/v1/executions/{execution_id}/signal"));
     assert!(paths.contains_key("/v1/checkpoints"));
+    assert!(paths.contains_key("/v1/checkpoints/import"));
     assert!(paths.contains_key("/v1/checkpoints/{checkpoint_id}"));
+    assert!(paths.contains_key("/v1/checkpoints/{checkpoint_id}/export"));
     assert!(paths.contains_key("/v1/checkpoints/{checkpoint_id}/children"));
     assert!(paths.contains_key("/v1/events/{stack_name}"));
     assert!(paths.contains_key("/v1/events/{stack_name}/stream"));
@@ -1757,6 +1759,56 @@ async fn checkpoint_restore_includes_fingerprint_metadata() {
     assert!(payload["restore_note"].as_str().is_some());
 }
 
+#[tokio::test]
+async fn checkpoint_export_rejects_invalid_json() {
+    let (app, _dir) = test_router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/checkpoints/ckpt-any/export")
+                .header("content-type", "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["error"]["code"].as_str().unwrap(),
+        "invalid_request"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_import_rejects_invalid_json() {
+    let (app, _dir) = test_router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/checkpoints/import")
+                .header("content-type", "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["error"]["code"].as_str().unwrap(),
+        "invalid_request"
+    );
+}
+
 // ── Cross-transport behavior parity tests ──────────────────────
 
 #[test]
@@ -1812,6 +1864,8 @@ fn transport_parity_openapi_operations_match_grpc_rpcs() {
         "ListCheckpoints",
         "RestoreCheckpoint",
         "ForkCheckpoint",
+        "ExportCheckpoint",
+        "ImportCheckpoint",
         // BuildService
         "StartBuild",
         "GetBuild",

@@ -916,6 +916,46 @@ pub(super) async fn list_checkpoint_children(
     )
 }
 
+pub(super) async fn export_checkpoint(
+    State(state): State<ApiState>,
+    Path(checkpoint_id): Path<String>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_export_checkpoint_via_daemon(&state, &checkpoint_id, raw_body.as_ref(), &request_id)
+            .await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "checkpoint operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
+pub(super) async fn import_checkpoint(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) =
+        try_import_checkpoint_via_daemon(&state, &headers, raw_body.as_ref(), &request_id).await
+    {
+        return response;
+    }
+    json_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "daemon_unavailable",
+        "checkpoint operations require vz-runtimed daemon",
+        &request_id,
+    )
+}
+
 // ── Container handlers ──
 
 pub(super) async fn create_container(

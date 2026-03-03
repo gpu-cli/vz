@@ -47,14 +47,14 @@ static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 mod daemon_bridge;
 mod handlers;
 mod models;
-mod openapi_doc;
 mod observability;
+mod openapi_doc;
 
 use daemon_bridge::*;
 use handlers::*;
 use models::*;
-use openapi_doc::openapi_document;
 use observability::{ApiObservability, normalize_http_path_for_metrics};
+use openapi_doc::openapi_document;
 
 /// API adapter configuration.
 #[derive(Debug, Clone)]
@@ -274,7 +274,12 @@ pub fn router(config: ApiConfig) -> Router {
             "/v1/checkpoints",
             get(list_checkpoints).post(create_checkpoint),
         )
+        .route("/v1/checkpoints/import", post(import_checkpoint))
         .route("/v1/checkpoints/{checkpoint_id}", get(get_checkpoint))
+        .route(
+            "/v1/checkpoints/{checkpoint_id}/export",
+            post(export_checkpoint),
+        )
         .route(
             "/v1/checkpoints/{checkpoint_id}/restore",
             post(restore_checkpoint),

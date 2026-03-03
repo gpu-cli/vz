@@ -383,6 +383,30 @@ pub(crate) struct ForkCheckpointRequest {
     pub(crate) new_sandbox_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct ExportCheckpointRequest {
+    pub(crate) stream_path: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ExportCheckpointResponse {
+    pub(crate) request_id: String,
+    pub(crate) checkpoint_id: String,
+    pub(crate) stream_path: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct ImportCheckpointRequest {
+    pub(crate) sandbox_id: String,
+    pub(crate) stream_path: String,
+    #[serde(default)]
+    pub(crate) class: Option<String>,
+    #[serde(default)]
+    pub(crate) compatibility_fingerprint: Option<String>,
+    #[serde(default)]
+    pub(crate) retention_tag: Option<String>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct CheckpointPayload {
     pub(crate) checkpoint_id: String,

@@ -6,13 +6,14 @@ use super::{
     CloseSandboxShellResponse, ContainerListResponse, ContainerResponse, CopyPathRequest,
     CreateCheckpointRequest, CreateContainerRequest, CreateExecutionRequest, CreateSandboxRequest,
     ErrorResponse, EventsResponse, ExecutionListResponse, ExecutionOutputStreamEventPayload,
-    ExecutionResponse, FileMutationResponse, ForkCheckpointRequest, ImageListResponse,
-    ImageResponse, LeaseListResponse, LeaseResponse, ListFilesRequest, ListFilesResponse,
-    MakeDirRequest, MovePathRequest, OpenLeaseRequest, OpenSandboxShellResponse,
-    PruneImagesResponse, PullImageRequest, PullImageResponse, ReadFileRequest, ReadFileResponse,
-    ReceiptResponse, RemovePathRequest, ResizeExecRequest, RestoreCheckpointResponse,
-    SandboxListResponse, SandboxResponse, SignalExecRequest, StartBuildRequest,
-    WriteExecStdinRequest, WriteFileRequest, WriteFileResponse,
+    ExecutionResponse, ExportCheckpointRequest, ExportCheckpointResponse, FileMutationResponse,
+    ForkCheckpointRequest, ImageListResponse, ImageResponse, ImportCheckpointRequest,
+    LeaseListResponse, LeaseResponse, ListFilesRequest, ListFilesResponse, MakeDirRequest,
+    MovePathRequest, OpenLeaseRequest, OpenSandboxShellResponse, PruneImagesResponse,
+    PullImageRequest, PullImageResponse, ReadFileRequest, ReadFileResponse, ReceiptResponse,
+    RemovePathRequest, ResizeExecRequest, RestoreCheckpointResponse, SandboxListResponse,
+    SandboxResponse, SignalExecRequest, StartBuildRequest, WriteExecStdinRequest,
+    WriteFileRequest, WriteFileResponse,
 };
 use utoipa::OpenApi;
 
@@ -505,6 +506,39 @@ fn restore_checkpoint() {}
 fn fork_checkpoint() {}
 
 #[utoipa::path(
+    post,
+    path = "/v1/checkpoints/{checkpoint_id}/export",
+    operation_id = "exportCheckpoint",
+    summary = "Export a checkpoint as a btrfs send stream",
+    params(("checkpoint_id" = String, Path, description = "Unique checkpoint identifier (ckpt-...)")),
+    request_body = ExportCheckpointRequest,
+    responses(
+        (status = 200, description = "Checkpoint export completed", body = ExportCheckpointResponse),
+        (status = 400, description = "Invalid request body", body = ErrorResponse),
+        (status = 404, description = "Checkpoint not found", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn export_checkpoint() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/checkpoints/import",
+    operation_id = "importCheckpoint",
+    summary = "Import a checkpoint from a btrfs send stream",
+    params(("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY_KEY_DESCRIPTION)),
+    request_body = ImportCheckpointRequest,
+    responses(
+        (status = 201, description = "Checkpoint imported", body = CheckpointResponse),
+        (status = 400, description = "Invalid request body", body = ErrorResponse),
+        (status = 404, description = "Sandbox not found", body = ErrorResponse),
+        (status = 409, description = "Checkpoint conflict", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse),
+    )
+)]
+fn import_checkpoint() {}
+
+#[utoipa::path(
     get,
     path = "/v1/checkpoints/{checkpoint_id}/children",
     operation_id = "listCheckpointChildren",
@@ -899,6 +933,8 @@ fn chown_path() {}
         get_checkpoint,
         restore_checkpoint,
         fork_checkpoint,
+        export_checkpoint,
+        import_checkpoint,
         list_checkpoint_children,
         list_containers,
         create_container,
@@ -950,6 +986,9 @@ fn chown_path() {}
         crate::SignalExecRequest,
         crate::WriteExecStdinRequest,
         crate::CreateCheckpointRequest,
+        crate::ExportCheckpointRequest,
+        crate::ExportCheckpointResponse,
+        crate::ImportCheckpointRequest,
         crate::ForkCheckpointRequest,
         crate::CheckpointPayload,
         crate::CheckpointResponse,
