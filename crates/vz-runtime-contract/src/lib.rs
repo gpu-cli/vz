@@ -53,7 +53,9 @@ pub use types::{
     SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX, SANDBOX_LABEL_SPACE_SERVICE_STATE_PREFIX,
     SANDBOX_LABEL_SPACE_WORKTREE_ID, SANDBOX_LABEL_SPACE_WORKTREE_NAMESPACE,
     SANDBOX_SPACE_LIFECYCLE_EPHEMERAL, SANDBOX_SPACE_LIFECYCLE_PERSISTENT,
-    SANDBOX_SPACE_MODE_REQUIRED, Sandbox, SandboxBackend, SandboxSpec, SandboxState,
-    SandboxVolumeMount, SharedVmPhase, SharedVmPhaseTracker, StackResourceHint, StackVolumeMount,
-    Volume, VolumeType, default_namespace_config,
+    SANDBOX_SPACE_MODE_REQUIRED, SPACE_CACHE_KEY_SCHEMA_VERSION, Sandbox, SandboxBackend,
+    SandboxSpec, SandboxState, SandboxVolumeMount, SharedVmPhase, SharedVmPhaseTracker,
+    SpaceCacheIndex, SpaceCacheKey, SpaceCacheKeyMaterial, SpaceCacheLookup,
+    SpaceCacheRuntimeIdentity, StackResourceHint, StackVolumeMount, Volume, VolumeType,
+    default_namespace_config,
 };

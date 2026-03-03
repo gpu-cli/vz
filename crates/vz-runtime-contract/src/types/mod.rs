@@ -17,6 +17,7 @@ mod isolation;
 mod operations;
 mod sandbox;
 mod shared_vm;
+mod space_cache;
 mod stack;
 mod workload;
 
@@ -29,6 +30,7 @@ pub use self::isolation::*;
 pub use self::operations::*;
 pub use self::sandbox::*;
 pub use self::shared_vm::*;
+pub use self::space_cache::*;
 pub use self::stack::*;
 pub use self::workload::*;
 
