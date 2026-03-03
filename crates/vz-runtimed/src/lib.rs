@@ -169,6 +169,19 @@ impl RuntimeDaemon {
                 source,
             }
         })?;
+        let legacy_checkpoint_artifacts =
+            detect_legacy_runtime_checkpoint_roots(&config.runtime_data_dir).map_err(|source| {
+                RuntimedError::InspectLegacyCheckpointArtifacts {
+                    path: config.runtime_data_dir.clone(),
+                    source,
+                }
+            })?;
+        if !legacy_checkpoint_artifacts.is_empty() {
+            return Err(RuntimedError::LegacyCheckpointArtifactsIncompatible {
+                runtime_data_dir: config.runtime_data_dir.clone(),
+                paths: legacy_checkpoint_artifacts,
+            });
+        }
 
         let startup_lock = StartupLock::acquire(startup_lock_path(&config.state_store_path))?;
         let state_store = StateStore::open_with_pragmas(
@@ -409,6 +422,29 @@ impl RuntimeDaemon {
         self.placement_scheduler
             .set_limits_for_test(max_sandboxes, max_containers);
     }
+}
+
+fn detect_legacy_runtime_checkpoint_roots(
+    runtime_data_dir: &Path,
+) -> Result<Vec<PathBuf>, std::io::Error> {
+    let sandboxes_dir = runtime_data_dir.join("sandboxes");
+    if !sandboxes_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut legacy_roots = Vec::new();
+    for sandbox_entry in std::fs::read_dir(&sandboxes_dir)? {
+        let sandbox_entry = sandbox_entry?;
+        if !sandbox_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let legacy_fs_root = sandbox_entry.path().join("fs");
+        if legacy_fs_root.is_dir() {
+            legacy_roots.push(legacy_fs_root);
+        }
+    }
+    legacy_roots.sort();
+    Ok(legacy_roots)
 }
 
 #[cfg(any(test, feature = "test-backend"))]
@@ -741,6 +777,19 @@ pub enum RuntimedError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to inspect legacy checkpoint artifacts under {path}: {source}")]
+    InspectLegacyCheckpointArtifacts {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "legacy checkpoint artifact layout is incompatible with btrfs-only mode under {runtime_data_dir}; migrate or remove these paths: {paths:?}"
+    )]
+    LegacyCheckpointArtifactsIncompatible {
+        runtime_data_dir: PathBuf,
+        paths: Vec<PathBuf>,
+    },
     #[error("failed to open daemon state store at {path}: {source}")]
     OpenStateStore {
         path: PathBuf,
@@ -824,6 +873,33 @@ mod tests {
             daemon.startup_lock_path(),
             startup_lock_path(&cfg.state_store_path).as_path()
         );
+    }
+
+    #[test]
+    fn start_rejects_legacy_runtime_checkpoint_layout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = RuntimedConfig {
+            state_store_path: tmp.path().join("state").join("stack-state.db"),
+            runtime_data_dir: tmp.path().join("runtime"),
+            socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+        };
+        let legacy_root = cfg.runtime_data_dir.join("sandboxes").join("sbx-legacy").join("fs");
+        std::fs::create_dir_all(&legacy_root).expect("create legacy checkpoint root");
+
+        let error = match RuntimeDaemon::start(cfg.clone()) {
+            Ok(_) => panic!("daemon should reject legacy layout"),
+            Err(error) => error,
+        };
+        match error {
+            RuntimedError::LegacyCheckpointArtifactsIncompatible {
+                runtime_data_dir,
+                paths,
+            } => {
+                assert_eq!(runtime_data_dir, cfg.runtime_data_dir);
+                assert_eq!(paths, vec![legacy_root]);
+            }
+            other => panic!("unexpected start error: {other}"),
+        }
     }
 
     #[tokio::test]
