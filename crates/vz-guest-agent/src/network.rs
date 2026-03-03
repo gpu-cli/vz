@@ -38,6 +38,7 @@ use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use tracing::info;
 use vz::protocol::NetworkServiceConfig;
@@ -169,7 +170,9 @@ pub fn setup_stack_network(stack_id: &str, services: &[NetworkServiceConfig]) ->
             }
 
             // Rename guest end to ethN inside the namespace.
-            nsenter_ip(&ns_path, &["link", "set", &veth_guest, "name", &eth_name])?;
+            // This can race briefly with netns handoff; retry on transient
+            // kernel/iproute2 "No such device" errors to reduce flakiness.
+            rename_netns_interface_with_retry(&ns_path, &veth_guest, &eth_name)?;
 
             nsenter_ip(
                 &ns_path,
@@ -515,6 +518,51 @@ fn nsenter_ip(ns_path: &str, args: &[&str]) -> io::Result<()> {
     Ok(())
 }
 
+fn rename_netns_interface_with_retry(ns_path: &str, from: &str, to: &str) -> io::Result<()> {
+    const ATTEMPTS: u32 = 8;
+    const RETRY_DELAY: Duration = Duration::from_millis(75);
+
+    let mut last_error: Option<io::Error> = None;
+    for attempt in 1..=ATTEMPTS {
+        match nsenter_ip(ns_path, &["link", "set", from, "name", to]) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let transient = is_transient_link_rename_error(&error);
+                if !transient || attempt == ATTEMPTS {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "failed to rename netns interface `{from}` -> `{to}` in {ns_path} after {attempt} attempt(s): {error}"
+                        ),
+                    ));
+                }
+                last_error = Some(error);
+                std::thread::sleep(RETRY_DELAY);
+            }
+        }
+    }
+
+    if let Some(error) = last_error {
+        Err(io::Error::new(
+            error.kind(),
+            format!(
+                "failed to rename netns interface `{from}` -> `{to}` in {ns_path}: {error}"
+            ),
+        ))
+    } else {
+        Err(io::Error::other(format!(
+            "failed to rename netns interface `{from}` -> `{to}` in {ns_path}"
+        )))
+    }
+}
+
+fn is_transient_link_rename_error(error: &io::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("siocsifname")
+        || message.contains("no such device")
+        || message.contains("cannot find device")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,5 +587,17 @@ mod tests {
     #[test]
     fn truncate_name_long() {
         assert_eq!(truncate_name("very-long-stack-name", 12), "very-long-st");
+    }
+
+    #[test]
+    fn transient_link_rename_error_detection_matches_kernel_message() {
+        let err = io::Error::other("ip: SIOCSIFNAME: No such device");
+        assert!(is_transient_link_rename_error(&err));
+    }
+
+    #[test]
+    fn transient_link_rename_error_detection_rejects_unrelated_messages() {
+        let err = io::Error::other("permission denied");
+        assert!(!is_transient_link_rename_error(&err));
     }
 }
