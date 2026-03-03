@@ -31,9 +31,11 @@ const LEGACY_SANDBOX_BASE_IMAGE_REF: &str = "debian:bookworm";
 const SANDBOX_DEFAULT_BASE_IMAGE_ENV: &str = "VZ_SANDBOX_DEFAULT_BASE_IMAGE";
 const SANDBOX_DEFAULT_MAIN_CONTAINER_ENV: &str = "VZ_SANDBOX_DEFAULT_MAIN_CONTAINER";
 const SANDBOX_DISABLE_LEGACY_DEFAULT_ENV: &str = "VZ_SANDBOX_DISABLE_LEGACY_DEFAULT_BASE_IMAGE";
+const LEGACY_CHECKPOINT_MIGRATION_ENV: &str = "VZ_RUNTIMED_MIGRATE_LEGACY_CHECKPOINT_ARTIFACTS";
 const BUILD_RESTART_RECONCILE_ERROR: &str = "build reconciled after daemon restart";
 const BUILD_RESTART_RECONCILE_OPERATION: &str = "reconcile_build_after_restart";
 const BUILD_RESTART_RECONCILE_REQUEST_PREFIX: &str = "req-build-reconcile";
+const LEGACY_CHECKPOINT_MIGRATION_OPERATION: &str = "migrate_legacy_checkpoint_artifacts";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SandboxDefaultSource {
@@ -176,12 +178,8 @@ impl RuntimeDaemon {
                     source,
                 }
             })?;
-        if !legacy_checkpoint_artifacts.is_empty() {
-            return Err(RuntimedError::LegacyCheckpointArtifactsIncompatible {
-                runtime_data_dir: config.runtime_data_dir.clone(),
-                paths: legacy_checkpoint_artifacts,
-            });
-        }
+        let migrate_legacy_checkpoint_artifacts =
+            load_legacy_checkpoint_migration_mode_enabled()?;
 
         let startup_lock = StartupLock::acquire(startup_lock_path(&config.state_store_path))?;
         let state_store = StateStore::open_with_pragmas(
@@ -192,6 +190,30 @@ impl RuntimeDaemon {
             path: config.state_store_path.clone(),
             source,
         })?;
+        if !legacy_checkpoint_artifacts.is_empty() {
+            if migrate_legacy_checkpoint_artifacts {
+                let report = migrate_legacy_checkpoint_artifacts_to_archive(
+                    &config.runtime_data_dir,
+                    &legacy_checkpoint_artifacts,
+                )
+                .map_err(|source| RuntimedError::MigrateLegacyCheckpointArtifacts {
+                    runtime_data_dir: config.runtime_data_dir.clone(),
+                    source,
+                })?;
+                persist_legacy_checkpoint_migration_audit(&state_store, &report).map_err(
+                    |source| RuntimedError::RecordLegacyCheckpointMigration {
+                        path: config.state_store_path.clone(),
+                        source,
+                    },
+                )?;
+            } else {
+                return Err(RuntimedError::LegacyCheckpointArtifactsIncompatible {
+                    runtime_data_dir: config.runtime_data_dir.clone(),
+                    migration_env: LEGACY_CHECKPOINT_MIGRATION_ENV,
+                    paths: legacy_checkpoint_artifacts,
+                });
+            }
+        }
         let schema_version =
             state_store
                 .schema_version()
@@ -445,6 +467,123 @@ fn detect_legacy_runtime_checkpoint_roots(
     }
     legacy_roots.sort();
     Ok(legacy_roots)
+}
+
+#[derive(Debug, Clone)]
+struct LegacyCheckpointMigrationReport {
+    archive_root: PathBuf,
+    migrated_paths: Vec<PathBuf>,
+}
+
+#[derive(serde::Serialize)]
+struct LegacyCheckpointMigrationReceiptMetadata {
+    event_type: &'static str,
+    migration_mode: &'static str,
+    archive_root: String,
+    migrated_path_count: usize,
+    migrated_paths: Vec<String>,
+}
+
+fn migrate_legacy_checkpoint_artifacts_to_archive(
+    runtime_data_dir: &Path,
+    legacy_paths: &[PathBuf],
+) -> Result<LegacyCheckpointMigrationReport, std::io::Error> {
+    let now = current_unix_secs();
+    let archive_root = runtime_data_dir
+        .join("checkpoints")
+        .join("legacy-artifacts")
+        .join(format!("{now}"));
+    std::fs::create_dir_all(&archive_root)?;
+
+    let mut migrated_paths = Vec::new();
+    for path in legacy_paths {
+        if !path.is_dir() {
+            continue;
+        }
+        let sandbox_id = path
+            .parent()
+            .and_then(Path::file_name)
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown-sandbox".to_string());
+        let mut destination = archive_root.join(format!("{sandbox_id}-fs"));
+        if destination.exists() {
+            let mut suffix = 1_u32;
+            loop {
+                let candidate = archive_root.join(format!("{sandbox_id}-fs-{suffix}"));
+                if !candidate.exists() {
+                    destination = candidate;
+                    break;
+                }
+                suffix = suffix.saturating_add(1);
+            }
+        }
+        std::fs::rename(path, &destination)?;
+        migrated_paths.push(destination);
+    }
+
+    migrated_paths.sort();
+    Ok(LegacyCheckpointMigrationReport {
+        archive_root,
+        migrated_paths,
+    })
+}
+
+fn persist_legacy_checkpoint_migration_audit(
+    state_store: &StateStore,
+    report: &LegacyCheckpointMigrationReport,
+) -> Result<(), StackError> {
+    let now = current_unix_secs();
+    let request_id = format!("req-legacy-checkpoint-migration-{now}");
+    let receipt_id = format!("rcp-legacy-checkpoint-migration-{now}");
+    let metadata = serde_json::to_value(LegacyCheckpointMigrationReceiptMetadata {
+        event_type: "checkpoint_failed",
+        migration_mode: "archive_legacy_paths",
+        archive_root: report.archive_root.display().to_string(),
+        migrated_path_count: report.migrated_paths.len(),
+        migrated_paths: report
+            .migrated_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+    })
+    .map_err(StackError::from)?;
+    let migration_note = format!(
+        "legacy checkpoint artifacts migrated to archive root {} ({} paths)",
+        report.archive_root.display(),
+        report.migrated_paths.len()
+    );
+
+    state_store.with_immediate_transaction(|tx| {
+        tx.emit_event(
+            "daemon",
+            &StackEvent::CheckpointFailed {
+                checkpoint_id: "legacy-checkpoint-layout".to_string(),
+                error: migration_note.clone(),
+            },
+        )?;
+        tx.save_receipt(&Receipt {
+            receipt_id,
+            operation: LEGACY_CHECKPOINT_MIGRATION_OPERATION.to_string(),
+            entity_id: "daemon".to_string(),
+            entity_type: "migration".to_string(),
+            request_id,
+            status: "success".to_string(),
+            created_at: now,
+            metadata,
+        })?;
+        Ok(())
+    })
+}
+
+fn load_legacy_checkpoint_migration_mode_enabled() -> Result<bool, RuntimedError> {
+    match std::env::var(LEGACY_CHECKPOINT_MIGRATION_ENV) {
+        Ok(value) => parse_env_bool(&value, LEGACY_CHECKPOINT_MIGRATION_ENV),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(value)) => Err(RuntimedError::InvalidPolicyEnvValue {
+            env_name: LEGACY_CHECKPOINT_MIGRATION_ENV,
+            value: value.to_string_lossy().to_string(),
+        }),
+    }
 }
 
 #[cfg(any(test, feature = "test-backend"))]
@@ -783,11 +922,24 @@ pub enum RuntimedError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to migrate legacy checkpoint artifacts under {runtime_data_dir}: {source}")]
+    MigrateLegacyCheckpointArtifacts {
+        runtime_data_dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to record legacy checkpoint migration in state store {path}: {source}")]
+    RecordLegacyCheckpointMigration {
+        path: PathBuf,
+        #[source]
+        source: StackError,
+    },
     #[error(
-        "legacy checkpoint artifact layout is incompatible with btrfs-only mode under {runtime_data_dir}; migrate or remove these paths: {paths:?}"
+        "legacy checkpoint artifact layout is incompatible with btrfs-only mode under {runtime_data_dir}; set {migration_env}=1 to auto-archive or migrate/remove these paths manually: {paths:?}"
     )]
     LegacyCheckpointArtifactsIncompatible {
         runtime_data_dir: PathBuf,
+        migration_env: &'static str,
         paths: Vec<PathBuf>,
     },
     #[error("failed to open daemon state store at {path}: {source}")]
@@ -893,6 +1045,7 @@ mod tests {
         match error {
             RuntimedError::LegacyCheckpointArtifactsIncompatible {
                 runtime_data_dir,
+                migration_env: _,
                 paths,
             } => {
                 assert_eq!(runtime_data_dir, cfg.runtime_data_dir);
@@ -900,6 +1053,116 @@ mod tests {
             }
             other => panic!("unexpected start error: {other}"),
         }
+    }
+
+    #[test]
+    fn migrate_legacy_checkpoint_artifacts_archives_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let runtime_data_dir = tmp.path().join("runtime");
+        let legacy_one = runtime_data_dir.join("sandboxes").join("sbx-one").join("fs");
+        let legacy_two = runtime_data_dir.join("sandboxes").join("sbx-two").join("fs");
+        std::fs::create_dir_all(&legacy_one).expect("create legacy one");
+        std::fs::create_dir_all(&legacy_two).expect("create legacy two");
+
+        let report = migrate_legacy_checkpoint_artifacts_to_archive(
+            &runtime_data_dir,
+            &[legacy_one.clone(), legacy_two.clone()],
+        )
+        .expect("migration should succeed");
+
+        assert!(
+            report.archive_root.is_dir(),
+            "archive root should be created: {}",
+            report.archive_root.display()
+        );
+        assert_eq!(report.migrated_paths.len(), 2);
+        assert!(
+            !legacy_one.exists() && !legacy_two.exists(),
+            "legacy roots should be moved to archive"
+        );
+        for archived in &report.migrated_paths {
+            assert!(archived.is_dir(), "archived path should exist: {}", archived.display());
+            assert!(
+                archived.starts_with(&report.archive_root),
+                "archived path should remain under archive root"
+            );
+        }
+    }
+
+    #[test]
+    fn persist_legacy_checkpoint_migration_audit_writes_receipt_and_event() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_store_path = tmp.path().join("state").join("stack-state.db");
+        std::fs::create_dir_all(state_store_path.parent().expect("parent")).expect("state parent");
+        let store = StateStore::open(&state_store_path).expect("state store");
+        let report = LegacyCheckpointMigrationReport {
+            archive_root: tmp.path().join("runtime").join("checkpoints").join("legacy-artifacts"),
+            migrated_paths: vec![tmp.path().join("runtime").join("legacy-a")],
+        };
+
+        persist_legacy_checkpoint_migration_audit(&store, &report)
+            .expect("audit receipt/event should be written");
+
+        let receipts = store.list_receipts().expect("list receipts");
+        assert_eq!(receipts.len(), 1);
+        let receipt = &receipts[0];
+        assert_eq!(receipt.operation, LEGACY_CHECKPOINT_MIGRATION_OPERATION);
+        assert_eq!(receipt.entity_type, "migration");
+        assert_eq!(receipt.status, "success");
+        assert_eq!(
+            receipt
+                .metadata
+                .get("migrated_path_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+
+        let events = store.load_events("daemon").expect("daemon events");
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StackEvent::CheckpointFailed {
+                checkpoint_id,
+                error,
+            } => {
+                assert_eq!(checkpoint_id, "legacy-checkpoint-layout");
+                assert!(error.contains("legacy checkpoint artifacts migrated"));
+            }
+            other => panic!("unexpected migration event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upgrade_restart_succeeds_after_legacy_checkpoint_migration() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = RuntimedConfig {
+            state_store_path: tmp.path().join("state").join("stack-state.db"),
+            runtime_data_dir: tmp.path().join("runtime"),
+            socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+        };
+        let legacy_root = cfg.runtime_data_dir.join("sandboxes").join("sbx-legacy").join("fs");
+        std::fs::create_dir_all(&legacy_root).expect("create legacy checkpoint root");
+
+        let first_start_error = match RuntimeDaemon::start(cfg.clone()) {
+            Ok(_) => panic!("initial start should fail with incompatible legacy layout"),
+            Err(error) => error,
+        };
+        match first_start_error {
+            RuntimedError::LegacyCheckpointArtifactsIncompatible { paths, .. } => {
+                assert_eq!(paths, vec![legacy_root.clone()]);
+            }
+            other => panic!("unexpected start error before migration: {other}"),
+        }
+
+        let report = migrate_legacy_checkpoint_artifacts_to_archive(
+            &cfg.runtime_data_dir,
+            std::slice::from_ref(&legacy_root),
+        )
+        .expect("legacy checkpoint migration should succeed");
+        assert_eq!(report.migrated_paths.len(), 1);
+
+        let daemon =
+            RuntimeDaemon::start(cfg).expect("restart should succeed after migration cleanup");
+        drop(daemon);
     }
 
     #[tokio::test]
