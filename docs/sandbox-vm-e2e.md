@@ -148,6 +148,14 @@ VZ_TEST_BTRFS_WORKSPACE=/mnt/vz-btrfs ./scripts/run-linux-btrfs-e2e.sh
 For dedicated remote `vz` Linux environments (SSH-accessible), use the remote wrapper:
 
 ```bash
+# one-time setup
+cp config/vz-linux-btrfs-e2e.env.example .config/vz-linux-btrfs-e2e.env
+$EDITOR .config/vz-linux-btrfs-e2e.env
+
+# then run (no flags)
+./scripts/run-linux-btrfs-e2e-remote.sh
+
+# or explicit flags
 ./scripts/run-linux-btrfs-e2e-remote.sh \
   --host user@vz-linux-host \
   --workspace /mnt/vz-btrfs \
