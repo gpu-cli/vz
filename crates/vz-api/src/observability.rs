@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 
-const LATENCY_BUCKETS_SECONDS: [f64; 11] =
-    [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+const LATENCY_BUCKETS_SECONDS: [f64; 11] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
 
 #[derive(Debug, Default)]
 pub(crate) struct ApiObservability {
@@ -104,9 +105,8 @@ impl ApiObservability {
         };
 
         let mut output = String::new();
-        output.push_str(
-            "# HELP vz_api_http_requests_total Total HTTP requests handled by vz-api.\n",
-        );
+        output
+            .push_str("# HELP vz_api_http_requests_total Total HTTP requests handled by vz-api.\n");
         output.push_str("# TYPE vz_api_http_requests_total counter\n");
         for (key, count) in &guard.request_counts {
             output.push_str(&format!(
