@@ -136,6 +136,30 @@ Recommended pre-release evidence bundle:
 - `<timestamp>/summary.txt`
 - `<timestamp>/stack-snapshot-restore.log`
 
+## Linux btrfs Portability Gate
+
+For Linux-native btrfs portability (checkpoint + shared-cache send/receive), run the dedicated
+harness on a Linux host/VM with a real btrfs workspace path:
+
+```bash
+VZ_TEST_BTRFS_WORKSPACE=/mnt/vz-btrfs ./scripts/run-linux-btrfs-e2e.sh
+```
+
+Mandatory pass criteria:
+
+- `summary.txt` contains:
+  - `passed=spaces_btrfs_checkpoint_restore_and_fork_use_real_subvolumes`
+  - `checkpoint_export_import_round_trip_preserves_workspace_snapshot`
+  - `space_cache_export_import_round_trip_preserves_payload`
+- `summary.txt` contains `failed=none`
+- Each corresponding log file contains `running 1 test`
+
+Artifacts are written under:
+
+```text
+.artifacts/linux-btrfs-e2e/<timestamp>/
+```
+
 ## Signing Behavior
 
 The harness signs:
