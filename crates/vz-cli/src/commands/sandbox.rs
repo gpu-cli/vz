@@ -1424,6 +1424,16 @@ fn open_sandbox_shell_progress_message(phase: &str, detail: &str) -> String {
     }
 }
 
+fn prepare_space_cache_progress_message(phase: &str, detail: &str) -> String {
+    match phase {
+        "validating" => "Validating cache key payloads".to_string(),
+        "resolving" => "Resolving cache hits/misses and remote trust".to_string(),
+        "invalidating" => sanitize_progress_detail(detail),
+        "persisting" => "Persisting cache preparation receipt".to_string(),
+        _ => sanitize_progress_detail(detail),
+    }
+}
+
 async fn daemon_grpc_list_sandboxes(state_db: &Path) -> anyhow::Result<Vec<Sandbox>> {
     let mut client = connect_control_plane_for_state_db(state_db).await?;
     let response = client
@@ -1572,6 +1582,100 @@ async fn daemon_grpc_terminate_sandbox(
     }
 }
 
+fn map_prepare_space_cache_outcome(
+    outcome: runtime_v2::SpaceCacheTrustOutcome,
+) -> SpaceCacheTrustOutcome {
+    match outcome {
+        runtime_v2::SpaceCacheTrustOutcome::LocalHit => SpaceCacheTrustOutcome::LocalHit,
+        runtime_v2::SpaceCacheTrustOutcome::LocalMissCold => SpaceCacheTrustOutcome::LocalMissCold,
+        runtime_v2::SpaceCacheTrustOutcome::LocalMissDimensionChange => {
+            SpaceCacheTrustOutcome::LocalMissDimensionChange
+        }
+        runtime_v2::SpaceCacheTrustOutcome::LocalMissSchemaMismatch => {
+            SpaceCacheTrustOutcome::LocalMissSchemaMismatch
+        }
+        runtime_v2::SpaceCacheTrustOutcome::RemoteVerifiedMaterialized => {
+            SpaceCacheTrustOutcome::RemoteVerifiedMaterialized
+        }
+        runtime_v2::SpaceCacheTrustOutcome::RemoteMissUntrusted
+        | runtime_v2::SpaceCacheTrustOutcome::Unspecified => {
+            SpaceCacheTrustOutcome::RemoteMissUntrusted
+        }
+    }
+}
+
+async fn daemon_grpc_prepare_space_cache(
+    state_db: &Path,
+    cache_keys: &[SpaceCacheKey],
+) -> anyhow::Result<BTreeMap<String, SpaceCacheTrustOutcome>> {
+    if cache_keys.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut client = connect_control_plane_for_state_db(state_db).await?;
+    let mut stream = client
+        .prepare_space_cache_stream(runtime_v2::PrepareSpaceCacheRequest {
+            metadata: None,
+            keys: cache_keys
+                .iter()
+                .map(|key| runtime_v2::SpaceCacheKeyPayload {
+                    schema_version: u32::from(key.schema_version),
+                    cache_name: key.cache_name.clone(),
+                    digest_hex: key.digest_hex.clone(),
+                    canonical_json: key.canonical_json.clone(),
+                })
+                .collect(),
+        })
+        .await
+        .context("failed to prepare space cache via daemon")?;
+    let spinner = SpinnerProgress::start("Preparing shared caches".to_string());
+    let mut completion = None;
+    loop {
+        let maybe_event = match stream.message().await {
+            Ok(event) => event,
+            Err(error) => {
+                spinner.abandon("Shared cache preparation failed".to_string());
+                return Err(anyhow!(error).context("failed reading prepare space cache stream"));
+            }
+        };
+        let Some(event) = maybe_event else {
+            break;
+        };
+        match event.payload {
+            Some(runtime_v2::prepare_space_cache_event::Payload::Progress(progress)) => {
+                spinner.set_message(prepare_space_cache_progress_message(
+                    progress.phase.as_str(),
+                    progress.detail.as_str(),
+                ));
+            }
+            Some(runtime_v2::prepare_space_cache_event::Payload::Completion(done)) => {
+                completion = Some(done);
+                break;
+            }
+            None => {}
+        }
+    }
+    let Some(done) = completion else {
+        spinner.abandon("Shared cache preparation failed".to_string());
+        return Err(anyhow!(
+            "daemon prepare_space_cache stream ended without completion"
+        ));
+    };
+    spinner.finish_with_elapsed("Shared cache preparation complete".to_string());
+    if !done.receipt_id.trim().is_empty() {
+        println!("Receipt: {}", done.receipt_id.trim());
+    }
+    let mut outcomes = BTreeMap::new();
+    for outcome in done.outcomes {
+        let parsed = match runtime_v2::SpaceCacheTrustOutcome::try_from(outcome.outcome) {
+            Ok(value) => value,
+            Err(_) => runtime_v2::SpaceCacheTrustOutcome::Unspecified,
+        };
+        let mapped = map_prepare_space_cache_outcome(parsed);
+        outcomes.insert(outcome.cache_name, mapped);
+    }
+    Ok(outcomes)
+}
+
 async fn daemon_list_sandboxes(state_db: &Path) -> anyhow::Result<Vec<Sandbox>> {
     match control_plane_transport()? {
         ControlPlaneTransport::DaemonGrpc => daemon_grpc_list_sandboxes(state_db).await,
@@ -1602,6 +1706,18 @@ async fn daemon_create_sandbox(
         ControlPlaneTransport::ApiHttp => {
             api_create_sandbox(sandbox_id, cpus, memory, labels).await
         }
+    }
+}
+
+async fn daemon_prepare_space_cache(
+    state_db: &Path,
+    cache_keys: &[SpaceCacheKey],
+) -> anyhow::Result<BTreeMap<String, SpaceCacheTrustOutcome>> {
+    match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            daemon_grpc_prepare_space_cache(state_db, cache_keys).await
+        }
+        ControlPlaneTransport::ApiHttp => update_space_cache_index(state_db, cache_keys),
     }
 }
 
@@ -1971,7 +2087,7 @@ async fn cmd_create_sandbox(
         worktree_identity.worktree_id.as_str(),
     )
     .await?;
-    let cache_trust_outcomes = update_space_cache_index(state_db, &cache_keys)?;
+    let cache_trust_outcomes = daemon_prepare_space_cache(state_db, &cache_keys).await?;
     apply_space_cache_trust_labels(&mut labels, &cache_trust_outcomes);
 
     // Ensure state directory exists.

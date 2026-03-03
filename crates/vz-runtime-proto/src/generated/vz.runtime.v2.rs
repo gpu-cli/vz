@@ -210,6 +210,70 @@ pub mod create_sandbox_event {
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SpaceCacheKeyPayload {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub cache_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub digest_hex: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub canonical_json: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SpaceCacheOutcomePayload {
+    #[prost(string, tag = "1")]
+    pub cache_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub digest_hex: ::prost::alloc::string::String,
+    #[prost(enumeration = "SpaceCacheTrustOutcome", tag = "3")]
+    pub outcome: i32,
+    #[prost(string, tag = "4")]
+    pub detail: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PrepareSpaceCacheRequest {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<RequestMetadata>,
+    #[prost(message, repeated, tag = "2")]
+    pub keys: ::prost::alloc::vec::Vec<SpaceCacheKeyPayload>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PrepareSpaceCacheProgress {
+    #[prost(string, tag = "1")]
+    pub phase: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PrepareSpaceCacheCompletion {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub outcomes: ::prost::alloc::vec::Vec<SpaceCacheOutcomePayload>,
+    #[prost(string, tag = "3")]
+    pub receipt_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PrepareSpaceCacheEvent {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(oneof = "prepare_space_cache_event::Payload", tags = "3, 4")]
+    pub payload: ::core::option::Option<prepare_space_cache_event::Payload>,
+}
+/// Nested message and enum types in `PrepareSpaceCacheEvent`.
+pub mod prepare_space_cache_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "3")]
+        Progress(super::PrepareSpaceCacheProgress),
+        #[prost(message, tag = "4")]
+        Completion(super::PrepareSpaceCacheCompletion),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TerminateSandboxCompletion {
     #[prost(message, optional, tag = "1")]
     pub response: ::core::option::Option<SandboxResponse>,
@@ -1475,6 +1539,63 @@ pub struct GetCapabilitiesResponse {
     #[prost(message, repeated, tag = "2")]
     pub capabilities: ::prost::alloc::vec::Vec<Capability>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SpaceCacheTrustOutcome {
+    Unspecified = 0,
+    LocalHit = 1,
+    LocalMissCold = 2,
+    LocalMissDimensionChange = 3,
+    LocalMissSchemaMismatch = 4,
+    RemoteVerifiedMaterialized = 5,
+    RemoteMissUntrusted = 6,
+}
+impl SpaceCacheTrustOutcome {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SPACE_CACHE_TRUST_OUTCOME_UNSPECIFIED",
+            Self::LocalHit => "SPACE_CACHE_TRUST_OUTCOME_LOCAL_HIT",
+            Self::LocalMissCold => "SPACE_CACHE_TRUST_OUTCOME_LOCAL_MISS_COLD",
+            Self::LocalMissDimensionChange => {
+                "SPACE_CACHE_TRUST_OUTCOME_LOCAL_MISS_DIMENSION_CHANGE"
+            }
+            Self::LocalMissSchemaMismatch => {
+                "SPACE_CACHE_TRUST_OUTCOME_LOCAL_MISS_SCHEMA_MISMATCH"
+            }
+            Self::RemoteVerifiedMaterialized => {
+                "SPACE_CACHE_TRUST_OUTCOME_REMOTE_VERIFIED_MATERIALIZED"
+            }
+            Self::RemoteMissUntrusted => {
+                "SPACE_CACHE_TRUST_OUTCOME_REMOTE_MISS_UNTRUSTED"
+            }
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SPACE_CACHE_TRUST_OUTCOME_UNSPECIFIED" => Some(Self::Unspecified),
+            "SPACE_CACHE_TRUST_OUTCOME_LOCAL_HIT" => Some(Self::LocalHit),
+            "SPACE_CACHE_TRUST_OUTCOME_LOCAL_MISS_COLD" => Some(Self::LocalMissCold),
+            "SPACE_CACHE_TRUST_OUTCOME_LOCAL_MISS_DIMENSION_CHANGE" => {
+                Some(Self::LocalMissDimensionChange)
+            }
+            "SPACE_CACHE_TRUST_OUTCOME_LOCAL_MISS_SCHEMA_MISMATCH" => {
+                Some(Self::LocalMissSchemaMismatch)
+            }
+            "SPACE_CACHE_TRUST_OUTCOME_REMOTE_VERIFIED_MATERIALIZED" => {
+                Some(Self::RemoteVerifiedMaterialized)
+            }
+            "SPACE_CACHE_TRUST_OUTCOME_REMOTE_MISS_UNTRUSTED" => {
+                Some(Self::RemoteMissUntrusted)
+            }
+            _ => None,
+        }
+    }
+}
 /// Generated client implementations.
 pub mod sandbox_service_client {
     #![allow(
@@ -1589,6 +1710,32 @@ pub mod sandbox_service_client {
             req.extensions_mut()
                 .insert(
                     GrpcMethod::new("vz.runtime.v2.SandboxService", "CreateSandbox"),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
+        pub async fn prepare_space_cache(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PrepareSpaceCacheRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::PrepareSpaceCacheEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.runtime.v2.SandboxService/PrepareSpaceCache",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("vz.runtime.v2.SandboxService", "PrepareSpaceCache"),
                 );
             self.inner.server_streaming(req, path, codec).await
         }
@@ -4187,6 +4334,19 @@ pub mod sandbox_service_server {
             tonic::Response<Self::CreateSandboxStream>,
             tonic::Status,
         >;
+        /// Server streaming response type for the PrepareSpaceCache method.
+        type PrepareSpaceCacheStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::PrepareSpaceCacheEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn prepare_space_cache(
+            &self,
+            request: tonic::Request<super::PrepareSpaceCacheRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::PrepareSpaceCacheStream>,
+            tonic::Status,
+        >;
         async fn get_sandbox(
             &self,
             request: tonic::Request<super::GetSandboxRequest>,
@@ -4345,6 +4505,54 @@ pub mod sandbox_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = CreateSandboxSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.runtime.v2.SandboxService/PrepareSpaceCache" => {
+                    #[allow(non_camel_case_types)]
+                    struct PrepareSpaceCacheSvc<T: SandboxService>(pub Arc<T>);
+                    impl<
+                        T: SandboxService,
+                    > tonic::server::ServerStreamingService<
+                        super::PrepareSpaceCacheRequest,
+                    > for PrepareSpaceCacheSvc<T> {
+                        type Response = super::PrepareSpaceCacheEvent;
+                        type ResponseStream = T::PrepareSpaceCacheStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PrepareSpaceCacheRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SandboxService>::prepare_space_cache(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PrepareSpaceCacheSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

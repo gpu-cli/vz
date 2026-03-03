@@ -12,7 +12,7 @@ use tower::service_fn;
 use vz_runtime_contract::{
     PolicyDecision, RequestMetadata, RuntimeOperation, RuntimePolicyHook,
     SANDBOX_LABEL_PROJECT_DIR, SANDBOX_LABEL_SPACE_MODE, SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX,
-    SANDBOX_SPACE_MODE_REQUIRED, SandboxBackend,
+    SANDBOX_SPACE_MODE_REQUIRED, SPACE_CACHE_KEY_SCHEMA_VERSION, SandboxBackend,
 };
 
 use super::*;
@@ -381,6 +381,24 @@ async fn read_create_sandbox_completion_response(
     read_create_sandbox_completion(&mut stream).await
 }
 
+async fn read_prepare_space_cache_completion(
+    stream: &mut tonic::Streaming<runtime_v2::PrepareSpaceCacheEvent>,
+) -> runtime_v2::PrepareSpaceCacheCompletion {
+    let mut completion = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .expect("read prepare space cache stream event")
+    {
+        if let Some(runtime_v2::prepare_space_cache_event::Payload::Completion(done)) =
+            event.payload
+        {
+            completion = Some(done);
+        }
+    }
+    completion.expect("expected terminal prepare space cache completion event")
+}
+
 async fn read_close_sandbox_shell_completion(
     stream: &mut tonic::Streaming<runtime_v2::CloseSandboxShellEvent>,
 ) -> runtime_v2::CloseSandboxShellResponse {
@@ -665,6 +683,65 @@ async fn create_sandbox_rejects_empty_stack_name() {
         .expect("server join timeout")
         .expect("server join should succeed");
     assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn prepare_space_cache_stream_persists_receipt_and_returns_outcomes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+    let shutdown_task = shutdown.clone();
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+    wait_for_socket(&config.socket_path).await;
+
+    let mut client = connect_sandbox_client(&config.socket_path).await;
+    let response = client
+        .prepare_space_cache(Request::new(runtime_v2::PrepareSpaceCacheRequest {
+            metadata: None,
+            keys: vec![runtime_v2::SpaceCacheKeyPayload {
+                schema_version: u32::from(SPACE_CACHE_KEY_SCHEMA_VERSION),
+                cache_name: "deps".to_string(),
+                digest_hex: "abc123".to_string(),
+                canonical_json: "{}".to_string(),
+            }],
+        }))
+        .await
+        .expect("prepare_space_cache call");
+    assert!(response.metadata().get("x-receipt-id").is_some());
+    let mut stream = response.into_inner();
+    let completion = read_prepare_space_cache_completion(&mut stream).await;
+    assert_eq!(completion.outcomes.len(), 1);
+    assert_eq!(completion.outcomes[0].cache_name, "deps");
+    assert_eq!(
+        completion.outcomes[0].outcome,
+        runtime_v2::SpaceCacheTrustOutcome::LocalMissCold as i32
+    );
+    assert!(!completion.receipt_id.is_empty());
+
+    let receipts = daemon
+        .with_state_store(|store| store.list_receipts_for_entity("cache", "space_cache"))
+        .expect("list cache receipts");
+    assert!(
+        receipts
+            .iter()
+            .any(|receipt| receipt.operation == "prepare_space_cache"),
+        "prepare_space_cache receipt should be persisted"
+    );
+
+    shutdown.notify_waiters();
+    server.await.expect("server join").expect("server result");
 }
 
 #[tokio::test]

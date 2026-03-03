@@ -3,6 +3,7 @@ use super::*;
 #[tonic::async_trait]
 impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
     type CreateSandboxStream = CreateSandboxEventStream;
+    type PrepareSpaceCacheStream = PrepareSpaceCacheEventStream;
     type TerminateSandboxStream = TerminateSandboxEventStream;
     type OpenSandboxShellStream = OpenSandboxShellEventStream;
     type CloseSandboxShellStream = CloseSandboxShellEventStream;
@@ -321,6 +322,280 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
                 request_id: request_id.clone(),
                 sandbox: Some(sandbox_to_proto_payload(&sandbox)),
             },
+            receipt_id.as_str(),
+        )));
+        Ok(sandbox_stream_response(events, Some(receipt_id.as_str())))
+    }
+
+    async fn prepare_space_cache(
+        &self,
+        request: Request<runtime_v2::PrepareSpaceCacheRequest>,
+    ) -> Result<Response<Self::PrepareSpaceCacheStream>, Status> {
+        let intercepted_request_id = request_id_from_extensions(&request);
+        let request = request.into_inner();
+        let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
+        let request_id = metadata
+            .request_id
+            .clone()
+            .unwrap_or_else(generate_request_id);
+        enforce_mutation_policy_preflight(
+            self.daemon.as_ref(),
+            RuntimeOperation::CreateSandbox,
+            &metadata,
+            &request_id,
+        )?;
+        let mut sequence = 1u64;
+        let mut events = vec![Ok(prepare_space_cache_progress_event(
+            &request_id,
+            sequence,
+            "validating",
+            "validating cache key payloads",
+        ))];
+
+        if request.keys.is_empty() {
+            sequence += 1;
+            events.push(Ok(prepare_space_cache_completion_event(
+                &request_id,
+                sequence,
+                Vec::new(),
+                "",
+            )));
+            return Ok(sandbox_stream_response(events, None));
+        }
+
+        let mut keys = Vec::with_capacity(request.keys.len());
+        for key in request.keys {
+            if key.cache_name.trim().is_empty() {
+                return Err(status_from_machine_error(MachineError::new(
+                    MachineErrorCode::ValidationError,
+                    "space cache key cache_name cannot be empty".to_string(),
+                    Some(request_id),
+                    BTreeMap::new(),
+                )));
+            }
+            if key.digest_hex.trim().is_empty() {
+                return Err(status_from_machine_error(MachineError::new(
+                    MachineErrorCode::ValidationError,
+                    format!(
+                        "space cache key digest_hex cannot be empty for cache `{}`",
+                        key.cache_name
+                    ),
+                    Some(request_id),
+                    BTreeMap::new(),
+                )));
+            }
+            let schema_version = u16::try_from(key.schema_version).map_err(|_| {
+                status_from_machine_error(MachineError::new(
+                    MachineErrorCode::ValidationError,
+                    format!(
+                        "space cache key schema_version out of range for cache `{}`: {}",
+                        key.cache_name, key.schema_version
+                    ),
+                    Some(request_id.clone()),
+                    BTreeMap::new(),
+                ))
+            })?;
+            keys.push(SpaceCacheKey {
+                schema_version,
+                cache_name: key.cache_name,
+                digest_hex: key.digest_hex,
+                canonical_json: key.canonical_json,
+            });
+        }
+
+        sequence += 1;
+        events.push(Ok(prepare_space_cache_progress_event(
+            &request_id,
+            sequence,
+            "resolving",
+            "resolving cache key hits, misses, and remote materialization",
+        )));
+
+        let index_path = daemon_space_cache_index_path(self.daemon.as_ref());
+        let remote_cache_trust = SpaceRemoteCacheTrustConfig::from_env().map_err(|error| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                format!("invalid daemon remote cache trust env configuration: {error}"),
+                Some(request_id.clone()),
+                BTreeMap::new(),
+            ))
+        })?;
+        let mut index = SpaceCacheIndex::load(&index_path).map_err(|error| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::InternalError,
+                format!(
+                    "failed to load space cache index {}: {error}",
+                    index_path.display()
+                ),
+                Some(request_id.clone()),
+                BTreeMap::new(),
+            ))
+        })?;
+        let invalidated = index.invalidate_for_schema(SPACE_CACHE_KEY_SCHEMA_VERSION);
+        if invalidated > 0 {
+            sequence += 1;
+            events.push(Ok(prepare_space_cache_progress_event(
+                &request_id,
+                sequence,
+                "invalidating",
+                format!(
+                    "invalidated {invalidated} cache entries for schema v{SPACE_CACHE_KEY_SCHEMA_VERSION}"
+                )
+                .as_str(),
+            )));
+        }
+
+        let mut outcomes = Vec::with_capacity(keys.len());
+        let mut remote_verified_materialized = 0usize;
+        let mut remote_miss_untrusted = 0usize;
+        for key in &keys {
+            let lookup = index.lookup(key);
+            let (mut outcome, mut detail) = match lookup {
+                SpaceCacheLookup::Hit => (
+                    runtime_v2::SpaceCacheTrustOutcome::LocalHit,
+                    "local cache hit".to_string(),
+                ),
+                SpaceCacheLookup::MissNotFound => (
+                    runtime_v2::SpaceCacheTrustOutcome::LocalMissCold,
+                    "local cache miss (cold)".to_string(),
+                ),
+                SpaceCacheLookup::MissKeyMismatch => (
+                    runtime_v2::SpaceCacheTrustOutcome::LocalMissDimensionChange,
+                    "local cache miss (dimension change)".to_string(),
+                ),
+                SpaceCacheLookup::MissVersionMismatch { requested, stored } => (
+                    runtime_v2::SpaceCacheTrustOutcome::LocalMissSchemaMismatch,
+                    format!(
+                        "local cache miss (schema mismatch: stored=v{stored}, requested=v{requested})"
+                    ),
+                ),
+            };
+            if !matches!(lookup, SpaceCacheLookup::Hit)
+                && let Some(remote_cache_trust) = remote_cache_trust.as_ref()
+            {
+                match remote_cache_trust.verify_key(key) {
+                    SpaceRemoteCacheVerificationOutcome::Verified { artifact } => {
+                        match daemon_materialize_verified_remote_cache_artifact(
+                            self.daemon.as_ref(),
+                            key,
+                            &artifact,
+                        ) {
+                            Ok(path) => {
+                                outcome =
+                                    runtime_v2::SpaceCacheTrustOutcome::RemoteVerifiedMaterialized;
+                                detail = format!(
+                                    "remote cache verified and materialized at {}",
+                                    path.display()
+                                );
+                                remote_verified_materialized =
+                                    remote_verified_materialized.saturating_add(1);
+                            }
+                            Err(_) => {
+                                outcome = runtime_v2::SpaceCacheTrustOutcome::RemoteMissUntrusted;
+                                detail =
+                                    "remote cache verification passed but materialization failed"
+                                        .to_string();
+                                remote_miss_untrusted = remote_miss_untrusted.saturating_add(1);
+                            }
+                        }
+                    }
+                    SpaceRemoteCacheVerificationOutcome::Miss(reason) => {
+                        outcome = runtime_v2::SpaceCacheTrustOutcome::RemoteMissUntrusted;
+                        detail = format!("remote cache miss ({})", reason.diagnostic());
+                        remote_miss_untrusted = remote_miss_untrusted.saturating_add(1);
+                    }
+                }
+            }
+            outcomes.push(runtime_v2::SpaceCacheOutcomePayload {
+                cache_name: key.cache_name.clone(),
+                digest_hex: key.digest_hex.clone(),
+                outcome: outcome as i32,
+                detail,
+            });
+            index.upsert(key.clone());
+        }
+        index.save(&index_path).map_err(|error| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::InternalError,
+                format!(
+                    "failed to save space cache index {}: {error}",
+                    index_path.display()
+                ),
+                Some(request_id.clone()),
+                BTreeMap::new(),
+            ))
+        })?;
+
+        sequence += 1;
+        events.push(Ok(prepare_space_cache_progress_event(
+            &request_id,
+            sequence,
+            "persisting",
+            "persisting cache preparation receipt and event",
+        )));
+
+        let now = current_unix_secs();
+        let receipt_id = generate_receipt_id();
+        let metadata = serde_json::to_value(PrepareSpaceCacheReceiptMetadata {
+            event_type: "space_cache_prepared",
+            prepared: outcomes.len(),
+            remote_verified_materialized,
+            remote_miss_untrusted,
+        })
+        .map_err(|error| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::InternalError,
+                format!("failed to serialize prepare_space_cache receipt metadata: {error}"),
+                Some(request_id.clone()),
+                BTreeMap::new(),
+            ))
+        })?;
+        let status = if remote_miss_untrusted > 0 {
+            "warning"
+        } else {
+            "success"
+        };
+        self.daemon
+            .with_state_store(|store| {
+                store.with_immediate_transaction(|tx| {
+                    tx.emit_event(
+                        "daemon",
+                        &StackEvent::DriftDetected {
+                            stack_name: "daemon".to_string(),
+                            category: "space_cache_prepare".to_string(),
+                            description: format!(
+                                "space cache prepare completed: prepared={} remote_verified={} remote_untrusted={}",
+                                outcomes.len(),
+                                remote_verified_materialized,
+                                remote_miss_untrusted
+                            ),
+                            severity: if remote_miss_untrusted > 0 {
+                                "warning".to_string()
+                            } else {
+                                "info".to_string()
+                            },
+                        },
+                    )?;
+                    tx.save_receipt(&Receipt {
+                        receipt_id: receipt_id.clone(),
+                        operation: "prepare_space_cache".to_string(),
+                        entity_id: "space_cache".to_string(),
+                        entity_type: "cache".to_string(),
+                        request_id: request_id.clone(),
+                        status: status.to_string(),
+                        created_at: now,
+                        metadata,
+                    })?;
+                    Ok(())
+                })
+            })
+            .map_err(|error| status_from_stack_error(error, &request_id))?;
+
+        sequence += 1;
+        events.push(Ok(prepare_space_cache_completion_event(
+            &request_id,
+            sequence,
+            outcomes,
             receipt_id.as_str(),
         )));
         Ok(sandbox_stream_response(events, Some(receipt_id.as_str())))

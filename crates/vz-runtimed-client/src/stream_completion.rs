@@ -48,6 +48,27 @@ pub(crate) async fn read_terminate_sandbox_completion(
     ))
 }
 
+pub(crate) async fn read_prepare_space_cache_completion(
+    socket_path: &Path,
+    stream: &mut tonic::Streaming<runtime_v2::PrepareSpaceCacheEvent>,
+) -> Result<runtime_v2::PrepareSpaceCacheCompletion> {
+    while let Some(event) = stream
+        .message()
+        .await
+        .map_err(|status| status_to_client_error(socket_path, status))?
+    {
+        if let Some(runtime_v2::prepare_space_cache_event::Payload::Completion(completion)) =
+            event.payload
+        {
+            return Ok(completion);
+        }
+    }
+    Err(status_to_client_error(
+        socket_path,
+        Status::internal("prepare_space_cache stream ended without terminal completion event"),
+    ))
+}
+
 pub(crate) async fn read_apply_stack_completion(
     socket_path: &Path,
     stream: &mut tonic::Streaming<runtime_v2::ApplyStackEvent>,

@@ -5,7 +5,11 @@
 
 use super::super::*;
 use std::path::{Path, PathBuf};
-use vz_runtime_contract::{RuntimeBackend, StackResourceHint, StackVolumeMount};
+use vz_runtime_contract::{
+    RuntimeBackend, SPACE_CACHE_KEY_SCHEMA_VERSION, SpaceCacheIndex, SpaceCacheKey,
+    SpaceCacheLookup, SpaceRemoteCacheTrustConfig, SpaceRemoteCacheVerificationOutcome,
+    SpaceRemoteCacheVerifiedArtifact, StackResourceHint, StackVolumeMount,
+};
 use vz_runtime_proto::runtime_v2::container_service_server::ContainerService as _;
 use vz_runtime_proto::runtime_v2::execution_service_server::ExecutionService as _;
 
@@ -26,8 +30,21 @@ type CloseSandboxShellEventStream =
     tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::CloseSandboxShellEvent, Status>>;
 type CreateSandboxEventStream =
     tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::CreateSandboxEvent, Status>>;
+type PrepareSpaceCacheEventStream =
+    tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::PrepareSpaceCacheEvent, Status>>;
 type TerminateSandboxEventStream =
     tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::TerminateSandboxEvent, Status>>;
+
+const SPACE_CACHE_INDEX_FILE: &str = "space-cache-index.json";
+const SPACE_CACHE_ARTIFACTS_DIR: &str = "space-cache-artifacts";
+
+#[derive(Debug, serde::Serialize)]
+struct PrepareSpaceCacheReceiptMetadata {
+    event_type: &'static str,
+    prepared: usize,
+    remote_verified_materialized: usize,
+    remote_miss_untrusted: usize,
+}
 
 fn sandbox_exec_control_debug_enabled() -> bool {
     std::env::var("VZ_RUNTIMED_EXEC_CONTROL_DEBUG")
@@ -103,6 +120,43 @@ fn create_sandbox_completion_event(
         payload: Some(runtime_v2::create_sandbox_event::Payload::Completion(
             runtime_v2::CreateSandboxCompletion {
                 response: Some(response),
+                receipt_id: receipt_id.to_string(),
+            },
+        )),
+    }
+}
+
+fn prepare_space_cache_progress_event(
+    request_id: &str,
+    sequence: u64,
+    phase: &str,
+    detail: &str,
+) -> runtime_v2::PrepareSpaceCacheEvent {
+    runtime_v2::PrepareSpaceCacheEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::prepare_space_cache_event::Payload::Progress(
+            runtime_v2::PrepareSpaceCacheProgress {
+                phase: phase.to_string(),
+                detail: detail.to_string(),
+            },
+        )),
+    }
+}
+
+fn prepare_space_cache_completion_event(
+    request_id: &str,
+    sequence: u64,
+    outcomes: Vec<runtime_v2::SpaceCacheOutcomePayload>,
+    receipt_id: &str,
+) -> runtime_v2::PrepareSpaceCacheEvent {
+    runtime_v2::PrepareSpaceCacheEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::prepare_space_cache_event::Payload::Completion(
+            runtime_v2::PrepareSpaceCacheCompletion {
+                request_id: request_id.to_string(),
+                outcomes,
                 receipt_id: receipt_id.to_string(),
             },
         )),
@@ -207,6 +261,90 @@ fn close_sandbox_shell_completion_event(
             response,
         )),
     }
+}
+
+fn daemon_space_cache_index_path(daemon: &RuntimeDaemon) -> PathBuf {
+    daemon
+        .state_store_path()
+        .parent()
+        .map(|parent| parent.join(SPACE_CACHE_INDEX_FILE))
+        .unwrap_or_else(|| PathBuf::from(SPACE_CACHE_INDEX_FILE))
+}
+
+fn daemon_space_cache_artifact_dir(daemon: &RuntimeDaemon, key: &SpaceCacheKey) -> PathBuf {
+    daemon
+        .state_store_path()
+        .parent()
+        .map(|parent| {
+            parent
+                .join(SPACE_CACHE_ARTIFACTS_DIR)
+                .join(&key.cache_name)
+                .join(&key.digest_hex)
+        })
+        .unwrap_or_else(|| {
+            PathBuf::from(SPACE_CACHE_ARTIFACTS_DIR)
+                .join(&key.cache_name)
+                .join(&key.digest_hex)
+        })
+}
+
+fn daemon_materialize_verified_remote_cache_artifact(
+    daemon: &RuntimeDaemon,
+    key: &SpaceCacheKey,
+    artifact: &SpaceRemoteCacheVerifiedArtifact,
+) -> Result<PathBuf, Status> {
+    let target_dir = daemon_space_cache_artifact_dir(daemon, key);
+    std::fs::create_dir_all(&target_dir).map_err(|error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::InternalError,
+            format!(
+                "failed to create daemon spaces cache artifact directory {}: {error}",
+                target_dir.display()
+            ),
+            None,
+            BTreeMap::new(),
+        ))
+    })?;
+    let target_manifest = target_dir.join("manifest.json");
+    let target_signature = target_dir.join("signature.sig");
+    let target_blob = target_dir.join("payload.tar.zst");
+    std::fs::copy(&artifact.manifest_path, &target_manifest).map_err(|error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::InternalError,
+            format!(
+                "failed to materialize manifest {} -> {}: {error}",
+                artifact.manifest_path.display(),
+                target_manifest.display()
+            ),
+            None,
+            BTreeMap::new(),
+        ))
+    })?;
+    std::fs::copy(&artifact.signature_path, &target_signature).map_err(|error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::InternalError,
+            format!(
+                "failed to materialize signature {} -> {}: {error}",
+                artifact.signature_path.display(),
+                target_signature.display()
+            ),
+            None,
+            BTreeMap::new(),
+        ))
+    })?;
+    std::fs::copy(&artifact.blob_path, &target_blob).map_err(|error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::InternalError,
+            format!(
+                "failed to materialize payload {} -> {}: {error}",
+                artifact.blob_path.display(),
+                target_blob.display()
+            ),
+            None,
+            BTreeMap::new(),
+        ))
+    })?;
+    Ok(target_blob)
 }
 
 async fn terminate_runtime_sandbox_resources(
