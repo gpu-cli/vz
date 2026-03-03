@@ -439,6 +439,58 @@ async fn read_teardown_stack_completion_response(
     read_teardown_stack_completion(&mut stream).await
 }
 
+#[cfg(target_os = "linux")]
+async fn read_export_checkpoint_completion(
+    stream: &mut tonic::Streaming<runtime_v2::ExportCheckpointEvent>,
+) -> runtime_v2::ExportCheckpointCompletion {
+    let mut completion = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .expect("read export checkpoint stream event")
+    {
+        if let Some(runtime_v2::export_checkpoint_event::Payload::Completion(done)) = event.payload
+        {
+            completion = Some(done);
+        }
+    }
+    completion.expect("expected terminal export checkpoint completion event")
+}
+
+#[cfg(target_os = "linux")]
+async fn read_export_checkpoint_completion_response(
+    response: tonic::Response<tonic::Streaming<runtime_v2::ExportCheckpointEvent>>,
+) -> runtime_v2::ExportCheckpointCompletion {
+    let mut stream = response.into_inner();
+    read_export_checkpoint_completion(&mut stream).await
+}
+
+#[cfg(target_os = "linux")]
+async fn read_import_checkpoint_completion(
+    stream: &mut tonic::Streaming<runtime_v2::ImportCheckpointEvent>,
+) -> runtime_v2::ImportCheckpointCompletion {
+    let mut completion = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .expect("read import checkpoint stream event")
+    {
+        if let Some(runtime_v2::import_checkpoint_event::Payload::Completion(done)) = event.payload
+        {
+            completion = Some(done);
+        }
+    }
+    completion.expect("expected terminal import checkpoint completion event")
+}
+
+#[cfg(target_os = "linux")]
+async fn read_import_checkpoint_completion_response(
+    response: tonic::Response<tonic::Streaming<runtime_v2::ImportCheckpointEvent>>,
+) -> runtime_v2::ImportCheckpointCompletion {
+    let mut stream = response.into_inner();
+    read_import_checkpoint_completion(&mut stream).await
+}
+
 struct DenyCreateSandboxPolicyHook;
 
 impl RuntimePolicyHook for DenyCreateSandboxPolicyHook {
@@ -5400,6 +5452,187 @@ async fn checkpoint_export_import_missing_entities_return_not_found() {
         .expect("server join timeout")
         .expect("server join should succeed");
     assert!(result.is_ok());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires VZ_TEST_BTRFS_WORKSPACE on a host btrfs filesystem"]
+async fn checkpoint_export_import_round_trip_preserves_workspace_snapshot() {
+    fn run_btrfs(args: &[&str]) {
+        let output = Command::new("btrfs")
+            .args(args)
+            .output()
+            .expect("run btrfs");
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("btrfs command failed ({args:?}): {stderr}");
+        }
+    }
+
+    let workspace_root_base = std::env::var("VZ_TEST_BTRFS_WORKSPACE")
+        .expect("VZ_TEST_BTRFS_WORKSPACE must point at a btrfs path");
+    let workspace_root = PathBuf::from(workspace_root_base)
+        .join(format!("vz-portability-{}", current_unix_secs()))
+        .join("workspace");
+    let parent = workspace_root
+        .parent()
+        .expect("workspace root parent should exist");
+    std::fs::create_dir_all(parent).expect("create test workspace parent");
+    run_btrfs(&[
+        "subvolume",
+        "create",
+        workspace_root.to_string_lossy().as_ref(),
+    ]);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+    wait_for_socket(&config.socket_path).await;
+
+    let now = current_unix_secs();
+    daemon
+        .with_state_store(|store| {
+            store.with_immediate_transaction(|tx| {
+                tx.save_sandbox(&Sandbox {
+                    sandbox_id: "sbx-portability".to_string(),
+                    backend: SandboxBackend::LinuxFirecracker,
+                    spec: SandboxSpec::default(),
+                    state: SandboxState::Ready,
+                    created_at: now,
+                    updated_at: now,
+                    labels: BTreeMap::from([
+                        (
+                            SANDBOX_LABEL_SPACE_MODE.to_string(),
+                            SANDBOX_SPACE_MODE_REQUIRED.to_string(),
+                        ),
+                        (
+                            SANDBOX_LABEL_PROJECT_DIR.to_string(),
+                            workspace_root.to_string_lossy().to_string(),
+                        ),
+                    ]),
+                })?;
+                Ok(())
+            })
+        })
+        .expect("seed spaces-mode sandbox");
+
+    std::fs::write(workspace_root.join("marker.txt"), b"portable").expect("seed workspace marker");
+
+    let mut checkpoint_client = connect_checkpoint_client(&config.socket_path).await;
+    let source_checkpoint = checkpoint_client
+        .create_checkpoint(Request::new(runtime_v2::CreateCheckpointRequest {
+            metadata: None,
+            sandbox_id: "sbx-portability".to_string(),
+            checkpoint_class: "fs_quick".to_string(),
+            compatibility_fingerprint: String::new(),
+            retention_tag: String::new(),
+        }))
+        .await
+        .expect("create checkpoint")
+        .into_inner()
+        .checkpoint
+        .expect("checkpoint payload");
+
+    let stream_path = tmp.path().join("portable").join("checkpoint.send");
+    let export_completion = read_export_checkpoint_completion_response(
+        checkpoint_client
+            .export_checkpoint(Request::new(runtime_v2::ExportCheckpointRequest {
+                checkpoint_id: source_checkpoint.checkpoint_id.clone(),
+                stream_path: stream_path.to_string_lossy().to_string(),
+                metadata: None,
+            }))
+            .await
+            .expect("export checkpoint"),
+    )
+    .await;
+    assert_eq!(
+        export_completion.checkpoint_id,
+        source_checkpoint.checkpoint_id
+    );
+    assert_eq!(
+        export_completion.stream_path,
+        stream_path.to_string_lossy().to_string()
+    );
+    assert!(stream_path.exists(), "exported send stream should exist");
+
+    let import_completion = read_import_checkpoint_completion_response(
+        checkpoint_client
+            .import_checkpoint(Request::new(runtime_v2::ImportCheckpointRequest {
+                sandbox_id: "sbx-portability".to_string(),
+                stream_path: stream_path.to_string_lossy().to_string(),
+                checkpoint_class: "fs_quick".to_string(),
+                compatibility_fingerprint: "fp-portability".to_string(),
+                retention_tag: String::new(),
+                metadata: None,
+            }))
+            .await
+            .expect("import checkpoint"),
+    )
+    .await;
+    let imported = import_completion
+        .response
+        .expect("import completion response")
+        .checkpoint
+        .expect("imported checkpoint payload");
+    assert_ne!(
+        imported.checkpoint_id, source_checkpoint.checkpoint_id,
+        "import should create a distinct checkpoint id"
+    );
+    let imported_snapshot = config
+        .runtime_data_dir
+        .join("checkpoints")
+        .join("workspace-subvolumes")
+        .join(imported.checkpoint_id.as_str());
+    assert!(
+        imported_snapshot.exists(),
+        "imported workspace snapshot should exist at {}",
+        imported_snapshot.display()
+    );
+
+    let diff = checkpoint_client
+        .diff_checkpoints(Request::new(runtime_v2::DiffCheckpointsRequest {
+            from_checkpoint_id: source_checkpoint.checkpoint_id.clone(),
+            to_checkpoint_id: imported.checkpoint_id.clone(),
+            metadata: None,
+        }))
+        .await
+        .expect("diff checkpoints")
+        .into_inner();
+    assert!(
+        diff.files.is_empty(),
+        "portable round-trip should preserve checkpoint file entries"
+    );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+
+    if workspace_root.exists() {
+        let _ = Command::new("btrfs")
+            .args([
+                "subvolume",
+                "delete",
+                workspace_root.to_string_lossy().as_ref(),
+            ])
+            .output();
+    }
 }
 
 #[tokio::test]
