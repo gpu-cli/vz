@@ -43,6 +43,12 @@ pub enum CheckpointCommand {
 
     /// Fork a checkpoint into a new sandbox snapshot lineage.
     Fork(CheckpointForkArgs),
+
+    /// Export a checkpoint to a btrfs send stream file.
+    Export(CheckpointExportArgs),
+
+    /// Import a checkpoint from a btrfs send stream file.
+    Import(CheckpointImportArgs),
 }
 
 /// Arguments for `vz checkpoint list`.
@@ -121,6 +127,48 @@ pub struct CheckpointForkArgs {
     state_db: PathBuf,
 }
 
+/// Arguments for `vz checkpoint export`.
+#[derive(Args, Debug)]
+pub struct CheckpointExportArgs {
+    /// Checkpoint identifier.
+    pub checkpoint_id: String,
+
+    /// Absolute destination path for the exported stream file.
+    #[arg(long)]
+    pub stream_path: PathBuf,
+
+    /// Path to the state database.
+    #[arg(long, default_value = "stack-state.db")]
+    state_db: PathBuf,
+}
+
+/// Arguments for `vz checkpoint import`.
+#[derive(Args, Debug)]
+pub struct CheckpointImportArgs {
+    /// Owning sandbox identifier.
+    pub sandbox_id: String,
+
+    /// Absolute source path for the import stream file.
+    #[arg(long)]
+    pub stream_path: PathBuf,
+
+    /// Checkpoint class: fs_quick or vm_full.
+    #[arg(long, default_value = "fs_quick")]
+    class: String,
+
+    /// Compatibility fingerprint string.
+    #[arg(long, default_value = "unset")]
+    fingerprint: String,
+
+    /// Optional retention tag. Tagged checkpoints are protected from policy GC.
+    #[arg(long)]
+    tag: Option<String>,
+
+    /// Path to the state database.
+    #[arg(long, default_value = "stack-state.db")]
+    state_db: PathBuf,
+}
+
 /// Run the checkpoint subcommand.
 pub async fn run(args: CheckpointArgs) -> anyhow::Result<()> {
     match args.action {
@@ -129,6 +177,8 @@ pub async fn run(args: CheckpointArgs) -> anyhow::Result<()> {
         CheckpointCommand::Create(create_args) => cmd_create(create_args).await,
         CheckpointCommand::Restore(restore_args) => cmd_restore(restore_args).await,
         CheckpointCommand::Fork(fork_args) => cmd_fork(fork_args).await,
+        CheckpointCommand::Export(export_args) => cmd_export(export_args).await,
+        CheckpointCommand::Import(import_args) => cmd_import(import_args).await,
     }
 }
 
@@ -184,6 +234,29 @@ struct ApiCreateCheckpointRequest {
 struct ApiForkCheckpointRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     new_sandbox_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiExportCheckpointRequest {
+    stream_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiExportCheckpointResponse {
+    checkpoint_id: String,
+    stream_path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiImportCheckpointRequest {
+    sandbox_id: String,
+    stream_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compatibility_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retention_tag: Option<String>,
 }
 
 fn checkpoint_payload_from_api(payload: ApiCheckpointPayload) -> runtime_v2::CheckpointPayload {
@@ -337,6 +410,64 @@ async fn api_fork_checkpoint(
         .json()
         .await
         .context("failed to decode api fork checkpoint response")?;
+    Ok(checkpoint_payload_from_api(payload.checkpoint))
+}
+
+async fn api_export_checkpoint(
+    checkpoint_id: &str,
+    stream_path: &std::path::Path,
+) -> anyhow::Result<runtime_v2::ExportCheckpointCompletion> {
+    let url = runtime_api_url(&format!("/v1/checkpoints/{checkpoint_id}/export"))?;
+    let body = ApiExportCheckpointRequest {
+        stream_path: stream_path.display().to_string(),
+    };
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .context("failed to call api export checkpoint")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to export checkpoint via api").await);
+    }
+    let payload: ApiExportCheckpointResponse = response
+        .json()
+        .await
+        .context("failed to decode api export checkpoint response")?;
+    Ok(runtime_v2::ExportCheckpointCompletion {
+        checkpoint_id: payload.checkpoint_id,
+        stream_path: payload.stream_path,
+    })
+}
+
+async fn api_import_checkpoint(
+    sandbox_id: String,
+    stream_path: &std::path::Path,
+    checkpoint_class: String,
+    fingerprint: String,
+    retention_tag: Option<String>,
+) -> anyhow::Result<runtime_v2::CheckpointPayload> {
+    let url = runtime_api_url("/v1/checkpoints/import")?;
+    let body = ApiImportCheckpointRequest {
+        sandbox_id,
+        stream_path: stream_path.display().to_string(),
+        class: Some(checkpoint_class),
+        compatibility_fingerprint: Some(fingerprint),
+        retention_tag,
+    };
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .context("failed to call api import checkpoint")?;
+    if !response.status().is_success() {
+        return Err(api_error_response(response, "failed to import checkpoint via api").await);
+    }
+    let payload: ApiCheckpointResponse = response
+        .json()
+        .await
+        .context("failed to decode api import checkpoint response")?;
     Ok(checkpoint_payload_from_api(payload.checkpoint))
 }
 
@@ -572,6 +703,69 @@ async fn cmd_fork(args: CheckpointForkArgs) -> anyhow::Result<()> {
     println!(
         "Checkpoint {} forked to sandbox {} as checkpoint {}.",
         args.checkpoint_id, payload.sandbox_id, payload.checkpoint_id
+    );
+    Ok(())
+}
+
+async fn cmd_export(args: CheckpointExportArgs) -> anyhow::Result<()> {
+    let stream_path = args.stream_path.display().to_string();
+    let exported = match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+            client
+                .export_checkpoint(runtime_v2::ExportCheckpointRequest {
+                    checkpoint_id: args.checkpoint_id.clone(),
+                    stream_path: stream_path.clone(),
+                    metadata: None,
+                })
+                .await
+                .context("failed to export checkpoint via daemon")?
+        }
+        ControlPlaneTransport::ApiHttp => {
+            api_export_checkpoint(&args.checkpoint_id, &args.stream_path).await?
+        }
+    };
+    println!(
+        "Checkpoint {} exported to {}.",
+        exported.checkpoint_id, exported.stream_path
+    );
+    Ok(())
+}
+
+async fn cmd_import(args: CheckpointImportArgs) -> anyhow::Result<()> {
+    let checkpoint_class = normalize_checkpoint_class(&args.class)?;
+    let payload = match control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let mut client = connect_control_plane_for_state_db(&args.state_db).await?;
+            let response = client
+                .import_checkpoint(runtime_v2::ImportCheckpointRequest {
+                    sandbox_id: args.sandbox_id,
+                    stream_path: args.stream_path.display().to_string(),
+                    checkpoint_class,
+                    compatibility_fingerprint: args.fingerprint,
+                    retention_tag: args.tag.unwrap_or_default(),
+                    metadata: None,
+                })
+                .await
+                .context("failed to import checkpoint via daemon")?;
+            response
+                .checkpoint
+                .ok_or_else(|| anyhow!("daemon returned missing checkpoint payload"))?
+        }
+        ControlPlaneTransport::ApiHttp => {
+            api_import_checkpoint(
+                args.sandbox_id,
+                &args.stream_path,
+                checkpoint_class,
+                args.fingerprint,
+                args.tag,
+            )
+            .await?
+        }
+    };
+    println!(
+        "Checkpoint imported for sandbox {} as checkpoint {}.",
+        payload.sandbox_id, payload.checkpoint_id
     );
     Ok(())
 }
