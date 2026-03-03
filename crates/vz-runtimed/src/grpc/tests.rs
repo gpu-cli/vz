@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -5021,6 +5023,158 @@ async fn checkpoint_state_survives_daemon_restart() {
         .expect("server join timeout")
         .expect("server join should succeed");
     assert!(second_result.is_ok());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires VZ_TEST_BTRFS_WORKSPACE on a host btrfs filesystem"]
+async fn spaces_btrfs_checkpoint_restore_and_fork_use_real_subvolumes() {
+    use std::process::Command;
+
+    fn run_btrfs(args: &[&str]) {
+        let output = Command::new("btrfs")
+            .args(args)
+            .output()
+            .expect("run btrfs");
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("btrfs command failed ({args:?}): {stderr}");
+        }
+    }
+
+    let workspace_root_base = std::env::var("VZ_TEST_BTRFS_WORKSPACE")
+        .expect("VZ_TEST_BTRFS_WORKSPACE must point at a btrfs path");
+    let workspace_root = PathBuf::from(workspace_root_base)
+        .join(format!("vz-space-{}", current_unix_secs()))
+        .join("workspace");
+    let parent = workspace_root
+        .parent()
+        .expect("workspace root parent should exist");
+    std::fs::create_dir_all(parent).expect("create test workspace parent");
+    run_btrfs(&[
+        "subvolume",
+        "create",
+        workspace_root.to_string_lossy().as_ref(),
+    ]);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+    wait_for_socket(&config.socket_path).await;
+
+    let now = current_unix_secs();
+    daemon
+        .with_state_store(|store| {
+            store.with_immediate_transaction(|tx| {
+                tx.save_sandbox(&Sandbox {
+                    sandbox_id: "sbx-space-btrfs-real".to_string(),
+                    backend: SandboxBackend::LinuxFirecracker,
+                    spec: SandboxSpec::default(),
+                    state: SandboxState::Ready,
+                    created_at: now,
+                    updated_at: now,
+                    labels: BTreeMap::from([
+                        (
+                            SANDBOX_LABEL_SPACE_MODE.to_string(),
+                            SANDBOX_SPACE_MODE_REQUIRED.to_string(),
+                        ),
+                        (
+                            SANDBOX_LABEL_PROJECT_DIR.to_string(),
+                            workspace_root.to_string_lossy().to_string(),
+                        ),
+                    ]),
+                })?;
+                Ok(())
+            })
+        })
+        .expect("seed spaces-mode sandbox");
+
+    std::fs::write(workspace_root.join("marker.txt"), b"before").expect("seed workspace marker");
+
+    let mut checkpoint_client = connect_checkpoint_client(&config.socket_path).await;
+    let parent_checkpoint_id = checkpoint_client
+        .create_checkpoint(Request::new(runtime_v2::CreateCheckpointRequest {
+            metadata: None,
+            sandbox_id: "sbx-space-btrfs-real".to_string(),
+            checkpoint_class: "fs_quick".to_string(),
+            compatibility_fingerprint: String::new(),
+            retention_tag: String::new(),
+        }))
+        .await
+        .expect("create checkpoint")
+        .into_inner()
+        .checkpoint
+        .expect("checkpoint payload")
+        .checkpoint_id;
+
+    std::fs::write(workspace_root.join("marker.txt"), b"after").expect("mutate workspace marker");
+
+    checkpoint_client
+        .restore_checkpoint(Request::new(runtime_v2::RestoreCheckpointRequest {
+            checkpoint_id: parent_checkpoint_id.clone(),
+            metadata: None,
+        }))
+        .await
+        .expect("restore checkpoint");
+    let restored_marker =
+        std::fs::read_to_string(workspace_root.join("marker.txt")).expect("read restored marker");
+    assert_eq!(restored_marker, "before");
+
+    let fork_checkpoint_id = checkpoint_client
+        .fork_checkpoint(Request::new(runtime_v2::ForkCheckpointRequest {
+            checkpoint_id: parent_checkpoint_id,
+            new_sandbox_id: "sbx-space-btrfs-fork".to_string(),
+            metadata: None,
+        }))
+        .await
+        .expect("fork checkpoint")
+        .into_inner()
+        .checkpoint
+        .expect("fork payload")
+        .checkpoint_id;
+
+    let fork_snapshot_path = config
+        .runtime_data_dir
+        .join("checkpoints")
+        .join("workspace-subvolumes")
+        .join(&fork_checkpoint_id);
+    assert!(
+        fork_snapshot_path.exists(),
+        "fork snapshot should exist at {}",
+        fork_snapshot_path.display()
+    );
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+
+    if workspace_root.exists() {
+        let _ = Command::new("btrfs")
+            .args([
+                "subvolume",
+                "delete",
+                workspace_root.to_string_lossy().as_ref(),
+            ])
+            .output();
+    }
 }
 
 #[tokio::test]
