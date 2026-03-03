@@ -109,3 +109,45 @@ pub(crate) async fn read_stack_service_action_completion(
         Status::internal("stack_service_action stream ended without terminal completion event"),
     ))
 }
+
+pub(crate) async fn read_export_checkpoint_completion(
+    socket_path: &Path,
+    stream: &mut tonic::Streaming<runtime_v2::ExportCheckpointEvent>,
+) -> Result<runtime_v2::ExportCheckpointCompletion> {
+    while let Some(event) = stream
+        .message()
+        .await
+        .map_err(|status| status_to_client_error(socket_path, status))?
+    {
+        if let Some(runtime_v2::export_checkpoint_event::Payload::Completion(completion)) =
+            event.payload
+        {
+            return Ok(completion);
+        }
+    }
+    Err(status_to_client_error(
+        socket_path,
+        Status::internal("export_checkpoint stream ended without terminal completion event"),
+    ))
+}
+
+pub(crate) async fn read_import_checkpoint_completion(
+    socket_path: &Path,
+    stream: &mut tonic::Streaming<runtime_v2::ImportCheckpointEvent>,
+) -> Result<runtime_v2::ImportCheckpointCompletion> {
+    while let Some(event) = stream
+        .message()
+        .await
+        .map_err(|status| status_to_client_error(socket_path, status))?
+    {
+        if let Some(runtime_v2::import_checkpoint_event::Payload::Completion(completion)) =
+            event.payload
+        {
+            return Ok(completion);
+        }
+    }
+    Err(status_to_client_error(
+        socket_path,
+        Status::internal("import_checkpoint stream ended without terminal completion event"),
+    ))
+}

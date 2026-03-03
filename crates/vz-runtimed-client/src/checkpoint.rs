@@ -1,6 +1,11 @@
 use tonic::Request;
+use tonic::metadata::MetadataValue;
+use tonic::Status;
 use vz_runtime_proto::runtime_v2;
 
+use crate::stream_completion::{
+    read_export_checkpoint_completion, read_import_checkpoint_completion,
+};
 use crate::transport::status_to_client_error;
 use crate::{DaemonClient, Result};
 
@@ -127,6 +132,102 @@ impl DaemonClient {
         Self::ensure_metadata(&mut request.metadata);
         self.checkpoint_client
             .diff_checkpoints(Request::new(request))
+            .await
+            .map_err(|status| status_to_client_error(&self.config.socket_path, status))
+    }
+
+    /// Call Runtime V2 `ExportCheckpoint`.
+    pub async fn export_checkpoint(
+        &mut self,
+        request: runtime_v2::ExportCheckpointRequest,
+    ) -> Result<runtime_v2::ExportCheckpointCompletion> {
+        let response = self.export_checkpoint_with_metadata(request).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Call Runtime V2 `ExportCheckpoint` and preserve gRPC response metadata.
+    pub async fn export_checkpoint_with_metadata(
+        &mut self,
+        request: runtime_v2::ExportCheckpointRequest,
+    ) -> Result<tonic::Response<runtime_v2::ExportCheckpointCompletion>> {
+        let response = self.export_checkpoint_stream_with_metadata(request).await?;
+        let mut stream = response.into_inner();
+        let completion =
+            read_export_checkpoint_completion(&self.config.socket_path, &mut stream).await?;
+        Ok(tonic::Response::new(completion))
+    }
+
+    /// Call Runtime V2 `ExportCheckpoint` as a server stream.
+    pub async fn export_checkpoint_stream(
+        &mut self,
+        request: runtime_v2::ExportCheckpointRequest,
+    ) -> Result<tonic::Streaming<runtime_v2::ExportCheckpointEvent>> {
+        let response = self.export_checkpoint_stream_with_metadata(request).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Call Runtime V2 `ExportCheckpoint` as a server stream and preserve gRPC response metadata.
+    pub async fn export_checkpoint_stream_with_metadata(
+        &mut self,
+        mut request: runtime_v2::ExportCheckpointRequest,
+    ) -> Result<tonic::Response<tonic::Streaming<runtime_v2::ExportCheckpointEvent>>> {
+        Self::ensure_metadata(&mut request.metadata);
+        self.checkpoint_client
+            .export_checkpoint(Request::new(request))
+            .await
+            .map_err(|status| status_to_client_error(&self.config.socket_path, status))
+    }
+
+    /// Call Runtime V2 `ImportCheckpoint`.
+    pub async fn import_checkpoint(
+        &mut self,
+        request: runtime_v2::ImportCheckpointRequest,
+    ) -> Result<runtime_v2::CheckpointResponse> {
+        let response = self.import_checkpoint_with_metadata(request).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Call Runtime V2 `ImportCheckpoint` and preserve gRPC response metadata.
+    pub async fn import_checkpoint_with_metadata(
+        &mut self,
+        request: runtime_v2::ImportCheckpointRequest,
+    ) -> Result<tonic::Response<runtime_v2::CheckpointResponse>> {
+        let response = self.import_checkpoint_stream_with_metadata(request).await?;
+        let mut stream = response.into_inner();
+        let completion =
+            read_import_checkpoint_completion(&self.config.socket_path, &mut stream).await?;
+        let checkpoint_response = completion.response.ok_or_else(|| {
+            status_to_client_error(
+                &self.config.socket_path,
+                Status::internal("import_checkpoint completion missing response payload"),
+            )
+        })?;
+        let mut grpc_response = tonic::Response::new(checkpoint_response);
+        if !completion.receipt_id.trim().is_empty()
+            && let Ok(value) = MetadataValue::try_from(completion.receipt_id.as_str())
+        {
+            grpc_response.metadata_mut().insert("x-receipt-id", value);
+        }
+        Ok(grpc_response)
+    }
+
+    /// Call Runtime V2 `ImportCheckpoint` as a server stream.
+    pub async fn import_checkpoint_stream(
+        &mut self,
+        request: runtime_v2::ImportCheckpointRequest,
+    ) -> Result<tonic::Streaming<runtime_v2::ImportCheckpointEvent>> {
+        let response = self.import_checkpoint_stream_with_metadata(request).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Call Runtime V2 `ImportCheckpoint` as a server stream and preserve gRPC response metadata.
+    pub async fn import_checkpoint_stream_with_metadata(
+        &mut self,
+        mut request: runtime_v2::ImportCheckpointRequest,
+    ) -> Result<tonic::Response<tonic::Streaming<runtime_v2::ImportCheckpointEvent>>> {
+        Self::ensure_metadata(&mut request.metadata);
+        self.checkpoint_client
+            .import_checkpoint(Request::new(request))
             .await
             .map_err(|status| status_to_client_error(&self.config.socket_path, status))
     }

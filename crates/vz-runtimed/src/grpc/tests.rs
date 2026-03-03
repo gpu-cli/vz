@@ -5289,6 +5289,60 @@ async fn diff_checkpoints_returns_real_file_level_deltas() {
 }
 
 #[tokio::test]
+async fn checkpoint_export_import_missing_entities_return_not_found() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+    wait_for_socket(&config.socket_path).await;
+
+    let mut checkpoint_client = connect_checkpoint_client(&config.socket_path).await;
+    let export_error = checkpoint_client
+        .export_checkpoint(Request::new(runtime_v2::ExportCheckpointRequest {
+            checkpoint_id: "ckpt-missing-export".to_string(),
+            stream_path: "/tmp/vz-missing-export.stream".to_string(),
+            metadata: None,
+        }))
+        .await
+        .expect_err("missing checkpoint export should fail");
+    assert_eq!(export_error.code(), tonic::Code::NotFound);
+
+    let import_error = checkpoint_client
+        .import_checkpoint(Request::new(runtime_v2::ImportCheckpointRequest {
+            sandbox_id: "sbx-missing-import".to_string(),
+            stream_path: "/tmp/vz-missing-import.stream".to_string(),
+            checkpoint_class: "fs_quick".to_string(),
+            compatibility_fingerprint: String::new(),
+            retention_tag: String::new(),
+            metadata: None,
+        }))
+        .await
+        .expect_err("missing sandbox import should fail");
+    assert_eq!(import_error.code(), tonic::Code::NotFound);
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
 async fn file_service_write_read_list_round_trip_with_receipts() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = RuntimedConfig {

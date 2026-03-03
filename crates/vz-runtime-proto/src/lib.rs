@@ -88,6 +88,9 @@ mod tests {
             ("ListCheckpoints", RpcMode::Unary),
             ("RestoreCheckpoint", RpcMode::Unary),
             ("ForkCheckpoint", RpcMode::Unary),
+            ("DiffCheckpoints", RpcMode::Unary),
+            ("ExportCheckpoint", RpcMode::ServerStreaming),
+            ("ImportCheckpoint", RpcMode::ServerStreaming),
             ("StartBuild", RpcMode::Unary),
             ("GetBuild", RpcMode::Unary),
             ("ListBuilds", RpcMode::Unary),
@@ -136,6 +139,8 @@ mod tests {
         let _ = CreateExecutionRequest::default();
         let _ = WriteExecStdinRequest::default();
         let _ = CreateCheckpointRequest::default();
+        let _ = ExportCheckpointRequest::default();
+        let _ = ImportCheckpointRequest::default();
         let _ = StartBuildRequest::default();
         let _ = GetReceiptRequest::default();
         let _ = ListEventsRequest::default();
@@ -169,6 +174,8 @@ mod tests {
         let _ = ImagePayload::default();
         let _ = ExecutionPayload::default();
         let _ = CheckpointPayload::default();
+        let _ = ExportCheckpointCompletion::default();
+        let _ = ImportCheckpointCompletion::default();
         let _ = BuildPayload::default();
         let _ = ReceiptPayload::default();
         let _ = StackServiceStatus::default();
@@ -185,6 +192,8 @@ mod tests {
 
         // Verify streaming types.
         let _ = ExecOutputEvent::default();
+        let _ = ExportCheckpointEvent::default();
+        let _ = ImportCheckpointEvent::default();
         let _ = BuildEvent::default();
         let _ = RuntimeEvent::default();
     }

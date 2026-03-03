@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::btrfs_portability::{export_subvolume_send_stream, import_subvolume_receive_stream};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -12,6 +13,118 @@ pub(in crate::grpc) struct CheckpointServiceImpl {
 impl CheckpointServiceImpl {
     pub(in crate::grpc) fn new(daemon: Arc<RuntimeDaemon>) -> Self {
         Self { daemon }
+    }
+}
+
+type ExportCheckpointEventStream =
+    tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::ExportCheckpointEvent, Status>>;
+type ImportCheckpointEventStream =
+    tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::ImportCheckpointEvent, Status>>;
+
+fn checkpoint_event_stream_from_events<T>(
+    events: Vec<Result<T, Status>>,
+) -> tokio_stream::wrappers::ReceiverStream<Result<T, Status>>
+where
+    T: Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel(events.len().max(1));
+    for event in events {
+        if tx.try_send(event).is_err() {
+            break;
+        }
+    }
+    drop(tx);
+    tokio_stream::wrappers::ReceiverStream::new(rx)
+}
+
+fn checkpoint_stream_response<T>(
+    events: Vec<Result<T, Status>>,
+    receipt_id: Option<&str>,
+) -> Response<tokio_stream::wrappers::ReceiverStream<Result<T, Status>>>
+where
+    T: Send + 'static,
+{
+    let mut response = Response::new(checkpoint_event_stream_from_events(events));
+    if let Some(receipt_id) = receipt_id
+        && !receipt_id.trim().is_empty()
+        && let Ok(value) = MetadataValue::try_from(receipt_id)
+    {
+        response.metadata_mut().insert("x-receipt-id", value);
+    }
+    response
+}
+
+fn export_checkpoint_progress_event(
+    request_id: &str,
+    sequence: u64,
+    phase: &str,
+    detail: &str,
+) -> runtime_v2::ExportCheckpointEvent {
+    runtime_v2::ExportCheckpointEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::export_checkpoint_event::Payload::Progress(
+            runtime_v2::CheckpointMutationProgress {
+                phase: phase.to_string(),
+                detail: detail.to_string(),
+            },
+        )),
+    }
+}
+
+fn export_checkpoint_completion_event(
+    request_id: &str,
+    sequence: u64,
+    checkpoint_id: &str,
+    stream_path: &str,
+) -> runtime_v2::ExportCheckpointEvent {
+    runtime_v2::ExportCheckpointEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::export_checkpoint_event::Payload::Completion(
+            runtime_v2::ExportCheckpointCompletion {
+                checkpoint_id: checkpoint_id.to_string(),
+                stream_path: stream_path.to_string(),
+            },
+        )),
+    }
+}
+
+fn import_checkpoint_progress_event(
+    request_id: &str,
+    sequence: u64,
+    phase: &str,
+    detail: &str,
+) -> runtime_v2::ImportCheckpointEvent {
+    runtime_v2::ImportCheckpointEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::import_checkpoint_event::Payload::Progress(
+            runtime_v2::CheckpointMutationProgress {
+                phase: phase.to_string(),
+                detail: detail.to_string(),
+            },
+        )),
+    }
+}
+
+fn import_checkpoint_completion_event(
+    request_id: &str,
+    sequence: u64,
+    response: runtime_v2::CheckpointResponse,
+    receipt_id: &str,
+    received_subvolume_path: &Path,
+) -> runtime_v2::ImportCheckpointEvent {
+    runtime_v2::ImportCheckpointEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::import_checkpoint_event::Payload::Completion(
+            runtime_v2::ImportCheckpointCompletion {
+                response: Some(response),
+                receipt_id: receipt_id.to_string(),
+                received_subvolume_path: received_subvolume_path.display().to_string(),
+            },
+        )),
     }
 }
 
@@ -722,6 +835,32 @@ fn normalize_checkpoint_retention_tag(tag: &str) -> Result<Option<String>, Machi
     Ok(Some(normalized.to_string()))
 }
 
+fn normalize_required_absolute_path(
+    raw: &str,
+    field_name: &str,
+    request_id: &str,
+) -> Result<PathBuf, Status> {
+    let normalized = raw.trim();
+    if normalized.is_empty() {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!("{field_name} cannot be empty"),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+    let path = PathBuf::from(normalized);
+    if !path.is_absolute() {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!("{field_name} must be an absolute path: {}", path.display()),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+    Ok(path)
+}
+
 fn load_checkpoint_retention_states(
     daemon: &RuntimeDaemon,
     request_id: &str,
@@ -756,6 +895,9 @@ fn checkpoint_to_proto_with_retention(
 
 #[tonic::async_trait]
 impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServiceImpl {
+    type ExportCheckpointStream = ExportCheckpointEventStream;
+    type ImportCheckpointStream = ImportCheckpointEventStream;
+
     async fn create_checkpoint(
         &self,
         request: Request<runtime_v2::CreateCheckpointRequest>,
@@ -1117,6 +1259,327 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
             request_id,
             files: diff_checkpoint_file_entries(&from_entries, &to_entries),
         }))
+    }
+
+    async fn export_checkpoint(
+        &self,
+        request: Request<runtime_v2::ExportCheckpointRequest>,
+    ) -> Result<Response<Self::ExportCheckpointStream>, Status> {
+        let intercepted_request_id = request_id_from_extensions(&request);
+        let request = request.into_inner();
+        let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
+        let request_id = metadata
+            .request_id
+            .clone()
+            .unwrap_or_else(generate_request_id);
+
+        let checkpoint_id = request.checkpoint_id.trim().to_string();
+        if checkpoint_id.is_empty() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                "checkpoint_id cannot be empty".to_string(),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+        let stream_path =
+            normalize_required_absolute_path(&request.stream_path, "stream_path", &request_id)?;
+
+        let checkpoint = self
+            .daemon
+            .with_state_store(|store| store.load_checkpoint(&checkpoint_id))
+            .map_err(|error| status_from_stack_error(error, &request_id))?
+            .ok_or_else(|| {
+                status_from_machine_error(MachineError::new(
+                    MachineErrorCode::NotFound,
+                    format!("checkpoint not found: {checkpoint_id}"),
+                    Some(request_id.clone()),
+                    BTreeMap::new(),
+                ))
+            })?;
+
+        if checkpoint.state != CheckpointState::Ready {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::StateConflict,
+                format!("checkpoint {checkpoint_id} is not in ready state"),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        let snapshot_root =
+            checkpoint_workspace_snapshot_subvolume_path(self.daemon.as_ref(), &checkpoint_id);
+        if !snapshot_root.is_dir() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::NotFound,
+                format!(
+                    "workspace checkpoint snapshot is missing for export: {}",
+                    snapshot_root.display()
+                ),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        export_subvolume_send_stream(&snapshot_root, &stream_path)
+            .map_err(|error| status_from_stack_error(error, &request_id))?;
+
+        Ok(checkpoint_stream_response(
+            vec![
+                Ok(export_checkpoint_progress_event(
+                    &request_id,
+                    1,
+                    "validate",
+                    "validated checkpoint export request",
+                )),
+                Ok(export_checkpoint_progress_event(
+                    &request_id,
+                    2,
+                    "export",
+                    "streaming btrfs send payload",
+                )),
+                Ok(export_checkpoint_completion_event(
+                    &request_id,
+                    3,
+                    &checkpoint_id,
+                    stream_path.display().to_string().as_str(),
+                )),
+            ],
+            None,
+        ))
+    }
+
+    async fn import_checkpoint(
+        &self,
+        request: Request<runtime_v2::ImportCheckpointRequest>,
+    ) -> Result<Response<Self::ImportCheckpointStream>, Status> {
+        let intercepted_request_id = request_id_from_extensions(&request);
+        let request = request.into_inner();
+        let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
+        let request_id = metadata
+            .request_id
+            .clone()
+            .unwrap_or_else(generate_request_id);
+        enforce_mutation_policy_preflight(
+            self.daemon.as_ref(),
+            RuntimeOperation::CreateCheckpoint,
+            &metadata,
+            &request_id,
+        )?;
+
+        let sandbox_id = request.sandbox_id.trim().to_string();
+        if sandbox_id.is_empty() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                "sandbox_id cannot be empty".to_string(),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+        let stream_path =
+            normalize_required_absolute_path(&request.stream_path, "stream_path", &request_id)?;
+
+        self.daemon
+            .with_state_store(|store| store.load_sandbox(&sandbox_id))
+            .map_err(|error| status_from_stack_error(error, &request_id))?
+            .ok_or_else(|| {
+                status_from_machine_error(MachineError::new(
+                    MachineErrorCode::NotFound,
+                    format!("sandbox not found: {sandbox_id}"),
+                    Some(request_id.clone()),
+                    BTreeMap::new(),
+                ))
+            })?;
+
+        let class = checkpoint_class_from_wire(&request.checkpoint_class).map_err(|error| {
+            status_from_machine_error(MachineError::new(
+                error.code,
+                error.message,
+                Some(request_id.clone()),
+                BTreeMap::new(),
+            ))
+        })?;
+        let capabilities = self.daemon.capabilities();
+        match class {
+            CheckpointClass::VmFull if !capabilities.vm_full_checkpoint => {
+                return Err(status_from_machine_error(MachineError::new(
+                    MachineErrorCode::UnsupportedOperation,
+                    "VM full checkpoints are not supported by the current backend".to_string(),
+                    Some(request_id),
+                    BTreeMap::new(),
+                )));
+            }
+            CheckpointClass::FsQuick if !capabilities.fs_quick_checkpoint => {
+                return Err(status_from_machine_error(MachineError::new(
+                    MachineErrorCode::UnsupportedOperation,
+                    "Filesystem quick checkpoints are not supported by the current backend"
+                        .to_string(),
+                    Some(request_id),
+                    BTreeMap::new(),
+                )));
+            }
+            _ => {}
+        }
+
+        let retention_tag =
+            normalize_checkpoint_retention_tag(&request.retention_tag).map_err(|error| {
+                status_from_machine_error(MachineError::new(
+                    error.code,
+                    error.message,
+                    Some(request_id.clone()),
+                    BTreeMap::new(),
+                ))
+            })?;
+
+        let now = current_unix_secs();
+        let request_hash = create_checkpoint_request_hash(
+            &sandbox_id,
+            &request.checkpoint_class,
+            &request.compatibility_fingerprint,
+            &request.retention_tag,
+        );
+        let checkpoint = Checkpoint {
+            checkpoint_id: generate_checkpoint_id(),
+            sandbox_id,
+            parent_checkpoint_id: None,
+            class,
+            state: CheckpointState::Ready,
+            created_at: now,
+            compatibility_fingerprint: resolve_checkpoint_compatibility_fingerprint(
+                self.daemon.as_ref(),
+                request.compatibility_fingerprint.as_str(),
+            ),
+        };
+
+        let receive_parent = self
+            .daemon
+            .runtime_data_dir()
+            .join("checkpoints")
+            .join("import-staging")
+            .join(request_id.as_str());
+        let received_subvolume_path =
+            import_subvolume_receive_stream(&stream_path, &receive_parent)
+                .map_err(|error| status_from_stack_error(error, &request_id))?;
+
+        let checkpoint_snapshot_path = checkpoint_workspace_snapshot_subvolume_path(
+            self.daemon.as_ref(),
+            checkpoint.checkpoint_id.as_str(),
+        );
+        if checkpoint_snapshot_path.exists() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::StateConflict,
+                format!(
+                    "workspace checkpoint snapshot already exists: {}",
+                    checkpoint_snapshot_path.display()
+                ),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+        if let Some(parent) = checkpoint_snapshot_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                status_from_machine_error(MachineError::new(
+                    MachineErrorCode::BackendUnavailable,
+                    format!(
+                        "failed to prepare workspace checkpoint directory {}: {error}",
+                        parent.display()
+                    ),
+                    Some(request_id.clone()),
+                    BTreeMap::new(),
+                ))
+            })?;
+        }
+        std::fs::rename(&received_subvolume_path, &checkpoint_snapshot_path).map_err(|error| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::BackendUnavailable,
+                format!(
+                    "failed to move received subvolume {} to {}: {error}",
+                    received_subvolume_path.display(),
+                    checkpoint_snapshot_path.display()
+                ),
+                Some(request_id.clone()),
+                BTreeMap::new(),
+            ))
+        })?;
+
+        let checkpoint_file_entries =
+            collect_checkpoint_file_entries(&checkpoint_snapshot_path, &request_id)?;
+        let receipt_id = generate_receipt_id();
+        self.daemon
+            .with_state_store(|store| {
+                store.with_immediate_transaction(|tx| {
+                    tx.save_checkpoint(&checkpoint)?;
+                    if let Some(tag) = retention_tag.as_deref() {
+                        tx.save_checkpoint_retention_tag(checkpoint.checkpoint_id.as_str(), tag)?;
+                    }
+                    tx.replace_checkpoint_file_entries(
+                        checkpoint.checkpoint_id.as_str(),
+                        &checkpoint_file_entries,
+                    )?;
+                    tx.emit_event(
+                        &checkpoint.sandbox_id,
+                        &StackEvent::CheckpointReady {
+                            checkpoint_id: checkpoint.checkpoint_id.clone(),
+                        },
+                    )?;
+                    tx.save_receipt(&Receipt {
+                        receipt_id: receipt_id.clone(),
+                        operation: "import_checkpoint".to_string(),
+                        entity_id: checkpoint.checkpoint_id.clone(),
+                        entity_type: "checkpoint".to_string(),
+                        request_id: request_id.clone(),
+                        status: "success".to_string(),
+                        created_at: now,
+                        metadata: receipt_idempotent_mutation_metadata(
+                            "checkpoint_imported",
+                            request_hash.as_str(),
+                            None,
+                        )?,
+                    })?;
+                    Ok(())
+                })
+            })
+            .map_err(|error| status_from_stack_error(error, &request_id))?;
+
+        let retention_states = load_checkpoint_retention_states(self.daemon.as_ref(), &request_id)?;
+        let checkpoint_response = runtime_v2::CheckpointResponse {
+            request_id: request_id.clone(),
+            checkpoint: Some(checkpoint_to_proto_with_retention(
+                &checkpoint,
+                retention_states.get(&checkpoint.checkpoint_id),
+            )),
+        };
+
+        Ok(checkpoint_stream_response(
+            vec![
+                Ok(import_checkpoint_progress_event(
+                    &request_id,
+                    1,
+                    "validate",
+                    "validated checkpoint import request",
+                )),
+                Ok(import_checkpoint_progress_event(
+                    &request_id,
+                    2,
+                    "receive",
+                    "receiving btrfs send stream payload",
+                )),
+                Ok(import_checkpoint_progress_event(
+                    &request_id,
+                    3,
+                    "persist",
+                    "persisted imported checkpoint metadata and receipts",
+                )),
+                Ok(import_checkpoint_completion_event(
+                    &request_id,
+                    4,
+                    checkpoint_response,
+                    &receipt_id,
+                    &checkpoint_snapshot_path,
+                )),
+            ],
+            Some(receipt_id.as_str()),
+        ))
     }
 
     async fn restore_checkpoint(

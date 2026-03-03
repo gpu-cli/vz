@@ -5,7 +5,7 @@
 //   - LeaseService:      lease management (open, heartbeat, close)
 //   - ContainerService:  container lifecycle (create, get, list, remove)
 //   - ExecutionService:  exec lifecycle (create, stream, cancel, pty, signal)
-//   - CheckpointService: checkpoint/restore (create, restore, fork)
+//   - CheckpointService: checkpoint/restore/portability
 //   - BuildService:      image builds (start, stream events, cancel)
 //   - EventService:      event log (list, stream)
 //   - FileService:       scoped sandbox filesystem primitives
@@ -474,6 +474,8 @@ service CheckpointService {
   rpc RestoreCheckpoint(RestoreCheckpointRequest) returns (CheckpointResponse);
   rpc ForkCheckpoint(ForkCheckpointRequest) returns (CheckpointResponse);
   rpc DiffCheckpoints(DiffCheckpointsRequest) returns (DiffCheckpointsResponse);
+  rpc ExportCheckpoint(ExportCheckpointRequest) returns (stream ExportCheckpointEvent);
+  rpc ImportCheckpoint(ImportCheckpointRequest) returns (stream ImportCheckpointEvent);
 }
 
 message CreateCheckpointRequest {
@@ -553,6 +555,57 @@ message CheckpointFileDiffPayload {
 message DiffCheckpointsResponse {
   string request_id = 1;
   repeated CheckpointFileDiffPayload files = 2;
+}
+
+message ExportCheckpointRequest {
+  string checkpoint_id = 1;
+  string stream_path = 2;
+  RequestMetadata metadata = 3;
+}
+
+message ExportCheckpointCompletion {
+  string checkpoint_id = 1;
+  string stream_path = 2;
+}
+
+message ImportCheckpointRequest {
+  string sandbox_id = 1;
+  string stream_path = 2;
+  // Checkpoint class: "fs_quick" or "vm_full".
+  string checkpoint_class = 3;
+  string compatibility_fingerprint = 4;
+  // Optional retention tag; tagged checkpoints are protected from policy GC.
+  string retention_tag = 5;
+  RequestMetadata metadata = 6;
+}
+
+message CheckpointMutationProgress {
+  string phase = 1;
+  string detail = 2;
+}
+
+message ImportCheckpointCompletion {
+  CheckpointResponse response = 1;
+  string receipt_id = 2;
+  string received_subvolume_path = 3;
+}
+
+message ExportCheckpointEvent {
+  string request_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    CheckpointMutationProgress progress = 3;
+    ExportCheckpointCompletion completion = 4;
+  }
+}
+
+message ImportCheckpointEvent {
+  string request_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    CheckpointMutationProgress progress = 3;
+    ImportCheckpointCompletion completion = 4;
+  }
 }
 
 // ── 6. BuildService ───────────────────────────────────────────────

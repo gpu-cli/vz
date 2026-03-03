@@ -662,6 +662,40 @@ async fn checkpoint_restore_and_fork_missing_return_not_found() {
 }
 
 #[tokio::test]
+async fn checkpoint_export_and_import_missing_paths_return_not_found() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(runtimed_config(&tmp)).await;
+    let mut client = DaemonClient::connect_with_config(client_config(&tmp, false))
+        .await
+        .expect("client connect");
+
+    let export_error = client
+        .export_checkpoint(runtime_v2::ExportCheckpointRequest {
+            checkpoint_id: "ckpt-missing-client".to_string(),
+            stream_path: "/tmp/vz-missing-export.stream".to_string(),
+            metadata: None,
+        })
+        .await
+        .expect_err("missing checkpoint export should fail");
+    assert_grpc_status_in(export_error, &[Code::NotFound]);
+
+    let import_error = client
+        .import_checkpoint(runtime_v2::ImportCheckpointRequest {
+            sandbox_id: "sbx-missing-client".to_string(),
+            stream_path: "/tmp/vz-missing-import.stream".to_string(),
+            checkpoint_class: "fs_quick".to_string(),
+            compatibility_fingerprint: String::new(),
+            retention_tag: String::new(),
+            metadata: None,
+        })
+        .await
+        .expect_err("missing sandbox import should fail");
+    assert_grpc_status_in(import_error, &[Code::NotFound]);
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn stack_auxiliary_methods_and_event_stream_paths_are_covered() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let daemon = start_daemon(runtimed_config(&tmp)).await;

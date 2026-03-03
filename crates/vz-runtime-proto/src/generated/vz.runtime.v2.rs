@@ -779,6 +779,93 @@ pub struct DiffCheckpointsResponse {
     pub files: ::prost::alloc::vec::Vec<CheckpointFileDiffPayload>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ExportCheckpointRequest {
+    #[prost(string, tag = "1")]
+    pub checkpoint_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub stream_path: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub metadata: ::core::option::Option<RequestMetadata>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ExportCheckpointCompletion {
+    #[prost(string, tag = "1")]
+    pub checkpoint_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub stream_path: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ImportCheckpointRequest {
+    #[prost(string, tag = "1")]
+    pub sandbox_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub stream_path: ::prost::alloc::string::String,
+    /// Checkpoint class: "fs_quick" or "vm_full".
+    #[prost(string, tag = "3")]
+    pub checkpoint_class: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub compatibility_fingerprint: ::prost::alloc::string::String,
+    /// Optional retention tag; tagged checkpoints are protected from policy GC.
+    #[prost(string, tag = "5")]
+    pub retention_tag: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "6")]
+    pub metadata: ::core::option::Option<RequestMetadata>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CheckpointMutationProgress {
+    #[prost(string, tag = "1")]
+    pub phase: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ImportCheckpointCompletion {
+    #[prost(message, optional, tag = "1")]
+    pub response: ::core::option::Option<CheckpointResponse>,
+    #[prost(string, tag = "2")]
+    pub receipt_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub received_subvolume_path: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ExportCheckpointEvent {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(oneof = "export_checkpoint_event::Payload", tags = "3, 4")]
+    pub payload: ::core::option::Option<export_checkpoint_event::Payload>,
+}
+/// Nested message and enum types in `ExportCheckpointEvent`.
+pub mod export_checkpoint_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "3")]
+        Progress(super::CheckpointMutationProgress),
+        #[prost(message, tag = "4")]
+        Completion(super::ExportCheckpointCompletion),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ImportCheckpointEvent {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(oneof = "import_checkpoint_event::Payload", tags = "3, 4")]
+    pub payload: ::core::option::Option<import_checkpoint_event::Payload>,
+}
+/// Nested message and enum types in `ImportCheckpointEvent`.
+pub mod import_checkpoint_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "3")]
+        Progress(super::CheckpointMutationProgress),
+        #[prost(message, tag = "4")]
+        Completion(super::ImportCheckpointCompletion),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StartBuildRequest {
     #[prost(message, optional, tag = "1")]
     pub metadata: ::core::option::Option<RequestMetadata>,
@@ -2770,6 +2857,64 @@ pub mod checkpoint_service_client {
                     GrpcMethod::new("vz.runtime.v2.CheckpointService", "DiffCheckpoints"),
                 );
             self.inner.unary(req, path, codec).await
+        }
+        pub async fn export_checkpoint(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ExportCheckpointRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::ExportCheckpointEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.runtime.v2.CheckpointService/ExportCheckpoint",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "vz.runtime.v2.CheckpointService",
+                        "ExportCheckpoint",
+                    ),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
+        pub async fn import_checkpoint(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ImportCheckpointRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::ImportCheckpointEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.runtime.v2.CheckpointService/ImportCheckpoint",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "vz.runtime.v2.CheckpointService",
+                        "ImportCheckpoint",
+                    ),
+                );
+            self.inner.server_streaming(req, path, codec).await
         }
     }
 }
@@ -6161,6 +6306,32 @@ pub mod checkpoint_service_server {
             tonic::Response<super::DiffCheckpointsResponse>,
             tonic::Status,
         >;
+        /// Server streaming response type for the ExportCheckpoint method.
+        type ExportCheckpointStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::ExportCheckpointEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn export_checkpoint(
+            &self,
+            request: tonic::Request<super::ExportCheckpointRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::ExportCheckpointStream>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the ImportCheckpoint method.
+        type ImportCheckpointStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::ImportCheckpointEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn import_checkpoint(
+            &self,
+            request: tonic::Request<super::ImportCheckpointRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::ImportCheckpointStream>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct CheckpointServiceServer<T> {
@@ -6513,6 +6684,102 @@ pub mod checkpoint_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.runtime.v2.CheckpointService/ExportCheckpoint" => {
+                    #[allow(non_camel_case_types)]
+                    struct ExportCheckpointSvc<T: CheckpointService>(pub Arc<T>);
+                    impl<
+                        T: CheckpointService,
+                    > tonic::server::ServerStreamingService<
+                        super::ExportCheckpointRequest,
+                    > for ExportCheckpointSvc<T> {
+                        type Response = super::ExportCheckpointEvent;
+                        type ResponseStream = T::ExportCheckpointStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ExportCheckpointRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as CheckpointService>::export_checkpoint(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ExportCheckpointSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.runtime.v2.CheckpointService/ImportCheckpoint" => {
+                    #[allow(non_camel_case_types)]
+                    struct ImportCheckpointSvc<T: CheckpointService>(pub Arc<T>);
+                    impl<
+                        T: CheckpointService,
+                    > tonic::server::ServerStreamingService<
+                        super::ImportCheckpointRequest,
+                    > for ImportCheckpointSvc<T> {
+                        type Response = super::ImportCheckpointEvent;
+                        type ResponseStream = T::ImportCheckpointStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ImportCheckpointRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as CheckpointService>::import_checkpoint(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ImportCheckpointSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
