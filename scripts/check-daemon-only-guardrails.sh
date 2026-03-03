@@ -81,6 +81,14 @@ check_contains "super::build::run\\(\\*build_args\\)\\.await" \
   "crates/vz-cli/src/commands/image.rs" \
   "vz image build command must dispatch to build command implementation"
 
+check_no_match "(--mount|--volume)" \
+  "sandbox create surface must not expose live host-mount flags in Spaces R1" \
+  "crates/vz-cli/src/commands/sandbox.rs"
+
+check_contains "Release Scope: No Live Host Mounts" \
+  "docs/daemon-only-guardrails.md" \
+  "release docs must explicitly declare live host mounts out of scope"
+
 coverage_output=""
 if ! coverage_output="$("$ROOT/scripts/check-runtime-v2-rpc-test-coverage.sh" 2>&1)"; then
   report_failure "$coverage_output"

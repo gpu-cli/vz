@@ -639,6 +639,15 @@ async fn checkpoint_restore_and_fork_missing_return_not_found() {
         .await
         .expect("client connect");
 
+    let get_error = client
+        .get_checkpoint(runtime_v2::GetCheckpointRequest {
+            checkpoint_id: "ckpt-missing-client".to_string(),
+            metadata: None,
+        })
+        .await
+        .expect_err("missing checkpoint get should fail");
+    assert_grpc_status_in(get_error, &[Code::NotFound]);
+
     let restore_error = client
         .restore_checkpoint(runtime_v2::RestoreCheckpointRequest {
             checkpoint_id: "ckpt-missing-client".to_string(),

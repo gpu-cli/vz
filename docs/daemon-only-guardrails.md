@@ -51,6 +51,15 @@ API transport parity for checkpoint evidence is provided via `GET /v1/checkpoint
 (`from_checkpoint_id` + `to_checkpoint_id` query parameters), and `vz diff` now uses that
 endpoint when `VZ_CONTROL_PLANE_TRANSPORT=api-http`.
 
+## Release Scope: No Live Host Mounts
+
+Spaces R1 excludes live host mount features in sandbox lifecycle surfaces.
+
+- `vz sandbox create` does not expose `--mount`/`--volume` style host-mount flags.
+- API `POST /v1/sandboxes` create contract is workspace/project-dir based and does not accept host
+  mount configuration.
+- Guardrail checks fail if host-mount flags are introduced on sandbox create paths.
+
 ## Restart/Reconcile Validation
 
 Daemon startup reconcile and post-restart attach semantics are validated with:
