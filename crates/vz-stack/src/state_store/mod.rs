@@ -290,6 +290,8 @@ pub enum RetentionGcReason {
     AgeLimit,
     /// Exceeded count-based retention threshold.
     CountLimit,
+    /// Cascaded from lineage-parent deletion.
+    LineageCascade,
 }
 
 impl RetentionGcReason {
@@ -298,6 +300,7 @@ impl RetentionGcReason {
         match self {
             Self::AgeLimit => "age_limit",
             Self::CountLimit => "count_limit",
+            Self::LineageCascade => "lineage_cascade",
         }
     }
 }
@@ -367,12 +370,14 @@ pub struct CheckpointGcReport {
     pub deleted_by_age: Vec<String>,
     /// Checkpoints deleted by count policy.
     pub deleted_by_count: Vec<String>,
+    /// Checkpoints deleted due to lineage cascading from an already-selected ancestor.
+    pub deleted_by_lineage: Vec<String>,
 }
 
 impl CheckpointGcReport {
     /// Total deleted checkpoints.
     pub fn total_deleted(&self) -> usize {
-        self.deleted_by_age.len() + self.deleted_by_count.len()
+        self.deleted_by_age.len() + self.deleted_by_count.len() + self.deleted_by_lineage.len()
     }
 
     /// Whether no records were deleted.

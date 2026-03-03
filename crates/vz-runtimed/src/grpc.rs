@@ -195,6 +195,7 @@ async fn run_maintenance_loop(
                             debug!(
                                 deleted_checkpoint_age = report.deleted_by_age.len(),
                                 deleted_checkpoint_count = report.deleted_by_count.len(),
+                                deleted_checkpoint_lineage = report.deleted_by_lineage.len(),
                                 "daemon maintenance: compacted checkpoints by retention policy"
                             );
                         }

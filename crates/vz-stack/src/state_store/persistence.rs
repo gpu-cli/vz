@@ -1203,10 +1203,13 @@ impl StateStore {
     ) -> Result<HashMap<String, CheckpointRetentionState>, StackError> {
         let checkpoints = self.list_checkpoints()?;
         let tags = self.list_checkpoint_retention_tags()?;
-        let (age_deleted, count_deleted) =
-            Self::compute_checkpoint_gc_plan(&checkpoints, &tags, policy, now);
+        let plan = Self::compute_checkpoint_gc_plan(&checkpoints, &tags, policy, now);
+        let age_deleted = plan.deleted_by_age;
+        let count_deleted = plan.deleted_by_count;
+        let lineage_deleted = plan.deleted_by_lineage;
         let age_set: std::collections::HashSet<_> = age_deleted.into_iter().collect();
         let count_set: std::collections::HashSet<_> = count_deleted.into_iter().collect();
+        let lineage_set: std::collections::HashSet<_> = lineage_deleted.into_iter().collect();
 
         let mut states = HashMap::new();
         for checkpoint in checkpoints {
@@ -1216,6 +1219,8 @@ impl StateStore {
                 Some(RetentionGcReason::AgeLimit)
             } else if count_set.contains(&checkpoint.checkpoint_id) {
                 Some(RetentionGcReason::CountLimit)
+            } else if lineage_set.contains(&checkpoint.checkpoint_id) {
+                Some(RetentionGcReason::LineageCascade)
             } else {
                 None
             };
@@ -1260,17 +1265,21 @@ impl StateStore {
     ) -> Result<CheckpointGcReport, StackError> {
         let checkpoints = self.list_checkpoints()?;
         let tags = self.list_checkpoint_retention_tags()?;
-        let (deleted_by_age, deleted_by_count) =
-            Self::compute_checkpoint_gc_plan(&checkpoints, &tags, policy, now);
+        let plan = Self::compute_checkpoint_gc_plan(&checkpoints, &tags, policy, now);
+        let deleted_by_age = plan.deleted_by_age;
+        let deleted_by_count = plan.deleted_by_count;
+        let deleted_by_lineage = plan.deleted_by_lineage;
         let to_delete: Vec<String> = deleted_by_age
             .iter()
             .chain(deleted_by_count.iter())
+            .chain(deleted_by_lineage.iter())
             .cloned()
             .collect();
         if to_delete.is_empty() {
             return Ok(CheckpointGcReport {
                 deleted_by_age,
                 deleted_by_count,
+                deleted_by_lineage,
             });
         }
 
@@ -1284,6 +1293,7 @@ impl StateStore {
         Ok(CheckpointGcReport {
             deleted_by_age,
             deleted_by_count,
+            deleted_by_lineage,
         })
     }
 
@@ -1292,11 +1302,41 @@ impl StateStore {
         tags: &HashMap<String, String>,
         policy: CheckpointRetentionPolicy,
         now: u64,
-    ) -> (Vec<String>, Vec<String>) {
+    ) -> CheckpointGcReport {
+        use std::collections::{HashMap, HashSet};
+
+        let by_id: HashMap<&str, &Checkpoint> = checkpoints
+            .iter()
+            .map(|checkpoint| (checkpoint.checkpoint_id.as_str(), checkpoint))
+            .collect();
+        let mut children_by_parent: HashMap<&str, Vec<&str>> = HashMap::new();
+        for checkpoint in checkpoints {
+            if let Some(parent) = checkpoint.parent_checkpoint_id.as_deref() {
+                children_by_parent
+                    .entry(parent)
+                    .or_default()
+                    .push(checkpoint.checkpoint_id.as_str());
+            }
+        }
+
+        // Protect tagged checkpoints and every ancestor in their lineage.
+        let mut protected_ids: HashSet<&str> = HashSet::new();
+        for tagged_checkpoint_id in tags.keys() {
+            let mut cursor = Some(tagged_checkpoint_id.as_str());
+            while let Some(current) = cursor {
+                if !protected_ids.insert(current) {
+                    break;
+                }
+                cursor = by_id
+                    .get(current)
+                    .and_then(|checkpoint| checkpoint.parent_checkpoint_id.as_deref());
+            }
+        }
+
         let cutoff = now.saturating_sub(policy.max_age_secs);
         let mut untagged: Vec<&Checkpoint> = checkpoints
             .iter()
-            .filter(|checkpoint| !tags.contains_key(&checkpoint.checkpoint_id))
+            .filter(|checkpoint| !protected_ids.contains(checkpoint.checkpoint_id.as_str()))
             .collect();
         untagged.sort_by(|lhs, rhs| {
             lhs.created_at
@@ -1321,9 +1361,37 @@ impl StateStore {
             .into_iter()
             .take(overflow)
             .map(|checkpoint| checkpoint.checkpoint_id.clone())
-            .collect();
+            .collect::<Vec<_>>();
 
-        (deleted_by_age, deleted_by_count)
+        let mut selected_set: HashSet<String> = deleted_by_age
+            .iter()
+            .chain(deleted_by_count.iter())
+            .cloned()
+            .collect();
+        let mut deleted_by_lineage = Vec::new();
+        let mut stack: Vec<String> = deleted_by_age
+            .iter()
+            .chain(deleted_by_count.iter())
+            .cloned()
+            .collect();
+        while let Some(current) = stack.pop() {
+            if let Some(children) = children_by_parent.get(current.as_str()) {
+                let mut sorted_children = children.clone();
+                sorted_children.sort_unstable();
+                for child in sorted_children {
+                    if selected_set.insert(child.to_string()) {
+                        deleted_by_lineage.push(child.to_string());
+                        stack.push(child.to_string());
+                    }
+                }
+            }
+        }
+
+        CheckpointGcReport {
+            deleted_by_age,
+            deleted_by_count,
+            deleted_by_lineage,
+        }
     }
 
     /// Replace file snapshot entries for a checkpoint.

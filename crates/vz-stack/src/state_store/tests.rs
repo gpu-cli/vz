@@ -1753,6 +1753,7 @@ fn checkpoint_gc_respects_tags_and_is_idempotent() {
         .unwrap();
     assert_eq!(report.deleted_by_age, vec!["ckpt-age".to_string()]);
     assert_eq!(report.deleted_by_count, vec!["ckpt-count".to_string()]);
+    assert!(report.deleted_by_lineage.is_empty());
 
     let remaining_ids: Vec<_> = store
         .list_checkpoints()
@@ -1769,6 +1770,109 @@ fn checkpoint_gc_respects_tags_and_is_idempotent() {
         .compact_checkpoints_with_policy_at(policy, 100)
         .unwrap();
     assert!(second.is_empty());
+}
+
+#[test]
+fn checkpoint_gc_preserves_tagged_lineage_ancestors() {
+    let store = StateStore::in_memory().unwrap();
+
+    let mut root = sample_checkpoint("ckpt-root", "sb-1");
+    root.created_at = 10;
+    let mut child = sample_checkpoint("ckpt-child", "sb-1");
+    child.parent_checkpoint_id = Some("ckpt-root".to_string());
+    child.created_at = 20;
+    let mut tagged_leaf = sample_checkpoint("ckpt-tagged-leaf", "sb-1");
+    tagged_leaf.parent_checkpoint_id = Some("ckpt-child".to_string());
+    tagged_leaf.created_at = 30;
+    let mut old_unrelated = sample_checkpoint("ckpt-old-unrelated", "sb-1");
+    old_unrelated.created_at = 5;
+
+    store.save_checkpoint(&root).unwrap();
+    store.save_checkpoint(&child).unwrap();
+    store.save_checkpoint(&tagged_leaf).unwrap();
+    store.save_checkpoint(&old_unrelated).unwrap();
+    store
+        .save_checkpoint_retention_tag("ckpt-tagged-leaf", "golden")
+        .unwrap();
+
+    let policy = CheckpointRetentionPolicy {
+        max_untagged_count: 1,
+        max_age_secs: 50,
+    };
+
+    let state_map = store.checkpoint_retention_state_map(policy, 100).unwrap();
+    assert_eq!(state_map["ckpt-root"].gc_reason, None);
+    assert_eq!(state_map["ckpt-child"].gc_reason, None);
+    assert_eq!(state_map["ckpt-tagged-leaf"].gc_reason, None);
+
+    let report = store
+        .compact_checkpoints_with_policy_at(policy, 100)
+        .unwrap();
+    assert_eq!(
+        report.deleted_by_age,
+        vec!["ckpt-old-unrelated".to_string()]
+    );
+    assert!(report.deleted_by_count.is_empty());
+    assert!(report.deleted_by_lineage.is_empty());
+
+    assert!(store.load_checkpoint("ckpt-root").unwrap().is_some());
+    assert!(store.load_checkpoint("ckpt-child").unwrap().is_some());
+    assert!(store.load_checkpoint("ckpt-tagged-leaf").unwrap().is_some());
+}
+
+#[test]
+fn checkpoint_gc_cascades_fork_descendants_with_lineage_reason() {
+    let store = StateStore::in_memory().unwrap();
+
+    let mut root = sample_checkpoint("ckpt-root", "sb-1");
+    root.created_at = 10;
+    let mut left = sample_checkpoint("ckpt-left", "sb-1");
+    left.parent_checkpoint_id = Some("ckpt-root".to_string());
+    left.created_at = 100;
+    let mut right = sample_checkpoint("ckpt-right", "sb-1");
+    right.parent_checkpoint_id = Some("ckpt-root".to_string());
+    right.created_at = 101;
+    let mut newest = sample_checkpoint("ckpt-newest", "sb-1");
+    newest.created_at = 111;
+
+    store.save_checkpoint(&root).unwrap();
+    store.save_checkpoint(&left).unwrap();
+    store.save_checkpoint(&right).unwrap();
+    store.save_checkpoint(&newest).unwrap();
+
+    let policy = CheckpointRetentionPolicy {
+        max_untagged_count: 16,
+        max_age_secs: 100,
+    };
+    let state_map = store.checkpoint_retention_state_map(policy, 120).unwrap();
+    assert_eq!(
+        state_map["ckpt-root"].gc_reason,
+        Some(RetentionGcReason::AgeLimit)
+    );
+    assert_eq!(
+        state_map["ckpt-left"].gc_reason,
+        Some(RetentionGcReason::LineageCascade)
+    );
+    assert_eq!(
+        state_map["ckpt-right"].gc_reason,
+        Some(RetentionGcReason::LineageCascade)
+    );
+    assert_eq!(state_map["ckpt-newest"].gc_reason, None);
+
+    let report = store
+        .compact_checkpoints_with_policy_at(policy, 120)
+        .unwrap();
+    assert_eq!(report.deleted_by_age, vec!["ckpt-root".to_string()]);
+    assert!(report.deleted_by_count.is_empty());
+    assert_eq!(
+        report.deleted_by_lineage,
+        vec!["ckpt-left".to_string(), "ckpt-right".to_string()]
+    );
+
+    assert!(store.load_checkpoint("ckpt-root").unwrap().is_none());
+    assert!(store.load_checkpoint("ckpt-left").unwrap().is_none());
+    assert!(store.load_checkpoint("ckpt-right").unwrap().is_none());
+    assert!(store.load_checkpoint("ckpt-newest").unwrap().is_some());
 }
 
 // ── Receipt persistence tests (from agent-a03881b1) ──
