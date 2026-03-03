@@ -3931,6 +3931,8 @@ name = "vz-runtime-contract"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

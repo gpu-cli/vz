@@ -18,6 +18,7 @@ mod operations;
 mod sandbox;
 mod shared_vm;
 mod space_cache;
+mod space_cache_trust;
 mod stack;
 mod workload;
 
@@ -31,6 +32,7 @@ pub use self::operations::*;
 pub use self::sandbox::*;
 pub use self::shared_vm::*;
 pub use self::space_cache::*;
+pub use self::space_cache_trust::*;
 pub use self::stack::*;
 pub use self::workload::*;
 

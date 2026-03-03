@@ -127,6 +127,7 @@ serde_json = "1"
 serde_yml = "0.0.12"
 base64 = "0.22"
 sha2 = "0.10"
+ring = "0.17"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
