@@ -71,8 +71,15 @@ command -v findmnt >/dev/null 2>&1 || err "findmnt not found"
 [[ -n "$OWNER_USER" ]] || err "--owner is required or USER/SUDO_USER must be set"
 
 mkdir -p "$(dirname "$IMAGE_PATH")"
+[[ "$IMAGE_SIZE_GB" =~ ^[0-9]+$ ]] || err "--size-gb must be an integer"
+desired_size_bytes=$((IMAGE_SIZE_GB * 1024 * 1024 * 1024))
 if [[ ! -f "$IMAGE_PATH" ]]; then
     truncate -s "${IMAGE_SIZE_GB}G" "$IMAGE_PATH"
+else
+    current_size_bytes="$(stat -c %s "$IMAGE_PATH")"
+    if (( current_size_bytes < desired_size_bytes )); then
+        truncate -s "${IMAGE_SIZE_GB}G" "$IMAGE_PATH"
+    fi
 fi
 
 if ! blkid -s TYPE -o value "$IMAGE_PATH" 2>/dev/null | grep -qx "btrfs"; then
@@ -83,6 +90,9 @@ mkdir -p "$WORKSPACE"
 if ! findmnt -n -M "$WORKSPACE" >/dev/null 2>&1; then
     mount -o loop "$IMAGE_PATH" "$WORKSPACE"
 fi
+
+# Ensure an expanded backing file is reflected in mounted filesystem capacity.
+btrfs filesystem resize max "$WORKSPACE" >/dev/null 2>&1 || true
 
 FSTYPE="$(findmnt -n -M "$WORKSPACE" -o FSTYPE || true)"
 [[ "$FSTYPE" == "btrfs" ]] || err "workspace is not mounted as btrfs (detected: ${FSTYPE:-unknown})"

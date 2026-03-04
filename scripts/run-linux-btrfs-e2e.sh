@@ -19,7 +19,7 @@ PROFILE="debug"
 KEEP_GOING=false
 OUTPUT_ROOT="$REPO_ROOT/.artifacts/linux-btrfs-e2e"
 WORKSPACE="${VZ_TEST_BTRFS_WORKSPACE:-}"
-RUN_ARGS=("--ignored" "--exact" "--nocapture" "--test-threads=1")
+RUN_ARGS=("--ignored" "--nocapture" "--test-threads=1")
 TESTS=(
     "spaces_btrfs_checkpoint_restore_and_fork_use_real_subvolumes"
     "checkpoint_export_import_round_trip_preserves_workspace_snapshot"
@@ -105,9 +105,17 @@ command -v btrfs >/dev/null 2>&1 || err "btrfs command not found in PATH"
 
 ensure_btrfs_workspace "$WORKSPACE"
 export VZ_TEST_BTRFS_WORKSPACE="$WORKSPACE"
-: "${CARGO_TARGET_DIR:=/var/tmp/vz-cargo-target}"
+: "${CARGO_TARGET_DIR:=$WORKSPACE/.cargo-target}"
 export CARGO_TARGET_DIR
 mkdir -p "$CARGO_TARGET_DIR"
+if command -v chattr >/dev/null 2>&1; then
+    chattr +C "$CARGO_TARGET_DIR" >/dev/null 2>&1 || true
+fi
+echo "==> disk usage preflight"
+df -h "$WORKSPACE" "$CARGO_TARGET_DIR" 2>/dev/null || true
+if command -v btrfs >/dev/null 2>&1; then
+    btrfs filesystem usage -T "$WORKSPACE" 2>/dev/null || true
+fi
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_DIR="$OUTPUT_ROOT/$timestamp"
@@ -133,7 +141,7 @@ PASSED=()
 
 for test_name in "${TESTS[@]}"; do
     log_file="$RUN_DIR/${test_name}.log"
-    cmd=(cargo test -p vz-runtimed "${BUILD_ARGS[@]}" "$test_name" -- "${RUN_ARGS[@]}" "$test_name")
+    cmd=(cargo test -p vz-runtimed "${BUILD_ARGS[@]}" "$test_name" -- "${RUN_ARGS[@]}")
     echo "running [$test_name]: ${cmd[*]}"
 
     set +e

@@ -11,13 +11,13 @@ PROFILE="debug"
 WORKSPACE_IN_GUEST="/mnt/vz-btrfs"
 OUTPUT_DIR="$REPO_ROOT/.artifacts/vm-linux-hostboot-e2e"
 ROOTFS_DIR=""
-DISK_SIZE_GB="24"
+DISK_SIZE_GB="192"
 CPUS="4"
 MEMORY_MB="8192"
 SKIP_PKG_SETUP=false
 PROVISION_BTRFS=true
-BTRFS_IMAGE="/var/lib/vz-btrfs-workspace.img"
-BTRFS_SIZE_GB="64"
+BTRFS_IMAGE="/var/lib/vz-persist/vz-btrfs-workspace.img"
+BTRFS_SIZE_GB="128"
 RUN_BTRFS_PORTABILITY=false
 
 usage() {
@@ -33,13 +33,13 @@ Options:
   --workspace <path>           In-guest btrfs workspace path (default: /mnt/vz-btrfs)
   --output-dir <path>          Host descriptor/disk output dir (default: .artifacts/vm-linux-hostboot-e2e)
   --rootfs-dir <path>          Distro rootfs directory (default: auto via ensure-alpine-rootfs.sh)
-  --disk-size-gb <n>           Persistent disk GiB (default: 24)
+  --disk-size-gb <n>           Persistent disk GiB (default: 192)
   --cpus <n>                   VM CPUs (default: 4)
   --memory-mb <n>              VM memory MB (default: 8192)
   --skip-pkg-setup             Skip guest package install bootstrap
   --no-provision-btrfs         Skip in-guest btrfs provisioning
-  --btrfs-image <path>         In-guest loopback btrfs image (default: /var/lib/vz-btrfs-workspace.img)
-  --btrfs-size-gb <n>          In-guest btrfs image size GiB (default: 64)
+  --btrfs-image <path>         In-guest loopback btrfs image (default: /var/lib/vz-persist/vz-btrfs-workspace.img)
+  --btrfs-size-gb <n>          In-guest btrfs image size GiB (default: 128)
   --run-btrfs-portability      Also run scripts/run-linux-btrfs-e2e.sh inside the guest
   -h, --help                   Show help
 
@@ -119,6 +119,14 @@ done
 
 [[ "$PROFILE" == "debug" || "$PROFILE" == "release" ]] || err "--profile must be debug|release"
 [[ "$(uname -s)" == "Darwin" ]] || err "host-boot Linux VM E2E requires macOS host"
+[[ "$DISK_SIZE_GB" =~ ^[0-9]+$ ]] || err "--disk-size-gb must be an integer"
+[[ "$BTRFS_SIZE_GB" =~ ^[0-9]+$ ]] || err "--btrfs-size-gb must be an integer"
+if [[ "$PROVISION_BTRFS" == "true" ]]; then
+    min_disk_size_gb=$((BTRFS_SIZE_GB + 16))
+    if (( DISK_SIZE_GB < min_disk_size_gb )); then
+        err "--disk-size-gb (${DISK_SIZE_GB}) must be >= --btrfs-size-gb + 16 (${min_disk_size_gb})"
+    fi
+fi
 
 if [[ -z "$ROOTFS_DIR" ]]; then
     ROOTFS_DIR="$("$SCRIPT_DIR/ensure-alpine-rootfs.sh")"
@@ -144,7 +152,7 @@ apk_retry() {
   return 1;
 };
 apk_retry 6 apk update;
-apk_retry 6 apk add --no-cache bash curl git build-base pkgconf openssl-dev openssl-libs-static protobuf-dev rustup btrfs-progs util-linux iproute2 iptables runc;
+apk_retry 6 apk add --no-cache bash curl git build-base pkgconf openssl-dev openssl-libs-static protobuf-dev rustup btrfs-progs util-linux e2fsprogs iproute2 iptables runc;
 if ! command -v youki >/dev/null 2>&1 && command -v runc >/dev/null 2>&1; then
   runc_bin="$(command -v runc)";
   mkdir -p /usr/bin;
@@ -164,7 +172,7 @@ if command -v rustup >/dev/null 2>&1; then rustup toolchain install stable >/dev
 '
 else
     skip_pkg_preflight='
-required_tools="bash curl git cargo rustup btrfs youki";
+required_tools="bash curl git cargo rustup btrfs youki blkid findmnt mount mkfs.ext4";
 for tool in $required_tools; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "missing required guest tool \"$tool\" while --skip-pkg-setup is set; rerun without --skip-pkg-setup" >&2;
@@ -177,8 +185,19 @@ fi
 provision_btrfs_cmd=""
 if [[ "$PROVISION_BTRFS" == "true" ]]; then
     provision_btrfs_cmd="
+mkdir -p /var/lib/vz-persist;
+if [ -b /dev/vda ]; then
+  if ! blkid /dev/vda >/dev/null 2>&1; then
+    mkfs.ext4 -F /dev/vda;
+  fi;
+  if ! findmnt -n -M /var/lib/vz-persist >/dev/null 2>&1; then
+    mount /dev/vda /var/lib/vz-persist;
+  fi;
+fi;
+mkdir -p \"\$(dirname '${BTRFS_IMAGE}')\";
 cd /mnt/repo;
 ./scripts/provision-linux-btrfs-workspace.sh --workspace '${WORKSPACE_IN_GUEST}' --image '${BTRFS_IMAGE}' --size-gb '${BTRFS_SIZE_GB}' --owner root;
+rm -rf '${WORKSPACE_IN_GUEST}/.vz-e2e';
 "
 fi
 
@@ -195,9 +214,17 @@ mount -t virtiofs repo /mnt/repo;
 ${skip_pkg_preflight}
 ${pkg_setup}
 ${provision_btrfs_cmd}
-: \"\${VZ_GUEST_CARGO_TARGET_DIR:=/var/tmp/vz-cargo-target}\";
+: \"\${VZ_GUEST_CARGO_TARGET_DIR:=${WORKSPACE_IN_GUEST}/.cargo-target}\";
 export CARGO_TARGET_DIR=\"\$VZ_GUEST_CARGO_TARGET_DIR\";
+rm -rf \"\$CARGO_TARGET_DIR\";
 mkdir -p \"\$CARGO_TARGET_DIR\";
+if command -v chattr >/dev/null 2>&1; then chattr +C \"\$CARGO_TARGET_DIR\" >/dev/null 2>&1 || true; fi;
+: \"\${VZ_GUEST_CARGO_BUILD_JOBS:=2}\";
+export CARGO_BUILD_JOBS=\"\$VZ_GUEST_CARGO_BUILD_JOBS\";
+: \"\${VZ_GUEST_CARGO_PROFILE_DEV_DEBUG:=0}\";
+export CARGO_PROFILE_DEV_DEBUG=\"\$VZ_GUEST_CARGO_PROFILE_DEV_DEBUG\";
+: \"\${VZ_GUEST_CARGO_PROFILE_TEST_DEBUG:=0}\";
+export CARGO_PROFILE_TEST_DEBUG=\"\$VZ_GUEST_CARGO_PROFILE_TEST_DEBUG\";
 cd /mnt/repo;
 ./scripts/run-vz-linux-vm-e2e.sh --workspace '${WORKSPACE_IN_GUEST}' --profile '${PROFILE}'
 "
@@ -205,7 +232,16 @@ cd /mnt/repo;
 if [[ "$RUN_BTRFS_PORTABILITY" == "true" ]]; then
     guest_cmd+="
 cd /mnt/repo;
-./scripts/run-linux-btrfs-e2e.sh --workspace '${WORKSPACE_IN_GUEST}' --profile '${PROFILE}'
+if ! ./scripts/run-linux-btrfs-e2e.sh --workspace '${WORKSPACE_IN_GUEST}' --profile '${PROFILE}'; then
+  echo '==> portability diagnostics';
+  df -h || true;
+  if command -v btrfs >/dev/null 2>&1; then
+    btrfs filesystem usage -T '${WORKSPACE_IN_GUEST}' || true;
+    btrfs device stats '${WORKSPACE_IN_GUEST}' || true;
+  fi;
+  dmesg | tail -n 250 || true;
+  exit 1;
+fi
 "
 fi
 
