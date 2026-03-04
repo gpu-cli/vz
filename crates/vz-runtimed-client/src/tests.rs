@@ -72,6 +72,13 @@ fn client_config(tmp: &tempfile::TempDir, auto_spawn: bool) -> DaemonClientConfi
     }
 }
 
+fn required_sandbox_labels(tmp: &tempfile::TempDir) -> HashMap<String, String> {
+    HashMap::from([(
+        "project_dir".to_string(),
+        tmp.path().display().to_string(),
+    )])
+}
+
 fn assert_grpc_status_in(error: DaemonClientError, expected: &[Code]) {
     match error {
         DaemonClientError::Grpc(status) => {
@@ -114,7 +121,7 @@ async fn connect_retries_until_daemon_cold_start_is_ready() {
             stack_name: "   ".to_string(),
             cpus: 0,
             memory_mb: 0,
-            labels: HashMap::new(),
+            labels: required_sandbox_labels(&tmp),
         })
         .await
         .expect_err("empty stack name should fail validation");
@@ -201,7 +208,7 @@ async fn reconnect_after_daemon_restart_yields_new_handshake() {
             stack_name: "".to_string(),
             cpus: 0,
             memory_mb: 0,
-            labels: HashMap::new(),
+            labels: required_sandbox_labels(&tmp),
         })
         .await
         .expect_err("empty stack name should fail validation");
@@ -227,24 +234,39 @@ async fn create_sandbox_stream_emits_progress_and_completion() {
             stack_name: "stream-sandbox-client".to_string(),
             cpus: 1,
             memory_mb: 256,
-            labels: HashMap::new(),
+            labels: required_sandbox_labels(&tmp),
         })
         .await
         .expect("create sandbox stream");
 
     let mut saw_progress = false;
     let mut completion = None;
-    while let Some(event) = stream.message().await.expect("read create sandbox stream") {
-        match event.payload {
-            Some(runtime_v2::create_sandbox_event::Payload::Progress(progress)) => {
-                saw_progress = true;
-                assert!(!progress.phase.trim().is_empty());
+    let mut terminal_error = None;
+    loop {
+        match stream.message().await {
+            Ok(Some(event)) => match event.payload {
+                Some(runtime_v2::create_sandbox_event::Payload::Progress(progress)) => {
+                    saw_progress = true;
+                    assert!(!progress.phase.trim().is_empty());
+                }
+                Some(runtime_v2::create_sandbox_event::Payload::Completion(done)) => {
+                    completion = Some(done);
+                }
+                None => {}
+            },
+            Ok(None) => break,
+            Err(error) => {
+                terminal_error = Some(error);
+                break;
             }
-            Some(runtime_v2::create_sandbox_event::Payload::Completion(done)) => {
-                completion = Some(done);
-            }
-            None => {}
         }
+    }
+
+    if !cfg!(target_os = "linux") {
+        let error = terminal_error.expect("non-linux should report unsupported spaces mode");
+        assert_eq!(error.code(), Code::Unimplemented);
+        daemon.stop().await;
+        return;
     }
 
     assert!(
@@ -275,16 +297,25 @@ async fn create_sandbox_with_metadata_preserves_receipt_header_from_stream_compl
         .await
         .expect("client connect");
 
-    let response = client
+    let response_result = client
         .create_sandbox_with_metadata(runtime_v2::CreateSandboxRequest {
             metadata: None,
             stack_name: "sandbox-receipt-header".to_string(),
             cpus: 1,
             memory_mb: 256,
-            labels: HashMap::new(),
+            labels: required_sandbox_labels(&tmp),
         })
-        .await
-        .expect("create sandbox with metadata");
+        .await;
+    if !cfg!(target_os = "linux") {
+        let error = response_result.expect_err("non-linux should reject spaces-mode sandbox");
+        assert!(matches!(
+            error,
+            DaemonClientError::Grpc(status) if status.code() == Code::Unimplemented
+        ));
+        daemon.stop().await;
+        return;
+    }
+    let response = response_result.expect("create sandbox with metadata");
 
     let receipt_id = response
         .metadata()
@@ -521,16 +552,25 @@ async fn heartbeat_lease_round_trip_and_signal_exec_missing_returns_not_found() 
         .await
         .expect("client connect");
 
-    let sandbox = client
+    let sandbox_result = client
         .create_sandbox(runtime_v2::CreateSandboxRequest {
             metadata: None,
             stack_name: "client-heartbeat-sandbox".to_string(),
             cpus: 1,
             memory_mb: 128,
-            labels: HashMap::new(),
+            labels: required_sandbox_labels(&tmp),
         })
-        .await
-        .expect("create sandbox");
+        .await;
+    if !cfg!(target_os = "linux") {
+        let error = sandbox_result.expect_err("non-linux should reject spaces-mode sandbox");
+        assert!(matches!(
+            error,
+            DaemonClientError::Grpc(status) if status.code() == Code::Unimplemented
+        ));
+        daemon.stop().await;
+        return;
+    }
+    let sandbox = sandbox_result.expect("create sandbox");
     let sandbox_id = sandbox
         .sandbox
         .expect("sandbox payload")
@@ -823,16 +863,25 @@ async fn file_mutation_rpc_methods_are_covered() {
         .await
         .expect("client connect");
 
-    let sandbox = client
+    let sandbox_result = client
         .create_sandbox(runtime_v2::CreateSandboxRequest {
             metadata: None,
             stack_name: "client-file-rpc-sandbox".to_string(),
             cpus: 1,
             memory_mb: 128,
-            labels: HashMap::new(),
+            labels: required_sandbox_labels(&tmp),
         })
-        .await
-        .expect("create sandbox");
+        .await;
+    if !cfg!(target_os = "linux") {
+        let error = sandbox_result.expect_err("non-linux should reject spaces-mode sandbox");
+        assert!(matches!(
+            error,
+            DaemonClientError::Grpc(status) if status.code() == Code::Unimplemented
+        ));
+        daemon.stop().await;
+        return;
+    }
+    let sandbox = sandbox_result.expect("create sandbox");
     let sandbox_id = sandbox
         .sandbox
         .expect("sandbox payload")
