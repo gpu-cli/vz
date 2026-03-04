@@ -1982,3 +1982,228 @@ async fn cli_daemon_grpc_linux_base_lifecycle() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn cli_daemon_grpc_linux_patch_apply_incompatibility_and_rollback() -> Result<()> {
+    let temp_dir = tempfile::tempdir().context("create temp dir")?;
+    let home_dir = temp_dir.path().join("home");
+    std::fs::create_dir_all(&home_dir).context("create isolated HOME directory")?;
+    let state_store_path = temp_dir.path().join("state").join("stack-state.db");
+    std::fs::create_dir_all(
+        state_store_path
+            .parent()
+            .context("state store path parent should exist")?,
+    )
+    .context("create state store parent")?;
+
+    let (daemon_shutdown, daemon_server, daemon_socket_path) =
+        start_daemon_for_state_store(&state_store_path).await?;
+
+    let client_config = DaemonClientConfig {
+        socket_path: daemon_socket_path.clone(),
+        auto_spawn: false,
+        state_store_path: Some(state_store_path.clone()),
+        runtime_data_dir: daemon_socket_path.parent().map(Path::to_path_buf),
+        ..DaemonClientConfig::default()
+    };
+    let client = DaemonClient::connect_with_config(client_config)
+        .await
+        .context("connect daemon client")?;
+    if !is_linux_backend_name(client.handshake().backend_name.as_str()) {
+        daemon_shutdown.notify_waiters();
+        daemon_server
+            .await
+            .context("join daemon server task")?
+            .context("run daemon server")?;
+        return Ok(());
+    }
+
+    let artifacts_dir = temp_dir.path().join("linux-artifacts");
+    std::fs::create_dir_all(&artifacts_dir).context("create linux artifacts dir")?;
+    let kernel_path = artifacts_dir.join("vmlinux");
+    let initramfs_path = artifacts_dir.join("initramfs.img");
+    let version_path = artifacts_dir.join("version.json");
+    std::fs::write(&kernel_path, b"kernel-bytes").context("write kernel artifact")?;
+    std::fs::write(&initramfs_path, b"initramfs-bytes").context("write initramfs artifact")?;
+    std::fs::write(&version_path, b"{\"kernel\":\"6.12.11\"}").context("write version json")?;
+
+    let patch_bundle_path = temp_dir.path().join("patch-apply.json");
+    std::fs::write(
+        &patch_bundle_path,
+        "{\"schema_version\":1,\"patch_id\":\"patch-e2e\",\"base_id\":\"patch-base\",\"set\":{\"description\":\"after\"}}",
+    )
+    .context("write patch bundle")?;
+    let incompatible_bundle_path = temp_dir.path().join("patch-incompat.json");
+    std::fs::write(
+        &incompatible_bundle_path,
+        "{\"schema_version\":1,\"patch_id\":\"patch-missing\",\"base_id\":\"missing-base\",\"set\":{\"description\":\"x\"}}",
+    )
+    .context("write incompatible patch bundle")?;
+
+    let vz_bin = resolve_vz_binary()?;
+    let state_store_path_arg = state_store_path.to_string_lossy().to_string();
+    let kernel_path_arg = kernel_path.to_string_lossy().to_string();
+    let initramfs_path_arg = initramfs_path.to_string_lossy().to_string();
+    let version_path_arg = version_path.to_string_lossy().to_string();
+
+    let upsert_output = run_vz_command_daemon(
+        &vz_bin,
+        &daemon_socket_path,
+        &home_dir,
+        &[
+            "vm",
+            "linux",
+            "base",
+            "upsert",
+            "patch-base",
+            "--kernel",
+            &kernel_path_arg,
+            "--initramfs",
+            &initramfs_path_arg,
+            "--version-json",
+            &version_path_arg,
+            "--description",
+            "before",
+            "--state-db",
+            &state_store_path_arg,
+        ],
+    )
+    .await?;
+    if !upsert_output.status.success() {
+        bail!(
+            "vz vm linux base upsert for patch test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&upsert_output.stdout),
+            String::from_utf8_lossy(&upsert_output.stderr)
+        );
+    }
+
+    let patch_bundle_arg = patch_bundle_path.to_string_lossy().to_string();
+    let apply_output = run_vz_command_daemon(
+        &vz_bin,
+        &daemon_socket_path,
+        &home_dir,
+        &[
+            "vm",
+            "linux",
+            "patch",
+            "apply",
+            "--bundle",
+            &patch_bundle_arg,
+            "--json",
+            "--state-db",
+            &state_store_path_arg,
+        ],
+    )
+    .await?;
+    if !apply_output.status.success() {
+        bail!(
+            "vz vm linux patch apply failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&apply_output.stdout),
+            String::from_utf8_lossy(&apply_output.stderr)
+        );
+    }
+    let apply_report: serde_json::Value =
+        serde_json::from_slice(&apply_output.stdout).context("parse patch apply json")?;
+    let rollback_id = apply_report["rollback_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("patch apply output missing rollback_id"))?
+        .to_string();
+    if apply_report["base"]["description"] != "after" {
+        bail!(
+            "patch apply output missing updated description: {}",
+            String::from_utf8_lossy(&apply_output.stdout)
+        );
+    }
+
+    let inspect_after_output = run_vz_command_daemon(
+        &vz_bin,
+        &daemon_socket_path,
+        &home_dir,
+        &[
+            "vm",
+            "linux",
+            "base",
+            "inspect",
+            "patch-base",
+            "--json",
+            "--state-db",
+            &state_store_path_arg,
+        ],
+    )
+    .await?;
+    let inspect_after: serde_json::Value = serde_json::from_slice(&inspect_after_output.stdout)
+        .context("parse inspect after patch json")?;
+    if inspect_after["description"] != "after" {
+        bail!(
+            "base description mismatch after patch apply: {}",
+            String::from_utf8_lossy(&inspect_after_output.stdout)
+        );
+    }
+
+    let rollback_output = run_vz_command_daemon(
+        &vz_bin,
+        &daemon_socket_path,
+        &home_dir,
+        &[
+            "vm",
+            "linux",
+            "patch",
+            "rollback",
+            &rollback_id,
+            "--json",
+            "--state-db",
+            &state_store_path_arg,
+        ],
+    )
+    .await?;
+    if !rollback_output.status.success() {
+        bail!(
+            "vz vm linux patch rollback failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&rollback_output.stdout),
+            String::from_utf8_lossy(&rollback_output.stderr)
+        );
+    }
+    let rollback_report: serde_json::Value =
+        serde_json::from_slice(&rollback_output.stdout).context("parse patch rollback json")?;
+    if rollback_report["base"]["description"] != "before" {
+        bail!(
+            "rollback output missing restored description: {}",
+            String::from_utf8_lossy(&rollback_output.stdout)
+        );
+    }
+
+    let incompatible_bundle_arg = incompatible_bundle_path.to_string_lossy().to_string();
+    let incompatible_output = run_vz_command_daemon(
+        &vz_bin,
+        &daemon_socket_path,
+        &home_dir,
+        &[
+            "vm",
+            "linux",
+            "patch",
+            "apply",
+            "--bundle",
+            &incompatible_bundle_arg,
+            "--state-db",
+            &state_store_path_arg,
+        ],
+    )
+    .await?;
+    if incompatible_output.status.success() {
+        bail!("vz vm linux patch apply unexpectedly succeeded for missing base");
+    }
+    if !String::from_utf8_lossy(&incompatible_output.stderr).contains("not found") {
+        bail!(
+            "incompatible patch stderr mismatch:\n{}",
+            String::from_utf8_lossy(&incompatible_output.stderr)
+        );
+    }
+
+    daemon_shutdown.notify_waiters();
+    daemon_server
+        .await
+        .context("join daemon server task")?
+        .context("run daemon server")?;
+
+    Ok(())
+}

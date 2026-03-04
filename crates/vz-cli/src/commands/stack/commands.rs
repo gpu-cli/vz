@@ -649,6 +649,9 @@ pub(super) fn event_service_name(event: &StackEvent) -> Option<&str> {
         | StackEvent::ContainerFailed { .. }
         | StackEvent::ContainerRemoved { .. }
         | StackEvent::DriftDetected { .. }
+        | StackEvent::LinuxVmPatchApplied { .. }
+        | StackEvent::LinuxVmPatchRolledBack { .. }
+        | StackEvent::LinuxVmPatchFailed { .. }
         | StackEvent::OrphanCleaned { .. } => None,
     }
 }

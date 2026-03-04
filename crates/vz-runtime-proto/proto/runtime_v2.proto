@@ -282,6 +282,8 @@ service LinuxVmService {
   rpc GetLinuxVmBase(GetLinuxVmBaseRequest) returns (LinuxVmBaseResponse);
   rpc UpsertLinuxVmBase(UpsertLinuxVmBaseRequest) returns (stream UpsertLinuxVmBaseEvent);
   rpc DeleteLinuxVmBase(DeleteLinuxVmBaseRequest) returns (stream DeleteLinuxVmBaseEvent);
+  rpc ApplyLinuxVmPatch(ApplyLinuxVmPatchRequest) returns (stream ApplyLinuxVmPatchEvent);
+  rpc RollbackLinuxVmPatch(RollbackLinuxVmPatchRequest) returns (stream RollbackLinuxVmPatchEvent);
 }
 
 message ValidateLinuxVmRequest {
@@ -381,6 +383,53 @@ message DeleteLinuxVmBaseEvent {
   oneof payload {
     LinuxVmBaseMutationProgress progress = 3;
     DeleteLinuxVmBaseCompletion completion = 4;
+  }
+}
+
+message ApplyLinuxVmPatchRequest {
+  RequestMetadata metadata = 1;
+  string bundle_path = 2;
+}
+
+message RollbackLinuxVmPatchRequest {
+  RequestMetadata metadata = 1;
+  string rollback_id = 2;
+}
+
+message LinuxVmPatchMutationProgress {
+  string phase = 1;
+  string detail = 2;
+}
+
+message ApplyLinuxVmPatchCompletion {
+  LinuxVmBaseDefinition base = 1;
+  string patch_id = 2;
+  string rollback_id = 3;
+  string receipt_id = 4;
+}
+
+message RollbackLinuxVmPatchCompletion {
+  LinuxVmBaseDefinition base = 1;
+  string patch_id = 2;
+  string rollback_id = 3;
+  string receipt_id = 4;
+}
+
+message ApplyLinuxVmPatchEvent {
+  string request_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    LinuxVmPatchMutationProgress progress = 3;
+    ApplyLinuxVmPatchCompletion completion = 4;
+  }
+}
+
+message RollbackLinuxVmPatchEvent {
+  string request_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    LinuxVmPatchMutationProgress progress = 3;
+    RollbackLinuxVmPatchCompletion completion = 4;
   }
 }
 

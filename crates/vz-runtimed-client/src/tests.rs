@@ -1074,3 +1074,136 @@ async fn linux_vm_base_lifecycle_rpc_methods_are_covered() {
 
     daemon.stop().await;
 }
+
+#[tokio::test]
+async fn linux_vm_patch_apply_and_rollback_rpc_methods_are_covered() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(runtimed_config(&tmp)).await;
+    let mut client = DaemonClient::connect_with_config(client_config(&tmp, false))
+        .await
+        .expect("client connect");
+
+    let kernel = tmp.path().join("vmlinux");
+    let initramfs = tmp.path().join("initramfs.img");
+    let version = tmp.path().join("version.json");
+    std::fs::write(&kernel, b"kernel").expect("write kernel");
+    std::fs::write(&initramfs, b"initramfs").expect("write initramfs");
+    std::fs::write(&version, b"{\"kernel\":\"6.12.11\"}").expect("write version");
+
+    let mut upsert_stream = client
+        .upsert_linux_vm_base_stream(runtime_v2::UpsertLinuxVmBaseRequest {
+            metadata: None,
+            base: Some(runtime_v2::LinuxVmBaseDefinition {
+                base_id: "patch-base".to_string(),
+                kernel_path: kernel.display().to_string(),
+                initramfs_path: initramfs.display().to_string(),
+                version_json_path: version.display().to_string(),
+                description: "before".to_string(),
+                updated_at_unix_secs: 0,
+            }),
+        })
+        .await
+        .expect("upsert base");
+    while let Some(event) = upsert_stream
+        .message()
+        .await
+        .expect("read upsert stream event")
+    {
+        if matches!(
+            event.payload,
+            Some(runtime_v2::upsert_linux_vm_base_event::Payload::Completion(
+                _
+            ))
+        ) {
+            break;
+        }
+    }
+
+    let bundle_path = tmp.path().join("patch-1.json");
+    std::fs::write(
+        &bundle_path,
+        format!(
+            "{{\"schema_version\":1,\"patch_id\":\"patch-1\",\"base_id\":\"patch-base\",\"set\":{{\"description\":\"after\"}}}}"
+        ),
+    )
+    .expect("write bundle");
+
+    let mut apply_stream = client
+        .apply_linux_vm_patch_stream(runtime_v2::ApplyLinuxVmPatchRequest {
+            metadata: None,
+            bundle_path: bundle_path.display().to_string(),
+        })
+        .await
+        .expect("apply patch stream");
+    let mut apply_completion = None;
+    while let Some(event) = apply_stream
+        .message()
+        .await
+        .expect("read apply stream event")
+    {
+        if let Some(runtime_v2::apply_linux_vm_patch_event::Payload::Completion(done)) =
+            event.payload
+        {
+            apply_completion = Some(done);
+            break;
+        }
+    }
+    let apply_completion = apply_completion.expect("apply completion");
+    assert!(!apply_completion.receipt_id.trim().is_empty());
+    let rollback_id = apply_completion.rollback_id.clone();
+    let patched_base = apply_completion.base.expect("patched base");
+    assert_eq!(patched_base.description, "after");
+
+    let receipt = client
+        .get_receipt(runtime_v2::GetReceiptRequest {
+            receipt_id: apply_completion.receipt_id.clone(),
+            metadata: None,
+        })
+        .await
+        .expect("get apply receipt");
+    assert!(
+        receipt.receipt.is_some(),
+        "apply receipt payload should exist"
+    );
+
+    let mut rollback_stream = client
+        .rollback_linux_vm_patch_stream(runtime_v2::RollbackLinuxVmPatchRequest {
+            metadata: None,
+            rollback_id: rollback_id.clone(),
+        })
+        .await
+        .expect("rollback stream");
+    let mut rollback_completion = None;
+    while let Some(event) = rollback_stream
+        .message()
+        .await
+        .expect("read rollback stream event")
+    {
+        if let Some(runtime_v2::rollback_linux_vm_patch_event::Payload::Completion(done)) =
+            event.payload
+        {
+            rollback_completion = Some(done);
+            break;
+        }
+    }
+    let rollback_completion = rollback_completion.expect("rollback completion");
+    let rolled_base = rollback_completion.base.expect("rolled base");
+    assert_eq!(rolled_base.description, "before");
+
+    let incompatible_bundle = tmp.path().join("patch-missing.json");
+    std::fs::write(
+        &incompatible_bundle,
+        "{\"schema_version\":1,\"patch_id\":\"patch-missing\",\"base_id\":\"missing-base\",\"set\":{\"description\":\"x\"}}",
+    )
+    .expect("write incompatible bundle");
+    let incompatible_error = client
+        .apply_linux_vm_patch_stream(runtime_v2::ApplyLinuxVmPatchRequest {
+            metadata: None,
+            bundle_path: incompatible_bundle.display().to_string(),
+        })
+        .await
+        .expect_err("apply patch should fail for missing base");
+    assert_grpc_status_in(incompatible_error, &[Code::NotFound]);
+
+    daemon.stop().await;
+}

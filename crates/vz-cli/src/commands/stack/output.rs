@@ -338,6 +338,21 @@ pub(super) fn format_event_summary(event: &StackEvent) -> String {
             severity,
             ..
         } => format!("drift [{severity}] {category}: {description}"),
+        StackEvent::LinuxVmPatchApplied {
+            base_id,
+            patch_id,
+            rollback_id,
+        } => format!("linux patch applied: {patch_id} on {base_id} ({rollback_id})"),
+        StackEvent::LinuxVmPatchRolledBack {
+            base_id,
+            patch_id,
+            rollback_id,
+        } => format!("linux patch rollback: {patch_id} on {base_id} ({rollback_id})"),
+        StackEvent::LinuxVmPatchFailed {
+            base_id,
+            patch_id,
+            error,
+        } => format!("linux patch failed: {patch_id} on {base_id}: {error}"),
         StackEvent::OrphanCleaned { container_id, .. } => {
             format!("orphan cleaned: {container_id}")
         }

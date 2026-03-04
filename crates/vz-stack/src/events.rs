@@ -407,6 +407,36 @@ pub enum StackEvent {
         /// Number of checkpoints compacted by lineage cascade.
         deleted_by_lineage: usize,
     },
+    /// A Linux VM patch bundle was applied to a base definition.
+    #[serde(rename = "linux_vm_patch_applied")]
+    LinuxVmPatchApplied {
+        /// Linux base identifier that was patched.
+        base_id: String,
+        /// Patch identifier from the bundle.
+        patch_id: String,
+        /// Rollback handle persisted for reversal.
+        rollback_id: String,
+    },
+    /// A Linux VM patch rollback was applied to a base definition.
+    #[serde(rename = "linux_vm_patch_rolled_back")]
+    LinuxVmPatchRolledBack {
+        /// Linux base identifier that was restored.
+        base_id: String,
+        /// Patch identifier associated with the rollback snapshot.
+        patch_id: String,
+        /// Rollback handle consumed for restoration.
+        rollback_id: String,
+    },
+    /// A Linux VM patch operation failed.
+    #[serde(rename = "linux_vm_patch_failed")]
+    LinuxVmPatchFailed {
+        /// Linux base identifier targeted by the patch.
+        base_id: String,
+        /// Patch identifier from the bundle when available.
+        patch_id: String,
+        /// Error description.
+        error: String,
+    },
     /// An orphaned container was cleaned up during startup recovery.
     #[serde(rename = "orphan_cleaned")]
     OrphanCleaned {

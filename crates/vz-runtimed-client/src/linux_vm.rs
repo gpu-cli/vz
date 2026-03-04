@@ -113,4 +113,50 @@ impl DaemonClient {
             .await
             .map_err(|status| status_to_client_error(&self.config.socket_path, status))
     }
+
+    /// Call Runtime V2 `ApplyLinuxVmPatch` as a server stream.
+    pub async fn apply_linux_vm_patch_stream(
+        &mut self,
+        request: runtime_v2::ApplyLinuxVmPatchRequest,
+    ) -> Result<tonic::Streaming<runtime_v2::ApplyLinuxVmPatchEvent>> {
+        let response = self
+            .apply_linux_vm_patch_stream_with_metadata(request)
+            .await?;
+        Ok(response.into_inner())
+    }
+
+    /// Call Runtime V2 `ApplyLinuxVmPatch` as a server stream and preserve metadata.
+    pub async fn apply_linux_vm_patch_stream_with_metadata(
+        &mut self,
+        mut request: runtime_v2::ApplyLinuxVmPatchRequest,
+    ) -> Result<tonic::Response<tonic::Streaming<runtime_v2::ApplyLinuxVmPatchEvent>>> {
+        Self::ensure_metadata(&mut request.metadata);
+        self.linux_vm_client
+            .apply_linux_vm_patch(Request::new(request))
+            .await
+            .map_err(|status| status_to_client_error(&self.config.socket_path, status))
+    }
+
+    /// Call Runtime V2 `RollbackLinuxVmPatch` as a server stream.
+    pub async fn rollback_linux_vm_patch_stream(
+        &mut self,
+        request: runtime_v2::RollbackLinuxVmPatchRequest,
+    ) -> Result<tonic::Streaming<runtime_v2::RollbackLinuxVmPatchEvent>> {
+        let response = self
+            .rollback_linux_vm_patch_stream_with_metadata(request)
+            .await?;
+        Ok(response.into_inner())
+    }
+
+    /// Call Runtime V2 `RollbackLinuxVmPatch` as a server stream and preserve metadata.
+    pub async fn rollback_linux_vm_patch_stream_with_metadata(
+        &mut self,
+        mut request: runtime_v2::RollbackLinuxVmPatchRequest,
+    ) -> Result<tonic::Response<tonic::Streaming<runtime_v2::RollbackLinuxVmPatchEvent>>> {
+        Self::ensure_metadata(&mut request.metadata);
+        self.linux_vm_client
+            .rollback_linux_vm_patch(Request::new(request))
+            .await
+            .map_err(|status| status_to_client_error(&self.config.socket_path, status))
+    }
 }

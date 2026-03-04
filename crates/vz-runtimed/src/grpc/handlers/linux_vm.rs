@@ -6,6 +6,10 @@ use vz_runtime_contract::SandboxBackend;
 
 const LINUX_VM_BASE_REGISTRY_VERSION: u32 = 1;
 const LINUX_VM_BASE_REGISTRY_FILENAME: &str = "linux-vm-bases.json";
+const LINUX_VM_PATCH_ROLLBACK_DIR: &str = "linux-vm-patch-rollbacks";
+const LINUX_VM_PATCH_EVENT_STACK: &str = "daemon";
+const LINUX_VM_PATCH_APPLY_OPERATION: &str = "linux_vm_patch_apply";
+const LINUX_VM_PATCH_ROLLBACK_OPERATION: &str = "linux_vm_patch_rollback";
 
 pub(in crate::grpc) struct LinuxVmServiceImpl {
     daemon: Arc<RuntimeDaemon>,
@@ -108,6 +112,108 @@ impl LinuxVmServiceImpl {
 
         Ok(())
     }
+
+    fn linux_vm_patch_rollback_dir(&self) -> PathBuf {
+        self.daemon
+            .runtime_data_dir()
+            .join(LINUX_VM_PATCH_ROLLBACK_DIR)
+    }
+
+    fn linux_vm_patch_rollback_path(&self, rollback_id: &str) -> PathBuf {
+        self.linux_vm_patch_rollback_dir()
+            .join(format!("{rollback_id}.json"))
+    }
+
+    fn persist_patch_rollback_snapshot(
+        &self,
+        snapshot: &LinuxVmPatchRollbackSnapshot,
+    ) -> Result<(), MachineError> {
+        let path = self.linux_vm_patch_rollback_path(&snapshot.rollback_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                MachineError::new(
+                    MachineErrorCode::InternalError,
+                    format!(
+                        "failed to create linux vm rollback dir {}: {error}",
+                        parent.display()
+                    ),
+                    None,
+                    BTreeMap::new(),
+                )
+            })?;
+        }
+        let payload = serde_json::to_vec_pretty(snapshot).map_err(|error| {
+            MachineError::new(
+                MachineErrorCode::InternalError,
+                format!("failed to serialize linux vm rollback snapshot: {error}"),
+                None,
+                BTreeMap::new(),
+            )
+        })?;
+        std::fs::write(&path, payload).map_err(|error| {
+            MachineError::new(
+                MachineErrorCode::InternalError,
+                format!(
+                    "failed to persist linux vm rollback snapshot {}: {error}",
+                    path.display()
+                ),
+                None,
+                BTreeMap::new(),
+            )
+        })?;
+        Ok(())
+    }
+
+    fn load_patch_rollback_snapshot(
+        &self,
+        rollback_id: &str,
+    ) -> Result<LinuxVmPatchRollbackSnapshot, MachineError> {
+        let path = self.linux_vm_patch_rollback_path(rollback_id);
+        let raw = std::fs::read(&path).map_err(|error| {
+            let code = if error.kind() == std::io::ErrorKind::NotFound {
+                MachineErrorCode::NotFound
+            } else {
+                MachineErrorCode::InternalError
+            };
+            MachineError::new(
+                code,
+                format!(
+                    "failed to read linux vm rollback snapshot {}: {error}",
+                    path.display()
+                ),
+                None,
+                BTreeMap::new(),
+            )
+        })?;
+        serde_json::from_slice::<LinuxVmPatchRollbackSnapshot>(&raw).map_err(|error| {
+            MachineError::new(
+                MachineErrorCode::InternalError,
+                format!(
+                    "failed to parse linux vm rollback snapshot {}: {error}",
+                    path.display()
+                ),
+                None,
+                BTreeMap::new(),
+            )
+        })
+    }
+
+    fn delete_patch_rollback_snapshot(&self, rollback_id: &str) -> Result<(), MachineError> {
+        let path = self.linux_vm_patch_rollback_path(rollback_id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(MachineError::new(
+                MachineErrorCode::InternalError,
+                format!(
+                    "failed to remove linux vm rollback snapshot {}: {error}",
+                    path.display()
+                ),
+                None,
+                BTreeMap::new(),
+            )),
+        }
+    }
 }
 
 type ValidateLinuxVmEventStream =
@@ -116,6 +222,10 @@ type UpsertLinuxVmBaseEventStream =
     tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::UpsertLinuxVmBaseEvent, Status>>;
 type DeleteLinuxVmBaseEventStream =
     tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::DeleteLinuxVmBaseEvent, Status>>;
+type ApplyLinuxVmPatchEventStream =
+    tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::ApplyLinuxVmPatchEvent, Status>>;
+type RollbackLinuxVmPatchEventStream =
+    tokio_stream::wrappers::ReceiverStream<Result<runtime_v2::RollbackLinuxVmPatchEvent, Status>>;
 
 fn linux_vm_event_stream_from_events<T>(
     events: Vec<Result<T, Status>>,
@@ -239,6 +349,90 @@ fn linux_vm_base_delete_completion_event(
     }
 }
 
+fn linux_vm_patch_apply_progress_event(
+    request_id: &str,
+    sequence: u64,
+    phase: &str,
+    detail: &str,
+) -> runtime_v2::ApplyLinuxVmPatchEvent {
+    runtime_v2::ApplyLinuxVmPatchEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::apply_linux_vm_patch_event::Payload::Progress(
+            runtime_v2::LinuxVmPatchMutationProgress {
+                phase: phase.to_string(),
+                detail: detail.to_string(),
+            },
+        )),
+    }
+}
+
+fn linux_vm_patch_rollback_progress_event(
+    request_id: &str,
+    sequence: u64,
+    phase: &str,
+    detail: &str,
+) -> runtime_v2::RollbackLinuxVmPatchEvent {
+    runtime_v2::RollbackLinuxVmPatchEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(
+            runtime_v2::rollback_linux_vm_patch_event::Payload::Progress(
+                runtime_v2::LinuxVmPatchMutationProgress {
+                    phase: phase.to_string(),
+                    detail: detail.to_string(),
+                },
+            ),
+        ),
+    }
+}
+
+fn linux_vm_patch_apply_completion_event(
+    request_id: &str,
+    sequence: u64,
+    base: runtime_v2::LinuxVmBaseDefinition,
+    patch_id: &str,
+    rollback_id: &str,
+    receipt_id: &str,
+) -> runtime_v2::ApplyLinuxVmPatchEvent {
+    runtime_v2::ApplyLinuxVmPatchEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(runtime_v2::apply_linux_vm_patch_event::Payload::Completion(
+            runtime_v2::ApplyLinuxVmPatchCompletion {
+                base: Some(base),
+                patch_id: patch_id.to_string(),
+                rollback_id: rollback_id.to_string(),
+                receipt_id: receipt_id.to_string(),
+            },
+        )),
+    }
+}
+
+fn linux_vm_patch_rollback_completion_event(
+    request_id: &str,
+    sequence: u64,
+    base: runtime_v2::LinuxVmBaseDefinition,
+    patch_id: &str,
+    rollback_id: &str,
+    receipt_id: &str,
+) -> runtime_v2::RollbackLinuxVmPatchEvent {
+    runtime_v2::RollbackLinuxVmPatchEvent {
+        request_id: request_id.to_string(),
+        sequence,
+        payload: Some(
+            runtime_v2::rollback_linux_vm_patch_event::Payload::Completion(
+                runtime_v2::RollbackLinuxVmPatchCompletion {
+                    base: Some(base),
+                    patch_id: patch_id.to_string(),
+                    rollback_id: rollback_id.to_string(),
+                    receipt_id: receipt_id.to_string(),
+                },
+            ),
+        ),
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct LinuxVmImageDescriptor {
     schema_version: u16,
@@ -280,6 +474,48 @@ struct LinuxVmBaseRecord {
 struct LinuxVmBaseRegistry {
     version: u32,
     bases: BTreeMap<String, LinuxVmBaseRecord>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct LinuxVmPatchBundle {
+    schema_version: u32,
+    patch_id: String,
+    base_id: String,
+    set: LinuxVmPatchSet,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct LinuxVmPatchSet {
+    kernel_path: Option<String>,
+    initramfs_path: Option<String>,
+    version_json_path: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct LinuxVmPatchRollbackSnapshot {
+    rollback_id: String,
+    patch_id: String,
+    base_id: String,
+    previous: LinuxVmBaseRecord,
+    created_at_unix_secs: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct LinuxVmPatchApplyReceiptMetadata {
+    event_type: &'static str,
+    patch_id: String,
+    rollback_id: String,
+    bundle_path: String,
+    base_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct LinuxVmPatchRollbackReceiptMetadata {
+    event_type: &'static str,
+    patch_id: String,
+    rollback_id: String,
+    base_id: String,
 }
 
 impl Default for LinuxVmBaseRegistry {
@@ -466,6 +702,125 @@ fn linux_vm_base_record_to_proto(record: &LinuxVmBaseRecord) -> runtime_v2::Linu
     }
 }
 
+fn parse_linux_vm_patch_bundle(
+    bundle_path: &Path,
+    request_id: &str,
+) -> Result<LinuxVmPatchBundle, MachineError> {
+    let raw = std::fs::read(bundle_path).map_err(|error| {
+        let code = if error.kind() == std::io::ErrorKind::NotFound {
+            MachineErrorCode::NotFound
+        } else {
+            MachineErrorCode::InternalError
+        };
+        MachineError::new(
+            code,
+            format!(
+                "failed to read patch bundle {}: {error}",
+                bundle_path.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )
+    })?;
+    let bundle = serde_json::from_slice::<LinuxVmPatchBundle>(&raw).map_err(|error| {
+        MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!(
+                "failed to parse patch bundle {}: {error}",
+                bundle_path.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )
+    })?;
+    if bundle.schema_version != 1 {
+        return Err(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!(
+                "unsupported linux patch bundle schema_version {}",
+                bundle.schema_version
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ));
+    }
+    if bundle.patch_id.trim().is_empty() {
+        return Err(MachineError::new(
+            MachineErrorCode::ValidationError,
+            "patch_id is required".to_string(),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ));
+    }
+    if bundle.base_id.trim().is_empty() {
+        return Err(MachineError::new(
+            MachineErrorCode::ValidationError,
+            "base_id is required".to_string(),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ));
+    }
+    Ok(bundle)
+}
+
+fn validate_patch_path_field(
+    request_id: &str,
+    field_name: &str,
+    path_value: &str,
+) -> Result<PathBuf, MachineError> {
+    let path = PathBuf::from(path_value.trim());
+    if path.as_os_str().is_empty() {
+        return Err(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!("{field_name} cannot be empty"),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ));
+    }
+    if !path.is_absolute() {
+        return Err(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!("{field_name} must be absolute: {}", path.display()),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ));
+    }
+    if !path.exists() {
+        return Err(MachineError::new(
+            MachineErrorCode::NotFound,
+            format!("{field_name} does not exist: {}", path.display()),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ));
+    }
+    Ok(path)
+}
+
+fn apply_patch_set_to_base(
+    request_id: &str,
+    current: &LinuxVmBaseRecord,
+    patch: &LinuxVmPatchSet,
+    now: u64,
+) -> Result<LinuxVmBaseRecord, MachineError> {
+    let mut next = current.clone();
+    if let Some(kernel_path) = patch.kernel_path.as_deref() {
+        next.kernel_path = validate_patch_path_field(request_id, "kernel_path", kernel_path)?;
+    }
+    if let Some(initramfs_path) = patch.initramfs_path.as_deref() {
+        next.initramfs_path =
+            validate_patch_path_field(request_id, "initramfs_path", initramfs_path)?;
+    }
+    if let Some(version_json_path) = patch.version_json_path.as_deref() {
+        next.version_json_path =
+            validate_patch_path_field(request_id, "version_json_path", version_json_path)?;
+    }
+    if let Some(description) = patch.description.as_ref() {
+        next.description = description.trim().to_string();
+    }
+    next.updated_at_unix_secs = now;
+    Ok(next)
+}
+
 fn attach_request_id(mut error: MachineError, request_id: &str) -> MachineError {
     if error.request_id.is_none() {
         error.request_id = Some(request_id.to_string());
@@ -473,11 +828,29 @@ fn attach_request_id(mut error: MachineError, request_id: &str) -> MachineError 
     error
 }
 
+fn sanitize_id_for_persistence(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+    if sanitized.is_empty() {
+        "patch".to_string()
+    } else {
+        sanitized
+    }
+}
+
 #[tonic::async_trait]
 impl runtime_v2::linux_vm_service_server::LinuxVmService for LinuxVmServiceImpl {
     type ValidateLinuxVmStream = ValidateLinuxVmEventStream;
     type UpsertLinuxVmBaseStream = UpsertLinuxVmBaseEventStream;
     type DeleteLinuxVmBaseStream = DeleteLinuxVmBaseEventStream;
+    type ApplyLinuxVmPatchStream = ApplyLinuxVmPatchEventStream;
+    type RollbackLinuxVmPatchStream = RollbackLinuxVmPatchEventStream;
 
     async fn validate_linux_vm(
         &self,
@@ -767,6 +1140,243 @@ impl runtime_v2::linux_vm_service_server::LinuxVmService for LinuxVmServiceImpl 
             &request_id,
             sequence,
             base_id,
+        )));
+
+        Ok(Response::new(linux_vm_event_stream_from_events(events)))
+    }
+
+    async fn apply_linux_vm_patch(
+        &self,
+        request: Request<runtime_v2::ApplyLinuxVmPatchRequest>,
+    ) -> Result<Response<Self::ApplyLinuxVmPatchStream>, Status> {
+        let intercepted_request_id = request_id_from_extensions(&request);
+        let request = request.into_inner();
+        let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
+        let request_id = metadata.request_id.unwrap_or_else(generate_request_id);
+
+        let bundle_path = PathBuf::from(request.bundle_path.trim());
+        if bundle_path.as_os_str().is_empty() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                "bundle_path is required".to_string(),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        let mut sequence = 1;
+        let mut events = vec![Ok(linux_vm_patch_apply_progress_event(
+            &request_id,
+            sequence,
+            "bundle",
+            "loading linux patch bundle",
+        ))];
+
+        let bundle = parse_linux_vm_patch_bundle(&bundle_path, &request_id)
+            .map_err(status_from_machine_error)?;
+        let now = current_unix_secs();
+        let rollback_id = format!(
+            "lrb-{}-{now}",
+            sanitize_id_for_persistence(&bundle.patch_id)
+        );
+
+        sequence += 1;
+        events.push(Ok(linux_vm_patch_apply_progress_event(
+            &request_id,
+            sequence,
+            "apply",
+            "applying linux patch to base definition",
+        )));
+
+        let mut registry = self
+            .load_linux_vm_base_registry()
+            .map_err(|error| status_from_machine_error(attach_request_id(error, &request_id)))?;
+        let Some(current_base) = registry.bases.get(bundle.base_id.as_str()).cloned() else {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::NotFound,
+                format!("linux vm base {} not found", bundle.base_id),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        };
+        let next_base = apply_patch_set_to_base(&request_id, &current_base, &bundle.set, now)
+            .map_err(status_from_machine_error)?;
+        let rollback_snapshot = LinuxVmPatchRollbackSnapshot {
+            rollback_id: rollback_id.clone(),
+            patch_id: bundle.patch_id.clone(),
+            base_id: bundle.base_id.clone(),
+            previous: current_base,
+            created_at_unix_secs: now,
+        };
+        self.persist_patch_rollback_snapshot(&rollback_snapshot)
+            .map_err(|error| status_from_machine_error(attach_request_id(error, &request_id)))?;
+        registry
+            .bases
+            .insert(next_base.base_id.clone(), next_base.clone());
+        self.persist_linux_vm_base_registry(&registry)
+            .map_err(|error| status_from_machine_error(attach_request_id(error, &request_id)))?;
+
+        let receipt_id = format!("rcp-linux-patch-apply-{now}");
+        let receipt_metadata = serde_json::to_value(LinuxVmPatchApplyReceiptMetadata {
+            event_type: "linux_vm_patch_applied",
+            patch_id: bundle.patch_id.clone(),
+            rollback_id: rollback_id.clone(),
+            bundle_path: bundle_path.display().to_string(),
+            base_id: next_base.base_id.clone(),
+        })
+        .map_err(|error| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::InternalError,
+                format!("failed to serialize patch apply receipt metadata: {error}"),
+                Some(request_id.clone()),
+                BTreeMap::new(),
+            ))
+        })?;
+        let event_patch_id = bundle.patch_id.clone();
+        let event_rollback_id = rollback_id.clone();
+        let event_base_id = next_base.base_id.clone();
+        self.daemon
+            .with_state_store(|store| {
+                store.with_immediate_transaction(|tx| {
+                    tx.emit_event(
+                        LINUX_VM_PATCH_EVENT_STACK,
+                        &StackEvent::LinuxVmPatchApplied {
+                            base_id: event_base_id.clone(),
+                            patch_id: event_patch_id.clone(),
+                            rollback_id: event_rollback_id.clone(),
+                        },
+                    )?;
+                    tx.save_receipt(&Receipt {
+                        receipt_id: receipt_id.clone(),
+                        operation: LINUX_VM_PATCH_APPLY_OPERATION.to_string(),
+                        entity_id: event_base_id.clone(),
+                        entity_type: "linux_vm_base".to_string(),
+                        request_id: request_id.clone(),
+                        status: "success".to_string(),
+                        created_at: now,
+                        metadata: receipt_metadata.clone(),
+                    })?;
+                    Ok(())
+                })
+            })
+            .map_err(|error| status_from_stack_error(error, &request_id))?;
+
+        sequence += 1;
+        events.push(Ok(linux_vm_patch_apply_completion_event(
+            &request_id,
+            sequence,
+            linux_vm_base_record_to_proto(&next_base),
+            event_patch_id.as_str(),
+            event_rollback_id.as_str(),
+            receipt_id.as_str(),
+        )));
+
+        Ok(Response::new(linux_vm_event_stream_from_events(events)))
+    }
+
+    async fn rollback_linux_vm_patch(
+        &self,
+        request: Request<runtime_v2::RollbackLinuxVmPatchRequest>,
+    ) -> Result<Response<Self::RollbackLinuxVmPatchStream>, Status> {
+        let intercepted_request_id = request_id_from_extensions(&request);
+        let request = request.into_inner();
+        let metadata = normalize_metadata(request.metadata.as_ref(), intercepted_request_id);
+        let request_id = metadata.request_id.unwrap_or_else(generate_request_id);
+
+        let rollback_id = request.rollback_id.trim().to_string();
+        if rollback_id.is_empty() {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::ValidationError,
+                "rollback_id is required".to_string(),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+
+        let mut sequence = 1;
+        let mut events = vec![Ok(linux_vm_patch_rollback_progress_event(
+            &request_id,
+            sequence,
+            "rollback",
+            "loading rollback snapshot",
+        ))];
+
+        let snapshot = self
+            .load_patch_rollback_snapshot(rollback_id.as_str())
+            .map_err(|error| status_from_machine_error(attach_request_id(error, &request_id)))?;
+
+        let now = current_unix_secs();
+        let mut registry = self
+            .load_linux_vm_base_registry()
+            .map_err(|error| status_from_machine_error(attach_request_id(error, &request_id)))?;
+        registry
+            .bases
+            .insert(snapshot.base_id.clone(), snapshot.previous.clone());
+        self.persist_linux_vm_base_registry(&registry)
+            .map_err(|error| status_from_machine_error(attach_request_id(error, &request_id)))?;
+        self.delete_patch_rollback_snapshot(rollback_id.as_str())
+            .map_err(|error| status_from_machine_error(attach_request_id(error, &request_id)))?;
+
+        let receipt_id = format!("rcp-linux-patch-rollback-{now}");
+        let receipt_metadata = serde_json::to_value(LinuxVmPatchRollbackReceiptMetadata {
+            event_type: "linux_vm_patch_rolled_back",
+            patch_id: snapshot.patch_id.clone(),
+            rollback_id: snapshot.rollback_id.clone(),
+            base_id: snapshot.base_id.clone(),
+        })
+        .map_err(|error| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::InternalError,
+                format!("failed to serialize patch rollback receipt metadata: {error}"),
+                Some(request_id.clone()),
+                BTreeMap::new(),
+            ))
+        })?;
+        let event_base_id = snapshot.base_id.clone();
+        let event_patch_id = snapshot.patch_id.clone();
+        let event_rollback_id = snapshot.rollback_id.clone();
+        self.daemon
+            .with_state_store(|store| {
+                store.with_immediate_transaction(|tx| {
+                    tx.emit_event(
+                        LINUX_VM_PATCH_EVENT_STACK,
+                        &StackEvent::LinuxVmPatchRolledBack {
+                            base_id: event_base_id.clone(),
+                            patch_id: event_patch_id.clone(),
+                            rollback_id: event_rollback_id.clone(),
+                        },
+                    )?;
+                    tx.save_receipt(&Receipt {
+                        receipt_id: receipt_id.clone(),
+                        operation: LINUX_VM_PATCH_ROLLBACK_OPERATION.to_string(),
+                        entity_id: event_base_id.clone(),
+                        entity_type: "linux_vm_base".to_string(),
+                        request_id: request_id.clone(),
+                        status: "success".to_string(),
+                        created_at: now,
+                        metadata: receipt_metadata.clone(),
+                    })?;
+                    Ok(())
+                })
+            })
+            .map_err(|error| status_from_stack_error(error, &request_id))?;
+
+        sequence += 1;
+        events.push(Ok(linux_vm_patch_rollback_progress_event(
+            &request_id,
+            sequence,
+            "rollback",
+            "restored linux base definition from rollback snapshot",
+        )));
+
+        sequence += 1;
+        events.push(Ok(linux_vm_patch_rollback_completion_event(
+            &request_id,
+            sequence,
+            linux_vm_base_record_to_proto(&snapshot.previous),
+            event_patch_id.as_str(),
+            event_rollback_id.as_str(),
+            receipt_id.as_str(),
         )));
 
         Ok(Response::new(linux_vm_event_stream_from_events(events)))

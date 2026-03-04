@@ -16,26 +16,20 @@ This document maps `vz vm mac` base/validate/patch surfaces to Linux support sta
 |---|---|---|---|
 | `vm linux base` | Initial support shipped | Daemon-owned list/inspect/upsert/delete | Definitions are persisted by `vz-runtimed` and consumed by CLI over gRPC. |
 | `vm linux validate` | Initial support shipped | Daemon-owned descriptor/artifact/backend validation stream | Validation logic executes in daemon, CLI only renders stream output. |
-| `vm linux patch` | Not yet supported | Fail with actionable guidance | No Linux patch bundle workflow implemented yet. |
+| `vm linux patch` | Initial support shipped | Daemon-owned apply/rollback stream with receipt linkage | Patch bundles update base definitions and persist rollback snapshots in daemon runtime data. |
 
 ## Required UX for Unsupported Operations
 
-When invoked, unsupported commands should fail with deterministic guidance:
+Current unsupported gap:
 
-- `vm linux patch`: indicate feature not available and link planned bead.
-
-Failure output requirements:
-
-1. explicit unsupported operation name.
-2. suggested replacement command.
-3. docs path for details.
+- Advanced patch planning/authoring ergonomics (`create`, `verify`, signed bundles) from `vm mac patch`.
 
 ## Planned Supported Operations
 
-1. `vm linux patch`
-- candidate initial scope:
-  - declarative artifact delta apply to descriptor/disks
-  - compatibility validation + rollback receipt
+1. Extend `vm linux patch`
+- candidate follow-up scope:
+  - signed patch bundle verification and trust policy hooks
+  - richer incompatibility diagnostics and dry-run mode
 
 2. Extend `vm linux base`
 - candidate follow-up scope:

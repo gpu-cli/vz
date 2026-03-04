@@ -548,6 +548,87 @@ pub mod delete_linux_vm_base_event {
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ApplyLinuxVmPatchRequest {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<RequestMetadata>,
+    #[prost(string, tag = "2")]
+    pub bundle_path: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RollbackLinuxVmPatchRequest {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<RequestMetadata>,
+    #[prost(string, tag = "2")]
+    pub rollback_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LinuxVmPatchMutationProgress {
+    #[prost(string, tag = "1")]
+    pub phase: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ApplyLinuxVmPatchCompletion {
+    #[prost(message, optional, tag = "1")]
+    pub base: ::core::option::Option<LinuxVmBaseDefinition>,
+    #[prost(string, tag = "2")]
+    pub patch_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub rollback_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub receipt_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RollbackLinuxVmPatchCompletion {
+    #[prost(message, optional, tag = "1")]
+    pub base: ::core::option::Option<LinuxVmBaseDefinition>,
+    #[prost(string, tag = "2")]
+    pub patch_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub rollback_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub receipt_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ApplyLinuxVmPatchEvent {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(oneof = "apply_linux_vm_patch_event::Payload", tags = "3, 4")]
+    pub payload: ::core::option::Option<apply_linux_vm_patch_event::Payload>,
+}
+/// Nested message and enum types in `ApplyLinuxVmPatchEvent`.
+pub mod apply_linux_vm_patch_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "3")]
+        Progress(super::LinuxVmPatchMutationProgress),
+        #[prost(message, tag = "4")]
+        Completion(super::ApplyLinuxVmPatchCompletion),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RollbackLinuxVmPatchEvent {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(oneof = "rollback_linux_vm_patch_event::Payload", tags = "3, 4")]
+    pub payload: ::core::option::Option<rollback_linux_vm_patch_event::Payload>,
+}
+/// Nested message and enum types in `RollbackLinuxVmPatchEvent`.
+pub mod rollback_linux_vm_patch_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "3")]
+        Progress(super::LinuxVmPatchMutationProgress),
+        #[prost(message, tag = "4")]
+        Completion(super::RollbackLinuxVmPatchCompletion),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OpenLeaseRequest {
     #[prost(message, optional, tag = "1")]
     pub metadata: ::core::option::Option<RequestMetadata>,
@@ -2387,6 +2468,61 @@ pub mod linux_vm_service_client {
             req.extensions_mut()
                 .insert(
                     GrpcMethod::new("vz.runtime.v2.LinuxVmService", "DeleteLinuxVmBase"),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
+        pub async fn apply_linux_vm_patch(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ApplyLinuxVmPatchRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::ApplyLinuxVmPatchEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.runtime.v2.LinuxVmService/ApplyLinuxVmPatch",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("vz.runtime.v2.LinuxVmService", "ApplyLinuxVmPatch"),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
+        pub async fn rollback_linux_vm_patch(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RollbackLinuxVmPatchRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::RollbackLinuxVmPatchEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.runtime.v2.LinuxVmService/RollbackLinuxVmPatch",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "vz.runtime.v2.LinuxVmService",
+                        "RollbackLinuxVmPatch",
+                    ),
                 );
             self.inner.server_streaming(req, path, codec).await
         }
@@ -5551,6 +5687,35 @@ pub mod linux_vm_service_server {
             tonic::Response<Self::DeleteLinuxVmBaseStream>,
             tonic::Status,
         >;
+        /// Server streaming response type for the ApplyLinuxVmPatch method.
+        type ApplyLinuxVmPatchStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::ApplyLinuxVmPatchEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn apply_linux_vm_patch(
+            &self,
+            request: tonic::Request<super::ApplyLinuxVmPatchRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::ApplyLinuxVmPatchStream>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the RollbackLinuxVmPatch method.
+        type RollbackLinuxVmPatchStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<
+                    super::RollbackLinuxVmPatchEvent,
+                    tonic::Status,
+                >,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn rollback_linux_vm_patch(
+            &self,
+            request: tonic::Request<super::RollbackLinuxVmPatchRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::RollbackLinuxVmPatchStream>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct LinuxVmServiceServer<T> {
@@ -5849,6 +6014,105 @@ pub mod linux_vm_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = DeleteLinuxVmBaseSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.runtime.v2.LinuxVmService/ApplyLinuxVmPatch" => {
+                    #[allow(non_camel_case_types)]
+                    struct ApplyLinuxVmPatchSvc<T: LinuxVmService>(pub Arc<T>);
+                    impl<
+                        T: LinuxVmService,
+                    > tonic::server::ServerStreamingService<
+                        super::ApplyLinuxVmPatchRequest,
+                    > for ApplyLinuxVmPatchSvc<T> {
+                        type Response = super::ApplyLinuxVmPatchEvent;
+                        type ResponseStream = T::ApplyLinuxVmPatchStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ApplyLinuxVmPatchRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LinuxVmService>::apply_linux_vm_patch(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ApplyLinuxVmPatchSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.runtime.v2.LinuxVmService/RollbackLinuxVmPatch" => {
+                    #[allow(non_camel_case_types)]
+                    struct RollbackLinuxVmPatchSvc<T: LinuxVmService>(pub Arc<T>);
+                    impl<
+                        T: LinuxVmService,
+                    > tonic::server::ServerStreamingService<
+                        super::RollbackLinuxVmPatchRequest,
+                    > for RollbackLinuxVmPatchSvc<T> {
+                        type Response = super::RollbackLinuxVmPatchEvent;
+                        type ResponseStream = T::RollbackLinuxVmPatchStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RollbackLinuxVmPatchRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LinuxVmService>::rollback_linux_vm_patch(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RollbackLinuxVmPatchSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

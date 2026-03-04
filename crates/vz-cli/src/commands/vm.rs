@@ -143,8 +143,8 @@ pub enum LinuxVmCommand {
     Base(LinuxVmBaseArgs),
     /// Validate Linux image descriptor and daemon readiness.
     Validate(LinuxVmValidateArgs),
-    /// Linux patch workflows (planned).
-    Patch(LinuxVmUnsupportedSurfaceArgs),
+    /// Linux patch workflows.
+    Patch(LinuxVmPatchArgs),
     /// Stop a Linux space.
     Stop(LinuxVmStopArgs),
     /// Remove (terminate) a Linux space.
@@ -394,6 +394,49 @@ pub struct LinuxVmBaseDeleteArgs {
     pub state_db: Option<PathBuf>,
 }
 
+/// `vz vm linux patch` arguments.
+#[derive(Args, Debug)]
+pub struct LinuxVmPatchArgs {
+    #[command(subcommand)]
+    pub action: LinuxVmPatchCommand,
+}
+
+/// `vz vm linux patch` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum LinuxVmPatchCommand {
+    /// Apply a Linux patch bundle to a base definition.
+    Apply(LinuxVmPatchApplyArgs),
+    /// Roll back a previously applied Linux patch.
+    Rollback(LinuxVmPatchRollbackArgs),
+}
+
+/// Arguments for `vz vm linux patch apply`.
+#[derive(Args, Debug)]
+pub struct LinuxVmPatchApplyArgs {
+    /// Path to patch bundle JSON.
+    #[arg(long)]
+    pub bundle: PathBuf,
+    /// Path to runtime state DB.
+    #[arg(long)]
+    pub state_db: Option<PathBuf>,
+    /// Output payload as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `vz vm linux patch rollback`.
+#[derive(Args, Debug)]
+pub struct LinuxVmPatchRollbackArgs {
+    /// Rollback handle emitted by patch apply.
+    pub rollback_id: String,
+    /// Path to runtime state DB.
+    #[arg(long)]
+    pub state_db: Option<PathBuf>,
+    /// Output payload as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Arguments for `vz vm linux validate`.
 #[derive(Args, Debug)]
 pub struct LinuxVmValidateArgs {
@@ -507,7 +550,7 @@ async fn run_linux(args: LinuxVmArgs) -> anyhow::Result<()> {
         LinuxVmCommand::Restore(restore_args) => run_linux_restore(restore_args).await,
         LinuxVmCommand::Base(base_args) => run_linux_base(base_args).await,
         LinuxVmCommand::Validate(validate_args) => run_linux_validate(validate_args).await,
-        LinuxVmCommand::Patch(_) => run_linux_unsupported_surface("patch"),
+        LinuxVmCommand::Patch(patch_args) => run_linux_patch(patch_args).await,
         LinuxVmCommand::Stop(stop_args) => run_linux_stop(stop_args).await,
         LinuxVmCommand::Rm(rm_args) => run_linux_rm(rm_args).await,
         LinuxVmCommand::Test(test_args) => run_linux_test(test_args).await,
@@ -1564,6 +1607,158 @@ async fn run_linux_base_delete(args: LinuxVmBaseDeleteArgs) -> anyhow::Result<()
 }
 
 #[derive(Debug, Serialize)]
+struct LinuxPatchApplyReport {
+    patch_id: String,
+    rollback_id: String,
+    receipt_id: String,
+    base: LinuxBaseView,
+}
+
+#[derive(Debug, Serialize)]
+struct LinuxPatchRollbackReport {
+    patch_id: String,
+    rollback_id: String,
+    receipt_id: String,
+    base: LinuxBaseView,
+}
+
+async fn run_linux_patch(args: LinuxVmPatchArgs) -> anyhow::Result<()> {
+    match args.action {
+        LinuxVmPatchCommand::Apply(apply_args) => run_linux_patch_apply(apply_args).await,
+        LinuxVmPatchCommand::Rollback(rollback_args) => {
+            run_linux_patch_rollback(rollback_args).await
+        }
+    }
+}
+
+async fn run_linux_patch_apply(args: LinuxVmPatchApplyArgs) -> anyhow::Result<()> {
+    let state_db = args.state_db.unwrap_or_else(default_state_db_path);
+    let mut client = connect_linux_daemon(&state_db).await?;
+    let mut stream = client
+        .apply_linux_vm_patch_stream(runtime_v2::ApplyLinuxVmPatchRequest {
+            metadata: None,
+            bundle_path: args.bundle.display().to_string(),
+        })
+        .await
+        .context("failed to start daemon linux patch apply stream")?;
+
+    let mut completion: Option<runtime_v2::ApplyLinuxVmPatchCompletion> = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .context("failed to read daemon linux patch apply stream")?
+    {
+        if let Some(payload) = event.payload {
+            match payload {
+                runtime_v2::apply_linux_vm_patch_event::Payload::Progress(progress) => {
+                    if !args.json {
+                        println!(
+                            "[INFO] {}: {}",
+                            progress.phase.trim(),
+                            progress.detail.trim()
+                        );
+                    }
+                }
+                runtime_v2::apply_linux_vm_patch_event::Payload::Completion(done) => {
+                    completion = Some(done);
+                }
+            }
+        }
+    }
+
+    let completion = completion
+        .ok_or_else(|| anyhow!("daemon linux patch apply stream ended without completion"))?;
+    let base = completion
+        .base
+        .ok_or_else(|| anyhow!("daemon linux patch apply completion missing base payload"))?;
+    let report = LinuxPatchApplyReport {
+        patch_id: completion.patch_id,
+        rollback_id: completion.rollback_id,
+        receipt_id: completion.receipt_id,
+        base: linux_base_view_from_proto(base),
+    };
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("serialize linux patch apply report")?
+        );
+    } else {
+        println!(
+            "Applied linux patch {} to base {} (rollback_id: {}, receipt: {}).",
+            report.patch_id, report.base.base_id, report.rollback_id, report.receipt_id
+        );
+    }
+    Ok(())
+}
+
+async fn run_linux_patch_rollback(args: LinuxVmPatchRollbackArgs) -> anyhow::Result<()> {
+    let state_db = args.state_db.unwrap_or_else(default_state_db_path);
+    let mut client = connect_linux_daemon(&state_db).await?;
+    let mut stream = client
+        .rollback_linux_vm_patch_stream(runtime_v2::RollbackLinuxVmPatchRequest {
+            metadata: None,
+            rollback_id: args.rollback_id.clone(),
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "failed to start daemon linux patch rollback for {}",
+                args.rollback_id
+            )
+        })?;
+
+    let mut completion: Option<runtime_v2::RollbackLinuxVmPatchCompletion> = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .context("failed to read daemon linux patch rollback stream")?
+    {
+        if let Some(payload) = event.payload {
+            match payload {
+                runtime_v2::rollback_linux_vm_patch_event::Payload::Progress(progress) => {
+                    if !args.json {
+                        println!(
+                            "[INFO] {}: {}",
+                            progress.phase.trim(),
+                            progress.detail.trim()
+                        );
+                    }
+                }
+                runtime_v2::rollback_linux_vm_patch_event::Payload::Completion(done) => {
+                    completion = Some(done);
+                }
+            }
+        }
+    }
+    let completion = completion
+        .ok_or_else(|| anyhow!("daemon linux patch rollback stream ended without completion"))?;
+    let base = completion
+        .base
+        .ok_or_else(|| anyhow!("daemon linux patch rollback completion missing base payload"))?;
+    let report = LinuxPatchRollbackReport {
+        patch_id: completion.patch_id,
+        rollback_id: completion.rollback_id,
+        receipt_id: completion.receipt_id,
+        base: linux_base_view_from_proto(base),
+    };
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .context("serialize linux patch rollback report")?
+        );
+    } else {
+        println!(
+            "Rolled back linux patch {} on base {} (rollback_id: {}, receipt: {}).",
+            report.patch_id, report.base.base_id, report.rollback_id, report.receipt_id
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
 struct LinuxValidateCheck {
     name: String,
     status: String,
@@ -1669,20 +1864,6 @@ async fn run_linux_validate(args: LinuxVmValidateArgs) -> anyhow::Result<()> {
         bail!("linux vm validation failed");
     }
     Ok(())
-}
-
-fn linux_unsupported_surface_guidance(surface: &str) -> anyhow::Error {
-    let replacement = match surface {
-        "patch" => "linux patch workflow is not implemented yet; track planned work via beads",
-        _ => "surface is not implemented for vm linux yet",
-    };
-    anyhow!(
-        "unsupported operation: `vz vm linux {surface}`; {replacement}. See docs/linux-vm-base-validate-patch-parity.md"
-    )
-}
-
-fn run_linux_unsupported_surface(surface: &str) -> anyhow::Result<()> {
-    Err(linux_unsupported_surface_guidance(surface))
 }
 
 async fn run_linux_stop(args: LinuxVmStopArgs) -> anyhow::Result<()> {
@@ -2037,13 +2218,6 @@ mod tests {
     fn normalize_linux_checkpoint_class_rejects_unknown_values() {
         let error = normalize_linux_checkpoint_class("snapshot").expect_err("unknown class");
         assert!(error.to_string().contains("unknown checkpoint class"));
-    }
-
-    #[test]
-    fn linux_unsupported_surface_guidance_mentions_replacement_and_docs() {
-        let message = linux_unsupported_surface_guidance("patch").to_string();
-        assert!(message.contains("vz vm linux patch"));
-        assert!(message.contains("docs/linux-vm-base-validate-patch-parity.md"));
     }
 
     #[test]
