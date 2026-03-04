@@ -73,10 +73,7 @@ fn client_config(tmp: &tempfile::TempDir, auto_spawn: bool) -> DaemonClientConfi
 }
 
 fn required_sandbox_labels(tmp: &tempfile::TempDir) -> HashMap<String, String> {
-    HashMap::from([(
-        "project_dir".to_string(),
-        tmp.path().display().to_string(),
-    )])
+    HashMap::from([("project_dir".to_string(), tmp.path().display().to_string())])
 }
 
 fn assert_grpc_status_in(error: DaemonClientError, expected: &[Code]) {

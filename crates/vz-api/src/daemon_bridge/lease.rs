@@ -76,7 +76,7 @@ pub(crate) async fn try_open_lease_via_daemon(
             Some(response)
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -126,7 +126,7 @@ pub(crate) async fn try_list_leases_via_daemon(
                 .into_response(),
         ),
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -184,7 +184,7 @@ pub(crate) async fn try_get_lease_via_daemon(
             )
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -253,7 +253,7 @@ pub(crate) async fn try_close_lease_via_daemon(
             Some(response)
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -311,7 +311,7 @@ pub(crate) async fn try_heartbeat_lease_via_daemon(
             )
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,

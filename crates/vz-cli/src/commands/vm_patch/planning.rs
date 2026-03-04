@@ -119,9 +119,7 @@ fn create_inline_mode_requested(args: &CreateArgs) -> bool {
 
 type InlineCreateInputs = (Vec<PatchOperation>, Vec<(String, Vec<u8>)>);
 
-fn build_inline_create_inputs(
-    args: &CreateArgs,
-) -> anyhow::Result<InlineCreateInputs> {
+fn build_inline_create_inputs(args: &CreateArgs) -> anyhow::Result<InlineCreateInputs> {
     let mut operations = Vec::new();
     let mut payload_by_digest = BTreeMap::<String, Vec<u8>>::new();
 

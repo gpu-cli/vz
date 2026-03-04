@@ -54,7 +54,7 @@ pub(crate) async fn try_read_file_via_daemon(
                 .into_response(),
         ),
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -148,7 +148,7 @@ pub(crate) async fn try_write_file_via_daemon(
             Some(response)
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -216,7 +216,7 @@ pub(crate) async fn try_list_files_via_daemon(
                 .into_response(),
         ),
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -296,7 +296,7 @@ pub(crate) async fn try_make_dir_via_daemon(
             Some(response)
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -376,7 +376,7 @@ pub(crate) async fn try_remove_path_via_daemon(
             Some(response)
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -457,7 +457,7 @@ pub(crate) async fn try_move_path_via_daemon(
             Some(response)
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -538,7 +538,7 @@ pub(crate) async fn try_copy_path_via_daemon(
             Some(response)
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -618,7 +618,7 @@ pub(crate) async fn try_chmod_path_via_daemon(
             Some(response)
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -699,7 +699,7 @@ pub(crate) async fn try_chown_path_via_daemon(
             Some(response)
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,

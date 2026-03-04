@@ -86,7 +86,7 @@ pub(crate) async fn try_apply_stack_via_daemon(
             Some(response)
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -169,7 +169,7 @@ pub(crate) async fn try_teardown_stack_via_daemon(
             Some(response)
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -224,7 +224,7 @@ pub(crate) async fn try_get_stack_status_via_daemon(
                 .into_response(),
         ),
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -288,7 +288,7 @@ pub(crate) async fn try_list_stack_events_via_daemon(
                 .into_response(),
         ),
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -349,7 +349,7 @@ pub(crate) async fn try_get_stack_logs_via_daemon(
                 .into_response(),
         ),
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -440,7 +440,7 @@ pub(crate) async fn try_stack_service_action_via_daemon(
             Some(response)
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -516,7 +516,7 @@ pub(crate) async fn try_create_stack_run_container_via_daemon(
             )
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -592,7 +592,7 @@ pub(crate) async fn try_remove_stack_run_container_via_daemon(
             )
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,

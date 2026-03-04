@@ -106,7 +106,7 @@ pub(crate) async fn try_create_execution_via_daemon(
             Some(response)
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -156,7 +156,7 @@ pub(crate) async fn try_list_executions_via_daemon(
                 .into_response(),
         ),
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -214,7 +214,7 @@ pub(crate) async fn try_get_execution_via_daemon(
             )
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -283,7 +283,7 @@ pub(crate) async fn try_cancel_execution_via_daemon(
             Some(response)
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -344,7 +344,7 @@ pub(crate) async fn try_resize_execution_via_daemon(
             )
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -436,7 +436,7 @@ pub(crate) async fn try_write_execution_stdin_via_daemon(
                     "[vz-api exec-control] write_exec_stdin daemon grpc error request_id={request_id} execution_id={execution_id} status={status}"
                 );
             }
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => {
             if debug {
@@ -503,7 +503,7 @@ pub(crate) async fn try_signal_execution_via_daemon(
             )
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -538,7 +538,7 @@ pub(crate) async fn open_execution_output_stream_via_daemon(
         })
         .await
         .map_err(|error| match error {
-            DaemonClientError::Grpc(status) => daemon_status_to_http_response(status, request_id),
+            DaemonClientError::Grpc(status) => daemon_status_to_http_response(*status, request_id),
             other => json_error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "daemon_unavailable",

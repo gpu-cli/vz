@@ -56,7 +56,7 @@ pub(crate) async fn try_list_events_via_daemon(
             )
         }
         Err(DaemonClientError::Grpc(status)) => {
-            Some(daemon_status_to_http_response(status, request_id))
+            Some(daemon_status_to_http_response(*status, request_id))
         }
         Err(error) => Some(json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -94,7 +94,7 @@ pub(crate) async fn open_event_stream_via_daemon(
         })
         .await
         .map_err(|error| match error {
-            DaemonClientError::Grpc(status) => daemon_status_to_http_response(status, request_id),
+            DaemonClientError::Grpc(status) => daemon_status_to_http_response(*status, request_id),
             other => json_error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "daemon_unavailable",

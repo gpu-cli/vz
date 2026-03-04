@@ -5,7 +5,8 @@
 //! - `manifest` — Dump the current cohort manifest as JSON.
 //! - `list`     — List images, scenarios, and matrix sizes per tier.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -13,8 +14,9 @@ use clap::{Args, Subcommand};
 use tracing::info;
 
 use vz_validation::{
-    CohortManifest, ExecOutput, MockAdapter, OciRuntimeAdapter, RuntimeAdapter, ScenarioRunner,
-    StressConfig, StressReport, TestReport, default_manifest, stress_scenario,
+    CohortManifest, ExecOutput, FailureCategory, MockAdapter, OciRuntimeAdapter, RuntimeAdapter,
+    ScenarioRunner, StressConfig, StressReport, TestReport, classify_failure_category,
+    default_manifest, stress_scenario,
 };
 
 /// Validate OCI image cohorts with tiered test suites.
@@ -32,6 +34,8 @@ pub enum ValidateCommand {
     Manifest(ManifestArgs),
     /// List images, scenarios, and test matrix for each tier.
     List(ListArgs),
+    /// Run external Dockerfile compatibility build sweep cases.
+    SweepBuild(SweepBuildArgs),
 }
 
 /// Arguments for `vz validate run`.
@@ -82,12 +86,37 @@ pub struct ListArgs {
     pub json: bool,
 }
 
+/// Arguments for `vz validate sweep-build`.
+#[derive(Debug, Args)]
+pub struct SweepBuildArgs {
+    /// Path to sweep case manifest JSON.
+    #[arg(long)]
+    pub manifest: PathBuf,
+
+    /// Repository root used for relative case paths (defaults to cwd).
+    #[arg(long)]
+    pub repo_root: Option<PathBuf>,
+
+    /// Only resolve and report context/dockerfile mapping, do not run builds.
+    #[arg(long, default_value = "false")]
+    pub dry_run: bool,
+
+    /// Continue processing all cases after failures.
+    #[arg(long, default_value = "true")]
+    pub continue_on_error: bool,
+
+    /// Output report as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Entry point for `vz validate`.
 pub async fn run(args: ValidateArgs) -> Result<()> {
     match args.action {
         ValidateCommand::Run(args) => cmd_run(args),
         ValidateCommand::Manifest(args) => cmd_manifest(args),
         ValidateCommand::List(args) => cmd_list(args),
+        ValidateCommand::SweepBuild(args) => cmd_sweep_build(args).await,
     }
 }
 
@@ -434,6 +463,317 @@ fn cmd_list(args: ListArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct BuildSweepManifest {
+    cases: Vec<BuildSweepCase>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BuildSweepCase {
+    id: String,
+    dockerfile: PathBuf,
+    #[serde(default)]
+    context: Option<PathBuf>,
+    #[serde(default)]
+    repo_root: Option<PathBuf>,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    build_args: BTreeMap<String, String>,
+    #[serde(default)]
+    target: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BuildSweepStatus {
+    Passed,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BuildSweepCaseResult {
+    id: String,
+    status: BuildSweepStatus,
+    context_dir: String,
+    dockerfile: String,
+    tag: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_category: Option<FailureCategory>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BuildSweepReport {
+    total: usize,
+    passed: usize,
+    failed: usize,
+    skipped: usize,
+    results: Vec<BuildSweepCaseResult>,
+}
+
+#[derive(Debug)]
+struct ResolvedBuildSweepCase {
+    id: String,
+    context_dir: PathBuf,
+    dockerfile: PathBuf,
+    tag: String,
+    build_args: Vec<String>,
+    target: Option<String>,
+}
+
+async fn cmd_sweep_build(args: SweepBuildArgs) -> Result<()> {
+    let manifest_text = std::fs::read_to_string(&args.manifest)
+        .with_context(|| format!("failed to read manifest {}", args.manifest.display()))?;
+    let manifest: BuildSweepManifest =
+        serde_json::from_str(&manifest_text).context("failed to parse sweep manifest JSON")?;
+    if manifest.cases.is_empty() {
+        bail!("sweep manifest contains no cases");
+    }
+
+    let default_repo_root = if let Some(path) = args.repo_root {
+        canonicalize_existing_dir(&path)?
+    } else {
+        std::env::current_dir().context("failed to resolve current directory")?
+    };
+
+    let mut report = BuildSweepReport {
+        total: manifest.cases.len(),
+        passed: 0,
+        failed: 0,
+        skipped: 0,
+        results: Vec::with_capacity(manifest.cases.len()),
+    };
+
+    for case in manifest.cases {
+        let resolved = resolve_build_sweep_case(&case, &default_repo_root);
+        let result = match resolved {
+            Ok(resolved) => run_build_sweep_case(resolved, args.dry_run).await,
+            Err(error) => BuildSweepCaseResult {
+                id: case.id.clone(),
+                status: BuildSweepStatus::Failed,
+                context_dir: String::new(),
+                dockerfile: String::new(),
+                tag: case.tag.unwrap_or_else(|| sweep_case_tag(case.id.as_str())),
+                failure_category: Some(classify_failure_category(&error.to_string())),
+                message: Some(error.to_string()),
+            },
+        };
+
+        match result.status {
+            BuildSweepStatus::Passed => report.passed += 1,
+            BuildSweepStatus::Failed => report.failed += 1,
+            BuildSweepStatus::Skipped => report.skipped += 1,
+        }
+
+        if matches!(result.status, BuildSweepStatus::Failed) && !args.continue_on_error {
+            report.results.push(result);
+            break;
+        }
+
+        report.results.push(result);
+    }
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("failed to serialize sweep report")?
+        );
+    } else {
+        print_build_sweep_report(&report);
+    }
+
+    if report.failed > 0 {
+        bail!(
+            "build sweep failed: {} of {} cases failed",
+            report.failed,
+            report.results.len()
+        );
+    }
+    Ok(())
+}
+
+fn resolve_build_sweep_case(
+    case: &BuildSweepCase,
+    default_repo_root: &Path,
+) -> Result<ResolvedBuildSweepCase> {
+    let repo_root = if let Some(root) = &case.repo_root {
+        if root.is_absolute() {
+            canonicalize_existing_dir(root)?
+        } else {
+            canonicalize_existing_dir(&default_repo_root.join(root))?
+        }
+    } else {
+        canonicalize_existing_dir(default_repo_root)?
+    };
+
+    let dockerfile_abs = if case.dockerfile.is_absolute() {
+        case.dockerfile.clone()
+    } else {
+        repo_root.join(&case.dockerfile)
+    };
+    let dockerfile_abs = canonicalize_existing_file(&dockerfile_abs)?;
+
+    let context_input = case.context.as_ref().map(PathBuf::from).unwrap_or_else(|| {
+        case.dockerfile
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    });
+    let context_abs = if context_input.is_absolute() {
+        canonicalize_existing_dir(&context_input)?
+    } else {
+        canonicalize_existing_dir(&repo_root.join(context_input))?
+    };
+
+    let dockerfile_relative = dockerfile_abs.strip_prefix(&context_abs).map_err(|_| {
+        anyhow::anyhow!(
+            "dockerfile {} must be within context {}",
+            dockerfile_abs.display(),
+            context_abs.display()
+        )
+    })?;
+
+    let tag = case
+        .tag
+        .clone()
+        .unwrap_or_else(|| sweep_case_tag(case.id.as_str()));
+    let build_args = case
+        .build_args
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+
+    Ok(ResolvedBuildSweepCase {
+        id: case.id.clone(),
+        context_dir: context_abs,
+        dockerfile: dockerfile_relative.to_path_buf(),
+        tag,
+        build_args,
+        target: case.target.clone(),
+    })
+}
+
+async fn run_build_sweep_case(case: ResolvedBuildSweepCase, dry_run: bool) -> BuildSweepCaseResult {
+    if dry_run {
+        return BuildSweepCaseResult {
+            id: case.id,
+            status: BuildSweepStatus::Skipped,
+            context_dir: case.context_dir.display().to_string(),
+            dockerfile: case.dockerfile.display().to_string(),
+            tag: case.tag,
+            failure_category: None,
+            message: Some("dry-run".to_string()),
+        };
+    }
+
+    let build_args = super::build::BuildArgs {
+        subcommand: None,
+        context: case.context_dir.clone(),
+        tag: Some(case.tag.clone()),
+        dockerfile: case.dockerfile.clone(),
+        target: case.target.clone(),
+        build_args: case.build_args.clone(),
+        secrets: Vec::new(),
+        no_cache: false,
+        push: false,
+        output: None,
+        progress: super::build::ProgressArg::Plain,
+        opts: super::oci::ContainerOpts::default(),
+    };
+
+    let result = super::build::run(build_args).await;
+    match result {
+        Ok(()) => BuildSweepCaseResult {
+            id: case.id,
+            status: BuildSweepStatus::Passed,
+            context_dir: case.context_dir.display().to_string(),
+            dockerfile: case.dockerfile.display().to_string(),
+            tag: case.tag,
+            failure_category: None,
+            message: None,
+        },
+        Err(error) => {
+            let message = error.to_string();
+            BuildSweepCaseResult {
+                id: case.id,
+                status: BuildSweepStatus::Failed,
+                context_dir: case.context_dir.display().to_string(),
+                dockerfile: case.dockerfile.display().to_string(),
+                tag: case.tag,
+                failure_category: Some(classify_failure_category(&message)),
+                message: Some(message),
+            }
+        }
+    }
+}
+
+fn print_build_sweep_report(report: &BuildSweepReport) {
+    println!(
+        "Build sweep: total={} passed={} failed={} skipped={}",
+        report.total, report.passed, report.failed, report.skipped
+    );
+    for result in &report.results {
+        let status = match result.status {
+            BuildSweepStatus::Passed => "PASS",
+            BuildSweepStatus::Failed => "FAIL",
+            BuildSweepStatus::Skipped => "SKIP",
+        };
+        println!(
+            "  [{status}] {id} context={} dockerfile={} tag={}",
+            result.context_dir,
+            result.dockerfile,
+            result.tag,
+            id = result.id
+        );
+        if let Some(category) = result.failure_category {
+            println!("         category={}", category.label());
+        }
+        if let Some(message) = &result.message {
+            println!("         {message}");
+        }
+    }
+}
+
+fn canonicalize_existing_dir(path: &Path) -> Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("path does not exist: {}", path.display()))?;
+    if !canonical.is_dir() {
+        bail!("path is not a directory: {}", canonical.display());
+    }
+    Ok(canonical)
+}
+
+fn canonicalize_existing_file(path: &Path) -> Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("path does not exist: {}", path.display()))?;
+    if !canonical.is_file() {
+        bail!("path is not a file: {}", canonical.display());
+    }
+    Ok(canonical)
+}
+
+fn sweep_case_tag(id: &str) -> String {
+    let mut sanitized = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    sanitized.truncate(64);
+    if sanitized.trim_matches('-').is_empty() {
+        "sweep-case".to_string()
+    } else {
+        format!("vz-sweep:{sanitized}")
+    }
+}
+
 #[derive(serde::Serialize)]
 struct TierInfo {
     tier: String,
@@ -540,5 +880,56 @@ mod tests {
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("tier-1-smoke"));
         assert!(json.contains("matrix_size"));
+    }
+
+    #[test]
+    fn resolve_build_sweep_case_defaults_context_to_dockerfile_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let docker_dir = repo.join("docker-stacks").join("binder");
+        std::fs::create_dir_all(&docker_dir).unwrap();
+        std::fs::write(docker_dir.join("Dockerfile"), "FROM alpine:3.20\n").unwrap();
+
+        let case = BuildSweepCase {
+            id: "binder-default".to_string(),
+            dockerfile: PathBuf::from("docker-stacks/binder/Dockerfile"),
+            context: None,
+            repo_root: None,
+            tag: None,
+            build_args: BTreeMap::new(),
+            target: None,
+        };
+
+        let resolved = resolve_build_sweep_case(&case, &repo).unwrap();
+        assert_eq!(resolved.context_dir, docker_dir.canonicalize().unwrap());
+        assert_eq!(resolved.dockerfile, PathBuf::from("Dockerfile"));
+    }
+
+    #[test]
+    fn resolve_build_sweep_case_honors_explicit_context_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let docker_dir = repo.join("docker-stacks").join("binder");
+        std::fs::create_dir_all(repo.join("binder")).unwrap();
+        std::fs::create_dir_all(&docker_dir).unwrap();
+        std::fs::write(repo.join("binder").join("README.ipynb"), "notebook").unwrap();
+        std::fs::write(docker_dir.join("Dockerfile"), "FROM alpine:3.20\n").unwrap();
+
+        let case = BuildSweepCase {
+            id: "binder-root-context".to_string(),
+            dockerfile: PathBuf::from("docker-stacks/binder/Dockerfile"),
+            context: Some(PathBuf::from(".")),
+            repo_root: None,
+            tag: None,
+            build_args: BTreeMap::new(),
+            target: None,
+        };
+
+        let resolved = resolve_build_sweep_case(&case, &repo).unwrap();
+        assert_eq!(resolved.context_dir, repo.canonicalize().unwrap());
+        assert_eq!(
+            resolved.dockerfile,
+            PathBuf::from("docker-stacks/binder/Dockerfile")
+        );
     }
 }
