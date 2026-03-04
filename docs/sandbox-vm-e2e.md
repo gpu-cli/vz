@@ -214,7 +214,7 @@ Or run from macOS host into a local `vz` VM (no SSH) using VM control socket:
   --vm-name vz-linux-test \
   --guest-repo /workspace/vz \
   --auto-start \
-  --vm-image ~/.vz/images/linux-test.img \
+  --vm-image ~/.vz/images/<mac-vm-image>.img \
   --mount repo:/Users/$USER/workspace/jl/vz \
   --workspace /mnt/vz-btrfs \
   --profile release
@@ -230,7 +230,9 @@ What this flow validates:
 
 - `vz-runtimed` starts and owns runtime state.
 - `vz-api` routes to daemon over UDS.
-- high-level `vz` CLI (`create`, `ls`, `inspect`, `rm`) works via `api-http` transport.
+- high-level `vz` CLI (`create`, `ls`, `inspect`) works via `api-http` transport.
+- `vz vm linux` daemon lifecycle flows (`list`, `inspect`, streamed `exec`, `stop`, `rm`) work via daemon gRPC transport.
+- streamed exec output and non-zero exit code propagation are validated (`exit 7` test case).
 - final sandbox state is `terminated`.
 
 Artifacts are written under:
