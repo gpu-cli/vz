@@ -139,8 +139,8 @@ pub enum LinuxVmCommand {
     Save(LinuxVmSaveArgs),
     /// Restore a Linux space from a checkpoint.
     Restore(LinuxVmRestoreArgs),
-    /// Linux base image management (planned).
-    Base(LinuxVmUnsupportedSurfaceArgs),
+    /// Linux base image definition management.
+    Base(LinuxVmBaseArgs),
     /// Validate Linux image descriptor and daemon readiness.
     Validate(LinuxVmValidateArgs),
     /// Linux patch workflows (planned).
@@ -315,6 +315,85 @@ pub struct LinuxVmUnsupportedSurfaceArgs {
     pub _args: Vec<String>,
 }
 
+/// `vz vm linux base` arguments.
+#[derive(Args, Debug)]
+pub struct LinuxVmBaseArgs {
+    #[command(subcommand)]
+    pub action: LinuxVmBaseCommand,
+}
+
+/// `vz vm linux base` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum LinuxVmBaseCommand {
+    /// List daemon-managed Linux base definitions.
+    List(LinuxVmBaseListArgs),
+    /// Inspect a single daemon-managed Linux base definition.
+    Inspect(LinuxVmBaseInspectArgs),
+    /// Create or update a daemon-managed Linux base definition.
+    Upsert(LinuxVmBaseUpsertArgs),
+    /// Delete a daemon-managed Linux base definition.
+    Delete(LinuxVmBaseDeleteArgs),
+}
+
+/// Arguments for `vz vm linux base list`.
+#[derive(Args, Debug)]
+pub struct LinuxVmBaseListArgs {
+    /// Path to runtime state DB.
+    #[arg(long)]
+    pub state_db: Option<PathBuf>,
+    /// Output payload as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `vz vm linux base inspect`.
+#[derive(Args, Debug)]
+pub struct LinuxVmBaseInspectArgs {
+    /// Base definition identifier.
+    pub base_id: String,
+    /// Path to runtime state DB.
+    #[arg(long)]
+    pub state_db: Option<PathBuf>,
+    /// Output payload as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `vz vm linux base upsert`.
+#[derive(Args, Debug)]
+pub struct LinuxVmBaseUpsertArgs {
+    /// Base definition identifier.
+    pub base_id: String,
+    /// Absolute kernel artifact path.
+    #[arg(long)]
+    pub kernel: PathBuf,
+    /// Absolute initramfs artifact path.
+    #[arg(long)]
+    pub initramfs: PathBuf,
+    /// Absolute version metadata JSON path.
+    #[arg(long)]
+    pub version_json: PathBuf,
+    /// Optional free-form description.
+    #[arg(long, default_value = "")]
+    pub description: String,
+    /// Path to runtime state DB.
+    #[arg(long)]
+    pub state_db: Option<PathBuf>,
+    /// Output payload as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `vz vm linux base delete`.
+#[derive(Args, Debug)]
+pub struct LinuxVmBaseDeleteArgs {
+    /// Base definition identifier.
+    pub base_id: String,
+    /// Path to runtime state DB.
+    #[arg(long)]
+    pub state_db: Option<PathBuf>,
+}
+
 /// Arguments for `vz vm linux validate`.
 #[derive(Args, Debug)]
 pub struct LinuxVmValidateArgs {
@@ -426,7 +505,7 @@ async fn run_linux(args: LinuxVmArgs) -> anyhow::Result<()> {
         LinuxVmCommand::Exec(exec_args) => run_linux_exec(exec_args).await,
         LinuxVmCommand::Save(save_args) => run_linux_save(save_args).await,
         LinuxVmCommand::Restore(restore_args) => run_linux_restore(restore_args).await,
-        LinuxVmCommand::Base(_) => run_linux_unsupported_surface("base"),
+        LinuxVmCommand::Base(base_args) => run_linux_base(base_args).await,
         LinuxVmCommand::Validate(validate_args) => run_linux_validate(validate_args).await,
         LinuxVmCommand::Patch(_) => run_linux_unsupported_surface("patch"),
         LinuxVmCommand::Stop(stop_args) => run_linux_stop(stop_args).await,
@@ -1288,6 +1367,203 @@ async fn run_linux_restore(args: LinuxVmRestoreArgs) -> anyhow::Result<()> {
 }
 
 #[derive(Debug, Serialize)]
+struct LinuxBaseView {
+    base_id: String,
+    kernel_path: String,
+    initramfs_path: String,
+    version_json_path: String,
+    description: String,
+    updated_at_unix_secs: u64,
+}
+
+fn linux_base_view_from_proto(base: runtime_v2::LinuxVmBaseDefinition) -> LinuxBaseView {
+    LinuxBaseView {
+        base_id: base.base_id,
+        kernel_path: base.kernel_path,
+        initramfs_path: base.initramfs_path,
+        version_json_path: base.version_json_path,
+        description: base.description,
+        updated_at_unix_secs: base.updated_at_unix_secs,
+    }
+}
+
+async fn run_linux_base(args: LinuxVmBaseArgs) -> anyhow::Result<()> {
+    match args.action {
+        LinuxVmBaseCommand::List(list_args) => run_linux_base_list(list_args).await,
+        LinuxVmBaseCommand::Inspect(inspect_args) => run_linux_base_inspect(inspect_args).await,
+        LinuxVmBaseCommand::Upsert(upsert_args) => run_linux_base_upsert(upsert_args).await,
+        LinuxVmBaseCommand::Delete(delete_args) => run_linux_base_delete(delete_args).await,
+    }
+}
+
+async fn run_linux_base_list(args: LinuxVmBaseListArgs) -> anyhow::Result<()> {
+    let state_db = args.state_db.unwrap_or_else(default_state_db_path);
+    let mut client = connect_linux_daemon(&state_db).await?;
+    let response = client
+        .list_linux_vm_bases(runtime_v2::ListLinuxVmBasesRequest { metadata: None })
+        .await
+        .context("failed to list linux vm bases via daemon")?;
+    let bases = response
+        .bases
+        .into_iter()
+        .map(linux_base_view_from_proto)
+        .collect::<Vec<_>>();
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&bases).context("serialize linux base list")?
+        );
+        return Ok(());
+    }
+
+    if bases.is_empty() {
+        println!("No linux base definitions found.");
+        return Ok(());
+    }
+    for base in bases {
+        println!(
+            "{}  kernel={}  initramfs={}  version_json={}",
+            base.base_id, base.kernel_path, base.initramfs_path, base.version_json_path
+        );
+    }
+    Ok(())
+}
+
+async fn run_linux_base_inspect(args: LinuxVmBaseInspectArgs) -> anyhow::Result<()> {
+    let state_db = args.state_db.unwrap_or_else(default_state_db_path);
+    let mut client = connect_linux_daemon(&state_db).await?;
+    let response = client
+        .get_linux_vm_base(runtime_v2::GetLinuxVmBaseRequest {
+            metadata: None,
+            base_id: args.base_id.clone(),
+        })
+        .await
+        .with_context(|| format!("failed to inspect linux vm base {}", args.base_id))?;
+    let base = response
+        .base
+        .ok_or_else(|| anyhow!("daemon get_linux_vm_base missing base payload"))?;
+    let base = linux_base_view_from_proto(base);
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&base).context("serialize linux base")?
+        );
+        return Ok(());
+    }
+    println!("base_id: {}", base.base_id);
+    println!("kernel_path: {}", base.kernel_path);
+    println!("initramfs_path: {}", base.initramfs_path);
+    println!("version_json_path: {}", base.version_json_path);
+    println!("description: {}", base.description);
+    println!("updated_at_unix_secs: {}", base.updated_at_unix_secs);
+    Ok(())
+}
+
+async fn run_linux_base_upsert(args: LinuxVmBaseUpsertArgs) -> anyhow::Result<()> {
+    let state_db = args.state_db.unwrap_or_else(default_state_db_path);
+    let mut client = connect_linux_daemon(&state_db).await?;
+    let mut stream = client
+        .upsert_linux_vm_base_stream(runtime_v2::UpsertLinuxVmBaseRequest {
+            metadata: None,
+            base: Some(runtime_v2::LinuxVmBaseDefinition {
+                base_id: args.base_id,
+                kernel_path: args.kernel.display().to_string(),
+                initramfs_path: args.initramfs.display().to_string(),
+                version_json_path: args.version_json.display().to_string(),
+                description: args.description,
+                updated_at_unix_secs: 0,
+            }),
+        })
+        .await
+        .context("failed to start daemon linux base upsert stream")?;
+
+    let mut completion: Option<runtime_v2::UpsertLinuxVmBaseCompletion> = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .context("failed to read daemon linux base upsert stream")?
+    {
+        if let Some(payload) = event.payload {
+            match payload {
+                runtime_v2::upsert_linux_vm_base_event::Payload::Progress(progress) => {
+                    if !args.json {
+                        println!(
+                            "[INFO] {}: {}",
+                            progress.phase.trim(),
+                            progress.detail.trim()
+                        );
+                    }
+                }
+                runtime_v2::upsert_linux_vm_base_event::Payload::Completion(done) => {
+                    completion = Some(done);
+                }
+            }
+        }
+    }
+    let completion = completion
+        .ok_or_else(|| anyhow!("daemon linux base upsert stream ended without completion"))?;
+    let base = completion
+        .base
+        .ok_or_else(|| anyhow!("daemon linux base upsert completion missing base payload"))?;
+    let base = linux_base_view_from_proto(base);
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&base).context("serialize linux base")?
+        );
+    } else {
+        println!("Upserted linux base {}.", base.base_id);
+    }
+    Ok(())
+}
+
+async fn run_linux_base_delete(args: LinuxVmBaseDeleteArgs) -> anyhow::Result<()> {
+    let state_db = args.state_db.unwrap_or_else(default_state_db_path);
+    let mut client = connect_linux_daemon(&state_db).await?;
+    let mut stream = client
+        .delete_linux_vm_base_stream(runtime_v2::DeleteLinuxVmBaseRequest {
+            metadata: None,
+            base_id: args.base_id.clone(),
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "failed to start daemon linux base delete for {}",
+                args.base_id
+            )
+        })?;
+
+    let mut deleted_base_id: Option<String> = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .context("failed to read daemon linux base delete stream")?
+    {
+        if let Some(payload) = event.payload {
+            match payload {
+                runtime_v2::delete_linux_vm_base_event::Payload::Progress(progress) => {
+                    println!(
+                        "[INFO] {}: {}",
+                        progress.phase.trim(),
+                        progress.detail.trim()
+                    );
+                }
+                runtime_v2::delete_linux_vm_base_event::Payload::Completion(done) => {
+                    deleted_base_id = Some(done.base_id);
+                }
+            }
+        }
+    }
+    let deleted_base_id = deleted_base_id
+        .ok_or_else(|| anyhow!("daemon linux base delete stream ended without completion"))?;
+    println!("Deleted linux base {}.", deleted_base_id);
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
 struct LinuxValidateCheck {
     name: String,
     status: String,
@@ -1397,7 +1673,6 @@ async fn run_linux_validate(args: LinuxVmValidateArgs) -> anyhow::Result<()> {
 
 fn linux_unsupported_surface_guidance(surface: &str) -> anyhow::Error {
     let replacement = match surface {
-        "base" => "use `vz vm linux init --name <name>` for image/descriptor preparation",
         "patch" => "linux patch workflow is not implemented yet; track planned work via beads",
         _ => "surface is not implemented for vm linux yet",
     };
@@ -1766,11 +2041,9 @@ mod tests {
 
     #[test]
     fn linux_unsupported_surface_guidance_mentions_replacement_and_docs() {
-        for surface in ["base", "patch"] {
-            let message = linux_unsupported_surface_guidance(surface).to_string();
-            assert!(message.contains(&format!("vz vm linux {surface}")));
-            assert!(message.contains("docs/linux-vm-base-validate-patch-parity.md"));
-        }
+        let message = linux_unsupported_surface_guidance("patch").to_string();
+        assert!(message.contains("vz vm linux patch"));
+        assert!(message.contains("docs/linux-vm-base-validate-patch-parity.md"));
     }
 
     #[test]

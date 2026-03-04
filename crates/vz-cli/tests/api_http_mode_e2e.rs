@@ -1778,3 +1778,207 @@ async fn cli_daemon_grpc_linux_validate_reports_success_and_failure_modes() -> R
 
     Ok(())
 }
+
+#[tokio::test]
+async fn cli_daemon_grpc_linux_base_lifecycle() -> Result<()> {
+    let temp_dir = tempfile::tempdir().context("create temp dir")?;
+    let home_dir = temp_dir.path().join("home");
+    std::fs::create_dir_all(&home_dir).context("create isolated HOME directory")?;
+    let state_store_path = temp_dir.path().join("state").join("stack-state.db");
+    std::fs::create_dir_all(
+        state_store_path
+            .parent()
+            .context("state store path parent should exist")?,
+    )
+    .context("create state store parent")?;
+
+    let (daemon_shutdown, daemon_server, daemon_socket_path) =
+        start_daemon_for_state_store(&state_store_path).await?;
+
+    let client_config = DaemonClientConfig {
+        socket_path: daemon_socket_path.clone(),
+        auto_spawn: false,
+        state_store_path: Some(state_store_path.clone()),
+        runtime_data_dir: daemon_socket_path.parent().map(Path::to_path_buf),
+        ..DaemonClientConfig::default()
+    };
+    let client = DaemonClient::connect_with_config(client_config)
+        .await
+        .context("connect daemon client")?;
+    if !is_linux_backend_name(client.handshake().backend_name.as_str()) {
+        daemon_shutdown.notify_waiters();
+        daemon_server
+            .await
+            .context("join daemon server task")?
+            .context("run daemon server")?;
+        return Ok(());
+    }
+
+    let artifacts_dir = temp_dir.path().join("linux-artifacts");
+    std::fs::create_dir_all(&artifacts_dir).context("create linux artifacts dir")?;
+    let kernel_path = artifacts_dir.join("vmlinux");
+    let initramfs_path = artifacts_dir.join("initramfs.img");
+    let version_path = artifacts_dir.join("version.json");
+    std::fs::write(&kernel_path, b"kernel-bytes").context("write kernel artifact")?;
+    std::fs::write(&initramfs_path, b"initramfs-bytes").context("write initramfs artifact")?;
+    std::fs::write(&version_path, b"{\"kernel\":\"6.12.11\"}").context("write version json")?;
+
+    let vz_bin = resolve_vz_binary()?;
+    let state_store_path_arg = state_store_path.to_string_lossy().to_string();
+    let kernel_path_arg = kernel_path.to_string_lossy().to_string();
+    let initramfs_path_arg = initramfs_path.to_string_lossy().to_string();
+    let version_path_arg = version_path.to_string_lossy().to_string();
+
+    let upsert_output = run_vz_command_daemon(
+        &vz_bin,
+        &daemon_socket_path,
+        &home_dir,
+        &[
+            "vm",
+            "linux",
+            "base",
+            "upsert",
+            "base-cli-e2e",
+            "--kernel",
+            &kernel_path_arg,
+            "--initramfs",
+            &initramfs_path_arg,
+            "--version-json",
+            &version_path_arg,
+            "--description",
+            "cli lifecycle test",
+            "--state-db",
+            &state_store_path_arg,
+        ],
+    )
+    .await?;
+    if !upsert_output.status.success() {
+        bail!(
+            "vz vm linux base upsert failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&upsert_output.stdout),
+            String::from_utf8_lossy(&upsert_output.stderr)
+        );
+    }
+
+    let list_output = run_vz_command_daemon(
+        &vz_bin,
+        &daemon_socket_path,
+        &home_dir,
+        &[
+            "vm",
+            "linux",
+            "base",
+            "list",
+            "--json",
+            "--state-db",
+            &state_store_path_arg,
+        ],
+    )
+    .await?;
+    if !list_output.status.success() {
+        bail!(
+            "vz vm linux base list failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&list_output.stdout),
+            String::from_utf8_lossy(&list_output.stderr)
+        );
+    }
+    let listed: serde_json::Value =
+        serde_json::from_slice(&list_output.stdout).context("parse linux base list json")?;
+    if !listed
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item["base_id"] == "base-cli-e2e"))
+    {
+        bail!(
+            "linux base list output missing base-cli-e2e: {}",
+            String::from_utf8_lossy(&list_output.stdout)
+        );
+    }
+
+    let inspect_output = run_vz_command_daemon(
+        &vz_bin,
+        &daemon_socket_path,
+        &home_dir,
+        &[
+            "vm",
+            "linux",
+            "base",
+            "inspect",
+            "base-cli-e2e",
+            "--json",
+            "--state-db",
+            &state_store_path_arg,
+        ],
+    )
+    .await?;
+    if !inspect_output.status.success() {
+        bail!(
+            "vz vm linux base inspect failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&inspect_output.stdout),
+            String::from_utf8_lossy(&inspect_output.stderr)
+        );
+    }
+    let inspected: serde_json::Value =
+        serde_json::from_slice(&inspect_output.stdout).context("parse linux base inspect json")?;
+    if inspected["base_id"] != "base-cli-e2e" {
+        bail!(
+            "linux base inspect mismatch: {}",
+            String::from_utf8_lossy(&inspect_output.stdout)
+        );
+    }
+
+    let delete_output = run_vz_command_daemon(
+        &vz_bin,
+        &daemon_socket_path,
+        &home_dir,
+        &[
+            "vm",
+            "linux",
+            "base",
+            "delete",
+            "base-cli-e2e",
+            "--state-db",
+            &state_store_path_arg,
+        ],
+    )
+    .await?;
+    if !delete_output.status.success() {
+        bail!(
+            "vz vm linux base delete failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&delete_output.stdout),
+            String::from_utf8_lossy(&delete_output.stderr)
+        );
+    }
+
+    let inspect_missing_output = run_vz_command_daemon(
+        &vz_bin,
+        &daemon_socket_path,
+        &home_dir,
+        &[
+            "vm",
+            "linux",
+            "base",
+            "inspect",
+            "base-cli-e2e",
+            "--state-db",
+            &state_store_path_arg,
+        ],
+    )
+    .await?;
+    if inspect_missing_output.status.success() {
+        bail!("vz vm linux base inspect unexpectedly succeeded after delete");
+    }
+    if !String::from_utf8_lossy(&inspect_missing_output.stderr).contains("not found") {
+        bail!(
+            "inspect missing stderr mismatch:\n{}",
+            String::from_utf8_lossy(&inspect_missing_output.stderr)
+        );
+    }
+
+    daemon_shutdown.notify_waiters();
+    daemon_server
+        .await
+        .context("join daemon server task")?
+        .context("run daemon server")?;
+
+    Ok(())
+}

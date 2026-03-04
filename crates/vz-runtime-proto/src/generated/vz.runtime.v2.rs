@@ -442,6 +442,112 @@ pub mod validate_linux_vm_event {
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LinuxVmBaseDefinition {
+    #[prost(string, tag = "1")]
+    pub base_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub kernel_path: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub initramfs_path: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub version_json_path: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub description: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "6")]
+    pub updated_at_unix_secs: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListLinuxVmBasesRequest {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<RequestMetadata>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListLinuxVmBasesResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub bases: ::prost::alloc::vec::Vec<LinuxVmBaseDefinition>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetLinuxVmBaseRequest {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<RequestMetadata>,
+    #[prost(string, tag = "2")]
+    pub base_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LinuxVmBaseResponse {
+    #[prost(message, optional, tag = "1")]
+    pub base: ::core::option::Option<LinuxVmBaseDefinition>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpsertLinuxVmBaseRequest {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<RequestMetadata>,
+    #[prost(message, optional, tag = "2")]
+    pub base: ::core::option::Option<LinuxVmBaseDefinition>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteLinuxVmBaseRequest {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<RequestMetadata>,
+    #[prost(string, tag = "2")]
+    pub base_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LinuxVmBaseMutationProgress {
+    #[prost(string, tag = "1")]
+    pub phase: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpsertLinuxVmBaseCompletion {
+    #[prost(message, optional, tag = "1")]
+    pub base: ::core::option::Option<LinuxVmBaseDefinition>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteLinuxVmBaseCompletion {
+    #[prost(string, tag = "1")]
+    pub base_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpsertLinuxVmBaseEvent {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(oneof = "upsert_linux_vm_base_event::Payload", tags = "3, 4")]
+    pub payload: ::core::option::Option<upsert_linux_vm_base_event::Payload>,
+}
+/// Nested message and enum types in `UpsertLinuxVmBaseEvent`.
+pub mod upsert_linux_vm_base_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "3")]
+        Progress(super::LinuxVmBaseMutationProgress),
+        #[prost(message, tag = "4")]
+        Completion(super::UpsertLinuxVmBaseCompletion),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteLinuxVmBaseEvent {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(oneof = "delete_linux_vm_base_event::Payload", tags = "3, 4")]
+    pub payload: ::core::option::Option<delete_linux_vm_base_event::Payload>,
+}
+/// Nested message and enum types in `DeleteLinuxVmBaseEvent`.
+pub mod delete_linux_vm_base_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "3")]
+        Progress(super::LinuxVmBaseMutationProgress),
+        #[prost(message, tag = "4")]
+        Completion(super::DeleteLinuxVmBaseCompletion),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OpenLeaseRequest {
     #[prost(message, optional, tag = "1")]
     pub metadata: ::core::option::Option<RequestMetadata>,
@@ -2177,6 +2283,110 @@ pub mod linux_vm_service_client {
             req.extensions_mut()
                 .insert(
                     GrpcMethod::new("vz.runtime.v2.LinuxVmService", "ValidateLinuxVm"),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
+        pub async fn list_linux_vm_bases(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListLinuxVmBasesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListLinuxVmBasesResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.runtime.v2.LinuxVmService/ListLinuxVmBases",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("vz.runtime.v2.LinuxVmService", "ListLinuxVmBases"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_linux_vm_base(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetLinuxVmBaseRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::LinuxVmBaseResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.runtime.v2.LinuxVmService/GetLinuxVmBase",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("vz.runtime.v2.LinuxVmService", "GetLinuxVmBase"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn upsert_linux_vm_base(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UpsertLinuxVmBaseRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::UpsertLinuxVmBaseEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.runtime.v2.LinuxVmService/UpsertLinuxVmBase",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("vz.runtime.v2.LinuxVmService", "UpsertLinuxVmBase"),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
+        pub async fn delete_linux_vm_base(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeleteLinuxVmBaseRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::DeleteLinuxVmBaseEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.runtime.v2.LinuxVmService/DeleteLinuxVmBase",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("vz.runtime.v2.LinuxVmService", "DeleteLinuxVmBase"),
                 );
             self.inner.server_streaming(req, path, codec).await
         }
@@ -5301,6 +5511,46 @@ pub mod linux_vm_service_server {
             tonic::Response<Self::ValidateLinuxVmStream>,
             tonic::Status,
         >;
+        async fn list_linux_vm_bases(
+            &self,
+            request: tonic::Request<super::ListLinuxVmBasesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListLinuxVmBasesResponse>,
+            tonic::Status,
+        >;
+        async fn get_linux_vm_base(
+            &self,
+            request: tonic::Request<super::GetLinuxVmBaseRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::LinuxVmBaseResponse>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the UpsertLinuxVmBase method.
+        type UpsertLinuxVmBaseStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::UpsertLinuxVmBaseEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn upsert_linux_vm_base(
+            &self,
+            request: tonic::Request<super::UpsertLinuxVmBaseRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::UpsertLinuxVmBaseStream>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the DeleteLinuxVmBase method.
+        type DeleteLinuxVmBaseStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::DeleteLinuxVmBaseEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn delete_linux_vm_base(
+            &self,
+            request: tonic::Request<super::DeleteLinuxVmBaseRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::DeleteLinuxVmBaseStream>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct LinuxVmServiceServer<T> {
@@ -5411,6 +5661,194 @@ pub mod linux_vm_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ValidateLinuxVmSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.runtime.v2.LinuxVmService/ListLinuxVmBases" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListLinuxVmBasesSvc<T: LinuxVmService>(pub Arc<T>);
+                    impl<
+                        T: LinuxVmService,
+                    > tonic::server::UnaryService<super::ListLinuxVmBasesRequest>
+                    for ListLinuxVmBasesSvc<T> {
+                        type Response = super::ListLinuxVmBasesResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListLinuxVmBasesRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LinuxVmService>::list_linux_vm_bases(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListLinuxVmBasesSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.runtime.v2.LinuxVmService/GetLinuxVmBase" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetLinuxVmBaseSvc<T: LinuxVmService>(pub Arc<T>);
+                    impl<
+                        T: LinuxVmService,
+                    > tonic::server::UnaryService<super::GetLinuxVmBaseRequest>
+                    for GetLinuxVmBaseSvc<T> {
+                        type Response = super::LinuxVmBaseResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetLinuxVmBaseRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LinuxVmService>::get_linux_vm_base(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetLinuxVmBaseSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.runtime.v2.LinuxVmService/UpsertLinuxVmBase" => {
+                    #[allow(non_camel_case_types)]
+                    struct UpsertLinuxVmBaseSvc<T: LinuxVmService>(pub Arc<T>);
+                    impl<
+                        T: LinuxVmService,
+                    > tonic::server::ServerStreamingService<
+                        super::UpsertLinuxVmBaseRequest,
+                    > for UpsertLinuxVmBaseSvc<T> {
+                        type Response = super::UpsertLinuxVmBaseEvent;
+                        type ResponseStream = T::UpsertLinuxVmBaseStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UpsertLinuxVmBaseRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LinuxVmService>::upsert_linux_vm_base(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UpsertLinuxVmBaseSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.runtime.v2.LinuxVmService/DeleteLinuxVmBase" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteLinuxVmBaseSvc<T: LinuxVmService>(pub Arc<T>);
+                    impl<
+                        T: LinuxVmService,
+                    > tonic::server::ServerStreamingService<
+                        super::DeleteLinuxVmBaseRequest,
+                    > for DeleteLinuxVmBaseSvc<T> {
+                        type Response = super::DeleteLinuxVmBaseEvent;
+                        type ResponseStream = T::DeleteLinuxVmBaseStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DeleteLinuxVmBaseRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LinuxVmService>::delete_linux_vm_base(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteLinuxVmBaseSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

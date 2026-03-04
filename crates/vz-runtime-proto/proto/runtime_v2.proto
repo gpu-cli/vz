@@ -278,6 +278,10 @@ message TerminateSandboxEvent {
 
 service LinuxVmService {
   rpc ValidateLinuxVm(ValidateLinuxVmRequest) returns (stream ValidateLinuxVmEvent);
+  rpc ListLinuxVmBases(ListLinuxVmBasesRequest) returns (ListLinuxVmBasesResponse);
+  rpc GetLinuxVmBase(GetLinuxVmBaseRequest) returns (LinuxVmBaseResponse);
+  rpc UpsertLinuxVmBase(UpsertLinuxVmBaseRequest) returns (stream UpsertLinuxVmBaseEvent);
+  rpc DeleteLinuxVmBase(DeleteLinuxVmBaseRequest) returns (stream DeleteLinuxVmBaseEvent);
 }
 
 message ValidateLinuxVmRequest {
@@ -310,6 +314,73 @@ message ValidateLinuxVmEvent {
   oneof payload {
     LinuxVmValidationProgress progress = 3;
     ValidateLinuxVmCompletion completion = 4;
+  }
+}
+
+message LinuxVmBaseDefinition {
+  string base_id = 1;
+  string kernel_path = 2;
+  string initramfs_path = 3;
+  string version_json_path = 4;
+  string description = 5;
+  uint64 updated_at_unix_secs = 6;
+}
+
+message ListLinuxVmBasesRequest {
+  RequestMetadata metadata = 1;
+}
+
+message ListLinuxVmBasesResponse {
+  repeated LinuxVmBaseDefinition bases = 1;
+}
+
+message GetLinuxVmBaseRequest {
+  RequestMetadata metadata = 1;
+  string base_id = 2;
+}
+
+message LinuxVmBaseResponse {
+  LinuxVmBaseDefinition base = 1;
+}
+
+message UpsertLinuxVmBaseRequest {
+  RequestMetadata metadata = 1;
+  LinuxVmBaseDefinition base = 2;
+}
+
+message DeleteLinuxVmBaseRequest {
+  RequestMetadata metadata = 1;
+  string base_id = 2;
+}
+
+message LinuxVmBaseMutationProgress {
+  string phase = 1;
+  string detail = 2;
+}
+
+message UpsertLinuxVmBaseCompletion {
+  LinuxVmBaseDefinition base = 1;
+}
+
+message DeleteLinuxVmBaseCompletion {
+  string base_id = 1;
+}
+
+message UpsertLinuxVmBaseEvent {
+  string request_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    LinuxVmBaseMutationProgress progress = 3;
+    UpsertLinuxVmBaseCompletion completion = 4;
+  }
+}
+
+message DeleteLinuxVmBaseEvent {
+  string request_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    LinuxVmBaseMutationProgress progress = 3;
+    DeleteLinuxVmBaseCompletion completion = 4;
   }
 }
 

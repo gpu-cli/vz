@@ -974,3 +974,103 @@ async fn validate_linux_vm_stream_reports_descriptor_checksum_failure() {
 
     daemon.stop().await;
 }
+
+#[tokio::test]
+async fn linux_vm_base_lifecycle_rpc_methods_are_covered() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(runtimed_config(&tmp)).await;
+    let mut client = DaemonClient::connect_with_config(client_config(&tmp, false))
+        .await
+        .expect("client connect");
+
+    let kernel = tmp.path().join("vmlinux");
+    let initramfs = tmp.path().join("initramfs.img");
+    let version = tmp.path().join("version.json");
+    std::fs::write(&kernel, b"kernel").expect("write kernel");
+    std::fs::write(&initramfs, b"initramfs").expect("write initramfs");
+    std::fs::write(&version, b"{\"kernel\":\"6.12.11\"}").expect("write version");
+
+    let mut upsert_stream = client
+        .upsert_linux_vm_base_stream(runtime_v2::UpsertLinuxVmBaseRequest {
+            metadata: None,
+            base: Some(runtime_v2::LinuxVmBaseDefinition {
+                base_id: "base-e2e".to_string(),
+                kernel_path: kernel.display().to_string(),
+                initramfs_path: initramfs.display().to_string(),
+                version_json_path: version.display().to_string(),
+                description: "test base".to_string(),
+                updated_at_unix_secs: 0,
+            }),
+        })
+        .await
+        .expect("upsert linux vm base stream");
+    let mut saw_upsert_completion = false;
+    while let Some(event) = upsert_stream
+        .message()
+        .await
+        .expect("read upsert stream event")
+    {
+        if matches!(
+            event.payload,
+            Some(runtime_v2::upsert_linux_vm_base_event::Payload::Completion(
+                _
+            ))
+        ) {
+            saw_upsert_completion = true;
+            break;
+        }
+    }
+    assert!(saw_upsert_completion, "upsert stream must emit completion");
+
+    let listed = client
+        .list_linux_vm_bases(runtime_v2::ListLinuxVmBasesRequest { metadata: None })
+        .await
+        .expect("list linux vm bases");
+    assert!(listed.bases.iter().any(|base| base.base_id == "base-e2e"));
+
+    let inspected = client
+        .get_linux_vm_base(runtime_v2::GetLinuxVmBaseRequest {
+            metadata: None,
+            base_id: "base-e2e".to_string(),
+        })
+        .await
+        .expect("inspect linux vm base");
+    let inspected_base = inspected.base.expect("base payload");
+    assert_eq!(inspected_base.base_id, "base-e2e");
+
+    let mut delete_stream = client
+        .delete_linux_vm_base_stream(runtime_v2::DeleteLinuxVmBaseRequest {
+            metadata: None,
+            base_id: "base-e2e".to_string(),
+        })
+        .await
+        .expect("delete linux vm base stream");
+    let mut saw_delete_completion = false;
+    while let Some(event) = delete_stream
+        .message()
+        .await
+        .expect("read delete stream event")
+    {
+        if matches!(
+            event.payload,
+            Some(runtime_v2::delete_linux_vm_base_event::Payload::Completion(
+                _
+            ))
+        ) {
+            saw_delete_completion = true;
+            break;
+        }
+    }
+    assert!(saw_delete_completion, "delete stream must emit completion");
+
+    let missing = client
+        .get_linux_vm_base(runtime_v2::GetLinuxVmBaseRequest {
+            metadata: None,
+            base_id: "base-e2e".to_string(),
+        })
+        .await
+        .expect_err("deleted base should be missing");
+    assert_grpc_status_in(missing, &[Code::NotFound]);
+
+    daemon.stop().await;
+}

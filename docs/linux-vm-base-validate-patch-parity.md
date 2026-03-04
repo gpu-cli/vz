@@ -14,16 +14,14 @@ This document maps `vz vm mac` base/validate/patch surfaces to Linux support sta
 
 | Surface | Linux Status | Short-Term Behavior | Notes |
 |---|---|---|---|
-| `vm linux base` | Not yet supported | Fail with actionable guidance | Linux uses `vm linux init` descriptor+artifact flow today. |
-| `vm linux validate` | Not yet supported | Fail with actionable guidance | Validation currently covered by host-boot and e2e harnesses. |
+| `vm linux base` | Initial support shipped | Daemon-owned list/inspect/upsert/delete | Definitions are persisted by `vz-runtimed` and consumed by CLI over gRPC. |
+| `vm linux validate` | Initial support shipped | Daemon-owned descriptor/artifact/backend validation stream | Validation logic executes in daemon, CLI only renders stream output. |
 | `vm linux patch` | Not yet supported | Fail with actionable guidance | No Linux patch bundle workflow implemented yet. |
 
 ## Required UX for Unsupported Operations
 
-When invoked, commands should fail with deterministic guidance:
+When invoked, unsupported commands should fail with deterministic guidance:
 
-- `vm linux base`: suggest `vz vm linux init --name ...` and link docs.
-- `vm linux validate`: suggest `vz vm linux test e2e ...` and staging validation runbook.
 - `vm linux patch`: indicate feature not available and link planned bead.
 
 Failure output requirements:
@@ -34,21 +32,15 @@ Failure output requirements:
 
 ## Planned Supported Operations
 
-1. `vm linux validate`
-- candidate initial scope:
-  - artifact checksum validation
-  - descriptor consistency checks
-  - guest-agent readiness smoke check
-
-2. `vm linux patch`
+1. `vm linux patch`
 - candidate initial scope:
   - declarative artifact delta apply to descriptor/disks
   - compatibility validation + rollback receipt
 
-3. `vm linux base`
-- candidate initial scope:
-  - managed Linux base definitions from `~/.vz/linux` sources
-  - list/inspect/update/delete operations via daemon APIs
+2. Extend `vm linux base`
+- candidate follow-up scope:
+  - policy hooks + receipts for base mutations
+  - base/channel promotion semantics analogous to `vm mac base`
 
 ## Follow-up Implementation Beads
 
