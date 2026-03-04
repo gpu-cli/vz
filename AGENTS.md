@@ -48,5 +48,7 @@ bd sync               # Sync with git
 
 - Do NOT consider any bead/task complete based only on unit tests.
 - Completion requires real verification in a Linux VM with end-to-end testing of the implemented behavior.
+- On macOS hosts, Linux verification should run inside a local `vz`-managed Linux VM first (via `vz debug vm ...` flows), not an arbitrary external SSH host.
+- External SSH Linux hosts are fallback-only when explicitly requested or when local `vz` VM execution is unavailable.
 - If Linux VM end-to-end verification has not been run and passed, keep the bead/task open.
 - For btrfs portability changes, run `scripts/run-linux-btrfs-e2e.sh` and attach `.artifacts/linux-btrfs-e2e/<timestamp>/summary.txt` + logs as evidence.
