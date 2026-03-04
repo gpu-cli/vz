@@ -121,7 +121,8 @@ echo "==> building binaries"
     cargo build "${BUILD_ARGS[@]}" -p vz-runtimed -p vz-api -p vz-cli
 ) >"$RUN_DIR/build.log" 2>&1
 
-TARGET_DIR="$REPO_ROOT/crates/target/$PROFILE"
+TARGET_ROOT="${CARGO_TARGET_DIR:-$REPO_ROOT/crates/target}"
+TARGET_DIR="$TARGET_ROOT/$PROFILE"
 BIN_RUNTIMED="$TARGET_DIR/vz-runtimed"
 BIN_API="$TARGET_DIR/vz-api"
 BIN_VZ="$TARGET_DIR/vz"
@@ -163,7 +164,7 @@ API_PID=$!
 API_BASE_URL="http://$API_BIND"
 wait_for_http "$API_BASE_URL/v1/capabilities" || err "api failed readiness check"
 
-SANDBOX_ID="vz-e2e-${timestamp,,}"
+REQUESTED_SANDBOX_NAME="vz-e2e-${timestamp,,}"
 
 echo "==> creating sandbox via vz CLI (api-http transport)"
 (
@@ -173,12 +174,19 @@ echo "==> creating sandbox via vz CLI (api-http transport)"
     VZ_RUNTIME_DAEMON_AUTOSTART=0 \
     HOME="$HOME_DIR" \
     "$BIN_VZ" create \
-        --name "$SANDBOX_ID" \
+        --name "$REQUESTED_SANDBOX_NAME" \
         --cpus 2 \
         --memory 1024 \
         --state-db "$STATE_DB" \
         --json
 ) > "$RUN_DIR/vz-create.json"
+
+SANDBOX_ID="$(
+    grep -o '"sandbox_id"[[:space:]]*:[[:space:]]*"[^"]*"' "$RUN_DIR/vz-create.json" \
+        | head -n 1 \
+        | sed -E 's/.*"([^"]+)"/\1/'
+)"
+[[ -n "$SANDBOX_ID" ]] || err "failed to parse sandbox_id from vz create output"
 
 echo "==> validating vm linux lifecycle via daemon-grpc"
 VZ_CONTROL_PLANE_TRANSPORT=daemon-grpc \

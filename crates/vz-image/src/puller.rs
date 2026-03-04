@@ -2,7 +2,7 @@
 
 use std::str::FromStr;
 
-use docker_credential::{DockerCredential, get_credential};
+use docker_credential::{CredentialRetrievalError, DockerCredential, get_credential};
 use oci_distribution::client::ClientConfig;
 use oci_distribution::errors::OciDistributionError;
 use oci_distribution::manifest::ImageIndexEntry;
@@ -316,29 +316,54 @@ fn resolve_registry_auth(reference: &Reference, auth: &Auth) -> Result<RegistryA
             Ok(RegistryAuth::Basic(username.clone(), password.clone()))
         }
         Auth::DockerConfig => {
-            let server = docker_server_for_registry(reference.registry());
-            let credential = get_credential(&server)?;
-            match credential {
-                DockerCredential::UsernamePassword(username, password) => {
-                    Ok(RegistryAuth::Basic(username, password))
+            for server in docker_credential_lookup_servers(reference.registry()) {
+                match get_credential(&server) {
+                    Ok(DockerCredential::UsernamePassword(username, password)) => {
+                        return Ok(RegistryAuth::Basic(username, password));
+                    }
+                    Ok(DockerCredential::IdentityToken(_)) => {
+                        return Err(ImageError::AuthenticationUnsupported(
+                            "docker identity-token credentials are not supported".to_string(),
+                        ));
+                    }
+                    Err(error) if is_nonfatal_credential_lookup_error(&error) => continue,
+                    Err(error) => return Err(ImageError::CredentialLookup(error)),
                 }
-                DockerCredential::IdentityToken(_) => Err(ImageError::AuthenticationUnsupported(
-                    "docker identity-token credentials are not supported".to_string(),
-                )),
             }
+            Ok(RegistryAuth::Anonymous)
         }
     }
 }
 
-fn docker_server_for_registry(registry: &str) -> String {
+fn docker_credential_lookup_servers(registry: &str) -> Vec<String> {
     if matches!(
         registry,
         "docker.io" | "index.docker.io" | "registry-1.docker.io"
     ) {
-        return "https://index.docker.io/v1/".to_string();
+        return vec![
+            "https://index.docker.io/v1/".to_string(),
+            "docker.io".to_string(),
+            "index.docker.io".to_string(),
+            "registry-1.docker.io".to_string(),
+        ];
     }
+    vec![registry.to_string()]
+}
 
-    registry.to_string()
+fn is_nonfatal_credential_lookup_error(error: &CredentialRetrievalError) -> bool {
+    match error {
+        CredentialRetrievalError::NoCredentialConfigured
+        | CredentialRetrievalError::ConfigNotFound
+        | CredentialRetrievalError::ConfigReadError => true,
+        CredentialRetrievalError::HelperFailure { stdout, stderr, .. } => {
+            let text = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+            text.contains("not found")
+                || text.contains("credentials not found")
+                || text.contains("no credentials")
+                || text.contains("no credential configured")
+        }
+        _ => false,
+    }
 }
 
 fn parse_image_config_summary(config_json: &str) -> Result<ImageConfigSummary, ImageError> {

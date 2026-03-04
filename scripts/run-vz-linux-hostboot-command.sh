@@ -11,6 +11,7 @@ OUTPUT_DIR="$REPO_ROOT/.artifacts/vm-linux-hostboot"
 DISK_SIZE_GB="32"
 CPUS="4"
 MEMORY_MB="4096"
+ROOTFS_DIR=""
 FORCE_INIT=false
 GUEST_COMMAND=""
 MOUNTS=()
@@ -30,6 +31,7 @@ Options:
   --disk-size-gb <n>            Persistent disk size GiB (default: 32)
   --cpus <n>                    VM CPUs (default: 4)
   --memory-mb <n>               VM memory MB (default: 4096)
+  --rootfs-dir <path>           Optional VirtioFS rootfs directory for distro userland
   --mount <TAG:HOST_PATH[:ro|rw]>  VirtioFS share passed to `vz vm linux run` (repeatable)
   --command <shell-command>     Guest command for `/bin/sh -lc` (required)
   --guest-user <user>           Optional guest user for command execution
@@ -89,6 +91,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --memory-mb)
             MEMORY_MB="${2:-}"
+            shift 2
+            ;;
+        --rootfs-dir)
+            ROOTFS_DIR="${2:-}"
             shift 2
             ;;
         --mount)
@@ -159,10 +165,12 @@ run_cmd=(
 if [[ -n "$GUEST_USER" ]]; then
     run_cmd+=(--guest-command-user "$GUEST_USER")
 fi
+if [[ -n "$ROOTFS_DIR" ]]; then
+    run_cmd+=(--rootfs-dir "$ROOTFS_DIR")
+fi
 for mount in "${MOUNTS[@]}"; do
     run_cmd+=(--mount "$mount")
 done
 
 echo "==> booting linux guest and running command"
 "${run_cmd[@]}"
-

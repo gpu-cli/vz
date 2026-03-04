@@ -1148,7 +1148,12 @@ async fn connect_linux_daemon(state_db: &Path) -> anyhow::Result<DaemonClient> {
 fn is_linux_backend_name(name: &str) -> bool {
     matches!(
         name.trim().to_ascii_lowercase().as_str(),
-        "linux_firecracker" | "linux-firecracker" | "firecracker"
+        "linux_firecracker"
+            | "linux-firecracker"
+            | "firecracker"
+            | "linux-native"
+            | "linux_native"
+            | "linux"
     )
 }
 

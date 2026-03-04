@@ -80,11 +80,11 @@ if ! blkid -s TYPE -o value "$IMAGE_PATH" 2>/dev/null | grep -qx "btrfs"; then
 fi
 
 mkdir -p "$WORKSPACE"
-if ! findmnt -n -T "$WORKSPACE" >/dev/null 2>&1; then
+if ! findmnt -n -M "$WORKSPACE" >/dev/null 2>&1; then
     mount -o loop "$IMAGE_PATH" "$WORKSPACE"
 fi
 
-FSTYPE="$(findmnt -n -T "$WORKSPACE" -o FSTYPE || true)"
+FSTYPE="$(findmnt -n -M "$WORKSPACE" -o FSTYPE || true)"
 [[ "$FSTYPE" == "btrfs" ]] || err "workspace is not mounted as btrfs (detected: ${FSTYPE:-unknown})"
 
 chown "$OWNER_USER":"$OWNER_USER" "$WORKSPACE"
