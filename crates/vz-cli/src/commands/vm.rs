@@ -1298,7 +1298,7 @@ struct LinuxValidateCheck {
 struct LinuxValidateReport {
     ok: bool,
     descriptor_path: String,
-    daemon_backend: Option<String>,
+    daemon_backend: String,
     checks: Vec<LinuxValidateCheck>,
 }
 
@@ -1317,131 +1317,56 @@ fn resolve_linux_validate_descriptor_path(args: &LinuxVmValidateArgs) -> anyhow:
 async fn run_linux_validate(args: LinuxVmValidateArgs) -> anyhow::Result<()> {
     let descriptor_path = resolve_linux_validate_descriptor_path(&args)?;
     let state_db = args.state_db.unwrap_or_else(default_state_db_path);
-    let mut checks = Vec::new();
-    let mut daemon_backend = None;
-    let mut failed = false;
+    let mut client = connect_linux_daemon(&state_db).await?;
+    let mut stream = client
+        .validate_linux_vm_stream(runtime_v2::ValidateLinuxVmRequest {
+            metadata: None,
+            descriptor_path: descriptor_path.display().to_string(),
+            sandbox_id: args.sandbox_id.unwrap_or_default(),
+        })
+        .await
+        .context("failed to start daemon linux validation stream")?;
 
-    let descriptor = match load_linux_vm_image_descriptor(descriptor_path.as_path()) {
-        Ok(descriptor) => {
-            checks.push(LinuxValidateCheck {
-                name: "descriptor_load".to_string(),
-                status: "pass".to_string(),
-                detail: format!("loaded descriptor {}", descriptor_path.display()),
-            });
-            descriptor
-        }
-        Err(error) => {
-            checks.push(LinuxValidateCheck {
-                name: "descriptor_load".to_string(),
-                status: "fail".to_string(),
-                detail: error.to_string(),
-            });
-            failed = true;
-            LinuxVmImageDescriptor {
-                schema_version: LINUX_VM_IMAGE_DESCRIPTOR_SCHEMA_VERSION,
-                image_name: String::new(),
-                kernel_path: PathBuf::new(),
-                initramfs_path: PathBuf::new(),
-                version_json_path: PathBuf::new(),
-                disk_path: PathBuf::new(),
-                disk_size_gb: 0,
-                linux_artifact_version: String::new(),
-                sha256_vmlinux: String::new(),
-                sha256_initramfs: String::new(),
-                created_at_unix_secs: 0,
-            }
-        }
-    };
-
-    if !failed {
-        match validate_descriptor_against_current_artifacts(&descriptor) {
-            Ok(()) => checks.push(LinuxValidateCheck {
-                name: "descriptor_consistency".to_string(),
-                status: "pass".to_string(),
-                detail: "descriptor artifacts and checksums validated".to_string(),
-            }),
-            Err(error) => {
-                checks.push(LinuxValidateCheck {
-                    name: "descriptor_consistency".to_string(),
-                    status: "fail".to_string(),
-                    detail: error.to_string(),
-                });
-                failed = true;
-            }
-        }
-    }
-
-    let mut daemon_client = match connect_linux_daemon(&state_db).await {
-        Ok(client) => {
-            daemon_backend = Some(client.handshake().backend_name.clone());
-            checks.push(LinuxValidateCheck {
-                name: "daemon_connectivity".to_string(),
-                status: "pass".to_string(),
-                detail: "connected to linux daemon".to_string(),
-            });
-            Some(client)
-        }
-        Err(error) => {
-            checks.push(LinuxValidateCheck {
-                name: "daemon_connectivity".to_string(),
-                status: "fail".to_string(),
-                detail: error.to_string(),
-            });
-            failed = true;
-            None
-        }
-    };
-
-    if let Some(sandbox_id) = args.sandbox_id.as_deref()
-        && let Some(client) = daemon_client.as_mut()
+    let mut completion: Option<runtime_v2::ValidateLinuxVmCompletion> = None;
+    while let Some(event) = stream
+        .message()
+        .await
+        .context("failed to read daemon linux validation stream")?
     {
-        match client
-            .get_sandbox(runtime_v2::GetSandboxRequest {
-                sandbox_id: sandbox_id.to_string(),
-                metadata: None,
-            })
-            .await
-        {
-            Ok(response) => {
-                let payload = response
-                    .sandbox
-                    .ok_or_else(|| anyhow!("daemon get_sandbox missing payload"))?;
-                if is_linux_backend_name(payload.backend.as_str()) {
-                    checks.push(LinuxValidateCheck {
-                        name: "sandbox_readiness".to_string(),
-                        status: "pass".to_string(),
-                        detail: format!(
-                            "sandbox {} resolved in state {} on backend {}",
-                            sandbox_id, payload.state, payload.backend
-                        ),
-                    });
-                } else {
-                    checks.push(LinuxValidateCheck {
-                        name: "sandbox_readiness".to_string(),
-                        status: "fail".to_string(),
-                        detail: format!(
-                            "sandbox {} backend {} is not linux",
-                            sandbox_id, payload.backend
-                        ),
-                    });
-                    failed = true;
+        if let Some(payload) = event.payload {
+            match payload {
+                runtime_v2::validate_linux_vm_event::Payload::Progress(progress) => {
+                    if !args.json {
+                        println!(
+                            "[INFO] {}: {}",
+                            progress.phase.trim(),
+                            progress.detail.trim()
+                        );
+                    }
+                }
+                runtime_v2::validate_linux_vm_event::Payload::Completion(done) => {
+                    completion = Some(done);
                 }
             }
-            Err(error) => {
-                checks.push(LinuxValidateCheck {
-                    name: "sandbox_readiness".to_string(),
-                    status: "fail".to_string(),
-                    detail: error.to_string(),
-                });
-                failed = true;
-            }
         }
     }
+    let completion = completion
+        .ok_or_else(|| anyhow!("daemon linux validation stream ended without completion event"))?;
+
+    let checks = completion
+        .checks
+        .into_iter()
+        .map(|check| LinuxValidateCheck {
+            name: check.name,
+            status: check.status,
+            detail: check.detail,
+        })
+        .collect();
 
     let report = LinuxValidateReport {
-        ok: !failed,
-        descriptor_path: descriptor_path.display().to_string(),
-        daemon_backend,
+        ok: completion.ok,
+        descriptor_path: completion.descriptor_path,
+        daemon_backend: completion.daemon_backend,
         checks,
     };
 
@@ -1453,9 +1378,7 @@ async fn run_linux_validate(args: LinuxVmValidateArgs) -> anyhow::Result<()> {
     } else {
         println!("Linux VM validation report:");
         println!("  descriptor: {}", report.descriptor_path);
-        if let Some(backend) = report.daemon_backend.as_deref() {
-            println!("  daemon_backend: {backend}");
-        }
+        println!("  daemon_backend: {}", report.daemon_backend);
         for check in &report.checks {
             let marker = if check.status == "pass" {
                 "PASS"
@@ -1466,7 +1389,7 @@ async fn run_linux_validate(args: LinuxVmValidateArgs) -> anyhow::Result<()> {
         }
     }
 
-    if failed {
+    if !report.ok {
         bail!("linux vm validation failed");
     }
     Ok(())

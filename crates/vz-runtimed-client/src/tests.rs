@@ -910,3 +910,67 @@ async fn file_mutation_rpc_methods_are_covered() {
 
     daemon.stop().await;
 }
+
+#[tokio::test]
+async fn validate_linux_vm_stream_reports_descriptor_checksum_failure() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(runtimed_config(&tmp)).await;
+    let mut client = DaemonClient::connect_with_config(client_config(&tmp, false))
+        .await
+        .expect("client connect");
+
+    let artifact_dir = tmp.path().join("artifacts");
+    std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+    let kernel_path = artifact_dir.join("vmlinux");
+    let initramfs_path = artifact_dir.join("initramfs.img");
+    let version_path = artifact_dir.join("version.json");
+    let descriptor_path = artifact_dir.join("validate-linux.json");
+
+    std::fs::write(&kernel_path, b"kernel-good").expect("write kernel");
+    std::fs::write(&initramfs_path, b"initramfs-good").expect("write initramfs");
+
+    let expected_kernel_sha = "00".repeat(32);
+    let expected_initramfs_sha = "11".repeat(32);
+
+    let version_json = format!(
+        "{{\"kernel\":\"6.12.11\",\"sha256_vmlinux\":\"{expected_kernel_sha}\",\"sha256_initramfs\":\"{expected_initramfs_sha}\"}}"
+    );
+    std::fs::write(&version_path, version_json).expect("write version json");
+
+    let descriptor_json = format!(
+        "{{\"schema_version\":1,\"image_name\":\"validate-linux\",\"kernel_path\":\"{}\",\"initramfs_path\":\"{}\",\"version_json_path\":\"{}\",\"disk_path\":\"{}\",\"disk_size_gb\":8,\"linux_artifact_version\":\"6.12.11\",\"sha256_vmlinux\":\"\",\"sha256_initramfs\":\"\",\"created_at_unix_secs\":1700000000}}",
+        kernel_path.display(),
+        initramfs_path.display(),
+        version_path.display(),
+        artifact_dir.join("disk.img").display()
+    );
+    std::fs::write(&descriptor_path, descriptor_json).expect("write descriptor");
+
+    let mut stream = client
+        .validate_linux_vm_stream(runtime_v2::ValidateLinuxVmRequest {
+            metadata: None,
+            descriptor_path: descriptor_path.display().to_string(),
+            sandbox_id: String::new(),
+        })
+        .await
+        .expect("validate stream");
+
+    let mut completion = None;
+    while let Some(event) = stream.message().await.expect("read stream event") {
+        if let Some(runtime_v2::validate_linux_vm_event::Payload::Completion(done)) = event.payload
+        {
+            completion = Some(done);
+            break;
+        }
+    }
+    let completion = completion.expect("completion event");
+    assert!(!completion.ok, "checksum mismatch must fail validation");
+    assert!(
+        completion
+            .checks
+            .iter()
+            .any(|check| check.name == "descriptor_consistency" && check.status == "fail")
+    );
+
+    daemon.stop().await;
+}

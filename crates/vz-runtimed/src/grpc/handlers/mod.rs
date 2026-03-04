@@ -7,6 +7,7 @@ pub(super) mod execution;
 pub(super) mod file;
 pub(super) mod image;
 pub(super) mod lease;
+pub(super) mod linux_vm;
 pub(super) mod receipt;
 pub(super) mod sandbox;
 pub(super) mod stack;

@@ -21,6 +21,7 @@ mod events;
 mod execution;
 mod files;
 mod image;
+mod linux_vm;
 mod sandbox;
 mod stack;
 mod stream_completion;
@@ -144,6 +145,7 @@ pub struct DaemonClient {
     build_client: runtime_v2::build_service_client::BuildServiceClient<Channel>,
     execution_client: runtime_v2::execution_service_client::ExecutionServiceClient<Channel>,
     checkpoint_client: runtime_v2::checkpoint_service_client::CheckpointServiceClient<Channel>,
+    linux_vm_client: runtime_v2::linux_vm_service_client::LinuxVmServiceClient<Channel>,
     event_client: runtime_v2::event_service_client::EventServiceClient<Channel>,
     receipt_client: runtime_v2::receipt_service_client::ReceiptServiceClient<Channel>,
     stack_client: runtime_v2::stack_service_client::StackServiceClient<Channel>,
@@ -247,6 +249,8 @@ impl DaemonClient {
             runtime_v2::execution_service_client::ExecutionServiceClient::new(channel.clone());
         let checkpoint_client =
             runtime_v2::checkpoint_service_client::CheckpointServiceClient::new(channel.clone());
+        let linux_vm_client =
+            runtime_v2::linux_vm_service_client::LinuxVmServiceClient::new(channel.clone());
         let event_client =
             runtime_v2::event_service_client::EventServiceClient::new(channel.clone());
         let receipt_client =
@@ -268,6 +272,7 @@ impl DaemonClient {
             build_client,
             execution_client,
             checkpoint_client,
+            linux_vm_client,
             event_client,
             receipt_client,
             stack_client,

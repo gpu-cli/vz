@@ -43,6 +43,7 @@ use handlers::execution::ExecutionServiceImpl;
 use handlers::file::FileServiceImpl;
 use handlers::image::ImageServiceImpl;
 use handlers::lease::LeaseServiceImpl;
+use handlers::linux_vm::LinuxVmServiceImpl;
 use handlers::receipt::ReceiptServiceImpl;
 use handlers::sandbox::SandboxServiceImpl;
 use handlers::stack::StackServiceImpl;
@@ -438,6 +439,11 @@ where
         LeaseServiceImpl::new(daemon.clone()),
         request_metadata_interceptor,
     );
+    let linux_vm_service =
+        runtime_v2::linux_vm_service_server::LinuxVmServiceServer::with_interceptor(
+            LinuxVmServiceImpl::new(daemon.clone()),
+            request_metadata_interceptor,
+        );
     let container_service =
         runtime_v2::container_service_server::ContainerServiceServer::with_interceptor(
             ContainerServiceImpl::new(daemon.clone()),
@@ -488,6 +494,7 @@ where
     let server_result = Server::builder()
         .layer(GrpcMetricsLayer::new(grpc_observability))
         .add_service(sandbox_service)
+        .add_service(linux_vm_service)
         .add_service(lease_service)
         .add_service(container_service)
         .add_service(image_service)

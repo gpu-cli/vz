@@ -276,6 +276,45 @@ message TerminateSandboxEvent {
 
 // ── 2. LeaseService ────────────────────────────────────────────────
 
+service LinuxVmService {
+  rpc ValidateLinuxVm(ValidateLinuxVmRequest) returns (stream ValidateLinuxVmEvent);
+}
+
+message ValidateLinuxVmRequest {
+  RequestMetadata metadata = 1;
+  string descriptor_path = 2;
+  string sandbox_id = 3;
+}
+
+message LinuxVmValidationProgress {
+  string phase = 1;
+  string detail = 2;
+}
+
+message LinuxVmValidationCheck {
+  string name = 1;
+  string status = 2;
+  string detail = 3;
+}
+
+message ValidateLinuxVmCompletion {
+  string descriptor_path = 1;
+  string daemon_backend = 2;
+  bool ok = 3;
+  repeated LinuxVmValidationCheck checks = 4;
+}
+
+message ValidateLinuxVmEvent {
+  string request_id = 1;
+  uint64 sequence = 2;
+  oneof payload {
+    LinuxVmValidationProgress progress = 3;
+    ValidateLinuxVmCompletion completion = 4;
+  }
+}
+
+// ── 2. LeaseService ────────────────────────────────────────────────
+
 service LeaseService {
   rpc OpenLease(OpenLeaseRequest) returns (LeaseResponse);
   rpc GetLease(GetLeaseRequest) returns (LeaseResponse);
