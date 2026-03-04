@@ -548,6 +548,7 @@ mod tests {
             "vz",
             "vm",
             "linux",
+            "test",
             "e2e",
             "--vm-name",
             "linux-e2e",
@@ -555,6 +556,54 @@ mod tests {
             "/workspaces/vz",
         ])
         .expect("parse");
+        assert!(matches!(cli.command, Some(Commands::Vm(_))));
+    }
+
+    #[test]
+    fn parse_vm_linux_run() {
+        let cli = Cli::try_parse_from([
+            "vz", "vm", "linux", "run", "--name", "space-a", "--cpus", "4", "--memory", "4096",
+        ])
+        .expect("parse");
+        assert!(matches!(cli.command, Some(Commands::Vm(_))));
+    }
+
+    #[test]
+    fn parse_vm_linux_list() {
+        let cli = Cli::try_parse_from(["vz", "vm", "linux", "list"]).expect("parse");
+        assert!(matches!(cli.command, Some(Commands::Vm(_))));
+    }
+
+    #[test]
+    fn parse_vm_linux_inspect() {
+        let cli = Cli::try_parse_from(["vz", "vm", "linux", "inspect", "vz-1234"]).expect("parse");
+        assert!(matches!(cli.command, Some(Commands::Vm(_))));
+    }
+
+    #[test]
+    fn parse_vm_linux_attach() {
+        let cli = Cli::try_parse_from(["vz", "vm", "linux", "attach", "vz-1234"]).expect("parse");
+        assert!(matches!(cli.command, Some(Commands::Vm(_))));
+    }
+
+    #[test]
+    fn parse_vm_linux_exec() {
+        let cli = Cli::try_parse_from([
+            "vz", "vm", "linux", "exec", "vz-1234", "--", "echo", "hello",
+        ])
+        .expect("parse");
+        assert!(matches!(cli.command, Some(Commands::Vm(_))));
+    }
+
+    #[test]
+    fn parse_vm_linux_stop() {
+        let cli = Cli::try_parse_from(["vz", "vm", "linux", "stop", "vz-1234"]).expect("parse");
+        assert!(matches!(cli.command, Some(Commands::Vm(_))));
+    }
+
+    #[test]
+    fn parse_vm_linux_rm() {
+        let cli = Cli::try_parse_from(["vz", "vm", "linux", "rm", "vz-1234"]).expect("parse");
         assert!(matches!(cli.command, Some(Commands::Vm(_))));
     }
 

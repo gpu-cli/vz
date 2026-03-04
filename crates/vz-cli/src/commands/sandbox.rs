@@ -1926,11 +1926,11 @@ async fn daemon_close_sandbox_shell(
 pub struct SandboxListArgs {
     /// Path to the state database.
     #[arg(long)]
-    state_db: Option<PathBuf>,
+    pub(crate) state_db: Option<PathBuf>,
 
     /// Output as JSON.
     #[arg(long)]
-    json: bool,
+    pub(crate) json: bool,
 }
 
 /// Arguments for `vz create`.
@@ -1938,31 +1938,31 @@ pub struct SandboxListArgs {
 pub struct SandboxCreateArgs {
     /// Name the new sandbox.
     #[arg(long)]
-    name: Option<String>,
+    pub(crate) name: Option<String>,
 
     /// Number of virtual CPUs.
     #[arg(long, default_value = "2")]
-    cpus: u8,
+    pub(crate) cpus: u8,
 
     /// Memory in MB.
     #[arg(long, default_value = "2048")]
-    memory: u64,
+    pub(crate) memory: u64,
 
     /// Default image reference for sandbox startup workload.
     #[arg(long)]
-    base_image: Option<String>,
+    pub(crate) base_image: Option<String>,
 
     /// Main container/workload identifier for sandbox startup.
     #[arg(long)]
-    main_container: Option<String>,
+    pub(crate) main_container: Option<String>,
 
     /// Path to the state database.
     #[arg(long)]
-    state_db: Option<PathBuf>,
+    pub(crate) state_db: Option<PathBuf>,
 
     /// Output sandbox JSON payload.
     #[arg(long)]
-    json: bool,
+    pub(crate) json: bool,
 }
 
 /// Arguments for `vz inspect`.
@@ -1973,7 +1973,7 @@ pub struct SandboxInspectArgs {
 
     /// Path to the state database.
     #[arg(long)]
-    state_db: Option<PathBuf>,
+    pub(crate) state_db: Option<PathBuf>,
 }
 
 /// Arguments for `vz rm`.
@@ -1984,7 +1984,7 @@ pub struct SandboxTerminateArgs {
 
     /// Path to the state database.
     #[arg(long)]
-    state_db: Option<PathBuf>,
+    pub(crate) state_db: Option<PathBuf>,
 }
 
 /// Arguments for `vz attach`.
@@ -1995,7 +1995,7 @@ pub struct SandboxAttachArgs {
 
     /// Path to the state database.
     #[arg(long)]
-    state_db: Option<PathBuf>,
+    pub(crate) state_db: Option<PathBuf>,
 }
 
 /// Arguments for `vz close-shell`.
@@ -2342,7 +2342,10 @@ pub async fn cmd_create(args: SandboxCreateArgs) -> anyhow::Result<()> {
         println!("{json}");
     } else {
         println!("Sandbox {} ready (not attached).", sandbox.sandbox_id);
-        println!("Use `vz attach {}` to open an interactive shell.", sandbox.sandbox_id);
+        println!(
+            "Use `vz attach {}` to open an interactive shell.",
+            sandbox.sandbox_id
+        );
         println!("Display name: {display_name}");
     }
 
