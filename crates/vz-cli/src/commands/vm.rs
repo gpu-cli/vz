@@ -364,6 +364,39 @@ async fn run_linux_init(args: LinuxVmInitArgs) -> anyhow::Result<()> {
 
     let disk_path = output_dir.join(format!("{}.img", args.name));
     let descriptor_path = output_dir.join(format!("{}.linux.json", args.name));
+    let requested_disk_size_bytes = gib_to_bytes(args.disk_size_gb)?;
+    let disk_result =
+        provision_linux_disk_image(disk_path.as_path(), requested_disk_size_bytes, args.force)?;
+
+    if descriptor_path.exists() && !args.force {
+        let existing = load_linux_vm_image_descriptor(descriptor_path.as_path())?;
+        if existing.disk_path != disk_path {
+            bail!(
+                "existing descriptor disk path {} does not match expected {}",
+                existing.disk_path.display(),
+                disk_path.display()
+            );
+        }
+        if existing.disk_size_gb != args.disk_size_gb {
+            bail!(
+                "existing descriptor disk size {} GiB does not match requested {} GiB; re-run with --force to replace",
+                existing.disk_size_gb,
+                args.disk_size_gb
+            );
+        }
+        validate_descriptor_against_current_artifacts(&existing)?;
+        println!(
+            "Linux image descriptor already exists and is compatible: {}",
+            descriptor_path.display()
+        );
+        println!(
+            "Disk image: {} ({})",
+            disk_path.display(),
+            disk_result.as_str()
+        );
+        println!("Re-run with --force to overwrite descriptor and disk metadata.");
+        return Ok(());
+    }
 
     let descriptor = LinuxVmImageDescriptor {
         schema_version: LINUX_VM_IMAGE_DESCRIPTOR_SCHEMA_VERSION,
@@ -379,17 +412,6 @@ async fn run_linux_init(args: LinuxVmInitArgs) -> anyhow::Result<()> {
         created_at_unix_secs: now_unix_secs()?,
     };
 
-    if descriptor_path.exists() && !args.force {
-        let existing = load_linux_vm_image_descriptor(descriptor_path.as_path())?;
-        validate_descriptor_against_current_artifacts(&existing)?;
-        println!(
-            "Linux image descriptor already exists and is compatible: {}",
-            descriptor_path.display()
-        );
-        println!("Re-run with --force to overwrite descriptor metadata.");
-        return Ok(());
-    }
-
     write_linux_vm_image_descriptor(descriptor_path.as_path(), &descriptor)?;
     println!(
         "Initialized Linux image descriptor: {}",
@@ -398,8 +420,10 @@ async fn run_linux_init(args: LinuxVmInitArgs) -> anyhow::Result<()> {
     println!("Kernel: {}", descriptor.kernel_path.display());
     println!("Initramfs: {}", descriptor.initramfs_path.display());
     println!(
-        "Disk path (provisioning pending): {}",
-        descriptor.disk_path.display()
+        "Disk image: {} ({}; {} GiB)",
+        descriptor.disk_path.display(),
+        disk_result.as_str(),
+        descriptor.disk_size_gb
     );
     Ok(())
 }
@@ -579,6 +603,81 @@ fn now_unix_secs() -> anyhow::Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock before unix epoch")?
         .as_secs())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskProvisioningResult {
+    Created,
+    Reused,
+    Replaced,
+}
+
+impl DiskProvisioningResult {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Reused => "reused",
+            Self::Replaced => "replaced",
+        }
+    }
+}
+
+fn gib_to_bytes(gib: u64) -> anyhow::Result<u64> {
+    gib.checked_mul(1024 * 1024 * 1024)
+        .ok_or_else(|| anyhow!("disk size too large: {gib} GiB"))
+}
+
+fn provision_linux_disk_image(
+    path: &Path,
+    expected_size_bytes: u64,
+    force_replace: bool,
+) -> anyhow::Result<DiskProvisioningResult> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create parent directory for disk image {}",
+                path.display()
+            )
+        })?;
+    }
+
+    if path.exists() {
+        if force_replace {
+            std::fs::remove_file(path)
+                .with_context(|| format!("failed to remove disk image {}", path.display()))?;
+            create_sparse_disk(path, expected_size_bytes)?;
+            return Ok(DiskProvisioningResult::Replaced);
+        }
+
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("failed to stat disk image {}", path.display()))?;
+        if !metadata.is_file() {
+            bail!("disk image path is not a regular file: {}", path.display());
+        }
+        if metadata.len() != expected_size_bytes {
+            bail!(
+                "disk image {} exists with size {} bytes but expected {} bytes; re-run with --force to replace",
+                path.display(),
+                metadata.len(),
+                expected_size_bytes
+            );
+        }
+        return Ok(DiskProvisioningResult::Reused);
+    }
+
+    create_sparse_disk(path, expected_size_bytes)?;
+    Ok(DiskProvisioningResult::Created)
+}
+
+fn create_sparse_disk(path: &Path, size_bytes: u64) -> anyhow::Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to create disk image {}", path.display()))?;
+    file.set_len(size_bytes)
+        .with_context(|| format!("failed to size disk image {}", path.display()))?;
+    Ok(())
 }
 
 async fn run_linux_run(args: LinuxVmRunArgs) -> anyhow::Result<()> {
@@ -1106,5 +1205,55 @@ mod tests {
             loaded.linux_artifact_version,
             descriptor.linux_artifact_version
         );
+    }
+
+    #[test]
+    fn provision_linux_disk_image_creates_and_reuses() {
+        let tmp = tempdir().expect("tempdir");
+        let disk_path = tmp.path().join("linux-test.img");
+        let size_bytes = gib_to_bytes(1).expect("size bytes");
+
+        let created = provision_linux_disk_image(disk_path.as_path(), size_bytes, false)
+            .expect("create disk");
+        assert_eq!(created, DiskProvisioningResult::Created);
+        assert!(disk_path.is_file());
+        let size = std::fs::metadata(&disk_path).expect("metadata").len();
+        assert_eq!(size, size_bytes);
+
+        let reused =
+            provision_linux_disk_image(disk_path.as_path(), size_bytes, false).expect("reuse disk");
+        assert_eq!(reused, DiskProvisioningResult::Reused);
+    }
+
+    #[test]
+    fn provision_linux_disk_image_replaces_when_forced() {
+        let tmp = tempdir().expect("tempdir");
+        let disk_path = tmp.path().join("linux-test.img");
+        std::fs::write(&disk_path, b"seed").expect("seed disk");
+
+        let replaced = provision_linux_disk_image(
+            disk_path.as_path(),
+            gib_to_bytes(1).expect("size bytes"),
+            true,
+        )
+        .expect("replace disk");
+        assert_eq!(replaced, DiskProvisioningResult::Replaced);
+        let size = std::fs::metadata(&disk_path).expect("metadata").len();
+        assert_eq!(size, gib_to_bytes(1).expect("size bytes"));
+    }
+
+    #[test]
+    fn provision_linux_disk_image_rejects_size_mismatch_without_force() {
+        let tmp = tempdir().expect("tempdir");
+        let disk_path = tmp.path().join("linux-test.img");
+        std::fs::write(&disk_path, b"seed").expect("seed disk");
+
+        let error = provision_linux_disk_image(
+            disk_path.as_path(),
+            gib_to_bytes(1).expect("size bytes"),
+            false,
+        )
+        .expect_err("mismatch should fail");
+        assert!(error.to_string().contains("exists with size"));
     }
 }
