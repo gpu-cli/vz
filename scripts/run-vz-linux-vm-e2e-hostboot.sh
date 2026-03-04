@@ -18,6 +18,7 @@ SKIP_PKG_SETUP=false
 PROVISION_BTRFS=true
 BTRFS_IMAGE="/var/lib/vz-btrfs-workspace.img"
 BTRFS_SIZE_GB="64"
+RUN_BTRFS_PORTABILITY=false
 
 usage() {
     cat <<'USAGE'
@@ -39,6 +40,7 @@ Options:
   --no-provision-btrfs         Skip in-guest btrfs provisioning
   --btrfs-image <path>         In-guest loopback btrfs image (default: /var/lib/vz-btrfs-workspace.img)
   --btrfs-size-gb <n>          In-guest btrfs image size GiB (default: 64)
+  --run-btrfs-portability      Also run scripts/run-linux-btrfs-e2e.sh inside the guest
   -h, --help                   Show help
 
 Env:
@@ -100,6 +102,10 @@ while [[ $# -gt 0 ]]; do
         --btrfs-size-gb)
             BTRFS_SIZE_GB="${2:-}"
             shift 2
+            ;;
+        --run-btrfs-portability)
+            RUN_BTRFS_PORTABILITY=true
+            shift
             ;;
         -h|--help)
             usage
@@ -189,10 +195,19 @@ mount -t virtiofs repo /mnt/repo;
 ${skip_pkg_preflight}
 ${pkg_setup}
 ${provision_btrfs_cmd}
-export CARGO_TARGET_DIR='/tmp/vz-cargo-target';
+: \"\${VZ_GUEST_CARGO_TARGET_DIR:=/var/tmp/vz-cargo-target}\";
+export CARGO_TARGET_DIR=\"\$VZ_GUEST_CARGO_TARGET_DIR\";
+mkdir -p \"\$CARGO_TARGET_DIR\";
 cd /mnt/repo;
 ./scripts/run-vz-linux-vm-e2e.sh --workspace '${WORKSPACE_IN_GUEST}' --profile '${PROFILE}'
 "
+
+if [[ "$RUN_BTRFS_PORTABILITY" == "true" ]]; then
+    guest_cmd+="
+cd /mnt/repo;
+./scripts/run-linux-btrfs-e2e.sh --workspace '${WORKSPACE_IN_GUEST}' --profile '${PROFILE}'
+"
+fi
 
 "$SCRIPT_DIR/run-vz-linux-hostboot-command.sh" \
     --name "$NAME" \

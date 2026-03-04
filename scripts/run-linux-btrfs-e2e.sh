@@ -58,6 +58,12 @@ ensure_btrfs_workspace() {
     if command -v stat >/dev/null 2>&1; then
         fs_type="$(stat -f -c %T "$path" 2>/dev/null || true)"
     fi
+    if [[ "${fs_type,,}" == "unknown" ]]; then
+        fs_type=""
+    fi
+    if [[ -z "$fs_type" ]] && command -v findmnt >/dev/null 2>&1; then
+        fs_type="$(findmnt -n -M "$path" -o FSTYPE 2>/dev/null || true)"
+    fi
     if [[ -z "$fs_type" ]] && command -v findmnt >/dev/null 2>&1; then
         fs_type="$(findmnt -n -T "$path" -o FSTYPE 2>/dev/null || true)"
     fi
@@ -99,6 +105,9 @@ command -v btrfs >/dev/null 2>&1 || err "btrfs command not found in PATH"
 
 ensure_btrfs_workspace "$WORKSPACE"
 export VZ_TEST_BTRFS_WORKSPACE="$WORKSPACE"
+: "${CARGO_TARGET_DIR:=/var/tmp/vz-cargo-target}"
+export CARGO_TARGET_DIR
+mkdir -p "$CARGO_TARGET_DIR"
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_DIR="$OUTPUT_ROOT/$timestamp"
