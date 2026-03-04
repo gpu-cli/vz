@@ -22,7 +22,10 @@ pub use manifest::{
 };
 #[cfg(feature = "oci")]
 pub use oci_adapter::OciRuntimeAdapter;
-pub use report::{ImageSummary, ScenarioOutcome, TestReport, TestResult};
+pub use report::{
+    FailureCategory, ImageSummary, ScenarioOutcome, TestReport, TestResult,
+    classify_failure_category,
+};
 pub use runner::{ExecOutput, FailingAdapter, MockAdapter, RuntimeAdapter, ScenarioRunner};
 pub use scenario::{
     ComposeServiceSpec, ConnectivityCheck, Expectation, Scenario, ScenarioKind,

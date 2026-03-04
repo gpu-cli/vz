@@ -10,6 +10,38 @@ use serde::{Deserialize, Serialize};
 use crate::cohort::{ImageRef, Tier};
 use crate::scenario::ScenarioKind;
 
+/// Structured failure category for compatibility reporting.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCategory {
+    /// Runtime behavioral regression likely within vz/runtime layers.
+    RuntimeRegression,
+    /// Upstream project/dependency drift unrelated to runtime execution semantics.
+    UpstreamProjectDrift,
+    /// Base image lifecycle drift (for example, distro repositories EOL).
+    BaseImageEol,
+    /// Toolchain/version incompatibility in build or package managers.
+    ToolchainMismatch,
+    /// Dockerfile/context mismatch in upstream repository layout.
+    DockerfileContextMismatch,
+    /// Uncategorized failure (needs manual triage).
+    Unknown,
+}
+
+impl FailureCategory {
+    /// Human-readable label for CLI summaries.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RuntimeRegression => "runtime-regression",
+            Self::UpstreamProjectDrift => "upstream-project-drift",
+            Self::BaseImageEol => "base-image-eol",
+            Self::ToolchainMismatch => "toolchain-mismatch",
+            Self::DockerfileContextMismatch => "dockerfile-context-mismatch",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Outcome of evaluating a single expectation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ScenarioOutcome {
@@ -67,6 +99,9 @@ pub struct TestResult {
     /// Captured stderr (truncated if large).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
+    /// Structured failure category for non-pass outcomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_category: Option<FailureCategory>,
 }
 
 /// Aggregate report for a validation run.
@@ -175,6 +210,66 @@ impl TestReport {
         summaries.sort_by(|a, b| a.reference.cmp(&b.reference));
         summaries
     }
+
+    /// Count failures grouped by structured category.
+    pub fn failure_category_counts(&self) -> Vec<(FailureCategory, usize)> {
+        let mut counts: std::collections::BTreeMap<FailureCategory, usize> =
+            std::collections::BTreeMap::new();
+        for result in &self.results {
+            if result.outcome.is_failure() {
+                let category = result.failure_category.unwrap_or(FailureCategory::Unknown);
+                *counts.entry(category).or_default() += 1;
+            }
+        }
+        counts.into_iter().collect()
+    }
+}
+
+/// Classify a failure/error using normalized diagnostic text.
+pub fn classify_failure_category(message: &str) -> FailureCategory {
+    let lower = message.to_ascii_lowercase();
+
+    if lower.contains("copy failed: file not found")
+        || lower.contains("dockerfile must be inside build context")
+        || lower.contains("failed to compute cache key")
+    {
+        return FailureCategory::DockerfileContextMismatch;
+    }
+
+    if (lower.contains("buster") && lower.contains("release file"))
+        || (lower.contains("apt") && lower.contains("no longer has a release file"))
+        || (lower.contains("apt-get update") && lower.contains("404"))
+    {
+        return FailureCategory::BaseImageEol;
+    }
+
+    if lower.contains("ebadengine")
+        || lower.contains("unsupported engine")
+        || (lower.contains("edition2024") && lower.contains("cargo"))
+        || (lower.contains("pip") && lower.contains("invalid requirement"))
+        || (lower.contains("toolchain") && lower.contains("mismatch"))
+    {
+        return FailureCategory::ToolchainMismatch;
+    }
+
+    if lower.contains("upstream")
+        || lower.contains("deprecated")
+        || lower.contains("repository moved")
+        || lower.contains("no matching distribution found")
+    {
+        return FailureCategory::UpstreamProjectDrift;
+    }
+
+    if lower.contains("panic")
+        || lower.contains("segmentation fault")
+        || lower.contains("runtime error")
+        || lower.contains("vz-runtime")
+        || lower.contains("daemon unavailable")
+    {
+        return FailureCategory::RuntimeRegression;
+    }
+
+    FailureCategory::Unknown
 }
 
 /// Per-image outcome summary for nightly reports.
@@ -238,6 +333,11 @@ mod tests {
             duration: Duration::from_millis(150),
             stdout: Some("output".to_string()),
             stderr: None,
+            failure_category: if passed {
+                None
+            } else {
+                Some(FailureCategory::RuntimeRegression)
+            },
         }
     }
 
@@ -384,5 +484,37 @@ mod tests {
         let deserialized: ImageSummary = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.reference, "alpine:3.20");
         assert_eq!(deserialized.passed, 5);
+    }
+
+    #[test]
+    fn failure_category_counts_group_failures() {
+        let mut report = TestReport::new(Tier::Tier2, "2026-02-20T00:00:00Z");
+        let mut failed = sample_result(false);
+        failed.failure_category = Some(FailureCategory::ToolchainMismatch);
+        report.add_result(failed);
+        let mut failed_unknown = sample_result(false);
+        failed_unknown.failure_category = None;
+        report.add_result(failed_unknown);
+        report.add_result(sample_result(true));
+
+        let counts = report.failure_category_counts();
+        assert!(counts.contains(&(FailureCategory::ToolchainMismatch, 1)));
+        assert!(counts.contains(&(FailureCategory::Unknown, 1)));
+    }
+
+    #[test]
+    fn classify_failure_category_detects_known_signatures() {
+        assert_eq!(
+            classify_failure_category("npm ERR! code EBADENGINE unsupported engine"),
+            FailureCategory::ToolchainMismatch
+        );
+        assert_eq!(
+            classify_failure_category("E: The repository no longer has a Release file (buster)"),
+            FailureCategory::BaseImageEol
+        );
+        assert_eq!(
+            classify_failure_category("COPY failed: file not found in build context"),
+            FailureCategory::DockerfileContextMismatch
+        );
     }
 }

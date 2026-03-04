@@ -8,7 +8,7 @@
 use std::time::Instant;
 
 use crate::cohort::ImageRef;
-use crate::report::{ScenarioOutcome, TestResult};
+use crate::report::{ScenarioOutcome, TestResult, classify_failure_category};
 use crate::scenario::{Expectation, Scenario, ScenarioKind};
 
 /// Output captured from a scenario execution.
@@ -100,6 +100,33 @@ impl<R: RuntimeAdapter> ScenarioRunner<R> {
         };
 
         let duration = start.elapsed();
+        let failure_category = if outcome.is_failure() {
+            let mut diagnostic = String::new();
+            match &outcome {
+                ScenarioOutcome::Fail { failures } => {
+                    diagnostic.push_str(&failures.join("; "));
+                }
+                ScenarioOutcome::Error { message } => {
+                    diagnostic.push_str(message);
+                }
+                ScenarioOutcome::Pass | ScenarioOutcome::Skipped { .. } => {}
+            }
+            if let Some(captured_stderr) = stderr.as_deref() {
+                if !diagnostic.is_empty() {
+                    diagnostic.push_str(" | ");
+                }
+                diagnostic.push_str(captured_stderr);
+            }
+            if let Some(captured_stdout) = stdout.as_deref() {
+                if !diagnostic.is_empty() {
+                    diagnostic.push_str(" | ");
+                }
+                diagnostic.push_str(captured_stdout);
+            }
+            Some(classify_failure_category(&diagnostic))
+        } else {
+            None
+        };
 
         TestResult {
             image: image.clone(),
@@ -110,6 +137,7 @@ impl<R: RuntimeAdapter> ScenarioRunner<R> {
             duration,
             stdout,
             stderr,
+            failure_category,
         }
     }
 

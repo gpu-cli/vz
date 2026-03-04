@@ -155,6 +155,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         println!("{json}");
     } else {
         print_report_summary(&report);
+        print_failure_category_summary(&report);
         if args.tier >= 2 {
             print_per_image_summary(&report);
         }
@@ -310,8 +311,12 @@ fn print_report_summary(report: &TestReport) {
         } else {
             "FAIL"
         };
+        let category_suffix = result
+            .failure_category
+            .map(|category| format!(" [{}]", category.label()))
+            .unwrap_or_default();
         println!(
-            "  [{status}] {image} / {scenario} ({ms}ms)",
+            "  [{status}] {image} / {scenario} ({ms}ms){category_suffix}",
             image = result.image.label,
             scenario = result.scenario_id,
             ms = result.duration.as_millis(),
@@ -325,6 +330,18 @@ fn print_report_summary(report: &TestReport) {
         if let vz_validation::ScenarioOutcome::Error { message } = &result.outcome {
             println!("         error: {message}");
         }
+    }
+}
+
+fn print_failure_category_summary(report: &TestReport) {
+    let counts = report.failure_category_counts();
+    if counts.is_empty() {
+        return;
+    }
+    println!();
+    println!("Failure categories:");
+    for (category, count) in counts {
+        println!("  {:<30} {}", category.label(), count);
     }
 }
 
