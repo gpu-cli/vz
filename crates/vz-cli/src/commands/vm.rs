@@ -135,6 +135,10 @@ pub enum LinuxVmCommand {
     Attach(LinuxVmAttachArgs),
     /// Execute a command in a Linux space with streamed output.
     Exec(LinuxVmExecArgs),
+    /// Save a Linux space as a daemon checkpoint.
+    Save(LinuxVmSaveArgs),
+    /// Restore a Linux space from a checkpoint.
+    Restore(LinuxVmRestoreArgs),
     /// Stop a Linux space.
     Stop(LinuxVmStopArgs),
     /// Remove (terminate) a Linux space.
@@ -269,6 +273,34 @@ pub struct LinuxVmExecArgs {
     pub pty: bool,
 }
 
+/// Arguments for `vz vm linux save`.
+#[derive(Args, Debug)]
+pub struct LinuxVmSaveArgs {
+    /// Sandbox identifier.
+    pub sandbox_id: String,
+    /// Checkpoint class: fs_quick or vm_full.
+    #[arg(long, default_value = "fs_quick")]
+    pub class: String,
+    /// Optional retention tag. Tagged checkpoints are protected from policy GC.
+    #[arg(long)]
+    pub tag: Option<String>,
+    /// Path to runtime state DB.
+    #[arg(long)]
+    pub state_db: Option<PathBuf>,
+}
+
+/// Arguments for `vz vm linux restore`.
+#[derive(Args, Debug)]
+pub struct LinuxVmRestoreArgs {
+    /// Sandbox identifier.
+    pub sandbox_id: String,
+    /// Checkpoint identifier.
+    pub checkpoint_id: String,
+    /// Path to runtime state DB.
+    #[arg(long)]
+    pub state_db: Option<PathBuf>,
+}
+
 /// Arguments for `vz vm linux stop`.
 #[derive(Args, Debug)]
 pub struct LinuxVmStopArgs {
@@ -355,6 +387,8 @@ async fn run_linux(args: LinuxVmArgs) -> anyhow::Result<()> {
         LinuxVmCommand::Inspect(inspect_args) => run_linux_inspect(inspect_args).await,
         LinuxVmCommand::Attach(attach_args) => run_linux_attach(attach_args).await,
         LinuxVmCommand::Exec(exec_args) => run_linux_exec(exec_args).await,
+        LinuxVmCommand::Save(save_args) => run_linux_save(save_args).await,
+        LinuxVmCommand::Restore(restore_args) => run_linux_restore(restore_args).await,
         LinuxVmCommand::Stop(stop_args) => run_linux_stop(stop_args).await,
         LinuxVmCommand::Rm(rm_args) => run_linux_rm(rm_args).await,
         LinuxVmCommand::Test(test_args) => run_linux_test(test_args).await,
@@ -1110,6 +1144,109 @@ fn normalize_linux_exec_command(command: Vec<String>) -> Vec<String> {
     }
 }
 
+fn normalize_linux_checkpoint_class(class: &str) -> anyhow::Result<String> {
+    match class.trim().to_ascii_lowercase().as_str() {
+        "fs_quick" | "fs-quick" => Ok("fs_quick".to_string()),
+        "vm_full" | "vm-full" => Ok("vm_full".to_string()),
+        other => bail!("unknown checkpoint class: {other}"),
+    }
+}
+
+async fn run_linux_save(args: LinuxVmSaveArgs) -> anyhow::Result<()> {
+    let checkpoint_class = normalize_linux_checkpoint_class(&args.class)?;
+    let state_db = args.state_db.unwrap_or_else(default_state_db_path);
+    let mut client = connect_linux_daemon(&state_db).await?;
+
+    let sandbox = match client
+        .get_sandbox(runtime_v2::GetSandboxRequest {
+            sandbox_id: args.sandbox_id.clone(),
+            metadata: None,
+        })
+        .await
+    {
+        Ok(response) => response
+            .sandbox
+            .ok_or_else(|| anyhow!("daemon get_sandbox missing payload"))?,
+        Err(DaemonClientError::Grpc(status)) if status.code() == Code::NotFound => {
+            bail!("linux space {} not found", args.sandbox_id)
+        }
+        Err(error) => return Err(anyhow!(error).context("failed to resolve linux space")),
+    };
+    if !is_linux_backend_name(&sandbox.backend) {
+        bail!(
+            "sandbox {} is backend `{}`, not linux",
+            args.sandbox_id,
+            sandbox.backend
+        );
+    }
+
+    let response = client
+        .create_checkpoint(runtime_v2::CreateCheckpointRequest {
+            metadata: None,
+            sandbox_id: args.sandbox_id.clone(),
+            checkpoint_class: checkpoint_class.clone(),
+            compatibility_fingerprint: "runtime:auto".to_string(),
+            retention_tag: args.tag.unwrap_or_default(),
+        })
+        .await
+        .context("failed to create checkpoint via daemon")?;
+    let payload = response
+        .checkpoint
+        .ok_or_else(|| anyhow!("daemon create_checkpoint missing checkpoint payload"))?;
+    println!(
+        "Linux space {} saved as checkpoint {} (class: {}).",
+        args.sandbox_id, payload.checkpoint_id, checkpoint_class
+    );
+    Ok(())
+}
+
+async fn run_linux_restore(args: LinuxVmRestoreArgs) -> anyhow::Result<()> {
+    let state_db = args.state_db.unwrap_or_else(default_state_db_path);
+    let mut client = connect_linux_daemon(&state_db).await?;
+
+    ensure_linux_sandbox(&state_db, &args.sandbox_id).await?;
+
+    let checkpoint = match client
+        .get_checkpoint(runtime_v2::GetCheckpointRequest {
+            checkpoint_id: args.checkpoint_id.clone(),
+            metadata: None,
+        })
+        .await
+    {
+        Ok(response) => response
+            .checkpoint
+            .ok_or_else(|| anyhow!("daemon get_checkpoint missing checkpoint payload"))?,
+        Err(DaemonClientError::Grpc(status)) if status.code() == Code::NotFound => {
+            bail!("checkpoint {} not found", args.checkpoint_id)
+        }
+        Err(error) => return Err(anyhow!(error).context("failed to resolve checkpoint")),
+    };
+    if checkpoint.sandbox_id != args.sandbox_id {
+        bail!(
+            "checkpoint {} belongs to sandbox {}, not {}",
+            args.checkpoint_id,
+            checkpoint.sandbox_id,
+            args.sandbox_id
+        );
+    }
+
+    let response = client
+        .restore_checkpoint(runtime_v2::RestoreCheckpointRequest {
+            checkpoint_id: args.checkpoint_id.clone(),
+            metadata: None,
+        })
+        .await
+        .context("failed to restore checkpoint via daemon")?;
+    let payload = response
+        .checkpoint
+        .ok_or_else(|| anyhow!("daemon restore_checkpoint missing checkpoint payload"))?;
+    println!(
+        "Linux space {} restored from checkpoint {}.",
+        payload.sandbox_id, payload.checkpoint_id
+    );
+    Ok(())
+}
+
 async fn run_linux_stop(args: LinuxVmStopArgs) -> anyhow::Result<()> {
     let state_db = args.state_db.unwrap_or_else(default_state_db_path);
     ensure_linux_sandbox(&state_db, &args.sandbox_id).await?;
@@ -1436,6 +1573,32 @@ mod tests {
             "echo ok".to_string(),
         ];
         assert_eq!(normalize_linux_exec_command(command.clone()), command);
+    }
+
+    #[test]
+    fn normalize_linux_checkpoint_class_accepts_known_values() {
+        assert_eq!(
+            normalize_linux_checkpoint_class("fs_quick").expect("fs_quick"),
+            "fs_quick"
+        );
+        assert_eq!(
+            normalize_linux_checkpoint_class("fs-quick").expect("fs-quick"),
+            "fs_quick"
+        );
+        assert_eq!(
+            normalize_linux_checkpoint_class("vm_full").expect("vm_full"),
+            "vm_full"
+        );
+        assert_eq!(
+            normalize_linux_checkpoint_class("vm-full").expect("vm-full"),
+            "vm_full"
+        );
+    }
+
+    #[test]
+    fn normalize_linux_checkpoint_class_rejects_unknown_values() {
+        let error = normalize_linux_checkpoint_class("snapshot").expect_err("unknown class");
+        assert!(error.to_string().contains("unknown checkpoint class"));
     }
 
     #[test]

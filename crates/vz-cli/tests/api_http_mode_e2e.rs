@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -19,7 +19,9 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use vz_api::{ApiConfig, router};
 use vz_runtime_contract::RuntimeCapabilities;
+use vz_runtime_proto::runtime_v2;
 use vz_runtimed::{RuntimeDaemon, RuntimedConfig, serve_runtime_uds_with_shutdown};
+use vz_runtimed_client::{DaemonClient, DaemonClientConfig};
 
 #[derive(Debug, Serialize)]
 struct CreateSandboxRequest {
@@ -283,6 +285,87 @@ async fn run_vz_command(
     })
     .await
     .context("join vz command task")?
+}
+
+fn run_vz_command_daemon_blocking(
+    vz_bin: PathBuf,
+    daemon_socket_path: PathBuf,
+    home_dir: PathBuf,
+    args: Vec<String>,
+) -> Result<Output> {
+    let mut child = Command::new(&vz_bin)
+        .args(&args)
+        .env("VZ_CONTROL_PLANE_TRANSPORT", "daemon-grpc")
+        .env("VZ_RUNTIME_DAEMON_SOCKET", &daemon_socket_path)
+        .env("VZ_RUNTIME_DAEMON_AUTOSTART", "0")
+        .env("HOME", &home_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn vz daemon command: {:?}", args))?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().context("poll vz command status")? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("timed out running vz command: {:?}", args);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    let mut stdout = Vec::new();
+    if let Some(mut stream) = child.stdout.take() {
+        stream
+            .read_to_end(&mut stdout)
+            .context("read vz command stdout")?;
+    }
+
+    let mut stderr = Vec::new();
+    if let Some(mut stream) = child.stderr.take() {
+        stream
+            .read_to_end(&mut stderr)
+            .context("read vz command stderr")?;
+    }
+
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+async fn run_vz_command_daemon(
+    vz_bin: &Path,
+    daemon_socket_path: &Path,
+    home_dir: &Path,
+    args: &[&str],
+) -> Result<Output> {
+    let vz_bin = vz_bin.to_path_buf();
+    let daemon_socket_path = daemon_socket_path.to_path_buf();
+    let home_dir = home_dir.to_path_buf();
+    let args: Vec<String> = args.iter().map(|value| (*value).to_string()).collect();
+
+    tokio::task::spawn_blocking(move || {
+        run_vz_command_daemon_blocking(vz_bin, daemon_socket_path, home_dir, args)
+    })
+    .await
+    .context("join vz daemon command task")?
+}
+
+fn is_linux_backend_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "linux_firecracker"
+            | "linux-firecracker"
+            | "firecracker"
+            | "linux-native"
+            | "linux_native"
+            | "linux"
+    )
 }
 
 fn transcript_contains(transcript: &Arc<Mutex<Vec<u8>>>, needle: &str) -> bool {
@@ -1346,6 +1429,195 @@ async fn cli_api_http_mode_lease_commands_work_against_stub_api_without_daemon()
         .await
         .context("join stub API server task")?
         .context("run stub API server")?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_daemon_grpc_linux_save_restore_commands_cover_happy_path_and_errors() -> Result<()> {
+    let temp_dir = tempfile::tempdir().context("create temp dir")?;
+    let home_dir = temp_dir.path().join("home");
+    std::fs::create_dir_all(&home_dir).context("create isolated HOME directory")?;
+    let state_store_path = temp_dir.path().join("state").join("stack-state.db");
+    std::fs::create_dir_all(
+        state_store_path
+            .parent()
+            .context("state store path parent should exist")?,
+    )
+    .context("create state store parent")?;
+
+    let (daemon_shutdown, daemon_server, daemon_socket_path) =
+        start_daemon_for_state_store(&state_store_path).await?;
+
+    let client_config = DaemonClientConfig {
+        socket_path: daemon_socket_path.clone(),
+        auto_spawn: false,
+        state_store_path: Some(state_store_path.clone()),
+        runtime_data_dir: daemon_socket_path.parent().map(Path::to_path_buf),
+        ..DaemonClientConfig::default()
+    };
+    let mut client = DaemonClient::connect_with_config(client_config)
+        .await
+        .context("connect daemon client")?;
+
+    if !is_linux_backend_name(client.handshake().backend_name.as_str()) {
+        daemon_shutdown.notify_waiters();
+        daemon_server
+            .await
+            .context("join daemon server task")?
+            .context("run daemon server")?;
+        return Ok(());
+    }
+
+    let sandbox = client
+        .create_sandbox(runtime_v2::CreateSandboxRequest {
+            metadata: None,
+            stack_name: "cli-linux-save-restore".to_string(),
+            cpus: 1,
+            memory_mb: 256,
+            labels: HashMap::new(),
+        })
+        .await
+        .context("create sandbox via daemon")?;
+    let sandbox_id = sandbox
+        .sandbox
+        .context("create_sandbox missing payload")?
+        .sandbox_id;
+
+    let vz_bin = resolve_vz_binary()?;
+    let state_store_path_arg = state_store_path.to_string_lossy().to_string();
+
+    let bad_class_output = run_vz_command_daemon(
+        &vz_bin,
+        &daemon_socket_path,
+        &home_dir,
+        &[
+            "debug",
+            "vm",
+            "linux",
+            "save",
+            &sandbox_id,
+            "--class",
+            "snapshot",
+            "--state-db",
+            &state_store_path_arg,
+        ],
+    )
+    .await?;
+    if bad_class_output.status.success() {
+        bail!("vz vm linux save with bad class unexpectedly succeeded");
+    }
+    let bad_class_stderr = String::from_utf8_lossy(&bad_class_output.stderr);
+    if !bad_class_stderr.contains("unknown checkpoint class") {
+        bail!(
+            "unexpected bad-class stderr:\n{}",
+            String::from_utf8_lossy(&bad_class_output.stderr)
+        );
+    }
+
+    let save_output = run_vz_command_daemon(
+        &vz_bin,
+        &daemon_socket_path,
+        &home_dir,
+        &[
+            "debug",
+            "vm",
+            "linux",
+            "save",
+            &sandbox_id,
+            "--class",
+            "fs_quick",
+            "--state-db",
+            &state_store_path_arg,
+        ],
+    )
+    .await?;
+    if !save_output.status.success() {
+        bail!(
+            "vz vm linux save failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&save_output.stdout),
+            String::from_utf8_lossy(&save_output.stderr)
+        );
+    }
+    let save_stdout = String::from_utf8_lossy(&save_output.stdout);
+    if !save_stdout.contains("saved as checkpoint") {
+        bail!("save output missing checkpoint marker:\n{save_stdout}");
+    }
+
+    let list = client
+        .list_checkpoints(runtime_v2::ListCheckpointsRequest {
+            metadata: None,
+        })
+        .await
+        .context("list checkpoints")?;
+    let checkpoint_id = list
+        .checkpoints
+        .iter()
+        .filter(|checkpoint| checkpoint.sandbox_id == sandbox_id)
+        .last()
+        .map(|checkpoint| checkpoint.checkpoint_id.clone())
+        .context("expected checkpoint after save")?;
+
+    let restore_output = run_vz_command_daemon(
+        &vz_bin,
+        &daemon_socket_path,
+        &home_dir,
+        &[
+            "debug",
+            "vm",
+            "linux",
+            "restore",
+            &sandbox_id,
+            &checkpoint_id,
+            "--state-db",
+            &state_store_path_arg,
+        ],
+    )
+    .await?;
+    if !restore_output.status.success() {
+        bail!(
+            "vz vm linux restore failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&restore_output.stdout),
+            String::from_utf8_lossy(&restore_output.stderr)
+        );
+    }
+    let restore_stdout = String::from_utf8_lossy(&restore_output.stdout);
+    if !restore_stdout.contains("restored from checkpoint") {
+        bail!("restore output missing checkpoint marker:\n{restore_stdout}");
+    }
+
+    let missing_output = run_vz_command_daemon(
+        &vz_bin,
+        &daemon_socket_path,
+        &home_dir,
+        &[
+            "debug",
+            "vm",
+            "linux",
+            "restore",
+            &sandbox_id,
+            "ckpt-missing-cli",
+            "--state-db",
+            &state_store_path_arg,
+        ],
+    )
+    .await?;
+    if missing_output.status.success() {
+        bail!("vz vm linux restore unexpectedly succeeded for missing checkpoint");
+    }
+    let missing_stderr = String::from_utf8_lossy(&missing_output.stderr);
+    if !missing_stderr.contains("checkpoint ckpt-missing-cli not found") {
+        bail!(
+            "missing checkpoint stderr mismatch:\n{}",
+            String::from_utf8_lossy(&missing_output.stderr)
+        );
+    }
+
+    daemon_shutdown.notify_waiters();
+    daemon_server
+        .await
+        .context("join daemon server task")?
+        .context("run daemon server")?;
 
     Ok(())
 }
