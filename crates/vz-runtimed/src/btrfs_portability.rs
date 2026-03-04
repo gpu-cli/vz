@@ -50,21 +50,79 @@ pub fn export_subvolume_send_stream(
         fs::create_dir_all(parent).map_err(StackError::from)?;
     }
     let stream_file = File::create(stream_path).map_err(StackError::from)?;
-    let output = Command::new("btrfs")
-        .args(["send", &subvolume_path.to_string_lossy()])
+    let timestamp_nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+    {
+        Ok(duration) => duration.as_nanos(),
+        Err(_) => 0,
+    };
+    let snapshot_name = format!(".vz-send-{}-{timestamp_nanos}", std::process::id());
+    let snapshot_path = subvolume_path
+        .parent()
+        .ok_or_else(|| {
+            machine_error(
+                MachineErrorCode::ValidationError,
+                format!(
+                    "btrfs send source subvolume has no parent directory: {}",
+                    subvolume_path.display()
+                ),
+            )
+        })?
+        .join(snapshot_name);
+
+    let snapshot_output = Command::new("btrfs")
+        .args([
+            "subvolume",
+            "snapshot",
+            "-r",
+            &subvolume_path.to_string_lossy(),
+            &snapshot_path.to_string_lossy(),
+        ])
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(StackError::from)?;
+    if !snapshot_output.status.success() {
+        return Err(machine_error(
+            MachineErrorCode::BackendUnavailable,
+            format!(
+                "btrfs readonly snapshot failed for {}: {}",
+                subvolume_path.display(),
+                String::from_utf8_lossy(&snapshot_output.stderr).trim()
+            ),
+        ));
+    }
+
+    let send_output = Command::new("btrfs")
+        .args(["send", &snapshot_path.to_string_lossy()])
         .stdout(Stdio::from(stream_file))
         .stderr(Stdio::piped())
         .output()
         .map_err(StackError::from)?;
-    if output.status.success() {
+
+    let cleanup_output = Command::new("btrfs")
+        .args(["subvolume", "delete", &snapshot_path.to_string_lossy()])
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(StackError::from)?;
+    if !cleanup_output.status.success() {
+        return Err(machine_error(
+            MachineErrorCode::BackendUnavailable,
+            format!(
+                "btrfs delete failed for snapshot {}: {}",
+                snapshot_path.display(),
+                String::from_utf8_lossy(&cleanup_output.stderr).trim()
+            ),
+        ));
+    }
+
+    if send_output.status.success() {
         return Ok(());
     }
     Err(machine_error(
         MachineErrorCode::BackendUnavailable,
         format!(
             "btrfs send failed for {}: {}",
-            subvolume_path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            snapshot_path.display(),
+            String::from_utf8_lossy(&send_output.stderr).trim()
         ),
     ))
 }
@@ -141,7 +199,50 @@ pub fn import_subvolume_receive_stream(
             ),
         ));
     }
-    Ok(receive_parent.join(&created[0]))
+    let received_subvolume_path = receive_parent.join(&created[0]);
+    let writable_subvolume_path = receive_parent.join(format!(
+        "{}-rw",
+        created[0].to_string_lossy()
+    ));
+    let snapshot_output = Command::new("btrfs")
+        .args([
+            "subvolume",
+            "snapshot",
+            &received_subvolume_path.to_string_lossy(),
+            &writable_subvolume_path.to_string_lossy(),
+        ])
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(StackError::from)?;
+    if !snapshot_output.status.success() {
+        return Err(machine_error(
+            MachineErrorCode::BackendUnavailable,
+            format!(
+                "btrfs snapshot failed from {} to {}: {}",
+                received_subvolume_path.display(),
+                writable_subvolume_path.display(),
+                String::from_utf8_lossy(&snapshot_output.stderr).trim()
+            ),
+        ));
+    }
+
+    let delete_received_output = Command::new("btrfs")
+        .args(["subvolume", "delete", &received_subvolume_path.to_string_lossy()])
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(StackError::from)?;
+    if !delete_received_output.status.success() {
+        return Err(machine_error(
+            MachineErrorCode::BackendUnavailable,
+            format!(
+                "btrfs delete failed for received subvolume {}: {}",
+                received_subvolume_path.display(),
+                String::from_utf8_lossy(&delete_received_output.stderr).trim()
+            ),
+        ));
+    }
+
+    Ok(writable_subvolume_path)
 }
 
 #[cfg(test)]
