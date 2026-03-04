@@ -145,6 +145,12 @@ harness on a Linux host/VM with a real btrfs workspace path:
 VZ_TEST_BTRFS_WORKSPACE=/mnt/vz-btrfs ./scripts/run-linux-btrfs-e2e.sh
 ```
 
+If your Linux VM does not already have a btrfs workspace, provision one once:
+
+```bash
+sudo ./scripts/provision-linux-btrfs-workspace.sh --workspace /mnt/vz-btrfs
+```
+
 For dedicated remote `vz` Linux environments (SSH-accessible), use the remote wrapper:
 
 ```bash
