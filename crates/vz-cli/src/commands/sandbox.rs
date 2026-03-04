@@ -1933,6 +1933,38 @@ pub struct SandboxListArgs {
     json: bool,
 }
 
+/// Arguments for `vz create`.
+#[derive(Args, Debug)]
+pub struct SandboxCreateArgs {
+    /// Name the new sandbox.
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Number of virtual CPUs.
+    #[arg(long, default_value = "2")]
+    cpus: u8,
+
+    /// Memory in MB.
+    #[arg(long, default_value = "2048")]
+    memory: u64,
+
+    /// Default image reference for sandbox startup workload.
+    #[arg(long)]
+    base_image: Option<String>,
+
+    /// Main container/workload identifier for sandbox startup.
+    #[arg(long)]
+    main_container: Option<String>,
+
+    /// Path to the state database.
+    #[arg(long)]
+    state_db: Option<PathBuf>,
+
+    /// Output sandbox JSON payload.
+    #[arg(long)]
+    json: bool,
+}
+
 /// Arguments for `vz inspect`.
 #[derive(Args, Debug)]
 pub struct SandboxInspectArgs {
@@ -2101,8 +2133,8 @@ async fn cmd_resume_sandbox(state_db: &Path, target: &str) -> anyhow::Result<()>
     }
 }
 
-/// Create a new sandbox and attach to it.
-async fn cmd_create_sandbox(
+/// Create a new sandbox in spaces mode.
+async fn create_space_sandbox(
     state_db: &Path,
     cwd: &Path,
     space_config: &SpaceConfig,
@@ -2112,7 +2144,7 @@ async fn cmd_create_sandbox(
     memory: u64,
     base_image_ref: Option<String>,
     main_container: Option<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(Sandbox, String)> {
     let sandbox_id = generate_sandbox_id();
     let display_name = name.as_deref().unwrap_or(&sandbox_id);
     let worktree_identity = derive_space_worktree_identity(cwd)?;
@@ -2209,6 +2241,34 @@ async fn cmd_create_sandbox(
         labels.clone(),
     )
     .await?;
+
+    Ok((sandbox, display_name.to_string()))
+}
+
+/// Create a new sandbox and attach to it.
+async fn cmd_create_sandbox(
+    state_db: &Path,
+    cwd: &Path,
+    space_config: &SpaceConfig,
+    name: Option<String>,
+    lifecycle_mode: SpaceLifecycleMode,
+    cpus: u8,
+    memory: u64,
+    base_image_ref: Option<String>,
+    main_container: Option<String>,
+) -> anyhow::Result<()> {
+    let (sandbox, _display_name) = create_space_sandbox(
+        state_db,
+        cwd,
+        space_config,
+        name,
+        lifecycle_mode,
+        cpus,
+        memory,
+        base_image_ref,
+        main_container,
+    )
+    .await?;
     println!("Sandbox {} ready. Launching shell...", sandbox.sandbox_id);
     println!();
     let attach_result = attach_to_sandbox_by_id(state_db, &sandbox.sandbox_id).await;
@@ -2254,6 +2314,39 @@ async fn cmd_create_sandbox(
             }
         }
     }
+}
+
+/// Create a sandbox without attaching an interactive shell (`vz create`).
+pub async fn cmd_create(args: SandboxCreateArgs) -> anyhow::Result<()> {
+    let state_db = args.state_db.unwrap_or_else(default_state_db_path);
+    let cwd = std::env::current_dir().context("failed to get current directory")?;
+    let space_config = load_space_config(&cwd)?;
+    enforce_btrfs_workspace_preflight(&cwd)?;
+
+    let (sandbox, display_name) = create_space_sandbox(
+        &state_db,
+        &cwd,
+        &space_config,
+        args.name,
+        SpaceLifecycleMode::Persistent,
+        args.cpus,
+        args.memory,
+        args.base_image,
+        args.main_container,
+    )
+    .await?;
+
+    if args.json {
+        let json = serde_json::to_string_pretty(&sandbox)
+            .context("failed to serialize created sandbox payload")?;
+        println!("{json}");
+    } else {
+        println!("Sandbox {} ready (not attached).", sandbox.sandbox_id);
+        println!("Use `vz attach {}` to open an interactive shell.", sandbox.sandbox_id);
+        println!("Display name: {display_name}");
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

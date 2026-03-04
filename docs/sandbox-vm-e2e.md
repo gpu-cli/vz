@@ -222,8 +222,7 @@ What this flow validates:
 
 - `vz-runtimed` starts and owns runtime state.
 - `vz-api` routes to daemon over UDS.
-- sandbox create via API succeeds.
-- high-level `vz` CLI (`ls`, `inspect`, `rm`) works via `api-http` transport.
+- high-level `vz` CLI (`create`, `ls`, `inspect`, `rm`) works via `api-http` transport.
 - final sandbox state is `terminated`.
 
 Artifacts are copied locally under:

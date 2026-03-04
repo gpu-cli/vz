@@ -924,10 +924,14 @@ async fn exec_container_linux(
     let timeout = args.timeout_secs.map(Duration::from_secs);
 
     let config = vz_runtime_contract::ExecConfig {
+        execution_id: None,
         cmd: args.command,
         working_dir: args.workdir,
         env,
         user: args.user,
+        pty: false,
+        term_rows: None,
+        term_cols: None,
         timeout,
     };
 
@@ -988,7 +992,7 @@ async fn stop_container_linux(
     use vz_runtime_contract::RuntimeBackend;
 
     let container = backend
-        .stop_container(&args.id, args.force)
+        .stop_container(&args.id, args.force, None, None)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     match container.status {
@@ -1032,10 +1036,14 @@ async fn container_logs_linux(
     // Initial fetch: bounded tail -n <count>.
     let tail_n = args.tail.to_string();
     let exec_config = vz_runtime_contract::ExecConfig {
+        execution_id: None,
         cmd: vec!["tail".into(), "-n".into(), tail_n, log_file.into()],
         working_dir: None,
         env: vec![],
         user: None,
+        pty: false,
+        term_rows: None,
+        term_cols: None,
         timeout: Some(Duration::from_secs(5)),
     };
 
@@ -1053,10 +1061,14 @@ async fn container_logs_linux(
 
     // Follow mode: track byte offset, poll with tail -c +<offset>.
     let size_config = vz_runtime_contract::ExecConfig {
+        execution_id: None,
         cmd: vec!["wc".into(), "-c".into(), log_file.into()],
         working_dir: None,
         env: vec![],
         user: None,
+        pty: false,
+        term_rows: None,
+        term_cols: None,
         timeout: Some(Duration::from_secs(5)),
     };
 
@@ -1076,10 +1088,14 @@ async fn container_logs_linux(
 
         let offset_arg = format!("+{}", offset + 1);
         let poll_config = vz_runtime_contract::ExecConfig {
+            execution_id: None,
             cmd: vec!["tail".into(), "-c".into(), offset_arg, log_file.into()],
             working_dir: None,
             env: vec![],
             user: None,
+            pty: false,
+            term_rows: None,
+            term_cols: None,
             timeout: Some(Duration::from_secs(5)),
         };
 

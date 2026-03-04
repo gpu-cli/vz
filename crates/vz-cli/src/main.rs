@@ -101,6 +101,9 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum Commands {
+    /// Create a new sandbox without attaching an interactive shell.
+    Create(commands::sandbox::SandboxCreateArgs),
+
     // ── Sandbox management (top-level) ──
     /// List sandboxes.
     Ls(commands::sandbox::SandboxListArgs),
@@ -216,6 +219,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             // Sandbox management
+            Some(Commands::Create(args)) => commands::sandbox::cmd_create(args).await,
             Some(Commands::Ls(args)) => commands::sandbox::cmd_list(args).await,
             Some(Commands::Rm(args)) => commands::sandbox::cmd_terminate(args).await,
             Some(Commands::Inspect(args)) => commands::sandbox::cmd_inspect(args).await,

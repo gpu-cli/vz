@@ -262,11 +262,6 @@ fn sandbox_workspace_project_dir(
 
 #[cfg(target_os = "linux")]
 fn path_is_on_btrfs(path: &Path, request_id: &str) -> Result<bool, Status> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    const BTRFS_SUPER_MAGIC: libc::c_long = 0x9123_683E;
-
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         status_from_machine_error(MachineError::new(
             MachineErrorCode::BackendUnavailable,
@@ -278,38 +273,59 @@ fn path_is_on_btrfs(path: &Path, request_id: &str) -> Result<bool, Status> {
             BTreeMap::new(),
         ))
     })?;
-    let path_cstr = CString::new(canonical.as_os_str().as_bytes()).map_err(|_| {
+    let fs_type = detect_filesystem_type(&canonical).map_err(|error| {
         status_from_machine_error(MachineError::new(
-            MachineErrorCode::ValidationError,
+            MachineErrorCode::BackendUnavailable,
             format!(
-                "workspace path contains unsupported null byte: {}",
-                canonical.display()
+                "failed to inspect workspace filesystem for {}: {}",
+                canonical.display(),
+                error
             ),
             Some(request_id.to_string()),
             BTreeMap::new(),
         ))
     })?;
+    Ok(fs_type == "btrfs")
+}
 
-    #[allow(unsafe_code)]
-    let f_type = unsafe {
-        let mut stat: libc::statfs = std::mem::zeroed();
-        if libc::statfs(path_cstr.as_ptr(), &mut stat) != 0 {
-            let io_error = std::io::Error::last_os_error();
-            return Err(status_from_machine_error(MachineError::new(
-                MachineErrorCode::BackendUnavailable,
-                format!(
-                    "failed to inspect workspace filesystem for {}: {}",
-                    canonical.display(),
-                    io_error
-                ),
-                Some(request_id.to_string()),
-                BTreeMap::new(),
-            )));
+#[cfg(target_os = "linux")]
+fn detect_filesystem_type(path: &Path) -> std::io::Result<String> {
+    let findmnt_output = Command::new("findmnt")
+        .arg("-n")
+        .arg("-T")
+        .arg(path)
+        .arg("-o")
+        .arg("FSTYPE")
+        .output();
+
+    if let Ok(output) = findmnt_output
+        && output.status.success()
+    {
+        let fs_type = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !fs_type.is_empty() {
+            return Ok(fs_type);
         }
-        stat.f_type as libc::c_long
-    };
+    }
 
-    Ok(f_type == BTRFS_SUPER_MAGIC)
+    let stat_output = Command::new("stat")
+        .arg("-f")
+        .arg("-c")
+        .arg("%T")
+        .arg(path)
+        .output()?;
+    if !stat_output.status.success() {
+        let stderr = String::from_utf8_lossy(&stat_output.stderr).trim().to_string();
+        return Err(std::io::Error::other(format!(
+            "stat filesystem probe failed: {stderr}"
+        )));
+    }
+    let fs_type = String::from_utf8_lossy(&stat_output.stdout).trim().to_string();
+    if fs_type.is_empty() {
+        return Err(std::io::Error::other(
+            "filesystem probe returned empty type",
+        ));
+    }
+    Ok(fs_type)
 }
 
 #[cfg(target_os = "linux")]

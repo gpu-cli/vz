@@ -95,7 +95,11 @@ HOME_DIR="$STATE_ROOT/home"
 PROJECT_DIR="$STATE_ROOT/project"
 mkdir -p "$STATE_ROOT" "$RUNTIME_DIR" "$HOME_DIR/.vz" "$PROJECT_DIR"
 
-cp "$REPO_ROOT/config/vz-space.json.example" "$PROJECT_DIR/vz.json"
+cat > "$PROJECT_DIR/vz.json" <<'EOF'
+{
+  "image": "alpine:3.20"
+}
+EOF
 
 BUILD_ARGS=()
 if [[ "$PROFILE" == "release" ]]; then
@@ -140,19 +144,19 @@ trap cleanup EXIT
 
 echo "==> starting vz-runtimed"
 "$BIN_RUNTIMED" \
-    --state_store_path "$STATE_DB" \
-    --runtime_data_dir "$RUNTIME_DIR" \
-    --socket_path "$SOCKET_PATH" \
+    --state-store-path "$STATE_DB" \
+    --runtime-data-dir "$RUNTIME_DIR" \
+    --socket-path "$SOCKET_PATH" \
     >"$RUN_DIR/runtimed.log" 2>&1 &
 RUNTIMED_PID=$!
 
 echo "==> starting vz-api"
 "$BIN_API" \
     --bind "$API_BIND" \
-    --state_store_path "$STATE_DB" \
-    --daemon_socket_path "$SOCKET_PATH" \
-    --daemon_runtime_data_dir "$RUNTIME_DIR" \
-    --daemon_auto_spawn false \
+    --state-store-path "$STATE_DB" \
+    --daemon-socket-path "$SOCKET_PATH" \
+    --daemon-runtime-data-dir "$RUNTIME_DIR" \
+    --daemon-auto-spawn false \
     >"$RUN_DIR/api.log" 2>&1 &
 API_PID=$!
 
@@ -160,26 +164,21 @@ API_BASE_URL="http://$API_BIND"
 wait_for_http "$API_BASE_URL/v1/capabilities" || err "api failed readiness check"
 
 SANDBOX_ID="vz-e2e-${timestamp,,}"
-CREATE_PAYLOAD_FILE="$RUN_DIR/create-sandbox.json"
-cat > "$CREATE_PAYLOAD_FILE" <<EOF
-{
-  "project_dir": "$PROJECT_DIR",
-  "stack_name": "$SANDBOX_ID",
-  "cpus": 2,
-  "memory_mb": 1024,
-  "labels": {
-    "vz.project_dir": "$PROJECT_DIR",
-    "source": "vz-linux-vm-e2e"
-  }
-}
-EOF
 
-echo "==> creating sandbox via API"
-curl -fsS \
-    -H 'content-type: application/json' \
-    --data @"$CREATE_PAYLOAD_FILE" \
-    "$API_BASE_URL/v1/sandboxes" \
-    > "$RUN_DIR/api-create-response.json"
+echo "==> creating sandbox via vz CLI (api-http transport)"
+(
+    cd "$PROJECT_DIR"
+    VZ_CONTROL_PLANE_TRANSPORT=api-http \
+    VZ_RUNTIME_API_BASE_URL="$API_BASE_URL" \
+    VZ_RUNTIME_DAEMON_AUTOSTART=0 \
+    HOME="$HOME_DIR" \
+    "$BIN_VZ" create \
+        --name "$SANDBOX_ID" \
+        --cpus 2 \
+        --memory 1024 \
+        --state-db "$STATE_DB" \
+        --json
+) > "$RUN_DIR/vz-create.json"
 
 echo "==> validating via vz CLI (api-http transport)"
 VZ_CONTROL_PLANE_TRANSPORT=api-http \
