@@ -196,32 +196,15 @@ Artifacts are written under:
 .artifacts/linux-btrfs-e2e/<timestamp>/
 ```
 
-## High-Level `vz` on Remote Linux VM Gate
+## High-Level `vz` on Linux VM Gate (No SSH)
 
 Use this to validate high-level `vz` CLI/API behavior against real daemon-owned
-Linux runtime orchestration on a remote Linux VM.
+Linux runtime orchestration inside the local `vz` Linux VM environment.
 
-One-time config setup:
-
-```bash
-cp config/vz-linux-vm-e2e.env.example .config/vz-linux-vm-e2e.env
-$EDITOR .config/vz-linux-vm-e2e.env
-```
-
-Run (no flags):
+Run from inside the Linux VM:
 
 ```bash
-./scripts/run-vz-linux-vm-e2e-remote.sh
-```
-
-Or explicit flags:
-
-```bash
-./scripts/run-vz-linux-vm-e2e-remote.sh \
-  --host user@vz-linux-host \
-  --workspace /mnt/vz-btrfs \
-  --remote-repo ~/workspace/vz \
-  --profile release
+./scripts/run-vz-linux-vm-e2e.sh --workspace /mnt/vz-btrfs --profile release
 ```
 
 What this flow validates:
@@ -231,10 +214,10 @@ What this flow validates:
 - high-level `vz` CLI (`create`, `ls`, `inspect`, `rm`) works via `api-http` transport.
 - final sandbox state is `terminated`.
 
-Artifacts are copied locally under:
+Artifacts are written under:
 
 ```text
-.artifacts/vz-linux-vm-e2e-remote/<timestamp>/
+.artifacts/vz-linux-vm-e2e/<timestamp>/
 ```
 
 ## Signing Behavior
