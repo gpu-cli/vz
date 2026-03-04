@@ -1007,6 +1007,8 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
         let (tx, rx) =
             tokio::sync::mpsc::channel::<Result<runtime_v2::ExecOutputEvent, Status>>(32);
         let stream_request_id = request_id.clone();
+        let stream_daemon = self.daemon.clone();
+        let stream_execution_id = execution_id.clone();
         tokio::spawn(async move {
             loop {
                 match session_rx.recv().await {
@@ -1027,11 +1029,21 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        let terminal_event = stream_daemon
+                            .with_state_store(|store| store.load_execution(&stream_execution_id))
+                            .ok()
+                            .and_then(|execution| {
+                                execution.and_then(|entry| terminal_stream_event(&entry))
+                            });
+                        if let Some(event) = terminal_event {
+                            let _ = tx.send(Ok(event)).await;
+                            return;
+                        }
                         let _ = tx
                             .send(Ok(runtime_v2::ExecOutputEvent {
                                 payload: Some(runtime_v2::exec_output_event::Payload::Error(
                                     format!(
-                                        "execution output stream closed (request_id={stream_request_id})"
+                                        "execution output stream closed before terminal state (request_id={stream_request_id})"
                                     ),
                                 )),
                                 sequence: 0,

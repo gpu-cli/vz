@@ -15,6 +15,7 @@ const OCI_ROOTFS_DIRNAME: &str = "rootfs";
 pub const OCI_CONFIG_FILENAME: &str = "config.json";
 const OCI_ANNOTATION_COMPOSE_TTY: &str = "io.vz.compose.tty";
 const OCI_ANNOTATION_COMPOSE_STDIN_OPEN: &str = "io.vz.compose.stdin_open";
+const SUPPORTS_UTS_NAMESPACE: bool = false;
 
 /// Mount entry written into an OCI runtime-spec bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +113,7 @@ pub fn write_oci_bundle(
 
     let rootfs_path_in_spec = if rootfs_dir.is_absolute() {
         // Absolute path: embed directly in config.json, no symlink needed.
+        ensure_runtime_paths_for_spec(rootfs_dir, &spec)?;
         rootfs_dir.to_string_lossy().into_owned()
     } else {
         // Relative path: create a symlink at <bundle>/rootfs.
@@ -125,6 +127,45 @@ pub fn write_oci_bundle(
     runtime_spec.save(&config_path)?;
 
     Ok(())
+}
+
+fn ensure_runtime_paths_for_spec(rootfs_dir: &Path, spec: &BundleSpec) -> Result<(), OciError> {
+    if let Some(cwd) = &spec.cwd {
+        if let Some(host_path) = container_path_to_rootfs_path(rootfs_dir, cwd) {
+            fs::create_dir_all(host_path)?;
+        }
+    }
+
+    for mount in &spec.mounts {
+        let destination = mount.destination.to_string_lossy();
+        let Some(host_destination) = container_path_to_rootfs_path(rootfs_dir, &destination) else {
+            continue;
+        };
+
+        let source_is_file = fs::metadata(&mount.source)
+            .map(|meta| meta.is_file())
+            .unwrap_or(false);
+        if source_is_file {
+            if let Some(parent) = host_destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if !host_destination.exists() {
+                fs::File::create(host_destination)?;
+            }
+        } else {
+            fs::create_dir_all(host_destination)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn container_path_to_rootfs_path(rootfs_dir: &Path, container_path: &str) -> Option<PathBuf> {
+    if !container_path.starts_with('/') {
+        return None;
+    }
+    let relative = container_path.trim_start_matches('/');
+    Some(rootfs_dir.join(relative))
 }
 
 fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciError> {
@@ -233,15 +274,23 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
         builder = builder.annotations(annotations);
     }
 
-    if let Some(ref hn) = hostname {
-        builder = builder.hostname(hn);
+    if SUPPORTS_UTS_NAMESPACE {
+        if let Some(ref hn) = hostname {
+            builder = builder.hostname(hn);
+        }
     }
 
-    if let Some(ref dn) = domainname {
-        builder = builder.domainname(dn);
+    if SUPPORTS_UTS_NAMESPACE {
+        if let Some(ref dn) = domainname {
+            builder = builder.domainname(dn);
+        }
     }
 
     let mut spec = builder.build()?;
+    if !SUPPORTS_UTS_NAMESPACE {
+        spec.set_hostname(None);
+        spec.set_domainname(None);
+    }
 
     if share_host_network {
         remove_network_namespace(&mut spec);
@@ -1777,7 +1826,11 @@ mod tests {
         .unwrap();
 
         let spec = Spec::load(temp.join("bundle").join(OCI_CONFIG_FILENAME)).unwrap();
-        assert_eq!(spec.hostname().as_deref(), Some("my-host"));
+        if SUPPORTS_UTS_NAMESPACE {
+            assert_eq!(spec.hostname().as_deref(), Some("my-host"));
+        } else {
+            assert_ne!(spec.hostname().as_deref(), Some("my-host"));
+        }
     }
 
     #[test]
@@ -1815,6 +1868,10 @@ mod tests {
         .unwrap();
 
         let spec = Spec::load(temp.join("bundle").join(OCI_CONFIG_FILENAME)).unwrap();
-        assert_eq!(spec.domainname().as_deref(), Some("example.com"));
+        if SUPPORTS_UTS_NAMESPACE {
+            assert_eq!(spec.domainname().as_deref(), Some("example.com"));
+        } else {
+            assert_ne!(spec.domainname().as_deref(), Some("example.com"));
+        }
     }
 }

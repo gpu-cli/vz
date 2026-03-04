@@ -86,14 +86,14 @@ fi
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-echo "==> resolving latest Alpine minirootfs (${ALPINE_VERSION}, ${ARCH})"
+echo "==> resolving latest Alpine minirootfs (${ALPINE_VERSION}, ${ARCH})" >&2
 curl -fsSL "$releases_url" -o "$tmp_dir/latest-releases.yaml"
 archive_name="$(awk '/^[[:space:]]*file:[[:space:]]+alpine-minirootfs-.*\.tar\.gz$/ {print $2; exit}' "$tmp_dir/latest-releases.yaml")"
 [[ -n "$archive_name" ]] || err "failed to resolve minirootfs archive from $releases_url"
 
 archive_url="${base_url}/${archive_name}"
 archive_path="${tmp_dir}/${archive_name}"
-echo "==> downloading $archive_name"
+echo "==> downloading $archive_name" >&2
 curl -fL "$archive_url" -o "$archive_path"
 
 if [[ -d "$target_dir" ]]; then
@@ -101,7 +101,7 @@ if [[ -d "$target_dir" ]]; then
 fi
 mkdir -p "$target_dir"
 
-echo "==> extracting to $target_dir"
+echo "==> extracting to $target_dir" >&2
 tar -xzf "$archive_path" -C "$target_dir"
 echo "$archive_name" > "$stamp_file"
 

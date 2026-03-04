@@ -1002,11 +1002,11 @@ async fn run_linux_attach(args: LinuxVmAttachArgs) -> anyhow::Result<()> {
 }
 
 async fn run_linux_exec(args: LinuxVmExecArgs) -> anyhow::Result<()> {
-    if args.command.is_empty() {
+    let command = normalize_linux_exec_command(args.command);
+    if command.is_empty() {
         bail!("exec requires a command");
     }
-    let (cmd, tail) = args
-        .command
+    let (cmd, tail) = command
         .split_first()
         .ok_or_else(|| anyhow!("exec requires a command"))?;
     let state_db = args.state_db.unwrap_or_else(default_state_db_path);
@@ -1100,6 +1100,14 @@ async fn run_linux_exec(args: LinuxVmExecArgs) -> anyhow::Result<()> {
         std::process::exit(code);
     }
     Ok(())
+}
+
+fn normalize_linux_exec_command(command: Vec<String>) -> Vec<String> {
+    if command.first().map(|token| token == "--").unwrap_or(false) {
+        command.into_iter().skip(1).collect()
+    } else {
+        command
+    }
 }
 
 async fn run_linux_stop(args: LinuxVmStopArgs) -> anyhow::Result<()> {
@@ -1400,6 +1408,34 @@ mod tests {
             loaded.linux_artifact_version,
             descriptor.linux_artifact_version
         );
+    }
+
+    #[test]
+    fn normalize_linux_exec_command_strips_leading_separator() {
+        let command = vec![
+            "--".to_string(),
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            "echo ok".to_string(),
+        ];
+        assert_eq!(
+            normalize_linux_exec_command(command),
+            vec![
+                "/bin/sh".to_string(),
+                "-lc".to_string(),
+                "echo ok".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_linux_exec_command_keeps_regular_command() {
+        let command = vec![
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            "echo ok".to_string(),
+        ];
+        assert_eq!(normalize_linux_exec_command(command.clone()), command);
     }
 
     #[test]

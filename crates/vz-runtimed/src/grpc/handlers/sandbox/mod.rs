@@ -773,12 +773,16 @@ fn detect_filesystem_type(path: &Path) -> std::io::Result<String> {
         .arg(path)
         .output()?;
     if !stat_output.status.success() {
-        let stderr = String::from_utf8_lossy(&stat_output.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&stat_output.stderr)
+            .trim()
+            .to_string();
         return Err(std::io::Error::other(format!(
             "stat filesystem probe failed: {stderr}"
         )));
     }
-    let fs_type = String::from_utf8_lossy(&stat_output.stdout).trim().to_string();
+    let fs_type = String::from_utf8_lossy(&stat_output.stdout)
+        .trim()
+        .to_string();
     if fs_type.is_empty() {
         return Err(std::io::Error::other(
             "filesystem probe returned empty type",
@@ -1048,9 +1052,9 @@ async fn ensure_sandbox_shell_container(
             cmd: default_keepalive_container_cmd(),
             env: std::collections::HashMap::new(),
             // Keep shell container startup portable across base images.
-            // If no workspace mount exists, forcing `/workspace` can fail
-            // container creation (`ENOENT`) on images that do not ship it.
-            cwd: String::new(),
+            // Explicitly use `/` so runtime backends do not inherit image
+            // defaults like `/workspace`, which may not exist yet.
+            cwd: "/".to_string(),
             user: String::new(),
         }))
         .await?;

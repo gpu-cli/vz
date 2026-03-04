@@ -42,6 +42,12 @@ impl ContainerRuntime {
         info!(container_id, ?bundle_dir, "creating container");
 
         std::fs::create_dir_all(&state_dir)?;
+        if let Some(cwd) = &spec.cwd {
+            if let Some(relative_cwd) = cwd.strip_prefix('/') {
+                let host_cwd = rootfs_dir.join(relative_cwd);
+                std::fs::create_dir_all(&host_cwd)?;
+            }
+        }
 
         bundle::write_oci_bundle(&bundle_dir, rootfs_dir, spec)?;
 

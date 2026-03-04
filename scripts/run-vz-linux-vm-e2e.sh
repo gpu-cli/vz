@@ -144,6 +144,10 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> starting vz-runtimed"
+RUNTIMED_LOG="${VZ_LINUX_VM_E2E_RUST_LOG:-vz_runtimed=debug,vz_linux_native=debug}"
+RUNTIMED_EXEC_DEBUG="${VZ_LINUX_VM_E2E_EXEC_DEBUG:-1}"
+RUST_LOG="$RUNTIMED_LOG" \
+VZ_RUNTIMED_EXEC_CONTROL_DEBUG="$RUNTIMED_EXEC_DEBUG" \
 "$BIN_RUNTIMED" \
     --state-store-path "$STATE_DB" \
     --runtime-data-dir "$RUNTIME_DIR" \
@@ -271,7 +275,8 @@ HOME="$HOME_DIR" \
 "$BIN_VZ" vm linux rm "$SANDBOX_ID" --state-db "$STATE_DB" > "$RUN_DIR/vm-linux-rm.log"
 
 curl -fsS "$API_BASE_URL/v1/sandboxes/$SANDBOX_ID" > "$RUN_DIR/api-sandbox-final.json"
-grep -q '"state": "terminated"' "$RUN_DIR/api-sandbox-final.json" || err "final sandbox state is not terminated"
+grep -Eq '"state"[[:space:]]*:[[:space:]]*"terminated"' "$RUN_DIR/api-sandbox-final.json" \
+    || err "final sandbox state is not terminated"
 
 {
     echo "passed=vz_cli_api_daemon_linux_happy_path,vz_vm_linux_daemon_lifecycle"

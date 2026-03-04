@@ -135,7 +135,7 @@ pub(crate) struct ExecOptions<'a> {
 
 /// Execute a command in a running container.
 ///
-/// Runs: `<runtime> exec <id> [--cwd <dir>] [--env K=V]* [--user U] -- <cmd> [args]`
+/// Runs: `<runtime> exec [--cwd <dir>] [--env K=V]* [--user U] <id> <cmd> [args]`
 pub(crate) async fn oci_exec(opts: ExecOptions<'_>) -> Result<ProcessOutput, LinuxNativeError> {
     let ExecOptions {
         runtime_binary,
@@ -177,7 +177,6 @@ pub(crate) async fn oci_exec(opts: ExecOptions<'_>) -> Result<ProcessOutput, Lin
     }
 
     args.push(container_id.to_string());
-    args.push("--".to_string());
     args.extend(cmd.iter().cloned());
 
     let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();

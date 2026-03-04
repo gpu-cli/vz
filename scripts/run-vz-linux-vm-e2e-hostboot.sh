@@ -120,14 +120,33 @@ fi
 [[ -d "$ROOTFS_DIR" ]] || err "rootfs dir not found: $ROOTFS_DIR"
 
 pkg_setup=""
+skip_pkg_preflight=""
 if [[ "$SKIP_PKG_SETUP" != "true" ]]; then
     pkg_setup='
-apk update;
-apk add --no-cache bash curl git build-base pkgconf openssl-dev openssl-libs-static protobuf-dev rustup btrfs-progs util-linux iproute2 iptables runc;
+apk_retry() {
+  local attempts="${1:-5}";
+  shift;
+  local n=1;
+  while [ "$n" -le "$attempts" ]; do
+    if "$@"; then
+      return 0;
+    fi;
+    echo "apk command failed (attempt ${n}/${attempts}), retrying..." >&2;
+    sleep $((n * 2));
+    n=$((n + 1));
+  done;
+  return 1;
+};
+apk_retry 6 apk update;
+apk_retry 6 apk add --no-cache bash curl git build-base pkgconf openssl-dev openssl-libs-static protobuf-dev rustup btrfs-progs util-linux iproute2 iptables runc;
 if ! command -v youki >/dev/null 2>&1 && command -v runc >/dev/null 2>&1; then
+  runc_bin="$(command -v runc)";
+  mkdir -p /usr/bin;
   mkdir -p /usr/local/bin;
-  ln -sf \"$(command -v runc)\" /usr/local/bin/youki;
+  ln -sf "$runc_bin" /usr/bin/youki;
+  ln -sf "$runc_bin" /usr/local/bin/youki;
 fi;
+command -v youki >/dev/null 2>&1 || { echo "youki shim unavailable after bootstrap" >&2; exit 1; };
 cargo_supports_resolver3() {
   cargo --version 2>/dev/null | awk "{split(\$2,v,\".\"); exit !((v[1] > 1) || (v[1] == 1 && v[2] >= 84))}"
 }
@@ -136,6 +155,16 @@ if ! cargo_supports_resolver3; then
 fi;
 if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi;
 if command -v rustup >/dev/null 2>&1; then rustup toolchain install stable >/dev/null 2>&1 || true; rustup default stable >/dev/null 2>&1 || true; fi;
+'
+else
+    skip_pkg_preflight='
+required_tools="bash curl git cargo rustup btrfs youki";
+for tool in $required_tools; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "missing required guest tool '$tool' while --skip-pkg-setup is set; rerun without --skip-pkg-setup" >&2;
+    exit 1;
+  fi;
+done;
 '
 fi
 
@@ -157,6 +186,7 @@ fi;
 export DOCKER_CONFIG=\"\$HOME/.docker\";
 mkdir -p /mnt/repo;
 mount -t virtiofs repo /mnt/repo;
+${skip_pkg_preflight}
 ${pkg_setup}
 ${provision_btrfs_cmd}
 export CARGO_TARGET_DIR='/tmp/vz-cargo-target';
