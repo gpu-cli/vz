@@ -225,6 +225,8 @@ Notes:
 - `--mount` is forwarded to `vz vm mac run` during auto-start.
 - ensure `--guest-repo` matches the in-guest mount path for your VM image.
 - wrapper can provision btrfs workspace in-guest automatically before running harness.
+- local wrapper fails fast when guest OS is not Linux (for example, macOS base images).
+- set `VZ_BIN=/path/to/vz` to force a specific host `vz` binary; otherwise it auto-detects PATH or repo-built binaries.
 
 What this flow validates:
 

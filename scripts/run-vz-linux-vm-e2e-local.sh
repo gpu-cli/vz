@@ -7,6 +7,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 VM_NAME=""
 GUEST_REPO=""
 WORKSPACE="/mnt/vz-btrfs"
@@ -54,6 +57,27 @@ USAGE
 err() {
     echo "error: $*" >&2
     exit 1
+}
+
+resolve_vz_bin() {
+    if [[ -n "${VZ_BIN:-}" ]]; then
+        [[ -x "$VZ_BIN" ]] || err "VZ_BIN is set but not executable: $VZ_BIN"
+        echo "$VZ_BIN"
+        return 0
+    fi
+    if command -v vz >/dev/null 2>&1; then
+        command -v vz
+        return 0
+    fi
+    if [[ -x "$REPO_ROOT/crates/target/debug/vz" ]]; then
+        echo "$REPO_ROOT/crates/target/debug/vz"
+        return 0
+    fi
+    if [[ -x "$REPO_ROOT/crates/target/release/vz" ]]; then
+        echo "$REPO_ROOT/crates/target/release/vz"
+        return 0
+    fi
+    err "vz binary not found (set VZ_BIN, put vz in PATH, or build crates/target/{debug,release}/vz)"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -131,10 +155,15 @@ if [[ "$AUTO_START" == "true" && -z "$VM_IMAGE" ]]; then
     err "--auto-start requires --vm-image"
 fi
 
-command -v vz >/dev/null 2>&1 || err "vz binary not found in PATH"
+VZ_BIN="$(resolve_vz_bin)"
+echo "==> using vz binary: $VZ_BIN"
 
 vm_exec_probe() {
-    vz vm mac exec "$VM_NAME" --user dev -- /bin/sh -lc "echo vm_ok" >/dev/null 2>&1
+    "$VZ_BIN" vm mac exec "$VM_NAME" --user dev -- /bin/sh -lc "echo vm_ok" >/dev/null 2>&1
+}
+
+guest_uname() {
+    "$VZ_BIN" vm mac exec "$VM_NAME" --user dev -- /bin/sh -lc "uname -s" 2>/dev/null | tr -d '\r' | tail -n 1
 }
 
 cleanup() {
@@ -151,7 +180,7 @@ if ! vm_exec_probe; then
     fi
 
     echo "==> starting VM: $VM_NAME"
-    run_cmd=(vz vm mac run --name "$VM_NAME" --image "$VM_IMAGE" --cpus "$VM_CPUS" --memory "$VM_MEMORY_GB" --headless)
+    run_cmd=("$VZ_BIN" vm mac run --name "$VM_NAME" --image "$VM_IMAGE" --cpus "$VM_CPUS" --memory "$VM_MEMORY_GB" --headless)
     for mount in "${MOUNTS[@]}"; do
         run_cmd+=(--mount "$mount")
     done
@@ -169,14 +198,19 @@ fi
 
 echo "==> VM reachable: $VM_NAME"
 
+guest_os="$(guest_uname || true)"
+if [[ "$guest_os" != "Linux" ]]; then
+    err "VM '$VM_NAME' guest OS is '$guest_os' (expected Linux). Use a Linux guest image for Linux daemon E2E."
+fi
+
 if [[ "$PROVISION_BTRFS" == "true" ]]; then
     echo "==> provisioning btrfs workspace in guest: $WORKSPACE"
-    vz vm mac exec "$VM_NAME" --user root -- /bin/sh -lc \
+    "$VZ_BIN" vm mac exec "$VM_NAME" --user root -- /bin/sh -lc \
         "set -euo pipefail; cd '$GUEST_REPO'; ./scripts/provision-linux-btrfs-workspace.sh --workspace '$WORKSPACE' --image '$BTRFS_IMAGE' --size-gb '$BTRFS_SIZE_GB' --owner dev"
 fi
 
 echo "==> running Linux VM E2E harness in guest"
-vz vm mac exec "$VM_NAME" --user dev -- /bin/sh -lc \
+"$VZ_BIN" vm mac exec "$VM_NAME" --user dev -- /bin/sh -lc \
     "set -euo pipefail; if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; fi; cd '$GUEST_REPO'; ./scripts/run-vz-linux-vm-e2e.sh --workspace '$WORKSPACE' --profile '$PROFILE'"
 
 echo "==> completed successfully"
