@@ -6,6 +6,8 @@ This document defines the command contract for the Linux guest image pipeline.
 
 - `vz vm linux init`
 - `vz vm linux run`
+- `vz vm linux save` (planned)
+- `vz vm linux restore` (planned)
 
 ## `vz vm linux init`
 
@@ -68,6 +70,7 @@ vz vm linux run --name dev-linux --cpus 4 --memory 8192
 - For daemon-managed space lifecycle, use:
   - `vz create` for sandbox creation
   - `vz vm linux list|inspect|attach|exec|stop|rm` for Linux-daemon-scoped operations
+- Save/restore parity mapping is documented in `docs/linux-vm-save-restore-contract.md`.
 
 ## Backward Compatibility
 
