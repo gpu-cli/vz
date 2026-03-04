@@ -12,8 +12,12 @@ use vz_runtimed_client::{DaemonClient, DaemonClientConfig};
 const CONTROL_PLANE_TRANSPORT_ENV: &str = "VZ_CONTROL_PLANE_TRANSPORT";
 /// Optional daemon socket override for CLI runtime commands.
 const DAEMON_SOCKET_PATH_ENV: &str = "VZ_RUNTIME_DAEMON_SOCKET";
+/// Optional runtime data directory override (socket/log/metrics parent).
+const RUNTIME_DATA_DIR_ENV: &str = "VZ_RUNTIME_DATA_DIR";
 /// Optional daemon autostart policy override (`true/false`, `1/0`, etc.).
 const DAEMON_AUTOSTART_ENV: &str = "VZ_RUNTIME_DAEMON_AUTOSTART";
+/// Optional runtime state DB path override.
+const RUNTIME_STATE_DB_ENV: &str = "VZ_RUNTIME_STATE_DB";
 /// Runtime API base URL used when control plane transport is `api-http`.
 const API_BASE_URL_ENV: &str = "VZ_RUNTIME_API_BASE_URL";
 
@@ -143,9 +147,30 @@ fn parse_env_daemon_socket_override() -> Option<PathBuf> {
     parse_daemon_socket_override(std::env::var_os(DAEMON_SOCKET_PATH_ENV))
 }
 
+fn parse_runtime_data_dir_override(raw: Option<OsString>) -> Option<PathBuf> {
+    let value = raw?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(value))
+}
+
+fn parse_env_runtime_data_dir_override() -> Option<PathBuf> {
+    parse_runtime_data_dir_override(std::env::var_os(RUNTIME_DATA_DIR_ENV))
+}
+
+fn parse_state_db_override(raw: Option<OsString>) -> Option<PathBuf> {
+    let value = raw?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(value))
+}
+
 fn daemon_client_config_with_overrides(
     state_db: &Path,
     socket_override: Option<PathBuf>,
+    runtime_data_dir_override: Option<PathBuf>,
     auto_spawn: bool,
 ) -> DaemonClientConfig {
     let mut config = DaemonClientConfig::default();
@@ -159,6 +184,12 @@ fn daemon_client_config_with_overrides(
         {
             config.runtime_data_dir = Some(parent.to_path_buf());
         }
+        return config;
+    }
+
+    if let Some(runtime_dir) = runtime_data_dir_override {
+        config.socket_path = runtime_dir.join("runtimed.sock");
+        config.runtime_data_dir = Some(runtime_dir);
         return config;
     }
 
@@ -194,9 +225,11 @@ pub(crate) fn runtime_api_base_url() -> anyhow::Result<String> {
 pub(crate) fn daemon_client_config(state_db: &Path) -> anyhow::Result<DaemonClientConfig> {
     let auto_spawn = parse_env_daemon_autostart()?;
     let socket_override = parse_env_daemon_socket_override();
+    let runtime_data_dir_override = parse_env_runtime_data_dir_override();
     Ok(daemon_client_config_with_overrides(
         state_db,
         socket_override,
+        runtime_data_dir_override,
         auto_spawn,
     ))
 }
@@ -227,6 +260,9 @@ pub(crate) async fn connect_control_plane_for_state_db(
 
 /// Default CLI state DB path in user home.
 pub(crate) fn default_state_db_path() -> PathBuf {
+    if let Some(explicit) = parse_state_db_override(std::env::var_os(RUNTIME_STATE_DB_ENV)) {
+        return explicit;
+    }
     std::env::var_os("HOME")
         .map(|home| PathBuf::from(home).join(".vz").join("stack-state.db"))
         .unwrap_or_else(|| PathBuf::from("stack-state.db"))
@@ -293,6 +329,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_runtime_data_dir_override_ignores_empty() {
+        let override_path = parse_runtime_data_dir_override(Some(OsString::from("")));
+        assert!(override_path.is_none());
+    }
+
+    #[test]
+    fn parse_state_db_override_ignores_empty() {
+        let override_path = parse_state_db_override(Some(OsString::from("")));
+        assert!(override_path.is_none());
+    }
+
+    #[test]
     fn parse_api_base_url_defaults_and_validates() {
         assert_eq!(
             parse_api_base_url(None).ok(),
@@ -308,7 +356,7 @@ mod tests {
     #[test]
     fn daemon_client_config_defaults_to_state_db_runtime_dir() {
         let state_db = PathBuf::from("/tmp/vz/state/stack-state.db");
-        let config = daemon_client_config_with_overrides(&state_db, None, true);
+        let config = daemon_client_config_with_overrides(&state_db, None, None, true);
 
         assert!(config.auto_spawn);
         assert_eq!(config.state_store_path, Some(state_db.clone()));
@@ -326,7 +374,8 @@ mod tests {
     fn daemon_client_config_uses_socket_override() {
         let state_db = PathBuf::from("/tmp/vz/state/stack-state.db");
         let socket_path = PathBuf::from("/tmp/custom-runtime/runtimed.sock");
-        let config = daemon_client_config_with_overrides(&state_db, Some(socket_path), false);
+        let config =
+            daemon_client_config_with_overrides(&state_db, Some(socket_path), None, false);
 
         assert!(!config.auto_spawn);
         assert_eq!(config.state_store_path, Some(state_db));
@@ -338,6 +387,22 @@ mod tests {
             config.runtime_data_dir,
             Some(PathBuf::from("/tmp/custom-runtime"))
         );
+    }
+
+    #[test]
+    fn daemon_client_config_uses_runtime_data_dir_override() {
+        let state_db = PathBuf::from("/tmp/vz/state/stack-state.db");
+        let runtime_dir = PathBuf::from("/tmp/runtime-dir");
+        let config =
+            daemon_client_config_with_overrides(&state_db, None, Some(runtime_dir), false);
+
+        assert!(!config.auto_spawn);
+        assert_eq!(config.state_store_path, Some(state_db));
+        assert_eq!(
+            config.socket_path,
+            PathBuf::from("/tmp/runtime-dir/runtimed.sock")
+        );
+        assert_eq!(config.runtime_data_dir, Some(PathBuf::from("/tmp/runtime-dir")));
     }
 
     #[test]

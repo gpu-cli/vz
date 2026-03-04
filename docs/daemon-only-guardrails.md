@@ -2,6 +2,21 @@
 
 This project enforces daemon ownership (`vz-runtimed`) for runtime mutations.
 
+## Runtime Path Conventions
+
+Default runtime path layout is deterministic:
+
+- state DB: `~/.vz/stack-state.db`
+- daemon runtime data dir: `<state-db-parent>/.vz-runtime`
+- daemon gRPC socket: `<runtime-data-dir>/runtimed.sock`
+
+Supported env overrides:
+
+- `VZ_RUNTIME_STATE_DB`: override default state DB path used by CLI runtime commands.
+- `VZ_RUNTIME_DATA_DIR`: override runtime data dir (socket is `<dir>/runtimed.sock`).
+- `VZ_RUNTIME_DAEMON_SOCKET`: explicit socket path override (takes precedence over runtime data dir).
+- `VZ_RUNTIME_DAEMON_AUTOSTART`: enable/disable daemon auto-spawn (`1/0`, `true/false`, etc).
+
 ## Static Guardrail Check
 
 Run:
