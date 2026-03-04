@@ -1,6 +1,7 @@
 use super::networking::ensure_interactive_exec_pty_prerequisites;
 use super::oci_lifecycle::parse_signal_number;
 use super::*;
+use tracing::debug;
 
 fn exec_control_debug_enabled() -> bool {
     std::env::var("VZ_OCI_EXEC_CONTROL_DEBUG")
@@ -59,7 +60,7 @@ impl Runtime {
             };
 
             if debug {
-                eprintln!(
+                debug!(
                     "[vz-oci-macos exec-control] interactive exec resolving container state execution_id={execution_id} container_id={id}"
                 );
             }
@@ -70,7 +71,7 @@ impl Runtime {
                 )));
             };
             if debug {
-                eprintln!(
+                debug!(
                     "[vz-oci-macos exec-control] interactive exec container pid resolved execution_id={execution_id} container_id={id} pid={pid}"
                 );
             }
@@ -105,25 +106,25 @@ impl Runtime {
 
             if should_prepare_pty {
                 if debug {
-                    eprintln!(
+                    debug!(
                         "[vz-oci-macos exec-control] interactive exec preparing pty prerequisites execution_id={execution_id} timeout_secs={:.3}",
                         timeout.as_secs_f64()
                     );
                 }
                 ensure_interactive_exec_pty_prerequisites(vm.as_ref(), timeout).await;
                 if debug {
-                    eprintln!(
+                    debug!(
                         "[vz-oci-macos exec-control] interactive exec prerequisite step complete execution_id={execution_id}"
                     );
                 }
             } else if debug {
-                eprintln!(
+                debug!(
                     "[vz-oci-macos exec-control] interactive exec skipping pty prerequisite step execution_id={execution_id}"
                 );
             }
 
             if debug {
-                eprintln!(
+                debug!(
                     "[vz-oci-macos exec-control] interactive exec invoking guest exec RPC execution_id={execution_id} command={:?} args={:?} rows={} cols={}",
                     "/bin/busybox", nsenter_arg_refs, term_rows, term_cols
                 );
@@ -146,7 +147,7 @@ impl Runtime {
                 ))
             })??;
             if debug {
-                eprintln!(
+                debug!(
                     "[vz-oci-macos exec-control] interactive exec guest exec RPC ready execution_id={execution_id} guest_exec_id={guest_exec_id}"
                 );
             }
@@ -273,7 +274,7 @@ impl Runtime {
     pub async fn write_exec_stdin(&self, execution_id: &str, data: &[u8]) -> Result<(), OciError> {
         let debug = exec_control_debug_enabled();
         if debug {
-            eprintln!(
+            debug!(
                 "[vz-oci-macos exec-control] write_exec_stdin start execution_id={execution_id} bytes={}",
                 data.len()
             );
@@ -292,11 +293,11 @@ impl Runtime {
             .map_err(OciError::from);
         if debug {
             match &write_result {
-                Ok(()) => eprintln!(
+                Ok(()) => debug!(
                     "[vz-oci-macos exec-control] write_exec_stdin complete execution_id={execution_id} guest_exec_id={}",
                     session.guest_exec_id
                 ),
-                Err(error) => eprintln!(
+                Err(error) => debug!(
                     "[vz-oci-macos exec-control] write_exec_stdin failed execution_id={execution_id} guest_exec_id={} error={error}",
                     session.guest_exec_id
                 ),

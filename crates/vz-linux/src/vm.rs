@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 use tokio::time::Instant;
+use tracing::debug;
 use vz::Vm;
 use vz::protocol::{ExecEvent, ExecOutput, NetworkServiceConfig, OciContainerState, OciExecResult};
 use vz_agent_proto::SystemInfoResponse;
@@ -406,7 +407,7 @@ impl LinuxVm {
     pub async fn oci_state(&self, id: String) -> Result<OciContainerState, LinuxError> {
         let debug = exec_control_debug_enabled();
         if debug {
-            eprintln!("[vz-linux exec-control] oci_state start container_id={id}");
+            debug!("[vz-linux exec-control] oci_state start container_id={id}");
         }
         self.ensure_grpc().await?;
         let mut grpc = self.grpc.lock().await;
@@ -416,11 +417,11 @@ impl LinuxVm {
         let state_result = client.oci_state(id.clone()).await;
         if debug {
             match &state_result {
-                Ok(state) => eprintln!(
+                Ok(state) => debug!(
                     "[vz-linux exec-control] oci_state complete container_id={} status={} pid={:?}",
                     id, state.status, state.pid
                 ),
-                Err(error) => eprintln!(
+                Err(error) => debug!(
                     "[vz-linux exec-control] oci_state failed container_id={} error={error}",
                     id
                 ),
@@ -514,7 +515,7 @@ impl LinuxVm {
     ) -> Result<(crate::grpc_client::GrpcExecStream, u64), LinuxError> {
         let debug = exec_control_debug_enabled();
         if debug {
-            eprintln!(
+            debug!(
                 "[vz-linux exec-control] exec_interactive start command={:?} args={:?} rows={} cols={} cwd={:?}",
                 command, args, rows, cols, working_dir
             );
@@ -535,10 +536,10 @@ impl LinuxVm {
         if debug {
             match &interactive_result {
                 Ok((_, exec_id)) => {
-                    eprintln!("[vz-linux exec-control] exec_interactive complete exec_id={exec_id}")
+                    debug!("[vz-linux exec-control] exec_interactive complete exec_id={exec_id}")
                 }
                 Err(error) => {
-                    eprintln!("[vz-linux exec-control] exec_interactive failed error={error}")
+                    debug!("[vz-linux exec-control] exec_interactive failed error={error}")
                 }
             }
         }
@@ -549,7 +550,7 @@ impl LinuxVm {
     pub async fn stdin_write(&self, exec_id: u64, data: &[u8]) -> Result<(), LinuxError> {
         let debug = exec_control_debug_enabled();
         if debug {
-            eprintln!(
+            debug!(
                 "[vz-linux exec-control] stdin_write start exec_id={exec_id} bytes={}",
                 data.len()
             );
@@ -563,9 +564,9 @@ impl LinuxVm {
         if debug {
             match &write_result {
                 Ok(()) => {
-                    eprintln!("[vz-linux exec-control] stdin_write complete exec_id={exec_id}")
+                    debug!("[vz-linux exec-control] stdin_write complete exec_id={exec_id}")
                 }
-                Err(error) => eprintln!(
+                Err(error) => debug!(
                     "[vz-linux exec-control] stdin_write failed exec_id={exec_id} error={error}"
                 ),
             }

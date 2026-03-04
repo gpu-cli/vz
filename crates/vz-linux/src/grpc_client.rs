@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
+use tracing::debug;
 use vz::Vm;
 use vz::protocol::{ExecOutput, OciContainerState, OciExecResult};
 use vz_agent_proto::{
@@ -388,7 +389,7 @@ impl GrpcAgentClient {
         let metadata = self.next_transport_metadata(None);
         let request_id = metadata.request_id.clone();
         if debug {
-            eprintln!(
+            debug!(
                 "[vz-linux grpc-client] oci_state rpc start container_id={} request_id={}",
                 id, request_id
             );
@@ -404,12 +405,12 @@ impl GrpcAgentClient {
             match &response_result {
                 Ok(response) => {
                     let state = response.get_ref();
-                    eprintln!(
+                    debug!(
                         "[vz-linux grpc-client] oci_state rpc complete container_id={} request_id={} status={} pid={}",
                         id, request_id, state.status, state.pid
                     );
                 }
-                Err(error) => eprintln!(
+                Err(error) => debug!(
                     "[vz-linux grpc-client] oci_state rpc failed container_id={} request_id={} error={error}",
                     id, request_id
                 ),
@@ -558,7 +559,7 @@ impl GrpcAgentClient {
     pub async fn stdin_write(&mut self, exec_id: u64, data: &[u8]) -> Result<(), LinuxError> {
         let debug = exec_control_debug_enabled();
         if debug {
-            eprintln!(
+            debug!(
                 "[vz-linux grpc-client] stdin_write rpc start exec_id={exec_id} bytes={}",
                 data.len()
             );
@@ -575,9 +576,9 @@ impl GrpcAgentClient {
         if debug {
             match &rpc_result {
                 Ok(_) => {
-                    eprintln!("[vz-linux grpc-client] stdin_write rpc complete exec_id={exec_id}")
+                    debug!("[vz-linux grpc-client] stdin_write rpc complete exec_id={exec_id}")
                 }
-                Err(error) => eprintln!(
+                Err(error) => debug!(
                     "[vz-linux grpc-client] stdin_write rpc failed exec_id={exec_id} error={error}"
                 ),
             }
@@ -654,7 +655,7 @@ impl GrpcAgentClient {
         let command_debug = command.clone();
         let args_debug = args.clone();
         if debug {
-            eprintln!(
+            debug!(
                 "[vz-linux grpc-client] exec_stream_interactive rpc start request_id={} command={:?} args={:?} rows={} cols={}",
                 request_id, command_debug, args_debug, rows, cols
             );
@@ -677,15 +678,15 @@ impl GrpcAgentClient {
                 .await;
         if debug {
             match &response_result {
-                Ok(Ok(_)) => eprintln!(
+                Ok(Ok(_)) => debug!(
                     "[vz-linux grpc-client] exec_stream_interactive rpc accepted request_id={}",
                     request_id
                 ),
-                Ok(Err(error)) => eprintln!(
+                Ok(Err(error)) => debug!(
                     "[vz-linux grpc-client] exec_stream_interactive rpc failed request_id={} error={error}",
                     request_id
                 ),
-                Err(_) => eprintln!(
+                Err(_) => debug!(
                     "[vz-linux grpc-client] exec_stream_interactive rpc timeout waiting for headers request_id={}",
                     request_id
                 ),
@@ -711,7 +712,7 @@ impl GrpcAgentClient {
             Ok(Ok(value)) => value,
             Ok(Err(error)) => {
                 if debug {
-                    eprintln!(
+                    debug!(
                         "[vz-linux grpc-client] exec_stream_interactive initial event error request_id={} error={error}",
                         request_id
                     );
@@ -720,7 +721,7 @@ impl GrpcAgentClient {
             }
             Err(_) => {
                 if debug {
-                    eprintln!(
+                    debug!(
                         "[vz-linux grpc-client] exec_stream_interactive initial event timeout request_id={}",
                         request_id
                     );
@@ -731,7 +732,7 @@ impl GrpcAgentClient {
             }
         };
         if debug {
-            eprintln!(
+            debug!(
                 "[vz-linux grpc-client] exec_stream_interactive ready request_id={} exec_id={}",
                 request_id, exec_id
             );

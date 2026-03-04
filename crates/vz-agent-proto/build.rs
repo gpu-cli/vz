@@ -16,9 +16,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Ensure vendored protoc is used so local/CI builds match.
     let protoc = protoc_bin_vendored::protoc_bin_path()?;
-    unsafe {
-        std::env::set_var("PROTOC", protoc);
-    }
+    let mut prost_config = tonic_build::Config::new();
+    prost_config.protoc_executable(protoc);
 
     std::fs::create_dir_all(out_dir)?;
 
@@ -26,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .out_dir(out_dir)
-        .compile_protos(proto_paths, &["proto"])?;
+        .compile_protos_with_config(prost_config, proto_paths, &["proto"])?;
 
     Ok(())
 }

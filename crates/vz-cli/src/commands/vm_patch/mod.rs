@@ -59,6 +59,7 @@ pub struct VmPatchArgs {
 
 /// `vz vm mac patch` subcommands.
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum VmPatchCommand {
     /// Create a signed patch bundle from operations + payload inputs.
     Create(CreateArgs),

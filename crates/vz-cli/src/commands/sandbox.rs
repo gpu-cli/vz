@@ -2021,6 +2021,7 @@ pub struct SandboxCloseShellArgs {
 /// - `vz -c`: continue most recent sandbox for the current directory
 /// - `vz -r <name>`: resume a specific sandbox by name or ID
 /// - `vz`: create a new sandbox bound to the current directory
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_default_sandbox(
     continue_last: bool,
     resume: Option<String>,
@@ -2134,6 +2135,7 @@ async fn cmd_resume_sandbox(state_db: &Path, target: &str) -> anyhow::Result<()>
 }
 
 /// Create a new sandbox in spaces mode.
+#[allow(clippy::too_many_arguments)]
 async fn create_space_sandbox(
     state_db: &Path,
     cwd: &Path,
@@ -2246,6 +2248,7 @@ async fn create_space_sandbox(
 }
 
 /// Create a new sandbox and attach to it.
+#[allow(clippy::too_many_arguments)]
 async fn cmd_create_sandbox(
     state_db: &Path,
     cwd: &Path,
@@ -3110,24 +3113,24 @@ async fn attach_to_execution_interactive_daemon(
             );
         }
 
-        if terminal_exit_code.is_none() && !detached {
-            if let Ok(response) = client
+        if terminal_exit_code.is_none()
+            && !detached
+            && let Ok(response) = client
                 .get_execution(runtime_v2::GetExecutionRequest {
                     execution_id: execution_id.clone(),
                     metadata: None,
                 })
                 .await
-                && let Some(execution) = response.execution
-            {
-                if debug {
-                    eprintln!(
-                        "[vz attach debug] daemon attach final status check state={} exit_code={}",
-                        execution.state,
-                        execution.exit_code
-                    );
-                }
-                terminal_exit_code = Some(execution.exit_code);
+            && let Some(execution) = response.execution
+        {
+            if debug {
+                eprintln!(
+                    "[vz attach debug] daemon attach final status check state={} exit_code={}",
+                    execution.state,
+                    execution.exit_code
+                );
             }
+            terminal_exit_code = Some(execution.exit_code);
         }
 
         Ok::<_, anyhow::Error>((detached, terminal_exit_code))

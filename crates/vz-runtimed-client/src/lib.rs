@@ -70,9 +70,9 @@ pub enum DaemonClientError {
     #[error("daemon protocol mismatch: {reason}")]
     IncompatibleProtocol { reason: String },
     #[error("transport error: {0}")]
-    Transport(#[from] tonic::transport::Error),
+    Transport(#[from] Box<tonic::transport::Error>),
     #[error("grpc status error: {0}")]
-    Grpc(#[from] tonic::Status),
+    Grpc(#[from] Box<tonic::Status>),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

@@ -58,6 +58,7 @@ pub struct MacVmArgs {
 /// macOS VM management operations.
 #[cfg(target_os = "macos")]
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum MacVmCommand {
     /// Create a golden macOS VM image from an IPSW.
     Init(super::init::InitArgs),

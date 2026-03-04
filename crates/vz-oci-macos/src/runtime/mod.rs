@@ -131,6 +131,8 @@ struct InteractiveExecSession {
     pty_enabled: bool,
 }
 
+type ContainerExecEnvMap = HashMap<String, Vec<(String, String)>>;
+
 /// Unified runtime entrypoint.
 #[derive(Clone)]
 pub struct Runtime {
@@ -177,7 +179,7 @@ pub struct Runtime {
     ///
     /// Used to provide docker-compatible exec behavior where ad-hoc exec
     /// commands inherit the container's configured environment by default.
-    container_exec_env: Arc<Mutex<HashMap<String, Vec<(String, String)>>>>,
+    container_exec_env: Arc<Mutex<ContainerExecEnvMap>>,
     /// VM instances that already ran interactive PTY prerequisite setup.
     ///
     /// Keyed by `Arc<LinuxVm>` pointer identity (`Arc::as_ptr` cast to usize)

@@ -50,5 +50,5 @@ pub(crate) fn status_to_client_error(socket_path: &Path, status: Status) -> Daem
             reason: status.to_string(),
         };
     }
-    DaemonClientError::Grpc(status)
+    DaemonClientError::Grpc(Box::new(status))
 }

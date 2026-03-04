@@ -1042,6 +1042,7 @@ fn expand_home_dir(path: &Path) -> PathBuf {
 
 /// Status of an individual build step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub enum BuildStepStatus {
     /// Step is currently executing.
     Running,
@@ -1059,6 +1060,7 @@ pub enum BuildStepStatus {
 /// containing vertex, status, log, and warning arrays. This struct
 /// distills that into the most relevant progress information.
 #[derive(Debug, Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct BuildProgressInfo {
     /// Human-readable step name (e.g. "[1/3] FROM docker.io/library/alpine:3.20").
     pub step: String,
@@ -1083,6 +1085,7 @@ pub struct BuildProgressInfo {
 ///     assert_eq!(progress.status, BuildStepStatus::Cached);
 /// }
 /// ```
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_buildkit_output(line: &str) -> Option<BuildProgressInfo> {
     let status: vz_oci_macos::buildkit::BuildkitSolveStatus = serde_json::from_str(line).ok()?;
 
@@ -1091,8 +1094,7 @@ pub fn parse_buildkit_output(line: &str) -> Option<BuildProgressInfo> {
     let vertex = status
         .vertexes
         .iter()
-        .filter(|v| !v.name.trim().is_empty())
-        .last()
+        .rfind(|v| !v.name.trim().is_empty())
         .or_else(|| status.vertexes.last())?;
 
     let step_name = if vertex.name.trim().is_empty() {
@@ -1134,6 +1136,7 @@ pub fn parse_buildkit_output(line: &str) -> Option<BuildProgressInfo> {
 ///
 /// Returns `None` if either timestamp cannot be parsed. This is best-effort
 /// since BuildKit timestamps may use varying precision.
+#[cfg_attr(not(test), allow(dead_code))]
 fn parse_duration_between(start: &str, end: &str) -> Option<Duration> {
     // Simple ISO 8601 / RFC 3339 parsing. BuildKit emits timestamps like
     // "2026-02-23T13:00:00.123456789Z". We use string parsing rather than
@@ -1147,6 +1150,7 @@ fn parse_duration_between(start: &str, end: &str) -> Option<Duration> {
 /// Parse an RFC 3339 timestamp to nanoseconds since epoch.
 ///
 /// Handles timestamps with or without fractional seconds.
+#[cfg_attr(not(test), allow(dead_code))]
 fn parse_rfc3339_nanos(ts: &str) -> Option<u128> {
     // Strip trailing 'Z' or timezone offset for simplicity.
     let ts = ts.trim();
@@ -1207,6 +1211,7 @@ fn parse_rfc3339_nanos(ts: &str) -> Option<u128> {
 }
 
 /// Approximate day-of-year (1-indexed) for duration computation.
+#[cfg_attr(not(test), allow(dead_code))]
 fn day_of_year(month: i64, day: i64) -> i64 {
     let days_before_month = match month {
         1 => 0,
@@ -1235,6 +1240,7 @@ fn day_of_year(month: i64, day: i64) -> i64 {
 /// [ERROR] [3/3] COPY . /app -- file not found
 /// [RUN] [1/1] Building application
 /// ```
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn format_build_progress(info: &BuildProgressInfo) -> String {
     let prefix = match info.status {
         BuildStepStatus::Running => "[RUN]".to_string(),

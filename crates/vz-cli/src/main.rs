@@ -100,6 +100,7 @@ struct Cli {
 }
 
 #[derive(clap::Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Create a new sandbox without attaching an interactive shell.
     Create(commands::sandbox::SandboxCreateArgs),

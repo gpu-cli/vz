@@ -84,8 +84,6 @@ pub(super) fn print_ps_table(observed: &[ServiceObservedState], desired: Option<
             "\u{2717} fail".to_string()
         } else if svc.ready {
             "\u{2713} ok".to_string()
-        } else if svc.phase == ServicePhase::Running {
-            "-".to_string()
         } else {
             "-".to_string()
         };

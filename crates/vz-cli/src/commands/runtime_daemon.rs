@@ -173,9 +173,11 @@ fn daemon_client_config_with_overrides(
     runtime_data_dir_override: Option<PathBuf>,
     auto_spawn: bool,
 ) -> DaemonClientConfig {
-    let mut config = DaemonClientConfig::default();
-    config.auto_spawn = auto_spawn;
-    config.state_store_path = Some(state_db.to_path_buf());
+    let mut config = DaemonClientConfig {
+        auto_spawn,
+        state_store_path: Some(state_db.to_path_buf()),
+        ..DaemonClientConfig::default()
+    };
 
     if let Some(socket_path) = socket_override {
         config.socket_path = socket_path.clone();

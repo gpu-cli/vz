@@ -1,4 +1,5 @@
 //! OCI container runtime operations (top-level commands).
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;

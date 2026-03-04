@@ -97,6 +97,7 @@ pub(super) struct ApiStackLogsResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub(super) struct ApiStackServiceActionPayload {
     pub(super) stack_name: String,
     pub(super) service: ApiStackServiceStatus,
@@ -116,6 +117,7 @@ pub(super) struct ApiStackRunContainerRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub(super) struct ApiStackRunContainerPayload {
     pub(super) stack_name: String,
     pub(super) service_name: String,
