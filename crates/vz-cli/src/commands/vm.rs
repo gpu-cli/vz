@@ -141,8 +141,8 @@ pub enum LinuxVmCommand {
     Restore(LinuxVmRestoreArgs),
     /// Linux base image management (planned).
     Base(LinuxVmUnsupportedSurfaceArgs),
-    /// Linux validation workflows (planned).
-    Validate(LinuxVmUnsupportedSurfaceArgs),
+    /// Validate Linux image descriptor and daemon readiness.
+    Validate(LinuxVmValidateArgs),
     /// Linux patch workflows (planned).
     Patch(LinuxVmUnsupportedSurfaceArgs),
     /// Stop a Linux space.
@@ -315,6 +315,29 @@ pub struct LinuxVmUnsupportedSurfaceArgs {
     pub _args: Vec<String>,
 }
 
+/// Arguments for `vz vm linux validate`.
+#[derive(Args, Debug)]
+pub struct LinuxVmValidateArgs {
+    /// Linux guest image name (descriptor file `<name>.linux.json`).
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Optional explicit descriptor path.
+    #[arg(long)]
+    pub descriptor: Option<PathBuf>,
+    /// Descriptor directory when `--descriptor` is not set.
+    #[arg(long, default_value = "~/.vz/images")]
+    pub output_dir: String,
+    /// Optional sandbox identifier for daemon-side linux sandbox readiness check.
+    #[arg(long)]
+    pub sandbox_id: Option<String>,
+    /// Path to runtime state DB.
+    #[arg(long)]
+    pub state_db: Option<PathBuf>,
+    /// Output validation report as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Arguments for `vz vm linux stop`.
 #[derive(Args, Debug)]
 pub struct LinuxVmStopArgs {
@@ -404,7 +427,7 @@ async fn run_linux(args: LinuxVmArgs) -> anyhow::Result<()> {
         LinuxVmCommand::Save(save_args) => run_linux_save(save_args).await,
         LinuxVmCommand::Restore(restore_args) => run_linux_restore(restore_args).await,
         LinuxVmCommand::Base(_) => run_linux_unsupported_surface("base"),
-        LinuxVmCommand::Validate(_) => run_linux_unsupported_surface("validate"),
+        LinuxVmCommand::Validate(validate_args) => run_linux_validate(validate_args).await,
         LinuxVmCommand::Patch(_) => run_linux_unsupported_surface("patch"),
         LinuxVmCommand::Stop(stop_args) => run_linux_stop(stop_args).await,
         LinuxVmCommand::Rm(rm_args) => run_linux_rm(rm_args).await,
@@ -1264,12 +1287,194 @@ async fn run_linux_restore(args: LinuxVmRestoreArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+struct LinuxValidateCheck {
+    name: String,
+    status: String,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LinuxValidateReport {
+    ok: bool,
+    descriptor_path: String,
+    daemon_backend: Option<String>,
+    checks: Vec<LinuxValidateCheck>,
+}
+
+fn resolve_linux_validate_descriptor_path(args: &LinuxVmValidateArgs) -> anyhow::Result<PathBuf> {
+    if let Some(path) = args.descriptor.as_ref() {
+        return Ok(path.clone());
+    }
+    let name = args
+        .name
+        .as_deref()
+        .ok_or_else(|| anyhow!("either --descriptor or --name must be provided"))?;
+    let output_dir = expand_home_path(args.output_dir.as_str())?;
+    Ok(output_dir.join(format!("{name}.linux.json")))
+}
+
+async fn run_linux_validate(args: LinuxVmValidateArgs) -> anyhow::Result<()> {
+    let descriptor_path = resolve_linux_validate_descriptor_path(&args)?;
+    let state_db = args.state_db.unwrap_or_else(default_state_db_path);
+    let mut checks = Vec::new();
+    let mut daemon_backend = None;
+    let mut failed = false;
+
+    let descriptor = match load_linux_vm_image_descriptor(descriptor_path.as_path()) {
+        Ok(descriptor) => {
+            checks.push(LinuxValidateCheck {
+                name: "descriptor_load".to_string(),
+                status: "pass".to_string(),
+                detail: format!("loaded descriptor {}", descriptor_path.display()),
+            });
+            descriptor
+        }
+        Err(error) => {
+            checks.push(LinuxValidateCheck {
+                name: "descriptor_load".to_string(),
+                status: "fail".to_string(),
+                detail: error.to_string(),
+            });
+            failed = true;
+            LinuxVmImageDescriptor {
+                schema_version: LINUX_VM_IMAGE_DESCRIPTOR_SCHEMA_VERSION,
+                image_name: String::new(),
+                kernel_path: PathBuf::new(),
+                initramfs_path: PathBuf::new(),
+                version_json_path: PathBuf::new(),
+                disk_path: PathBuf::new(),
+                disk_size_gb: 0,
+                linux_artifact_version: String::new(),
+                sha256_vmlinux: String::new(),
+                sha256_initramfs: String::new(),
+                created_at_unix_secs: 0,
+            }
+        }
+    };
+
+    if !failed {
+        match validate_descriptor_against_current_artifacts(&descriptor) {
+            Ok(()) => checks.push(LinuxValidateCheck {
+                name: "descriptor_consistency".to_string(),
+                status: "pass".to_string(),
+                detail: "descriptor artifacts and checksums validated".to_string(),
+            }),
+            Err(error) => {
+                checks.push(LinuxValidateCheck {
+                    name: "descriptor_consistency".to_string(),
+                    status: "fail".to_string(),
+                    detail: error.to_string(),
+                });
+                failed = true;
+            }
+        }
+    }
+
+    let mut daemon_client = match connect_linux_daemon(&state_db).await {
+        Ok(client) => {
+            daemon_backend = Some(client.handshake().backend_name.clone());
+            checks.push(LinuxValidateCheck {
+                name: "daemon_connectivity".to_string(),
+                status: "pass".to_string(),
+                detail: "connected to linux daemon".to_string(),
+            });
+            Some(client)
+        }
+        Err(error) => {
+            checks.push(LinuxValidateCheck {
+                name: "daemon_connectivity".to_string(),
+                status: "fail".to_string(),
+                detail: error.to_string(),
+            });
+            failed = true;
+            None
+        }
+    };
+
+    if let Some(sandbox_id) = args.sandbox_id.as_deref()
+        && let Some(client) = daemon_client.as_mut()
+    {
+        match client
+            .get_sandbox(runtime_v2::GetSandboxRequest {
+                sandbox_id: sandbox_id.to_string(),
+                metadata: None,
+            })
+            .await
+        {
+            Ok(response) => {
+                let payload = response
+                    .sandbox
+                    .ok_or_else(|| anyhow!("daemon get_sandbox missing payload"))?;
+                if is_linux_backend_name(payload.backend.as_str()) {
+                    checks.push(LinuxValidateCheck {
+                        name: "sandbox_readiness".to_string(),
+                        status: "pass".to_string(),
+                        detail: format!(
+                            "sandbox {} resolved in state {} on backend {}",
+                            sandbox_id, payload.state, payload.backend
+                        ),
+                    });
+                } else {
+                    checks.push(LinuxValidateCheck {
+                        name: "sandbox_readiness".to_string(),
+                        status: "fail".to_string(),
+                        detail: format!(
+                            "sandbox {} backend {} is not linux",
+                            sandbox_id, payload.backend
+                        ),
+                    });
+                    failed = true;
+                }
+            }
+            Err(error) => {
+                checks.push(LinuxValidateCheck {
+                    name: "sandbox_readiness".to_string(),
+                    status: "fail".to_string(),
+                    detail: error.to_string(),
+                });
+                failed = true;
+            }
+        }
+    }
+
+    let report = LinuxValidateReport {
+        ok: !failed,
+        descriptor_path: descriptor_path.display().to_string(),
+        daemon_backend,
+        checks,
+    };
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("serialize linux validation report")?
+        );
+    } else {
+        println!("Linux VM validation report:");
+        println!("  descriptor: {}", report.descriptor_path);
+        if let Some(backend) = report.daemon_backend.as_deref() {
+            println!("  daemon_backend: {backend}");
+        }
+        for check in &report.checks {
+            let marker = if check.status == "pass" {
+                "PASS"
+            } else {
+                "FAIL"
+            };
+            println!("[{marker}] {}: {}", check.name, check.detail);
+        }
+    }
+
+    if failed {
+        bail!("linux vm validation failed");
+    }
+    Ok(())
+}
+
 fn linux_unsupported_surface_guidance(surface: &str) -> anyhow::Error {
     let replacement = match surface {
         "base" => "use `vz vm linux init --name <name>` for image/descriptor preparation",
-        "validate" => {
-            "use `vz vm linux test e2e ...` for runtime validation (see docs/observability-staging-runbook.md)"
-        }
         "patch" => "linux patch workflow is not implemented yet; track planned work via beads",
         _ => "surface is not implemented for vm linux yet",
     };
@@ -1638,11 +1843,29 @@ mod tests {
 
     #[test]
     fn linux_unsupported_surface_guidance_mentions_replacement_and_docs() {
-        for surface in ["base", "validate", "patch"] {
+        for surface in ["base", "patch"] {
             let message = linux_unsupported_surface_guidance(surface).to_string();
             assert!(message.contains(&format!("vz vm linux {surface}")));
             assert!(message.contains("docs/linux-vm-base-validate-patch-parity.md"));
         }
+    }
+
+    #[test]
+    fn resolve_linux_validate_descriptor_path_requires_name_or_descriptor() {
+        let args = LinuxVmValidateArgs {
+            name: None,
+            descriptor: None,
+            output_dir: "~/.vz/images".to_string(),
+            sandbox_id: None,
+            state_db: None,
+            json: false,
+        };
+        let error = resolve_linux_validate_descriptor_path(&args).expect_err("should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("either --descriptor or --name must be provided")
+        );
     }
 
     #[test]

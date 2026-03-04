@@ -1619,3 +1619,162 @@ async fn cli_daemon_grpc_linux_save_restore_commands_cover_happy_path_and_errors
 
     Ok(())
 }
+
+#[tokio::test]
+async fn cli_daemon_grpc_linux_validate_reports_success_and_failure_modes() -> Result<()> {
+    let temp_dir = tempfile::tempdir().context("create temp dir")?;
+    let home_dir = temp_dir.path().join("home");
+    std::fs::create_dir_all(&home_dir).context("create isolated HOME directory")?;
+    let state_store_path = temp_dir.path().join("state").join("stack-state.db");
+    std::fs::create_dir_all(
+        state_store_path
+            .parent()
+            .context("state store path parent should exist")?,
+    )
+    .context("create state store parent")?;
+
+    let (daemon_shutdown, daemon_server, daemon_socket_path) =
+        start_daemon_for_state_store(&state_store_path).await?;
+
+    let client_config = DaemonClientConfig {
+        socket_path: daemon_socket_path.clone(),
+        auto_spawn: false,
+        state_store_path: Some(state_store_path.clone()),
+        runtime_data_dir: daemon_socket_path.parent().map(Path::to_path_buf),
+        ..DaemonClientConfig::default()
+    };
+    let client = DaemonClient::connect_with_config(client_config)
+        .await
+        .context("connect daemon client")?;
+    if !is_linux_backend_name(client.handshake().backend_name.as_str()) {
+        daemon_shutdown.notify_waiters();
+        daemon_server
+            .await
+            .context("join daemon server task")?
+            .context("run daemon server")?;
+        return Ok(());
+    }
+
+    let artifacts_dir = temp_dir.path().join("linux-artifacts");
+    std::fs::create_dir_all(&artifacts_dir).context("create linux artifacts dir")?;
+    let kernel_path = artifacts_dir.join("vmlinux");
+    let initramfs_path = artifacts_dir.join("initramfs.img");
+    let version_path = artifacts_dir.join("version.json");
+    std::fs::write(&kernel_path, b"kernel-bytes").context("write kernel artifact")?;
+    std::fs::write(&initramfs_path, b"initramfs-bytes").context("write initramfs artifact")?;
+
+    use sha2::Digest;
+    let kernel_sha = {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"kernel-bytes");
+        format!("{:x}", hasher.finalize())
+    };
+    let initramfs_sha = {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"initramfs-bytes");
+        format!("{:x}", hasher.finalize())
+    };
+
+    std::fs::write(
+        &version_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "kernel": "6.12.11",
+            "sha256_vmlinux": kernel_sha,
+            "sha256_initramfs": initramfs_sha,
+        }))?,
+    )
+    .context("write version metadata")?;
+
+    let descriptor_path = temp_dir.path().join("validate-test.linux.json");
+    std::fs::write(
+        &descriptor_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "image_name": "validate-test",
+            "kernel_path": kernel_path,
+            "initramfs_path": initramfs_path,
+            "version_json_path": version_path,
+            "disk_path": temp_dir.path().join("validate-test.img"),
+            "disk_size_gb": 64,
+            "linux_artifact_version": "6.12.11",
+            "sha256_vmlinux": "unused-by-validator",
+            "sha256_initramfs": "unused-by-validator",
+            "created_at_unix_secs": 1_700_000_000u64
+        }))?,
+    )
+    .context("write descriptor")?;
+
+    let vz_bin = resolve_vz_binary()?;
+    let descriptor_path_arg = descriptor_path.to_string_lossy().to_string();
+    let state_store_path_arg = state_store_path.to_string_lossy().to_string();
+
+    let success_output = run_vz_command_daemon(
+        &vz_bin,
+        &daemon_socket_path,
+        &home_dir,
+        &[
+            "vm",
+            "linux",
+            "validate",
+            "--descriptor",
+            &descriptor_path_arg,
+            "--state-db",
+            &state_store_path_arg,
+        ],
+    )
+    .await?;
+    if !success_output.status.success() {
+        bail!(
+            "vz vm linux validate (success case) failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&success_output.stdout),
+            String::from_utf8_lossy(&success_output.stderr)
+        );
+    }
+    let success_stdout = String::from_utf8_lossy(&success_output.stdout);
+    if !success_stdout.contains("[PASS] descriptor_consistency")
+        || !success_stdout.contains("[PASS] daemon_connectivity")
+    {
+        bail!("validate success output missing pass checks:\n{success_stdout}");
+    }
+
+    std::fs::write(
+        &version_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "kernel": "6.12.11",
+            "sha256_vmlinux": "00".repeat(32),
+            "sha256_initramfs": "11".repeat(32),
+        }))?,
+    )
+    .context("write mismatched version metadata")?;
+
+    let failure_output = run_vz_command_daemon(
+        &vz_bin,
+        &daemon_socket_path,
+        &home_dir,
+        &[
+            "vm",
+            "linux",
+            "validate",
+            "--descriptor",
+            &descriptor_path_arg,
+            "--state-db",
+            &state_store_path_arg,
+        ],
+    )
+    .await?;
+    if failure_output.status.success() {
+        bail!("vz vm linux validate unexpectedly succeeded for checksum mismatch");
+    }
+    let failure_stdout = String::from_utf8_lossy(&failure_output.stdout);
+    if !failure_stdout.contains("[FAIL] descriptor_consistency") {
+        bail!("validate failure output missing descriptor_consistency failure:\n{failure_stdout}");
+    }
+
+    daemon_shutdown.notify_waiters();
+    daemon_server
+        .await
+        .context("join daemon server task")?
+        .context("run daemon server")?;
+
+    Ok(())
+}
