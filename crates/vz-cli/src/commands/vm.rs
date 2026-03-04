@@ -5,10 +5,11 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow, bail};
 use clap::{Args, Subcommand};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tonic::Code;
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed_client::{DaemonClient, DaemonClientError};
@@ -346,10 +347,238 @@ async fn run_linux(args: LinuxVmArgs) -> anyhow::Result<()> {
 }
 
 async fn run_linux_init(args: LinuxVmInitArgs) -> anyhow::Result<()> {
-    let _ = args;
-    bail!(
-        "vz vm linux init contract is reserved; implementation is tracked in vz-t8zg.2/vz-t8zg.3/vz-t8zg.4"
+    let output_dir = expand_home_path(args.output_dir.as_str())?;
+    let kernel = args.kernel.unwrap_or_else(default_linux_kernel_path);
+    let initramfs = args.initramfs.unwrap_or_else(default_linux_initramfs_path);
+    let version_path = default_linux_version_json_path();
+
+    ensure_file_exists(kernel.as_path(), "kernel")?;
+    ensure_file_exists(initramfs.as_path(), "initramfs")?;
+    ensure_file_exists(version_path.as_path(), "version metadata")?;
+
+    let version = load_linux_version_metadata(version_path.as_path())?;
+    validate_linux_artifacts(kernel.as_path(), initramfs.as_path(), &version)?;
+
+    std::fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create output directory {}", output_dir.display()))?;
+
+    let disk_path = output_dir.join(format!("{}.img", args.name));
+    let descriptor_path = output_dir.join(format!("{}.linux.json", args.name));
+
+    let descriptor = LinuxVmImageDescriptor {
+        schema_version: LINUX_VM_IMAGE_DESCRIPTOR_SCHEMA_VERSION,
+        image_name: args.name,
+        kernel_path: kernel,
+        initramfs_path: initramfs,
+        version_json_path: version_path,
+        disk_path,
+        disk_size_gb: args.disk_size_gb,
+        linux_artifact_version: version.kernel,
+        sha256_vmlinux: version.sha256_vmlinux,
+        sha256_initramfs: version.sha256_initramfs,
+        created_at_unix_secs: now_unix_secs()?,
+    };
+
+    if descriptor_path.exists() && !args.force {
+        let existing = load_linux_vm_image_descriptor(descriptor_path.as_path())?;
+        validate_descriptor_against_current_artifacts(&existing)?;
+        println!(
+            "Linux image descriptor already exists and is compatible: {}",
+            descriptor_path.display()
+        );
+        println!("Re-run with --force to overwrite descriptor metadata.");
+        return Ok(());
+    }
+
+    write_linux_vm_image_descriptor(descriptor_path.as_path(), &descriptor)?;
+    println!(
+        "Initialized Linux image descriptor: {}",
+        descriptor_path.display()
     );
+    println!("Kernel: {}", descriptor.kernel_path.display());
+    println!("Initramfs: {}", descriptor.initramfs_path.display());
+    println!(
+        "Disk path (provisioning pending): {}",
+        descriptor.disk_path.display()
+    );
+    Ok(())
+}
+
+const LINUX_VM_IMAGE_DESCRIPTOR_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LinuxVmImageDescriptor {
+    schema_version: u16,
+    image_name: String,
+    kernel_path: PathBuf,
+    initramfs_path: PathBuf,
+    version_json_path: PathBuf,
+    disk_path: PathBuf,
+    disk_size_gb: u64,
+    linux_artifact_version: String,
+    sha256_vmlinux: String,
+    sha256_initramfs: String,
+    created_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LinuxArtifactVersionJson {
+    kernel: String,
+    sha256_vmlinux: String,
+    sha256_initramfs: String,
+}
+
+fn expand_home_path(raw: &str) -> anyhow::Result<PathBuf> {
+    if raw == "~" {
+        return home_dir();
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return Ok(home_dir()?.join(rest));
+    }
+    Ok(PathBuf::from(raw))
+}
+
+fn home_dir() -> anyhow::Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("HOME is not set"))
+}
+
+fn default_linux_artifact_dir() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home).join(".vz").join("linux"),
+        None => PathBuf::from(".vz").join("linux"),
+    }
+}
+
+fn default_linux_kernel_path() -> PathBuf {
+    default_linux_artifact_dir().join("vmlinux")
+}
+
+fn default_linux_initramfs_path() -> PathBuf {
+    default_linux_artifact_dir().join("initramfs.img")
+}
+
+fn default_linux_version_json_path() -> PathBuf {
+    default_linux_artifact_dir().join("version.json")
+}
+
+fn ensure_file_exists(path: &Path, label: &str) -> anyhow::Result<()> {
+    if !path.is_file() {
+        bail!("{label} file not found at {}", path.display());
+    }
+    Ok(())
+}
+
+fn load_linux_version_metadata(path: &Path) -> anyhow::Result<LinuxArtifactVersionJson> {
+    let raw = std::fs::read(path)
+        .with_context(|| format!("failed to read linux version metadata {}", path.display()))?;
+    serde_json::from_slice::<LinuxArtifactVersionJson>(&raw)
+        .with_context(|| format!("failed to parse linux version metadata {}", path.display()))
+}
+
+fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read file {}", path.display()))?;
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn validate_linux_artifacts(
+    kernel: &Path,
+    initramfs: &Path,
+    version: &LinuxArtifactVersionJson,
+) -> anyhow::Result<()> {
+    let kernel_sha = sha256_file(kernel)?;
+    let initramfs_sha = sha256_file(initramfs)?;
+    if kernel_sha != version.sha256_vmlinux {
+        bail!(
+            "linux kernel checksum mismatch for {}: expected {}, got {}",
+            kernel.display(),
+            version.sha256_vmlinux,
+            kernel_sha
+        );
+    }
+    if initramfs_sha != version.sha256_initramfs {
+        bail!(
+            "linux initramfs checksum mismatch for {}: expected {}, got {}",
+            initramfs.display(),
+            version.sha256_initramfs,
+            initramfs_sha
+        );
+    }
+    Ok(())
+}
+
+fn write_linux_vm_image_descriptor(
+    path: &Path,
+    descriptor: &LinuxVmImageDescriptor,
+) -> anyhow::Result<()> {
+    let json = serde_json::to_vec_pretty(descriptor)
+        .context("failed to serialize linux vm image descriptor")?;
+    std::fs::write(path, json).with_context(|| {
+        format!(
+            "failed to write linux vm image descriptor {}",
+            path.display()
+        )
+    })
+}
+
+fn load_linux_vm_image_descriptor(path: &Path) -> anyhow::Result<LinuxVmImageDescriptor> {
+    let raw = std::fs::read(path).with_context(|| {
+        format!(
+            "failed to read linux vm image descriptor {}",
+            path.display()
+        )
+    })?;
+    let descriptor = serde_json::from_slice::<LinuxVmImageDescriptor>(&raw).with_context(|| {
+        format!(
+            "failed to parse linux vm image descriptor {}",
+            path.display()
+        )
+    })?;
+    if descriptor.schema_version != LINUX_VM_IMAGE_DESCRIPTOR_SCHEMA_VERSION {
+        bail!(
+            "unsupported linux vm image descriptor schema {} in {}",
+            descriptor.schema_version,
+            path.display()
+        );
+    }
+    Ok(descriptor)
+}
+
+fn validate_descriptor_against_current_artifacts(
+    descriptor: &LinuxVmImageDescriptor,
+) -> anyhow::Result<()> {
+    ensure_file_exists(descriptor.kernel_path.as_path(), "descriptor kernel")?;
+    ensure_file_exists(descriptor.initramfs_path.as_path(), "descriptor initramfs")?;
+    ensure_file_exists(
+        descriptor.version_json_path.as_path(),
+        "descriptor version metadata",
+    )?;
+    let version = load_linux_version_metadata(descriptor.version_json_path.as_path())?;
+    if version.kernel != descriptor.linux_artifact_version {
+        bail!(
+            "linux artifact version mismatch for descriptor {}: expected {}, got {}",
+            descriptor.image_name,
+            descriptor.linux_artifact_version,
+            version.kernel
+        );
+    }
+    validate_linux_artifacts(
+        descriptor.kernel_path.as_path(),
+        descriptor.initramfs_path.as_path(),
+        &version,
+    )
+}
+
+fn now_unix_secs() -> anyhow::Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before unix epoch")?
+        .as_secs())
 }
 
 async fn run_linux_run(args: LinuxVmRunArgs) -> anyhow::Result<()> {
@@ -787,4 +1016,95 @@ fn run_linux_e2e(args: LinuxVmE2eArgs) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::Digest;
+    use tempfile::tempdir;
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    #[test]
+    fn expand_home_path_expands_tilde_prefix() {
+        let home = std::env::var("HOME").expect("HOME must be set for tests");
+        let expanded = expand_home_path("~/foo/bar").expect("expand");
+        assert_eq!(expanded, PathBuf::from(home).join("foo").join("bar"));
+    }
+
+    #[test]
+    fn validate_linux_artifacts_accepts_matching_checksums() {
+        let tmp = tempdir().expect("tempdir");
+        let kernel = tmp.path().join("vmlinux");
+        let initramfs = tmp.path().join("initramfs.img");
+        let kernel_bytes = b"kernel-blob";
+        let initramfs_bytes = b"initramfs-blob";
+        std::fs::write(&kernel, kernel_bytes).expect("write kernel");
+        std::fs::write(&initramfs, initramfs_bytes).expect("write initramfs");
+
+        let version = LinuxArtifactVersionJson {
+            kernel: "6.12.11".to_string(),
+            sha256_vmlinux: sha256_hex(kernel_bytes),
+            sha256_initramfs: sha256_hex(initramfs_bytes),
+        };
+
+        validate_linux_artifacts(kernel.as_path(), initramfs.as_path(), &version)
+            .expect("checksums should match");
+    }
+
+    #[test]
+    fn validate_linux_artifacts_rejects_mismatched_checksums() {
+        let tmp = tempdir().expect("tempdir");
+        let kernel = tmp.path().join("vmlinux");
+        let initramfs = tmp.path().join("initramfs.img");
+        std::fs::write(&kernel, b"kernel-blob").expect("write kernel");
+        std::fs::write(&initramfs, b"initramfs-blob").expect("write initramfs");
+
+        let version = LinuxArtifactVersionJson {
+            kernel: "6.12.11".to_string(),
+            sha256_vmlinux: "00".repeat(32),
+            sha256_initramfs: "11".repeat(32),
+        };
+
+        let error = validate_linux_artifacts(kernel.as_path(), initramfs.as_path(), &version)
+            .expect_err("checksum mismatch should fail");
+        let message = error.to_string();
+        assert!(message.contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn descriptor_roundtrip_preserves_fields() {
+        let tmp = tempdir().expect("tempdir");
+        let descriptor_path = tmp.path().join("linux-test.linux.json");
+        let descriptor = LinuxVmImageDescriptor {
+            schema_version: LINUX_VM_IMAGE_DESCRIPTOR_SCHEMA_VERSION,
+            image_name: "linux-test".to_string(),
+            kernel_path: tmp.path().join("vmlinux"),
+            initramfs_path: tmp.path().join("initramfs.img"),
+            version_json_path: tmp.path().join("version.json"),
+            disk_path: tmp.path().join("linux-test.img"),
+            disk_size_gb: 64,
+            linux_artifact_version: "6.12.11".to_string(),
+            sha256_vmlinux: "aa".repeat(32),
+            sha256_initramfs: "bb".repeat(32),
+            created_at_unix_secs: 1_700_000_000,
+        };
+
+        write_linux_vm_image_descriptor(descriptor_path.as_path(), &descriptor).expect("write");
+        let loaded = load_linux_vm_image_descriptor(descriptor_path.as_path()).expect("load");
+        assert_eq!(loaded.image_name, descriptor.image_name);
+        assert_eq!(loaded.kernel_path, descriptor.kernel_path);
+        assert_eq!(loaded.initramfs_path, descriptor.initramfs_path);
+        assert_eq!(loaded.disk_path, descriptor.disk_path);
+        assert_eq!(loaded.disk_size_gb, descriptor.disk_size_gb);
+        assert_eq!(
+            loaded.linux_artifact_version,
+            descriptor.linux_artifact_version
+        );
+    }
 }
