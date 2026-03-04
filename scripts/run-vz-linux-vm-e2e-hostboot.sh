@@ -161,7 +161,7 @@ else
 required_tools="bash curl git cargo rustup btrfs youki";
 for tool in $required_tools; do
   if ! command -v "$tool" >/dev/null 2>&1; then
-    echo "missing required guest tool '$tool' while --skip-pkg-setup is set; rerun without --skip-pkg-setup" >&2;
+    echo "missing required guest tool \"$tool\" while --skip-pkg-setup is set; rerun without --skip-pkg-setup" >&2;
     exit 1;
   fi;
 done;
