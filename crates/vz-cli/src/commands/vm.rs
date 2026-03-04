@@ -122,6 +122,8 @@ pub struct LinuxVmArgs {
 /// Linux VM workflow operations.
 #[derive(Subcommand, Debug)]
 pub enum LinuxVmCommand {
+    /// Initialize Linux guest image metadata and persistent disk artifacts.
+    Init(LinuxVmInitArgs),
     /// Create/start a Linux space without attaching.
     Run(LinuxVmRunArgs),
     /// List Linux spaces.
@@ -141,6 +143,29 @@ pub enum LinuxVmCommand {
     /// Run local no-SSH Linux VM E2E harness orchestration (legacy alias).
     #[command(hide = true)]
     E2e(LinuxVmE2eArgs),
+}
+
+/// Arguments for `vz vm linux init`.
+#[derive(Args, Debug)]
+pub struct LinuxVmInitArgs {
+    /// Logical Linux guest image name.
+    #[arg(long)]
+    pub name: String,
+    /// Output directory for Linux guest image metadata and disk.
+    #[arg(long, default_value = "~/.vz/images")]
+    pub output_dir: String,
+    /// Linux guest persistent disk size in GiB.
+    #[arg(long, default_value_t = 64)]
+    pub disk_size_gb: u64,
+    /// Override kernel artifact path (defaults to ~/.vz/linux/vmlinux).
+    #[arg(long)]
+    pub kernel: Option<PathBuf>,
+    /// Override initramfs artifact path (defaults to ~/.vz/linux/initramfs.img).
+    #[arg(long)]
+    pub initramfs: Option<PathBuf>,
+    /// Replace existing image artifacts when target already exists.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Arguments for `vz vm linux run`.
@@ -302,6 +327,7 @@ pub struct LinuxVmE2eArgs {
 
 async fn run_linux(args: LinuxVmArgs) -> anyhow::Result<()> {
     match args.action {
+        LinuxVmCommand::Init(init_args) => run_linux_init(init_args).await,
         LinuxVmCommand::Run(run_args) => run_linux_run(run_args).await,
         LinuxVmCommand::List(list_args) => run_linux_list(list_args).await,
         LinuxVmCommand::Inspect(inspect_args) => run_linux_inspect(inspect_args).await,
@@ -310,8 +336,20 @@ async fn run_linux(args: LinuxVmArgs) -> anyhow::Result<()> {
         LinuxVmCommand::Stop(stop_args) => run_linux_stop(stop_args).await,
         LinuxVmCommand::Rm(rm_args) => run_linux_rm(rm_args).await,
         LinuxVmCommand::Test(test_args) => run_linux_test(test_args).await,
-        LinuxVmCommand::E2e(e2e_args) => run_linux_e2e(e2e_args),
+        LinuxVmCommand::E2e(e2e_args) => {
+            eprintln!(
+                "warning: `vz vm linux e2e` is deprecated; use `vz vm linux test e2e` instead"
+            );
+            run_linux_e2e(e2e_args)
+        }
     }
+}
+
+async fn run_linux_init(args: LinuxVmInitArgs) -> anyhow::Result<()> {
+    let _ = args;
+    bail!(
+        "vz vm linux init contract is reserved; implementation is tracked in vz-t8zg.2/vz-t8zg.3/vz-t8zg.4"
+    );
 }
 
 async fn run_linux_run(args: LinuxVmRunArgs) -> anyhow::Result<()> {

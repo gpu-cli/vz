@@ -569,6 +569,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_vm_linux_init() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "vm",
+            "linux",
+            "init",
+            "--name",
+            "linux-test",
+            "--disk-size-gb",
+            "80",
+            "--force",
+        ])
+        .expect("parse");
+        assert!(matches!(cli.command, Some(Commands::Vm(_))));
+    }
+
+    #[test]
     fn parse_vm_linux_list() {
         let cli = Cli::try_parse_from(["vz", "vm", "linux", "list"]).expect("parse");
         assert!(matches!(cli.command, Some(Commands::Vm(_))));
