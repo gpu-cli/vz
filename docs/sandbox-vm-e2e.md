@@ -241,6 +241,38 @@ Artifacts are written under:
 .artifacts/vz-linux-vm-e2e/<timestamp>/
 ```
 
+## Release-Gate One-Liner
+
+Run from repo root:
+
+```bash
+./scripts/run-linux-daemon-release-gate.sh \
+  --workspace /mnt/vz-btrfs \
+  --profile release
+```
+
+On macOS this delegates to the local VM wrapper (`run-vz-linux-vm-e2e-local.sh`).
+On Linux it runs the harness directly (`run-vz-linux-vm-e2e.sh`).
+
+Deterministic artifact root:
+
+```text
+.artifacts/release-gates/linux-daemon/
+```
+
+Gate checklist:
+
+- Latest run summary exists at:
+  `.artifacts/release-gates/linux-daemon/latest/summary.txt`
+- `summary.txt` contains:
+  - `passed=vz_cli_api_daemon_linux_happy_path,vz_vm_linux_daemon_lifecycle`
+  - `failed=none`
+- Artifacts include:
+  - `vm-linux-list.json`
+  - `vm-linux-inspect.json`
+  - `vm-linux-exec-success.log`
+  - `vm-linux-exec-fail.log`
+
 ## Signing Behavior
 
 The harness signs:
