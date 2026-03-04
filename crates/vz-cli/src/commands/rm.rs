@@ -1,4 +1,4 @@
-//! `vz vm rm` -- Remove VM runtime metadata and optional image artifacts.
+//! `vz vm mac rm` -- Remove VM runtime metadata and optional image artifacts.
 
 use std::path::{Path, PathBuf};
 

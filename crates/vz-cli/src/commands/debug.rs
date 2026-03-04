@@ -21,9 +21,9 @@ pub enum DebugCommand {
     /// Docker-compatible translation shim.
     Docker(super::docker::DockerArgs),
 
-    /// Manage virtual machines (macOS only).
+    /// Manage macOS virtual machines (legacy alias for `vz vm mac`).
     #[cfg(target_os = "macos")]
-    Vm(super::vm::VmArgs),
+    Vm(super::vm::MacVmArgs),
 
     /// Manage lease access grants.
     Lease(super::lease::LeaseArgs),
@@ -78,7 +78,7 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
         DebugCommand::Container(container_args) => run_container_debug(container_args).await,
         DebugCommand::Docker(docker_args) => super::docker::run(docker_args).await,
         #[cfg(target_os = "macos")]
-        DebugCommand::Vm(vm_args) => super::vm::run(vm_args).await,
+        DebugCommand::Vm(vm_args) => super::vm::run_mac(vm_args).await,
         DebugCommand::Lease(lease_args) => super::lease::run(lease_args).await,
         DebugCommand::Execution(exec_args) => super::execution::run(exec_args).await,
         DebugCommand::Checkpoint(checkpoint_args) => super::checkpoint::run(checkpoint_args).await,

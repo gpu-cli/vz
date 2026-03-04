@@ -501,7 +501,7 @@ fn patch_verify_rejects_unsupported_target_base_descriptor() {
     let msg = format!("{err:#}");
     assert!(msg.contains("unsupported or retired base"));
     assert!(msg.contains("unknown base selector"));
-    assert!(msg.contains("vz vm init --base stable"));
+    assert!(msg.contains("vz vm mac init --base stable"));
 }
 
 #[test]
@@ -534,7 +534,7 @@ fn patch_apply_rejects_retired_target_base_descriptor() {
     assert!(msg.contains("unsupported or retired base"));
     assert!(msg.contains("retired base"));
     assert!(msg.contains(RETIRED_BASE_ID));
-    assert!(msg.contains("vz vm init --base stable"));
+    assert!(msg.contains("vz vm mac init --base stable"));
     assert!(msg.contains(BASE_CHANNEL_STABLE));
     assert!(!root.path().join("opt/tool").exists());
 }

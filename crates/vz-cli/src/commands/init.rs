@@ -142,7 +142,7 @@ fn disk_size_bytes_from_base(base: &BaseImage) -> anyhow::Result<u64> {
 }
 
 fn require_allow_unpinned(allow_unpinned: bool) -> anyhow::Result<()> {
-    require_unpinned_policy(allow_unpinned, "init", "vz vm init --base <id>")
+    require_unpinned_policy(allow_unpinned, "init", "vz vm mac init --base <id>")
 }
 
 fn print_unpinned_warning() {

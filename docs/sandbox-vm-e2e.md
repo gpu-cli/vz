@@ -222,7 +222,7 @@ Or run from macOS host into a local `vz` VM (no SSH) using VM control socket:
 
 Notes:
 
-- `--mount` is forwarded to `vz debug vm run` during auto-start.
+- `--mount` is forwarded to `vz vm mac run` during auto-start.
 - ensure `--guest-repo` matches the in-guest mount path for your VM image.
 - wrapper can provision btrfs workspace in-guest automatically before running harness.
 

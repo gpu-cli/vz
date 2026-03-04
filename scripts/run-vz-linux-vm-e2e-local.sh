@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run Linux VM E2E harness inside a local vz-managed VM (no SSH).
 #
-# This wrapper executes commands through `vz debug vm exec` against an already
+# This wrapper executes commands through `vz vm mac exec` against an already
 # running local VM. It can also provision a loopback btrfs workspace in-guest
 # before running the high-level harness.
 
@@ -29,7 +29,7 @@ run-vz-linux-vm-e2e-local.sh
 Run Linux E2E harness inside a local vz-managed VM without SSH.
 
 Options:
-  --vm-name <name>            VM name registered in `vz debug vm list` (required)
+  --vm-name <name>            VM name registered in `vz vm mac list` (required)
   --guest-repo <path>         Repo path inside VM (required)
   --workspace <path>          In-guest btrfs workspace path (default: /mnt/vz-btrfs)
   --profile <debug|release>   Harness profile (default: debug)
@@ -38,7 +38,7 @@ Options:
   --vm-memory-gb <n>          Memory GB for auto-started VM (default: 8)
   --auto-start                Auto-start VM if not already running (requires --vm-image)
   --wait-secs <n>             Max seconds waiting for VM to accept exec after auto-start (default: 90)
-  --mount <TAG:HOST_PATH>     VirtioFS mount passed to `vz debug vm run` (repeatable, auto-start only)
+  --mount <TAG:HOST_PATH>     VirtioFS mount passed to `vz vm mac run` (repeatable, auto-start only)
   --provision-btrfs           Ensure btrfs workspace exists in guest (default: on)
   --no-provision-btrfs        Skip btrfs provisioning step
   --btrfs-image <path>        In-guest loopback image path (default: /var/lib/vz-btrfs-workspace.img)
@@ -46,7 +46,7 @@ Options:
   -h, --help                  Show help
 
 Notes:
-  - Without --auto-start, VM must already be running and reachable by `vz debug vm exec`.
+  - Without --auto-start, VM must already be running and reachable by `vz vm mac exec`.
   - This script does not use SSH.
 USAGE
 }
@@ -134,7 +134,7 @@ fi
 command -v vz >/dev/null 2>&1 || err "vz binary not found in PATH"
 
 vm_exec_probe() {
-    vz debug vm exec "$VM_NAME" --user dev -- /bin/sh -lc "echo vm_ok" >/dev/null 2>&1
+    vz vm mac exec "$VM_NAME" --user dev -- /bin/sh -lc "echo vm_ok" >/dev/null 2>&1
 }
 
 cleanup() {
@@ -151,7 +151,7 @@ if ! vm_exec_probe; then
     fi
 
     echo "==> starting VM: $VM_NAME"
-    run_cmd=(vz debug vm run --name "$VM_NAME" --image "$VM_IMAGE" --cpus "$VM_CPUS" --memory "$VM_MEMORY_GB" --headless)
+    run_cmd=(vz vm mac run --name "$VM_NAME" --image "$VM_IMAGE" --cpus "$VM_CPUS" --memory "$VM_MEMORY_GB" --headless)
     for mount in "${MOUNTS[@]}"; do
         run_cmd+=(--mount "$mount")
     done
@@ -171,12 +171,12 @@ echo "==> VM reachable: $VM_NAME"
 
 if [[ "$PROVISION_BTRFS" == "true" ]]; then
     echo "==> provisioning btrfs workspace in guest: $WORKSPACE"
-    vz debug vm exec "$VM_NAME" --user root -- /bin/sh -lc \
+    vz vm mac exec "$VM_NAME" --user root -- /bin/sh -lc \
         "set -euo pipefail; cd '$GUEST_REPO'; ./scripts/provision-linux-btrfs-workspace.sh --workspace '$WORKSPACE' --image '$BTRFS_IMAGE' --size-gb '$BTRFS_SIZE_GB' --owner dev"
 fi
 
 echo "==> running Linux VM E2E harness in guest"
-vz debug vm exec "$VM_NAME" --user dev -- /bin/sh -lc \
+vz vm mac exec "$VM_NAME" --user dev -- /bin/sh -lc \
     "set -euo pipefail; if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; fi; cd '$GUEST_REPO'; ./scripts/run-vz-linux-vm-e2e.sh --workspace '$WORKSPACE' --profile '$PROFILE'"
 
 echo "==> completed successfully"

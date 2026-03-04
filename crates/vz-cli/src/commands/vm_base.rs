@@ -1,4 +1,4 @@
-//! `vz vm base` -- Supported base matrix commands.
+//! `vz vm mac base` -- Supported base matrix commands.
 
 use std::collections::HashSet;
 use std::env;
@@ -24,7 +24,7 @@ pub struct VmBaseArgs {
     pub action: VmBaseCommand,
 }
 
-/// `vz vm base` subcommands.
+/// `vz vm mac base` subcommands.
 #[derive(Subcommand, Debug)]
 pub enum VmBaseCommand {
     /// List supported base definitions from the versioned matrix.
@@ -34,7 +34,7 @@ pub enum VmBaseCommand {
     Verify(VerifyArgs),
 }
 
-/// Arguments for `vz vm base verify`.
+/// Arguments for `vz vm mac base verify`.
 #[derive(Args, Debug)]
 pub struct VerifyArgs {
     /// Path to the base image (.img).
@@ -538,7 +538,7 @@ pub(crate) fn resolve_base_selector_or_err<'a>(
         resolved.ok_or_else(|| {
             anyhow::anyhow!(
                 "unknown base selector '{selector}'. Use a base ID or channel alias ({BASE_CHANNEL_STABLE}, {BASE_CHANNEL_PREVIOUS}). Known base IDs: {}.\n\
-                 Fallback: run `vz vm init --base {BASE_CHANNEL_STABLE}` and retry with a supported selector.",
+                 Fallback: run `vz vm mac init --base {BASE_CHANNEL_STABLE}` and retry with a supported selector.",
                 known_base_ids(matrix)
             )
         })?
@@ -547,7 +547,7 @@ pub(crate) fn resolve_base_selector_or_err<'a>(
     ensure_resolved_base_is_supported(matrix, selector, resolved)
 }
 
-/// Entry point for `vz vm base`.
+/// Entry point for `vz vm mac base`.
 pub async fn run(args: VmBaseArgs) -> anyhow::Result<()> {
     match args.action {
         VmBaseCommand::List => list_bases(),
@@ -635,7 +635,7 @@ fn ensure_resolved_base_is_supported<'a>(
     let retired_at = base.support.retired_at.as_deref().unwrap_or("unknown");
     let mut message = format!(
         "base selector '{}' resolves to retired base '{}' (retired_at: {}).\n\
-         Fallback: re-init on {BASE_CHANNEL_STABLE}: `vz vm init --base {BASE_CHANNEL_STABLE}`.",
+         Fallback: re-init on {BASE_CHANNEL_STABLE}: `vz vm mac init --base {BASE_CHANNEL_STABLE}`.",
         selector, base.base_id, retired_at
     );
 
@@ -1023,7 +1023,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("retired base"));
         assert!(msg.contains(BASE_ID_2));
-        assert!(msg.contains("vz vm init --base stable"));
+        assert!(msg.contains("vz vm mac init --base stable"));
         assert!(msg.contains("Recommended replacement"));
         assert!(msg.contains(BASE_CHANNEL_STABLE));
         assert!(msg.contains(BASE_ID_1));
@@ -1040,7 +1040,7 @@ mod tests {
         assert!(msg.contains(BASE_CHANNEL_PREVIOUS));
         assert!(msg.contains(BASE_ID_1));
         assert!(msg.contains(BASE_ID_2));
-        assert!(msg.contains("vz vm init --base stable"));
+        assert!(msg.contains("vz vm mac init --base stable"));
     }
 
     #[test]
@@ -1048,7 +1048,7 @@ mod tests {
         let err = require_unpinned_policy_with_context(
             false,
             "provision",
-            "vz vm provision --base-id <id>",
+            "vz vm mac provision --base-id <id>",
             UnpinnedPolicyContext {
                 in_ci: false,
                 allow_unpinned_in_ci: false,
@@ -1063,7 +1063,7 @@ mod tests {
         require_unpinned_policy_with_context(
             true,
             "init",
-            "vz vm init --base <id>",
+            "vz vm mac init --base <id>",
             UnpinnedPolicyContext {
                 in_ci: false,
                 allow_unpinned_in_ci: false,
@@ -1077,7 +1077,7 @@ mod tests {
         let err = require_unpinned_policy_with_context(
             true,
             "init",
-            "vz vm init --base <id>",
+            "vz vm mac init --base <id>",
             UnpinnedPolicyContext {
                 in_ci: true,
                 allow_unpinned_in_ci: false,
@@ -1094,7 +1094,7 @@ mod tests {
         require_unpinned_policy_with_context(
             true,
             "provision",
-            "vz vm provision --base-id <id>",
+            "vz vm mac provision --base-id <id>",
             UnpinnedPolicyContext {
                 in_ci: true,
                 allow_unpinned_in_ci: true,

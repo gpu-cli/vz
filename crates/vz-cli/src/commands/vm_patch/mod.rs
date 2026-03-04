@@ -1,4 +1,4 @@
-//! `vz vm patch` -- Signed patch bundles plus binary image deltas.
+//! `vz vm mac patch` -- Signed patch bundles plus binary image deltas.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -57,7 +57,7 @@ pub struct VmPatchArgs {
     pub action: VmPatchCommand,
 }
 
-/// `vz vm patch` subcommands.
+/// `vz vm mac patch` subcommands.
 #[derive(Subcommand, Debug)]
 pub enum VmPatchCommand {
     /// Create a signed patch bundle from operations + payload inputs.
@@ -72,7 +72,7 @@ pub enum VmPatchCommand {
     ApplyDelta(ApplyDeltaArgs),
 }
 
-/// Arguments for `vz vm patch create`.
+/// Arguments for `vz vm mac patch create`.
 #[derive(Args, Debug)]
 pub struct CreateArgs {
     /// Output bundle directory to write (for example: `/tmp/patch-1.vzpatch`).
@@ -143,7 +143,7 @@ pub struct CreateArgs {
     pub created_at: Option<String>,
 }
 
-/// Arguments for `vz vm patch verify`.
+/// Arguments for `vz vm mac patch verify`.
 #[derive(Args, Debug)]
 pub struct VerifyArgs {
     /// Bundle directory containing manifest, payload, and detached signature.
@@ -151,7 +151,7 @@ pub struct VerifyArgs {
     pub bundle: PathBuf,
 }
 
-/// Arguments for `vz vm patch apply`.
+/// Arguments for `vz vm mac patch apply`.
 #[derive(Args, Debug)]
 pub struct ApplyArgs {
     /// Bundle directory containing manifest, payload, and detached signature.
@@ -167,7 +167,7 @@ pub struct ApplyArgs {
     pub image: Option<PathBuf>,
 }
 
-/// Arguments for `vz vm patch create-delta`.
+/// Arguments for `vz vm mac patch create-delta`.
 #[derive(Args, Debug)]
 pub struct CreateDeltaArgs {
     /// Bundle directory to apply when producing the patched image snapshot.
@@ -191,14 +191,14 @@ pub struct CreateDeltaArgs {
     pub chunk_size_mib: u32,
 }
 
-/// Arguments for `vz vm patch apply-delta`.
+/// Arguments for `vz vm mac patch apply-delta`.
 #[derive(Args, Debug)]
 pub struct ApplyDeltaArgs {
     /// Base raw VM image path used as delta source.
     #[arg(long)]
     pub base_image: PathBuf,
 
-    /// Binary delta file produced by `vz vm patch create-delta`.
+    /// Binary delta file produced by `vz vm mac patch create-delta`.
     #[arg(long)]
     pub delta: PathBuf,
 
@@ -631,7 +631,7 @@ fn normalize_sha256_field(field: &str, value: &str) -> anyhow::Result<String> {
     ipsw::normalize_sha256(value).with_context(|| format!("invalid {field}"))
 }
 
-/// Entry point for `vz vm patch`.
+/// Entry point for `vz vm mac patch`.
 pub async fn run(args: VmPatchArgs) -> anyhow::Result<()> {
     match args.action {
         VmPatchCommand::Create(args) => create(args),

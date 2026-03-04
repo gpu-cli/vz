@@ -135,6 +135,9 @@ enum Commands {
     /// Checkpoint lifecycle management (list, inspect, create, restore, fork).
     Checkpoint(commands::checkpoint::CheckpointArgs),
 
+    /// VM command namespaces (`mac`, `linux`).
+    Vm(commands::vm::VmArgs),
+
     // ── Debug/advanced (hidden) ──
     /// Advanced debugging and low-level operations.
     #[command(hide = true)]
@@ -178,19 +181,38 @@ fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    // GUI mode: `vz debug vm run` without --headless needs AppKit on the main thread.
+    // GUI mode: `vz vm mac run` (and legacy `vz debug vm run`) without
+    // --headless needs AppKit on the main thread.
+    #[cfg(target_os = "macos")]
+    if let Some(Commands::Vm(ref vm_args)) = cli.command
+        && let commands::vm::VmCommand::Mac(ref mac_args) = vm_args.action
+        && let commands::vm::MacVmCommand::Run(ref args) = mac_args.action
+        && !args.headless
+    {
+        let Some(Commands::Vm(vm_args)) = cli.command else {
+            unreachable!()
+        };
+        let commands::vm::VmCommand::Mac(mac_args) = vm_args.action else {
+            unreachable!()
+        };
+        let commands::vm::MacVmCommand::Run(args) = mac_args.action else {
+            unreachable!()
+        };
+        return gui::run_with_gui(args);
+    }
+
     #[cfg(target_os = "macos")]
     if let Some(Commands::Debug(ref debug_args)) = cli.command {
         if let commands::debug::DebugCommand::Vm(ref vm_args) = debug_args.action {
-            if let commands::vm::VmCommand::Run(ref args) = vm_args.action {
+            if let commands::vm::MacVmCommand::Run(ref args) = vm_args.action {
                 if !args.headless {
                     let Some(Commands::Debug(debug_args)) = cli.command else {
                         unreachable!()
                     };
-                    let commands::debug::DebugCommand::Vm(vm_args) = debug_args.action else {
+                    let commands::debug::DebugCommand::Vm(mac_args) = debug_args.action else {
                         unreachable!()
                     };
-                    let commands::vm::VmCommand::Run(args) = vm_args.action else {
+                    let commands::vm::MacVmCommand::Run(args) = mac_args.action else {
                         unreachable!()
                     };
                     return gui::run_with_gui(args);
@@ -237,6 +259,9 @@ fn main() -> anyhow::Result<()> {
 
             // Checkpoint lifecycle
             Some(Commands::Checkpoint(args)) => commands::checkpoint::run(args).await,
+
+            // VM command namespaces
+            Some(Commands::Vm(args)) => commands::vm::run(args).await,
 
             // Debug/advanced
             Some(Commands::Debug(args)) => commands::debug::run(*args).await,
@@ -507,6 +532,30 @@ mod tests {
         let cli = Cli::try_parse_from(["vz", "debug", "vm", "init", "--disk-size", "64G"])
             .expect("parse");
         assert!(matches!(cli.command, Some(Commands::Debug(_))));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_vm_mac_init() {
+        let cli =
+            Cli::try_parse_from(["vz", "vm", "mac", "init", "--disk-size", "64G"]).expect("parse");
+        assert!(matches!(cli.command, Some(Commands::Vm(_))));
+    }
+
+    #[test]
+    fn parse_vm_linux_e2e() {
+        let cli = Cli::try_parse_from([
+            "vz",
+            "vm",
+            "linux",
+            "e2e",
+            "--vm-name",
+            "linux-e2e",
+            "--guest-repo",
+            "/workspaces/vz",
+        ])
+        .expect("parse");
+        assert!(matches!(cli.command, Some(Commands::Vm(_))));
     }
 
     #[test]

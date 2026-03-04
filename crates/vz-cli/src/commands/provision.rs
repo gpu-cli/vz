@@ -1,4 +1,4 @@
-//! `vz vm provision` -- Provision a VM disk image offline.
+//! `vz vm mac provision` -- Provision a VM disk image offline.
 
 use std::path::PathBuf;
 
@@ -76,7 +76,7 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
         super::vm_base::require_unpinned_policy(
             args.allow_unpinned,
             "provision",
-            "vz vm provision --base-id <id> --image <path>",
+            "vz vm mac provision --base-id <id> --image <path>",
         )?;
         print_unpinned_warning();
     }
@@ -154,7 +154,7 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
         println!("\nWARNING: LaunchDaemon files need root ownership to work.");
         println!("Run this to fix:");
         println!(
-            "  sudo vz vm provision --image {}{}",
+            "  sudo vz vm mac provision --image {}{}",
             image.display(),
             rerun_policy
         );
@@ -170,7 +170,7 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
         println!("  sudo chown 0:0 /tmp/vz-provision/usr/local/bin/vz-guest-agent");
         println!("\nNo-local-sudo alternative (opt-in user runtime policy):");
         println!(
-            "  vz vm provision --image {}{} --agent-mode user",
+            "  vz vm mac provision --image {}{} --agent-mode user",
             image.display(),
             rerun_policy
         );
@@ -186,10 +186,10 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
 
     println!("\nNext steps:");
     println!(
-        "  vz vm run --image {} --name my-vm --headless",
+        "  vz vm mac run --image {} --name my-vm --headless",
         image.display()
     );
-    println!("  vz vm exec my-vm -- whoami");
+    println!("  vz vm mac exec my-vm -- whoami");
 
     Ok(())
 }
