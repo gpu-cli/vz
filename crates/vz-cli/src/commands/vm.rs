@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow, bail};
 use clap::{Args, Subcommand};
@@ -172,27 +172,36 @@ pub struct LinuxVmInitArgs {
 /// Arguments for `vz vm linux run`.
 #[derive(Args, Debug)]
 pub struct LinuxVmRunArgs {
-    /// Optional display name.
+    /// Linux guest image name (descriptor file `<name>.linux.json`).
     #[arg(long)]
-    pub name: Option<String>,
+    pub name: String,
+    /// Optional explicit descriptor path.
+    #[arg(long)]
+    pub descriptor: Option<PathBuf>,
+    /// Descriptor directory when `--descriptor` is not set.
+    #[arg(long, default_value = "~/.vz/images")]
+    pub output_dir: String,
     /// Number of virtual CPUs.
     #[arg(long, default_value = "2")]
     pub cpus: u8,
     /// Memory in MB.
     #[arg(long, default_value = "2048")]
     pub memory: u64,
-    /// Default image reference for startup workload.
+    /// Optional kernel command line override.
     #[arg(long)]
-    pub base_image: Option<String>,
-    /// Main workload/container identifier for startup.
+    pub cmdline: Option<String>,
+    /// Optional rootfs directory mounted as `rootfs` VirtioFS tag.
     #[arg(long)]
-    pub main_container: Option<String>,
-    /// Path to runtime state DB.
+    pub rootfs_dir: Option<PathBuf>,
+    /// Additional shared directory mounts (`TAG:HOST_PATH[:ro|rw]`).
+    #[arg(long = "mount")]
+    pub mounts: Vec<String>,
+    /// Stop the VM once guest agent is ready (smoke mode).
     #[arg(long)]
-    pub state_db: Option<PathBuf>,
-    /// Output created space payload as JSON.
-    #[arg(long)]
-    pub json: bool,
+    pub stop_after_ready: bool,
+    /// Guest agent readiness timeout in seconds.
+    #[arg(long, default_value_t = 30)]
+    pub agent_timeout_secs: u64,
 }
 
 /// Arguments for `vz vm linux list`.
@@ -680,19 +689,150 @@ fn create_sparse_disk(path: &Path, size_bytes: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn parse_linux_vm_mount_specs(specs: &[String]) -> anyhow::Result<Vec<vz::SharedDirConfig>> {
+    let mut mounts = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let (tag, source, read_only) = parse_linux_vm_mount_spec(spec)?;
+        mounts.push(vz::SharedDirConfig {
+            tag,
+            source,
+            read_only,
+        });
+    }
+    Ok(mounts)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_linux_vm_mount_spec(spec: &str) -> anyhow::Result<(String, PathBuf, bool)> {
+    let mut parts = spec.split(':');
+    let tag = parts
+        .next()
+        .ok_or_else(|| anyhow!("mount spec must be TAG:HOST_PATH[:ro|rw]"))?;
+    let source = parts
+        .next()
+        .ok_or_else(|| anyhow!("mount spec must be TAG:HOST_PATH[:ro|rw]"))?;
+    let mode = parts.next();
+    if parts.next().is_some() {
+        bail!("mount spec has too many ':' separators: {spec}");
+    }
+    if tag.trim().is_empty() {
+        bail!("mount tag must not be empty in spec: {spec}");
+    }
+    if source.trim().is_empty() {
+        bail!("mount source path must not be empty in spec: {spec}");
+    }
+    let read_only = match mode {
+        None => false,
+        Some("rw") => false,
+        Some("ro") => true,
+        Some(other) => bail!("unsupported mount mode `{other}` in spec: {spec}"),
+    };
+    Ok((tag.to_string(), PathBuf::from(source), read_only))
+}
+
 async fn run_linux_run(args: LinuxVmRunArgs) -> anyhow::Result<()> {
-    let state_db = args.state_db.unwrap_or_else(default_state_db_path);
-    let _ = connect_linux_daemon(&state_db).await?;
-    sandbox::cmd_create(sandbox::SandboxCreateArgs {
-        name: args.name,
-        cpus: args.cpus,
-        memory: args.memory,
-        base_image: args.base_image,
-        main_container: args.main_container,
-        state_db: Some(state_db),
-        json: args.json,
-    })
-    .await
+    run_linux_host_boot(args).await
+}
+
+async fn run_linux_host_boot(args: LinuxVmRunArgs) -> anyhow::Result<()> {
+    let output_dir = expand_home_path(args.output_dir.as_str())?;
+    let descriptor_path = match args.descriptor.as_ref() {
+        Some(path) => path.clone(),
+        None => output_dir.join(format!("{}.linux.json", args.name)),
+    };
+    ensure_file_exists(descriptor_path.as_path(), "linux image descriptor")?;
+    let descriptor = load_linux_vm_image_descriptor(descriptor_path.as_path())?;
+    validate_descriptor_against_current_artifacts(&descriptor)?;
+
+    let expected_disk_size = gib_to_bytes(descriptor.disk_size_gb)?;
+    let disk_metadata = std::fs::metadata(descriptor.disk_path.as_path()).with_context(|| {
+        format!(
+            "failed to stat disk image {}",
+            descriptor.disk_path.display()
+        )
+    })?;
+    if !disk_metadata.is_file() {
+        bail!(
+            "descriptor disk path is not a regular file: {}",
+            descriptor.disk_path.display()
+        );
+    }
+    if disk_metadata.len() != expected_disk_size {
+        bail!(
+            "descriptor disk image {} has size {} bytes but expected {} bytes ({} GiB)",
+            descriptor.disk_path.display(),
+            disk_metadata.len(),
+            expected_disk_size,
+            descriptor.disk_size_gb
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = args;
+        bail!("`vz vm linux run` host boot is only supported on macOS hosts");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut config = vz_linux::LinuxVmConfig::new(
+            descriptor.kernel_path.clone(),
+            descriptor.initramfs_path.clone(),
+        );
+        config.cpus = args.cpus;
+        config.memory_mb = args.memory;
+        config.disk_image = Some(descriptor.disk_path.clone());
+        if let Some(cmdline) = args.cmdline {
+            config.cmdline = cmdline;
+        }
+        if let Some(rootfs_dir) = args.rootfs_dir {
+            config = config.with_rootfs_dir(rootfs_dir);
+        }
+        config.shared_dirs = parse_linux_vm_mount_specs(&args.mounts)?;
+        config
+            .validate()
+            .context("invalid Linux VM host boot configuration")?;
+
+        let vm = vz_linux::LinuxVm::create(config)
+            .await
+            .context("failed to create Linux VM from descriptor")?;
+        let timeout = Duration::from_secs(args.agent_timeout_secs);
+        let boot_elapsed = vm
+            .start_and_wait_for_agent_with_progress(timeout, |attempt, last_error| {
+                if attempt == 1 || attempt % 10 == 0 {
+                    eprintln!("waiting for guest agent (attempt {attempt}): {last_error}");
+                }
+            })
+            .await
+            .context("Linux VM boot failed before guest agent became ready")?;
+
+        println!(
+            "Linux VM booted from descriptor {}",
+            descriptor_path.display()
+        );
+        println!(
+            "Guest agent ready in {:.3}s; press Ctrl+C to stop VM",
+            boot_elapsed.as_secs_f64()
+        );
+
+        if args.stop_after_ready {
+            vm.stop()
+                .await
+                .context("failed to stop Linux VM in --stop-after-ready mode")?;
+            println!("Stopped Linux VM (stop-after-ready).");
+            return Ok(());
+        }
+
+        tokio::signal::ctrl_c()
+            .await
+            .context("failed waiting for Ctrl+C signal")?;
+        vm.stop()
+            .await
+            .context("failed to stop Linux VM after Ctrl+C")?;
+        println!("Stopped Linux VM.");
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1255,5 +1395,33 @@ mod tests {
         )
         .expect_err("mismatch should fail");
         assert!(error.to_string().contains("exists with size"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_linux_vm_mount_spec_accepts_rw_and_ro_modes() {
+        let (tag_rw, source_rw, ro_rw) =
+            parse_linux_vm_mount_spec("repo:/tmp/workspace:rw").expect("parse rw");
+        assert_eq!(tag_rw, "repo");
+        assert_eq!(source_rw, PathBuf::from("/tmp/workspace"));
+        assert!(!ro_rw);
+
+        let (tag_ro, source_ro, ro_ro) =
+            parse_linux_vm_mount_spec("cache:/tmp/cache:ro").expect("parse ro");
+        assert_eq!(tag_ro, "cache");
+        assert_eq!(source_ro, PathBuf::from("/tmp/cache"));
+        assert!(ro_ro);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_linux_vm_mount_spec_rejects_invalid_specs() {
+        let missing_source =
+            parse_linux_vm_mount_spec("repo").expect_err("missing source should fail");
+        assert!(missing_source.to_string().contains("TAG:HOST_PATH"));
+
+        let bad_mode =
+            parse_linux_vm_mount_spec("repo:/tmp:xxx").expect_err("bad mode should fail");
+        assert!(bad_mode.to_string().contains("unsupported mount mode"));
     }
 }
