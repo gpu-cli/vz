@@ -152,7 +152,7 @@ for test_name in "${TESTS[@]}"; do
     status=${PIPESTATUS[0]}
     set -e
 
-    if [[ $status -eq 0 ]] && grep -q "^running 0 tests$" "$log_file"; then
+    if [[ $status -eq 0 ]] && ! grep -Eq "test .*$test_name .*\\bok\\b" "$log_file"; then
         status=86
         echo "error: test filter '$test_name' executed zero tests" >&2
     fi

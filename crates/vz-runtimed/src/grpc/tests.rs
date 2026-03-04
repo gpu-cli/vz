@@ -5238,24 +5238,19 @@ async fn spaces_btrfs_checkpoint_restore_and_fork_use_real_subvolumes() {
 
     let workspace_root_base = std::env::var("VZ_TEST_BTRFS_WORKSPACE")
         .expect("VZ_TEST_BTRFS_WORKSPACE must point at a btrfs path");
-    let workspace_root = PathBuf::from(workspace_root_base)
-        .join(format!("vz-space-{}", current_unix_secs()))
-        .join("workspace");
-    let parent = workspace_root
-        .parent()
-        .expect("workspace root parent should exist");
-    std::fs::create_dir_all(parent).expect("create test workspace parent");
+    let test_root = PathBuf::from(workspace_root_base).join(format!("vz-space-{}", current_unix_secs()));
+    let workspace_root = test_root.join("workspace");
+    std::fs::create_dir_all(&test_root).expect("create test root");
     run_btrfs(&[
         "subvolume",
         "create",
         workspace_root.to_string_lossy().as_ref(),
     ]);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
     let config = RuntimedConfig {
-        state_store_path: tmp.path().join("state").join("stack-state.db"),
-        runtime_data_dir: tmp.path().join("runtime"),
-        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+        state_store_path: test_root.join("state").join("stack-state.db"),
+        runtime_data_dir: test_root.join("runtime"),
+        socket_path: test_root.join("runtime").join("runtimed.sock"),
     };
 
     let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
@@ -5369,6 +5364,9 @@ async fn spaces_btrfs_checkpoint_restore_and_fork_use_real_subvolumes() {
             ])
             .output();
     }
+    let _ = std::fs::remove_dir_all(test_root.join("runtime"));
+    let _ = std::fs::remove_dir_all(test_root.join("state"));
+    let _ = std::fs::remove_dir_all(test_root);
 }
 
 #[tokio::test]
@@ -5709,24 +5707,20 @@ async fn checkpoint_export_import_round_trip_preserves_workspace_snapshot() {
 
     let workspace_root_base = std::env::var("VZ_TEST_BTRFS_WORKSPACE")
         .expect("VZ_TEST_BTRFS_WORKSPACE must point at a btrfs path");
-    let workspace_root = PathBuf::from(workspace_root_base)
-        .join(format!("vz-portability-{}", current_unix_secs()))
-        .join("workspace");
-    let parent = workspace_root
-        .parent()
-        .expect("workspace root parent should exist");
-    std::fs::create_dir_all(parent).expect("create test workspace parent");
+    let test_root =
+        PathBuf::from(workspace_root_base).join(format!("vz-portability-{}", current_unix_secs()));
+    let workspace_root = test_root.join("workspace");
+    std::fs::create_dir_all(&test_root).expect("create test root");
     run_btrfs(&[
         "subvolume",
         "create",
         workspace_root.to_string_lossy().as_ref(),
     ]);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
     let config = RuntimedConfig {
-        state_store_path: tmp.path().join("state").join("stack-state.db"),
-        runtime_data_dir: tmp.path().join("runtime"),
-        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+        state_store_path: test_root.join("state").join("stack-state.db"),
+        runtime_data_dir: test_root.join("runtime"),
+        socket_path: test_root.join("runtime").join("runtimed.sock"),
     };
     let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
     let shutdown = Arc::new(tokio::sync::Notify::new());
@@ -5785,7 +5779,7 @@ async fn checkpoint_export_import_round_trip_preserves_workspace_snapshot() {
         .checkpoint
         .expect("checkpoint payload");
 
-    let stream_path = tmp.path().join("portable").join("checkpoint.send");
+    let stream_path = test_root.join("portable").join("checkpoint.send");
     let export_completion = read_export_checkpoint_completion_response(
         checkpoint_client
             .export_checkpoint(Request::new(runtime_v2::ExportCheckpointRequest {
@@ -5871,6 +5865,10 @@ async fn checkpoint_export_import_round_trip_preserves_workspace_snapshot() {
             ])
             .output();
     }
+    let _ = std::fs::remove_dir_all(test_root.join("portable"));
+    let _ = std::fs::remove_dir_all(test_root.join("runtime"));
+    let _ = std::fs::remove_dir_all(test_root.join("state"));
+    let _ = std::fs::remove_dir_all(test_root);
 }
 
 #[cfg(target_os = "linux")]
