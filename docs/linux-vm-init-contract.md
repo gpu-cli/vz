@@ -71,6 +71,8 @@ vz vm linux run --name dev-linux --cpus 4 --memory 8192
   - `vz create` for sandbox creation
   - `vz vm linux list|inspect|attach|exec|stop|rm` for Linux-daemon-scoped operations
 - Save/restore parity mapping is documented in `docs/linux-vm-save-restore-contract.md`.
+- Init daemon roadmap is documented in `docs/linux-vm-init-daemon-roadmap.md`.
+- Base/validate/patch parity matrix is documented in `docs/linux-vm-base-validate-patch-parity.md`.
 
 ## Backward Compatibility
 
