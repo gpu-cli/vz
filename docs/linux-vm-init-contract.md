@@ -40,12 +40,16 @@ Current CLI contract:
 - `--mount <TAG:HOST_PATH[:ro|rw]>` additional VirtioFS mounts (repeatable)
 - `--agent-timeout-secs <n>` guest-agent readiness timeout (default `30`)
 - `--stop-after-ready` boot smoke mode; stop VM once guest agent is ready
+- `--guest-command <shell>` execute `/bin/sh -lc <shell>` after guest-agent readiness
+- `--guest-command-timeout-secs <n>` command timeout (default `900`)
+- `--guest-command-user <user>` optional user for command execution
 
 Behavior:
 - Loads descriptor and validates kernel/initramfs compatibility.
 - Validates persistent disk exists and matches descriptor size.
 - Boots Linux guest via host Linux boot path.
 - Waits for guest-agent readiness, then keeps VM running until Ctrl+C (or exits immediately in `--stop-after-ready` mode).
+- When `--guest-command` is set, command output is streamed and exit code is propagated; VM is stopped after command completion.
 
 ## Canonical Workflow
 

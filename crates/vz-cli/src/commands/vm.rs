@@ -202,6 +202,18 @@ pub struct LinuxVmRunArgs {
     /// Guest agent readiness timeout in seconds.
     #[arg(long, default_value_t = 30)]
     pub agent_timeout_secs: u64,
+    /// Optional shell command executed inside the guest after agent readiness.
+    ///
+    /// When set, `vz vm linux run` streams command output, propagates exit code,
+    /// and stops the VM when the command completes.
+    #[arg(long)]
+    pub guest_command: Option<String>,
+    /// Timeout in seconds for `--guest-command` execution.
+    #[arg(long, default_value_t = 900)]
+    pub guest_command_timeout_secs: u64,
+    /// Optional guest user for `--guest-command`.
+    #[arg(long)]
+    pub guest_command_user: Option<String>,
 }
 
 /// Arguments for `vz vm linux list`.
@@ -815,6 +827,44 @@ async fn run_linux_host_boot(args: LinuxVmRunArgs) -> anyhow::Result<()> {
             "Guest agent ready in {:.3}s; press Ctrl+C to stop VM",
             boot_elapsed.as_secs_f64()
         );
+
+        if let Some(guest_command) = args.guest_command {
+            println!("Executing guest command via /bin/sh -lc ...");
+            let exec_timeout = Duration::from_secs(args.guest_command_timeout_secs);
+            let exec_options = vz_linux::ExecOptions {
+                user: args.guest_command_user,
+                ..Default::default()
+            };
+            let exec_output = vm
+                .exec_capture_with_options_streaming(
+                    "/bin/sh".to_string(),
+                    vec!["-lc".to_string(), guest_command],
+                    exec_timeout,
+                    exec_options,
+                    |event| match event {
+                        vz::protocol::ExecEvent::Stdout(bytes) => {
+                            let _ = std::io::stdout().write_all(bytes);
+                            let _ = std::io::stdout().flush();
+                        }
+                        vz::protocol::ExecEvent::Stderr(bytes) => {
+                            let _ = std::io::stderr().write_all(bytes);
+                            let _ = std::io::stderr().flush();
+                        }
+                        vz::protocol::ExecEvent::Exit(_) => {}
+                    },
+                )
+                .await
+                .context("guest command execution failed")?;
+
+            vm.stop()
+                .await
+                .context("failed to stop Linux VM after guest command")?;
+            println!("Stopped Linux VM.");
+            if exec_output.exit_code != 0 {
+                std::process::exit(exec_output.exit_code);
+            }
+            return Ok(());
+        }
 
         if args.stop_after_ready {
             vm.stop()

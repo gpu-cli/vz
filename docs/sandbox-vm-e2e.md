@@ -275,6 +275,25 @@ Gate checklist:
   - `vm-linux-exec-success.log`
   - `vm-linux-exec-fail.log`
 
+## Host-Boot Linux Bootstrap Runner
+
+For direct host-boot Linux guest command execution (no pre-existing VM image), use:
+
+```bash
+VZ_BIN=/tmp/vz-target-e2e/debug/vz \
+./scripts/run-vz-linux-hostboot-command.sh \
+  --name bootstrap-smoke \
+  --output-dir .artifacts/vm-linux-hostboot-smoke \
+  --command 'echo guest_ok; /bin/busybox uname -s'
+```
+
+This bootstrap path:
+
+- initializes descriptor + persistent disk (`vz vm linux init`)
+- boots Linux guest (`vz vm linux run`)
+- executes command in guest with streamed output and propagated exit code
+- stops VM automatically after command completion
+
 ## Signing Behavior
 
 The harness signs:
