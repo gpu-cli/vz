@@ -180,6 +180,54 @@ echo "==> creating sandbox via vz CLI (api-http transport)"
         --json
 ) > "$RUN_DIR/vz-create.json"
 
+echo "==> validating vm linux lifecycle via daemon-grpc"
+VZ_CONTROL_PLANE_TRANSPORT=daemon-grpc \
+VZ_RUNTIME_DAEMON_SOCKET="$SOCKET_PATH" \
+VZ_RUNTIME_DATA_DIR="$RUNTIME_DIR" \
+VZ_RUNTIME_STATE_DB="$STATE_DB" \
+VZ_RUNTIME_DAEMON_AUTOSTART=0 \
+HOME="$HOME_DIR" \
+"$BIN_VZ" vm linux list --state-db "$STATE_DB" --json > "$RUN_DIR/vm-linux-list.json"
+
+grep -q "\"sandbox_id\": \"$SANDBOX_ID\"" "$RUN_DIR/vm-linux-list.json" || err "vm linux list missing created sandbox"
+
+VZ_CONTROL_PLANE_TRANSPORT=daemon-grpc \
+VZ_RUNTIME_DAEMON_SOCKET="$SOCKET_PATH" \
+VZ_RUNTIME_DATA_DIR="$RUNTIME_DIR" \
+VZ_RUNTIME_STATE_DB="$STATE_DB" \
+VZ_RUNTIME_DAEMON_AUTOSTART=0 \
+HOME="$HOME_DIR" \
+"$BIN_VZ" vm linux inspect "$SANDBOX_ID" --state-db "$STATE_DB" > "$RUN_DIR/vm-linux-inspect.json"
+
+grep -q "\"sandbox_id\": \"$SANDBOX_ID\"" "$RUN_DIR/vm-linux-inspect.json" || err "vm linux inspect missing expected sandbox_id"
+
+VZ_CONTROL_PLANE_TRANSPORT=daemon-grpc \
+VZ_RUNTIME_DAEMON_SOCKET="$SOCKET_PATH" \
+VZ_RUNTIME_DATA_DIR="$RUNTIME_DIR" \
+VZ_RUNTIME_STATE_DB="$STATE_DB" \
+VZ_RUNTIME_DAEMON_AUTOSTART=0 \
+HOME="$HOME_DIR" \
+"$BIN_VZ" vm linux exec "$SANDBOX_ID" -- /bin/sh -lc 'printf "stream-one\nstream-two\n"; exit 0' > "$RUN_DIR/vm-linux-exec-success.log"
+
+grep -q "stream-one" "$RUN_DIR/vm-linux-exec-success.log" || err "vm linux exec success output missing stream-one"
+grep -q "stream-two" "$RUN_DIR/vm-linux-exec-success.log" || err "vm linux exec success output missing stream-two"
+
+set +e
+VZ_CONTROL_PLANE_TRANSPORT=daemon-grpc \
+VZ_RUNTIME_DAEMON_SOCKET="$SOCKET_PATH" \
+VZ_RUNTIME_DATA_DIR="$RUNTIME_DIR" \
+VZ_RUNTIME_STATE_DB="$STATE_DB" \
+VZ_RUNTIME_DAEMON_AUTOSTART=0 \
+HOME="$HOME_DIR" \
+"$BIN_VZ" vm linux exec "$SANDBOX_ID" -- /bin/sh -lc 'echo "intentional-failure"; exit 7' \
+    > "$RUN_DIR/vm-linux-exec-fail.log" 2>&1
+exec_rc=$?
+set -e
+if [[ $exec_rc -ne 7 ]]; then
+    err "vm linux exec did not propagate exit code 7 (got $exec_rc)"
+fi
+grep -q "intentional-failure" "$RUN_DIR/vm-linux-exec-fail.log" || err "vm linux exec failure output missing marker"
+
 echo "==> validating via vz CLI (api-http transport)"
 VZ_CONTROL_PLANE_TRANSPORT=api-http \
 VZ_RUNTIME_API_BASE_URL="$API_BASE_URL" \
@@ -198,17 +246,27 @@ HOME="$HOME_DIR" \
 grep -q "\"sandbox_id\": \"$SANDBOX_ID\"" "$RUN_DIR/vz-inspect.json" || err "vz inspect output missing expected sandbox_id"
 
 echo "==> terminating via vz CLI"
-VZ_CONTROL_PLANE_TRANSPORT=api-http \
-VZ_RUNTIME_API_BASE_URL="$API_BASE_URL" \
+VZ_CONTROL_PLANE_TRANSPORT=daemon-grpc \
+VZ_RUNTIME_DAEMON_SOCKET="$SOCKET_PATH" \
+VZ_RUNTIME_DATA_DIR="$RUNTIME_DIR" \
+VZ_RUNTIME_STATE_DB="$STATE_DB" \
 VZ_RUNTIME_DAEMON_AUTOSTART=0 \
 HOME="$HOME_DIR" \
-"$BIN_VZ" rm "$SANDBOX_ID" --state-db "$STATE_DB" > "$RUN_DIR/vz-rm.log"
+"$BIN_VZ" vm linux stop "$SANDBOX_ID" --state-db "$STATE_DB" > "$RUN_DIR/vm-linux-stop.log"
+
+VZ_CONTROL_PLANE_TRANSPORT=daemon-grpc \
+VZ_RUNTIME_DAEMON_SOCKET="$SOCKET_PATH" \
+VZ_RUNTIME_DATA_DIR="$RUNTIME_DIR" \
+VZ_RUNTIME_STATE_DB="$STATE_DB" \
+VZ_RUNTIME_DAEMON_AUTOSTART=0 \
+HOME="$HOME_DIR" \
+"$BIN_VZ" vm linux rm "$SANDBOX_ID" --state-db "$STATE_DB" > "$RUN_DIR/vm-linux-rm.log"
 
 curl -fsS "$API_BASE_URL/v1/sandboxes/$SANDBOX_ID" > "$RUN_DIR/api-sandbox-final.json"
 grep -q '"state": "terminated"' "$RUN_DIR/api-sandbox-final.json" || err "final sandbox state is not terminated"
 
 {
-    echo "passed=vz_cli_api_daemon_linux_happy_path"
+    echo "passed=vz_cli_api_daemon_linux_happy_path,vz_vm_linux_daemon_lifecycle"
     echo "failed=none"
 } > "$RUN_DIR/summary.txt"
 
