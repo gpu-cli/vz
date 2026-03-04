@@ -1545,9 +1545,7 @@ async fn cli_daemon_grpc_linux_save_restore_commands_cover_happy_path_and_errors
     }
 
     let list = client
-        .list_checkpoints(runtime_v2::ListCheckpointsRequest {
-            metadata: None,
-        })
+        .list_checkpoints(runtime_v2::ListCheckpointsRequest { metadata: None })
         .await
         .context("list checkpoints")?;
     let checkpoint_id = list

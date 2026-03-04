@@ -139,6 +139,12 @@ pub enum LinuxVmCommand {
     Save(LinuxVmSaveArgs),
     /// Restore a Linux space from a checkpoint.
     Restore(LinuxVmRestoreArgs),
+    /// Linux base image management (planned).
+    Base(LinuxVmUnsupportedSurfaceArgs),
+    /// Linux validation workflows (planned).
+    Validate(LinuxVmUnsupportedSurfaceArgs),
+    /// Linux patch workflows (planned).
+    Patch(LinuxVmUnsupportedSurfaceArgs),
     /// Stop a Linux space.
     Stop(LinuxVmStopArgs),
     /// Remove (terminate) a Linux space.
@@ -301,6 +307,14 @@ pub struct LinuxVmRestoreArgs {
     pub state_db: Option<PathBuf>,
 }
 
+/// Placeholder args for planned linux vm surfaces.
+#[derive(Args, Debug, Default)]
+pub struct LinuxVmUnsupportedSurfaceArgs {
+    /// Additional passthrough args (currently ignored).
+    #[arg(last = true)]
+    pub _args: Vec<String>,
+}
+
 /// Arguments for `vz vm linux stop`.
 #[derive(Args, Debug)]
 pub struct LinuxVmStopArgs {
@@ -389,6 +403,9 @@ async fn run_linux(args: LinuxVmArgs) -> anyhow::Result<()> {
         LinuxVmCommand::Exec(exec_args) => run_linux_exec(exec_args).await,
         LinuxVmCommand::Save(save_args) => run_linux_save(save_args).await,
         LinuxVmCommand::Restore(restore_args) => run_linux_restore(restore_args).await,
+        LinuxVmCommand::Base(_) => run_linux_unsupported_surface("base"),
+        LinuxVmCommand::Validate(_) => run_linux_unsupported_surface("validate"),
+        LinuxVmCommand::Patch(_) => run_linux_unsupported_surface("patch"),
         LinuxVmCommand::Stop(stop_args) => run_linux_stop(stop_args).await,
         LinuxVmCommand::Rm(rm_args) => run_linux_rm(rm_args).await,
         LinuxVmCommand::Test(test_args) => run_linux_test(test_args).await,
@@ -1247,6 +1264,24 @@ async fn run_linux_restore(args: LinuxVmRestoreArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn linux_unsupported_surface_guidance(surface: &str) -> anyhow::Error {
+    let replacement = match surface {
+        "base" => "use `vz vm linux init --name <name>` for image/descriptor preparation",
+        "validate" => {
+            "use `vz vm linux test e2e ...` for runtime validation (see docs/observability-staging-runbook.md)"
+        }
+        "patch" => "linux patch workflow is not implemented yet; track planned work via beads",
+        _ => "surface is not implemented for vm linux yet",
+    };
+    anyhow!(
+        "unsupported operation: `vz vm linux {surface}`; {replacement}. See docs/linux-vm-base-validate-patch-parity.md"
+    )
+}
+
+fn run_linux_unsupported_surface(surface: &str) -> anyhow::Result<()> {
+    Err(linux_unsupported_surface_guidance(surface))
+}
+
 async fn run_linux_stop(args: LinuxVmStopArgs) -> anyhow::Result<()> {
     let state_db = args.state_db.unwrap_or_else(default_state_db_path);
     ensure_linux_sandbox(&state_db, &args.sandbox_id).await?;
@@ -1599,6 +1634,15 @@ mod tests {
     fn normalize_linux_checkpoint_class_rejects_unknown_values() {
         let error = normalize_linux_checkpoint_class("snapshot").expect_err("unknown class");
         assert!(error.to_string().contains("unknown checkpoint class"));
+    }
+
+    #[test]
+    fn linux_unsupported_surface_guidance_mentions_replacement_and_docs() {
+        for surface in ["base", "validate", "patch"] {
+            let message = linux_unsupported_surface_guidance(surface).to_string();
+            assert!(message.contains(&format!("vz vm linux {surface}")));
+            assert!(message.contains("docs/linux-vm-base-validate-patch-parity.md"));
+        }
     }
 
     #[test]
