@@ -50,8 +50,7 @@ pub fn export_subvolume_send_stream(
         fs::create_dir_all(parent).map_err(StackError::from)?;
     }
     let stream_file = File::create(stream_path).map_err(StackError::from)?;
-    let timestamp_nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-    {
+    let timestamp_nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => duration.as_nanos(),
         Err(_) => 0,
     };
@@ -200,10 +199,8 @@ pub fn import_subvolume_receive_stream(
         ));
     }
     let received_subvolume_path = receive_parent.join(&created[0]);
-    let writable_subvolume_path = receive_parent.join(format!(
-        "{}-rw",
-        created[0].to_string_lossy()
-    ));
+    let writable_subvolume_path =
+        receive_parent.join(format!("{}-rw", created[0].to_string_lossy()));
     let snapshot_output = Command::new("btrfs")
         .args([
             "subvolume",
@@ -227,7 +224,11 @@ pub fn import_subvolume_receive_stream(
     }
 
     let delete_received_output = Command::new("btrfs")
-        .args(["subvolume", "delete", &received_subvolume_path.to_string_lossy()])
+        .args([
+            "subvolume",
+            "delete",
+            &received_subvolume_path.to_string_lossy(),
+        ])
         .stderr(Stdio::piped())
         .output()
         .map_err(StackError::from)?;

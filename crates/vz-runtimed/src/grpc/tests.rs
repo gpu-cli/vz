@@ -5238,7 +5238,8 @@ async fn spaces_btrfs_checkpoint_restore_and_fork_use_real_subvolumes() {
 
     let workspace_root_base = std::env::var("VZ_TEST_BTRFS_WORKSPACE")
         .expect("VZ_TEST_BTRFS_WORKSPACE must point at a btrfs path");
-    let test_root = PathBuf::from(workspace_root_base).join(format!("vz-space-{}", current_unix_secs()));
+    let test_root =
+        PathBuf::from(workspace_root_base).join(format!("vz-space-{}", current_unix_secs()));
     let workspace_root = test_root.join("workspace");
     std::fs::create_dir_all(&test_root).expect("create test root");
     run_btrfs(&[

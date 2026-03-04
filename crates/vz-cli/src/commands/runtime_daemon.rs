@@ -374,8 +374,7 @@ mod tests {
     fn daemon_client_config_uses_socket_override() {
         let state_db = PathBuf::from("/tmp/vz/state/stack-state.db");
         let socket_path = PathBuf::from("/tmp/custom-runtime/runtimed.sock");
-        let config =
-            daemon_client_config_with_overrides(&state_db, Some(socket_path), None, false);
+        let config = daemon_client_config_with_overrides(&state_db, Some(socket_path), None, false);
 
         assert!(!config.auto_spawn);
         assert_eq!(config.state_store_path, Some(state_db));
@@ -393,8 +392,7 @@ mod tests {
     fn daemon_client_config_uses_runtime_data_dir_override() {
         let state_db = PathBuf::from("/tmp/vz/state/stack-state.db");
         let runtime_dir = PathBuf::from("/tmp/runtime-dir");
-        let config =
-            daemon_client_config_with_overrides(&state_db, None, Some(runtime_dir), false);
+        let config = daemon_client_config_with_overrides(&state_db, None, Some(runtime_dir), false);
 
         assert!(!config.auto_spawn);
         assert_eq!(config.state_store_path, Some(state_db));
@@ -402,7 +400,10 @@ mod tests {
             config.socket_path,
             PathBuf::from("/tmp/runtime-dir/runtimed.sock")
         );
-        assert_eq!(config.runtime_data_dir, Some(PathBuf::from("/tmp/runtime-dir")));
+        assert_eq!(
+            config.runtime_data_dir,
+            Some(PathBuf::from("/tmp/runtime-dir"))
+        );
     }
 
     #[test]

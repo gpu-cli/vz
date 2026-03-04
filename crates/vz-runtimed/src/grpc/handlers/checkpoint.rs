@@ -314,12 +314,16 @@ fn detect_filesystem_type(path: &Path) -> std::io::Result<String> {
         .arg(path)
         .output()?;
     if !stat_output.status.success() {
-        let stderr = String::from_utf8_lossy(&stat_output.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&stat_output.stderr)
+            .trim()
+            .to_string();
         return Err(std::io::Error::other(format!(
             "stat filesystem probe failed: {stderr}"
         )));
     }
-    let fs_type = String::from_utf8_lossy(&stat_output.stdout).trim().to_string();
+    let fs_type = String::from_utf8_lossy(&stat_output.stdout)
+        .trim()
+        .to_string();
     if fs_type.is_empty() {
         return Err(std::io::Error::other(
             "filesystem probe returned empty type",
