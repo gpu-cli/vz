@@ -207,6 +207,25 @@ Run from inside the Linux VM:
 ./scripts/run-vz-linux-vm-e2e.sh --workspace /mnt/vz-btrfs --profile release
 ```
 
+Or run from macOS host into a local `vz` VM (no SSH) using VM control socket:
+
+```bash
+./scripts/run-vz-linux-vm-e2e-local.sh \
+  --vm-name vz-linux-test \
+  --guest-repo /workspace/vz \
+  --auto-start \
+  --vm-image ~/.vz/images/linux-test.img \
+  --mount repo:/Users/$USER/workspace/jl/vz \
+  --workspace /mnt/vz-btrfs \
+  --profile release
+```
+
+Notes:
+
+- `--mount` is forwarded to `vz debug vm run` during auto-start.
+- ensure `--guest-repo` matches the in-guest mount path for your VM image.
+- wrapper can provision btrfs workspace in-guest automatically before running harness.
+
 What this flow validates:
 
 - `vz-runtimed` starts and owns runtime state.
