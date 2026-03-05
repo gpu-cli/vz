@@ -1,0 +1,10 @@
+{
+  "cases": [
+    {
+      "id": "binder-root-context",
+      "dockerfile": "crates/vz-cli/tests/fixtures/build-sweep/docker-stacks/binder/Dockerfile",
+      "context": "crates/vz-cli/tests/fixtures/build-sweep",
+      "tag": "vz-sweep:binder-root-context"
+    }
+  ]
+}

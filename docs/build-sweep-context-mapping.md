@@ -49,3 +49,26 @@ Dry-run (path resolution only):
 ```bash
 vz validate sweep-build --manifest ./compat-build-cases.json --dry-run --json
 ```
+
+## Checked-in default
+
+Repository default manifest:
+
+- `config/build-sweep-manifest.json`
+
+It currently includes a binder-style case that validates repo-root context
+mapping against local fixtures:
+
+- `crates/vz-cli/tests/fixtures/build-sweep/docker-stacks/binder/Dockerfile`
+- `crates/vz-cli/tests/fixtures/build-sweep/binder/README.ipynb`
+
+## CI dry-run check
+
+Use:
+
+```bash
+./scripts/check-build-sweep-mapping.sh
+```
+
+This runs `vm mac validate sweep-build --dry-run` against the checked-in
+manifest and fails if any case path resolution regresses.
