@@ -8,6 +8,7 @@ proto_file="crates/vz-runtime-proto/proto/runtime_v2.proto"
 
 coverage_files=(
   "crates/vz-runtimed-client/src/lib.rs"
+  "crates/vz-runtimed-client/src/linux_vm.rs"
   "crates/vz-runtimed-client/src/tests.rs"
   "crates/vz-runtimed/src/grpc/tests.rs"
   "crates/vz-api/src/tests.rs"
