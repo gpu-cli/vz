@@ -15,7 +15,7 @@ mod gui;
 #[cfg(target_os = "macos")]
 mod ipsw;
 #[cfg(target_os = "macos")]
-mod provision;
+use vz_macos_provision as provision;
 mod registry;
 
 use clap::Parser;

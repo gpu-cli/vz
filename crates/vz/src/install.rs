@@ -255,7 +255,9 @@ pub async fn fetch_latest_ipsw_url() -> Result<String, VzError> {
             } else {
                 let image_ref = unsafe { &*image };
                 let url = unsafe { image_ref.URL() };
-                match url.absoluteString() {
+                // SAFETY: safe in objc2-foundation 0.3.2+, unsafe in 0.3.1.
+                #[allow(unused_unsafe)]
+                match unsafe { url.absoluteString() } {
                     Some(s) => Ok(s.to_string()),
                     None => Err(VzError::InstallFailed(
                         "restore image has no download URL".into(),
@@ -571,7 +573,9 @@ async fn run_installation(
             // Read progress from the installer's NSProgress.
             // NSProgress properties are KVO-observable and thread-safe for reading.
             let progress = unsafe { poll_handle.installer.progress() };
-            let fraction = progress.fractionCompleted();
+            // SAFETY: safe in objc2-foundation 0.3.2+, unsafe in 0.3.1.
+            #[allow(unused_unsafe)]
+            let fraction = unsafe { progress.fractionCompleted() };
             let pct = (fraction * 100.0) as i64;
 
             if pct != last_pct {
@@ -579,7 +583,10 @@ async fn run_installation(
                 last_pct = pct;
             }
 
-            if progress.isFinished() || progress.isCancelled() {
+            // SAFETY: safe in objc2-foundation 0.3.2+, unsafe in 0.3.1.
+            #[allow(unused_unsafe)]
+            let finished = unsafe { progress.isFinished() } || unsafe { progress.isCancelled() };
+            if finished {
                 break;
             }
         }

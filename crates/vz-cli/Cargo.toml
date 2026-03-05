@@ -38,6 +38,7 @@ tonic = { workspace = true }
 shell-words = { workspace = true }
 sha2 = { workspace = true }
 ring = "0.17.14"
+vz-macos-provision = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 vz-sandbox = { workspace = true }

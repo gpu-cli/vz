@@ -1,0 +1,22 @@
+[package]
+name = "vz-macos-provision"
+version = "0.1.0"
+description = "Automated first-boot provisioning for macOS VM golden images"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+serde_json = { workspace = true }
+vz-agent-loader-client = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+base64 = { workspace = true }
+
+[lints]
+workspace = true

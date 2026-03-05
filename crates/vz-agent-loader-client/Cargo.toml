@@ -1,0 +1,26 @@
+[package]
+name = "vz-agent-loader-client"
+version = "0.1.0"
+description = "Client library for vz-agent-loader — protocol types and host-side vsock client"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+# Host-side vsock connection uses the vz crate's vsock primitives.
+# For standalone use without vz, consumers can implement the VsockConnect trait.
+vz = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enable the host-side client that connects via vz crate's vsock_connect.
+host-vz = ["dep:vz"]
+
+[lints]
+workspace = true

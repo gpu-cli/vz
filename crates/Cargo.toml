@@ -19,6 +19,9 @@ members = [
     "vz-stack",
     "vz-validation",
     "vz-api",
+    "vz-macos-provision",
+    "vz-agent-loader",
+    "vz-agent-loader-client",
 ]
 
 [workspace.package]
@@ -181,6 +184,8 @@ vz-runtimed-client = { path = "vz-runtimed-client" }
 vz-validation = { path = "vz-validation" }
 vz-api = { path = "vz-api" }
 vz-runtimed = { path = "vz-runtimed" }
+vz-macos-provision = { path = "vz-macos-provision" }
+vz-agent-loader-client = { path = "vz-agent-loader-client" }
 
 # gRPC / Protobuf
 tonic = { version = "0.12", features = ["transport"] }

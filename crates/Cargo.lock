@@ -3709,6 +3709,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "vz-agent-loader"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vz-agent-loader-client",
+]
+
+[[package]]
+name = "vz-agent-loader-client"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "vz",
+]
+
+[[package]]
 name = "vz-agent-proto"
 version = "0.1.0"
 dependencies = [
@@ -3785,6 +3808,7 @@ dependencies = [
  "vz-image",
  "vz-linux",
  "vz-linux-native",
+ "vz-macos-provision",
  "vz-oci-macos",
  "vz-runtime-contract",
  "vz-runtime-proto",
@@ -3869,6 +3893,19 @@ dependencies = [
  "vz-image",
  "vz-oci",
  "vz-runtime-contract",
+]
+
+[[package]]
+name = "vz-macos-provision"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "vz-agent-loader-client",
 ]
 
 [[package]]

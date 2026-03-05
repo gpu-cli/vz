@@ -1,4 +1,4 @@
-//! Automated first-boot provisioning for golden images.
+//! Automated first-boot provisioning for macOS VM golden images.
 //!
 //! After macOS installation (`VZMacOSInstaller`), this module handles:
 //! - Skipping Setup Assistant (`.AppleSetupDone`)
@@ -10,6 +10,9 @@
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
+
+/// Default binary name for the guest agent.
+const DEFAULT_AGENT_BINARY_NAME: &str = "vz-guest-agent";
 
 // ---------------------------------------------------------------------------
 // Configuration types
@@ -84,10 +87,14 @@ impl Default for ProvisionConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AgentInstallMode {
     /// Install as a system LaunchDaemon (root-owned, starts before login).
-    #[default]
     SystemLaunchDaemon,
     /// Install as a per-user LaunchAgent (rootless-friendly, starts at login).
     UserLaunchAgent,
+    /// Copy binary to /usr/local/bin/ and register in the vz-agent-loader
+    /// startup manifest. Requires the loader to be pre-installed via the
+    /// bootstrap patch/delta. No root ownership needed. No launchd plists.
+    #[default]
+    LoaderManifest,
 }
 
 // ---------------------------------------------------------------------------
@@ -104,11 +111,15 @@ pub enum AgentInstallMode {
 ///
 /// `mount_point` is where the guest disk image is mounted on the host
 /// (e.g., `/Volumes/GuestDisk`).
+///
+/// `binary_name` controls the destination filename for the installed agent
+/// binary. When `None`, defaults to `"vz-guest-agent"`.
 pub fn apply_auto_config(
     mount_point: &Path,
     user_config: &UserConfig,
     guest_agent_binary: Option<&Path>,
     install_mode: AgentInstallMode,
+    binary_name: Option<&str>,
 ) -> anyhow::Result<()> {
     info!(
         mount_point = %mount_point.display(),
@@ -157,10 +168,43 @@ pub fn apply_auto_config(
                 );
             }
         }
+        AgentInstallMode::LoaderManifest => {
+            // LoaderManifest mode: the vz-agent-loader is already baked into the
+            // image via the bootstrap patch (root-owned LaunchDaemon). We just need
+            // user setup + copy the agent binary + write a startup manifest entry.
+            // No root ownership needed — the loader handles starting binaries.
+            if let Err(error) = skip_setup_assistant(mount_point) {
+                warn!(
+                    error = %error,
+                    "failed to write .AppleSetupDone; continuing"
+                );
+            }
+
+            if let Err(error) = create_user_account(mount_point, user_config) {
+                if user_home_exists {
+                    warn!(
+                        error = %error,
+                        user = %user_config.username,
+                        "unable to modify dslocal; existing user home found, continuing"
+                    );
+                } else {
+                    return Err(error);
+                }
+            }
+
+            if let Err(error) =
+                enable_auto_login(mount_point, &user_config.username, &user_config.password)
+            {
+                warn!(
+                    error = %error,
+                    "failed to set auto-login; continuing"
+                );
+            }
+        }
     }
 
     if let Some(agent_path) = guest_agent_binary {
-        install_guest_agent(mount_point, agent_path, user_config, install_mode)?;
+        install_guest_agent(mount_point, agent_path, user_config, install_mode, binary_name)?;
     }
 
     info!("auto-configuration complete");
@@ -423,33 +467,48 @@ fn encode_kcpassword(password: &str) -> Vec<u8> {
 
 /// Install the guest agent binary and launchd plist into the disk image.
 ///
-/// Supports both system LaunchDaemon and per-user LaunchAgent modes.
+/// `binary_name` controls the destination filename. When `None`, defaults
+/// to `"vz-guest-agent"`.
 fn install_guest_agent(
     mount_point: &Path,
     agent_binary: &Path,
     user_config: &UserConfig,
     install_mode: AgentInstallMode,
+    binary_name: Option<&str>,
 ) -> anyhow::Result<()> {
+    let name = binary_name.unwrap_or(DEFAULT_AGENT_BINARY_NAME);
     match install_mode {
         AgentInstallMode::SystemLaunchDaemon => {
-            install_guest_agent_system(mount_point, agent_binary)
+            install_guest_agent_system(mount_point, agent_binary, name)
         }
         AgentInstallMode::UserLaunchAgent => {
-            install_guest_agent_user(mount_point, agent_binary, user_config)
+            install_guest_agent_user(mount_point, agent_binary, user_config, name)
+        }
+        AgentInstallMode::LoaderManifest => {
+            install_guest_agent_loader_manifest(mount_point, agent_binary, name)
         }
     }
 }
 
 /// Install the guest agent as a system LaunchDaemon.
-fn install_guest_agent_system(mount_point: &Path, agent_binary: &Path) -> anyhow::Result<()> {
+fn install_guest_agent_system(
+    mount_point: &Path,
+    agent_binary: &Path,
+    binary_name: &str,
+) -> anyhow::Result<()> {
     if !agent_binary.exists() {
         anyhow::bail!("guest agent binary not found: {}", agent_binary.display());
     }
 
-    // Install binary
     let bin_dir = mount_point.join("usr/local/bin");
+    let launch_daemons = mount_point.join("Library/LaunchDaemons");
+    let dest_binary = bin_dir.join(binary_name);
+    let label = launchd_label(binary_name);
+    let binary_path_in_guest = format!("/usr/local/bin/{binary_name}");
+    let plist_path = launch_daemons.join(format!("{label}.plist"));
+    let plist = guest_agent_launchdaemon_plist(&label, &binary_path_in_guest);
+
     std::fs::create_dir_all(&bin_dir)?;
-    let dest_binary = bin_dir.join("vz-guest-agent");
     std::fs::copy(agent_binary, &dest_binary)?;
 
     #[cfg(unix)]
@@ -458,11 +517,8 @@ fn install_guest_agent_system(mount_point: &Path, agent_binary: &Path) -> anyhow
         std::fs::set_permissions(&dest_binary, std::fs::Permissions::from_mode(0o755))?;
     }
 
-    // Install launchd plist
-    let launch_daemons = mount_point.join("Library/LaunchDaemons");
     std::fs::create_dir_all(&launch_daemons)?;
-    let plist_path = launch_daemons.join("com.vz.guest-agent.plist");
-    std::fs::write(&plist_path, GUEST_AGENT_LAUNCHD_PLIST)?;
+    std::fs::write(&plist_path, &plist)?;
 
     #[cfg(unix)]
     {
@@ -470,8 +526,6 @@ fn install_guest_agent_system(mount_point: &Path, agent_binary: &Path) -> anyhow
         std::fs::set_permissions(&plist_path, std::fs::Permissions::from_mode(0o644))?;
     }
 
-    // launchd requires LaunchDaemon plists and binaries to be owned by root:wheel.
-    // When running as root, explicitly chown since APFS disk images may ignore ownership.
     #[cfg(unix)]
     if is_root() {
         for path in [&dest_binary, &plist_path, &launch_daemons, &bin_dir] {
@@ -479,7 +533,7 @@ fn install_guest_agent_system(mount_point: &Path, agent_binary: &Path) -> anyhow
                 anyhow::anyhow!("chown root:wheel failed for {}: {e}", path.display())
             })?;
         }
-        debug!("set root:wheel ownership on LaunchDaemon files");
+        debug!("installed LaunchDaemon files as root (chown root:wheel)");
     }
 
     info!(
@@ -495,6 +549,7 @@ fn install_guest_agent_user(
     mount_point: &Path,
     agent_binary: &Path,
     user_config: &UserConfig,
+    binary_name: &str,
 ) -> anyhow::Result<()> {
     if !agent_binary.exists() {
         anyhow::bail!("guest agent binary not found: {}", agent_binary.display());
@@ -505,15 +560,23 @@ fn install_guest_agent_user(
         .strip_prefix('/')
         .unwrap_or(&user_config.home);
     let user_home = mount_point.join(user_home_rel);
+
+    // Derive a directory name from the binary name (strip common suffixes for brevity)
+    let app_dir_name = binary_name
+        .strip_suffix("-guest-agent")
+        .unwrap_or(binary_name);
+
     let guest_binary_path = PathBuf::from(&user_config.home)
         .join("Library")
         .join("Application Support")
-        .join("vz")
-        .join("vz-guest-agent");
+        .join(app_dir_name)
+        .join(binary_name);
 
-    let agent_dir = user_home.join("Library/Application Support/vz");
+    let agent_dir = user_home
+        .join("Library/Application Support")
+        .join(app_dir_name);
     std::fs::create_dir_all(&agent_dir)?;
-    let dest_binary = agent_dir.join("vz-guest-agent");
+    let dest_binary = agent_dir.join(binary_name);
     std::fs::copy(agent_binary, &dest_binary)?;
 
     #[cfg(unix)]
@@ -522,16 +585,80 @@ fn install_guest_agent_user(
         std::fs::set_permissions(&dest_binary, std::fs::Permissions::from_mode(0o755))?;
     }
 
+    let label = format!("com.{app_dir_name}.user-guest-agent");
     let launch_agents = user_home.join("Library/LaunchAgents");
     std::fs::create_dir_all(&launch_agents)?;
-    let plist_path = launch_agents.join("com.vz.user-guest-agent.plist");
-    let plist = guest_agent_launchagent_plist(&guest_binary_path);
+    let plist_path = launch_agents.join(format!("{label}.plist"));
+    let plist = guest_agent_launchagent_plist(&label, &guest_binary_path);
     std::fs::write(&plist_path, plist)?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&plist_path, std::fs::Permissions::from_mode(0o644))?;
+    }
+
+    // Write a login hook that bootstraps the LaunchAgent into the user's
+    // launchd domain.  Modern macOS no longer auto-discovers plists dropped
+    // into ~/Library/LaunchAgents by external tools — a one-shot login hook
+    // ensures the agent is loaded on the first (and every) login.
+    let hook_dir = mount_point.join("usr/local/bin");
+    std::fs::create_dir_all(&hook_dir)?;
+    let hook_path = hook_dir.join(format!("{app_dir_name}-login-hook.sh"));
+    let hook_script = format!(
+        "#!/bin/bash\n\
+         # Auto-generated by vz-macos-provision — bootstraps the guest agent.\n\
+         USER_UID=$(id -u \"$1\" 2>/dev/null || echo 501)\n\
+         PLIST=\"{plist_in_guest}\"\n\
+         if [ -f \"$PLIST\" ]; then\n\
+         \tlaunchctl bootout \"gui/$USER_UID/{label}\" 2>/dev/null || true\n\
+         \tlaunchctl bootstrap \"gui/$USER_UID\" \"$PLIST\"\n\
+         fi\n",
+        plist_in_guest = PathBuf::from(&user_config.home)
+            .join("Library/LaunchAgents")
+            .join(format!("{label}.plist"))
+            .display(),
+    );
+    std::fs::write(&hook_path, &hook_script)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    // Register the hook via com.apple.loginwindow LoginHook.
+    // loginwindow reads this plist at /Library/Preferences/ on the Data volume.
+    let loginwindow_prefs = mount_point.join("Library/Preferences");
+    std::fs::create_dir_all(&loginwindow_prefs)?;
+    let hook_abs = PathBuf::from("/usr/local/bin")
+        .join(format!("{app_dir_name}-login-hook.sh"));
+    let defaults_cmd = std::process::Command::new("defaults")
+        .args([
+            "write",
+            &loginwindow_prefs
+                .join("com.apple.loginwindow")
+                .to_string_lossy(),
+            "LoginHook",
+            &hook_abs.to_string_lossy(),
+        ])
+        .output();
+    match defaults_cmd {
+        Ok(output) if output.status.success() => {
+            info!(
+                hook = %hook_abs.display(),
+                "registered LoginHook for guest agent bootstrap"
+            );
+        }
+        Ok(output) => {
+            warn!(
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "defaults write LoginHook returned non-zero"
+            );
+        }
+        Err(error) => {
+            warn!(error = %error, "failed to run defaults write for LoginHook");
+        }
     }
 
     info!(
@@ -543,8 +670,106 @@ fn install_guest_agent_user(
     Ok(())
 }
 
-fn guest_agent_launchagent_plist(program_path: &Path) -> String {
+/// Install the guest agent for the vz-agent-loader startup manifest.
+///
+/// Copies the binary to `/usr/local/bin/` and writes a startup manifest entry
+/// at the loader's manifest path. The loader (pre-installed via bootstrap patch)
+/// reads this manifest on boot and starts/supervises listed binaries.
+///
+/// No root ownership required — the loader runs as root and handles everything.
+fn install_guest_agent_loader_manifest(
+    mount_point: &Path,
+    agent_binary: &Path,
+    binary_name: &str,
+) -> anyhow::Result<()> {
+    if !agent_binary.exists() {
+        anyhow::bail!("guest agent binary not found: {}", agent_binary.display());
+    }
+
+    // Copy binary to /usr/local/bin/
+    let bin_dir = mount_point.join("usr/local/bin");
+    std::fs::create_dir_all(&bin_dir)?;
+    let dest_binary = bin_dir.join(binary_name);
+    std::fs::copy(agent_binary, &dest_binary)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest_binary, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    // Write startup manifest for the loader
+    let binary_path_in_guest = format!("/usr/local/bin/{binary_name}");
+    let manifest = vz_agent_loader_client::StartupManifest {
+        services: vec![vz_agent_loader_client::ServiceEntry {
+            name: binary_name.to_string(),
+            binary: binary_path_in_guest,
+            args: vec![],
+            env: vec![],
+            keep_alive: true,
+        }],
+    };
+
+    let manifest_path_in_guest =
+        std::path::Path::new(vz_agent_loader_client::STARTUP_MANIFEST_PATH);
+    let manifest_dir_rel = manifest_path_in_guest
+        .parent()
+        .and_then(|p| p.to_str())
+        .unwrap_or("var/lib/vz-agent-loader")
+        .trim_start_matches('/');
+    let manifest_dir = mount_point.join(manifest_dir_rel);
+    std::fs::create_dir_all(&manifest_dir)?;
+
+    let manifest_path = mount_point.join(
+        manifest_path_in_guest
+            .to_str()
+            .unwrap_or("var/lib/vz-agent-loader/startup.json")
+            .trim_start_matches('/'),
+    );
+
+    // If a manifest already exists, merge our entry into it
+    let mut existing_manifest = if manifest_path.exists() {
+        let content = std::fs::read_to_string(&manifest_path)?;
+        serde_json::from_str::<vz_agent_loader_client::StartupManifest>(&content)
+            .unwrap_or_default()
+    } else {
+        vz_agent_loader_client::StartupManifest::default()
+    };
+
+    // Remove any existing entry with the same name, then add ours
+    existing_manifest
+        .services
+        .retain(|s| s.name != binary_name);
+    existing_manifest.services.extend(manifest.services);
+
+    let manifest_json = serde_json::to_string_pretty(&existing_manifest)
+        .map_err(|e| anyhow::anyhow!("failed to serialize startup manifest: {e}"))?;
+    std::fs::write(&manifest_path, &manifest_json)?;
+
+    info!(
+        binary = %dest_binary.display(),
+        manifest = %manifest_path.display(),
+        "installed guest agent (LoaderManifest)"
+    );
+    Ok(())
+}
+
+/// Derive a reverse-DNS launchd label from a binary name.
+fn launchd_label(binary_name: &str) -> String {
+    // "vz-guest-agent" -> "com.vz.guest-agent"
+    // "mac-agent-guest-agent" -> "com.mac-agent.guest-agent"
+    // For names without a clear prefix, use the full name.
+    if let Some(pos) = binary_name.find("-guest-agent") {
+        let prefix = &binary_name[..pos];
+        format!("com.{prefix}.guest-agent")
+    } else {
+        format!("com.{binary_name}")
+    }
+}
+
+fn guest_agent_launchagent_plist(label: &str, program_path: &Path) -> String {
     let program = program_path.to_string_lossy();
+    let log_path = format!("/tmp/{label}.log");
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -552,7 +777,7 @@ fn guest_agent_launchagent_plist(program_path: &Path) -> String {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.vz.user-guest-agent</string>
+    <string>{label}</string>
     <key>ProgramArguments</key>
     <array>
         <string>{program}</string>
@@ -562,154 +787,41 @@ fn guest_agent_launchagent_plist(program_path: &Path) -> String {
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/vz-guest-agent.log</string>
+    <string>{log_path}</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/vz-guest-agent.log</string>
+    <string>{log_path}</string>
 </dict>
 </plist>
 "#
     )
 }
 
-/// launchd plist for the guest agent daemon.
-const GUEST_AGENT_LAUNCHD_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+fn guest_agent_launchdaemon_plist(label: &str, program_path: &str) -> String {
+    let log_path = format!("/var/log/{label}.log");
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.vz.guest-agent</string>
+    <string>{label}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/vz-guest-agent</string>
+        <string>{program_path}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/var/log/vz-guest-agent.log</string>
+    <string>{log_path}</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/vz-guest-agent.log</string>
+    <string>{log_path}</string>
 </dict>
 </plist>
-"#;
-
-// ---------------------------------------------------------------------------
-// Dev tool provisioning (runs inside VM via guest agent)
-// ---------------------------------------------------------------------------
-
-/// Generate the provisioning shell script based on the config.
-///
-/// This script is executed inside the VM via the guest agent after
-/// first boot completes. It installs dev tools non-interactively.
-#[allow(dead_code)]
-pub fn generate_provision_script(config: &ProvisionConfig) -> String {
-    let mut script = String::from("#!/bin/bash\nset -euo pipefail\n\n");
-
-    if config.xcode_cli {
-        script.push_str(
-            "# Install Xcode Command Line Tools\n\
-             echo 'Installing Xcode Command Line Tools...'\n\
-             sudo xcodebuild -license accept 2>/dev/null || true\n\
-             xcode-select --install 2>/dev/null || true\n\
-             # Wait for installation to complete (up to 10 minutes)\n\
-             for i in $(seq 1 120); do\n\
-               if xcode-select -p &>/dev/null; then break; fi\n\
-               sleep 5\n\
-             done\n\
-             echo 'Xcode CLI tools installed.'\n\n",
-        );
-    }
-
-    if config.homebrew {
-        script.push_str(
-            "# Install Homebrew\n\
-             echo 'Installing Homebrew...'\n\
-             NONINTERACTIVE=1 /bin/bash -c \\\n\
-               \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"\n\
-             eval \"$(/opt/homebrew/bin/brew shellenv)\"\n\
-             echo 'eval \"$(/opt/homebrew/bin/brew shellenv)\"' >> ~/.zprofile\n\
-             echo 'Homebrew installed.'\n\n",
-        );
-
-        if !config.brew_packages.is_empty() {
-            let packages = config.brew_packages.join(" ");
-            script.push_str(&format!(
-                "# Install common dev tools\n\
-                 echo 'Installing packages: {packages}...'\n\
-                 brew install {packages}\n\
-                 echo 'Packages installed.'\n\n",
-            ));
-        }
-    }
-
-    if config.rust {
-        script.push_str(
-            "# Install Rust toolchain\n\
-             echo 'Installing Rust...'\n\
-             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\n\
-             source \"$HOME/.cargo/env\"\n\
-             echo 'Rust installed.'\n\n",
-        );
-    }
-
-    script.push_str("echo 'Provisioning complete.'\n");
-    script
-}
-
-/// Read the saved password for a disk image (from the `.password` sidecar file).
-pub fn read_saved_password(image_path: &Path) -> Option<String> {
-    let password_path = image_path.with_extension("password");
-    std::fs::read_to_string(&password_path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-/// Find the built guest agent binary.
-///
-/// Checks common locations:
-/// 1. Relative to the current executable (sibling binary in same target dir)
-/// 2. `target/release/vz-guest-agent` and `target/debug/vz-guest-agent` (cwd)
-/// 3. System path via `which`
-pub fn find_guest_agent_binary() -> Option<PathBuf> {
-    // Check next to the running binary (e.g., target/debug/vz-guest-agent)
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sibling = dir.join("vz-guest-agent");
-            if sibling.exists() {
-                return Some(sibling);
-            }
-        }
-    }
-
-    // Check target directories relative to cwd
-    let target_dirs = [
-        PathBuf::from("target/release/vz-guest-agent"),
-        PathBuf::from("target/debug/vz-guest-agent"),
-    ];
-
-    for path in &target_dirs {
-        if path.exists() {
-            return Some(path.clone());
-        }
-    }
-
-    // Check system path
-    let output = std::process::Command::new("which")
-        .arg("vz-guest-agent")
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
-        }
-    }
-
-    None
+"#
+    )
 }
 
 /// Check if the current process is running as root.
@@ -932,11 +1044,6 @@ fn detach_disk_image(device: &str, mount_point: &Path) -> anyhow::Result<()> {
 // Top-level provisioning entry point
 // ---------------------------------------------------------------------------
 
-/// Provision a raw VM disk image offline.
-///
-/// Attaches the image, mounts the APFS data volume, applies auto-configuration
-/// (skip Setup Assistant, create user, install guest agent), then unmounts and
-/// detaches.
 /// Result of provisioning indicating if post-provisioning steps are needed.
 pub struct ProvisionResult {
     /// If true, LaunchDaemon files need root ownership set.
@@ -944,11 +1051,20 @@ pub struct ProvisionResult {
     pub needs_ownership_fix: bool,
 }
 
+/// Provision a raw VM disk image offline.
+///
+/// Attaches the image, mounts the APFS data volume, applies auto-configuration
+/// (skip Setup Assistant, create user, install guest agent), then unmounts and
+/// detaches.
+///
+/// `binary_name` controls the destination filename for the installed agent
+/// binary. When `None`, defaults to `"vz-guest-agent"`.
 pub fn provision_image(
     image_path: &Path,
     user_config: &UserConfig,
     guest_agent_binary: Option<&Path>,
     install_mode: AgentInstallMode,
+    binary_name: Option<&str>,
 ) -> anyhow::Result<ProvisionResult> {
     // LaunchDaemon plists must be owned by root:wheel. When running as root,
     // files are created with UID 0 automatically. When not root, we still
@@ -974,14 +1090,21 @@ pub fn provision_image(
         user_config,
         guest_agent_binary,
         install_mode,
+        binary_name,
     );
 
     // If running as non-root, try to fix ownership via sudo (best effort)
     if needs_ownership_fix && result.is_ok() {
-        let binary_path = disk.mount_point.join("usr/local/bin/vz-guest-agent");
+        let name = binary_name.unwrap_or(DEFAULT_AGENT_BINARY_NAME);
+        let label = launchd_label(name);
+        let binary_path = disk
+            .mount_point
+            .join("usr/local/bin")
+            .join(name);
         let plist_path = disk
             .mount_point
-            .join("Library/LaunchDaemons/com.vz.guest-agent.plist");
+            .join("Library/LaunchDaemons")
+            .join(format!("{label}.plist"));
         let daemon_dir = disk.mount_point.join("Library/LaunchDaemons");
         let bin_dir = disk.mount_point.join("usr/local/bin");
 
@@ -1044,6 +1167,123 @@ pub fn provision_image(
     Ok(ProvisionResult {
         needs_ownership_fix,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Dev tool provisioning (runs inside VM via guest agent)
+// ---------------------------------------------------------------------------
+
+/// Generate the provisioning shell script based on the config.
+///
+/// This script is executed inside the VM via the guest agent after
+/// first boot completes. It installs dev tools non-interactively.
+#[allow(dead_code)]
+pub fn generate_provision_script(config: &ProvisionConfig) -> String {
+    let mut script = String::from("#!/bin/bash\nset -euo pipefail\n\n");
+
+    if config.xcode_cli {
+        script.push_str(
+            "# Install Xcode Command Line Tools\n\
+             echo 'Installing Xcode Command Line Tools...'\n\
+             sudo xcodebuild -license accept 2>/dev/null || true\n\
+             xcode-select --install 2>/dev/null || true\n\
+             # Wait for installation to complete (up to 10 minutes)\n\
+             for i in $(seq 1 120); do\n\
+               if xcode-select -p &>/dev/null; then break; fi\n\
+               sleep 5\n\
+             done\n\
+             echo 'Xcode CLI tools installed.'\n\n",
+        );
+    }
+
+    if config.homebrew {
+        script.push_str(
+            "# Install Homebrew\n\
+             echo 'Installing Homebrew...'\n\
+             NONINTERACTIVE=1 /bin/bash -c \\\n\
+               \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"\n\
+             eval \"$(/opt/homebrew/bin/brew shellenv)\"\n\
+             echo 'eval \"$(/opt/homebrew/bin/brew shellenv)\"' >> ~/.zprofile\n\
+             echo 'Homebrew installed.'\n\n",
+        );
+
+        if !config.brew_packages.is_empty() {
+            let packages = config.brew_packages.join(" ");
+            script.push_str(&format!(
+                "# Install common dev tools\n\
+                 echo 'Installing packages: {packages}...'\n\
+                 brew install {packages}\n\
+                 echo 'Packages installed.'\n\n",
+            ));
+        }
+    }
+
+    if config.rust {
+        script.push_str(
+            "# Install Rust toolchain\n\
+             echo 'Installing Rust...'\n\
+             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\n\
+             source \"$HOME/.cargo/env\"\n\
+             echo 'Rust installed.'\n\n",
+        );
+    }
+
+    script.push_str("echo 'Provisioning complete.'\n");
+    script
+}
+
+/// Read the saved password for a disk image (from the `.password` sidecar file).
+pub fn read_saved_password(image_path: &Path) -> Option<String> {
+    let password_path = image_path.with_extension("password");
+    std::fs::read_to_string(&password_path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Find the built guest agent binary.
+///
+/// Checks common locations:
+/// 1. Relative to the current executable (sibling binary in same target dir)
+/// 2. `target/release/vz-guest-agent` and `target/debug/vz-guest-agent` (cwd)
+/// 3. System path via `which`
+pub fn find_guest_agent_binary() -> Option<PathBuf> {
+    // Check next to the running binary (e.g., target/debug/vz-guest-agent)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("vz-guest-agent");
+            if sibling.exists() {
+                return Some(sibling);
+            }
+        }
+    }
+
+    // Check target directories relative to cwd
+    let target_dirs = [
+        PathBuf::from("target/release/vz-guest-agent"),
+        PathBuf::from("target/debug/vz-guest-agent"),
+    ];
+
+    for path in &target_dirs {
+        if path.exists() {
+            return Some(path.clone());
+        }
+    }
+
+    // Check system path
+    let output = std::process::Command::new("which")
+        .arg("vz-guest-agent")
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1124,13 +1364,32 @@ mod tests {
     }
 
     #[test]
-    fn guest_agent_launchd_plist_valid_xml() {
-        assert!(GUEST_AGENT_LAUNCHD_PLIST.contains("<?xml version="));
-        assert!(GUEST_AGENT_LAUNCHD_PLIST.contains("<plist version=\"1.0\">"));
-        assert!(GUEST_AGENT_LAUNCHD_PLIST.contains("com.vz.guest-agent"));
-        assert!(GUEST_AGENT_LAUNCHD_PLIST.contains("/usr/local/bin/vz-guest-agent"));
-        assert!(GUEST_AGENT_LAUNCHD_PLIST.contains("<key>RunAtLoad</key>"));
-        assert!(GUEST_AGENT_LAUNCHD_PLIST.contains("<key>KeepAlive</key>"));
+    fn launchd_label_default() {
+        assert_eq!(launchd_label("vz-guest-agent"), "com.vz.guest-agent");
+    }
+
+    #[test]
+    fn launchd_label_mac_agent() {
+        assert_eq!(
+            launchd_label("mac-agent-guest-agent"),
+            "com.mac-agent.guest-agent"
+        );
+    }
+
+    #[test]
+    fn launchd_label_no_suffix() {
+        assert_eq!(launchd_label("my-daemon"), "com.my-daemon");
+    }
+
+    #[test]
+    fn guest_agent_launchdaemon_plist_valid_xml() {
+        let plist = guest_agent_launchdaemon_plist("com.vz.guest-agent", "/usr/local/bin/vz-guest-agent");
+        assert!(plist.contains("<?xml version="));
+        assert!(plist.contains("<plist version=\"1.0\">"));
+        assert!(plist.contains("com.vz.guest-agent"));
+        assert!(plist.contains("/usr/local/bin/vz-guest-agent"));
+        assert!(plist.contains("<key>RunAtLoad</key>"));
+        assert!(plist.contains("<key>KeepAlive</key>"));
     }
 
     #[test]
@@ -1187,6 +1446,7 @@ mod tests {
             Path::new("/nonexistent/vz-guest-agent"),
             &config,
             AgentInstallMode::SystemLaunchDaemon,
+            None,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
@@ -1210,6 +1470,7 @@ mod tests {
             &fake_binary,
             &config,
             AgentInstallMode::SystemLaunchDaemon,
+            None,
         )
         .unwrap();
 
@@ -1243,6 +1504,7 @@ mod tests {
             &fake_binary,
             &config,
             AgentInstallMode::UserLaunchAgent,
+            None,
         )
         .unwrap();
 
@@ -1255,5 +1517,149 @@ mod tests {
         assert!(content.contains("com.vz.user-guest-agent"));
         assert!(content.contains("/Users/dev/Library/Application Support/vz/vz-guest-agent"));
         assert!(!content.contains(&mount.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn install_guest_agent_custom_binary_name() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let fake_binary = tmp.path().join("fake-agent");
+        std::fs::write(&fake_binary, b"#!/bin/bash\necho agent").unwrap();
+
+        let mount = tmp.path().join("mount");
+        std::fs::create_dir_all(&mount).unwrap();
+
+        let config = UserConfig {
+            username: "dev".to_string(),
+            home: "/Users/dev".to_string(),
+            ..Default::default()
+        };
+        install_guest_agent(
+            &mount,
+            &fake_binary,
+            &config,
+            AgentInstallMode::UserLaunchAgent,
+            Some("mac-agent-guest-agent"),
+        )
+        .unwrap();
+
+        let user_binary = mount.join("Users/dev/Library/Application Support/mac-agent/mac-agent-guest-agent");
+        assert!(user_binary.exists());
+
+        let plist = mount.join("Users/dev/Library/LaunchAgents/com.mac-agent.user-guest-agent.plist");
+        assert!(plist.exists());
+        let content = std::fs::read_to_string(plist).unwrap();
+        assert!(content.contains("com.mac-agent.user-guest-agent"));
+        assert!(content.contains("mac-agent-guest-agent"));
+    }
+
+    #[test]
+    fn install_guest_agent_system_custom_binary_name() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let fake_binary = tmp.path().join("fake-agent");
+        std::fs::write(&fake_binary, b"#!/bin/bash\necho agent").unwrap();
+
+        let mount = tmp.path().join("mount");
+        std::fs::create_dir_all(&mount).unwrap();
+
+        let config = UserConfig::default();
+        install_guest_agent(
+            &mount,
+            &fake_binary,
+            &config,
+            AgentInstallMode::SystemLaunchDaemon,
+            Some("mac-agent-guest-agent"),
+        )
+        .unwrap();
+
+        assert!(mount.join("usr/local/bin/mac-agent-guest-agent").exists());
+
+        let plist = mount.join("Library/LaunchDaemons/com.mac-agent.guest-agent.plist");
+        assert!(plist.exists());
+        let content = std::fs::read_to_string(plist).unwrap();
+        assert!(content.contains("com.mac-agent.guest-agent"));
+        assert!(content.contains("/usr/local/bin/mac-agent-guest-agent"));
+    }
+
+    #[test]
+    fn install_guest_agent_loader_manifest_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let fake_binary = tmp.path().join("fake-agent");
+        std::fs::write(&fake_binary, b"#!/bin/bash\necho agent").unwrap();
+
+        let mount = tmp.path().join("mount");
+        std::fs::create_dir_all(&mount).unwrap();
+
+        let config = UserConfig::default();
+        install_guest_agent(
+            &mount,
+            &fake_binary,
+            &config,
+            AgentInstallMode::LoaderManifest,
+            None,
+        )
+        .unwrap();
+
+        // Binary copied to /usr/local/bin/
+        assert!(mount.join("usr/local/bin/vz-guest-agent").exists());
+
+        // Startup manifest written
+        let manifest_path = mount.join("var/lib/vz-agent-loader/startup.json");
+        assert!(manifest_path.exists());
+        let content = std::fs::read_to_string(&manifest_path).unwrap();
+        let manifest: vz_agent_loader_client::StartupManifest =
+            serde_json::from_str(&content).unwrap();
+        assert_eq!(manifest.services.len(), 1);
+        assert_eq!(manifest.services[0].name, "vz-guest-agent");
+        assert_eq!(manifest.services[0].binary, "/usr/local/bin/vz-guest-agent");
+        assert!(manifest.services[0].keep_alive);
+
+        // No LaunchDaemon plist should exist
+        assert!(!mount.join("Library/LaunchDaemons").exists());
+    }
+
+    #[test]
+    fn install_guest_agent_loader_manifest_merges_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let fake_binary = tmp.path().join("fake-agent");
+        std::fs::write(&fake_binary, b"#!/bin/bash\necho agent").unwrap();
+
+        let mount = tmp.path().join("mount");
+        std::fs::create_dir_all(&mount).unwrap();
+
+        let config = UserConfig::default();
+
+        // Install first agent
+        install_guest_agent(
+            &mount,
+            &fake_binary,
+            &config,
+            AgentInstallMode::LoaderManifest,
+            Some("vz-guest-agent"),
+        )
+        .unwrap();
+
+        // Install second agent (different name)
+        install_guest_agent(
+            &mount,
+            &fake_binary,
+            &config,
+            AgentInstallMode::LoaderManifest,
+            Some("mac-agent-guest-agent"),
+        )
+        .unwrap();
+
+        let manifest_path = mount.join("var/lib/vz-agent-loader/startup.json");
+        let content = std::fs::read_to_string(&manifest_path).unwrap();
+        let manifest: vz_agent_loader_client::StartupManifest =
+            serde_json::from_str(&content).unwrap();
+
+        // Both entries should be in the manifest
+        assert_eq!(manifest.services.len(), 2);
+        assert!(manifest.services.iter().any(|s| s.name == "vz-guest-agent"));
+        assert!(manifest.services.iter().any(|s| s.name == "mac-agent-guest-agent"));
     }
 }

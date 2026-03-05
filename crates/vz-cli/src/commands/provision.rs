@@ -8,13 +8,18 @@ use tracing::info;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum AgentModeArg {
+    /// Use the vz-agent-loader startup manifest (default, no root needed).
+    Loader,
+    /// Install as a system LaunchDaemon (requires root ownership).
     System,
+    /// Install as a per-user LaunchAgent (login-dependent).
     User,
 }
 
 impl From<AgentModeArg> for crate::provision::AgentInstallMode {
     fn from(value: AgentModeArg) -> Self {
         match value {
+            AgentModeArg::Loader => crate::provision::AgentInstallMode::LoaderManifest,
             AgentModeArg::System => crate::provision::AgentInstallMode::SystemLaunchDaemon,
             AgentModeArg::User => crate::provision::AgentInstallMode::UserLaunchAgent,
         }
@@ -50,7 +55,7 @@ pub struct ProvisionArgs {
     pub agent: Option<PathBuf>,
 
     /// Guest agent install mode: system LaunchDaemon or user LaunchAgent.
-    #[arg(long, value_enum, default_value_t = AgentModeArg::System)]
+    #[arg(long, value_enum, default_value_t = AgentModeArg::Loader)]
     pub agent_mode: AgentModeArg,
 }
 
@@ -124,6 +129,7 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
 
     let install_mode = crate::provision::AgentInstallMode::from(args.agent_mode);
     let mode_label = match args.agent_mode {
+        AgentModeArg::Loader => "loader",
         AgentModeArg::System => "system",
         AgentModeArg::User => "user",
     };
@@ -133,6 +139,7 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
         &user_config,
         agent_path.as_deref(),
         install_mode,
+        None,
     )?;
 
     println!("Image provisioned successfully: {}", image.display());
@@ -216,19 +223,21 @@ fn print_base_resolution(resolved: &super::vm_base::ResolvedBase) {
 
 fn print_runtime_policy_message(agent_mode: AgentModeArg) {
     match agent_mode {
+        AgentModeArg::Loader => {
+            println!(
+                "Runtime policy: loader mode (default). Agent starts via vz-agent-loader bootstrap."
+            );
+            println!("No sudo required. The loader must be pre-installed via bootstrap patch.");
+        }
         AgentModeArg::System => {
             println!(
-                "Runtime policy: system mode (default) is selected for reliable unattended startup."
-            );
-            println!(
-                "No-local-sudo option: use --agent-mode user as an explicit opt-in (login/session dependent)."
+                "Runtime policy: system mode. Agent installed as LaunchDaemon (requires root ownership)."
             );
         }
         AgentModeArg::User => {
             println!(
-                "Runtime policy: user mode selected (explicit opt-in). System mode remains the default for reliability."
+                "Runtime policy: user mode. Agent installed as per-user LaunchAgent (login-dependent)."
             );
-            println!("Note: user mode depends on guest login/session state.");
         }
     }
 }
