@@ -71,6 +71,45 @@ resolve_vz_bin() {
     err "vz binary not found (set VZ_BIN, put vz in PATH, or build crates/target/{debug,release}/vz)"
 }
 
+vz_has_virtualization_entitlement() {
+    local binary="$1"
+    if ! command -v codesign >/dev/null 2>&1; then
+        return 1
+    fi
+    local entitlements
+    entitlements="$(codesign -d --entitlements :- "$binary" 2>/dev/null || true)"
+    [[ "$entitlements" == *"com.apple.security.virtualization"* ]]
+}
+
+ensure_vz_binary_entitled() {
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        return 0
+    fi
+    if vz_has_virtualization_entitlement "$VZ_BIN"; then
+        return 0
+    fi
+
+    local profile=""
+    case "$VZ_BIN" in
+        "$REPO_ROOT"/crates/target/debug/vz)
+            profile="debug"
+            ;;
+        "$REPO_ROOT"/crates/target/release/vz)
+            profile="release"
+            ;;
+        *)
+            err "vz binary lacks virtualization entitlement; re-run with an entitled binary or use in-repo target binary so auto-sign can run"
+            ;;
+    esac
+
+    echo "==> vz binary is missing virtualization entitlement; running ad-hoc signing for profile: $profile"
+    "$SCRIPT_DIR/sign-dev.sh" --profile "$profile"
+
+    if ! vz_has_virtualization_entitlement "$VZ_BIN"; then
+        err "vz binary still missing virtualization entitlement after signing"
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --name)
@@ -136,6 +175,7 @@ done
 
 VZ_BIN="$(resolve_vz_bin)"
 echo "==> using vz binary: $VZ_BIN"
+ensure_vz_binary_entitled
 
 mkdir -p "$OUTPUT_DIR"
 
