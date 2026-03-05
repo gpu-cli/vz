@@ -24,8 +24,10 @@ On Linux hosts:
   - runs scripts/run-vz-linux-vm-e2e.sh
 
 On macOS hosts:
-  - runs scripts/run-vz-linux-vm-e2e-local.sh (no SSH) to execute the same
-    Linux harness inside a local vz-managed VM.
+  - runs scripts/run-vz-linux-vm-e2e-local.sh (no SSH) when --vm-name/--guest-repo/--vm-image
+    are provided
+  - otherwise falls back to scripts/run-vz-linux-vm-e2e-hostboot.sh to run
+    the same Linux harness in a transient host-boot guest.
 
 Options:
   --workspace <path>          Linux workspace path (or VZ_TEST_BTRFS_WORKSPACE)
@@ -118,27 +120,39 @@ if [[ "$(uname -s)" == "Linux" ]]; then
 fi
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
-    [[ -n "$VM_NAME" ]] || err "--vm-name (or VZ_LINUX_VM_NAME) is required on macOS"
-    [[ -n "$GUEST_REPO" ]] || err "--guest-repo (or VZ_LINUX_VM_GUEST_REPO) is required on macOS"
-    [[ -n "$VM_IMAGE" ]] || err "--vm-image (or VZ_LINUX_VM_IMAGE) is required on macOS"
+    if [[ -n "$VM_NAME" && -n "$GUEST_REPO" && -n "$VM_IMAGE" ]]; then
+        cmd=(
+            "$SCRIPT_DIR/run-vz-linux-vm-e2e-local.sh"
+            --vm-name "$VM_NAME"
+            --guest-repo "$GUEST_REPO"
+            --workspace "$WORKSPACE"
+            --profile "$PROFILE"
+            --output-dir "$OUTPUT_ROOT"
+            --auto-start
+            --vm-image "$VM_IMAGE"
+            --wait-secs "$WAIT_SECS"
+        )
+        if [[ "$PROVISION_BTRFS" == "false" ]]; then
+            cmd+=(--no-provision-btrfs)
+        fi
+        for mount in "${MOUNTS[@]}"; do
+            cmd+=(--mount "$mount")
+        done
+        "${cmd[@]}"
+        exit 0
+    fi
 
+    # Host-boot fallback path (no pre-existing local VM required).
     cmd=(
-        "$SCRIPT_DIR/run-vz-linux-vm-e2e-local.sh"
-        --vm-name "$VM_NAME"
-        --guest-repo "$GUEST_REPO"
+        "$SCRIPT_DIR/run-vz-linux-vm-e2e-hostboot.sh"
+        --output-dir "$OUTPUT_ROOT/hostboot"
+        --harness-output-dir "$OUTPUT_ROOT"
         --workspace "$WORKSPACE"
         --profile "$PROFILE"
-        --output-dir "$OUTPUT_ROOT"
-        --auto-start
-        --vm-image "$VM_IMAGE"
-        --wait-secs "$WAIT_SECS"
     )
     if [[ "$PROVISION_BTRFS" == "false" ]]; then
         cmd+=(--no-provision-btrfs)
     fi
-    for mount in "${MOUNTS[@]}"; do
-        cmd+=(--mount "$mount")
-    done
     "${cmd[@]}"
     exit 0
 fi

@@ -19,6 +19,7 @@ PROVISION_BTRFS=true
 BTRFS_IMAGE="/var/lib/vz-persist/vz-btrfs-workspace.img"
 BTRFS_SIZE_GB="128"
 RUN_BTRFS_PORTABILITY=false
+HARNESS_OUTPUT_DIR="$REPO_ROOT/.artifacts/vz-linux-vm-e2e"
 
 usage() {
     cat <<'USAGE'
@@ -32,6 +33,7 @@ Options:
   --profile <debug|release>    Harness profile (default: debug)
   --workspace <path>           In-guest btrfs workspace path (default: /mnt/vz-btrfs)
   --output-dir <path>          Host descriptor/disk output dir (default: .artifacts/vm-linux-hostboot-e2e)
+  --harness-output-dir <path>  Harness artifact root inside repo mount (default: .artifacts/vz-linux-vm-e2e)
   --rootfs-dir <path>          Distro rootfs directory (default: auto via ensure-alpine-rootfs.sh)
   --disk-size-gb <n>           Persistent disk GiB (default: 192)
   --cpus <n>                   VM CPUs (default: 4)
@@ -53,6 +55,25 @@ err() {
     exit 1
 }
 
+map_host_path_to_guest() {
+    local host_path="$1"
+    local abs_repo_root
+    local abs_host_path
+    abs_repo_root="$(cd "$REPO_ROOT" && pwd -P)"
+    abs_host_path="$(cd "$(dirname "$host_path")" && pwd -P)/$(basename "$host_path")"
+    case "$abs_host_path" in
+        "$abs_repo_root"/*)
+            printf '/mnt/repo/%s' "${abs_host_path#$abs_repo_root/}"
+            ;;
+        "$abs_repo_root")
+            printf '/mnt/repo'
+            ;;
+        *)
+            printf '%s' "$host_path"
+            ;;
+    esac
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --name)
@@ -69,6 +90,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --output-dir)
             OUTPUT_DIR="${2:-}"
+            shift 2
+            ;;
+        --harness-output-dir)
+            HARNESS_OUTPUT_DIR="${2:-}"
             shift 2
             ;;
         --rootfs-dir)
@@ -132,6 +157,7 @@ if [[ -z "$ROOTFS_DIR" ]]; then
     ROOTFS_DIR="$("$SCRIPT_DIR/ensure-alpine-rootfs.sh")"
 fi
 [[ -d "$ROOTFS_DIR" ]] || err "rootfs dir not found: $ROOTFS_DIR"
+GUEST_HARNESS_OUTPUT_DIR="$(map_host_path_to_guest "$HARNESS_OUTPUT_DIR")"
 
 pkg_setup=""
 skip_pkg_preflight=""
@@ -226,7 +252,7 @@ export CARGO_PROFILE_DEV_DEBUG=\"\$VZ_GUEST_CARGO_PROFILE_DEV_DEBUG\";
 : \"\${VZ_GUEST_CARGO_PROFILE_TEST_DEBUG:=0}\";
 export CARGO_PROFILE_TEST_DEBUG=\"\$VZ_GUEST_CARGO_PROFILE_TEST_DEBUG\";
 cd /mnt/repo;
-./scripts/run-vz-linux-vm-e2e.sh --workspace '${WORKSPACE_IN_GUEST}' --profile '${PROFILE}'
+./scripts/run-vz-linux-vm-e2e.sh --workspace '${WORKSPACE_IN_GUEST}' --profile '${PROFILE}' --output-dir '${GUEST_HARNESS_OUTPUT_DIR}'
 "
 
 if [[ "$RUN_BTRFS_PORTABILITY" == "true" ]]; then
