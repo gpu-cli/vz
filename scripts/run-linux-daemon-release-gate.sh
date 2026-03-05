@@ -128,6 +128,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
         --guest-repo "$GUEST_REPO"
         --workspace "$WORKSPACE"
         --profile "$PROFILE"
+        --output-dir "$OUTPUT_ROOT"
         --auto-start
         --vm-image "$VM_IMAGE"
         --wait-secs "$WAIT_SECS"

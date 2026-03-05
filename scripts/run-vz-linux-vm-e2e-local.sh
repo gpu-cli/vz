@@ -14,6 +14,7 @@ VM_NAME=""
 GUEST_REPO=""
 WORKSPACE="/mnt/vz-btrfs"
 PROFILE="debug"
+OUTPUT_DIR="$REPO_ROOT/.artifacts/vz-linux-vm-e2e"
 PROVISION_BTRFS=true
 BTRFS_IMAGE="/var/lib/vz-btrfs-workspace.img"
 BTRFS_SIZE_GB="64"
@@ -36,6 +37,7 @@ Options:
   --guest-repo <path>         Repo path inside VM (required)
   --workspace <path>          In-guest btrfs workspace path (default: /mnt/vz-btrfs)
   --profile <debug|release>   Harness profile (default: debug)
+  --output-dir <path>         Harness artifact root (default: .artifacts/vz-linux-vm-e2e)
   --vm-image <path>           VM image path for auto-start if VM is not running
   --vm-cpus <n>               CPUs for auto-started VM (default: 4)
   --vm-memory-gb <n>          Memory GB for auto-started VM (default: 8)
@@ -80,6 +82,25 @@ resolve_vz_bin() {
     err "vz binary not found (set VZ_BIN, put vz in PATH, or build crates/target/{debug,release}/vz)"
 }
 
+map_host_path_to_guest() {
+    local host_path="$1"
+    local abs_repo_root
+    local abs_host_path
+    abs_repo_root="$(cd "$REPO_ROOT" && pwd -P)"
+    abs_host_path="$(cd "$(dirname "$host_path")" && pwd -P)/$(basename "$host_path")"
+    case "$abs_host_path" in
+        "$abs_repo_root"/*)
+            printf '/mnt/repo/%s' "${abs_host_path#$abs_repo_root/}"
+            ;;
+        "$abs_repo_root")
+            printf '/mnt/repo'
+            ;;
+        *)
+            printf '%s' "$host_path"
+            ;;
+    esac
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --vm-name)
@@ -96,6 +117,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --profile)
             PROFILE="${2:-}"
+            shift 2
+            ;;
+        --output-dir)
+            OUTPUT_DIR="${2:-}"
             shift 2
             ;;
         --vm-image)
@@ -156,6 +181,7 @@ if [[ "$AUTO_START" == "true" && -z "$VM_IMAGE" ]]; then
 fi
 
 VZ_BIN="$(resolve_vz_bin)"
+GUEST_OUTPUT_DIR="$(map_host_path_to_guest "$OUTPUT_DIR")"
 echo "==> using vz binary: $VZ_BIN"
 
 vm_exec_probe() {
@@ -211,6 +237,6 @@ fi
 
 echo "==> running Linux VM E2E harness in guest"
 "$VZ_BIN" vm mac exec "$VM_NAME" --user dev -- /bin/sh -lc \
-    "set -euo pipefail; if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; fi; cd '$GUEST_REPO'; ./scripts/run-vz-linux-vm-e2e.sh --workspace '$WORKSPACE' --profile '$PROFILE'"
+    "set -euo pipefail; if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; fi; cd '$GUEST_REPO'; ./scripts/run-vz-linux-vm-e2e.sh --workspace '$WORKSPACE' --profile '$PROFILE' --output-dir '$GUEST_OUTPUT_DIR'"
 
 echo "==> completed successfully"
