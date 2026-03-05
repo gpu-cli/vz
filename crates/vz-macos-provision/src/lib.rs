@@ -710,22 +710,14 @@ fn install_guest_agent_loader_manifest(
         }],
     };
 
-    let manifest_path_in_guest =
-        std::path::Path::new(vz_agent_loader_client::STARTUP_MANIFEST_PATH);
-    let manifest_dir_rel = manifest_path_in_guest
-        .parent()
-        .and_then(|p| p.to_str())
-        .unwrap_or("var/lib/vz-agent-loader")
-        .trim_start_matches('/');
-    let manifest_dir = mount_point.join(manifest_dir_rel);
-    std::fs::create_dir_all(&manifest_dir)?;
-
-    let manifest_path = mount_point.join(
-        manifest_path_in_guest
-            .to_str()
-            .unwrap_or("var/lib/vz-agent-loader/startup.json")
-            .trim_start_matches('/'),
-    );
+    // On macOS, /var is a firmlink to /private/var. When writing to a mounted
+    // Data volume, we must use the real path (private/var/...) not the firmlink.
+    let manifest_rel = vz_agent_loader_client::STARTUP_MANIFEST_PATH
+        .trim_start_matches('/')
+        .replacen("var/", "private/var/", 1);
+    let manifest_path = mount_point.join(&manifest_rel);
+    let manifest_dir = manifest_path.parent().unwrap();
+    std::fs::create_dir_all(manifest_dir)?;
 
     // If a manifest already exists, merge our entry into it
     let mut existing_manifest = if manifest_path.exists() {
@@ -1606,7 +1598,7 @@ mod tests {
         assert!(mount.join("usr/local/bin/vz-guest-agent").exists());
 
         // Startup manifest written
-        let manifest_path = mount.join("var/lib/vz-agent-loader/startup.json");
+        let manifest_path = mount.join("private/var/lib/vz-agent-loader/startup.json");
         assert!(manifest_path.exists());
         let content = std::fs::read_to_string(&manifest_path).unwrap();
         let manifest: vz_agent_loader_client::StartupManifest =
@@ -1652,7 +1644,7 @@ mod tests {
         )
         .unwrap();
 
-        let manifest_path = mount.join("var/lib/vz-agent-loader/startup.json");
+        let manifest_path = mount.join("private/var/lib/vz-agent-loader/startup.json");
         let content = std::fs::read_to_string(&manifest_path).unwrap();
         let manifest: vz_agent_loader_client::StartupManifest =
             serde_json::from_str(&content).unwrap();
