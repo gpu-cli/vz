@@ -28,7 +28,7 @@ members = [
 edition = "2024"
 rust-version = "1.85.0"
 license = "MIT"
-repository = "https://github.com/jameslal/vz"
+repository = "https://github.com/gpu-cli/vz"
 
 [workspace.dependencies]
 # FFI — objc2-virtualization provides auto-generated bindings to all

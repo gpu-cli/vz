@@ -1,0 +1,237 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate-release-version:
+    name: Validate tag matches Cargo version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Verify Cargo.lock is tracked
+        run: git ls-files --error-unmatch crates/Cargo.lock >/dev/null
+
+      - name: Ensure tag matches vz-cli Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          TAG_VERSION="${TAG#v}"
+          CARGO_VERSION="$(awk -F '"' '/^version = / {print $2; exit}' crates/vz-cli/Cargo.toml)"
+          if [ -z "$CARGO_VERSION" ]; then
+            echo "Could not read package version from crates/vz-cli/Cargo.toml" >&2
+            exit 1
+          fi
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "Tag version ($TAG_VERSION) does not match vz-cli Cargo.toml version ($CARGO_VERSION)." >&2
+            echo "Bump version, run cargo check, commit Cargo.lock, then retag." >&2
+            exit 1
+          fi
+
+  build-macos:
+    name: Build + sign macOS binary (darwin-arm64)
+    runs-on: macos-14
+    needs: validate-release-version
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+
+      - name: Build release binaries
+        run: |
+          cd crates
+          cargo build --release -p vz-cli
+          cargo build --release -p vz-guest-agent
+
+      - name: Import code signing certificate
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH="$RUNNER_TEMP/build_certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+
+          if [ -z "$CERTIFICATE_BASE64" ] || [ -z "$CERTIFICATE_PASSWORD" ] || [ -z "$KEYCHAIN_PASSWORD" ]; then
+            echo "Missing required signing secrets." >&2
+            exit 1
+          fi
+
+          echo -n "$CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH" || \
+            echo -n "$CERTIFICATE_BASE64" | base64 -D > "$CERTIFICATE_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Sign vz-cli with Developer ID
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          codesign --sign "$APPLE_SIGNING_IDENTITY" \
+            --keychain "$KEYCHAIN_PATH" \
+            --entitlements entitlements/vz-cli.entitlements.plist \
+            --options runtime \
+            --timestamp \
+            --force \
+            crates/target/release/vz
+
+          codesign --verify --verbose crates/target/release/vz
+          echo "vz-cli signed successfully"
+
+      - name: Sign vz-guest-agent (ad-hoc, no entitlements)
+        run: |
+          codesign --sign - --force crates/target/release/vz-guest-agent
+          codesign --verify --verbose crates/target/release/vz-guest-agent
+
+      - name: Notarize vz-cli
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          ditto -c -k --keepParent crates/target/release/vz vz-notarize.zip
+
+          xcrun notarytool submit vz-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          rm vz-notarize.zip
+          echo "Notarization complete"
+
+      - name: Prepare release artifacts
+        env:
+          TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('vdev-{0}', github.run_number) }}
+        run: |
+          VERSION="${TAG#v}"
+          mkdir -p dist
+
+          cp crates/target/release/vz "dist/vz-v${VERSION}-darwin-arm64"
+          chmod +x "dist/vz-v${VERSION}-darwin-arm64"
+          shasum -a 256 "dist/vz-v${VERSION}-darwin-arm64" > "dist/vz-v${VERSION}-darwin-arm64.sha256"
+
+          cp crates/target/release/vz-guest-agent "dist/vz-guest-agent-v${VERSION}-darwin-arm64"
+          chmod +x "dist/vz-guest-agent-v${VERSION}-darwin-arm64"
+          shasum -a 256 "dist/vz-guest-agent-v${VERSION}-darwin-arm64" > "dist/vz-guest-agent-v${VERSION}-darwin-arm64.sha256"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-darwin-arm64
+          path: dist/*
+          retention-days: 7
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN_PATH:-}" ] && [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH"
+          fi
+
+  build-linux-artifacts:
+    name: Build Linux kernel + initramfs
+    runs-on: ubuntu-latest
+    needs: validate-release-version
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (arm64 emulation)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Linux artifacts via Docker (arm64)
+        run: |
+          cd linux
+          docker build --platform linux/arm64 -t vz-linux-builder .
+          docker run --rm --platform linux/arm64 \
+            -v "$(cd .. && pwd):/workspace" \
+            -w /workspace/linux \
+            vz-linux-builder \
+            make all CROSS_COMPILE= GUEST_AGENT_BUILD_TOOL=cargo
+
+      - name: Package Linux artifacts
+        env:
+          TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('vdev-{0}', github.run_number) }}
+        run: |
+          VERSION="${TAG#v}"
+          mkdir -p dist
+
+          tar czf "dist/vz-linux-v${VERSION}-arm64.tar.gz" \
+            -C linux/out \
+            vmlinux initramfs.img youki version.json
+
+          sha256sum "dist/vz-linux-v${VERSION}-arm64.tar.gz" > "dist/vz-linux-v${VERSION}-arm64.tar.gz.sha256"
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-artifacts
+          path: dist/*
+          retention-days: 7
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-macos, build-linux-artifacts]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-darwin-arm64
+          path: dist
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-linux-artifacts
+          path: dist
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading updated assets."
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes
+          fi
+          gh release upload "$TAG" dist/* --clobber

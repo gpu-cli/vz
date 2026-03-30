@@ -139,6 +139,12 @@ enum Commands {
     /// VM command namespaces (`mac`, `linux`).
     Vm(commands::vm::VmArgs),
 
+    // ── Setup ──
+    /// Ad-hoc sign the vz binary with required entitlements.
+    ///
+    /// Required after `cargo install vz-cli` to enable Virtualization.framework.
+    SelfSign(commands::self_sign::SelfSignArgs),
+
     // ── Debug/advanced (hidden) ──
     /// Advanced debugging and low-level operations.
     #[command(hide = true)]
@@ -263,6 +269,9 @@ fn main() -> anyhow::Result<()> {
 
             // VM command namespaces
             Some(Commands::Vm(args)) => commands::vm::run(args).await,
+
+            // Setup
+            Some(Commands::SelfSign(args)) => commands::self_sign::run(args).await,
 
             // Debug/advanced
             Some(Commands::Debug(args)) => commands::debug::run(*args).await,
