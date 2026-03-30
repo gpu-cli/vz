@@ -40,6 +40,12 @@ pub struct LinuxVmConfig {
     /// Used for persistent named volumes — an ext4 filesystem image
     /// that is mounted inside the guest at `/run/vz-oci/volumes`.
     pub disk_image: Option<PathBuf>,
+    /// Enable nested virtualization (exposes `/dev/kvm` in the guest).
+    ///
+    /// When enabled, the guest can run hypervisors like Firecracker or
+    /// Cloud Hypervisor. Requires Apple Silicon with Virtualization.framework
+    /// nested virtualization support and a guest kernel with `CONFIG_KVM=y`.
+    pub nested_virtualization: bool,
 }
 
 impl LinuxVmConfig {
@@ -181,6 +187,10 @@ impl LinuxVmConfig {
             builder = builder.disk(disk_image.clone());
         }
 
+        if self.nested_virtualization {
+            builder = builder.nested_virtualization(true);
+        }
+
         Ok(builder.build()?)
     }
 }
@@ -200,6 +210,7 @@ impl Default for LinuxVmConfig {
             vsock: true,
             network: None,
             disk_image: None,
+            nested_virtualization: true,
         }
     }
 }

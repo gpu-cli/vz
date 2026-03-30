@@ -71,6 +71,7 @@ pub struct VmConfigBuilder {
     network: NetworkConfig,
     vsock: bool,
     headless: bool,
+    nested_virtualization: bool,
 }
 
 impl VmConfigBuilder {
@@ -89,6 +90,7 @@ impl VmConfigBuilder {
             network: NetworkConfig::Nat,
             vsock: false,
             headless: true,
+            nested_virtualization: true,
         }
     }
 
@@ -206,6 +208,17 @@ impl VmConfigBuilder {
         self
     }
 
+    /// Enable nested virtualization for Linux guests.
+    ///
+    /// When enabled, the guest VM exposes `/dev/kvm`, allowing it to run
+    /// hypervisors like Firecracker or Cloud Hypervisor inside the guest.
+    /// Only supported on `VZGenericPlatformConfiguration` (Linux guests).
+    /// Requires Apple Silicon with Virtualization.framework support.
+    pub fn nested_virtualization(mut self, enabled: bool) -> Self {
+        self.nested_virtualization = enabled;
+        self
+    }
+
     /// Validate and build the configuration.
     pub fn build(self) -> Result<VmConfig, VzError> {
         let boot_loader = self
@@ -239,6 +252,7 @@ impl VmConfigBuilder {
             network: self.network,
             vsock: self.vsock,
             headless: self.headless,
+            nested_virtualization: self.nested_virtualization,
         })
     }
 }
@@ -268,4 +282,6 @@ pub struct VmConfig {
     /// Controls whether to attach a virtual display. Used by CLI layer.
     #[allow(dead_code)]
     pub(crate) headless: bool,
+    /// Enable nested virtualization (exposes /dev/kvm in Linux guests).
+    pub(crate) nested_virtualization: bool,
 }

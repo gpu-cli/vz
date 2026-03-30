@@ -335,6 +335,23 @@ pub(crate) fn build_objc_config(
                 // SAFETY: setMachineIdentifier assigns a validated machine identifier.
                 unsafe { platform.setMachineIdentifier(&machine_identifier) };
             }
+
+            // Nested virtualization: expose /dev/kvm inside the Linux guest.
+            if config.nested_virtualization {
+                let supported = unsafe {
+                    VZGenericPlatformConfiguration::isNestedVirtualizationSupported()
+                };
+                if supported {
+                    // SAFETY: setNestedVirtualizationEnabled toggles nested virt on a
+                    // validated generic platform configuration.
+                    unsafe { platform.setNestedVirtualizationEnabled(true) };
+                } else {
+                    return Err(VzError::InvalidConfig(
+                        "nested virtualization is not supported on this hardware".to_string(),
+                    ));
+                }
+            }
+
             // SAFETY: setPlatform accepts any VZPlatformConfiguration subclass.
             unsafe { vz_config.setPlatform(&platform) };
         }
