@@ -43,6 +43,7 @@ jobs:
     name: Build + sign macOS binary (darwin-arm64)
     runs-on: macos-14
     needs: validate-release-version
+    environment: release
     steps:
       - name: Checkout
         uses: actions/checkout@v4
