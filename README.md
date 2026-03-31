@@ -22,28 +22,64 @@ Typical use cases:
 
 ## Install
 
-### Build from source
+### Install from source (recommended)
 
 ```bash
-# Requires Rust 1.85+
+# Requires Rust 1.85+ and macOS on Apple Silicon
+cargo install --git https://github.com/gpu-cli/vz.git vz-cli
+
+# Sign the binary with required Virtualization.framework entitlements
+vz self-sign
+```
+
+### Clone and build
+
+```bash
 git clone https://github.com/gpu-cli/vz.git
 cd vz/crates
 cargo build --workspace --release
+
+# Sign the built binaries
+../scripts/sign-dev.sh
 ```
+
+The built binaries are in `crates/target/release/vz` and `crates/target/release/vz-guest-agent`.
+
+### Build the Linux kernel and initramfs
+
+VM commands (`vz vm linux run`, sandboxes) require a Linux kernel and initramfs.
+These are built via Docker (handles cross-compilation and build dependencies):
+
+```bash
+# Requires Docker — builds kernel 6.12, busybox, guest agent, and youki
+cd linux && make docker-build
+```
+
+Output goes to `linux/out/` (`vmlinux`, `initramfs.img`, `youki`, `version.json`).
+
+Install the artifacts to the default location:
+
+```bash
+mkdir -p ~/.vz/linux
+cp linux/out/{vmlinux,initramfs.img,youki,version.json} ~/.vz/linux/
+```
+
+Then initialize a Linux VM image:
+
+```bash
+vz vm linux init --name my-vm
+```
+
+### macOS code signing
+
+All VM commands require the `com.apple.security.virtualization` entitlement.
+`vz self-sign` applies an ad-hoc signature that works on the local machine.
+Pre-built releases (when available) ship with Developer ID signatures and Apple notarization.
 
 ## Platform support
 
 - **Linux:** container + stack commands
 - **macOS (Apple Silicon):** container + stack commands, plus `vz vm ...`
-- **macOS VM requirement:** virtualization entitlement (`vz vm self-sign`)
-
-### macOS VM entitlement (macOS only)
-
-VM commands require the `com.apple.security.virtualization` entitlement.
-
-```bash
-./target/release/vz vm self-sign
-```
 
 ## Quick start
 
