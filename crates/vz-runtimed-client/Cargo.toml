@@ -13,6 +13,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "time"] }
 tonic = { workspace = true }
 tower = { workspace = true }
+tracing = { workspace = true }
 vz-runtime-contract = { workspace = true }
 vz-runtime-proto = { workspace = true }
 vz-runtime-translate = { workspace = true }

@@ -244,6 +244,16 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
     // Build the shell command with env vars and working directory.
     let shell_command = args.command.join(" ");
     let mut env_map = config.env.clone();
+
+    // Auto-detect Rust projects and set CARGO_TARGET_DIR to persistent disk
+    // so build artifacts survive VM restarts.
+    if !env_map.contains_key("CARGO_TARGET_DIR") && project_dir.join("Cargo.toml").exists() {
+        env_map.insert(
+            "CARGO_TARGET_DIR".to_string(),
+            "/run/vz-oci/volumes/cargo-target".to_string(),
+        );
+    }
+
     for entry in &args.env {
         if let Some((key, value)) = entry.split_once('=') {
             env_map.insert(key.to_string(), value.to_string());
@@ -371,8 +381,8 @@ fn find_config_file() -> anyhow::Result<PathBuf> {
         }
         if !dir.pop() {
             bail!(
-                "no {VZ_CONFIG_FILE} found in current directory or any parent; \
-                 create one or use --config"
+                "no {VZ_CONFIG_FILE} found in current directory or any parent.\n\n\
+                 Run `vz init` to generate one, or use `--config <path>`."
             );
         }
     }
@@ -380,7 +390,7 @@ fn find_config_file() -> anyhow::Result<PathBuf> {
 
 // ── Sandbox naming ─────────────────────────────────────────────────
 
-fn sandbox_id_for_project(project_dir: &Path) -> String {
+pub(crate) fn sandbox_id_for_project(project_dir: &Path) -> String {
     let canonical = project_dir
         .canonicalize()
         .unwrap_or_else(|_| project_dir.to_path_buf());
@@ -467,6 +477,46 @@ fn ensure_project_disk(sandbox_id: &str) -> anyhow::Result<PathBuf> {
 
 // ── Setup caching ──────────────────────────────────────────────────
 
+/// Compute the setup hash for a set of commands.
+fn compute_setup_hash(commands: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    for cmd in commands {
+        hasher.update(cmd.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+}
+
+/// Host-side path for the setup hash fallback.
+fn host_setup_hash_path(sandbox_id: &str) -> anyhow::Result<PathBuf> {
+    Ok(home_dir()?
+        .join(".vz")
+        .join("run")
+        .join(sandbox_id)
+        .join(".vz-setup-hash"))
+}
+
+/// Check if setup hash matches on host (fallback) or guest (primary).
+fn check_host_setup_hash(sandbox_id: &str, expected: &str) -> bool {
+    host_setup_hash_path(sandbox_id)
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|content| content.trim() == expected)
+}
+
+/// Write setup hash to the host-side fallback location.
+fn write_host_setup_hash(sandbox_id: &str, hash: &str) {
+    if let Ok(path) = host_setup_hash_path(sandbox_id) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, hash);
+    }
+}
+
 async fn run_setup_if_needed(
     client: &mut DaemonClient,
     sandbox_id: &str,
@@ -476,32 +526,35 @@ async fn run_setup_if_needed(
         return Ok(());
     }
 
-    let setup_hash = {
-        let mut hasher = Sha256::new();
-        for cmd in &config.setup {
-            hasher.update(cmd.as_bytes());
-            hasher.update(b"\n");
-        }
-        hasher.finalize()[..8]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    };
+    let setup_hash = compute_setup_hash(&config.setup);
 
-    // Check if setup already ran (marker on persistent disk).
+    // Check guest-side hash first (persistent disk), then host-side fallback.
     let container_id = resolve_container(client, sandbox_id).await?;
-    let check_result = exec_quiet(
+    let guest_match = exec_quiet(
         client,
         &container_id,
         "cat /run/vz-oci/volumes/.vz-setup-hash 2>/dev/null",
     )
-    .await;
+    .await
+    .is_ok_and(|output| output.trim() == setup_hash);
 
-    if let Ok(output) = &check_result {
-        if output.trim() == setup_hash {
-            debug!(hash = %setup_hash, "setup already complete, skipping");
-            return Ok(());
-        }
+    if guest_match {
+        debug!(hash = %setup_hash, "setup already complete (guest hash match), skipping");
+        return Ok(());
+    }
+
+    if check_host_setup_hash(sandbox_id, &setup_hash) {
+        debug!(hash = %setup_hash, "setup already complete (host hash match), skipping");
+        // Re-write guest hash so future checks are fast.
+        let _ = exec_quiet(
+            client,
+            &container_id,
+            &format!(
+                "mkdir -p /run/vz-oci/volumes && printf '%s' '{setup_hash}' > /run/vz-oci/volumes/.vz-setup-hash"
+            ),
+        )
+        .await;
+        return Ok(());
     }
 
     eprintln!("Running setup commands...");
@@ -513,7 +566,7 @@ async fn run_setup_if_needed(
         }
     }
 
-    // Write the hash marker.
+    // Write the hash marker to both guest and host.
     exec_quiet(
         client,
         &container_id,
@@ -522,6 +575,7 @@ async fn run_setup_if_needed(
         ),
     )
     .await?;
+    write_host_setup_hash(sandbox_id, &setup_hash);
 
     eprintln!("Setup complete.");
     Ok(())

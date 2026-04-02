@@ -122,6 +122,9 @@ enum Commands {
     CloseShell(commands::sandbox::SandboxCloseShellArgs),
 
     // ── Dev environment ──
+    /// Generate a vz.json configuration for the current project.
+    Init(commands::dev_init::DevInitArgs),
+
     /// Run a command in the project's Linux VM (reads vz.json).
     #[cfg(target_os = "macos")]
     Run(commands::dev::DevRunArgs),
@@ -129,6 +132,12 @@ enum Commands {
     /// Stop the Linux VM for the current project.
     #[cfg(target_os = "macos")]
     Stop(commands::dev::DevStopArgs),
+
+    /// Show the current project's VM status.
+    Status(commands::dev_status::DevStatusArgs),
+
+    /// Show daemon logs for debugging.
+    Logs(commands::dev_logs::DevLogsArgs),
 
     // ── Stack orchestration ──
     /// Multi-service stack orchestration from Compose files.
@@ -265,10 +274,13 @@ fn main() -> anyhow::Result<()> {
             Some(Commands::CloseShell(args)) => commands::sandbox::cmd_close_shell(args).await,
 
             // Dev environment
+            Some(Commands::Init(args)) => commands::dev_init::cmd_dev_init(args).await,
             #[cfg(target_os = "macos")]
             Some(Commands::Run(args)) => commands::dev::cmd_run(args).await,
             #[cfg(target_os = "macos")]
             Some(Commands::Stop(args)) => commands::dev::cmd_stop(args).await,
+            Some(Commands::Status(args)) => commands::dev_status::cmd_dev_status(args).await,
+            Some(Commands::Logs(args)) => commands::dev_logs::cmd_dev_logs(args).await,
 
             // Stack orchestration
             Some(Commands::Stack(args)) => commands::stack::run(args).await,

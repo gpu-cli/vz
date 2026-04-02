@@ -10,6 +10,9 @@ pub mod checkpoint;
 pub mod cleanup;
 #[cfg(target_os = "macos")]
 pub mod dev;
+pub mod dev_init;
+pub mod dev_logs;
+pub mod dev_status;
 pub mod debug;
 pub mod diff;
 pub mod docker;

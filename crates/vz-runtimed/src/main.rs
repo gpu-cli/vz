@@ -70,9 +70,18 @@ async fn main() -> Result<()> {
     );
 
     let socket_path = daemon.socket_path().to_path_buf();
+
+    // Write PID file so the client can find us for version-mismatch restarts.
+    let pid_path = socket_path.with_extension("pid");
+    std::fs::write(&pid_path, std::process::id().to_string())
+        .context("failed to write daemon PID file")?;
+
     serve_runtime_uds_with_shutdown(daemon, socket_path, shutdown_signal())
         .await
         .context("runtime gRPC server failed")?;
+
+    // Clean up PID file on graceful shutdown.
+    let _ = std::fs::remove_file(&pid_path);
 
     info!("runtime daemon shutting down");
     Ok(())

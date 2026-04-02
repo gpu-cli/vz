@@ -166,20 +166,44 @@ impl DaemonClient {
     }
 
     /// Connect with explicit lifecycle config.
+    ///
+    /// When `auto_spawn` is enabled and the running daemon has a different
+    /// version than this client, the stale daemon is stopped and a fresh
+    /// one is spawned automatically.
     pub async fn connect_with_config(config: DaemonClientConfig) -> Result<Self> {
         let deadline = Instant::now() + config.startup_timeout;
         let mut backoff = config.retry_backoff;
         let mut spawned = false;
+        let mut restarted_for_version = false;
 
         loop {
             match Self::connect_once(&config).await {
                 Ok(client) => return Ok(client),
                 Err(error) => {
-                    if matches!(
-                        error,
-                        DaemonClientError::IncompatibleVersion { .. }
-                            | DaemonClientError::IncompatibleProtocol { .. }
-                    ) {
+                    // Version mismatch: kill the stale daemon and respawn (once).
+                    if let DaemonClientError::IncompatibleVersion {
+                        ref daemon_version,
+                        ref client_version,
+                    } = error
+                    {
+                        if config.auto_spawn && !restarted_for_version {
+                            tracing::warn!(
+                                daemon = %daemon_version,
+                                client = %client_version,
+                                "daemon version mismatch — restarting daemon"
+                            );
+                            Self::stop_running_daemon(&config.socket_path);
+                            Self::spawn_daemon(&config)?;
+                            restarted_for_version = true;
+                            spawned = true;
+                            backoff = config.retry_backoff;
+                            tokio::time::sleep(backoff).await;
+                            continue;
+                        }
+                        return Err(error);
+                    }
+
+                    if matches!(error, DaemonClientError::IncompatibleProtocol { .. }) {
                         return Err(error);
                     }
 
@@ -281,6 +305,54 @@ impl DaemonClient {
         })
     }
 
+    /// Best-effort stop of the daemon bound to the given socket path.
+    ///
+    /// Reads the PID file next to the socket (or falls back to lsof) and
+    /// sends SIGTERM via the `kill` command. The socket file is removed so
+    /// the next spawn gets a clean bind.
+    fn stop_running_daemon(socket_path: &Path) {
+        let pid_path = socket_path.with_extension("pid");
+        let pid = std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+
+        if let Some(pid) = pid {
+            let _ = Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = std::fs::remove_file(&pid_path);
+        } else {
+            // Fallback: find the daemon process via lsof on the socket.
+            if let Ok(output) = Command::new("lsof")
+                .arg("-t")
+                .arg(socket_path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+            {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    if let Ok(pid) = line.trim().parse::<u32>() {
+                        let _ = Command::new("kill")
+                            .arg("-TERM")
+                            .arg(pid.to_string())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status();
+                    }
+                }
+            }
+        }
+
+        // Remove stale socket so spawn_daemon gets a clean bind.
+        let _ = std::fs::remove_file(socket_path);
+
+        // Brief pause for process cleanup.
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
     fn spawn_daemon(config: &DaemonClientConfig) -> Result<()> {
         let binary = resolve_daemon_binary(config)?;
         if !binary.exists() {
@@ -302,11 +374,20 @@ impl DaemonClient {
             std::fs::create_dir_all(runtime_data_dir)?;
         }
 
+        // Direct daemon stderr to a log file for `vz logs` support.
+        let log_file_path = config.socket_path.with_extension("log");
+        let stderr_target = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file_path)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
+
         let mut command = Command::new(&binary);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(stderr_target)
             .arg("--socket-path")
             .arg(&config.socket_path);
 
