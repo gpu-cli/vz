@@ -408,6 +408,7 @@ fn run_config_from_contract(c: contract::RunConfig) -> oci_config::RunConfig {
         domainname: c.domainname,
         stop_signal: c.stop_signal,
         stop_grace_period_secs: c.stop_grace_period_secs,
+        share_host_network: c.share_host_network,
         mount_tag_offset: c.mount_tag_offset,
     }
 }

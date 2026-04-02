@@ -230,6 +230,7 @@ impl Runtime {
             domainname,
             stop_signal: _,
             stop_grace_period_secs: _,
+            share_host_network: _,
             mount_tag_offset: _,
         } = run;
 
@@ -432,6 +433,7 @@ impl Runtime {
             domainname: _,
             stop_signal: _,
             stop_grace_period_secs: _,
+            share_host_network: _,
             mount_tag_offset: _,
         } = run;
 

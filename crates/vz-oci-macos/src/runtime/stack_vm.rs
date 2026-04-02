@@ -394,6 +394,24 @@ impl Runtime {
                 return Err(err);
             }
         };
+        // When sharing the VM's host network, ensure the container has a
+        // working /etc/resolv.conf. Container images (e.g., Ubuntu) often
+        // ship a resolv.conf pointing to systemd-resolved (127.0.0.53)
+        // which isn't running in the VM. Write public DNS nameservers into
+        // the overlay's upper layer so DNS resolution works immediately.
+        if run.share_host_network {
+            let dns_cmd = format!(
+                "printf 'nameserver 8.8.8.8\\nnameserver 8.8.4.4\\n' > {guest_rootfs_path}/etc/resolv.conf"
+            );
+            let _ = vm
+                .exec_capture(
+                    "sh".to_string(),
+                    vec!["-c".to_string(), dns_cmd],
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
+
         // Bind-mount the VM-level log directory into the container so captured
         // stdout/stderr survives even if the container's init process exits.
         if run.capture_logs {
@@ -448,7 +466,7 @@ impl Runtime {
                 mounts: bundle_mounts,
                 oci_annotations: run.oci_annotations.clone(),
                 network_namespace_path: run.network_namespace_path.clone(),
-                share_host_network: false,
+                share_host_network: run.share_host_network,
                 cpu_quota: run.cpu_quota,
                 cpu_period: run.cpu_period,
                 capture_logs: run.capture_logs,

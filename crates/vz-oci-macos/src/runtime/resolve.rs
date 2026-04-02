@@ -226,6 +226,7 @@ pub(super) fn resolve_run_config(
         domainname,
         stop_signal: _,
         stop_grace_period_secs: _,
+        share_host_network,
         mount_tag_offset: _,
     } = run;
 
@@ -276,6 +277,7 @@ pub(super) fn resolve_run_config(
         domainname,
         stop_signal: None,
         stop_grace_period_secs: None,
+        share_host_network,
         mount_tag_offset: 0,
     })
 }

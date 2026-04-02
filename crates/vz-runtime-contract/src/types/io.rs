@@ -160,6 +160,13 @@ pub struct RunConfig {
     pub stop_signal: Option<String>,
     /// Seconds to wait after stop signal before SIGKILL. Default: 10.
     pub stop_grace_period_secs: Option<u64>,
+    // ── Network ─────────────────────────────────────────────────
+    /// Share the host (VM) network namespace instead of creating an isolated one.
+    ///
+    /// When true, the container does not get its own network namespace and
+    /// uses the VM's NAT network directly. This gives the container internet
+    /// access via the VM's DHCP-assigned IP.
+    pub share_host_network: bool,
     // ── Shared VM mount support ──────────────────────────────────
     /// Offset added to VirtioFS mount tag indices in shared VM mode.
     ///

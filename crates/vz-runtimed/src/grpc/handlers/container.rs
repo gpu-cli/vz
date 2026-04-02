@@ -318,6 +318,16 @@ fn build_runtime_run_config(
         }
     }
 
+    // `vz run` containers share the VM's host network for internet access.
+    // Detected by the presence of vz.run.mount.* labels.
+    let is_vz_run = sandbox
+        .labels
+        .keys()
+        .any(|k| k.starts_with("vz.run.mount."));
+    if is_vz_run {
+        run_config.share_host_network = true;
+    }
+
     Ok(run_config)
 }
 
