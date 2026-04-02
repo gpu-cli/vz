@@ -1326,6 +1326,30 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
                 return Ok(sandbox_stream_response(events, None));
             }
 
+            // Delete the sandbox record and associated containers/executions
+            // from the state store so the sandbox ID can be reused (e.g.,
+            // `vz stop` then `vz run`). Receipts and event log preserve
+            // the audit trail.
+            let sandbox_id_for_cleanup = sandbox.sandbox_id.clone();
+            let _ = self.daemon.with_state_store(|store| {
+                // Clean up executions for all containers in this sandbox.
+                if let Ok(containers) = store.list_containers() {
+                    for container in containers {
+                        if container.sandbox_id == sandbox_id_for_cleanup {
+                            if let Ok(executions) =
+                                store.list_executions_for_container(&container.container_id)
+                            {
+                                for exec in executions {
+                                    let _ = store.delete_execution(&exec.execution_id);
+                                }
+                            }
+                            let _ = store.delete_container(&container.container_id);
+                        }
+                    }
+                }
+                store.delete_sandbox(&sandbox_id_for_cleanup)
+            });
+
             sequence += 1;
             events.push(Ok(terminate_sandbox_completion_event(
                 &request_id,

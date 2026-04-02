@@ -228,7 +228,10 @@ fn exec_config_from_execution(
         execution_id: Some(execution.execution_id.clone()),
         cmd: build_exec_command(&execution.exec_spec),
         env,
-        working_dir: None,
+        // Default to `/` so nsenter uses `--wd=/` instead of inheriting
+        // the guest agent's CWD, which may be invalid inside the container's
+        // mount namespace (causing getcwd() failures).
+        working_dir: Some("/".to_string()),
         user: None,
         pty: execution.exec_spec.pty,
         term_rows: if execution.exec_spec.pty {

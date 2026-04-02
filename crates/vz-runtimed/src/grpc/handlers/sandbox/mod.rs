@@ -1095,9 +1095,9 @@ async fn ensure_sandbox_shell_container(
             image_digest: image_ref,
             cmd: default_keepalive_container_cmd(),
             env: std::collections::HashMap::new(),
-            // Keep shell container startup portable across base images.
-            // Explicitly use `/` so runtime backends do not inherit image
-            // defaults like `/workspace`, which may not exist yet.
+            // Use `/` as CWD — mount targets like /workspace may not exist
+            // in the rootfs before OCI mounts are applied. The `vz run`
+            // command prepends `cd /workspace &&` to handle this.
             cwd: "/".to_string(),
             user: String::new(),
         }))

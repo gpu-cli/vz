@@ -309,7 +309,7 @@ fn build_runtime_run_config(
         }
     }
 
-    // Use vz.run.workspace label as default working directory.
+    // Use vz.run.workspace label as default working directory when none is set.
     if run_config.working_dir.is_none() {
         if let Some(workspace) = sandbox.labels.get("vz.run.workspace") {
             if !workspace.trim().is_empty() {

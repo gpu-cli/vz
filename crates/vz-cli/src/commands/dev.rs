@@ -151,12 +151,20 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
                 .as_ref()
                 .map(|s| s.state.as_str())
                 .unwrap_or("");
-            if args.fresh && state != "terminated" && !state.is_empty() {
-                eprintln!("Stopping existing VM for fresh start...");
-                let _ = terminate_sandbox(&mut client, &sandbox_id).await;
-                true
-            } else {
-                state == "terminated" || state.is_empty()
+            match state {
+                // VM is running — reuse it (unless --fresh).
+                "ready" | "active" if !args.fresh => false,
+                // VM exists but we want fresh, or it's in a terminal/unknown state.
+                // Terminate so we can recreate.
+                _ if !state.is_empty() => {
+                    if args.fresh {
+                        eprintln!("Stopping existing VM for fresh start...");
+                    }
+                    let _ = terminate_sandbox(&mut client, &sandbox_id).await;
+                    true
+                }
+                // Empty state means not found.
+                _ => true,
             }
         }
         Err(_) => true,
@@ -248,10 +256,11 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
         .collect::<Vec<_>>()
         .join("; ");
 
+    let workspace = &config.workspace;
     let full_command = if env_prefix.is_empty() {
-        shell_command
+        format!("cd {workspace} && {shell_command}")
     } else {
-        format!("{env_prefix}; {shell_command}")
+        format!("cd {workspace} && {env_prefix}; {shell_command}")
     };
 
     let pty_mode = if args.interactive {
@@ -265,7 +274,7 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
             metadata: None,
             container_id,
             cmd: vec!["/bin/sh".to_string()],
-            args: vec!["-lc".to_string(), full_command],
+            args: vec!["-c".to_string(), full_command],
             env_override: HashMap::new(),
             timeout_secs: 0,
             pty_mode,
@@ -298,8 +307,10 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
                 let _ = std::io::stdout().flush();
             }
             Some(runtime_v2::exec_output_event::Payload::Stderr(bytes)) => {
-                let _ = std::io::stderr().write_all(&bytes);
-                let _ = std::io::stderr().flush();
+                // Filter the harmless getcwd() warning from the shell.
+                // The kernel's getcwd() syscall fails with stacked
+                // overlay+VirtioFS mounts but CWD is actually correct.
+                write_filtered_stderr(&bytes);
             }
             Some(runtime_v2::exec_output_event::Payload::ExitCode(code)) => {
                 exit_code = code;
@@ -514,6 +525,22 @@ async fn run_setup_if_needed(
 
     eprintln!("Setup complete.");
     Ok(())
+}
+
+/// Filter out the harmless `getcwd() failed` warning from stderr.
+///
+/// The Linux kernel's `getcwd()` syscall cannot resolve the dentry path
+/// through stacked overlay + VirtioFS mount boundaries. The shell prints
+/// this warning at startup, but the CWD is actually correct (verified via
+/// `/proc/self/cwd`). This is a kernel limitation, not a real error.
+fn write_filtered_stderr(bytes: &[u8]) {
+    let text = String::from_utf8_lossy(bytes);
+    for line in text.split_inclusive('\n') {
+        if !line.contains("getcwd() failed") {
+            let _ = std::io::stderr().write_all(line.as_bytes());
+        }
+    }
+    let _ = std::io::stderr().flush();
 }
 
 // ── Daemon helpers ─────────────────────────────────────────────────
