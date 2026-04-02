@@ -1,0 +1,10 @@
+{
+  "name": "vz",
+  "description": "Run commands in instant Linux VMs on macOS via vz",
+  "version": "0.3.0",
+  "author": {
+    "name": "gpu-cli"
+  },
+  "repository": "https://github.com/gpu-cli/vz",
+  "license": "MIT"
+}

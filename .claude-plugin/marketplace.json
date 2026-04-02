@@ -1,0 +1,15 @@
+{
+  "name": "gpu-cli",
+  "owner": {
+    "name": "gpu-cli"
+  },
+  "plugins": [
+    {
+      "name": "vz",
+      "source": {
+        "source": "github",
+        "repo": "gpu-cli/vz"
+      }
+    }
+  ]
+}
