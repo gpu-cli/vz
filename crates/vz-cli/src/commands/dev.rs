@@ -7,9 +7,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, anyhow, bail};
 use clap::Args;
+use crossterm::terminal;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tracing::debug;
@@ -235,6 +238,19 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
         eprintln!("VM ready.");
 
         // Run setup commands if needed.
+        // When --fresh, force re-run by clearing any cached hashes.
+        if args.fresh {
+            if let Ok(path) = host_setup_hash_path(&sandbox_id) {
+                let _ = std::fs::remove_file(path);
+            }
+            let container_id = resolve_container(&mut client, &sandbox_id).await?;
+            let _ = exec_quiet(
+                &mut client,
+                &container_id,
+                "rm -f /run/vz-oci/volumes/.vz-setup-hash",
+            )
+            .await;
+        }
         run_setup_if_needed(&mut client, &sandbox_id, &config).await?;
     }
 
@@ -244,6 +260,11 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
     // Build the shell command with env vars and working directory.
     let shell_command = args.command.join(" ");
     let mut env_map = config.env.clone();
+
+    // Ensure HOME is always set — many tools (rustup, npm, etc.) depend on it.
+    if !env_map.contains_key("HOME") {
+        env_map.insert("HOME".to_string(), "/root".to_string());
+    }
 
     // Auto-detect Rust projects and set CARGO_TARGET_DIR to persistent disk
     // so build artifacts survive VM restarts.
@@ -295,7 +316,69 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
     let execution_payload = execution
         .execution
         .ok_or_else(|| anyhow!("daemon missing execution payload"))?;
-    let execution_id = execution_payload.execution_id;
+    let execution_id = execution_payload.execution_id.clone();
+
+    // For interactive mode: enable raw terminal and forward stdin to the PTY.
+    let stdin_stop = Arc::new(AtomicBool::new(false));
+    let stdin_handle = if args.interactive {
+        terminal::enable_raw_mode().context("failed to enable raw mode")?;
+
+        let stop = Arc::clone(&stdin_stop);
+        let exec_id = execution_id.clone();
+        let mut stdin_client = client.clone();
+        Some(tokio::task::spawn_blocking(move || {
+            use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+            while !stop.load(Ordering::Relaxed) {
+                if !event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
+                    continue;
+                }
+                let Ok(ev) = event::read() else { break };
+                let bytes = match ev {
+                    Event::Key(key)
+                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
+                        match key.code {
+                            KeyCode::Char(c)
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                vec![c as u8 & 0x1f]
+                            }
+                            KeyCode::Char(c) => {
+                                let mut buf = [0u8; 4];
+                                c.encode_utf8(&mut buf);
+                                buf[..c.len_utf8()].to_vec()
+                            }
+                            KeyCode::Enter => vec![b'\r'],
+                            KeyCode::Backspace => vec![0x7f],
+                            KeyCode::Tab => vec![b'\t'],
+                            KeyCode::Esc => vec![0x1b],
+                            KeyCode::Up => vec![0x1b, b'[', b'A'],
+                            KeyCode::Down => vec![0x1b, b'[', b'B'],
+                            KeyCode::Right => vec![0x1b, b'[', b'C'],
+                            KeyCode::Left => vec![0x1b, b'[', b'D'],
+                            KeyCode::Home => vec![0x1b, b'[', b'H'],
+                            KeyCode::End => vec![0x1b, b'[', b'F'],
+                            KeyCode::Delete => vec![0x1b, b'[', b'3', b'~'],
+                            _ => continue,
+                        }
+                    }
+                    Event::Paste(text) => text.into_bytes(),
+                    _ => continue,
+                };
+
+                let rt = tokio::runtime::Handle::current();
+                let _ = rt.block_on(stdin_client.write_exec_stdin(
+                    runtime_v2::WriteExecStdinRequest {
+                        execution_id: exec_id.clone(),
+                        data: bytes,
+                        metadata: None,
+                    },
+                ));
+            }
+        }))
+    } else {
+        None
+    };
 
     let mut stream = client
         .stream_exec_output(runtime_v2::StreamExecOutputRequest {
@@ -317,18 +400,28 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
                 let _ = std::io::stdout().flush();
             }
             Some(runtime_v2::exec_output_event::Payload::Stderr(bytes)) => {
-                // Filter the harmless getcwd() warning from the shell.
-                // The kernel's getcwd() syscall fails with stacked
-                // overlay+VirtioFS mounts but CWD is actually correct.
                 write_filtered_stderr(&bytes);
             }
             Some(runtime_v2::exec_output_event::Payload::ExitCode(code)) => {
                 exit_code = code;
             }
             Some(runtime_v2::exec_output_event::Payload::Error(error)) => {
+                if args.interactive {
+                    stdin_stop.store(true, Ordering::Relaxed);
+                    let _ = terminal::disable_raw_mode();
+                }
                 bail!("execution error: {error}");
             }
             None => {}
+        }
+    }
+
+    // Clean up interactive mode.
+    if args.interactive {
+        stdin_stop.store(true, Ordering::Relaxed);
+        let _ = terminal::disable_raw_mode();
+        if let Some(handle) = stdin_handle {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
         }
     }
 
@@ -704,7 +797,9 @@ async fn exec_streaming(
                 "-c".to_string(),
                 format!("cd / && {command}"),
             ],
-            env_override: HashMap::new(),
+            env_override: HashMap::from([
+                ("HOME".to_string(), "/root".to_string()),
+            ]),
             timeout_secs: 3600,
             pty_mode: runtime_v2::create_execution_request::PtyMode::Disabled as i32,
         })
@@ -731,8 +826,7 @@ async fn exec_streaming(
                 let _ = std::io::stdout().flush();
             }
             Some(runtime_v2::exec_output_event::Payload::Stderr(bytes)) => {
-                let _ = std::io::stderr().write_all(&bytes);
-                let _ = std::io::stderr().flush();
+                write_filtered_stderr(&bytes);
             }
             Some(runtime_v2::exec_output_event::Payload::ExitCode(code)) => {
                 exit_code = Some(code);

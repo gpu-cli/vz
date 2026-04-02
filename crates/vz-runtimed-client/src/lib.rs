@@ -348,9 +348,30 @@ impl DaemonClient {
 
         // Remove stale socket so spawn_daemon gets a clean bind.
         let _ = std::fs::remove_file(socket_path);
+        // Remove stale log file so the new daemon gets a fresh one.
+        let _ = std::fs::remove_file(socket_path.with_extension("log"));
 
         // Brief pause for process cleanup.
         std::thread::sleep(Duration::from_millis(200));
+    }
+
+    /// Remove stale state store lock files that prevent daemon startup.
+    ///
+    /// Called before spawning to clean up after ungraceful daemon termination.
+    fn clean_stale_lock(config: &DaemonClientConfig) {
+        if let Some(state_store_path) = &config.state_store_path {
+            let lock_path = state_store_path.with_extension("db.lock");
+            if lock_path.exists() {
+                let _ = std::fs::remove_file(&lock_path);
+            }
+            // Also try without the .db extension in case the path doesn't end in .db
+            let mut lock_path_alt = state_store_path.as_os_str().to_owned();
+            lock_path_alt.push(".lock");
+            let lock_path_alt = Path::new(&lock_path_alt);
+            if lock_path_alt.exists() {
+                let _ = std::fs::remove_file(lock_path_alt);
+            }
+        }
     }
 
     fn spawn_daemon(config: &DaemonClientConfig) -> Result<()> {
@@ -358,6 +379,9 @@ impl DaemonClient {
         if !binary.exists() {
             return Err(DaemonClientError::BinaryNotFound { path: binary });
         }
+
+        // Clean up stale lock files from ungraceful daemon termination.
+        Self::clean_stale_lock(config);
 
         if let Some(parent) = config.socket_path.parent()
             && !parent.as_os_str().is_empty()
@@ -374,20 +398,13 @@ impl DaemonClient {
             std::fs::create_dir_all(runtime_data_dir)?;
         }
 
-        // Direct daemon stderr to a log file for `vz logs` support.
-        let log_file_path = config.socket_path.with_extension("log");
-        let stderr_target = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_file_path)
-            .map(Stdio::from)
-            .unwrap_or_else(|_| Stdio::null());
-
+        // Daemon writes its own log file via tracing (next to the socket),
+        // so we can discard spawned process stdio.
         let mut command = Command::new(&binary);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(stderr_target)
+            .stderr(Stdio::null())
             .arg("--socket-path")
             .arg(&config.socket_path);
 

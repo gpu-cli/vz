@@ -41,8 +41,11 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
     let cli = Cli::parse();
+
+    // Write logs to a file next to the socket for `vz logs` support.
+    let log_file_path = cli.socket_path.with_extension("log");
+    init_tracing(Some(&log_file_path));
 
     let daemon = Arc::new(
         RuntimeDaemon::start_with_checkpoint_retention_policy(
@@ -87,8 +90,30 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
+fn init_tracing(log_file: Option<&std::path::Path>) {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    if let Some(path) = log_file {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_target(false)
+                .with_ansi(false)
+                .compact()
+                .with_writer(file)
+                .init();
+            return;
+        }
+    }
+
+    // Fallback: write to stderr (for interactive use / debugging).
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_target(false)

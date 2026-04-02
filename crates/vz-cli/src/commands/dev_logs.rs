@@ -23,15 +23,24 @@ pub async fn cmd_dev_logs(args: DevLogsArgs) -> anyhow::Result<()> {
     let log_path = resolve_log_path()?;
 
     if !log_path.exists() {
+        // Check if the daemon socket exists — if so, the daemon was started
+        // before log-file support was added.
+        let socket_path = log_path.with_extension("sock");
+        if socket_path.exists() {
+            bail!(
+                "no log file found (daemon was started before log support).\n\
+                 Restart the daemon to enable logging:\n\
+                 \n  vz stop && vz run <command>"
+            );
+        }
         bail!(
             "no daemon log file found at {}\n\
-             The daemon may not have been started yet. Run `vz run` first.",
+             The daemon has not been started yet. Run `vz run` first.",
             log_path.display()
         );
     }
 
     if args.follow {
-        // Use tail -f for follow mode.
         let status = std::process::Command::new("tail")
             .arg("-f")
             .arg("-n")
