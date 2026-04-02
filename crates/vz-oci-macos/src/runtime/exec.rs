@@ -215,6 +215,31 @@ impl Runtime {
             return result;
         }
 
+        // Non-PTY streaming path: use nsenter via the streaming exec RPC
+        // so output is delivered incrementally instead of buffered until exit.
+        let state = vm.oci_state(id.to_string()).await?;
+        let Some(pid) = state.pid else {
+            return Err(OciError::InvalidConfig(format!(
+                "container '{id}' has no running pid for exec"
+            )));
+        };
+
+        let mut nsenter_args: Vec<String> = vec![
+            format!("--mount=/proc/{pid}/ns/mnt"),
+            format!("--net=/proc/{pid}/ns/net"),
+            format!("--pid=/proc/{pid}/ns/pid"),
+            format!("--ipc=/proc/{pid}/ns/ipc"),
+            format!("--uts=/proc/{pid}/ns/uts"),
+            format!("--root=/proc/{pid}/root"),
+        ];
+        if let Some(ref working_dir) = exec.working_dir
+            && !working_dir.is_empty()
+        {
+            nsenter_args.push(format!("--wd={working_dir}"));
+        }
+        nsenter_args.push("--".to_string());
+
+        // Build env export prefix for merged environment.
         let mut merged_env = self
             .container_exec_env
             .lock()
@@ -230,44 +255,47 @@ impl Runtime {
             }
         }
 
-        let result = tokio::time::timeout(
-            timeout,
-            vm.oci_exec(
-                id.to_string(),
-                command.clone(),
-                args.to_vec(),
-                OciExecOptions {
-                    env: merged_env,
-                    cwd: exec.working_dir,
-                    user: exec.user,
+        // Wrap in env + shell so environment variables are applied.
+        if merged_env.is_empty() {
+            nsenter_args.push(command.clone());
+            nsenter_args.extend(args.to_vec());
+        } else {
+            nsenter_args.push("env".to_string());
+            for (key, value) in &merged_env {
+                nsenter_args.push(format!("{key}={value}"));
+            }
+            nsenter_args.push(command.clone());
+            nsenter_args.extend(args.to_vec());
+        }
+
+        let options = ExecOptions::default();
+
+        let result = vm
+            .exec_capture_with_options_streaming(
+                "/bin/busybox".to_string(),
+                {
+                    let mut full_args = vec!["nsenter".to_string()];
+                    full_args.extend(nsenter_args);
+                    full_args
                 },
-            ),
-        )
-        .await
-        .map_err(|_| {
-            OciError::InvalidConfig(format!(
-                "exec timed out after {:.3}s",
-                timeout.as_secs_f64()
-            ))
-        })??;
+                timeout,
+                options,
+                |event| match event {
+                    ExecEvent::Stdout(data) => {
+                        on_event(InteractiveExecEvent::Stdout(data.clone()));
+                    }
+                    ExecEvent::Stderr(data) => {
+                        on_event(InteractiveExecEvent::Stderr(data.clone()));
+                    }
+                    ExecEvent::Exit(code) => {
+                        on_event(InteractiveExecEvent::Exit(*code));
+                    }
+                },
+            )
+            .await
+            .map_err(OciError::from)?;
 
-        if !result.stdout.is_empty() {
-            on_event(InteractiveExecEvent::Stdout(
-                result.stdout.as_bytes().to_vec(),
-            ));
-        }
-        if !result.stderr.is_empty() {
-            on_event(InteractiveExecEvent::Stderr(
-                result.stderr.as_bytes().to_vec(),
-            ));
-        }
-        on_event(InteractiveExecEvent::Exit(result.exit_code));
-
-        Ok(ExecOutput {
-            exit_code: result.exit_code,
-            stdout: result.stdout,
-            stderr: result.stderr,
-        })
+        Ok(result)
     }
 
     /// Write stdin bytes into an active interactive execution session.
