@@ -90,6 +90,7 @@ pub(crate) async fn try_create_sandbox_via_daemon(
         cpus: body.cpus.unwrap_or(0) as u32,
         memory_mb: body.memory_mb.unwrap_or(0),
         labels,
+        ..Default::default()
     };
 
     match client.create_sandbox_with_metadata(grpc_request).await {

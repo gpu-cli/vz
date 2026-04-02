@@ -451,7 +451,7 @@ impl ImageStore {
 
         fs::create_dir_all(&rootfs)?;
 
-        for layer in layers {
+        for layer in &layers {
             let layer_root = self.unpack_layer(&layer.digest, &layer.media_type)?;
             overlay_copy_layer(&layer_root, &rootfs)?;
         }

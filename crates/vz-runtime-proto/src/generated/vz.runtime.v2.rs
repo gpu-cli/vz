@@ -35,6 +35,30 @@ pub struct CreateSandboxRequest {
         ::prost::alloc::string::String,
         ::prost::alloc::string::String,
     >,
+    /// Explicit VirtioFS volume mounts for the shared VM.
+    /// When present, these are used instead of deriving mounts from labels.
+    #[prost(message, repeated, tag = "6")]
+    pub volume_mounts: ::prost::alloc::vec::Vec<VolumeMount>,
+    /// Optional path to a persistent disk image (ext4) attached as VirtioBlock.
+    #[prost(string, tag = "7")]
+    pub disk_image_path: ::prost::alloc::string::String,
+}
+/// A host directory to expose inside the shared VM via VirtioFS.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct VolumeMount {
+    /// VirtioFS mount tag (e.g., "vz-mount-0").
+    #[prost(string, tag = "1")]
+    pub tag: ::prost::alloc::string::String,
+    /// Absolute path on the host.
+    #[prost(string, tag = "2")]
+    pub host_path: ::prost::alloc::string::String,
+    /// Target path inside the guest (e.g., "/workspace").
+    /// Communicated via kernel cmdline parameter vz.mount.{N}={guest_path}.
+    #[prost(string, tag = "3")]
+    pub guest_path: ::prost::alloc::string::String,
+    /// Whether the mount is read-only.
+    #[prost(bool, tag = "4")]
+    pub read_only: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SandboxPayload {

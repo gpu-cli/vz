@@ -73,6 +73,12 @@ pub struct StackVolumeMount {
     pub tag: String,
     /// Absolute path on the host.
     pub host_path: std::path::PathBuf,
+    /// Target path inside the guest where this mount should appear.
+    ///
+    /// When set, the init script bind-mounts the VirtioFS share from
+    /// `/mnt/{tag}` to this path inside the chroot. Communicated to the
+    /// guest via kernel cmdline parameter `vz.mount.{N}={guest_path}`.
+    pub guest_path: Option<String>,
     /// Whether the mount is read-only.
     pub read_only: bool,
 }

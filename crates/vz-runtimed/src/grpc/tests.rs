@@ -723,6 +723,7 @@ async fn create_sandbox_rejects_empty_stack_name() {
             cpus: 0,
             memory_mb: 0,
             labels: std::collections::HashMap::new(),
+            ..Default::default()
         }))
         .await
         .expect_err("create_sandbox should reject empty stack_name")
@@ -898,6 +899,7 @@ async fn create_sandbox_requires_project_dir_label() {
             cpus: 1,
             memory_mb: 512,
             labels: std::collections::HashMap::new(),
+            ..Default::default()
         }))
         .await
         .expect("create_sandbox call");
@@ -967,6 +969,7 @@ async fn create_sandbox_spaces_mode_rejects_non_btrfs_workspace_storage() {
             cpus: 1,
             memory_mb: 512,
             labels,
+            ..Default::default()
         }))
         .await
         .expect("create_sandbox call");
@@ -1030,6 +1033,7 @@ async fn create_sandbox_rejects_non_spaces_mode_label_value() {
             cpus: 1,
             memory_mb: 512,
             labels,
+            ..Default::default()
         }))
         .await
         .expect("create_sandbox call");
@@ -1085,6 +1089,7 @@ async fn create_sandbox_writes_policy_allow_audit_receipt() {
                 cpus: 1,
                 memory_mb: 512,
                 labels: std::collections::HashMap::new(),
+                ..Default::default()
             }))
             .await
             .expect("create sandbox"),

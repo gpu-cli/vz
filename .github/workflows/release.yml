@@ -60,6 +60,7 @@ jobs:
         run: |
           cd crates
           cargo build --release -p vz-cli
+          cargo build --release -p vz-runtimed
           cargo build --release -p vz-guest-agent
 
       - name: Import code signing certificate
@@ -103,26 +104,50 @@ jobs:
           codesign --verify --verbose crates/target/release/vz
           echo "vz-cli signed successfully"
 
+      - name: Sign vz-runtimed with Developer ID
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          codesign --sign "$APPLE_SIGNING_IDENTITY" \
+            --keychain "$KEYCHAIN_PATH" \
+            --entitlements entitlements/vz-cli.entitlements.plist \
+            --options runtime \
+            --timestamp \
+            --force \
+            crates/target/release/vz-runtimed
+
+          codesign --verify --verbose crates/target/release/vz-runtimed
+          echo "vz-runtimed signed successfully"
+
       - name: Sign vz-guest-agent (ad-hoc, no entitlements)
         run: |
           codesign --sign - --force crates/target/release/vz-guest-agent
           codesign --verify --verbose crates/target/release/vz-guest-agent
 
-      - name: Notarize vz-cli
+      - name: Notarize vz-cli and vz-runtimed
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          # Notarize vz-cli
           ditto -c -k --keepParent crates/target/release/vz vz-notarize.zip
-
           xcrun notarytool submit vz-notarize.zip \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait
-
           rm vz-notarize.zip
+
+          # Notarize vz-runtimed
+          ditto -c -k --keepParent crates/target/release/vz-runtimed vz-runtimed-notarize.zip
+          xcrun notarytool submit vz-runtimed-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          rm vz-runtimed-notarize.zip
+
           echo "Notarization complete"
 
       - name: Prepare release artifacts
@@ -135,6 +160,10 @@ jobs:
           cp crates/target/release/vz "dist/vz-v${VERSION}-darwin-arm64"
           chmod +x "dist/vz-v${VERSION}-darwin-arm64"
           shasum -a 256 "dist/vz-v${VERSION}-darwin-arm64" > "dist/vz-v${VERSION}-darwin-arm64.sha256"
+
+          cp crates/target/release/vz-runtimed "dist/vz-runtimed-v${VERSION}-darwin-arm64"
+          chmod +x "dist/vz-runtimed-v${VERSION}-darwin-arm64"
+          shasum -a 256 "dist/vz-runtimed-v${VERSION}-darwin-arm64" > "dist/vz-runtimed-v${VERSION}-darwin-arm64.sha256"
 
           cp crates/target/release/vz-guest-agent "dist/vz-guest-agent-v${VERSION}-darwin-arm64"
           chmod +x "dist/vz-guest-agent-v${VERSION}-darwin-arm64"

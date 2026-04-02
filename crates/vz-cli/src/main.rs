@@ -121,6 +121,15 @@ enum Commands {
     /// Close an active shell session for a sandbox.
     CloseShell(commands::sandbox::SandboxCloseShellArgs),
 
+    // ── Dev environment ──
+    /// Run a command in the project's Linux VM (reads vz.json).
+    #[cfg(target_os = "macos")]
+    Run(commands::dev::DevRunArgs),
+
+    /// Stop the Linux VM for the current project.
+    #[cfg(target_os = "macos")]
+    Stop(commands::dev::DevStopArgs),
+
     // ── Stack orchestration ──
     /// Multi-service stack orchestration from Compose files.
     Stack(commands::stack::StackArgs),
@@ -254,6 +263,12 @@ fn main() -> anyhow::Result<()> {
             Some(Commands::Inspect(args)) => commands::sandbox::cmd_inspect(args).await,
             Some(Commands::Attach(args)) => commands::sandbox::cmd_attach(args).await,
             Some(Commands::CloseShell(args)) => commands::sandbox::cmd_close_shell(args).await,
+
+            // Dev environment
+            #[cfg(target_os = "macos")]
+            Some(Commands::Run(args)) => commands::dev::cmd_run(args).await,
+            #[cfg(target_os = "macos")]
+            Some(Commands::Stop(args)) => commands::dev::cmd_stop(args).await,
 
             // Stack orchestration
             Some(Commands::Stack(args)) => commands::stack::run(args).await,

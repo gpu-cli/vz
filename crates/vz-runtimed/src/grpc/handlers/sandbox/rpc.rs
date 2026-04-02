@@ -60,6 +60,8 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
         };
         let request_hash = create_sandbox_request_hash(&request, cpus);
         let normalized_idempotency_key = normalize_idempotency_key(idempotency_key.as_deref());
+        let explicit_volume_mounts = request.volume_mounts;
+        let explicit_disk_image_path = request.disk_image_path;
         let mut labels: BTreeMap<String, String> = request.labels.into_iter().collect();
         // Requesters cannot predeclare default-source audit labels.
         labels.remove(SANDBOX_LABEL_BASE_IMAGE_DEFAULT_SOURCE);
@@ -169,12 +171,19 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
             "booting_runtime",
             "booting sandbox runtime resources",
         )));
+        let disk_image_path = if explicit_disk_image_path.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(&explicit_disk_image_path))
+        };
         if let Err(status) = boot_runtime_sandbox_resources(
             self.daemon.clone(),
             &sandbox_id,
             cpus,
             memory_mb,
             &labels,
+            &explicit_volume_mounts,
+            disk_image_path,
             &request_id,
         )
         .await

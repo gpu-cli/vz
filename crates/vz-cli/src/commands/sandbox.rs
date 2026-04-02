@@ -1564,6 +1564,7 @@ async fn daemon_grpc_create_sandbox(
             cpus: u32::from(cpus),
             memory_mb: memory,
             labels: labels.into_iter().collect(),
+            ..Default::default()
         })
         .await
         .context("failed to create sandbox via daemon")?;

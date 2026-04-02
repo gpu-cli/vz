@@ -79,6 +79,16 @@ impl Runtime {
                 source: vol.host_path.clone(),
                 read_only: vol.read_only,
             });
+            // When a guest_path is specified, append the kernel cmdline
+            // parameter that tells the init script where to bind-mount this
+            // VirtioFS share inside the chroot.
+            if let Some(guest_path) = &vol.guest_path {
+                if let Some(idx_str) = vol.tag.strip_prefix("vz-mount-") {
+                    vm_config
+                        .cmdline
+                        .push_str(&format!(" vz.mount.{idx_str}={guest_path}"));
+                }
+            }
         }
 
         vm_config.cpus = resources.cpus.unwrap_or(self.config.default_cpus);
@@ -258,7 +268,6 @@ impl Runtime {
 
         let image_id = self.pull(image).await?;
         let container_id = run.container_id.clone().unwrap_or_else(new_container_id);
-        tracing::debug!(stack_id = %stack_id, container_id = %container_id, image_id = %image_id.0, "create_container_in_stack: starting");
 
         let created_unix_secs = current_unix_secs();
         let mut container = ContainerInfo {
@@ -277,9 +286,6 @@ impl Runtime {
             .upsert(container.clone())
             .map_err(OciError::from)?;
 
-        // Spawn rootfs assembly as a background task so we can do image config
-        // parsing and run config resolution concurrently with the heavy I/O.
-        tracing::debug!("step 1: spawn_assemble_rootfs (background)");
         let rootfs_handle = self.store.spawn_assemble_rootfs(&image_id.0, &container_id);
 
         // Step 2 runs concurrently with rootfs assembly (no disk I/O dependency).
@@ -315,7 +321,6 @@ impl Runtime {
         let bundle_guest_root = oci_bundle_guest_root(self.config.guest_state_dir.as_deref())?;
         let bundle_relative_path = oci_bundle_guest_path(&bundle_guest_root, &oci_container_id);
 
-        // Await rootfs assembly before writing the OCI bundle to disk.
         let rootfs_dir = match rootfs_handle.await {
             Ok(Ok(rootfs_dir)) => rootfs_dir,
             Ok(Err(err)) => {
@@ -341,8 +346,6 @@ impl Runtime {
                 )));
             }
         };
-        tracing::debug!(rootfs_dir = %rootfs_dir.display(), "step 1 OK");
-
         container.rootfs_path = Some(rootfs_dir.clone());
         self.container_store
             .upsert(container.clone())
@@ -352,8 +355,6 @@ impl Runtime {
         let bundle_host_dir = oci_bundle_host_dir(&rootfs_dir, &bundle_relative_path);
         // Guest: /vz-rootfs/<container_id>/<bundle_path>
         let bundle_guest_path = format!("/vz-rootfs/{container_id}{bundle_relative_path}");
-        tracing::debug!(bundle_host_dir = %bundle_host_dir.display(), bundle_guest_path = %bundle_guest_path, "step 3: write bundle");
-
         let bundle_cmd = run
             .init_process
             .clone()
@@ -375,7 +376,6 @@ impl Runtime {
         // Per-container overlay: VirtioFS doesn't support mknod, so we create a
         // guest-side overlay with tmpfs as upperdir for device nodes.
         let vz_rootfs_path = format!("/vz-rootfs/{container_id}");
-        tracing::debug!("step 3a: setup per-container overlay in guest");
         let guest_rootfs_path = match setup_guest_container_overlay(
             vm.as_ref(),
             &vz_rootfs_path,
@@ -385,7 +385,6 @@ impl Runtime {
         {
             Ok(path) => path,
             Err(err) => {
-                tracing::error!(error = %err, "step 3a FAILED: per-container overlay setup");
                 container.status = ContainerStatus::Stopped { exit_code: -1 };
                 container.stopped_unix_secs = Some(current_unix_secs());
                 container.host_pid = None;
@@ -395,8 +394,6 @@ impl Runtime {
                 return Err(err);
             }
         };
-        tracing::debug!("step 3a OK");
-
         // Bind-mount the VM-level log directory into the container so captured
         // stdout/stderr survives even if the container's init process exits.
         if run.capture_logs {
@@ -440,7 +437,6 @@ impl Runtime {
         // start (via guest exec or bind mount) fails due to VirtioFS caching
         // and youki's pivot_root creating an isolated mount tree.
 
-        tracing::debug!("step 3c: write_oci_bundle");
         write_oci_bundle(
             &bundle_host_dir,
             Path::new(&guest_rootfs_path),
@@ -466,15 +462,9 @@ impl Runtime {
                 hostname: run.hostname.clone(),
                 domainname: run.domainname.clone(),
             },
-        )
-        .map_err(|e| {
-            tracing::error!(error = %e, "step 3c FAILED: write_oci_bundle");
-            e
-        })?;
-        tracing::debug!("step 3c OK");
+        )?;
 
         // OCI create + start inside the shared VM.
-        tracing::debug!("step 4: oci_create + oci_start");
         if let Err(err) = vm
             .oci_create(oci_container_id.clone(), bundle_guest_path.clone())
             .await

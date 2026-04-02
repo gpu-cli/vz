@@ -250,6 +250,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                                 all_volume_mounts.push(vz_runtime_contract::StackVolumeMount {
                                     tag: format!("vz-mount-{idx}"),
                                     host_path: host_path.clone(),
+                                    guest_path: None,
                                     read_only: rm.read_only,
                                 });
                             }
@@ -300,6 +301,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                         all_volume_mounts.push(vz_runtime_contract::StackVolumeMount {
                             tag: format!("vz-mount-{idx}"),
                             host_path: secrets_dir.clone(),
+                            guest_path: None,
                             read_only: true,
                         });
                     }

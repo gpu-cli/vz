@@ -354,6 +354,8 @@ impl DaemonClient {
             cpus: 0,
             memory_mb: 0,
             labels: HashMap::new(),
+            volume_mounts: Vec::new(),
+            disk_image_path: String::new(),
         };
         let _ = self.create_sandbox(request).await?;
         Ok(())

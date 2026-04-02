@@ -1476,6 +1476,7 @@ async fn cli_daemon_grpc_linux_save_restore_commands_cover_happy_path_and_errors
             cpus: 1,
             memory_mb: 256,
             labels: HashMap::new(),
+            ..Default::default()
         })
         .await
         .context("create sandbox via daemon")?;

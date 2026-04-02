@@ -658,6 +658,7 @@ fn sandbox_workspace_volume_mount(
     Ok(Some(StackVolumeMount {
         tag: "vz-mount-0".to_string(),
         host_path,
+        guest_path: None,
         read_only: false,
     }))
 }
@@ -797,18 +798,61 @@ async fn boot_runtime_sandbox_resources(
     cpus: Option<u8>,
     memory_mb: Option<u64>,
     labels: &BTreeMap<String, String>,
+    explicit_mounts: &[vz_runtime_proto::runtime_v2::VolumeMount],
+    disk_image_path: Option<std::path::PathBuf>,
     request_id: &str,
 ) -> Result<(), Status> {
     let mut volume_mounts = Vec::new();
-    if let Some(workspace_mount) = sandbox_workspace_volume_mount(labels, request_id)? {
-        volume_mounts.push(workspace_mount);
+
+    if explicit_mounts.is_empty() {
+        // Legacy path: derive a single workspace mount from labels.
+        if let Some(workspace_mount) = sandbox_workspace_volume_mount(labels, request_id)? {
+            volume_mounts.push(workspace_mount);
+        }
+    } else {
+        // New path: use explicitly provided mounts from the request.
+        for mount in explicit_mounts {
+            let host_path = PathBuf::from(&mount.host_path);
+            if !host_path.is_absolute() {
+                return Err(status_from_machine_error(MachineError::new(
+                    MachineErrorCode::ValidationError,
+                    format!(
+                        "volume mount host_path must be absolute: {}",
+                        mount.host_path
+                    ),
+                    Some(request_id.to_string()),
+                    BTreeMap::new(),
+                )));
+            }
+            if !host_path.exists() {
+                return Err(status_from_machine_error(MachineError::new(
+                    MachineErrorCode::ValidationError,
+                    format!(
+                        "volume mount host_path does not exist: {}",
+                        mount.host_path
+                    ),
+                    Some(request_id.to_string()),
+                    BTreeMap::new(),
+                )));
+            }
+            volume_mounts.push(StackVolumeMount {
+                tag: mount.tag.clone(),
+                host_path,
+                guest_path: if mount.guest_path.is_empty() {
+                    None
+                } else {
+                    Some(mount.guest_path.clone())
+                },
+                read_only: mount.read_only,
+            });
+        }
     }
 
     let resources = StackResourceHint {
         cpus,
         memory_mb,
         volume_mounts,
-        disk_image_path: None,
+        disk_image_path,
     };
 
     match daemon

@@ -119,6 +119,7 @@ async fn connect_retries_until_daemon_cold_start_is_ready() {
             cpus: 0,
             memory_mb: 0,
             labels: required_sandbox_labels(&tmp),
+            ..Default::default()
         })
         .await
         .expect_err("empty stack name should fail validation");
@@ -206,6 +207,7 @@ async fn reconnect_after_daemon_restart_yields_new_handshake() {
             cpus: 0,
             memory_mb: 0,
             labels: required_sandbox_labels(&tmp),
+            ..Default::default()
         })
         .await
         .expect_err("empty stack name should fail validation");
@@ -232,6 +234,7 @@ async fn create_sandbox_stream_emits_progress_and_completion() {
             cpus: 1,
             memory_mb: 256,
             labels: required_sandbox_labels(&tmp),
+            ..Default::default()
         })
         .await
         .expect("create sandbox stream");
@@ -301,6 +304,7 @@ async fn create_sandbox_with_metadata_preserves_receipt_header_from_stream_compl
             cpus: 1,
             memory_mb: 256,
             labels: required_sandbox_labels(&tmp),
+            ..Default::default()
         })
         .await;
     if !cfg!(target_os = "linux") {
@@ -343,6 +347,7 @@ async fn create_sandbox_stream_terminal_error_is_mapped_to_invalid_argument() {
                 "project_dir".to_string(),
                 "relative/not-absolute".to_string(),
             )]),
+            ..Default::default()
         })
         .await
         .expect("create sandbox stream should start");
@@ -381,6 +386,7 @@ async fn create_sandbox_stream_terminal_error_is_mapped_to_invalid_argument() {
                 "project_dir".to_string(),
                 "relative/not-absolute".to_string(),
             )]),
+            ..Default::default()
         })
         .await
         .expect_err("unary compatibility wrapper should map stream terminal error");
@@ -556,6 +562,7 @@ async fn heartbeat_lease_round_trip_and_signal_exec_missing_returns_not_found() 
             cpus: 1,
             memory_mb: 128,
             labels: required_sandbox_labels(&tmp),
+            ..Default::default()
         })
         .await;
     if !cfg!(target_os = "linux") {
@@ -867,6 +874,7 @@ async fn file_mutation_rpc_methods_are_covered() {
             cpus: 1,
             memory_mb: 128,
             labels: required_sandbox_labels(&tmp),
+            ..Default::default()
         })
         .await;
     if !cfg!(target_os = "linux") {

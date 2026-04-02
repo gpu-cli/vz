@@ -8,6 +8,8 @@ pub mod cache;
 pub mod checkpoint;
 #[cfg(target_os = "macos")]
 pub mod cleanup;
+#[cfg(target_os = "macos")]
+pub mod dev;
 pub mod debug;
 pub mod diff;
 pub mod docker;

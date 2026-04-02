@@ -113,7 +113,12 @@ pub fn write_oci_bundle(
 
     let rootfs_path_in_spec = if rootfs_dir.is_absolute() {
         // Absolute path: embed directly in config.json, no symlink needed.
-        ensure_runtime_paths_for_spec(rootfs_dir, &spec)?;
+        // Only pre-create paths if the rootfs is on the local host filesystem.
+        // When using a shared VM, rootfs_dir may be a guest-side path (e.g.,
+        // /run/vz-oci/containers/.../merged) that doesn't exist on the host.
+        if rootfs_dir.exists() {
+            ensure_runtime_paths_for_spec(rootfs_dir, &spec)?;
+        }
         rootfs_dir.to_string_lossy().into_owned()
     } else {
         // Relative path: create a symlink at <bundle>/rootfs.

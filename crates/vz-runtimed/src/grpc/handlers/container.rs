@@ -295,6 +295,29 @@ fn build_runtime_run_config(
         }
     }
 
+    // `vz run` stores VirtioFS mount targets as labels (vz.run.mount.vz-mount-N=/path).
+    // Add them as bind mounts so the container sees the VirtioFS shares.
+    for (key, guest_path) in &sandbox.labels {
+        if let Some(tag) = key.strip_prefix("vz.run.mount.") {
+            run_config.mounts.push(MountSpec {
+                source: Some(PathBuf::from(format!("/mnt/{tag}"))),
+                target: PathBuf::from(guest_path),
+                mount_type: MountType::Bind,
+                access: MountAccess::ReadWrite,
+                subpath: None,
+            });
+        }
+    }
+
+    // Use vz.run.workspace label as default working directory.
+    if run_config.working_dir.is_none() {
+        if let Some(workspace) = sandbox.labels.get("vz.run.workspace") {
+            if !workspace.trim().is_empty() {
+                run_config.working_dir = Some(workspace.clone());
+            }
+        }
+    }
+
     Ok(run_config)
 }
 
