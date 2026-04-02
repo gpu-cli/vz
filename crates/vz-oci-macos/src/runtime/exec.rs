@@ -232,11 +232,14 @@ impl Runtime {
             format!("--uts=/proc/{pid}/ns/uts"),
             format!("--root=/proc/{pid}/root"),
         ];
-        if let Some(ref working_dir) = exec.working_dir
-            && !working_dir.is_empty()
-        {
-            nsenter_args.push(format!("--wd={working_dir}"));
-        }
+        // Always set --wd to avoid inheriting the guest agent's CWD which
+        // sits on a stacked overlay+VirtioFS mount where getcwd() fails.
+        let wd = exec
+            .working_dir
+            .as_deref()
+            .filter(|d| !d.is_empty())
+            .unwrap_or("/");
+        nsenter_args.push(format!("--wd={wd}"));
         nsenter_args.push("--".to_string());
 
         // Build env export prefix for merged environment.

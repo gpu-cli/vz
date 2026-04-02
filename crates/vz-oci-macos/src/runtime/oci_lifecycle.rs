@@ -86,6 +86,7 @@ impl OciLifecycleOps for LinuxVm {
                 format!("--ipc=/proc/{pid}/ns/ipc"),
                 format!("--uts=/proc/{pid}/ns/uts"),
                 format!("--root=/proc/{pid}/root"),
+                "--wd=/".to_string(),
                 "--".to_string(),
                 command,
             ];

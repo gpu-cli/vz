@@ -558,6 +558,7 @@ impl Runtime {
                             "nsenter".to_string(),
                             format!("--mount=/proc/{pid}/ns/mnt"),
                             format!("--root=/proc/{pid}/root"),
+                            "--wd=/".to_string(),
                             "--".to_string(),
                             "/bin/sh".to_string(),
                             "-c".to_string(),

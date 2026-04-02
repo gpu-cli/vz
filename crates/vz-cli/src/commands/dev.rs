@@ -700,7 +700,10 @@ async fn exec_streaming(
             metadata: None,
             container_id: container_id.to_string(),
             cmd: vec!["/bin/sh".to_string()],
-            args: vec!["-lc".to_string(), command.to_string()],
+            args: vec![
+                "-c".to_string(),
+                format!("cd / && {command}"),
+            ],
             env_override: HashMap::new(),
             timeout_secs: 3600,
             pty_mode: runtime_v2::create_execution_request::PtyMode::Disabled as i32,
