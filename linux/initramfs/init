@@ -11,6 +11,17 @@ mount -t tmpfs tmpfs /tmp
 
 mkdir -p /run /mnt/rootfs /mnt/merged
 
+# Create device nodes that devtmpfs may not auto-populate.
+# /dev/kvm: needed for nested virtualization (Firecracker, QEMU).
+# /dev/net/tun: needed for tap networking (Firecracker guest NICs).
+if [ -e /sys/devices/virtual/misc/kvm ] && [ ! -e /dev/kvm ]; then
+  /bin/busybox mknod /dev/kvm c 10 232 2>/dev/null || true
+fi
+if [ -e /sys/class/misc/tun ] && [ ! -e /dev/net/tun ]; then
+  mkdir -p /dev/net
+  /bin/busybox mknod /dev/net/tun c 10 200 2>/dev/null || true
+fi
+
 # Optional runtime binary share (host-provided youki artifact).
 mkdir -p /mnt/oci-runtime-bin
 
@@ -57,6 +68,15 @@ switch_root_into_overlay_rootfs() {
   mount -t sysfs sysfs "$ROOTFS/sys" || return 1
   mount -t devtmpfs devtmpfs "$ROOTFS/dev" || true
   mount -t tmpfs tmpfs "$ROOTFS/tmp" || return 1
+
+  # Create device nodes that devtmpfs may not auto-populate in the chroot.
+  if [ -e /sys/devices/virtual/misc/kvm ] && [ ! -e "$ROOTFS/dev/kvm" ]; then
+    /bin/busybox mknod "$ROOTFS/dev/kvm" c 10 232 2>/dev/null || true
+  fi
+  if [ -e /sys/class/misc/tun ] && [ ! -e "$ROOTFS/dev/net/tun" ]; then
+    mkdir -p "$ROOTFS/dev/net"
+    /bin/busybox mknod "$ROOTFS/dev/net/tun" c 10 200 2>/dev/null || true
+  fi
 
   # Mount cgroup2 for OCI container runtime (youki) support.
   mkdir -p "$ROOTFS/sys/fs/cgroup"

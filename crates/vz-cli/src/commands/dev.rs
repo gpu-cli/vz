@@ -258,7 +258,14 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
     let container_id = resolve_container(&mut client, &sandbox_id).await?;
 
     // Build the shell command with env vars and working directory.
-    let shell_command = args.command.join(" ");
+    // Each argument is shell-quoted so that multi-word args (e.g. `sh -c 'echo hello'`)
+    // are preserved when the command string is passed through `/bin/sh -c`.
+    let shell_command = args
+        .command
+        .iter()
+        .map(|arg| shell_words::quote(arg).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut env_map = config.env.clone();
 
     // Ensure HOME is always set — many tools (rustup, npm, etc.) depend on it.
@@ -283,7 +290,7 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
 
     let env_prefix: String = env_map
         .iter()
-        .map(|(k, v)| format!("export {}={}", k, shell_escape(v)))
+        .map(|(k, v)| format!("export {}={}", k, shell_words::quote(v)))
         .collect::<Vec<_>>()
         .join("; ");
 
@@ -866,12 +873,3 @@ fn parse_memory(raw: Option<&str>) -> anyhow::Result<u64> {
     }
 }
 
-fn shell_escape(s: &str) -> String {
-    if s.chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '/' || c == '.' || c == ':')
-    {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', "'\\''"))
-    }
-}
