@@ -276,7 +276,7 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
             cmd: vec!["/bin/sh".to_string()],
             args: vec!["-c".to_string(), full_command],
             env_override: HashMap::new(),
-            timeout_secs: 0,
+            timeout_secs: 3600,
             pty_mode,
         })
         .await
@@ -648,7 +648,7 @@ async fn exec_streaming(
             cmd: vec!["/bin/sh".to_string()],
             args: vec!["-lc".to_string(), command.to_string()],
             env_override: HashMap::new(),
-            timeout_secs: 0,
+            timeout_secs: 3600,
             pty_mode: runtime_v2::create_execution_request::PtyMode::Disabled as i32,
         })
         .await
@@ -666,7 +666,7 @@ async fn exec_streaming(
         })
         .await?;
 
-    let mut exit_code = 0i32;
+    let mut exit_code: Option<i32> = None;
     while let Some(event) = stream.message().await? {
         match event.payload {
             Some(runtime_v2::exec_output_event::Payload::Stdout(bytes)) => {
@@ -678,12 +678,14 @@ async fn exec_streaming(
                 let _ = std::io::stderr().flush();
             }
             Some(runtime_v2::exec_output_event::Payload::ExitCode(code)) => {
-                exit_code = code;
+                exit_code = Some(code);
             }
             _ => {}
         }
     }
-    Ok(exit_code)
+    // If no exit code event was received (e.g., timeout or disconnection),
+    // treat as failure rather than silently succeeding.
+    Ok(exit_code.unwrap_or(1))
 }
 
 // ── Utilities ──────────────────────────────────────────────────────
