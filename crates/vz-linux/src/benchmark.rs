@@ -200,7 +200,7 @@ where
             });
 
             match vm
-                .exec_capture(
+                .exec_collect(
                     "sh".to_string(),
                     vec!["-lc".to_string(), command.clone()],
                     config.guest_log_timeout,

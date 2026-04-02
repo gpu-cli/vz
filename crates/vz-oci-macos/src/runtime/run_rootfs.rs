@@ -508,7 +508,7 @@ impl Runtime {
 
         let exec_timeout = timeout.unwrap_or(self.config.exec_timeout);
         let exec = vm
-            .exec_capture_with_options(
+            .exec_collect_with_options(
                 command.clone(),
                 args.to_vec(),
                 exec_timeout,

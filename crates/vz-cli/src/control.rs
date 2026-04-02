@@ -271,7 +271,11 @@ async fn handle_control_exec(
         user,
     };
 
-    match client.exec(cmd, args, options).await {
+    let result = async {
+        let stream = client.exec_stream(cmd, args, options).await?;
+        Ok::<_, vz_linux::LinuxError>(stream.collect().await)
+    };
+    match result.await {
         Ok(output) => ControlResponse::ExecResult {
             exit_code: output.exit_code,
             stdout: output.stdout,

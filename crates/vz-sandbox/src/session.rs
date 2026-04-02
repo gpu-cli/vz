@@ -268,7 +268,10 @@ impl SandboxSession {
                 user: Some(resolve_exec_user(user).to_string()),
             };
 
-            let exec_future = client.exec(command, args, options);
+            let exec_future = async {
+                let stream = client.exec_stream(command, args, options).await?;
+                Ok::<_, vz_linux::LinuxError>(stream.collect().await)
+            };
 
             if let Some(duration) = timeout {
                 tokio::time::timeout(duration, exec_future)

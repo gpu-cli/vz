@@ -177,7 +177,7 @@ pub(super) async fn ensure_interactive_exec_pty_prerequisites(
         fi";
 
     match vm
-        .exec_capture(
+        .exec_collect(
             "/bin/busybox".to_string(),
             vec!["sh".to_string(), "-lc".to_string(), prep_script.to_string()],
             prep_timeout,

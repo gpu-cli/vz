@@ -15,10 +15,10 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 use tracing::debug;
 use vz::Vm;
-use vz::protocol::{ExecOutput, OciContainerState, OciExecResult};
+use vz::protocol::{ExecOutput, OciContainerState};
 use vz_agent_proto::{
     ExecRequest as ProtoExecRequest, NetworkSetupRequest, NetworkTeardownRequest, OciCreateRequest,
-    OciDeleteRequest, OciExecRequest, OciKillRequest, OciStartRequest, OciStateRequest,
+    OciDeleteRequest, OciKillRequest, OciStartRequest, OciStateRequest,
     PingRequest, PortForwardFrame, PortForwardOpen, ResizeExecPtyRequest, ResourceStatsRequest,
     ResourceStatsResponse, SignalRequest, StdinCloseRequest, StdinWriteRequest, SystemInfoRequest,
     SystemInfoResponse, TransportMetadata as ProtoTransportMetadata,
@@ -205,86 +205,6 @@ impl GrpcAgentClient {
         Ok(response.into_inner())
     }
 
-    /// Execute a command in the guest and collect all output.
-    ///
-    /// Sends an `Exec` RPC and consumes the server-streamed response,
-    /// assembling stdout/stderr chunks into a single [`ExecOutput`].
-    pub async fn exec(
-        &mut self,
-        command: String,
-        args: Vec<String>,
-        options: ExecOptions,
-    ) -> Result<ExecOutput, LinuxError> {
-        let env = options.env.into_iter().collect::<HashMap<String, String>>();
-        let metadata = self.next_transport_metadata(Some(RuntimeOperation::ExecContainer));
-        let mut last_sequence = 0;
-        let mut expected_request_id = if metadata.request_id.is_empty() {
-            None
-        } else {
-            Some(metadata.request_id.clone())
-        };
-
-        let request = ProtoExecRequest {
-            command,
-            args,
-            working_dir: options.working_dir.unwrap_or_default(),
-            env,
-            user: options.user.unwrap_or_default(),
-            metadata: Some(metadata),
-            allocate_pty: false,
-            term_rows: 0,
-            term_cols: 0,
-        };
-
-        let response = self.agent.exec(request).await?;
-        let mut stream = response.into_inner();
-
-        let mut stdout_bytes = Vec::new();
-        let mut stderr_bytes = Vec::new();
-
-        loop {
-            match stream.message().await? {
-                Some(event) => {
-                    validate_exec_event_metadata(
-                        &mut last_sequence,
-                        &mut expected_request_id,
-                        event.sequence,
-                        event.request_id.as_str(),
-                    )?;
-                    match event.event {
-                        Some(exec_event::Event::Stdout(data)) => {
-                            stdout_bytes.extend_from_slice(&data);
-                        }
-                        Some(exec_event::Event::Stderr(data)) => {
-                            stderr_bytes.extend_from_slice(&data);
-                        }
-                        Some(exec_event::Event::ExitCode(code)) => {
-                            return Ok(ExecOutput {
-                                exit_code: code,
-                                stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
-                                stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
-                            });
-                        }
-                        Some(exec_event::Event::Error(msg)) => {
-                            return Err(LinuxError::Protocol(format!(
-                                "guest exec failed to start: {msg}"
-                            )));
-                        }
-                        None => {
-                            // Empty event frame, skip.
-                        }
-                    }
-                }
-                None => {
-                    // Stream ended without an exit code.
-                    return Err(LinuxError::Protocol(
-                        "exec stream ended without exit code".to_string(),
-                    ));
-                }
-            }
-        }
-    }
-
     /// Execute a command in the guest and return a streaming handle.
     ///
     /// Unlike [`exec`](Self::exec), this does not buffer the output.
@@ -336,7 +256,8 @@ impl GrpcAgentClient {
         options: ExecOptions,
     ) -> Result<ExecOutput, LinuxError> {
         let (command, args) = buildctl_guest_command(args);
-        self.exec(command, args, options).await
+        let stream = self.exec_stream(command, args, options).await?;
+        Ok(stream.collect().await)
     }
 
     /// Execute `buildctl` inside the guest and stream output events.
@@ -427,37 +348,6 @@ impl GrpcAgentClient {
             } else {
                 Some(state.bundle_path)
             },
-        })
-    }
-
-    /// Execute a command inside a running OCI container.
-    pub async fn oci_exec(
-        &mut self,
-        id: String,
-        command: String,
-        args: Vec<String>,
-        options: OciExecOptions,
-    ) -> Result<OciExecResult, LinuxError> {
-        let env = options.env.into_iter().collect::<HashMap<String, String>>();
-        let metadata = self.next_transport_metadata(Some(RuntimeOperation::ExecContainer));
-
-        let response = self
-            .oci
-            .exec(OciExecRequest {
-                container_id: id,
-                command,
-                args,
-                env,
-                working_dir: options.cwd.unwrap_or_default(),
-                user: options.user.unwrap_or_default(),
-                metadata: Some(metadata),
-            })
-            .await?;
-        let result = response.into_inner();
-        Ok(OciExecResult {
-            exit_code: result.exit_code,
-            stdout: result.stdout,
-            stderr: result.stderr,
         })
     }
 

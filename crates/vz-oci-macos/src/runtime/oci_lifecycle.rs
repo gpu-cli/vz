@@ -38,7 +38,7 @@ pub(super) fn parse_signal_number(signal: &str) -> Option<i32> {
 pub(super) trait OciLifecycleOps {
     fn oci_create<'a>(&'a self, id: String, bundle_path: String) -> OciLifecycleFuture<'a, ()>;
     fn oci_start<'a>(&'a self, id: String) -> OciLifecycleFuture<'a, ()>;
-    fn oci_exec<'a>(
+    fn exec_in_container<'a>(
         &'a self,
         id: String,
         command: String,
@@ -63,16 +63,39 @@ impl OciLifecycleOps for LinuxVm {
         Box::pin(async move { self.oci_start(id).await.map_err(OciError::from) })
     }
 
-    fn oci_exec<'a>(
+    fn exec_in_container<'a>(
         &'a self,
         id: String,
         command: String,
         args: Vec<String>,
-        options: OciExecOptions,
+        _options: OciExecOptions,
     ) -> OciLifecycleFuture<'a, ExecOutput> {
         Box::pin(async move {
+            // Use streaming exec via nsenter instead of unary oci_exec RPC.
+            let state = self.oci_state(id.clone()).await.map_err(OciError::from)?;
+            let pid = state.pid.ok_or_else(|| {
+                OciError::InvalidConfig(format!(
+                    "container '{id}' has no running pid for exec"
+                ))
+            })?;
+            let mut nsenter_args = vec![
+                "nsenter".to_string(),
+                format!("--mount=/proc/{pid}/ns/mnt"),
+                format!("--net=/proc/{pid}/ns/net"),
+                format!("--pid=/proc/{pid}/ns/pid"),
+                format!("--ipc=/proc/{pid}/ns/ipc"),
+                format!("--uts=/proc/{pid}/ns/uts"),
+                format!("--root=/proc/{pid}/root"),
+                "--".to_string(),
+                command,
+            ];
+            nsenter_args.extend(args);
             let result = self
-                .oci_exec(id, command, args, options)
+                .exec_collect(
+                    "/bin/busybox".to_string(),
+                    nsenter_args,
+                    Duration::from_secs(300),
+                )
                 .await
                 .map_err(OciError::from)?;
             Ok(ExecOutput {
@@ -113,7 +136,7 @@ pub(super) async fn run_oci_lifecycle(
     }
 
     let exec = vm
-        .oci_exec(container_id.clone(), command, args, options)
+        .exec_in_container(container_id.clone(), command, args, options)
         .await;
     let delete = vm.oci_delete(container_id, true).await;
 
@@ -175,7 +198,7 @@ async fn run_log_rotation_tick(
 ) -> Result<(), OciError> {
     let script = build_log_rotation_script(container_id, rotation);
     let output = vm
-        .exec_capture(
+        .exec_collect(
             "/bin/busybox".to_string(),
             vec!["sh".to_string(), "-c".to_string(), script],
             LOG_ROTATION_COMMAND_TIMEOUT,

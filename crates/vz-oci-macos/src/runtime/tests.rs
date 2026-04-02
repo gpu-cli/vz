@@ -274,7 +274,7 @@ async fn stop_via_oci_runtime_escalates_after_grace_period() {
         fn oci_start<'a>(&'a self, _id: String) -> OciLifecycleFuture<'a, ()> {
             Box::pin(async { Ok(()) })
         }
-        fn oci_exec<'a>(
+        fn exec_in_container<'a>(
             &'a self,
             _id: String,
             _command: String,
@@ -675,7 +675,7 @@ impl OciLifecycleOps for MockOciLifecycleOps {
         })
     }
 
-    fn oci_exec<'a>(
+    fn exec_in_container<'a>(
         &'a self,
         id: String,
         command: String,

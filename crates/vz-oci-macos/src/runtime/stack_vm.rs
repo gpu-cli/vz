@@ -122,7 +122,7 @@ impl Runtime {
 
             // Check if disk already has a filesystem. If not, format it as ext4.
             let blkid_result = vm
-                .exec_capture(
+                .exec_collect(
                     "/bin/busybox".to_string(),
                     vec!["blkid".to_string(), "/dev/vda".to_string()],
                     timeout,
@@ -153,7 +153,7 @@ impl Runtime {
                 // Busybox mke2fs creates ext2 (no -t flag). The ext4 driver
                 // can mount ext2/ext3/ext4, so this is fine.
                 let format_result = vm
-                    .exec_capture(
+                    .exec_collect(
                         "/bin/busybox".to_string(),
                         vec![
                             "mke2fs".to_string(),
@@ -188,7 +188,7 @@ impl Runtime {
 
             // Mount the formatted disk.
             let mount_result = vm
-                .exec_capture(
+                .exec_collect(
                     "/bin/busybox".to_string(),
                     vec![
                         "sh".to_string(),
@@ -404,7 +404,7 @@ impl Runtime {
                 "printf 'nameserver 8.8.8.8\\nnameserver 8.8.4.4\\n' > {guest_rootfs_path}/etc/resolv.conf"
             );
             let _ = vm
-                .exec_capture(
+                .exec_collect(
                     "sh".to_string(),
                     vec!["-c".to_string(), dns_cmd],
                     Duration::from_secs(5),
@@ -439,7 +439,7 @@ impl Runtime {
         if !volume_dirs.is_empty() {
             let mkdir_cmd = format!("/bin/busybox mkdir -p {}", volume_dirs.join(" "));
             let mkdir_result = vm
-                .exec_capture(
+                .exec_collect(
                     "/bin/busybox".to_string(),
                     vec!["sh".to_string(), "-c".to_string(), mkdir_cmd],
                     Duration::from_secs(10),
@@ -543,40 +543,50 @@ impl Runtime {
         // This writes directly into the container's mount namespace after
         // pivot_root, avoiding VirtioFS caching and overlay visibility issues.
         if !run.extra_hosts.is_empty() {
-            tracing::debug!("step 5: write /etc/hosts via oci_exec");
+            tracing::debug!("step 5: write /etc/hosts via nsenter streaming exec");
             let mut printf_content = String::from("127.0.0.1\\tlocalhost\\n::1\\tlocalhost\\n");
             for (hostname, ip) in &run.extra_hosts {
                 printf_content.push_str(&format!("{ip}\\t{hostname}\\n"));
             }
-            let hosts_result = tokio::time::timeout(
-                Duration::from_secs(30),
-                vm.oci_exec(
-                    oci_container_id.clone(),
-                    "/bin/sh".to_string(),
-                    vec![
-                        "-c".to_string(),
-                        format!("printf '{printf_content}' > /etc/hosts"),
-                    ],
-                    OciExecOptions::default(),
-                ),
-            )
-            .await;
+            // Get the container's init PID for nsenter.
+            let hosts_result = match vm.oci_state(oci_container_id.clone()).await {
+                Ok(state) if state.pid.is_some() => {
+                    let pid = state.pid.unwrap();
+                    vm.exec_collect(
+                        "/bin/busybox".to_string(),
+                        vec![
+                            "nsenter".to_string(),
+                            format!("--mount=/proc/{pid}/ns/mnt"),
+                            format!("--root=/proc/{pid}/root"),
+                            "--".to_string(),
+                            "/bin/sh".to_string(),
+                            "-c".to_string(),
+                            format!("printf '{printf_content}' > /etc/hosts"),
+                        ],
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    .map_err(OciError::from)
+                }
+                Ok(_) => Err(OciError::InvalidConfig(format!(
+                    "container '{}' has no running pid for /etc/hosts write",
+                    oci_container_id
+                ))),
+                Err(e) => Err(OciError::from(e)),
+            };
             match hosts_result {
-                Ok(Ok(r)) if r.exit_code == 0 => {
+                Ok(r) if r.exit_code == 0 => {
                     tracing::debug!("step 5 OK: /etc/hosts written");
                 }
-                Ok(Ok(r)) => {
+                Ok(r) => {
                     tracing::warn!(
                         exit_code = r.exit_code,
                         stderr = %r.stderr.trim(),
                         "step 5: /etc/hosts write returned non-zero"
                     );
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     tracing::warn!(error = %e, "step 5: /etc/hosts write failed");
-                }
-                Err(_) => {
-                    tracing::warn!("step 5: /etc/hosts write timed out");
                 }
             }
         }
@@ -736,7 +746,7 @@ impl Runtime {
                 OciError::InvalidConfig(format!("no shared VM running for stack '{stack_id}'"))
             })?;
 
-        let result = vm.exec_capture(command, args, timeout).await?;
+        let result = vm.exec_collect(command, args, timeout).await?;
 
         Ok(ExecOutput {
             exit_code: result.exit_code,

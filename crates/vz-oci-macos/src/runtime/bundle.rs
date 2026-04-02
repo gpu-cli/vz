@@ -260,7 +260,7 @@ pub(super) async fn setup_guest_container_overlay(
          echo 2 > /proc/sys/vm/drop_caches 2>/dev/null || true"
     );
     let _ = vm
-        .exec_capture(
+        .exec_collect(
             "sh".to_string(),
             vec!["-c".to_string(), cleanup_cmd],
             Duration::from_secs(5),
@@ -278,7 +278,7 @@ pub(super) async fn setup_guest_container_overlay(
     );
 
     let result = vm
-        .exec_capture(
+        .exec_collect(
             "sh".to_string(),
             vec!["-c".to_string(), overlay_cmd],
             Duration::from_secs(10),

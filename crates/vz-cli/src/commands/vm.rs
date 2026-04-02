@@ -1033,7 +1033,7 @@ async fn run_linux_host_boot(args: LinuxVmRunArgs) -> anyhow::Result<()> {
                 ..Default::default()
             };
             let exec_output = vm
-                .exec_capture_with_options_streaming(
+                .exec_streaming_with_options(
                     "/bin/sh".to_string(),
                     vec!["-lc".to_string(), guest_command],
                     exec_timeout,

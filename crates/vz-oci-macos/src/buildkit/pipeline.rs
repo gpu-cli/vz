@@ -1302,7 +1302,7 @@ async fn run_buildctl(
     let mut stderr_started = false;
 
     let output = vm
-        .exec_capture_streaming(
+        .exec_streaming(
             "/bin/busybox".to_string(),
             {
                 let mut args = vec![
@@ -1438,7 +1438,7 @@ async fn run_guest_command(
     timeout: Duration,
 ) -> Result<(), BuildkitError> {
     let output = vm
-        .exec_capture(command.to_string(), args, timeout)
+        .exec_collect(command.to_string(), args, timeout)
         .await
         .map_err(BuildkitError::from)?;
 

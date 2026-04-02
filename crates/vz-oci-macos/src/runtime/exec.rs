@@ -271,7 +271,7 @@ impl Runtime {
         let options = ExecOptions::default();
 
         let result = vm
-            .exec_capture_with_options_streaming(
+            .exec_streaming_with_options(
                 "/bin/busybox".to_string(),
                 {
                     let mut full_args = vec!["nsenter".to_string()];
@@ -423,17 +423,10 @@ impl Runtime {
 
         let timeout = exec.timeout.unwrap_or(self.config.exec_timeout);
 
-        let result = tokio::time::timeout(
-            timeout,
-            vm.exec_capture(command.clone(), args.to_vec(), timeout),
-        )
-        .await
-        .map_err(|_| {
-            OciError::InvalidConfig(format!(
-                "host exec timed out after {:.3}s",
-                timeout.as_secs_f64()
-            ))
-        })??;
+        let result = vm
+            .exec_collect(command.clone(), args.to_vec(), timeout)
+            .await
+            .map_err(OciError::from)?;
 
         Ok(ExecOutput {
             exit_code: result.exit_code,

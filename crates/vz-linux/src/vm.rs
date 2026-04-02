@@ -6,11 +6,11 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::debug;
 use vz::Vm;
-use vz::protocol::{ExecEvent, ExecOutput, NetworkServiceConfig, OciContainerState, OciExecResult};
+use vz::protocol::{ExecEvent, ExecOutput, NetworkServiceConfig, OciContainerState};
 use vz_agent_proto::SystemInfoResponse;
 
-use crate::grpc_client::{GrpcAgentClient, GrpcPortForwardStream};
-use crate::{ExecOptions, LinuxError, LinuxVmConfig, OciExecOptions};
+use crate::grpc_client::{GrpcAgentClient, GrpcExecStream, GrpcPortForwardStream};
+use crate::{ExecOptions, LinuxError, LinuxVmConfig};
 
 const AGENT_POLL_INITIAL: Duration = Duration::from_millis(50);
 const AGENT_POLL_MAX: Duration = Duration::from_secs(1);
@@ -252,42 +252,77 @@ impl LinuxVm {
         Ok(())
     }
 
-    /// Run a command on the guest and capture buffered output.
-    pub async fn exec_capture(
+    /// Run a command on the guest and return a streaming handle.
+    ///
+    /// The returned [`GrpcExecStream`] yields [`ExecEvent`](vz::protocol::ExecEvent)
+    /// values as they arrive from the guest agent. Call `.collect()` on the
+    /// stream when you only need the final `ExecOutput`.
+    pub async fn exec_stream(
+        &self,
+        command: String,
+        args: Vec<String>,
+    ) -> Result<GrpcExecStream, LinuxError> {
+        self.exec_stream_with_options(command, args, ExecOptions::default())
+            .await
+    }
+
+    /// Run a command on the guest with explicit execution options and return a streaming handle.
+    pub async fn exec_stream_with_options(
+        &self,
+        command: String,
+        args: Vec<String>,
+        options: ExecOptions,
+    ) -> Result<GrpcExecStream, LinuxError> {
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
+        client.exec_stream(command, args, options).await
+    }
+
+    /// Run a command on the guest, collect output via streaming, with a timeout.
+    ///
+    /// Convenience wrapper: opens a stream, collects all events, applies timeout.
+    /// Equivalent to `exec_stream().collect()` with a timeout guard.
+    pub async fn exec_collect(
         &self,
         command: String,
         args: Vec<String>,
         timeout: Duration,
     ) -> Result<ExecOutput, LinuxError> {
-        self.exec_capture_with_options(command, args, timeout, ExecOptions::default())
-            .await
+        tokio::time::timeout(timeout, async {
+            let stream: GrpcExecStream = self.exec_stream(command, args).await?;
+            Ok::<ExecOutput, LinuxError>(stream.collect().await)
+        })
+        .await
+        .map_err(|_| {
+            LinuxError::Protocol(format!("exec timed out after {:.3}s", timeout.as_secs_f64()))
+        })?
     }
 
-    /// Run a command on the guest with explicit execution options.
-    pub async fn exec_capture_with_options(
+    /// Run a command on the guest with explicit execution options, collect output via streaming.
+    pub async fn exec_collect_with_options(
         &self,
         command: String,
         args: Vec<String>,
         timeout: Duration,
         options: ExecOptions,
     ) -> Result<ExecOutput, LinuxError> {
-        self.ensure_grpc().await?;
-        let mut grpc = self.grpc.lock().await;
-        let client = grpc
-            .as_mut()
-            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
-        tokio::time::timeout(timeout, client.exec(command, args, options))
-            .await
-            .map_err(|_| {
-                LinuxError::Protocol(format!(
-                    "exec timed out after {:.3}s",
-                    timeout.as_secs_f64()
-                ))
-            })?
+        tokio::time::timeout(timeout, async {
+            let stream: GrpcExecStream = self
+                .exec_stream_with_options(command, args, options)
+                .await?;
+            Ok::<ExecOutput, LinuxError>(stream.collect().await)
+        })
+        .await
+        .map_err(|_| {
+            LinuxError::Protocol(format!("exec timed out after {:.3}s", timeout.as_secs_f64()))
+        })?
     }
 
-    /// Run a command on the guest and stream output events while buffering final output.
-    pub async fn exec_capture_streaming<F>(
+    /// Run a command on the guest, stream output events via callback, collect final output.
+    pub async fn exec_streaming<F>(
         &self,
         command: String,
         args: Vec<String>,
@@ -297,7 +332,7 @@ impl LinuxVm {
     where
         F: FnMut(&ExecEvent),
     {
-        self.exec_capture_with_options_streaming(
+        self.exec_streaming_with_options(
             command,
             args,
             timeout,
@@ -307,8 +342,8 @@ impl LinuxVm {
         .await
     }
 
-    /// Run a command with explicit execution options and stream output events.
-    pub async fn exec_capture_with_options_streaming<F>(
+    /// Run a command with explicit execution options and stream output events via callback.
+    pub async fn exec_streaming_with_options<F>(
         &self,
         command: String,
         args: Vec<String>,
@@ -319,15 +354,9 @@ impl LinuxVm {
     where
         F: FnMut(&ExecEvent),
     {
-        self.ensure_grpc().await?;
-        let mut grpc = self.grpc.lock().await;
-        let client = grpc
-            .as_mut()
-            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
-
-        tokio::time::timeout(timeout, async move {
-            let mut stream = client.exec_stream(command, args, options).await?;
-            let mut stdout_bytes = Vec::new();
+        tokio::time::timeout(timeout, async {
+            let mut stream: GrpcExecStream = self.exec_stream_with_options(command, args, options).await?;
+            let mut stdout_bytes: Vec<u8> = Vec::new();
             let mut stderr_bytes = Vec::new();
             let mut saw_exit = false;
             let mut exit_code = -1;
@@ -428,22 +457,6 @@ impl LinuxVm {
             }
         }
         state_result
-    }
-
-    /// Execute a command in a running guest OCI container.
-    pub async fn oci_exec(
-        &self,
-        id: String,
-        command: String,
-        args: Vec<String>,
-        options: OciExecOptions,
-    ) -> Result<OciExecResult, LinuxError> {
-        self.ensure_grpc().await?;
-        let mut grpc = self.grpc.lock().await;
-        let client = grpc
-            .as_mut()
-            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
-        client.oci_exec(id, command, args, options).await
     }
 
     /// Signal a running container in the guest OCI runtime.
