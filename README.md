@@ -22,59 +22,31 @@ Typical use cases:
 
 ## Install
 
-### Install from source (recommended)
+```bash
+curl -sSf https://raw.githubusercontent.com/gpu-cli/vz/main/scripts/install.sh | sh
+```
+
+This installs pre-built binaries (signed + notarized) and the Linux kernel to `~/.vz/bin/`.
+Requires macOS on Apple Silicon.
+
+Options:
+- `VZ_VERSION=0.3.0` — pin a specific version
+- `VZ_NO_LINUX=1` — skip Linux kernel download
+
+### Install from source
 
 ```bash
-# Requires Rust 1.85+ and macOS on Apple Silicon
+# Requires Rust 1.85+
 cargo install --git https://github.com/gpu-cli/vz.git vz-cli
-
-# Sign the binary with required Virtualization.framework entitlements
-vz self-sign
+vz self-sign  # apply Virtualization.framework entitlements
 ```
 
-### Clone and build
+### Build the Linux kernel (for source installs)
 
 ```bash
-git clone https://github.com/gpu-cli/vz.git
-cd vz/crates
-cargo build --workspace --release
-
-# Sign the built binaries
-../scripts/sign-dev.sh
+cd linux && make docker-build  # requires Docker
+mkdir -p ~/.vz/linux && cp linux/out/{vmlinux,initramfs.img,youki,version.json} ~/.vz/linux/
 ```
-
-The built binaries are in `crates/target/release/vz` and `crates/target/release/vz-guest-agent`.
-
-### Build the Linux kernel and initramfs
-
-VM commands (`vz vm linux run`, sandboxes) require a Linux kernel and initramfs.
-These are built via Docker (handles cross-compilation and build dependencies):
-
-```bash
-# Requires Docker — builds kernel 6.12, busybox, guest agent, and youki
-cd linux && make docker-build
-```
-
-Output goes to `linux/out/` (`vmlinux`, `initramfs.img`, `youki`, `version.json`).
-
-Install the artifacts to the default location:
-
-```bash
-mkdir -p ~/.vz/linux
-cp linux/out/{vmlinux,initramfs.img,youki,version.json} ~/.vz/linux/
-```
-
-Then initialize a Linux VM image:
-
-```bash
-vz vm linux init --name my-vm
-```
-
-### macOS code signing
-
-All VM commands require the `com.apple.security.virtualization` entitlement.
-`vz self-sign` applies an ad-hoc signature that works on the local machine.
-Pre-built releases (when available) ship with Developer ID signatures and Apple notarization.
 
 ## Platform support
 
@@ -83,53 +55,50 @@ Pre-built releases (when available) ship with Developer ID signatures and Apple 
 
 ## Quick start
 
-### 1. Boot an instant sandbox
+### 1. Run commands in a Linux VM
 
 ```bash
-# Create a required checked-in space definition
-cat > vz.json <<'JSON'
-{
-  "name": "my-workspace"
-}
-JSON
+cd your-project
 
-# Create + attach a new sandbox for the current directory
-vz --name my-workspace --cpus 4 --memory 4096 \
-  --base-image debian:bookworm \
-  --main-container workspace-main
+# Generate a vz.json config (auto-detects Rust, Node, Python, Go)
+vz init
 
-# Inspect persisted startup selection
-vz inspect my-workspace
+# Run any command inside the Linux VM
+vz run echo "hello from Linux"
+
+# Compile and run a Rust project
+vz run cargo build
+vz run cargo test
+
+# Open an interactive shell
+vz run -i bash
+
+# Check VM status
+vz status
+
+# Stop the VM when done
+vz stop
 ```
 
-`--base-image` and `--main-container` apply when creating a new sandbox (`vz` with no `-c/-r`).
-Spaces mode requires `vz.json` and Linux btrfs-backed workspace storage.
-`vz.json` must not embed raw secrets; use external env references under `secrets` instead:
+The first `vz run` boots a Linux VM (~3s), pulls the base image, and runs setup commands from `vz.json`. Subsequent runs reuse the VM and skip setup (cached by hash).
+
+#### vz.json
 
 ```json
 {
-  "secrets": {
-    "db_password": { "env": "DB_PASSWORD" }
-  }
+  "image": "ubuntu:24.04",
+  "workspace": "/workspace",
+  "mounts": [{ "source": ".", "target": "/workspace" }],
+  "setup": [
+    "apt-get update",
+    "apt-get install -y build-essential curl"
+  ],
+  "env": { "PATH": "/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin" },
+  "resources": { "cpus": 4, "memory": "8G" }
 }
 ```
 
-### 2. Manage sandboxes
-
-```bash
-# Continue or resume
-vz -c
-vz -r my-workspace
-
-# List and inspect
-vz ls
-vz inspect my-workspace
-
-# Remove a sandbox
-vz rm my-workspace
-```
-
-### 3. Run a Compose stack
+### 2. Run a Compose stack
 
 ```bash
 # Start services
@@ -147,7 +116,7 @@ Stack networking defaults to service identity inside the stack network.
 Host-facing port publishing is explicit opt-in via Compose host bindings
 (`HOST:CONTAINER`); container-only ports remain internal.
 
-### 4. Manage macOS VMs (macOS only)
+### 3. Manage macOS VMs (macOS only)
 
 ```bash
 # Create a pinned base image from the stable channel
@@ -175,7 +144,7 @@ vz vm save dev --stop
 vz vm run --image ~/.vz/images/base.img --name dev --restore ~/.vz/state/dev.vzsave --headless &
 ```
 
-### 5. Pinned-base automation policy (macOS VM flows)
+### 4. Pinned-base automation policy (macOS VM flows)
 
 - `vz vm init --base <selector>`, `vz vm provision --base-id <selector>`, and `vz vm base verify --base-id <selector>` accept immutable base IDs plus channel aliases (`stable`, `previous`).
 - Base descriptors include support lifecycle metadata (`active` or `retired`); selecting a retired or unknown base fails with explicit fallback guidance.
@@ -191,7 +160,7 @@ vz vm init --allow-unpinned --ipsw ~/Downloads/restore.ipsw
 sudo vz vm provision --image ~/.vz/images/base.img --allow-unpinned
 ```
 
-### 6. Create signed patch bundles
+### 5. Create signed patch bundles
 
 ```bash
 # Generate an Ed25519 signing key (PKCS#8 PEM)
@@ -214,7 +183,7 @@ sudo vz vm patch apply --bundle /tmp/patch-1.vzpatch --image ~/.vz/images/base.i
 
 For advanced CI workflows, `vz vm patch create` also supports `--operations <json>` + `--payload-dir <dir>`.
 
-### 7. Primary image-delta patch flow (sudo once, then sudoless apply)
+### 6. Primary image-delta patch flow (sudo once, then sudoless apply)
 
 ```bash
 # 1) Create a binary image delta from a signed bundle (runs bundle apply on a temp image copy)
@@ -234,6 +203,10 @@ vz vm run --image ~/.vz/images/base-patched.img --name delta-test --headless
 ```
 
 ## Command groups
+
+### Dev environments
+
+`init`, `run`, `run -i`, `stop`, `status`, `logs`
 
 ### Containers
 
