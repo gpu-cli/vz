@@ -4,9 +4,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use oci_spec::runtime::{
-    Capability, LinuxCapabilities, LinuxCapabilitiesBuilder, LinuxCpuBuilder, LinuxNamespaceType,
-    LinuxPidsBuilder, LinuxResourcesBuilder, Mount, MountBuilder, PosixRlimit, PosixRlimitBuilder,
-    PosixRlimitType, ProcessBuilder, RootBuilder, Spec, SpecBuilder, User, UserBuilder, VERSION,
+    Capability, LinuxCapabilities, LinuxCapabilitiesBuilder, LinuxCpuBuilder, LinuxDeviceBuilder,
+    LinuxDeviceType, LinuxNamespaceType, LinuxPidsBuilder, LinuxResourcesBuilder, Mount,
+    MountBuilder, PosixRlimit, PosixRlimitBuilder, PosixRlimitType, ProcessBuilder, RootBuilder,
+    Spec, SpecBuilder, User, UserBuilder, VERSION,
 };
 
 use crate::error::OciError;
@@ -318,6 +319,10 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
     if !sysctls.is_empty() {
         set_sysctls(&mut spec, sysctls);
     }
+
+    // Always expose /dev/kvm and /dev/net/tun when available in the host VM kernel.
+    // These are needed for nested virtualization (Firecracker) and tap networking.
+    set_default_devices(&mut spec);
 
     Ok(spec)
 }
@@ -764,6 +769,36 @@ fn parse_capability_name(name: &str) -> Option<Capability> {
         "WAKE_ALARM" => Some(Capability::WakeAlarm),
         _ => None,
     }
+}
+
+/// Add /dev/kvm and /dev/net/tun to the OCI spec so youki creates them
+/// during container setup. These are always useful when the host VM kernel
+/// supports them — no user configuration needed.
+fn set_default_devices(spec: &mut Spec) {
+    let Some(linux) = spec.linux_mut() else {
+        return;
+    };
+
+    let devices = vec![
+        LinuxDeviceBuilder::default()
+            .path("/dev/kvm")
+            .typ(LinuxDeviceType::C)
+            .major(10)
+            .minor(232)
+            .file_mode(0o666u32)
+            .build()
+            .expect("valid /dev/kvm device spec"),
+        LinuxDeviceBuilder::default()
+            .path("/dev/net/tun")
+            .typ(LinuxDeviceType::C)
+            .major(10)
+            .minor(200)
+            .file_mode(0o666u32)
+            .build()
+            .expect("valid /dev/net/tun device spec"),
+    ];
+
+    linux.set_devices(Some(devices));
 }
 
 /// Set sysctl parameters on the OCI spec's linux section.

@@ -97,11 +97,6 @@ struct VzConfig {
     /// Resource limits.
     #[serde(default)]
     resources: ResourceConfig,
-
-    /// Device nodes to create inside the container (e.g., "/dev/kvm", "/dev/net/tun").
-    /// These are created via mknod at container start using the host VM's device metadata.
-    #[serde(default)]
-    devices: Vec<String>,
 }
 
 fn default_image() -> String {
@@ -664,7 +659,7 @@ fn ensure_project_disk(sandbox_id: &str) -> anyhow::Result<PathBuf> {
 
 /// Compute a setup hash over the full vz.json config.
 ///
-/// Includes image, setup commands, devices, and resources so that
+/// Includes image, setup commands, and resources so that
 /// changes to any of these trigger re-execution of setup.
 fn compute_setup_hash(config: &VzConfig) -> String {
     let mut hasher = Sha256::new();
@@ -672,11 +667,6 @@ fn compute_setup_hash(config: &VzConfig) -> String {
     hasher.update(b"\n");
     for cmd in &config.setup {
         hasher.update(cmd.as_bytes());
-        hasher.update(b"\n");
-    }
-    for dev in &config.devices {
-        hasher.update(b"dev:");
-        hasher.update(dev.as_bytes());
         hasher.update(b"\n");
     }
     if let Some(cpus) = config.resources.cpus {
@@ -756,27 +746,6 @@ async fn run_setup_if_needed(
         )
         .await;
         return Ok(());
-    }
-
-    // Create requested device nodes before running user setup commands.
-    if !config.devices.is_empty() {
-        let device_cmds: Vec<String> = config
-            .devices
-            .iter()
-            .map(|dev| {
-                // Read major:minor from /proc/misc or /sys for well-known devices.
-                // For now, handle the common cases directly.
-                match dev.as_str() {
-                    "/dev/kvm" => "mknod /dev/kvm c 10 232 2>/dev/null || true".to_string(),
-                    "/dev/net/tun" => "mkdir -p /dev/net && mknod /dev/net/tun c 10 200 2>/dev/null || true".to_string(),
-                    _ => format!("echo 'unsupported device: {dev}'"),
-                }
-            })
-            .collect();
-
-        for cmd in &device_cmds {
-            let _ = exec_quiet(client, &container_id, cmd).await;
-        }
     }
 
     eprintln!("Running setup commands...");
