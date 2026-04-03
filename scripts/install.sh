@@ -144,16 +144,21 @@ install_linux_artifacts() {
     local base_url="https://github.com/$REPO/releases/download/v${version}"
     local tarball_name="vz-linux-v${version}-arm64.tar.gz"
 
-    # Check if Linux artifacts are already at this version.
-    if [ -f "$LINUX_DIR/version.json" ]; then
-        local current_kernel_hash
-        current_kernel_hash="$(python3 -c "import json; print(json.load(open('$LINUX_DIR/version.json'))['sha256_vmlinux'])" 2>/dev/null || echo "")"
-        if [ -n "$current_kernel_hash" ] && [ -f "$LINUX_DIR/vmlinux" ]; then
-            local actual_hash
-            actual_hash="$(shasum -a 256 "$LINUX_DIR/vmlinux" | awk '{print $1}')"
-            if [ "$current_kernel_hash" = "$actual_hash" ]; then
-                echo "Linux artifacts already up to date."
-                return
+    # Check if Linux artifacts are already at this version by comparing the
+    # installed kernel version against the release version.json from GitHub.
+    if [ -f "$LINUX_DIR/version.json" ] && [ -f "$LINUX_DIR/vmlinux" ]; then
+        local remote_version_json
+        remote_version_json="$(curl -sSfL "$base_url/version.json" 2>/dev/null || echo "")"
+        if [ -n "$remote_version_json" ]; then
+            local remote_kernel_hash
+            remote_kernel_hash="$(echo "$remote_version_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['sha256_vmlinux'])" 2>/dev/null || echo "")"
+            if [ -n "$remote_kernel_hash" ]; then
+                local local_kernel_hash
+                local_kernel_hash="$(shasum -a 256 "$LINUX_DIR/vmlinux" | awk '{print $1}')"
+                if [ "$remote_kernel_hash" = "$local_kernel_hash" ]; then
+                    echo "Linux artifacts already up to date."
+                    return
+                fi
             fi
         fi
     fi
