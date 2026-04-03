@@ -17,7 +17,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tracing::debug;
 use vz_runtime_proto::runtime_v2;
-use vz_runtimed_client::DaemonClient;
+use vz_runtimed_client::{DaemonClient, DaemonClientError};
 
 use super::runtime_daemon::{connect_control_plane_for_state_db, default_state_db_path};
 
@@ -61,6 +61,10 @@ pub struct DevStopArgs {
     /// Path to vz.json (default: search cwd and parents).
     #[arg(long)]
     pub config: Option<PathBuf>,
+
+    /// Stop all running `vz run` sandboxes (not just current project).
+    #[arg(long)]
+    pub all: bool,
 }
 
 // ── vz.json schema ─────────────────────────────────────────────────
@@ -93,6 +97,11 @@ struct VzConfig {
     /// Resource limits.
     #[serde(default)]
     resources: ResourceConfig,
+
+    /// Device nodes to create inside the container (e.g., "/dev/kvm", "/dev/net/tun").
+    /// These are created via mknod at container start using the host VM's device metadata.
+    #[serde(default)]
+    devices: Vec<String>,
 }
 
 fn default_image() -> String {
@@ -135,6 +144,16 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
     )?;
 
     let volume_mounts = build_volume_mounts(&config, &project_dir)?;
+
+    // --fresh: delete persistent disk so the container starts with a clean filesystem.
+    if args.fresh {
+        let run_dir = home_dir()?.join(".vz").join("run").join(&sandbox_id);
+        let disk_path = run_dir.join("disk.img");
+        if disk_path.exists() {
+            let _ = std::fs::remove_file(&disk_path);
+        }
+    }
+
     let disk_image_path = ensure_project_disk(&sandbox_id)?;
 
     let state_db = default_state_db_path();
@@ -307,6 +326,10 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
         runtime_v2::create_execution_request::PtyMode::Disabled as i32
     };
 
+    // Keep copies for potential retry on terminal state conflict.
+    let retry_container_id = container_id.clone();
+    let retry_full_command = full_command.clone();
+
     let execution = client
         .create_execution(runtime_v2::CreateExecutionRequest {
             metadata: None,
@@ -387,13 +410,49 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
         None
     };
 
-    let mut stream = client
+    let stream_result = client
         .stream_exec_output(runtime_v2::StreamExecOutputRequest {
-            execution_id,
+            execution_id: execution_id.clone(),
             metadata: None,
         })
-        .await
-        .context("failed to stream execution output")?;
+        .await;
+
+    // If the execution is already in a terminal state (e.g., from a previous failed run),
+    // create a fresh execution and retry. This recovers from stale state_conflict errors
+    // without requiring a manual daemon kill.
+    let is_terminal_err = stream_result.as_ref().err().is_some_and(is_terminal_state_error);
+    let mut stream = match stream_result {
+        Ok(s) => s,
+        Err(_) if is_terminal_err => {
+            debug!(execution_id = %execution_id, "execution in terminal state, creating fresh execution");
+            let retry = client
+                .create_execution(runtime_v2::CreateExecutionRequest {
+                    metadata: None,
+                    container_id: retry_container_id,
+                    cmd: vec!["/bin/sh".to_string()],
+                    args: vec!["-c".to_string(), retry_full_command],
+                    env_override: HashMap::new(),
+                    timeout_secs: 3600,
+                    pty_mode,
+                })
+                .await
+                .context("failed to create retry execution")?;
+
+            let retry_id = retry
+                .execution
+                .ok_or_else(|| anyhow!("daemon missing execution payload on retry"))?
+                .execution_id;
+
+            client
+                .stream_exec_output(runtime_v2::StreamExecOutputRequest {
+                    execution_id: retry_id,
+                    metadata: None,
+                })
+                .await
+                .context("failed to stream retry execution output")?
+        }
+        Err(e) => return Err(e).context("failed to stream execution output"),
+    };
 
     let mut exit_code = 0i32;
     while let Some(event) = stream
@@ -440,14 +499,40 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
 }
 
 pub async fn cmd_stop(args: DevStopArgs) -> anyhow::Result<()> {
-    let (_config, project_dir) = load_config(args.config.as_deref())?;
-    let sandbox_id = sandbox_id_for_project(&project_dir);
-
     let state_db = default_state_db_path();
     let mut client = connect_control_plane_for_state_db(&state_db).await?;
 
-    terminate_sandbox(&mut client, &sandbox_id).await?;
-    eprintln!("Stopped VM for {}", project_dir.display());
+    if args.all {
+        // Stop all vz-run sandboxes.
+        let response = client
+            .list_sandboxes(runtime_v2::ListSandboxesRequest { metadata: None })
+            .await
+            .context("failed to list sandboxes")?;
+
+        let run_sandboxes: Vec<_> = response
+            .sandboxes
+            .iter()
+            .filter(|s| s.sandbox_id.starts_with("vz-run-"))
+            .filter(|s| s.state == "ready" || s.state == "active")
+            .collect();
+
+        if run_sandboxes.is_empty() {
+            eprintln!("No running `vz run` VMs found.");
+            return Ok(());
+        }
+
+        for sandbox in &run_sandboxes {
+            let _ = terminate_sandbox(&mut client, &sandbox.sandbox_id).await;
+            eprintln!("Stopped {}", sandbox.sandbox_id);
+        }
+        eprintln!("Stopped {} VM(s).", run_sandboxes.len());
+    } else {
+        let (_config, project_dir) = load_config(args.config.as_deref())?;
+        let sandbox_id = sandbox_id_for_project(&project_dir);
+        terminate_sandbox(&mut client, &sandbox_id).await?;
+        eprintln!("Stopped VM for {}", project_dir.display());
+    }
+
     Ok(())
 }
 
@@ -577,12 +662,28 @@ fn ensure_project_disk(sandbox_id: &str) -> anyhow::Result<PathBuf> {
 
 // ── Setup caching ──────────────────────────────────────────────────
 
-/// Compute the setup hash for a set of commands.
-fn compute_setup_hash(commands: &[String]) -> String {
+/// Compute a setup hash over the full vz.json config.
+///
+/// Includes image, setup commands, devices, and resources so that
+/// changes to any of these trigger re-execution of setup.
+fn compute_setup_hash(config: &VzConfig) -> String {
     let mut hasher = Sha256::new();
-    for cmd in commands {
+    hasher.update(config.image.as_bytes());
+    hasher.update(b"\n");
+    for cmd in &config.setup {
         hasher.update(cmd.as_bytes());
         hasher.update(b"\n");
+    }
+    for dev in &config.devices {
+        hasher.update(b"dev:");
+        hasher.update(dev.as_bytes());
+        hasher.update(b"\n");
+    }
+    if let Some(cpus) = config.resources.cpus {
+        hasher.update(format!("cpus:{cpus}\n").as_bytes());
+    }
+    if let Some(ref mem) = config.resources.memory {
+        hasher.update(format!("mem:{mem}\n").as_bytes());
     }
     hasher.finalize()[..8]
         .iter()
@@ -626,7 +727,7 @@ async fn run_setup_if_needed(
         return Ok(());
     }
 
-    let setup_hash = compute_setup_hash(&config.setup);
+    let setup_hash = compute_setup_hash(config);
 
     // Check guest-side hash first (persistent disk), then host-side fallback.
     let container_id = resolve_container(client, sandbox_id).await?;
@@ -655,6 +756,27 @@ async fn run_setup_if_needed(
         )
         .await;
         return Ok(());
+    }
+
+    // Create requested device nodes before running user setup commands.
+    if !config.devices.is_empty() {
+        let device_cmds: Vec<String> = config
+            .devices
+            .iter()
+            .map(|dev| {
+                // Read major:minor from /proc/misc or /sys for well-known devices.
+                // For now, handle the common cases directly.
+                match dev.as_str() {
+                    "/dev/kvm" => "mknod /dev/kvm c 10 232 2>/dev/null || true".to_string(),
+                    "/dev/net/tun" => "mkdir -p /dev/net && mknod /dev/net/tun c 10 200 2>/dev/null || true".to_string(),
+                    _ => format!("echo 'unsupported device: {dev}'"),
+                }
+            })
+            .collect();
+
+        for cmd in &device_cmds {
+            let _ = exec_quiet(client, &container_id, cmd).await;
+        }
     }
 
     eprintln!("Running setup commands...");
@@ -852,6 +974,17 @@ fn home_dir() -> anyhow::Result<PathBuf> {
     std::env::var("HOME")
         .map(PathBuf::from)
         .context("HOME environment variable not set")
+}
+
+/// Check if a daemon client error is a "terminal state" conflict
+/// that can be recovered by creating a new execution.
+fn is_terminal_state_error(error: &DaemonClientError) -> bool {
+    matches!(
+        error,
+        DaemonClientError::Grpc(status)
+            if status.code() == tonic::Code::FailedPrecondition
+                && status.message().contains("terminal state")
+    )
 }
 
 fn parse_memory(raw: Option<&str>) -> anyhow::Result<u64> {
