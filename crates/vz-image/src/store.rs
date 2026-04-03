@@ -1023,15 +1023,12 @@ fn fix_ownership(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Produce a short deterministic hash for a reference string.
+/// Produce a deterministic SHA-256 hash for a reference string.
 fn hash_reference(reference: &str) -> String {
-    // Simple FNV-1a-style hash — sufficient for deduplication, not for crypto.
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in reference.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+    use sha2::{Digest, Sha256};
+
+    let hash = Sha256::digest(reference.as_bytes());
+    format!("{hash:x}")
 }
 
 /// Recursively deep-copy a directory tree.

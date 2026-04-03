@@ -14,7 +14,7 @@ use anyhow::{Context, anyhow, bail};
 use clap::Args;
 use crossterm::terminal;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use tracing::debug;
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed_client::{DaemonClient, DaemonClientError};
@@ -230,6 +230,13 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
             config.workspace.clone(),
         );
 
+        // Pass setup commands as indexed labels for the backend to
+        // execute once and commit. Subsequent boots reuse the committed
+        // rootfs automatically.
+        for (i, cmd) in config.setup.iter().enumerate() {
+            labels.insert(format!("vz.setup.{i}"), cmd.clone());
+        }
+
         let mut stream = client
             .create_sandbox_stream(runtime_v2::CreateSandboxRequest {
                 metadata: None,
@@ -271,21 +278,6 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
             );
         }
 
-        // Run setup commands if needed.
-        // When --fresh, force re-run by clearing any cached hashes.
-        if args.fresh {
-            if let Ok(path) = host_setup_hash_path(&sandbox_id) {
-                let _ = std::fs::remove_file(path);
-            }
-            let container_id = resolve_container(&mut client, &sandbox_id).await?;
-            let _ = exec_quiet(
-                &mut client,
-                &container_id,
-                "rm -f /run/vz-oci/volumes/.vz-setup-hash",
-            )
-            .await;
-        }
-        run_setup_if_needed(&mut client, &sandbox_id, &config).await?;
     }
 
     // Resolve the container for this sandbox.
@@ -675,123 +667,6 @@ fn ensure_project_disk(sandbox_id: &str) -> anyhow::Result<PathBuf> {
     Ok(disk_path)
 }
 
-// ── Setup caching ──────────────────────────────────────────────────
-
-/// Compute a setup hash over the full vz.json config.
-///
-/// Includes image, setup commands, and resources so that
-/// changes to any of these trigger re-execution of setup.
-fn compute_setup_hash(config: &VzConfig) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(config.image.as_bytes());
-    hasher.update(b"\n");
-    for cmd in &config.setup {
-        hasher.update(cmd.as_bytes());
-        hasher.update(b"\n");
-    }
-    if let Some(cpus) = config.resources.cpus {
-        hasher.update(format!("cpus:{cpus}\n").as_bytes());
-    }
-    if let Some(ref mem) = config.resources.memory {
-        hasher.update(format!("mem:{mem}\n").as_bytes());
-    }
-    hasher.finalize()[..8]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>()
-}
-
-/// Host-side path for the setup hash fallback.
-fn host_setup_hash_path(sandbox_id: &str) -> anyhow::Result<PathBuf> {
-    Ok(home_dir()?
-        .join(".vz")
-        .join("run")
-        .join(sandbox_id)
-        .join(".vz-setup-hash"))
-}
-
-/// Check if setup hash matches on host (fallback) or guest (primary).
-fn check_host_setup_hash(sandbox_id: &str, expected: &str) -> bool {
-    host_setup_hash_path(sandbox_id)
-        .ok()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .is_some_and(|content| content.trim() == expected)
-}
-
-/// Write setup hash to the host-side fallback location.
-fn write_host_setup_hash(sandbox_id: &str, hash: &str) {
-    if let Ok(path) = host_setup_hash_path(sandbox_id) {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(path, hash);
-    }
-}
-
-async fn run_setup_if_needed(
-    client: &mut DaemonClient,
-    sandbox_id: &str,
-    config: &VzConfig,
-) -> anyhow::Result<()> {
-    if config.setup.is_empty() {
-        return Ok(());
-    }
-
-    let setup_hash = compute_setup_hash(config);
-
-    // Check guest-side hash first (persistent disk), then host-side fallback.
-    let container_id = resolve_container(client, sandbox_id).await?;
-    let guest_match = exec_quiet(
-        client,
-        &container_id,
-        "cat /run/vz-oci/volumes/.vz-setup-hash 2>/dev/null",
-    )
-    .await
-    .is_ok_and(|output| output.trim() == setup_hash);
-
-    if guest_match {
-        debug!(hash = %setup_hash, "setup already complete (guest hash match), skipping");
-        return Ok(());
-    }
-
-    if check_host_setup_hash(sandbox_id, &setup_hash) {
-        debug!(hash = %setup_hash, "setup already complete (host hash match), skipping");
-        // Re-write guest hash so future checks are fast.
-        let _ = exec_quiet(
-            client,
-            &container_id,
-            &format!(
-                "mkdir -p /run/vz-oci/volumes && printf '%s' '{setup_hash}' > /run/vz-oci/volumes/.vz-setup-hash"
-            ),
-        )
-        .await;
-        return Ok(());
-    }
-
-    eprintln!("Running setup commands...");
-    for (i, cmd) in config.setup.iter().enumerate() {
-        eprintln!("  [{}/{}] {}", i + 1, config.setup.len(), cmd);
-        let exit_code = exec_streaming(client, &container_id, cmd).await?;
-        if exit_code != 0 {
-            bail!("setup command failed with exit code {exit_code}: {cmd}");
-        }
-    }
-
-    // Write the hash marker to both guest and host.
-    exec_quiet(
-        client,
-        &container_id,
-        &format!(
-            "mkdir -p /run/vz-oci/volumes && printf '%s' '{setup_hash}' > /run/vz-oci/volumes/.vz-setup-hash"
-        ),
-    )
-    .await?;
-    write_host_setup_hash(sandbox_id, &setup_hash);
-
-    eprintln!("Setup complete.");
-    Ok(())
-}
-
 /// Filter out the harmless `getcwd() failed` warning from stderr.
 ///
 /// The Linux kernel's `getcwd()` syscall cannot resolve the dentry path
@@ -860,101 +735,6 @@ async fn terminate_sandbox(
     {}
 
     Ok(())
-}
-
-async fn exec_quiet(
-    client: &mut DaemonClient,
-    container_id: &str,
-    command: &str,
-) -> anyhow::Result<String> {
-    let execution = client
-        .create_execution(runtime_v2::CreateExecutionRequest {
-            metadata: None,
-            container_id: container_id.to_string(),
-            cmd: vec!["/bin/sh".to_string()],
-            args: vec!["-c".to_string(), command.to_string()],
-            env_override: HashMap::new(),
-            timeout_secs: 60,
-            pty_mode: runtime_v2::create_execution_request::PtyMode::Disabled as i32,
-        })
-        .await
-        .context("exec failed")?;
-
-    let execution_id = execution
-        .execution
-        .ok_or_else(|| anyhow!("missing execution payload"))?
-        .execution_id;
-
-    let mut stream = client
-        .stream_exec_output(runtime_v2::StreamExecOutputRequest {
-            execution_id,
-            metadata: None,
-        })
-        .await?;
-
-    let mut stdout = String::new();
-    while let Some(event) = stream.message().await? {
-        if let Some(runtime_v2::exec_output_event::Payload::Stdout(bytes)) = event.payload {
-            stdout.push_str(&String::from_utf8_lossy(&bytes));
-        }
-    }
-    Ok(stdout)
-}
-
-async fn exec_streaming(
-    client: &mut DaemonClient,
-    container_id: &str,
-    command: &str,
-) -> anyhow::Result<i32> {
-    let execution = client
-        .create_execution(runtime_v2::CreateExecutionRequest {
-            metadata: None,
-            container_id: container_id.to_string(),
-            cmd: vec!["/bin/sh".to_string()],
-            args: vec![
-                "-c".to_string(),
-                format!("cd / && {command}"),
-            ],
-            env_override: HashMap::from([
-                ("HOME".to_string(), "/root".to_string()),
-            ]),
-            timeout_secs: 3600,
-            pty_mode: runtime_v2::create_execution_request::PtyMode::Disabled as i32,
-        })
-        .await
-        .context("exec failed")?;
-
-    let execution_id = execution
-        .execution
-        .ok_or_else(|| anyhow!("missing execution payload"))?
-        .execution_id;
-
-    let mut stream = client
-        .stream_exec_output(runtime_v2::StreamExecOutputRequest {
-            execution_id,
-            metadata: None,
-        })
-        .await?;
-
-    let mut exit_code: Option<i32> = None;
-    while let Some(event) = stream.message().await? {
-        match event.payload {
-            Some(runtime_v2::exec_output_event::Payload::Stdout(bytes)) => {
-                let _ = std::io::stdout().write_all(&bytes);
-                let _ = std::io::stdout().flush();
-            }
-            Some(runtime_v2::exec_output_event::Payload::Stderr(bytes)) => {
-                write_filtered_stderr(&bytes);
-            }
-            Some(runtime_v2::exec_output_event::Payload::ExitCode(code)) => {
-                exit_code = Some(code);
-            }
-            _ => {}
-        }
-    }
-    // If no exit code event was received (e.g., timeout or disconnection),
-    // treat as failure rather than silently succeeding.
-    Ok(exit_code.unwrap_or(1))
 }
 
 // ── Utilities ──────────────────────────────────────────────────────

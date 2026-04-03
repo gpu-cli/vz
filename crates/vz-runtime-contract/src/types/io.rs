@@ -175,6 +175,18 @@ pub struct RunConfig {
     /// starting at this offset so tags don't collide between services
     /// (e.g., service A gets `vz-mount-0`, service B gets `vz-mount-2`).
     pub mount_tag_offset: usize,
+    // ── Setup commands ──────────────────────────────────────────
+    /// Shell commands to run once to establish the container environment.
+    ///
+    /// Setup commands install packages, create files, or perform other
+    /// one-time initialization. The runtime commits the resulting
+    /// filesystem state so subsequent executions start from the
+    /// post-setup environment without re-running setup.
+    ///
+    /// Each entry is executed as a separate `sh -c` invocation inside
+    /// the container, in order. If any setup command fails, the run
+    /// fails without committing.
+    pub setup_commands: Vec<String>,
 }
 
 // ── Exec configuration ────────────────────────────────────────────

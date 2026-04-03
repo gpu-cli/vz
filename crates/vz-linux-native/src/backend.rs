@@ -256,34 +256,177 @@ impl RuntimeBackend for LinuxNativeBackend {
             .clone()
             .unwrap_or_else(|| format!("vz-{}", &uuid_short()));
 
-        // Pull image and assemble rootfs.
-        let (rootfs_dir, image_id) = pull_and_assemble(
-            &self.image_puller,
-            &self.image_store,
-            image,
-            &self.config.auth,
-            &container_id,
-        )
-        .await
-        .map_err(native_err)?;
+        let has_setup = !config.setup_commands.is_empty();
 
-        // Apply image config defaults.
-        apply_image_config(&self.image_store, &image_id, &mut config, &container_id)
-            .map_err(native_err)?;
+        // Deterministic commit reference: hash(image + sorted setup commands).
+        let commit_ref = if has_setup {
+            Some(setup_commit_reference(image, &config.setup_commands))
+        } else {
+            None
+        };
 
-        // For one-shot run: create container with init process, start, exec cmd, cleanup.
-        let init = config
-            .init_process
-            .clone()
-            .unwrap_or_else(|| vec!["sleep".to_string(), "infinity".to_string()]);
+        // If a committed rootfs exists for this image+setup combo, use it
+        // directly — skip pull, layer assembly, and setup execution.
+        let used_commit = if let Some(ref cref) = commit_ref {
+            if self.image_store.has_committed_rootfs(cref) {
+                let rootfs_dir = self
+                    .image_store
+                    .assemble_rootfs_from_commit_async(cref, &container_id)
+                    .await
+                    .map_err(|e| RuntimeError::Backend {
+                        message: format!("failed to restore committed rootfs: {e}"),
+                        source: Box::new(e),
+                    })?;
 
-        let mut spec = run_config_to_bundle_spec(&config);
-        spec.cmd = init;
+                let init = config
+                    .init_process
+                    .clone()
+                    .unwrap_or_else(|| vec!["sleep".to_string(), "infinity".to_string()]);
 
-        self.runtime
-            .create_and_start(&container_id, &rootfs_dir, spec)
+                let mut spec = run_config_to_bundle_spec(&config);
+                spec.cmd = init;
+
+                self.runtime
+                    .create_and_start(&container_id, &rootfs_dir, spec)
+                    .await
+                    .map_err(native_err)?;
+
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !used_commit {
+            // Fresh path: pull image, assemble rootfs from layers.
+            let (rootfs_dir, image_id) = pull_and_assemble(
+                &self.image_puller,
+                &self.image_store,
+                image,
+                &self.config.auth,
+                &container_id,
+            )
             .await
             .map_err(native_err)?;
+
+            apply_image_config(&self.image_store, &image_id, &mut config, &container_id)
+                .map_err(native_err)?;
+
+            let init = config
+                .init_process
+                .clone()
+                .unwrap_or_else(|| vec!["sleep".to_string(), "infinity".to_string()]);
+
+            let mut spec = run_config_to_bundle_spec(&config);
+            spec.cmd = init;
+
+            self.runtime
+                .create_and_start(&container_id, &rootfs_dir, spec)
+                .await
+                .map_err(native_err)?;
+
+            // Run setup commands inside the container, then commit.
+            if has_setup {
+                for setup_cmd in &config.setup_commands {
+                    let setup_result = self
+                        .runtime
+                        .exec(
+                            &container_id,
+                            &["sh".to_string(), "-c".to_string(), setup_cmd.clone()],
+                            &config.env,
+                            config.working_dir.as_deref(),
+                            config.user.as_deref(),
+                            config.timeout,
+                        )
+                        .await
+                        .map_err(native_err)?;
+
+                    if setup_result.exit_code != 0 {
+                        let _ = self.runtime.stop(&container_id, true).await;
+                        let _ = self.runtime.delete(&container_id, true).await;
+                        return Err(RuntimeError::Backend {
+                            message: format!(
+                                "setup command failed (exit {}): {}\nstderr: {}",
+                                setup_result.exit_code, setup_cmd, setup_result.stderr,
+                            ),
+                            source: Box::new(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "setup command failed",
+                            )),
+                        });
+                    }
+                }
+
+                // Commit the post-setup rootfs for future runs.
+                if let Some(ref cref) = commit_ref {
+                    // Stop the container so the rootfs is quiesced, then commit.
+                    let _ = self.runtime.stop(&container_id, true).await;
+                    let _ = self.runtime.delete(&container_id, true).await;
+
+                    let commit_result = self
+                        .image_store
+                        .commit_rootfs_async(&container_id, cref)
+                        .await;
+
+                    if let Err(e) = &commit_result {
+                        info!(error = %e, "failed to commit setup rootfs (non-fatal, setup will re-run next time)");
+                    }
+
+                    // Re-create a fresh container from the committed rootfs
+                    // for the actual command execution.
+                    let new_container_id = format!("vz-{}", &uuid_short());
+                    let rootfs_dir = self
+                        .image_store
+                        .assemble_rootfs_from_commit_async(
+                            cref,
+                            &new_container_id,
+                        )
+                        .await
+                        .map_err(|e| RuntimeError::Backend {
+                            message: format!("failed to restore committed rootfs: {e}"),
+                            source: Box::new(e),
+                        })?;
+
+                    let init = config
+                        .init_process
+                        .clone()
+                        .unwrap_or_else(|| vec!["sleep".to_string(), "infinity".to_string()]);
+
+                    let mut spec = run_config_to_bundle_spec(&config);
+                    spec.cmd = init;
+
+                    self.runtime
+                        .create_and_start(&new_container_id, &rootfs_dir, spec)
+                        .await
+                        .map_err(native_err)?;
+
+                    // Exec actual command in the committed container.
+                    let result = self
+                        .runtime
+                        .exec(
+                            &new_container_id,
+                            &config.cmd,
+                            &config.env,
+                            config.working_dir.as_deref(),
+                            config.user.as_deref(),
+                            config.timeout,
+                        )
+                        .await
+                        .map_err(native_err)?;
+
+                    let _ = self.runtime.stop(&new_container_id, true).await;
+                    let _ = self.runtime.delete(&new_container_id, true).await;
+
+                    return Ok(contract::ExecOutput {
+                        exit_code: result.exit_code,
+                        stdout: result.stdout,
+                        stderr: result.stderr,
+                    });
+                }
+            }
+        }
 
         // Exec the actual command.
         let result = self
@@ -320,7 +463,61 @@ impl RuntimeBackend for LinuxNativeBackend {
             .clone()
             .unwrap_or_else(|| format!("vz-{}", &uuid_short()));
 
-        // Pull image and assemble rootfs.
+        let has_setup = !config.setup_commands.is_empty();
+        let commit_ref = if has_setup {
+            Some(setup_commit_reference(image, &config.setup_commands))
+        } else {
+            None
+        };
+
+        // Fast path: committed rootfs exists for this image+setup combo.
+        if let Some(ref cref) = commit_ref {
+            if self.image_store.has_committed_rootfs(cref) {
+                info!(commit_ref = %cref, "using committed rootfs (setup already cached)");
+                let rootfs_dir = self
+                    .image_store
+                    .assemble_rootfs_from_commit_async(cref, &container_id)
+                    .await
+                    .map_err(|e| RuntimeError::Backend {
+                        message: format!("failed to restore committed rootfs: {e}"),
+                        source: Box::new(e),
+                    })?;
+
+                let init = config
+                    .init_process
+                    .clone()
+                    .unwrap_or_else(|| vec!["sleep".to_string(), "infinity".to_string()]);
+
+                let mut spec = run_config_to_bundle_spec(&config);
+                spec.cmd = init;
+
+                self.runtime
+                    .create_and_start(&container_id, &rootfs_dir, spec)
+                    .await
+                    .map_err(native_err)?;
+
+                let info = contract::ContainerInfo {
+                    id: container_id.clone(),
+                    image: image.to_string(),
+                    image_id: String::new(),
+                    status: contract::ContainerStatus::Running,
+                    created_unix_secs: now_unix_secs(),
+                    started_unix_secs: Some(now_unix_secs()),
+                    stopped_unix_secs: None,
+                    rootfs_path: Some(rootfs_dir),
+                    host_pid: None,
+                };
+
+                self.containers
+                    .lock()
+                    .await
+                    .insert(container_id.clone(), TrackedContainer { info });
+
+                return Ok(container_id);
+            }
+        }
+
+        // Cold path: pull image and assemble rootfs from layers.
         let (rootfs_dir, image_id) = pull_and_assemble(
             &self.image_puller,
             &self.image_store,
@@ -331,7 +528,6 @@ impl RuntimeBackend for LinuxNativeBackend {
         .await
         .map_err(native_err)?;
 
-        // Apply image config defaults.
         apply_image_config(&self.image_store, &image_id, &mut config, &container_id)
             .map_err(native_err)?;
 
@@ -348,7 +544,101 @@ impl RuntimeBackend for LinuxNativeBackend {
             .await
             .map_err(native_err)?;
 
-        // Track container.
+        // Run setup commands, commit, and re-create from the committed rootfs.
+        if has_setup {
+            info!(num_commands = config.setup_commands.len(), "running setup commands");
+            for (i, setup_cmd) in config.setup_commands.iter().enumerate() {
+                info!(step = i + 1, total = config.setup_commands.len(), cmd = %setup_cmd, "setup");
+                let setup_result = self
+                    .runtime
+                    .exec(
+                        &container_id,
+                        &["sh".to_string(), "-c".to_string(), setup_cmd.clone()],
+                        &config.env,
+                        config.working_dir.as_deref(),
+                        config.user.as_deref(),
+                        config.timeout,
+                    )
+                    .await
+                    .map_err(native_err)?;
+
+                if setup_result.exit_code != 0 {
+                    let _ = self.runtime.stop(&container_id, true).await;
+                    let _ = self.runtime.delete(&container_id, true).await;
+                    return Err(RuntimeError::Backend {
+                        message: format!(
+                            "setup command failed (exit {}): {}\nstderr: {}",
+                            setup_result.exit_code, setup_cmd, setup_result.stderr,
+                        ),
+                        source: Box::new(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "setup command failed",
+                        )),
+                    });
+                }
+            }
+
+            if let Some(ref cref) = commit_ref {
+                // Stop container to quiesce rootfs, then commit.
+                let _ = self.runtime.stop(&container_id, true).await;
+                let _ = self.runtime.delete(&container_id, true).await;
+
+                match self.image_store.commit_rootfs_async(&container_id, cref).await {
+                    Ok(_) => info!(commit_ref = %cref, "committed setup rootfs"),
+                    Err(e) => info!(error = %e, "failed to commit setup rootfs (non-fatal)"),
+                }
+
+                // Re-create container from committed rootfs so the caller
+                // gets a clean running container with setup baked in.
+                let new_id = config
+                    .container_id
+                    .clone()
+                    .unwrap_or_else(|| format!("vz-{}", &uuid_short()));
+
+                let rootfs_dir = self
+                    .image_store
+                    .assemble_rootfs_from_commit_async(cref, &new_id)
+                    .await
+                    .map_err(|e| RuntimeError::Backend {
+                        message: format!("failed to restore committed rootfs: {e}"),
+                        source: Box::new(e),
+                    })?;
+
+                let init = config
+                    .init_process
+                    .clone()
+                    .unwrap_or_else(|| vec!["sleep".to_string(), "infinity".to_string()]);
+
+                let mut spec = run_config_to_bundle_spec(&config);
+                spec.cmd = init;
+
+                self.runtime
+                    .create_and_start(&new_id, &rootfs_dir, spec)
+                    .await
+                    .map_err(native_err)?;
+
+                let info = contract::ContainerInfo {
+                    id: new_id.clone(),
+                    image: image.to_string(),
+                    image_id: image_id.clone(),
+                    status: contract::ContainerStatus::Running,
+                    created_unix_secs: now_unix_secs(),
+                    started_unix_secs: Some(now_unix_secs()),
+                    stopped_unix_secs: None,
+                    rootfs_path: Some(rootfs_dir),
+                    host_pid: None,
+                };
+
+                self.containers
+                    .lock()
+                    .await
+                    .insert(new_id.clone(), TrackedContainer { info });
+
+                return Ok(new_id);
+            }
+        }
+
+        // No setup — track and return.
         let info = contract::ContainerInfo {
             id: container_id.clone(),
             image: image.to_string(),
@@ -357,7 +647,7 @@ impl RuntimeBackend for LinuxNativeBackend {
             created_unix_secs: now_unix_secs(),
             started_unix_secs: Some(now_unix_secs()),
             stopped_unix_secs: None,
-            rootfs_path: Some(rootfs_dir.clone()),
+            rootfs_path: Some(rootfs_dir),
             host_pid: None,
         };
 
@@ -738,6 +1028,23 @@ impl RuntimeBackend for LinuxNativeBackend {
                 .block_on(async { self.stacks.lock().await.contains_key(stack_id) })
         })
     }
+}
+
+/// Build a deterministic commit reference from image + setup commands.
+///
+/// The reference is stable across runs so the runtime can detect when
+/// a matching committed rootfs already exists and skip re-running setup.
+fn setup_commit_reference(image: &str, setup_commands: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(image.as_bytes());
+    for cmd in setup_commands {
+        hasher.update(b"\x00"); // null separator to prevent collisions
+        hasher.update(cmd.as_bytes());
+    }
+    let hash = format!("{:x}", hasher.finalize());
+    format!("vz-setup:{image}:{hash}")
 }
 
 /// Generate a short pseudo-random ID.

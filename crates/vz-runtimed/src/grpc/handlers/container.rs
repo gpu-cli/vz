@@ -328,6 +328,21 @@ fn build_runtime_run_config(
         run_config.share_host_network = true;
     }
 
+    // Read setup commands from labels (vz.setup.0, vz.setup.1, ...).
+    // These are executed once and committed so subsequent container
+    // creations start from the post-setup filesystem.
+    let mut setup_entries: Vec<(usize, String)> = sandbox
+        .labels
+        .iter()
+        .filter_map(|(key, value)| {
+            key.strip_prefix("vz.setup.")
+                .and_then(|idx| idx.parse::<usize>().ok())
+                .map(|idx| (idx, value.clone()))
+        })
+        .collect();
+    setup_entries.sort_by_key(|(idx, _)| *idx);
+    run_config.setup_commands = setup_entries.into_iter().map(|(_, cmd)| cmd).collect();
+
     Ok(run_config)
 }
 
