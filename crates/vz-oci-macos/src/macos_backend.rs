@@ -32,6 +32,73 @@ impl MacosRuntimeBackend {
         &self.runtime
     }
 
+    /// Execute setup commands inside a running container.
+    ///
+    /// Runs each command as `sh -c <cmd>` in order. If any command
+    /// fails, the container is stopped and removed.
+    async fn run_setup_commands(
+        &self,
+        container_id: &str,
+        commands: &[String],
+        env: &[(String, String)],
+        _working_dir: Option<&str>,
+        user: Option<&str>,
+        _timeout: Option<std::time::Duration>,
+    ) -> Result<(), RuntimeError> {
+        // Setup commands (apt install, rustup, etc.) can take minutes.
+        let setup_timeout = Some(std::time::Duration::from_secs(1800));
+
+        tracing::info!(num_commands = commands.len(), "running setup commands");
+        for (i, cmd) in commands.iter().enumerate() {
+            tracing::info!(step = i + 1, total = commands.len(), cmd = %cmd, "setup");
+            // Ensure HOME is set for setup commands (e.g. rustup uses HOME
+            // to decide where to install). Merge caller env with HOME fallback.
+            let mut setup_env = env.to_vec();
+            if !setup_env.iter().any(|(k, _)| k == "HOME") {
+                setup_env.push(("HOME".to_string(), "/root".to_string()));
+            }
+            let exec_config = contract::ExecConfig {
+                // Prefix with `cd /tmp` so getcwd() resolves — the kernel
+                // can't resolve CWD through stacked overlay+VirtioFS mounts.
+                cmd: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("cd /tmp && {cmd}"),
+                ],
+                env: setup_env,
+                working_dir: Some("/tmp".to_string()),
+                user: user.map(str::to_string),
+                timeout: setup_timeout,
+                ..contract::ExecConfig::default()
+            };
+            let oci_config = exec_config_from_contract(exec_config);
+            let result = self
+                .runtime
+                .exec_container(container_id, oci_config)
+                .await
+                .map(exec_output_to_contract)
+                .map_err(oci_err)?;
+            if result.exit_code != 0 {
+                let _ = self
+                    .stop_container(container_id, true, None, None)
+                    .await;
+                let _ = self.remove_container(container_id).await;
+                return Err(RuntimeError::Backend {
+                    message: format!(
+                        "setup command failed (exit {}): {}\nstderr: {}",
+                        result.exit_code, cmd, result.stderr,
+                    ),
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "setup command failed",
+                    )),
+                });
+            }
+        }
+        tracing::info!("setup commands completed");
+        Ok(())
+    }
+
     pub async fn exec_container_streaming<F>(
         &self,
         id: &str,
@@ -96,11 +163,32 @@ impl RuntimeBackend for MacosRuntimeBackend {
         image: &str,
         config: contract::RunConfig,
     ) -> Result<String, RuntimeError> {
+        let setup_commands = config.setup_commands.clone();
+        let setup_env = config.env.clone();
+        let setup_cwd = config.working_dir.clone();
+        let setup_user = config.user.clone();
+        let setup_timeout = config.timeout;
+
         let oci_config = run_config_from_contract(config);
-        self.runtime
+        let container_id = self
+            .runtime
             .create_container(image, oci_config)
             .await
-            .map_err(oci_err)
+            .map_err(oci_err)?;
+
+        if !setup_commands.is_empty() {
+            self.run_setup_commands(
+                &container_id,
+                &setup_commands,
+                &setup_env,
+                setup_cwd.as_deref(),
+                setup_user.as_deref(),
+                setup_timeout,
+            )
+            .await?;
+        }
+
+        Ok(container_id)
     }
 
     async fn exec_container(
@@ -194,11 +282,33 @@ impl RuntimeBackend for MacosRuntimeBackend {
         image: &str,
         config: contract::RunConfig,
     ) -> Result<String, RuntimeError> {
+        let setup_commands = config.setup_commands.clone();
+        let setup_env = config.env.clone();
+        let setup_cwd = config.working_dir.clone();
+        let setup_user = config.user.clone();
+        let setup_timeout = config.timeout;
+
         let oci_config = run_config_from_contract(config);
-        self.runtime
+        let container_id = self
+            .runtime
             .create_container_in_stack(stack_id, image, oci_config)
             .await
-            .map_err(oci_err)
+            .map_err(oci_err)?;
+
+        // Run setup commands inside the container after creation.
+        if !setup_commands.is_empty() {
+            self.run_setup_commands(
+                &container_id,
+                &setup_commands,
+                &setup_env,
+                setup_cwd.as_deref(),
+                setup_user.as_deref(),
+                setup_timeout,
+            )
+            .await?;
+        }
+
+        Ok(container_id)
     }
 
     async fn network_setup(
