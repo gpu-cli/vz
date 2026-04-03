@@ -511,6 +511,53 @@ pub trait RuntimeBackend: Send + Sync {
     /// List all tracked containers.
     fn list_containers(&self) -> Result<Vec<ContainerInfo>, RuntimeError>;
 
+    // ── Container commit ─────────────────────────────────────────
+
+    /// Commit a running container's filesystem as a reusable snapshot.
+    ///
+    /// After setup commands modify a container's rootfs (installing packages,
+    /// creating files, etc.), calling `commit_container` saves that state so
+    /// future containers can start from the post-setup filesystem instead of
+    /// re-assembling from the base image layers.
+    ///
+    /// Returns a reference string that can be passed to
+    /// [`create_container_from_commit`](Self::create_container_from_commit)
+    /// to start new containers from the committed state.
+    fn commit_container(
+        &self,
+        _id: &str,
+        _reference: &str,
+    ) -> impl Future<Output = Result<String, RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: "commit_container".to_string(),
+                reason: "backend does not support container commits".to_string(),
+            })
+        }
+    }
+
+    /// Check whether a committed rootfs snapshot exists for the given reference.
+    fn has_committed_rootfs(&self, _reference: &str) -> bool {
+        false
+    }
+
+    /// Create a container from a previously committed snapshot.
+    ///
+    /// Instead of pulling an image and assembling layers, this starts from
+    /// the committed rootfs. The container gets its own writable copy.
+    fn create_container_from_commit(
+        &self,
+        _reference: &str,
+        _config: RunConfig,
+    ) -> impl Future<Output = Result<String, RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: "create_container_from_commit".to_string(),
+                reason: "backend does not support container commits".to_string(),
+            })
+        }
+    }
+
     // ── Stack / multi-container support ───────────────────────────
 
     /// Boot a shared runtime environment for multi-container stacks.

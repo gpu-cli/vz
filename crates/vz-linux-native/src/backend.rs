@@ -429,6 +429,117 @@ impl RuntimeBackend for LinuxNativeBackend {
         Ok(())
     }
 
+    // ── Container commit ─────────────────────────────────────────
+
+    async fn commit_container(
+        &self,
+        id: &str,
+        reference: &str,
+    ) -> Result<String, RuntimeError> {
+        // Look up the container's rootfs path and extract the container_id
+        // (last path component) while the lock is held, then drop the lock
+        // before the async commit call.
+        let container_id = {
+            let containers = self.containers.lock().await;
+            let tracked = containers.get(id).ok_or_else(|| RuntimeError::ContainerNotFound {
+                id: id.to_string(),
+            })?;
+            let rootfs_path = tracked
+                .info
+                .rootfs_path
+                .as_ref()
+                .ok_or_else(|| RuntimeError::Backend {
+                    message: format!("container '{id}' has no rootfs path"),
+                    source: Box::new(crate::error::LinuxNativeError::InvalidConfig(
+                        "no rootfs path".to_string(),
+                    )),
+                })?;
+
+            if !rootfs_path.exists() {
+                return Err(RuntimeError::Backend {
+                    message: format!("container rootfs not found: {}", rootfs_path.display()),
+                    source: Box::new(crate::error::LinuxNativeError::InvalidConfig(
+                        "rootfs does not exist".to_string(),
+                    )),
+                });
+            }
+
+            rootfs_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(id)
+                .to_string()
+        };
+
+        self.image_store
+            .commit_rootfs_async(&container_id, reference)
+            .await
+            .map_err(|e| RuntimeError::Backend {
+                message: format!("failed to commit container rootfs: {e}"),
+                source: Box::new(e),
+            })
+    }
+
+    fn has_committed_rootfs(&self, reference: &str) -> bool {
+        self.image_store.has_committed_rootfs(reference)
+    }
+
+    async fn create_container_from_commit(
+        &self,
+        reference: &str,
+        config: contract::RunConfig,
+    ) -> Result<String, RuntimeError> {
+        let container_id = config
+            .container_id
+            .clone()
+            .unwrap_or_else(|| format!("vz-{}", &uuid_short()));
+
+        // Assemble rootfs from the committed snapshot.
+        let rootfs_dir = self
+            .image_store
+            .assemble_rootfs_from_commit_async(reference, &container_id)
+            .await
+            .map_err(|e| RuntimeError::Backend {
+                message: format!("failed to assemble rootfs from commit: {e}"),
+                source: Box::new(e),
+            })?;
+
+        // We don't have the original image config, so only apply defaults
+        // if cmd is empty (use sleep infinity as init).
+        let init = config
+            .init_process
+            .clone()
+            .unwrap_or_else(|| vec!["sleep".to_string(), "infinity".to_string()]);
+
+        let mut spec = run_config_to_bundle_spec(&config);
+        spec.cmd = init;
+
+        self.runtime
+            .create_and_start(&container_id, &rootfs_dir, spec)
+            .await
+            .map_err(native_err)?;
+
+        // Track container.
+        let info = contract::ContainerInfo {
+            id: container_id.clone(),
+            image: format!("commit:{reference}"),
+            image_id: String::new(),
+            status: contract::ContainerStatus::Running,
+            created_unix_secs: now_unix_secs(),
+            started_unix_secs: Some(now_unix_secs()),
+            stopped_unix_secs: None,
+            rootfs_path: Some(rootfs_dir),
+            host_pid: None,
+        };
+
+        self.containers
+            .lock()
+            .await
+            .insert(container_id.clone(), TrackedContainer { info });
+
+        Ok(container_id)
+    }
+
     fn list_containers(&self) -> Result<Vec<contract::ContainerInfo>, RuntimeError> {
         let containers = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async { self.containers.lock().await })

@@ -98,6 +98,7 @@ impl ImageStore {
         fs::create_dir_all(self.layers_dir())?;
         fs::create_dir_all(self.refs_dir())?;
         fs::create_dir_all(self.rootfs_dir_root())?;
+        fs::create_dir_all(self.commits_dir())?;
         Ok(())
     }
 
@@ -511,6 +512,144 @@ impl ImageStore {
         self.rootfs_path(container_id)
     }
 
+    // ── Committed rootfs snapshots ───────────────────────────────
+
+    /// Commit a container's current rootfs as a reusable snapshot.
+    ///
+    /// Copies the rootfs of `source_container_id` into `commits/{commit_id}/`
+    /// and writes a reference so future containers can start from this state
+    /// instead of re-assembling from base image layers.
+    ///
+    /// Returns the commit ID (a `commit:` prefixed hash).
+    pub fn commit_rootfs(&self, source_container_id: &str, reference: &str) -> io::Result<String> {
+        let source_rootfs = self.rootfs_path(source_container_id);
+        if !source_rootfs.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "container rootfs not found: {}",
+                    source_rootfs.display()
+                ),
+            ));
+        }
+
+        let commit_id = format!("commit:{}", hash_reference(reference));
+        let commit_dir = self.commits_dir().join(&commit_id);
+
+        // Remove stale commit if it exists.
+        if commit_dir.exists() {
+            fs::remove_dir_all(&commit_dir)?;
+        }
+        fs::create_dir_all(&commit_dir)?;
+
+        // Deep-copy the rootfs into the commit directory.
+        copy_dir_recursive(&source_rootfs, &commit_dir)?;
+
+        // Write a ref so callers can look up the commit by reference name.
+        self.write_reference(reference, &commit_id)?;
+
+        Ok(commit_id)
+    }
+
+    /// Commit a container's rootfs in a blocking task.
+    pub async fn commit_rootfs_async(
+        &self,
+        source_container_id: &str,
+        reference: &str,
+    ) -> io::Result<String> {
+        let store = self.clone();
+        let source_container_id = source_container_id.to_string();
+        let reference = reference.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            store.commit_rootfs(&source_container_id, &reference)
+        })
+        .await
+        .map_err(|err| io::Error::other(err.to_string()))?
+    }
+
+    /// Check whether a committed rootfs exists for the given reference.
+    pub fn has_committed_rootfs(&self, reference: &str) -> bool {
+        let Ok(image_id) = self.read_reference(reference) else {
+            return false;
+        };
+        if !image_id.starts_with("commit:") {
+            return false;
+        }
+        self.commits_dir().join(&image_id).exists()
+    }
+
+    /// Assemble a container rootfs from a previously committed snapshot.
+    ///
+    /// Copies the committed rootfs into `rootfs/{container_id}/` so the
+    /// container gets its own writable copy while preserving the committed
+    /// state as the starting point.
+    pub fn assemble_rootfs_from_commit(
+        &self,
+        reference: &str,
+        container_id: &str,
+    ) -> io::Result<PathBuf> {
+        let image_id = self.read_reference(reference)?;
+        if !image_id.starts_with("commit:") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("reference '{reference}' is not a committed rootfs"),
+            ));
+        }
+
+        let commit_dir = self.commits_dir().join(&image_id);
+        if !commit_dir.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("committed rootfs not found: {}", commit_dir.display()),
+            ));
+        }
+
+        let rootfs = self.rootfs_path(container_id);
+        if rootfs.exists() {
+            fs::remove_dir_all(&rootfs)?;
+        }
+        fs::create_dir_all(&rootfs)?;
+
+        copy_dir_recursive(&commit_dir, &rootfs)?;
+
+        Ok(rootfs)
+    }
+
+    /// Assemble a container rootfs from a committed snapshot in a blocking task.
+    pub async fn assemble_rootfs_from_commit_async(
+        &self,
+        reference: &str,
+        container_id: &str,
+    ) -> io::Result<PathBuf> {
+        let store = self.clone();
+        let reference = reference.to_string();
+        let container_id = container_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            store.assemble_rootfs_from_commit(&reference, &container_id)
+        })
+        .await
+        .map_err(|err| io::Error::other(err.to_string()))?
+    }
+
+    /// Remove a committed rootfs snapshot and its reference.
+    pub fn remove_commit(&self, reference: &str) -> io::Result<()> {
+        if let Ok(image_id) = self.read_reference(reference) {
+            if image_id.starts_with("commit:") {
+                let commit_dir = self.commits_dir().join(&image_id);
+                if commit_dir.exists() {
+                    fs::remove_dir_all(&commit_dir)?;
+                }
+            }
+        }
+        let ref_path = self.ref_path(reference);
+        if ref_path.exists() {
+            fs::remove_file(&ref_path)?;
+        }
+        Ok(())
+    }
+
     fn manifest_path(&self, image_id: &str) -> PathBuf {
         self.manifests_dir().join(format!("{image_id}.json"))
     }
@@ -581,6 +720,10 @@ impl ImageStore {
 
     fn rootfs_dir_root(&self) -> PathBuf {
         self.base_dir.join("rootfs")
+    }
+
+    fn commits_dir(&self) -> PathBuf {
+        self.base_dir.join("commits")
     }
 
     fn reference_entries(&self) -> io::Result<Vec<ReferenceEntry>> {
@@ -880,6 +1023,49 @@ fn fix_ownership(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Produce a short deterministic hash for a reference string.
+fn hash_reference(reference: &str) -> String {
+    // Simple FNV-1a-style hash — sufficient for deduplication, not for crypto.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in reference.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Recursively deep-copy a directory tree.
+///
+/// Always performs full file copies (not hard-links) so the destination
+/// is an independent snapshot that can be modified without affecting the
+/// source.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+    let mut queue = VecDeque::from([(src.to_path_buf(), dst.to_path_buf())]);
+
+    while let Some((src_dir, dst_dir)) = queue.pop_front() {
+        fs::create_dir_all(&dst_dir)?;
+
+        for entry in fs::read_dir(&src_dir)? {
+            let entry = entry?;
+            let src_path = entry.path();
+            let dst_path = dst_dir.join(entry.file_name());
+            let metadata = fs::symlink_metadata(&src_path)?;
+
+            if metadata.is_dir() {
+                queue.push_back((src_path, dst_path));
+            } else if metadata.file_type().is_symlink() {
+                copy_symlink(&src_path, &dst_path)?;
+            } else {
+                remove_path_if_exists(&dst_path)?;
+                fs::copy(&src_path, &dst_path)?;
+                fs::set_permissions(&dst_path, metadata.permissions())?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct ManifestLayers {
     #[serde(default)]
@@ -1070,6 +1256,57 @@ mod tests {
         assert!(!store.unpacked_layer_dir("sha256:layer-orphan").exists());
         assert!(store.unpacked_layer_dir("sha256:layer-a").exists());
         assert!(store.unpacked_layer_dir("sha256:layer-shared").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn commit_rootfs_creates_snapshot_and_restores_it() {
+        let root = unique_temp_dir("commit-rootfs");
+        let store = ImageStore::new(root.clone());
+        store.ensure_layout().unwrap();
+
+        // Simulate a container rootfs with some files.
+        let container_id = "test-container-1";
+        let rootfs = store.rootfs_path(container_id);
+        fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+        fs::write(rootfs.join("usr/bin/hello"), b"#!/bin/sh\necho hi").unwrap();
+        fs::create_dir_all(rootfs.join("etc")).unwrap();
+        fs::write(rootfs.join("etc/setup-done"), b"1").unwrap();
+
+        // Commit the container's rootfs.
+        let reference = "my-setup:v1";
+        let commit_id = store.commit_rootfs(container_id, reference).unwrap();
+        assert!(commit_id.starts_with("commit:"));
+        assert!(store.has_committed_rootfs(reference));
+
+        // Restore into a new container.
+        let new_container_id = "test-container-2";
+        let new_rootfs = store
+            .assemble_rootfs_from_commit(reference, new_container_id)
+            .unwrap();
+
+        // Verify the new rootfs has the committed files.
+        assert!(new_rootfs.join("usr/bin/hello").exists());
+        assert_eq!(
+            fs::read_to_string(new_rootfs.join("etc/setup-done")).unwrap(),
+            "1"
+        );
+
+        // Verify it's a separate copy (modifying new doesn't affect commit).
+        fs::write(new_rootfs.join("etc/setup-done"), b"2").unwrap();
+        let another_container = "test-container-3";
+        let another_rootfs = store
+            .assemble_rootfs_from_commit(reference, another_container)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(another_rootfs.join("etc/setup-done")).unwrap(),
+            "1"
+        );
+
+        // Test remove_commit.
+        store.remove_commit(reference).unwrap();
+        assert!(!store.has_committed_rootfs(reference));
 
         fs::remove_dir_all(root).unwrap();
     }
