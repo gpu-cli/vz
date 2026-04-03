@@ -61,6 +61,18 @@ message CreateSandboxRequest {
   repeated VolumeMount volume_mounts = 6;
   // Optional path to a persistent disk image (ext4) attached as VirtioBlock.
   string disk_image_path = 7;
+  // Host-to-container port mappings for port forwarding.
+  repeated PortMapping port_mappings = 8;
+}
+
+// Host-to-container port mapping for port forwarding.
+message PortMapping {
+  // Host port to listen on.
+  uint32 host_port = 1;
+  // Container port to forward to.
+  uint32 container_port = 2;
+  // Protocol: "tcp" or "udp".
+  string protocol = 3;
 }
 
 // A host directory to expose inside the shared VM via VirtioFS.

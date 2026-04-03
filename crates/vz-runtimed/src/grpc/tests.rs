@@ -1170,6 +1170,7 @@ async fn create_sandbox_policy_deny_returns_permission_denied_and_audit_receipt(
             cpus: 1,
             memory_mb: 512,
             labels: std::collections::HashMap::new(),
+            ..Default::default()
         }))
         .await
         .expect_err("policy deny should reject mutation");
@@ -1248,6 +1249,7 @@ async fn create_sandbox_policy_transport_failure_is_unavailable_and_audited() {
             cpus: 1,
             memory_mb: 512,
             labels: std::collections::HashMap::new(),
+            ..Default::default()
         }))
         .await
         .expect_err("policy transport failure should reject mutation");
@@ -1320,6 +1322,7 @@ async fn create_sandbox_is_persisted_in_state_store() {
                 cpus: 2,
                 memory_mb: 1024,
                 labels: std::collections::HashMap::from([("env".to_string(), "test".to_string())]),
+                ..Default::default()
             }))
             .await
             .expect("create sandbox"),
@@ -1422,6 +1425,7 @@ async fn create_sandbox_stream_slow_consumer_preserves_order_and_completion() {
             cpus: 1,
             memory_mb: 512,
             labels: std::collections::HashMap::new(),
+            ..Default::default()
         }))
         .await
         .expect("create sandbox stream")
@@ -1506,6 +1510,7 @@ async fn create_sandbox_applies_legacy_base_image_default_and_audit_label() {
             cpus: 1,
             memory_mb: 512,
             labels,
+            ..Default::default()
         }))
         .await
         .expect("create sandbox stream")
@@ -1618,6 +1623,7 @@ async fn create_sandbox_strips_spoofed_default_source_labels_when_defaults_not_a
             cpus: 1,
             memory_mb: 512,
             labels,
+            ..Default::default()
         }))
         .await
         .expect("create sandbox stream")
@@ -1730,6 +1736,7 @@ async fn open_sandbox_shell_creates_container_and_resolves_default_shell() {
                 cpus: 0,
                 memory_mb: 0,
                 labels,
+                ..Default::default()
             }))
             .await
             .expect("create sandbox"),
@@ -1820,6 +1827,7 @@ async fn open_sandbox_shell_prefers_main_container_command_override() {
                 cpus: 0,
                 memory_mb: 0,
                 labels,
+                ..Default::default()
             }))
             .await
             .expect("create sandbox"),
@@ -1892,6 +1900,7 @@ async fn open_sandbox_shell_reuses_existing_active_execution_session() {
                 cpus: 0,
                 memory_mb: 0,
                 labels,
+                ..Default::default()
             }))
             .await
             .expect("create sandbox"),
@@ -2014,6 +2023,7 @@ async fn open_sandbox_shell_persists_external_secret_env_references_only() {
                 cpus: 0,
                 memory_mb: 0,
                 labels,
+                ..Default::default()
             }))
             .await
             .expect("create sandbox"),
@@ -2107,6 +2117,7 @@ async fn open_sandbox_shell_rejects_missing_external_secret_env_source() {
                 cpus: 0,
                 memory_mb: 0,
                 labels,
+                ..Default::default()
             }))
             .await
             .expect("create sandbox"),
@@ -2187,6 +2198,7 @@ async fn close_sandbox_shell_closes_active_execution_and_clears_session() {
                 cpus: 0,
                 memory_mb: 0,
                 labels,
+                ..Default::default()
             }))
             .await
             .expect("create sandbox"),
@@ -2378,6 +2390,7 @@ async fn create_sandbox_denied_when_scheduler_capacity_is_exhausted() {
             cpus: 1,
             memory_mb: 256,
             labels: std::collections::HashMap::new(),
+            ..Default::default()
         }))
         .await
         .expect_err("placement preflight should deny create_sandbox");
@@ -2436,6 +2449,7 @@ async fn create_sandbox_honors_idempotency_key_and_conflict() {
                 cpus: 1,
                 memory_mb: 256,
                 labels: std::collections::HashMap::new(),
+                ..Default::default()
             }))
             .await
             .expect("first create"),
@@ -2460,6 +2474,7 @@ async fn create_sandbox_honors_idempotency_key_and_conflict() {
                 cpus: 1,
                 memory_mb: 256,
                 labels: std::collections::HashMap::new(),
+                ..Default::default()
             }))
             .await
             .expect("idempotent replay"),
@@ -2484,6 +2499,7 @@ async fn create_sandbox_honors_idempotency_key_and_conflict() {
             cpus: 1,
             memory_mb: 256,
             labels: std::collections::HashMap::new(),
+            ..Default::default()
         }))
         .await
         .expect_err("same idempotency key with different request should fail");
@@ -4383,6 +4399,7 @@ async fn create_container_then_get_list_and_remove_round_trip() {
                 cpus: 0,
                 memory_mb: 0,
                 labels: std::collections::HashMap::new(),
+                ..Default::default()
             }))
             .await
             .expect("create sandbox"),
@@ -4518,6 +4535,7 @@ async fn create_container_denied_when_scheduler_capacity_is_exhausted() {
                 cpus: 0,
                 memory_mb: 0,
                 labels: std::collections::HashMap::new(),
+                ..Default::default()
             }))
             .await
             .expect("create sandbox"),
@@ -4604,6 +4622,7 @@ async fn create_container_uses_sandbox_startup_defaults_when_request_omits_image
                 cpus: 0,
                 memory_mb: 0,
                 labels,
+                ..Default::default()
             }))
             .await
             .expect("create sandbox"),
@@ -4693,6 +4712,7 @@ async fn create_container_preserves_explicit_image_and_cmd_over_sandbox_defaults
                 cpus: 0,
                 memory_mb: 0,
                 labels,
+                ..Default::default()
             }))
             .await
             .expect("create sandbox"),
@@ -4779,6 +4799,7 @@ async fn list_events_returns_persisted_stack_events() {
             cpus: 0,
             memory_mb: 0,
             labels: std::collections::HashMap::new(),
+            ..Default::default()
         }))
         .await
         .expect("create sandbox to emit event");
@@ -5417,6 +5438,7 @@ async fn diff_checkpoints_returns_real_file_level_deltas() {
                     SANDBOX_LABEL_PROJECT_DIR.to_string(),
                     workspace_root.to_string_lossy().to_string(),
                 )]),
+                ..Default::default()
             }))
             .await
             .expect("create sandbox"),
@@ -6036,6 +6058,7 @@ async fn file_service_write_read_list_round_trip_with_receipts() {
                 cpus: 0,
                 memory_mb: 0,
                 labels: std::collections::HashMap::new(),
+                ..Default::default()
             }))
             .await
             .expect("create sandbox"),
@@ -6163,6 +6186,7 @@ async fn file_service_rejects_path_traversal() {
                 cpus: 0,
                 memory_mb: 0,
                 labels: std::collections::HashMap::new(),
+                ..Default::default()
             }))
             .await
             .expect("create sandbox"),
@@ -6225,6 +6249,7 @@ async fn terminate_sandbox_honors_idempotency_and_emits_receipt_header() {
                 cpus: 0,
                 memory_mb: 0,
                 labels: std::collections::HashMap::new(),
+                ..Default::default()
             }))
             .await
             .expect("create first sandbox"),
@@ -6240,6 +6265,7 @@ async fn terminate_sandbox_honors_idempotency_and_emits_receipt_header() {
                 cpus: 0,
                 memory_mb: 0,
                 labels: std::collections::HashMap::new(),
+                ..Default::default()
             }))
             .await
             .expect("create second sandbox"),
@@ -6340,6 +6366,7 @@ async fn concurrent_create_sandbox_replays_idempotent_result_with_single_mutatio
                     cpus: 2,
                     memory_mb: 512,
                     labels: std::collections::HashMap::new(),
+                    ..Default::default()
                 }))
                 .await?;
 
@@ -6727,6 +6754,7 @@ async fn concurrent_create_without_idempotency_returns_conflict_not_internal() {
                     cpus: 1,
                     memory_mb: 256,
                     labels: std::collections::HashMap::new(),
+                    ..Default::default()
                 }))
                 .await?;
             let mut stream = response.into_inner();

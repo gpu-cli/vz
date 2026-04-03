@@ -62,6 +62,7 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
         let normalized_idempotency_key = normalize_idempotency_key(idempotency_key.as_deref());
         let explicit_volume_mounts = request.volume_mounts;
         let explicit_disk_image_path = request.disk_image_path;
+        let explicit_port_mappings = request.port_mappings;
         let mut labels: BTreeMap<String, String> = request.labels.into_iter().collect();
         // Requesters cannot predeclare default-source audit labels.
         labels.remove(SANDBOX_LABEL_BASE_IMAGE_DEFAULT_SOURCE);
@@ -184,6 +185,7 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
             &labels,
             &explicit_volume_mounts,
             disk_image_path,
+            &explicit_port_mappings,
             &request_id,
         )
         .await

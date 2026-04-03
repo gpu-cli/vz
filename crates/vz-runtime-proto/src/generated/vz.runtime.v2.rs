@@ -42,6 +42,22 @@ pub struct CreateSandboxRequest {
     /// Optional path to a persistent disk image (ext4) attached as VirtioBlock.
     #[prost(string, tag = "7")]
     pub disk_image_path: ::prost::alloc::string::String,
+    /// Host-to-container port mappings for port forwarding.
+    #[prost(message, repeated, tag = "8")]
+    pub port_mappings: ::prost::alloc::vec::Vec<PortMapping>,
+}
+/// Host-to-container port mapping for port forwarding.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PortMapping {
+    /// Host port to listen on.
+    #[prost(uint32, tag = "1")]
+    pub host_port: u32,
+    /// Container port to forward to.
+    #[prost(uint32, tag = "2")]
+    pub container_port: u32,
+    /// Protocol: "tcp" or "udp".
+    #[prost(string, tag = "3")]
+    pub protocol: ::prost::alloc::string::String,
 }
 /// A host directory to expose inside the shared VM via VirtioFS.
 #[derive(Clone, PartialEq, ::prost::Message)]

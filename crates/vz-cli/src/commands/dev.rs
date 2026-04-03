@@ -50,6 +50,10 @@ pub struct DevRunArgs {
     #[arg(short, long)]
     pub env: Vec<String>,
 
+    /// Publish a container port to the host (HOST:CONTAINER[/PROTO]).
+    #[arg(short = 'p', long = "publish")]
+    pub publish: Vec<String>,
+
     /// Force fresh VM (stop existing, re-provision).
     #[arg(long)]
     pub fresh: bool,
@@ -93,6 +97,10 @@ struct VzConfig {
     /// Environment variables injected into every exec.
     #[serde(default)]
     env: BTreeMap<String, String>,
+
+    /// Port mappings (HOST:CONTAINER or HOST:CONTAINER/PROTO).
+    #[serde(default)]
+    ports: Vec<String>,
 
     /// Resource limits.
     #[serde(default)]
@@ -139,6 +147,11 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
     )?;
 
     let volume_mounts = build_volume_mounts(&config, &project_dir)?;
+
+    // Merge ports from vz.json and CLI -p flags.
+    let mut all_port_specs = config.ports.clone();
+    all_port_specs.extend(args.publish.iter().cloned());
+    let port_mappings = parse_port_mappings(&all_port_specs)?;
 
     // --fresh: delete persistent disk so the container starts with a clean filesystem.
     if args.fresh {
@@ -226,6 +239,7 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
                 labels,
                 volume_mounts: proto_mounts,
                 disk_image_path: disk_image_path.to_string_lossy().to_string(),
+                port_mappings: port_mappings.clone(),
             })
             .await
             .context("failed to create sandbox via daemon")?;
@@ -250,6 +264,12 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
         }
 
         eprintln!("VM ready.");
+        for pm in &port_mappings {
+            eprintln!(
+                "  Port {} -> {} ({})",
+                pm.host_port, pm.container_port, pm.protocol
+            );
+        }
 
         // Run setup commands if needed.
         // When --fresh, force re-run by clearing any cached hashes.
@@ -954,6 +974,52 @@ fn is_terminal_state_error(error: &DaemonClientError) -> bool {
             if status.code() == tonic::Code::FailedPrecondition
                 && status.message().contains("terminal state")
     )
+}
+
+fn parse_port_mappings(
+    specs: &[String],
+) -> anyhow::Result<Vec<runtime_v2::PortMapping>> {
+    specs.iter().map(|s| parse_port_mapping(s)).collect()
+}
+
+fn parse_port_mapping(spec: &str) -> anyhow::Result<runtime_v2::PortMapping> {
+    let (ports_part, protocol) = match spec.split_once('/') {
+        Some((ports, proto)) => (ports, proto.to_ascii_lowercase()),
+        None => (spec, "tcp".to_string()),
+    };
+
+    if protocol != "tcp" && protocol != "udp" {
+        bail!(
+            "invalid -p protocol '{protocol}' in '{spec}', expected tcp or udp"
+        );
+    }
+
+    let mut parts = ports_part.split(':');
+    let host_str = parts
+        .next()
+        .context("invalid -p value, expected HOST:CONTAINER[/PROTO]")?;
+    let container_str = parts
+        .next()
+        .with_context(|| format!("invalid -p value '{spec}', expected HOST:CONTAINER[/PROTO]"))?;
+
+    if parts.next().is_some() {
+        bail!(
+            "invalid -p value '{spec}', host IP is not supported yet; expected HOST:CONTAINER[/PROTO]"
+        );
+    }
+
+    let host_port = host_str
+        .parse::<u32>()
+        .with_context(|| format!("invalid host port '{host_str}' in -p '{spec}'"))?;
+    let container_port = container_str
+        .parse::<u32>()
+        .with_context(|| format!("invalid container port '{container_str}' in -p '{spec}'"))?;
+
+    Ok(runtime_v2::PortMapping {
+        host_port,
+        container_port,
+        protocol,
+    })
 }
 
 fn parse_memory(raw: Option<&str>) -> anyhow::Result<u64> {

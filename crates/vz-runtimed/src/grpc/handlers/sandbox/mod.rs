@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Command;
 use vz_runtime_contract::{
-    RuntimeBackend, SPACE_CACHE_KEY_SCHEMA_VERSION, SpaceCacheIndex, SpaceCacheKey,
-    SpaceCacheLookup, SpaceRemoteCacheTrustConfig, SpaceRemoteCacheVerificationOutcome,
+    PortMapping as ContractPortMapping, PortProtocol, RuntimeBackend,
+    SPACE_CACHE_KEY_SCHEMA_VERSION, SpaceCacheIndex, SpaceCacheKey, SpaceCacheLookup,
+    SpaceRemoteCacheTrustConfig, SpaceRemoteCacheVerificationOutcome,
     SpaceRemoteCacheVerifiedArtifact, StackResourceHint, StackVolumeMount,
 };
 use vz_runtime_proto::runtime_v2::container_service_server::ContainerService as _;
@@ -800,6 +801,7 @@ async fn boot_runtime_sandbox_resources(
     labels: &BTreeMap<String, String>,
     explicit_mounts: &[vz_runtime_proto::runtime_v2::VolumeMount],
     disk_image_path: Option<std::path::PathBuf>,
+    port_mappings: &[vz_runtime_proto::runtime_v2::PortMapping],
     request_id: &str,
 ) -> Result<(), Status> {
     let mut volume_mounts = Vec::new();
@@ -855,10 +857,23 @@ async fn boot_runtime_sandbox_resources(
         disk_image_path,
     };
 
+    let ports: Vec<ContractPortMapping> = port_mappings
+        .iter()
+        .map(|pm| ContractPortMapping {
+            host: pm.host_port as u16,
+            container: pm.container_port as u16,
+            protocol: match pm.protocol.as_str() {
+                "udp" => PortProtocol::Udp,
+                _ => PortProtocol::Tcp,
+            },
+            target_host: None,
+        })
+        .collect();
+
     match daemon
         .manager()
         .backend()
-        .boot_shared_vm(sandbox_id, Vec::new(), resources)
+        .boot_shared_vm(sandbox_id, ports, resources)
         .await
     {
         Ok(()) => Ok(()),
