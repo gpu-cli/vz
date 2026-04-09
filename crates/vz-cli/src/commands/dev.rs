@@ -42,6 +42,11 @@ pub struct DevRunArgs {
     #[arg(long)]
     pub memory: Option<String>,
 
+    /// Override persistent disk size (e.g., "40G", "512M"). Existing disks can
+    /// be grown but never shrunk.
+    #[arg(long)]
+    pub disk: Option<String>,
+
     /// Interactive mode (allocate PTY).
     #[arg(short, long)]
     pub interactive: bool,
@@ -131,6 +136,10 @@ struct ResourceConfig {
     cpus: Option<u8>,
     #[serde(default)]
     memory: Option<String>,
+    /// Persistent disk size (e.g., "20G", "512M"). Defaults to 20 GiB.
+    /// Existing disks are grown to this size on boot but never shrunk.
+    #[serde(default)]
+    disk: Option<String>,
 }
 
 // ── Handlers ───────────────────────────────────────────────────────
@@ -144,6 +153,11 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
         args.memory
             .as_deref()
             .or(config.resources.memory.as_deref()),
+    )?;
+    let disk_size_bytes = parse_disk_config(
+        args.disk
+            .as_deref()
+            .or(config.resources.disk.as_deref()),
     )?;
 
     let volume_mounts = build_volume_mounts(&config, &project_dir)?;
@@ -162,7 +176,7 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
         }
     }
 
-    let disk_image_path = ensure_project_disk(&sandbox_id)?;
+    let disk_image_path = ensure_project_disk(&sandbox_id, disk_size_bytes)?;
 
     let state_db = default_state_db_path();
     let mut client = connect_control_plane_for_state_db(&state_db).await?;
@@ -649,22 +663,88 @@ fn build_volume_mounts(
 
 // ── Persistent disk ────────────────────────────────────────────────
 
-fn ensure_project_disk(sandbox_id: &str) -> anyhow::Result<PathBuf> {
+/// Default persistent disk size when `resources.disk` is not set in vz.json.
+const DEFAULT_PROJECT_DISK_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+/// Parse the `resources.disk` field (or `--disk` override) into bytes.
+/// Returns the default when unset.
+fn parse_disk_config(raw: Option<&str>) -> anyhow::Result<u64> {
+    match raw {
+        None => Ok(DEFAULT_PROJECT_DISK_BYTES),
+        Some(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(DEFAULT_PROJECT_DISK_BYTES)
+            } else {
+                crate::ipsw::parse_disk_size(trimmed)
+                    .context("invalid resources.disk (use e.g., '20G', '512M')")
+            }
+        }
+    }
+}
+
+fn ensure_project_disk(sandbox_id: &str, disk_size: u64) -> anyhow::Result<PathBuf> {
     let run_dir = home_dir()?.join(".vz").join("run").join(sandbox_id);
     std::fs::create_dir_all(&run_dir)
         .with_context(|| format!("failed to create {}", run_dir.display()))?;
 
     let disk_path = run_dir.join("disk.img");
     if !disk_path.exists() {
-        let disk_size: u64 = 20 * 1024 * 1024 * 1024;
         let file = std::fs::File::create(&disk_path)
             .with_context(|| format!("failed to create disk image {}", disk_path.display()))?;
         file.set_len(disk_size)
             .context("failed to set disk image size")?;
-        eprintln!("Created 20 GiB persistent disk at {}", disk_path.display());
+        eprintln!(
+            "Created {} persistent disk at {}",
+            format_bytes(disk_size),
+            disk_path.display()
+        );
+    } else {
+        // Grow (but never shrink) existing disks to match the requested size.
+        let current = std::fs::metadata(&disk_path)
+            .with_context(|| format!("failed to stat disk image {}", disk_path.display()))?
+            .len();
+        if disk_size > current {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&disk_path)
+                .with_context(|| format!("failed to open disk image {}", disk_path.display()))?;
+            file.set_len(disk_size)
+                .context("failed to grow disk image")?;
+            eprintln!(
+                "Grew persistent disk from {} to {} at {}",
+                format_bytes(current),
+                format_bytes(disk_size),
+                disk_path.display()
+            );
+        } else if disk_size < current {
+            eprintln!(
+                "Ignoring requested disk size {} — existing disk is {} (shrinking would lose data). \
+                 Use `vz run --fresh` to recreate.",
+                format_bytes(disk_size),
+                format_bytes(current),
+            );
+        }
     }
 
     Ok(disk_path)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const TIB: u64 = 1024 * 1024 * 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= TIB && bytes % TIB == 0 {
+        format!("{} TiB", bytes / TIB)
+    } else if bytes >= GIB {
+        if bytes % GIB == 0 {
+            format!("{} GiB", bytes / GIB)
+        } else {
+            format!("{:.1} GiB", bytes as f64 / GIB as f64)
+        }
+    } else {
+        format!("{} MiB", bytes / MIB)
+    }
 }
 
 /// Filter out the harmless `getcwd() failed` warning from stderr.
