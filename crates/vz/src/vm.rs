@@ -462,6 +462,78 @@ impl Vm {
             .await?
     }
 
+    /// Read the current target memory size in bytes.
+    ///
+    /// On a VM with the memory balloon enabled, this is the target size most
+    /// recently written via [`set_target_memory_size`](Self::set_target_memory_size).
+    /// Initially equals the VM's configured `memory_bytes`.
+    ///
+    /// Returns [`VzError::InvalidConfig`] if the VM was built without a memory
+    /// balloon (`VmConfigBuilder::memory_balloon(false)`).
+    pub async fn target_memory_size(&self) -> Result<u64, VzError> {
+        let handle = Arc::clone(&self.handle);
+        self.queue
+            .dispatch(move || {
+                // SAFETY: memoryBalloonDevices is a property accessor on VZVirtualMachine.
+                let devices = unsafe { handle.vm.memoryBalloonDevices() };
+                let device_retained = devices.to_vec().into_iter().next();
+                let Some(device) = device_retained else {
+                    return Err(VzError::InvalidConfig(
+                        "memory balloon not enabled on this VM".into(),
+                    ));
+                };
+                let traditional = Retained::downcast::<
+                    objc2_virtualization::VZVirtioTraditionalMemoryBalloonDevice,
+                >(device)
+                .map_err(|_| {
+                    VzError::InvalidConfig(
+                        "memory balloon is not a VZVirtioTraditionalMemoryBalloonDevice".into(),
+                    )
+                })?;
+                // SAFETY: targetVirtualMachineMemorySize is a property getter; always safe to read.
+                let bytes = unsafe { traditional.targetVirtualMachineMemorySize() };
+                Ok(bytes)
+            })
+            .await?
+    }
+
+    /// Ask the guest to balloon down (or back up) to `bytes` of available memory.
+    ///
+    /// Apple rounds the value down to a 1 MB boundary and clamps it to
+    /// `[VZVirtualMachineConfiguration.minimumAllowedMemorySize, memory_bytes]`.
+    /// The actual in-guest change is asynchronous — this method only writes
+    /// the target. The guest's balloon driver eventually responds and pages
+    /// move between guest and host.
+    ///
+    /// Returns [`VzError::InvalidConfig`] if the VM was built without a memory
+    /// balloon (`VmConfigBuilder::memory_balloon(false)`).
+    pub async fn set_target_memory_size(&self, bytes: u64) -> Result<(), VzError> {
+        let handle = Arc::clone(&self.handle);
+        self.queue
+            .dispatch(move || {
+                // SAFETY: memoryBalloonDevices is a property accessor on VZVirtualMachine.
+                let devices = unsafe { handle.vm.memoryBalloonDevices() };
+                let device_retained = devices.to_vec().into_iter().next();
+                let Some(device) = device_retained else {
+                    return Err(VzError::InvalidConfig(
+                        "memory balloon not enabled on this VM".into(),
+                    ));
+                };
+                let traditional = Retained::downcast::<
+                    objc2_virtualization::VZVirtioTraditionalMemoryBalloonDevice,
+                >(device)
+                .map_err(|_| {
+                    VzError::InvalidConfig(
+                        "memory balloon is not a VZVirtioTraditionalMemoryBalloonDevice".into(),
+                    )
+                })?;
+                // SAFETY: setTargetVirtualMachineMemorySize is a property setter; always safe.
+                unsafe { traditional.setTargetVirtualMachineMemorySize(bytes) };
+                Ok(())
+            })
+            .await?
+    }
+
     /// Get the current VM state.
     pub fn state(&self) -> VmState {
         self.state_rx.borrow().clone()

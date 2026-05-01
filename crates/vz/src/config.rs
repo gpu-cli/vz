@@ -91,6 +91,7 @@ pub struct VmConfigBuilder {
     vsock: bool,
     headless: bool,
     nested_virtualization: bool,
+    memory_balloon: bool,
 }
 
 impl VmConfigBuilder {
@@ -110,6 +111,7 @@ impl VmConfigBuilder {
             vsock: false,
             headless: true,
             nested_virtualization: true,
+            memory_balloon: true,
         }
     }
 
@@ -247,6 +249,17 @@ impl VmConfigBuilder {
         self
     }
 
+    /// Enable or disable the virtio memory balloon device. Default: enabled.
+    ///
+    /// When enabled, the host can call [`Vm::set_target_memory_size`] at runtime
+    /// to ask the guest to release pages back to the host (or to give them back).
+    /// Apple's framework allows at most one balloon device per VM, so this is
+    /// a simple on/off knob — there is nothing else to configure.
+    pub fn memory_balloon(mut self, enabled: bool) -> Self {
+        self.memory_balloon = enabled;
+        self
+    }
+
     /// Validate and build the configuration.
     pub fn build(self) -> Result<VmConfig, VzError> {
         let boot_loader = self
@@ -286,6 +299,7 @@ impl VmConfigBuilder {
             vsock: self.vsock,
             headless: self.headless,
             nested_virtualization: self.nested_virtualization,
+            memory_balloon: self.memory_balloon,
         })
     }
 }
@@ -320,6 +334,9 @@ pub struct VmConfig {
     pub(crate) headless: bool,
     /// Enable nested virtualization (exposes /dev/kvm in Linux guests).
     pub(crate) nested_virtualization: bool,
+    /// Attach a virtio memory balloon device. Required for runtime memory
+    /// reclaim via [`Vm::set_target_memory_size`].
+    pub(crate) memory_balloon: bool,
 }
 
 impl VmConfig {
@@ -337,5 +354,13 @@ impl VmConfig {
     /// The first entry is `vda` in the guest, the second `vdb`, and so on.
     pub fn disks(&self) -> &[DiskConfig] {
         &self.disks
+    }
+
+    /// Whether this VM was built with a virtio memory balloon device.
+    ///
+    /// When `true`, the host can call [`Vm::set_target_memory_size`] to ask
+    /// the guest to release pages back to the host.
+    pub fn memory_balloon_enabled(&self) -> bool {
+        self.memory_balloon
     }
 }

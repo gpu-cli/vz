@@ -28,8 +28,8 @@ use objc2_virtualization::{
     VZUSBKeyboardConfiguration, VZUSBScreenCoordinatePointingDeviceConfiguration,
     VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
     VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
-    VZVirtioSocketDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
-    VZVirtualMachineDelegate,
+    VZVirtioSocketDeviceConfiguration, VZVirtioTraditionalMemoryBalloonDeviceConfiguration,
+    VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineDelegate,
 };
 use tokio::sync::{oneshot, watch};
 
@@ -443,6 +443,27 @@ pub(crate) fn build_objc_config(
         NetworkConfig::None => {
             // No network devices
         }
+    }
+
+    // Memory balloon — host-driven path to ask the guest to release pages.
+    // Apple permits at most one balloon device per VM; we always wire up the
+    // traditional virtio variant when enabled. Without this device, runtime
+    // memory reclaim from the guest is impossible (the host pays for every
+    // page the guest has ever touched, indefinitely).
+    if config.memory_balloon {
+        // SAFETY: VZVirtioTraditionalMemoryBalloonDeviceConfiguration::new()
+        // returns a default-initialized configuration object.
+        let balloon_config =
+            unsafe { VZVirtioTraditionalMemoryBalloonDeviceConfiguration::new() };
+        // Upcast once: VZVirtioTraditional...DeviceConfiguration → VZMemoryBalloonDeviceConfiguration
+        // so the resulting NSArray matches setMemoryBalloonDevices's expected element type.
+        let balloon_devices =
+            NSArray::from_retained_slice(&[Retained::into_super(balloon_config)]);
+        // SAFETY: setMemoryBalloonDevices accepts an NSArray of
+        // VZMemoryBalloonDeviceConfiguration. Apple validates "at most one"
+        // at config-time; passing more than one element would error in
+        // VZVirtualMachineConfiguration::validateWithError.
+        unsafe { vz_config.setMemoryBalloonDevices(&balloon_devices) };
     }
 
     // Graphics device (required by macOS guests for proper operation, even headless)

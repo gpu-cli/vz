@@ -383,6 +383,35 @@ fn linux_boot_with_no_disks_succeeds() {
     assert!(cfg.disks().is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// Memory balloon
+// ---------------------------------------------------------------------------
+
+#[test]
+fn memory_balloon_enabled_by_default() {
+    // Builder defaults must enable the balloon — without it the host has no
+    // path to reclaim guest memory at runtime, which defeats the multi-VM
+    // story this whole change set was about.
+    let cfg = VmConfigBuilder::new()
+        .boot_linux("/boot/vmlinuz", None::<PathBuf>, "console=ttyS0")
+        .build()
+        .unwrap();
+    assert!(
+        cfg.memory_balloon_enabled(),
+        "memory balloon must be on by default"
+    );
+}
+
+#[test]
+fn memory_balloon_can_be_opted_out() {
+    let cfg = VmConfigBuilder::new()
+        .boot_linux("/boot/vmlinuz", None::<PathBuf>, "console=ttyS0")
+        .memory_balloon(false)
+        .build()
+        .unwrap();
+    assert!(!cfg.memory_balloon_enabled());
+}
+
 #[test]
 fn macos_boot_without_disks_fails() {
     let result = VmConfigBuilder::new()
