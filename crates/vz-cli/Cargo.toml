@@ -1,6 +1,6 @@
 [package]
 name = "vz-cli"
-version = "0.3.10"
+version = "0.3.11"
 description = "CLI for managing containers and macOS VM sandboxes"
 edition.workspace = true
 rust-version.workspace = true
