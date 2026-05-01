@@ -18,7 +18,7 @@ use thiserror::Error;
 use tracing::info;
 use vz_runtime_contract::{
     BuildState, ExecutionState, MachineError, MachineErrorCode, PolicyDecision, RequestMetadata,
-    RuntimeCapabilities, RuntimeError, RuntimeOperation, RuntimePolicyHook,
+    RuntimeCapabilities, RuntimeError, RuntimeOperation, RuntimePolicyHook, SandboxState,
     WorkspaceRuntimeManager, enforce_runtime_policy_hook,
 };
 use vz_stack::{Receipt, StackError, StackEvent, StateStore, StateStorePragmas};
@@ -36,6 +36,8 @@ const LEGACY_CHECKPOINT_MIGRATION_ENV: &str = "VZ_RUNTIMED_MIGRATE_LEGACY_CHECKP
 const BUILD_RESTART_RECONCILE_ERROR: &str = "build reconciled after daemon restart";
 const BUILD_RESTART_RECONCILE_OPERATION: &str = "reconcile_build_after_restart";
 const BUILD_RESTART_RECONCILE_REQUEST_PREFIX: &str = "req-build-reconcile";
+const SANDBOX_RESTART_RECONCILE_ERROR: &str =
+    "sandbox reconciled after daemon restart (in-memory backend state was lost)";
 const LEGACY_CHECKPOINT_MIGRATION_OPERATION: &str = "migrate_legacy_checkpoint_artifacts";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +279,13 @@ impl RuntimeDaemon {
                 source,
             }
         })?;
+        let reconciled_sandbox_count =
+            reconcile_orphaned_sandboxes(&state_store).map_err(|source| {
+                RuntimedError::ReconcileSandboxState {
+                    path: config.state_store_path.clone(),
+                    source,
+                }
+            })?;
 
         let manager = build_runtime_manager(&config.runtime_data_dir);
         let placement_scheduler = PlacementScheduler::default();
@@ -307,6 +316,7 @@ impl RuntimeDaemon {
             sqlite_schema_version = schema_version,
             reconciled_executions = reconciled_execution_count,
             reconciled_builds = reconciled_build_count,
+            reconciled_sandboxes = reconciled_sandbox_count,
             sandbox_default_base_image_ref = sandbox_startup_policy.default_base_image_ref.as_deref().unwrap_or(""),
             sandbox_default_main_container = sandbox_startup_policy.default_main_container.as_deref().unwrap_or(""),
             sandbox_legacy_base_default_enabled = sandbox_startup_policy.legacy_default_base_image_enabled,
@@ -843,6 +853,62 @@ fn reconcile_orphaned_builds(state_store: &StateStore) -> Result<u64, StackError
     Ok(reconciled)
 }
 
+/// Mark every non-terminal sandbox as `Failed` on daemon startup.
+///
+/// When the daemon dies (kill -9, panic, OS reboot mid-operation) the
+/// in-memory backend state is lost. The on-disk SQLite state-store still
+/// holds rows in `Creating` / `Ready` / `Draining` — but no live VM
+/// answers to those records. Without reconciliation:
+///   - `vz status` reports "ready" lying about a dead VM.
+///   - `vz stop` enters `shutdown_shared_vm` with empty in-memory maps,
+///     errors internally, and only succeeds because of a string-match
+///     mask in the gRPC handler — fragile.
+///   - The next `vz run` may trip on stale storage attachments because
+///     disk.img wasn't flushed/closed cleanly.
+///
+/// We transition each affected sandbox to `Failed` (terminal) so callers
+/// see truth in `vz status` / `vz ls`, and so `vz stop` / `vz run` paths
+/// take their already-handled "sandbox is in a terminal state" branches.
+/// The eligibility filter mirrors `reconcile_orphaned_executions` —
+/// terminal states are skipped.
+fn reconcile_orphaned_sandboxes(state_store: &StateStore) -> Result<u64, StackError> {
+    let mut reconciled: u64 = 0;
+    for mut sandbox in state_store.list_sandboxes()? {
+        if sandbox.state.is_terminal() {
+            continue;
+        }
+        let now = current_unix_secs();
+        sandbox
+            .transition_to(SandboxState::Failed)
+            .map_err(|error| StackError::Machine {
+                code: MachineErrorCode::StateConflict,
+                message: error.to_string(),
+            })?;
+        sandbox.updated_at = now;
+
+        let stack_name = sandbox
+            .labels
+            .get("stack_name")
+            .cloned()
+            .unwrap_or_else(|| sandbox.sandbox_id.clone());
+
+        state_store.with_immediate_transaction(|tx| {
+            tx.save_sandbox(&sandbox)?;
+            tx.emit_event(
+                &sandbox.sandbox_id,
+                &StackEvent::SandboxFailed {
+                    stack_name,
+                    sandbox_id: sandbox.sandbox_id.clone(),
+                    error: SANDBOX_RESTART_RECONCILE_ERROR.to_string(),
+                },
+            )?;
+            Ok(())
+        })?;
+        reconciled += 1;
+    }
+    Ok(reconciled)
+}
+
 fn ensure_parent_dir(path: &Path) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -1009,6 +1075,12 @@ pub enum RuntimedError {
         #[source]
         source: StackError,
     },
+    #[error("failed to reconcile sandbox state from {path}: {source}")]
+    ReconcileSandboxState {
+        path: PathBuf,
+        #[source]
+        source: StackError,
+    },
     #[error("failed to refresh placement snapshot from {path}: {source}")]
     RefreshPlacementSnapshot {
         path: PathBuf,
@@ -1036,7 +1108,8 @@ mod tests {
 
     use super::*;
     use vz_runtime_contract::{
-        Build, BuildSpec, BuildState, Execution, ExecutionSpec, ExecutionState,
+        Build, BuildSpec, BuildState, Execution, ExecutionSpec, ExecutionState, Sandbox,
+        SandboxBackend, SandboxSpec, SandboxState,
     };
 
     #[test]
@@ -1689,5 +1762,102 @@ mod tests {
                 if build_id == "build-running" && error == BUILD_RESTART_RECONCILE_ERROR
             )
         }));
+    }
+
+    /// VRT-gsk0 Bug A: when the daemon restarts after a hard kill, any
+    /// sandbox left in a non-terminal state (Creating / Ready / Draining)
+    /// must be transitioned to Failed. Otherwise `vz status` reports a
+    /// "ready" VM that no in-memory backend actually owns, and downstream
+    /// `vz stop` paths trip on an empty `stack_vms` map.
+    #[test]
+    fn daemon_start_reconciles_non_terminal_sandboxes_to_failed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = RuntimedConfig {
+            state_store_path: tmp.path().join("state").join("stack-state.db"),
+            runtime_data_dir: tmp.path().join("runtime"),
+            socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+        };
+
+        std::fs::create_dir_all(cfg.state_store_path.parent().expect("state parent"))
+            .expect("create state directory");
+        let store = StateStore::open(&cfg.state_store_path).expect("state store");
+
+        let make_sandbox = |id: &str, state: SandboxState| Sandbox {
+            sandbox_id: id.to_string(),
+            backend: SandboxBackend::MacosVz,
+            spec: SandboxSpec::default(),
+            state,
+            created_at: 1,
+            updated_at: 1,
+            labels: BTreeMap::new(),
+        };
+
+        store
+            .save_sandbox(&make_sandbox("sbx-creating", SandboxState::Creating))
+            .expect("save creating sandbox");
+        store
+            .save_sandbox(&make_sandbox("sbx-ready", SandboxState::Ready))
+            .expect("save ready sandbox");
+        store
+            .save_sandbox(&make_sandbox("sbx-draining", SandboxState::Draining))
+            .expect("save draining sandbox");
+        store
+            .save_sandbox(&make_sandbox("sbx-terminated", SandboxState::Terminated))
+            .expect("save terminated sandbox");
+        store
+            .save_sandbox(&make_sandbox("sbx-failed", SandboxState::Failed))
+            .expect("save failed sandbox");
+        drop(store);
+
+        let daemon = RuntimeDaemon::start(cfg).expect("daemon should start");
+
+        // Non-terminal states all transition to Failed.
+        for id in ["sbx-creating", "sbx-ready", "sbx-draining"] {
+            let sandbox = daemon
+                .with_state_store(|store| store.load_sandbox(id))
+                .expect("load sandbox")
+                .unwrap_or_else(|| panic!("{id} should exist"));
+            assert_eq!(
+                sandbox.state,
+                SandboxState::Failed,
+                "{id} should be reconciled to Failed"
+            );
+            assert!(
+                sandbox.updated_at >= 1,
+                "{id} updated_at should be bumped on reconcile"
+            );
+        }
+
+        // Terminal states are left alone.
+        let terminated = daemon
+            .with_state_store(|store| store.load_sandbox("sbx-terminated"))
+            .expect("load terminated")
+            .expect("sbx-terminated should exist");
+        assert_eq!(terminated.state, SandboxState::Terminated);
+
+        let failed = daemon
+            .with_state_store(|store| store.load_sandbox("sbx-failed"))
+            .expect("load failed")
+            .expect("sbx-failed should exist");
+        assert_eq!(failed.state, SandboxState::Failed);
+
+        // Each reconciled sandbox emits a SandboxFailed event with the
+        // reconcile reason.
+        for id in ["sbx-creating", "sbx-ready", "sbx-draining"] {
+            let events = daemon
+                .with_state_store(|store| {
+                    store.load_events_by_scope(id, "sandbox_", None, 20)
+                })
+                .expect("load sandbox events");
+            assert!(
+                events.iter().any(|record| matches!(
+                    &record.event,
+                    StackEvent::SandboxFailed { sandbox_id, error, .. }
+                        if sandbox_id == id
+                            && error == SANDBOX_RESTART_RECONCILE_ERROR
+                )),
+                "{id} should have a SandboxFailed reconcile event"
+            );
+        }
     }
 }
