@@ -239,11 +239,24 @@ pub fn container_log_dir(container_id: &str) -> String {
     format!("/run/vz-oci/logs/{container_id}")
 }
 
+/// Set up the per-container overlay rootfs in the guest VM and optionally
+/// pre-populate the upper layer from a setup-commit tarball.
+///
+/// `setup_commit_tar_path`: if `Some(guest_path)`, the overlay's upper dir
+/// is populated by extracting that tarball BEFORE the overlay is mounted.
+/// This is the only correct point to inject content — the kernel does not
+/// support reliable concurrent modification of an overlay's upperdir
+/// while the overlay is mounted (lookups silently miss the new files).
+///
+/// Returns `(merged_path, setup_was_restored)`. `setup_was_restored` is
+/// `true` if a commit tar was extracted; the caller should then skip
+/// `run_setup_commands`.
 pub(super) async fn setup_guest_container_overlay(
     vm: &LinuxVm,
     vz_rootfs_path: &str,
     container_id: &str,
-) -> Result<String, OciError> {
+    setup_commit_tar_path: Option<&str>,
+) -> Result<(String, bool), OciError> {
     let container_overlay = format!("/run/vz-oci/containers/{container_id}");
     let guest_rootfs_path = format!("{container_overlay}/merged");
     let log_dir = container_log_dir(container_id);
@@ -267,10 +280,21 @@ pub(super) async fn setup_guest_container_overlay(
         )
         .await;
 
+    // Build the overlay-setup script. If a setup-commit tar is provided,
+    // extract it into the upper dir AFTER creating it but BEFORE mounting
+    // the overlay — the kernel takes a snapshot of the upperdir state at
+    // mount time and won't reliably reflect later additions.
+    let extract_step = match setup_commit_tar_path {
+        Some(tar) => {
+            format!("/bin/busybox tar -C {container_overlay}/upper -xpf {tar} && ")
+        }
+        None => String::new(),
+    };
     let overlay_cmd = format!(
         "mkdir -p {container_overlay} && \
          mount -t tmpfs tmpfs {container_overlay} && \
          mkdir -p {container_overlay}/upper {container_overlay}/work {container_overlay}/merged && \
+         {extract_step}\
          mount -t overlay overlay \
          -o lowerdir={vz_rootfs_path},upperdir={container_overlay}/upper,workdir={container_overlay}/work \
          {container_overlay}/merged && \
@@ -281,7 +305,13 @@ pub(super) async fn setup_guest_container_overlay(
         .exec_collect(
             "sh".to_string(),
             vec!["-c".to_string(), overlay_cmd],
-            Duration::from_secs(10),
+            // Restore can take seconds if the tar is large (~400MB ext4-style),
+            // so allow generous time when a setup commit is being applied.
+            if setup_commit_tar_path.is_some() {
+                Duration::from_secs(120)
+            } else {
+                Duration::from_secs(10)
+            },
         )
         .await
         .map_err(OciError::from)?;
@@ -294,7 +324,7 @@ pub(super) async fn setup_guest_container_overlay(
         ))));
     }
 
-    Ok(guest_rootfs_path)
+    Ok((guest_rootfs_path, setup_commit_tar_path.is_some()))
 }
 
 pub(super) fn expand_home_dir(path: &Path) -> PathBuf {

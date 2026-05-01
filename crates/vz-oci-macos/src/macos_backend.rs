@@ -302,23 +302,63 @@ impl RuntimeBackend for MacosRuntimeBackend {
         let setup_timeout = config.timeout;
 
         let oci_config = run_config_from_contract(config);
+
+        // Resolve the cached setup-commit tarball (if any) BEFORE creating
+        // the container. The runtime layer extracts it into the overlay
+        // upperdir at mount time — modifying upperdir after mount is
+        // unreliable, so the decision must happen up-front.
+        let setup_commit_tar_guest = if !setup_commands.is_empty() {
+            let commit_ref = crate::Runtime::setup_commit_reference(image, &setup_commands);
+            let host_path = self
+                .runtime
+                .setup_commits_host_dir()
+                .join(format!("{commit_ref}.tar"));
+            if host_path.is_file() {
+                Some(format!("/vz-setup-commits/{commit_ref}.tar"))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let container_id = self
             .runtime
-            .create_container_in_stack(stack_id, image, oci_config)
+            .create_container_in_stack(stack_id, image, oci_config, setup_commit_tar_guest)
             .await
             .map_err(oci_err)?;
 
-        // Run setup commands inside the container after creation.
+        // Setup commit/restore: when a cached tarball exists for the
+        // (image, setup_commands) pair, the runtime layer pre-populates the
+        // overlay upperdir BEFORE mount. We just check whether that
+        // happened and either skip setup or run+commit accordingly.
         if !setup_commands.is_empty() {
-            self.run_setup_commands(
-                &container_id,
-                &setup_commands,
-                &setup_env,
-                setup_cwd.as_deref(),
-                setup_user.as_deref(),
-                setup_timeout,
-            )
-            .await?;
+            let restored = self.runtime.was_setup_restored(&container_id).await;
+            if restored {
+                tracing::info!(
+                    container_id = %container_id,
+                    "skipping run_setup_commands (cache hit)"
+                );
+            } else {
+                self.run_setup_commands(
+                    &container_id,
+                    &setup_commands,
+                    &setup_env,
+                    setup_cwd.as_deref(),
+                    setup_user.as_deref(),
+                    setup_timeout,
+                )
+                .await?;
+                let commit_ref = crate::Runtime::setup_commit_reference(image, &setup_commands);
+                if let Err(error) = self
+                    .runtime
+                    .save_setup_commit(stack_id, &container_id, &commit_ref)
+                    .await
+                {
+                    // save is best-effort — boot succeeded, cache miss next time.
+                    tracing::warn!(commit_ref = %commit_ref, %error, "save_setup_commit failed");
+                }
+            }
         }
 
         Ok(container_id)

@@ -778,6 +778,7 @@ async fn shared_vm_inter_service_connectivity() {
                 network_namespace_path: Some("/var/run/netns/web".to_string()),
                 ..RunConfig::default()
             },
+            None,
         )
         .await
         .unwrap_or_else(|e| panic!("create web container failed: {e:?}"));
@@ -793,6 +794,7 @@ async fn shared_vm_inter_service_connectivity() {
                 network_namespace_path: Some("/var/run/netns/db".to_string()),
                 ..RunConfig::default()
             },
+            None,
         )
         .await
         .unwrap();

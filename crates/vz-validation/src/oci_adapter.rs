@@ -219,7 +219,7 @@ impl RuntimeAdapter for OciRuntimeAdapter {
                 debug!("Creating container for service: {}", svc.name);
                 let cid = self
                     .runtime
-                    .create_container_in_stack(&stack_id, &svc.image, run_config)
+                    .create_container_in_stack(&stack_id, &svc.image, run_config, None)
                     .await
                     .map_err(|e| format!("create_container_in_stack failed for {}: {e}", svc.name))?;
 

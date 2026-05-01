@@ -22,6 +22,36 @@ impl Runtime {
         self.config.data_dir.join("rootfs")
     }
 
+    /// Host-side directory where setup-commit tarballs are stored.
+    ///
+    /// VirtioFS-shared into every shared VM at `/vz-setup-commits` so that
+    /// the post-setup filesystem state of a container can be tarred to
+    /// host once and replayed on subsequent boots, instead of re-running
+    /// `apt-get install` etc. on every cold boot.
+    pub fn setup_commits_host_dir(&self) -> PathBuf {
+        self.config.data_dir.join("setup-commits")
+    }
+
+    /// Compute a stable identifier for a (image, setup_commands) tuple.
+    ///
+    /// Used as the filename of the cached setup tarball
+    /// (`<reference>.tar` under [`setup_commits_host_dir`]). Hashes the
+    /// image string verbatim — when the user pins a digest the cache is
+    /// content-addressed; when they use a tag they accept that the cache
+    /// can be stale across image updates and is cleared by manually
+    /// removing the tarball.
+    pub fn setup_commit_reference(image: &str, setup_commands: &[String]) -> String {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(image.as_bytes());
+        hasher.update(b"\0");
+        for cmd in setup_commands {
+            hasher.update(cmd.as_bytes());
+            hasher.update(b"\0");
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
     /// Boot a shared VM for a multi-service stack.
     ///
     /// The VM runs a single kernel with the guest agent, and multiple OCI
@@ -93,6 +123,14 @@ impl Runtime {
         let rootfs_store = self.rootfs_store_dir();
         fs::create_dir_all(&rootfs_store)?;
 
+        // Setup-commit cache: VirtioFS-shared into the guest at
+        // /vz-setup-commits. Lets create_container_in_stack tar a
+        // post-setup upperdir to host once, then restore it on every
+        // subsequent cold boot — turning a 32s `apt-get install ...`
+        // into a sub-second `tar -xpf`.
+        let setup_commits = self.setup_commits_host_dir();
+        fs::create_dir_all(&setup_commits)?;
+
         let kernel = ensure_kernel_with_options(EnsureKernelOptions {
             install_dir: self.config.linux_install_dir.clone(),
             bundle_dir: self.config.linux_bundle_dir.clone(),
@@ -111,6 +149,11 @@ impl Runtime {
         vm_config
             .shared_dirs
             .push(make_oci_runtime_share(&runtime_binary)?);
+        vm_config.shared_dirs.push(SharedDirConfig {
+            tag: "vz-setup-commits".to_string(),
+            source: setup_commits,
+            read_only: false,
+        });
 
         // Add VirtioFS shares for per-service volume mounts. These must be
         // configured at VM creation time because VirtioFS shares are static.
@@ -261,6 +304,37 @@ impl Runtime {
 
         let vm = Arc::new(vm);
 
+        // Mount the setup-commits VirtioFS share inside the host VM so
+        // create_container_in_stack can tar/untar setup state. Idempotent —
+        // mountpoint may already exist from a prior boot of the same VM.
+        let mount_cmd =
+            "mkdir -p /vz-setup-commits && \
+             ( mountpoint -q /vz-setup-commits || \
+               mount -t virtiofs vz-setup-commits /vz-setup-commits )"
+                .to_string();
+        match vm
+            .exec_collect(
+                "sh".to_string(),
+                vec!["-c".to_string(), mount_cmd],
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            Ok(out) if out.exit_code == 0 => {
+                tracing::info!("setup-commits VirtioFS share mounted at /vz-setup-commits");
+            }
+            Ok(out) => {
+                tracing::warn!(
+                    exit_code = out.exit_code,
+                    stderr = %out.stderr.trim(),
+                    "setup-commits mount returned non-zero (cache will be unavailable)"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "setup-commits mount exec failed (cache will be unavailable)");
+            }
+        }
+
         // Set up port forwarding for all services' ports.
         let port_forwarding = match start_port_forwarding(vm.inner_shared(), &ports).await {
             Ok(pf) => pf,
@@ -294,6 +368,7 @@ impl Runtime {
         stack_id: &str,
         image: &str,
         run: RunConfig,
+        setup_commit_tar_guest: Option<String>,
     ) -> Result<String, OciError> {
         let vm = self
             .stack_vms
@@ -414,17 +489,23 @@ impl Runtime {
 
         let mut bundle_mounts = mount_specs_to_bundle_mounts(&run.mounts, run.mount_tag_offset)?;
 
+        // Setup commit/restore: caller (the macOS backend) precomputes the
+        // (image, setup_commands) hash and resolves it to a guest path
+        // under /vz-setup-commits — those fields are stripped during the
+        // contract → oci_config conversion so they can't be derived here.
+
         // Per-container overlay: VirtioFS doesn't support mknod, so we create a
         // guest-side overlay with tmpfs as upperdir for device nodes.
         let vz_rootfs_path = format!("/vz-rootfs/{container_id}");
-        let guest_rootfs_path = match setup_guest_container_overlay(
+        let (guest_rootfs_path, setup_was_restored) = match setup_guest_container_overlay(
             vm.as_ref(),
             &vz_rootfs_path,
             &container_id,
+            setup_commit_tar_guest.as_deref(),
         )
         .await
         {
-            Ok(path) => path,
+            Ok(out) => out,
             Err(err) => {
                 container.status = ContainerStatus::Stopped { exit_code: -1 };
                 container.stopped_unix_secs = Some(current_unix_secs());
@@ -435,6 +516,16 @@ impl Runtime {
                 return Err(err);
             }
         };
+        if setup_was_restored {
+            self.setup_restored_containers
+                .lock()
+                .await
+                .insert(container_id.clone());
+            tracing::info!(
+                container_id = %container_id,
+                "setup commit restored into overlay upperdir before mount"
+            );
+        }
         // When sharing the VM's host network, ensure the container has a
         // working /etc/resolv.conf. Container images (e.g., Ubuntu) often
         // ship a resolv.conf pointing to systemd-resolved (127.0.0.53)
@@ -634,6 +725,76 @@ impl Runtime {
         }
 
         Ok(container_id)
+    }
+
+    /// Tar the container's overlay upperdir to host as the cached commit
+    /// for `commit_ref`. Atomic via `<ref>.tar.tmp` + rename. Best-effort:
+    /// failures here only mean the next cold boot will run setup again.
+    pub async fn save_setup_commit(
+        &self,
+        stack_id: &str,
+        container_id: &str,
+        commit_ref: &str,
+    ) -> Result<(), OciError> {
+        let vm = self
+            .stack_vms
+            .lock()
+            .await
+            .get(stack_id)
+            .cloned()
+            .ok_or_else(|| {
+                OciError::InvalidConfig(format!(
+                    "no shared VM running for stack '{stack_id}'; call boot_shared_vm first"
+                ))
+            })?;
+        let tar_guest_tmp = format!("/vz-setup-commits/{commit_ref}.tar.tmp");
+        let tar_guest = format!("/vz-setup-commits/{commit_ref}.tar");
+        let upper_dir = format!("/run/vz-oci/containers/{container_id}/upper");
+        // -C cd into upper, -p preserve perms, -f write to tmp file. Use
+        // busybox tar for portability inside the minimal guest rootfs.
+        let save_cmd = format!(
+            "/bin/busybox tar -C {upper_dir} -cpf {tar_guest_tmp} . && \
+             mv {tar_guest_tmp} {tar_guest}"
+        );
+        let started = std::time::Instant::now();
+        let result = vm
+            .exec_collect(
+                "sh".to_string(),
+                vec!["-c".to_string(), save_cmd],
+                Duration::from_secs(120),
+            )
+            .await;
+        match result {
+            Ok(out) if out.exit_code == 0 => {
+                let bytes = fs::metadata(self.setup_commits_host_dir().join(format!("{commit_ref}.tar")))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                tracing::info!(
+                    commit_ref,
+                    bytes,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "saved setup commit to cache"
+                );
+                Ok(())
+            }
+            Ok(out) => {
+                tracing::warn!(
+                    commit_ref,
+                    exit_code = out.exit_code,
+                    stderr = %out.stderr.trim(),
+                    "setup commit save returned non-zero (next boot will re-run setup)"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                tracing::warn!(
+                    commit_ref,
+                    %error,
+                    "setup commit save exec failed (next boot will re-run setup)"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Stop all containers and shut down the shared VM for a stack.

@@ -141,7 +141,9 @@ impl Runtime {
         }
 
         // Set up per-container overlay so youki can mknod on tmpfs.
-        if let Err(err) = setup_guest_container_overlay(&vm, "/vz-rootfs", &oci_container_id).await
+        // Non-stack path: no setup-commit cache, always start fresh.
+        if let Err(err) =
+            setup_guest_container_overlay(&vm, "/vz-rootfs", &oci_container_id, None).await
         {
             let _ = vm.stop().await;
             return Err(err);
@@ -335,7 +337,10 @@ impl Runtime {
         }
 
         // Set up per-container overlay so youki can mknod on tmpfs.
-        if let Err(err) = setup_guest_container_overlay(&vm, "/vz-rootfs", &container_id).await {
+        // Non-stack path: no setup-commit cache, always start fresh.
+        if let Err(err) =
+            setup_guest_container_overlay(&vm, "/vz-rootfs", &container_id, None).await
+        {
             let _ = vm.stop().await;
             return Err(err);
         }

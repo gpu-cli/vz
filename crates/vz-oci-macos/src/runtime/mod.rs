@@ -185,6 +185,12 @@ pub struct Runtime {
     /// Keyed by `Arc<LinuxVm>` pointer identity (`Arc::as_ptr` cast to usize)
     /// so prep runs once per live VM instance.
     interactive_pty_prep_vms: Arc<Mutex<HashSet<usize>>>,
+    /// Container IDs whose overlay upperdir was prepopulated from a
+    /// setup-commit tarball at creation time. The backend reads this set
+    /// to skip `run_setup_commands` when the cache hit. Entries are added
+    /// in [`Self::create_container_in_stack`] and never proactively
+    /// removed — bounded by the lifetime of the daemon process.
+    setup_restored_containers: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Runtime {
@@ -212,6 +218,7 @@ impl Runtime {
             exec_sessions: Arc::new(Mutex::new(HashMap::new())),
             container_exec_env: Arc::new(Mutex::new(HashMap::new())),
             interactive_pty_prep_vms: Arc::new(Mutex::new(HashSet::new())),
+            setup_restored_containers: Arc::new(Mutex::new(HashSet::new())),
         };
 
         runtime.reconcile_stale_containers();
@@ -221,6 +228,16 @@ impl Runtime {
     }
 
     /// Return configured data directory.
+    /// Whether the named container's overlay upperdir was pre-populated
+    /// from a cached setup-commit tarball at creation time. Backends use
+    /// this to decide whether to skip `run_setup_commands`.
+    pub async fn was_setup_restored(&self, container_id: &str) -> bool {
+        self.setup_restored_containers
+            .lock()
+            .await
+            .contains(container_id)
+    }
+
     pub fn data_dir(&self) -> &PathBuf {
         &self.config.data_dir
     }
