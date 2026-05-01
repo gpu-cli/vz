@@ -11,6 +11,43 @@ mount -t tmpfs tmpfs /tmp
 
 mkdir -p /run /mnt/rootfs /mnt/merged
 
+# Optional: pre-allocate memory in tmpfs at boot for memory-balloon testing.
+# Honors `memhog_mb=N` on the kernel cmdline. Allocates N MB in /tmp (tmpfs)
+# so the host actually backs the pages with real RAM, giving the balloon
+# something to reclaim when the host calls set_target_memory_size().
+# Defaults to 0 (no allocation) so this is invisible for normal boots.
+memhog_mb=$(/bin/busybox sed -n 's/.*memhog_mb=\([0-9][0-9]*\).*/\1/p' /proc/cmdline)
+if [ -n "${memhog_mb:-}" ] && [ "${memhog_mb}" -gt 0 ] 2>/dev/null; then
+  echo "[vz-init] allocating ${memhog_mb} MB into /tmp/memhog (balloon test fixture)"
+  /bin/busybox dd if=/dev/zero of=/tmp/memhog bs=1M count="${memhog_mb}" 2>/dev/null || \
+    echo "[vz-init] memhog allocation failed (continuing)"
+fi
+
+# Optional: just keep the kernel running idle for measurement runs that
+# don't want the full guest-agent + youki setup. Set `vz_idle=1` on cmdline.
+if /bin/busybox grep -q '\bvz_idle=1\b' /proc/cmdline; then
+  echo "[vz-init] vz_idle=1 — dumping virtio device map, then polling meminfo"
+  echo "[vz-init] /sys/bus/virtio/devices:"
+  for d in /sys/bus/virtio/devices/*; do
+    [ -d "$d" ] || continue
+    dev=$(/bin/busybox cat "$d/device" 2>/dev/null || echo '?')
+    drv=$(/bin/busybox readlink "$d/driver" 2>/dev/null || echo 'UNBOUND')
+    echo "[vz-init]   $d  device=$dev  driver=$drv"
+  done
+  # Poll /proc/meminfo every 2s so the host can correlate balloon target
+  # changes with guest-visible MemFree shifts.
+  i=0
+  while [ "$i" -lt 30 ]; do
+    mt=$(/bin/busybox awk '/^MemTotal:/{print $2}' /proc/meminfo)
+    mf=$(/bin/busybox awk '/^MemFree:/{print $2}' /proc/meminfo)
+    ma=$(/bin/busybox awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+    echo "[vz-meminfo] t=${i}s MemTotal=${mt}kB MemFree=${mf}kB MemAvailable=${ma}kB"
+    /bin/busybox sleep 2
+    i=$((i + 2))
+  done
+  exec /bin/busybox sleep infinity
+fi
+
 # Create device nodes that devtmpfs may not auto-populate.
 # /dev/kvm: needed for nested virtualization (Firecracker, QEMU).
 # /dev/net/tun: needed for tap networking (Firecracker guest NICs).

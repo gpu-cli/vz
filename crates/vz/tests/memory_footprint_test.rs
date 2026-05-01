@@ -221,22 +221,21 @@ async fn balloon_reclaims_real_pages_under_load() {
         return;
     };
 
-    // Force the guest to actually allocate physical pages at boot via
-    // hugepages=. 256 hugepages × 2 MB = 512 MB of dirty pages per guest
-    // that the host is forced to back with real RAM.
+    // Force the guest to actually allocate physical pages at boot via the
+    // initramfs `memhog_mb=` knob. 512 MB of dd-into-tmpfs gives the balloon
+    // something concrete to reclaim. `vz_idle=1` keeps init from chaining
+    // into the full guest-agent + youki setup so memory accounting stays
+    // simple.
     let memory_per_vm = 2 * ONE_GB;
     let n = 4usize;
-    let cmdline = "console=hvc0 quiet hugepages=256";
+    let cmdline = "console=hvc0 quiet memhog_mb=512 vz_idle=1";
 
     let baseline = helper_processes();
     eprintln!();
     eprintln!("==== Balloon reclaim under load ====");
     eprintln!("N VMs:               {n}");
     eprintln!("memory per VM:       {}", fmt_mb(memory_per_vm));
-    eprintln!(
-        "cmdline:             {cmdline}  (forces {} MB hugepages)",
-        256 * 2
-    );
+    eprintln!("cmdline:             {cmdline}  (forces 512 MB allocation in tmpfs)");
     eprintln!(
         "baseline helpers:    {} (rss {})",
         baseline.count,
@@ -271,28 +270,33 @@ async fn balloon_reclaims_real_pages_under_load() {
     );
 
     // Balloon down to 1/4 of configured. Apple's setter is fire-and-forget;
-    // give the guest balloon driver time to actually inflate.
+    // give the guest balloon driver time to actually inflate, then sample
+    // RSS at intervals so we can see whether the host is gradually reclaiming
+    // or whether reclaim never happens at all.
     let target = memory_per_vm / 4;
     for vm in &vms {
         vm.set_target_memory_size(target).await.unwrap();
     }
-    tokio::time::sleep(Duration::from_secs(15)).await;
-
-    let after_balloon = helper_processes();
-    let after_balloon_delta = after_balloon
-        .total_rss_bytes
-        .saturating_sub(baseline.total_rss_bytes);
-    let signed_change: i64 =
-        after_balloon.total_rss_bytes as i64 - after_boot.total_rss_bytes as i64;
     eprintln!(
-        "after balloon to {} per VM (15s settle):",
+        "balloon target set to {} per VM, sampling RSS over time...",
         fmt_mb(target)
     );
-    eprintln!("  helpers={} sum RSS delta={}", after_balloon.count.saturating_sub(baseline.count), fmt_mb(after_balloon_delta));
-    eprintln!(
-        "  delta vs after-boot: {} MB  (negative = balloon driver returned pages to host)",
-        signed_change / ONE_MB as i64
-    );
+    for wait in [5u64, 15, 30, 60] {
+        tokio::time::sleep(Duration::from_secs(if wait == 5 { 5 } else { wait - 5 })).await;
+        let snap = helper_processes();
+        let delta = snap
+            .total_rss_bytes
+            .saturating_sub(baseline.total_rss_bytes);
+        let signed: i64 = snap.total_rss_bytes as i64 - after_boot.total_rss_bytes as i64;
+        eprintln!(
+            "  t=+{:>2}s helpers={} sum RSS delta={} ({}{} MB vs after-boot)",
+            wait,
+            snap.count.saturating_sub(baseline.count),
+            fmt_mb(delta),
+            if signed >= 0 { "+" } else { "" },
+            signed / ONE_MB as i64
+        );
+    }
 
     for vm in &vms {
         let _ = vm.stop().await;
