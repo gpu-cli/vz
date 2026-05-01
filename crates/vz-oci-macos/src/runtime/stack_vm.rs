@@ -42,11 +42,52 @@ impl Runtime {
         ports: Vec<PortMapping>,
         resources: vz_runtime_contract::StackResourceHint,
     ) -> Result<(), OciError> {
+        // Snapshot lock-protected counters into locals so the lock guards
+        // don't span the tracing::info! call (which was captured across
+        // the next .await and broke Send).
+        let (stack_vms_count, stack_port_forwards_count, has_leftover_pf, already_booted) = {
+            let vms = self.stack_vms.lock().await;
+            let pfs = self.stack_port_forwards.lock().await;
+            (
+                vms.len(),
+                pfs.len(),
+                pfs.contains_key(stack_id),
+                vms.contains_key(stack_id),
+            )
+        };
+        let sample_ports: Vec<(u16, u16)> = ports
+            .iter()
+            .take(4)
+            .map(|p| (p.host, p.container))
+            .collect();
+        tracing::info!(
+            target: "vz_post_stop",
+            stack_id = %stack_id,
+            in_count = ports.len(),
+            ?sample_ports,
+            stack_vms_count,
+            stack_port_forwards_count,
+            "[L4/stack-vm] boot_shared_vm entry"
+        );
         // Guard against double-boot.
-        if self.stack_vms.lock().await.contains_key(stack_id) {
+        if already_booted {
+            tracing::info!(
+                target: "vz_post_stop",
+                stack_id = %stack_id,
+                "[L4/stack-vm] returning 'shared VM already running' (BUG SUSPECT — partial-cleanup leftover)"
+            );
             return Err(OciError::InvalidConfig(format!(
                 "shared VM already running for stack '{stack_id}'"
             )));
+        }
+        // Inspect partial-cleanup state: stack_vms cleared but stack_port_forwards
+        // not. This is suspect (c).
+        if has_leftover_pf {
+            tracing::warn!(
+                target: "vz_post_stop",
+                stack_id = %stack_id,
+                "[L4/stack-vm] LEFTOVER PortForwarding entry for this stack from prior run (BUG SUSPECT (c))"
+            );
         }
 
         let rootfs_store = self.rootfs_store_dir();
@@ -600,6 +641,18 @@ impl Runtime {
     /// Each container is stopped via `oci_kill` + `oci_delete`, then the
     /// shared VM is torn down. Container metadata is updated to `Stopped`.
     pub async fn shutdown_shared_vm(&self, stack_id: &str) -> Result<(), OciError> {
+        let (stack_vms_count, stack_port_forwards_count) = {
+            let vms = self.stack_vms.lock().await;
+            let pfs = self.stack_port_forwards.lock().await;
+            (vms.len(), pfs.len())
+        };
+        tracing::info!(
+            target: "vz_post_stop",
+            stack_id = %stack_id,
+            stack_vms_count,
+            stack_port_forwards_count,
+            "[L4/stack-vm] shutdown_shared_vm entry"
+        );
         let vm = self
             .stack_vms
             .lock()
@@ -650,12 +703,49 @@ impl Runtime {
         }
 
         // Shut down port forwarding relays for this stack.
-        if let Some(pf) = self.stack_port_forwards.lock().await.remove(stack_id) {
-            pf.shutdown().await;
+        let pf_present = {
+            let mut guard = self.stack_port_forwards.lock().await;
+            guard.remove(stack_id)
+        };
+        match pf_present {
+            Some(pf) => {
+                tracing::info!(
+                    target: "vz_post_stop",
+                    stack_id = %stack_id,
+                    "[L4/stack-vm] shutdown_shared_vm: awaiting PortForwarding::shutdown"
+                );
+                let started = std::time::Instant::now();
+                pf.shutdown().await;
+                tracing::info!(
+                    target: "vz_post_stop",
+                    stack_id = %stack_id,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "[L4/stack-vm] shutdown_shared_vm: PortForwarding::shutdown returned"
+                );
+            }
+            None => {
+                tracing::info!(
+                    target: "vz_post_stop",
+                    stack_id = %stack_id,
+                    "[L4/stack-vm] shutdown_shared_vm: no PortForwarding registered for stack"
+                );
+            }
         }
 
         // Tear down the shared VM.
         let _ = vm.stop().await;
+        let (stack_vms_count_after, stack_port_forwards_count_after) = {
+            let vms = self.stack_vms.lock().await;
+            let pfs = self.stack_port_forwards.lock().await;
+            (vms.len(), pfs.len())
+        };
+        tracing::info!(
+            target: "vz_post_stop",
+            stack_id = %stack_id,
+            stack_vms_count_after,
+            stack_port_forwards_count_after,
+            "[L4/stack-vm] shutdown_shared_vm complete"
+        );
 
         Ok(())
     }

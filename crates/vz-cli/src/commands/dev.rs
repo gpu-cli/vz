@@ -15,7 +15,7 @@ use clap::Args;
 use crossterm::terminal;
 use serde::Deserialize;
 use sha2::Digest;
-use tracing::debug;
+use tracing::{debug, info};
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed_client::{DaemonClient, DaemonClientError};
 
@@ -166,6 +166,14 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
     let mut all_port_specs = config.ports.clone();
     all_port_specs.extend(args.publish.iter().cloned());
     let port_mappings = parse_port_mappings(&all_port_specs)?;
+    info!(
+        target: "vz_post_stop",
+        from_config = config.ports.len(),
+        from_cli = args.publish.len(),
+        total_after_parse = port_mappings.len(),
+        sample_ports = ?port_mappings.iter().take(4).map(|p| (p.host_port, p.container_port)).collect::<Vec<_>>(),
+        "[L0/cli] port mappings parsed"
+    );
 
     // --fresh: delete persistent disk so the container starts with a clean filesystem.
     if args.fresh {
@@ -181,6 +189,13 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
     let state_db = default_state_db_path();
     let mut client = connect_control_plane_for_state_db(&state_db).await?;
 
+    info!(
+        target: "vz_post_stop",
+        %sandbox_id,
+        port_count = port_mappings.len(),
+        "[L0/cli] checking existing sandbox state via get_sandbox"
+    );
+
     // Check if sandbox already exists and is running.
     let needs_boot = match client
         .get_sandbox(runtime_v2::GetSandboxRequest {
@@ -195,23 +210,47 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
                 .as_ref()
                 .map(|s| s.state.as_str())
                 .unwrap_or("");
+            info!(
+                target: "vz_post_stop",
+                %state,
+                fresh = args.fresh,
+                "[L0/cli] get_sandbox returned"
+            );
             match state {
                 // VM is running — reuse it (unless --fresh).
-                "ready" | "active" if !args.fresh => false,
+                "ready" | "active" if !args.fresh => {
+                    info!(
+                        target: "vz_post_stop",
+                        port_count = port_mappings.len(),
+                        "[L0/cli] REUSING existing VM — port_mappings dropped (BUG SUSPECT if -p was specified)"
+                    );
+                    false
+                }
                 // VM exists but we want fresh, or it's in a terminal/unknown state.
                 // Terminate so we can recreate.
                 _ if !state.is_empty() => {
                     if args.fresh {
                         eprintln!("Stopping existing VM for fresh start...");
                     }
+                    info!(
+                        target: "vz_post_stop",
+                        %state,
+                        "[L0/cli] terminating existing sandbox before fresh boot"
+                    );
                     let _ = terminate_sandbox(&mut client, &sandbox_id).await;
                     true
                 }
                 // Empty state means not found.
-                _ => true,
+                _ => {
+                    info!(target: "vz_post_stop", "[L0/cli] no existing sandbox; will create");
+                    true
+                }
             }
         }
-        Err(_) => true,
+        Err(error) => {
+            info!(target: "vz_post_stop", %error, "[L0/cli] get_sandbox failed; will create");
+            true
+        }
     };
 
     if needs_boot {
@@ -250,6 +289,14 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
         for (i, cmd) in config.setup.iter().enumerate() {
             labels.insert(format!("vz.setup.{i}"), cmd.clone());
         }
+
+        info!(
+            target: "vz_post_stop",
+            %sandbox_id,
+            port_count = port_mappings.len(),
+            sample_ports = ?port_mappings.iter().take(4).map(|p| (p.host_port, p.container_port)).collect::<Vec<_>>(),
+            "[L0/cli] sending CreateSandboxRequest with port_mappings"
+        );
 
         let mut stream = client
             .create_sandbox_stream(runtime_v2::CreateSandboxRequest {

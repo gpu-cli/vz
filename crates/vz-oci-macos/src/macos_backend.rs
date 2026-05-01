@@ -268,8 +268,21 @@ impl RuntimeBackend for MacosRuntimeBackend {
         ports: Vec<contract::PortMapping>,
         resources: contract::StackResourceHint,
     ) -> Result<(), RuntimeError> {
+        tracing::info!(
+            target: "vz_post_stop",
+            stack_id = %stack_id,
+            in_count = ports.len(),
+            sample_ports = ?ports.iter().take(4).map(|p| (p.host, p.container)).collect::<Vec<_>>(),
+            "[L3/macos-backend] boot_shared_vm received contract ports"
+        );
         let oci_ports: Vec<oci_config::PortMapping> =
             ports.into_iter().map(port_mapping_from_contract).collect();
+        tracing::info!(
+            target: "vz_post_stop",
+            stack_id = %stack_id,
+            out_count = oci_ports.len(),
+            "[L3/macos-backend] mapped to oci_config::PortMapping; calling runtime.boot_shared_vm"
+        );
         self.runtime
             .boot_shared_vm(stack_id, oci_ports, resources)
             .await

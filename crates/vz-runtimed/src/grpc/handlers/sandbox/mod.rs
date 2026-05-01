@@ -869,6 +869,14 @@ async fn boot_runtime_sandbox_resources(
             target_host: None,
         })
         .collect();
+    tracing::info!(
+        target: "vz_post_stop",
+        sandbox_id = %sandbox_id,
+        in_count = port_mappings.len(),
+        out_count = ports.len(),
+        sample_ports = ?ports.iter().take(4).map(|p| (p.host, p.container)).collect::<Vec<_>>(),
+        "[L2/runtimed-mod] mapped to ContractPortMapping; about to call boot_shared_vm"
+    );
 
     match daemon
         .manager()

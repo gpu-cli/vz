@@ -19,7 +19,17 @@ pub(super) async fn start_port_forwarding(
     vm: Arc<Vm>,
     ports: &[PortMapping],
 ) -> Result<Option<PortForwarding>, OciError> {
+    tracing::info!(
+        target: "vz_post_stop",
+        port_count = ports.len(),
+        sample_ports = ?ports.iter().take(4).map(|p| (p.host, p.container)).collect::<Vec<_>>(),
+        "[L5/networking] start_port_forwarding entry"
+    );
     if ports.is_empty() {
+        tracing::info!(
+            target: "vz_post_stop",
+            "[L5/networking] ports empty — returning Ok(None) (no listeners spawned) (BUG SUSPECT (a))"
+        );
         return Ok(None);
     }
 
@@ -39,8 +49,24 @@ pub(super) async fn start_port_forwarding(
         }
 
         let listener = match TcpListener::bind(("127.0.0.1", mapping.host)).await {
-            Ok(listener) => listener,
+            Ok(listener) => {
+                tracing::info!(
+                    target: "vz_post_stop",
+                    host_port = mapping.host,
+                    container_port = mapping.container,
+                    local_addr = ?listener.local_addr().ok(),
+                    "[L5/networking] TcpListener::bind succeeded"
+                );
+                listener
+            }
             Err(error) => {
+                tracing::error!(
+                    target: "vz_post_stop",
+                    host_port = mapping.host,
+                    container_port = mapping.container,
+                    error = %error,
+                    "[L5/networking] TcpListener::bind FAILED (BUG SUSPECT (b))"
+                );
                 let _ = shutdown_tx.send(true);
                 for task in listener_tasks.drain(..) {
                     let _ = task.await;

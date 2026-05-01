@@ -63,6 +63,15 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
         let explicit_volume_mounts = request.volume_mounts;
         let explicit_disk_image_path = request.disk_image_path;
         let explicit_port_mappings = request.port_mappings;
+        tracing::info!(
+            target: "vz_post_stop",
+            sandbox_id = %sandbox_id,
+            port_count = explicit_port_mappings.len(),
+            sample_ports = ?explicit_port_mappings.iter().take(4).map(|p| (p.host_port, p.container_port)).collect::<Vec<_>>(),
+            request_id = %request_id,
+            idempotency_key = ?idempotency_key,
+            "[L1/runtimed] create_sandbox received explicit_port_mappings"
+        );
         let mut labels: BTreeMap<String, String> = request.labels.into_iter().collect();
         // Requesters cannot predeclare default-source audit labels.
         labels.remove(SANDBOX_LABEL_BASE_IMAGE_DEFAULT_SOURCE);
@@ -111,6 +120,12 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
                 &request_hash,
                 &request_id,
             )? {
+                tracing::info!(
+                    target: "vz_post_stop",
+                    sandbox_id = %sandbox_id,
+                    port_count_dropped = explicit_port_mappings.len(),
+                    "[L1/runtimed] IDEMPOTENCY REPLAY — port_mappings DROPPED (BUG SUSPECT (d))"
+                );
                 sequence += 1;
                 events.push(Ok(create_sandbox_progress_event(
                     &request_id,
@@ -137,7 +152,18 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
             .with_state_store(|store| store.load_sandbox(&sandbox_id))
             .map_err(|error| status_from_stack_error(error, &request_id))?
             .is_some();
+        tracing::info!(
+            target: "vz_post_stop",
+            sandbox_id = %sandbox_id,
+            exists,
+            "[L1/runtimed] state_store load_sandbox check"
+        );
         if exists {
+            tracing::info!(
+                target: "vz_post_stop",
+                sandbox_id = %sandbox_id,
+                "[L1/runtimed] returning state_conflict 'sandbox already exists' (BUG SUSPECT for stop+rerun)"
+            );
             return Err(status_from_machine_error(MachineError::new(
                 MachineErrorCode::StateConflict,
                 format!("sandbox already exists: {sandbox_id}"),
