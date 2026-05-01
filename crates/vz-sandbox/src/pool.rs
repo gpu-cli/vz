@@ -525,7 +525,11 @@ impl SandboxPool {
             .cpus(config.cpus)
             .memory_gb(config.memory_gb)
             .boot_loader(vz::BootLoader::MacOS)
-            .disk(config.image_path.clone())
+            .disk(vz::DiskConfig {
+                id: "rootfs".into(),
+                path: config.image_path.clone(),
+                read_only: false,
+            })
             .enable_vsock();
 
         // Add workspace mount if configured

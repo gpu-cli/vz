@@ -74,7 +74,11 @@ pub async fn setup(args: &RunArgs) -> anyhow::Result<RunningVm> {
         .cpus(args.cpus)
         .memory_gb(args.memory as u32)
         .boot_loader(vz::BootLoader::MacOS)
-        .disk(args.image.clone())
+        .disk(vz::DiskConfig {
+            id: "rootfs".into(),
+            path: args.image.clone(),
+            read_only: false,
+        })
         .enable_vsock();
 
     // Look for platform identity files alongside the disk image

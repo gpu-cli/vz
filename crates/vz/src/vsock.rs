@@ -27,18 +27,55 @@ use tokio::sync::mpsc;
 
 use crate::error::VzError;
 
+/// Stable identifier for the VM that originated a vsock connection.
+///
+/// Derived from the address of the source `VZVirtioSocketDevice`, which is
+/// owned by exactly one VM and lives for that VM's lifetime. Two connections
+/// accepted from the same VM compare equal; connections from distinct VMs
+/// compare unequal. Useful as a trust-boundary signal in multi-tenant hosts:
+/// the framework sets the source — the guest cannot forge it.
+///
+/// Stable for the lifetime of the source device. Once the VM is torn down,
+/// a future VM may reuse the same address, so `VmHandle` is not a long-term
+/// archival key — treat it as an alive-VM equality token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VmHandle(u64);
+
+impl VmHandle {
+    pub(crate) fn from_device(device: &VZVirtioSocketDevice) -> Self {
+        Self(device as *const _ as usize as u64)
+    }
+
+    /// Raw u64 form of the handle. Useful for logging/correlation.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
 /// Wrapper to send a `VZVirtioSocketConnection` across thread boundaries.
 ///
 /// `Retained<VZVirtioSocketConnection>` is not `Send` because ObjC objects
 /// aren't generally thread-safe. However, we only access the connection's
 /// file descriptor (via `dup()`) after crossing the thread boundary, and
-/// file descriptors are safe to use from any thread.
+/// file descriptors are safe to use from any thread. Used on the
+/// host-dials-guest (`vsock_connect`) path where there is no source VM.
 pub(crate) struct SendableConnection(pub Retained<VZVirtioSocketConnection>);
 
 // SAFETY: After crossing the thread boundary, we only access the file
 // descriptor (which is thread-safe). The ObjC connection is retained purely
 // to keep the fd alive until we dup it.
 unsafe impl Send for SendableConnection {}
+
+/// Connection accepted from a guest, paired with the source-VM handle the
+/// framework reported on the accept callback.
+pub(crate) struct AcceptedConnection {
+    pub conn: Retained<VZVirtioSocketConnection>,
+    pub source: VmHandle,
+}
+
+// SAFETY: Same rationale as SendableConnection — we only touch the fd after
+// the channel hop. The VmHandle is a plain u64 and is trivially Send.
+unsafe impl Send for AcceptedConnection {}
 
 /// A bidirectional byte stream over vsock.
 ///
@@ -236,7 +273,7 @@ impl AsRawFd for VsockStream {
 pub struct VsockListener {
     /// Channel receiving raw connections from the ObjC delegate.
     /// Converted to `VsockStream` in `accept()` on the tokio thread.
-    rx: mpsc::UnboundedReceiver<SendableConnection>,
+    rx: mpsc::UnboundedReceiver<AcceptedConnection>,
     /// The ObjC listener delegate, retained to prevent deallocation.
     _handle: Arc<ListenerHandle>,
 }
@@ -258,7 +295,7 @@ impl VsockListener {
     /// Sets up a `VZVirtioSocketListener` with a delegate that forwards
     /// incoming connections to the returned listener via an mpsc channel.
     pub(crate) fn new(device: &VZVirtioSocketDevice, port: u32) -> Result<Self, VzError> {
-        let (tx, rx) = mpsc::unbounded_channel::<SendableConnection>();
+        let (tx, rx) = mpsc::unbounded_channel::<AcceptedConnection>();
 
         // Create the ObjC listener and delegate
         let delegate = VsockListenerDelegate::new(tx);
@@ -283,16 +320,29 @@ impl VsockListener {
 
     /// Accept the next incoming connection.
     ///
-    /// Waits for a guest to connect on this listener's port and
-    /// returns a `VsockStream` for the connection.
-    pub async fn accept(&mut self) -> Result<VsockStream, VzError> {
-        let conn = self.rx.recv().await.ok_or_else(|| VzError::VsockFailed {
-            port: 0,
-            reason: "listener channel closed".into(),
-        })?;
+    /// Waits for a guest to connect on this listener's port and returns the
+    /// connection paired with a `VmHandle` identifying the source VM. The
+    /// handle equals across accepts from the same VM and differs across VMs,
+    /// making it usable as a trust-boundary signal in multi-tenant hosts.
+    pub async fn accept(&mut self) -> Result<AcceptedVsockStream, VzError> {
+        let AcceptedConnection { conn, source } =
+            self.rx.recv().await.ok_or_else(|| VzError::VsockFailed {
+                port: 0,
+                reason: "listener channel closed".into(),
+            })?;
         // Create VsockStream here on the tokio thread (AsyncFd needs a reactor).
-        VsockStream::from_connection(conn.0)
+        let stream = VsockStream::from_connection(conn)?;
+        Ok(AcceptedVsockStream { stream, source })
     }
+}
+
+/// A connection accepted by `VsockListener::accept()`, carrying both the
+/// byte-stream and the source-VM identifier.
+pub struct AcceptedVsockStream {
+    /// Bidirectional async byte stream for the accepted connection.
+    pub stream: VsockStream,
+    /// Identifier of the VM that originated this connection.
+    pub source: VmHandle,
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +351,7 @@ impl VsockListener {
 
 /// Ivar storage for the listener delegate.
 pub(crate) struct VsockListenerDelegateIvars {
-    tx: Cell<Option<mpsc::UnboundedSender<SendableConnection>>>,
+    tx: Cell<Option<mpsc::UnboundedSender<AcceptedConnection>>>,
 }
 
 define_class!(
@@ -319,7 +369,7 @@ define_class!(
             &self,
             _listener: &VZVirtioSocketListener,
             connection: &VZVirtioSocketConnection,
-            _device: &VZVirtioSocketDevice,
+            device: &VZVirtioSocketDevice,
         ) -> Bool {
             if let Some(tx) = self.ivars().tx.take() {
                 // Retain the connection so it lives beyond this callback.
@@ -328,9 +378,11 @@ define_class!(
                     Retained::retain(connection as *const _ as *mut VZVirtioSocketConnection)
                 };
                 if let Some(conn) = retained_conn {
-                    // Send the raw connection through the channel.
-                    // VsockStream creation happens on the tokio thread in accept().
-                    let _ = tx.send(SendableConnection(conn));
+                    // Capture the source device here — Apple delivers it on every
+                    // accept callback and a host using vsock as a trust boundary
+                    // needs to know which VM the connection came from.
+                    let source = VmHandle::from_device(device);
+                    let _ = tx.send(AcceptedConnection { conn, source });
                     self.ivars().tx.set(Some(tx));
                     return Bool::YES;
                 }
@@ -342,7 +394,7 @@ define_class!(
 );
 
 impl VsockListenerDelegate {
-    fn new(tx: mpsc::UnboundedSender<SendableConnection>) -> Retained<Self> {
+    fn new(tx: mpsc::UnboundedSender<AcceptedConnection>) -> Retained<Self> {
         let ivars = VsockListenerDelegateIvars {
             tx: Cell::new(Some(tx)),
         };

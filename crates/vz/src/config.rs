@@ -56,6 +56,25 @@ pub enum NetworkConfig {
     None,
 }
 
+/// One block device attached to the VM.
+///
+/// Disks are presented to the guest as virtio-block devices in the order
+/// they were appended to the builder — the first disk is `vda`, the second
+/// `vdb`, and so on. Apple's `setStorageDevices_` accepts an array of
+/// configurations, and consumers running structured microVM workloads
+/// typically need an ordered set (rootfs, data, metadata, override) rather
+/// than a single image with a partition table.
+#[derive(Debug, Clone)]
+pub struct DiskConfig {
+    /// Stable identifier used for logging and (future) hot-replace flows.
+    /// Not visible to the guest — the guest sees `vda`/`vdb`/... by order.
+    pub id: String,
+    /// Host-side path to the disk image.
+    pub path: PathBuf,
+    /// If true, the guest cannot write to this disk.
+    pub read_only: bool,
+}
+
 /// Builder for VM configuration.
 #[derive(Debug)]
 pub struct VmConfigBuilder {
@@ -63,12 +82,12 @@ pub struct VmConfigBuilder {
     memory_bytes: u64,
     boot_loader: Option<BootLoader>,
     mac_platform: Option<MacPlatformConfig>,
-    disk_path: Option<PathBuf>,
-    disk_size_bytes: Option<u64>,
+    disks: Vec<DiskConfig>,
     shared_dirs: Vec<SharedDirConfig>,
     serial_log_file: Option<PathBuf>,
     generic_machine_identifier: Option<Vec<u8>>,
     network: NetworkConfig,
+    network_mac: Option<String>,
     vsock: bool,
     headless: bool,
     nested_virtualization: bool,
@@ -82,12 +101,12 @@ impl VmConfigBuilder {
             memory_bytes: 4 * 1024 * 1024 * 1024, // 4 GB
             boot_loader: None,
             mac_platform: None,
-            disk_path: None,
-            disk_size_bytes: None,
+            disks: Vec::new(),
             shared_dirs: Vec::new(),
             serial_log_file: None,
             generic_machine_identifier: None,
             network: NetworkConfig::Nat,
+            network_mac: None,
             vsock: false,
             headless: true,
             nested_virtualization: true,
@@ -154,15 +173,13 @@ impl VmConfigBuilder {
         self
     }
 
-    /// Set the disk image path.
-    pub fn disk(mut self, path: impl Into<PathBuf>) -> Self {
-        self.disk_path = Some(path.into());
-        self
-    }
-
-    /// Set the disk size in bytes (for creating new images).
-    pub fn disk_size(mut self, bytes: u64) -> Self {
-        self.disk_size_bytes = Some(bytes);
+    /// Append a disk to the VM's storage devices.
+    ///
+    /// Disks appear in the guest as virtio-block devices in declaration order:
+    /// the first appended disk is `vda`, the second `vdb`, and so on. For
+    /// macOS guests the first disk must be the rootfs.
+    pub fn disk(mut self, disk: DiskConfig) -> Self {
+        self.disks.push(disk);
         self
     }
 
@@ -193,6 +210,17 @@ impl VmConfigBuilder {
     /// Set network configuration.
     pub fn network(mut self, config: NetworkConfig) -> Self {
         self.network = config;
+        self
+    }
+
+    /// Pin the VM's MAC address to a specific value.
+    ///
+    /// Format is `"XX:XX:XX:XX:XX:XX"` (six hex bytes, colon-separated).
+    /// When unset, `build()` generates a fresh random locally-administered MAC.
+    /// Setting an explicit MAC is useful when the consumer derives a deterministic
+    /// MAC from a stable VM identity (e.g., for traffic correlation across restarts).
+    pub fn mac(mut self, mac: impl Into<String>) -> Self {
+        self.network_mac = Some(mac.into());
         self
     }
 
@@ -232,11 +260,16 @@ impl VmConfigBuilder {
             ));
         }
 
-        let disk_path = match &boot_loader {
-            BootLoader::MacOS => Some(self.disk_path.ok_or_else(|| {
-                VzError::InvalidConfig("macOS boot requires a disk image".into())
-            })?),
-            BootLoader::Linux { .. } => self.disk_path,
+        // macOS must boot from disk; Linux can boot from initramfs alone.
+        if matches!(boot_loader, BootLoader::MacOS) && self.disks.is_empty() {
+            return Err(VzError::InvalidConfig(
+                "macOS boot requires at least one disk".into(),
+            ));
+        }
+
+        let network_mac = match self.network_mac {
+            Some(mac) => mac,
+            None => crate::bridge::random_locally_administered_mac_string(),
         };
 
         Ok(VmConfig {
@@ -244,12 +277,12 @@ impl VmConfigBuilder {
             memory_bytes: self.memory_bytes,
             boot_loader,
             mac_platform: self.mac_platform,
-            disk_path,
-            disk_size_bytes: self.disk_size_bytes,
+            disks: self.disks,
             shared_dirs: self.shared_dirs,
             serial_log_file: self.serial_log_file,
             generic_machine_identifier: self.generic_machine_identifier,
             network: self.network,
+            network_mac,
             vsock: self.vsock,
             headless: self.headless,
             nested_virtualization: self.nested_virtualization,
@@ -270,18 +303,39 @@ pub struct VmConfig {
     pub(crate) memory_bytes: u64,
     pub(crate) boot_loader: BootLoader,
     pub(crate) mac_platform: Option<MacPlatformConfig>,
-    pub(crate) disk_path: Option<PathBuf>,
-    /// Used when creating new disk images (e.g., during install).
-    #[allow(dead_code)]
-    pub(crate) disk_size_bytes: Option<u64>,
+    /// Block devices in declaration order — guest sees them as `vda`, `vdb`, ...
+    pub(crate) disks: Vec<DiskConfig>,
     pub(crate) shared_dirs: Vec<SharedDirConfig>,
     pub(crate) serial_log_file: Option<PathBuf>,
     pub(crate) generic_machine_identifier: Option<Vec<u8>>,
     pub(crate) network: NetworkConfig,
+    /// MAC address in `"XX:XX:XX:XX:XX:XX"` form. Always populated by `build()`.
+    /// Persisting it here keeps save/restore correct (the restored VM's NIC must
+    /// match the MAC the saved guest expects) and gives every VM a unique address
+    /// when more than one runs in the same process.
+    pub(crate) network_mac: String,
     pub(crate) vsock: bool,
     /// Controls whether to attach a virtual display. Used by CLI layer.
     #[allow(dead_code)]
     pub(crate) headless: bool,
     /// Enable nested virtualization (exposes /dev/kvm in Linux guests).
     pub(crate) nested_virtualization: bool,
+}
+
+impl VmConfig {
+    /// Read the MAC address assigned to this VM's primary NIC.
+    ///
+    /// Always returns a value: either what the caller passed via
+    /// `VmConfigBuilder::mac()`, or a fresh random locally-administered
+    /// address generated at `build()` time.
+    pub fn mac_address(&self) -> &str {
+        &self.network_mac
+    }
+
+    /// Read the ordered list of disks attached to this VM.
+    ///
+    /// The first entry is `vda` in the guest, the second `vdb`, and so on.
+    pub fn disks(&self) -> &[DiskConfig] {
+        &self.disks
+    }
 }

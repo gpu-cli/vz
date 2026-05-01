@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use vz::{BootLoader, MacPlatformConfig, VmConfigBuilder, VzError};
+use vz::{BootLoader, DiskConfig, MacPlatformConfig, VmConfigBuilder, VzError};
 
 // ---------------------------------------------------------------------------
 // VmConfig → ObjC validation (requires macOS for Vz.framework)
@@ -26,7 +26,11 @@ async fn create_vm_fails_with_invalid_disk_path() {
             machine_identifier_path: PathBuf::from("/nonexistent/machine.id"),
             auxiliary_storage_path: PathBuf::from("/nonexistent/aux.storage"),
         })
-        .disk("/nonexistent/disk.img")
+        .disk(DiskConfig {
+            id: "rootfs".into(),
+            path: PathBuf::from("/nonexistent/disk.img"),
+            read_only: false,
+        })
         .build();
 
     assert!(config.is_ok(), "builder validation should pass");
@@ -61,7 +65,11 @@ async fn create_vm_fails_with_invalid_hardware_model() {
             machine_identifier_path: id_path,
             auxiliary_storage_path: aux_path,
         })
-        .disk(&disk_path)
+        .disk(DiskConfig {
+            id: "rootfs".into(),
+            path: disk_path.clone(),
+            read_only: false,
+        })
         .build()
         .unwrap();
 

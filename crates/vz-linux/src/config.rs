@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use vz::config::VmConfig;
-use vz::{NetworkConfig, SharedDirConfig, VmConfigBuilder};
+use vz::{DiskConfig, NetworkConfig, SharedDirConfig, VmConfigBuilder};
 
 use crate::LinuxError;
 
@@ -184,7 +184,11 @@ impl LinuxVmConfig {
         }
 
         if let Some(disk_image) = &self.disk_image {
-            builder = builder.disk(disk_image.clone());
+            builder = builder.disk(DiskConfig {
+                id: "rootfs".into(),
+                path: disk_image.clone(),
+                read_only: false,
+            });
         }
 
         if self.nested_virtualization {

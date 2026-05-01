@@ -6,7 +6,15 @@
 
 use std::path::PathBuf;
 
-use vz::{BootLoader, MacPlatformConfig, SharedDirConfig, VmConfigBuilder, VzError};
+use vz::{BootLoader, DiskConfig, MacPlatformConfig, SharedDirConfig, VmConfigBuilder, VzError};
+
+fn rootfs_disk(path: &str) -> DiskConfig {
+    DiskConfig {
+        id: "rootfs".into(),
+        path: PathBuf::from(path),
+        read_only: false,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Builder defaults
@@ -39,8 +47,7 @@ fn builder_chaining_fluent() {
         .cpus(4)
         .memory_mb(8192)
         .boot_macos()
-        .disk("/tmp/test.img")
-        .disk_size(64 * 1024 * 1024 * 1024)
+        .disk(rootfs_disk("/tmp/test.img"))
         .shared_dir(SharedDirConfig {
             tag: "project".into(),
             source: "/tmp/project".into(),
@@ -68,7 +75,7 @@ fn build_macos_minimal() {
             machine_identifier_path: PathBuf::from("/tmp/machine.id"),
             auxiliary_storage_path: PathBuf::from("/tmp/aux.storage"),
         })
-        .disk("/tmp/test.img")
+        .disk(rootfs_disk("/tmp/test.img"))
         .build();
 
     assert!(config.is_ok());
@@ -83,7 +90,7 @@ fn build_with_shared_dirs() {
             machine_identifier_path: PathBuf::from("/tmp/machine.id"),
             auxiliary_storage_path: PathBuf::from("/tmp/aux.storage"),
         })
-        .disk("/tmp/test.img")
+        .disk(rootfs_disk("/tmp/test.img"))
         .shared_dir(SharedDirConfig {
             tag: "project".into(),
             source: "/tmp/project".into(),
@@ -105,7 +112,9 @@ fn build_with_shared_dirs() {
 
 #[test]
 fn build_fails_without_boot_loader() {
-    let result = VmConfigBuilder::new().disk("/tmp/test.img").build();
+    let result = VmConfigBuilder::new()
+        .disk(rootfs_disk("/tmp/test.img"))
+        .build();
 
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -132,7 +141,7 @@ fn build_fails_without_disk() {
 fn build_macos_fails_without_mac_platform() {
     let result = VmConfigBuilder::new()
         .boot_macos()
-        .disk("/tmp/test.img")
+        .disk(rootfs_disk("/tmp/test.img"))
         .build();
 
     assert!(result.is_err());
@@ -247,6 +256,73 @@ fn shared_dir_config_debug_and_clone() {
 // MacPlatformConfig
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Per-VM MAC address
+// ---------------------------------------------------------------------------
+
+fn build_minimal_linux_config() -> vz::config::VmConfig {
+    VmConfigBuilder::new()
+        .boot_linux("/boot/vmlinuz", None::<PathBuf>, "console=ttyS0")
+        .build()
+        .unwrap()
+}
+
+fn parse_mac_octets(mac: &str) -> [u8; 6] {
+    let parts: Vec<&str> = mac.split(':').collect();
+    assert_eq!(parts.len(), 6, "mac {mac:?} should have 6 octets");
+    let mut bytes = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        bytes[i] = u8::from_str_radix(part, 16).unwrap();
+    }
+    bytes
+}
+
+#[test]
+fn builder_generates_locally_administered_mac_by_default() {
+    let cfg = build_minimal_linux_config();
+    let mac = cfg.mac_address();
+    assert_eq!(mac.split(':').count(), 6, "mac should be 6 octets: {mac}");
+    let bytes = parse_mac_octets(mac);
+    // Locally administered: second-LSB of first octet set.
+    assert_eq!(bytes[0] & 0x02, 0x02, "mac {mac} should be locally administered");
+    // Unicast: LSB of first octet clear.
+    assert_eq!(bytes[0] & 0x01, 0x00, "mac {mac} should be unicast");
+}
+
+#[test]
+fn two_vm_configs_get_different_macs() {
+    // Build twice from the same builder shape — they must NOT share a MAC,
+    // otherwise running both VMs in one process collides on the host bridge.
+    let a = build_minimal_linux_config();
+    let b = build_minimal_linux_config();
+    assert_ne!(
+        a.mac_address(),
+        b.mac_address(),
+        "fresh VmConfigs must get distinct MACs (got {} for both)",
+        a.mac_address()
+    );
+}
+
+#[test]
+fn explicit_mac_is_preserved() {
+    let cfg = VmConfigBuilder::new()
+        .boot_linux("/boot/vmlinuz", None::<PathBuf>, "console=ttyS0")
+        .mac("aa:bb:cc:dd:ee:ff")
+        .build()
+        .unwrap();
+    assert_eq!(cfg.mac_address(), "aa:bb:cc:dd:ee:ff");
+}
+
+#[test]
+fn cloned_vmconfig_shares_mac() {
+    // VmConfig is Clone — save/restore takes the same VmConfig and reuses it,
+    // so the clone path must produce a config whose MAC matches the original.
+    let cfg = build_minimal_linux_config();
+    let original = cfg.mac_address().to_string();
+    let cloned = cfg.clone();
+    assert_eq!(cloned.mac_address(), original);
+}
+
 #[test]
 fn mac_platform_config_debug_and_clone() {
     let config = MacPlatformConfig {
@@ -260,4 +336,65 @@ fn mac_platform_config_debug_and_clone() {
     assert!(debug.contains("machine.id"));
     assert!(debug.contains("aux.storage"));
     assert_eq!(format!("{:?}", cloned), debug);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-disk
+// ---------------------------------------------------------------------------
+
+#[test]
+fn build_with_multiple_disks_preserves_order() {
+    let cfg = VmConfigBuilder::new()
+        .boot_linux("/boot/vmlinuz", None::<PathBuf>, "console=ttyS0")
+        .disk(DiskConfig {
+            id: "rootfs".into(),
+            path: PathBuf::from("/vm/root.img"),
+            read_only: false,
+        })
+        .disk(DiskConfig {
+            id: "data".into(),
+            path: PathBuf::from("/vm/data.img"),
+            read_only: false,
+        })
+        .disk(DiskConfig {
+            id: "metadata".into(),
+            path: PathBuf::from("/vm/metadata.img"),
+            read_only: true,
+        })
+        .build()
+        .unwrap();
+
+    assert_eq!(cfg.disks().len(), 3, "three disks should round-trip");
+    assert_eq!(cfg.disks()[0].id, "rootfs");
+    assert_eq!(cfg.disks()[1].id, "data");
+    assert_eq!(cfg.disks()[2].id, "metadata");
+    assert!(!cfg.disks()[0].read_only);
+    assert!(!cfg.disks()[1].read_only);
+    assert!(cfg.disks()[2].read_only, "metadata disk should be read-only");
+}
+
+#[test]
+fn linux_boot_with_no_disks_succeeds() {
+    // Linux can boot from initramfs alone — no disk required.
+    let cfg = VmConfigBuilder::new()
+        .boot_linux("/boot/vmlinuz", None::<PathBuf>, "console=ttyS0")
+        .build()
+        .unwrap();
+    assert!(cfg.disks().is_empty());
+}
+
+#[test]
+fn macos_boot_without_disks_fails() {
+    let result = VmConfigBuilder::new()
+        .boot_macos()
+        .mac_platform(MacPlatformConfig {
+            hardware_model_path: PathBuf::from("/tmp/hw.model"),
+            machine_identifier_path: PathBuf::from("/tmp/machine.id"),
+            auxiliary_storage_path: PathBuf::from("/tmp/aux.storage"),
+        })
+        .build();
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(matches!(err, VzError::InvalidConfig(ref msg) if msg.contains("disk")));
 }

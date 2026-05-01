@@ -8,14 +8,18 @@
 //! ```rust,no_run
 //! # #[cfg(target_os = "macos")]
 //! # {
-//! use vz::{BootLoader, SharedDirConfig, VmConfigBuilder};
+//! use vz::{BootLoader, DiskConfig, SharedDirConfig, VmConfigBuilder};
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! let config = VmConfigBuilder::new()
 //!     .cpus(4)
 //!     .memory_gb(8)
 //!     .boot_loader(BootLoader::MacOS)
-//!     .disk("./base-macos.img")
+//!     .disk(DiskConfig {
+//!         id: "rootfs".into(),
+//!         path: "./base-macos.img".into(),
+//!         read_only: false,
+//!     })
 //!     .shared_dir(SharedDirConfig {
 //!         tag: "project".into(),
 //!         source: "./my-project".into(),
@@ -60,7 +64,9 @@ pub mod vm;
 pub mod vsock;
 
 #[cfg(target_os = "macos")]
-pub use config::{BootLoader, MacPlatformConfig, NetworkConfig, SharedDirConfig, VmConfigBuilder};
+pub use config::{
+    BootLoader, DiskConfig, MacPlatformConfig, NetworkConfig, SharedDirConfig, VmConfigBuilder,
+};
 #[cfg(target_os = "macos")]
 pub use error::VzError;
 #[cfg(target_os = "macos")]
@@ -70,4 +76,4 @@ pub use machine_identifier::generate_generic_machine_identifier_data;
 #[cfg(target_os = "macos")]
 pub use vm::{Vm, VmState};
 #[cfg(target_os = "macos")]
-pub use vsock::{VsockListener, VsockStream};
+pub use vsock::{AcceptedVsockStream, VmHandle, VsockListener, VsockStream};
