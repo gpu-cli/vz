@@ -542,6 +542,34 @@ async fn port_forwarding_tcp() {
     let _ = rt.remove_container(&container_id).await;
 }
 
+/// VRT-gsk0 Bug B: when the daemon respawns after a kill, the in-memory
+/// `stack_vms` map is empty. A subsequent `vz stop` enters
+/// `shutdown_shared_vm` for a stack_id that exists only in SQLite, not
+/// in the runtime. The fix is to treat this as idempotent ("already
+/// stopped") instead of erroring with "no shared VM running" and
+/// relying on a string-match mask in the gRPC handler.
+///
+/// This test does not require the virtualization entitlement — it
+/// constructs a Runtime and calls shutdown_shared_vm on an unknown
+/// stack_id, which exercises only the in-memory branch.
+#[tokio::test]
+async fn shutdown_shared_vm_is_idempotent_when_in_memory_state_empty() {
+    init_tracing();
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = test_runtime(tmp.path());
+
+    // No prior boot — stack_vms is empty.
+    let result = rt.shutdown_shared_vm("does-not-exist").await;
+    assert!(
+        result.is_ok(),
+        "shutdown_shared_vm should be idempotent when no in-memory VM, got: {result:?}"
+    );
+
+    // Still idempotent on a second call.
+    let result2 = rt.shutdown_shared_vm("does-not-exist").await;
+    assert!(result2.is_ok(), "shutdown_shared_vm should remain idempotent: {result2:?}");
+}
+
 // ── Image pull caching ──────────────────────────────────────────
 
 /// Verify that pulling the same image twice is idempotent (uses cache).

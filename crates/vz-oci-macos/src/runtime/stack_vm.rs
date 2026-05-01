@@ -653,14 +653,25 @@ impl Runtime {
             stack_port_forwards_count,
             "[L4/stack-vm] shutdown_shared_vm entry"
         );
-        let vm = self
-            .stack_vms
-            .lock()
-            .await
-            .remove(stack_id)
-            .ok_or_else(|| {
-                OciError::InvalidConfig(format!("no shared VM running for stack '{stack_id}'"))
-            })?;
+        let Some(vm) = self.stack_vms.lock().await.remove(stack_id) else {
+            // Bug B fix: in-memory state can be empty after a daemon
+            // respawn (kill -9 / OS reboot mid-operation). In that case
+            // the SQLite state-store may still claim the sandbox is
+            // running, but we have no VM handle to shut down. Treat
+            // this as idempotent "already stopped" rather than the
+            // previous error path that relied on a string-match mask
+            // (`runtime_shutdown_error_is_not_active`) in the gRPC
+            // handler. Still drop any leftover port-forward map entry
+            // for this stack so subsequent boots start from a clean slate.
+            tracing::warn!(
+                stack_id,
+                "shutdown_shared_vm: no in-memory VM (likely after daemon respawn); treating as already-stopped"
+            );
+            if let Some(pf) = self.stack_port_forwards.lock().await.remove(stack_id) {
+                pf.shutdown().await;
+            }
+            return Ok(());
+        };
 
         // Find all containers belonging to this stack.
         let stack_containers: Vec<String> = {
