@@ -112,6 +112,47 @@ impl KernelCapability {
     }
 }
 
+/// Security and capability profile for bundled `vz` Linux kernels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KernelProfile {
+    /// Broad developer kernel with nested virtualization and TUN/TAP support.
+    Developer,
+    /// Constrained container/sandbox kernel without nested virtualization.
+    Container,
+}
+
+impl KernelProfile {
+    /// Stable string identifier used in release artifact names and metadata.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Developer => "developer",
+            Self::Container => "container",
+        }
+    }
+
+    /// Stable profile-specific bundle directory environment variable.
+    pub const fn bundle_dir_env_var(self) -> &'static str {
+        match self {
+            Self::Developer => "VZ_LINUX_DEVELOPER_BUNDLE_DIR",
+            Self::Container => "VZ_LINUX_CONTAINER_BUNDLE_DIR",
+        }
+    }
+
+    /// Security posture descriptor written to `version.json`.
+    pub const fn security_profile(self) -> &'static str {
+        match self {
+            Self::Developer => "developer-nested-virt",
+            Self::Container => "container-hardened",
+        }
+    }
+
+    /// Expected capability contract for this profile.
+    pub fn default_capabilities(self) -> BTreeSet<KernelCapability> {
+        default_vz_linux_kernel_profile_capabilities(self)
+    }
+}
+
 /// Versioned kernel flavor provided by `vz-linux`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelFlavor {
@@ -131,6 +172,11 @@ pub struct KernelBundleOptions {
     /// If unset, `VZ_LINUX_BUNDLE_DIR` and workspace-relative `linux/out`
     /// discovery behave the same as [`ensure_kernel_with_options`].
     pub bundle_dir: Option<PathBuf>,
+    /// Optional kernel profile to select and validate.
+    ///
+    /// When set, profile-specific bundle env vars and workspace discovery are
+    /// used, and the resolved metadata must declare the requested profile.
+    pub profile: Option<KernelProfile>,
     /// Require strict `vz-guest-agent` version/protocol compatibility.
     ///
     /// Callers that only need the kernel image, such as direct-rootfs guests,
@@ -146,6 +192,7 @@ impl Default for KernelBundleOptions {
             flavor: KernelFlavor::LinuxAarch64Vz,
             install_dir: None,
             bundle_dir: None,
+            profile: None,
             require_exact_agent_version: true,
             required_capabilities: default_vz_linux_kernel_capabilities(),
         }
@@ -202,9 +249,70 @@ pub fn default_linux_dir() -> Result<PathBuf, LinuxError> {
     Ok(PathBuf::from(home).join(".vz").join("linux"))
 }
 
+/// Resolve the default install directory for a kernel profile.
+pub fn default_linux_profile_dir(profile: KernelProfile) -> Result<PathBuf, LinuxError> {
+    Ok(default_linux_dir()?.join(profile.as_str()))
+}
+
 /// Ensure Linux kernel artifacts are installed and compatible.
 pub async fn ensure_kernel() -> Result<KernelPaths, LinuxError> {
     ensure_kernel_with_options(EnsureKernelOptions::default()).await
+}
+
+/// Ensure Linux kernel artifacts for a specific kernel profile are installed and compatible.
+pub async fn ensure_kernel_profile(profile: KernelProfile) -> Result<KernelPaths, LinuxError> {
+    ensure_kernel_profile_with_options(profile, EnsureKernelOptions::default()).await
+}
+
+/// Ensure Linux kernel artifacts for a specific profile are installed and compatible.
+///
+/// This resolver validates both profile metadata and the default capability
+/// contract for the selected profile. Use `ensure_kernel_bundle` with
+/// `KernelBundleOptions::profile` when a caller also needs the declared
+/// capability set returned.
+pub async fn ensure_kernel_profile_with_options(
+    profile: KernelProfile,
+    options: EnsureKernelOptions,
+) -> Result<KernelPaths, LinuxError> {
+    let use_default_install_dir = options.install_dir.is_none();
+    let install_dir = match options.install_dir {
+        Some(path) => path,
+        None => default_linux_profile_dir(profile)?,
+    };
+    let bundle_dir = profile_bundle_dir(profile, options.bundle_dir);
+    let selected_bundle_dir = bundle_dir.is_some();
+    let require_exact_agent_version = options.require_exact_agent_version;
+
+    let paths = ensure_kernel_with_resolved_options(ResolvedKernelOptions {
+        install_dir: install_dir.clone(),
+        bundle_dir: bundle_dir.clone(),
+        workspace_profile: use_default_install_dir.then_some(profile),
+        expected_profile: Some(profile),
+        require_exact_agent_version,
+    })
+    .await;
+
+    let paths = match paths {
+        Err(LinuxError::MissingKernelArtifacts { .. })
+            if use_default_install_dir
+                && !selected_bundle_dir
+                && profile == KernelProfile::Developer =>
+        {
+            ensure_kernel_with_resolved_options(ResolvedKernelOptions {
+                install_dir: default_linux_dir()?,
+                bundle_dir,
+                workspace_profile: use_default_install_dir.then_some(profile),
+                expected_profile: Some(profile),
+                require_exact_agent_version,
+            })
+            .await?
+        }
+        other => other?,
+    };
+
+    let capabilities = capabilities_for_version(&paths.version, KernelFlavor::LinuxAarch64Vz);
+    validate_required_capabilities(&capabilities, &profile.default_capabilities())?;
+    Ok(paths)
 }
 
 /// Ensure a versioned Linux kernel bundle is installed and satisfies caller requirements.
@@ -220,16 +328,23 @@ pub async fn ensure_kernel_bundle(
         flavor,
         install_dir,
         bundle_dir,
+        profile,
         require_exact_agent_version,
-        required_capabilities,
+        mut required_capabilities,
     } = options;
 
-    let paths = ensure_kernel_with_options(EnsureKernelOptions {
+    let ensure_options = EnsureKernelOptions {
         install_dir,
         bundle_dir,
         require_exact_agent_version,
-    })
-    .await?;
+    };
+    let paths = match profile {
+        Some(profile) => {
+            required_capabilities.extend(profile.default_capabilities());
+            ensure_kernel_profile_with_options(profile, ensure_options).await?
+        }
+        None => ensure_kernel_with_options(ensure_options).await?,
+    };
     let capabilities = capabilities_for_version(&paths.version, flavor);
     validate_required_capabilities(&capabilities, &required_capabilities)?;
 
@@ -256,31 +371,58 @@ pub async fn ensure_kernel_with_options(
         Some(path) => path,
         None => default_linux_dir()?,
     };
+    ensure_kernel_with_resolved_options(ResolvedKernelOptions {
+        install_dir,
+        bundle_dir: generic_bundle_dir(options.bundle_dir),
+        workspace_profile: should_probe_workspace_bundle.then_some(KernelProfile::Developer),
+        expected_profile: None,
+        require_exact_agent_version: options.require_exact_agent_version,
+    })
+    .await
+}
+
+struct ResolvedKernelOptions {
+    install_dir: PathBuf,
+    bundle_dir: Option<PathBuf>,
+    workspace_profile: Option<KernelProfile>,
+    expected_profile: Option<KernelProfile>,
+    require_exact_agent_version: bool,
+}
+
+async fn ensure_kernel_with_resolved_options(
+    options: ResolvedKernelOptions,
+) -> Result<KernelPaths, LinuxError> {
+    let ResolvedKernelOptions {
+        install_dir,
+        mut bundle_dir,
+        workspace_profile,
+        expected_profile,
+        require_exact_agent_version,
+    } = options;
     let expected_agent = env!("CARGO_PKG_VERSION").to_string();
     let expected_protocol_revision = vz_agent_proto::AGENT_PROTOCOL_REVISION;
-    let mut bundle_dir = options
-        .bundle_dir
-        .or_else(|| std::env::var_os("VZ_LINUX_BUNDLE_DIR").map(PathBuf::from));
-    if bundle_dir.is_none() && should_probe_workspace_bundle {
-        bundle_dir = workspace_bundle_dir();
+    if bundle_dir.is_none() {
+        bundle_dir = workspace_profile.and_then(workspace_bundle_dir);
     }
 
     if let Some(bundle_dir) = bundle_dir {
         let bundle = read_kernel_paths(&bundle_dir).await?;
-        validate_agent_version(
+        validate_kernel_metadata(
             &bundle.version,
             &expected_agent,
             expected_protocol_revision,
-            options.require_exact_agent_version,
+            require_exact_agent_version,
+            expected_profile,
         )?;
         validate_artifact_checksums(&bundle).await?;
 
         if let Ok(installed) = read_kernel_paths(&install_dir).await {
-            let version_ok = validate_agent_version(
+            let version_ok = validate_kernel_metadata(
                 &installed.version,
                 &expected_agent,
                 expected_protocol_revision,
-                options.require_exact_agent_version,
+                require_exact_agent_version,
+                expected_profile,
             )
             .is_ok();
             let checksum_ok = validate_artifact_checksums(&installed).await.is_ok();
@@ -292,22 +434,24 @@ pub async fn ensure_kernel_with_options(
 
         install_from_bundle(&bundle_dir, &install_dir).await?;
         let installed = read_kernel_paths(&install_dir).await?;
-        validate_agent_version(
+        validate_kernel_metadata(
             &installed.version,
             &expected_agent,
             expected_protocol_revision,
-            options.require_exact_agent_version,
+            require_exact_agent_version,
+            expected_profile,
         )?;
         validate_artifact_checksums(&installed).await?;
         return Ok(installed);
     }
 
     if let Ok(installed) = read_kernel_paths(&install_dir).await {
-        validate_agent_version(
+        validate_kernel_metadata(
             &installed.version,
             &expected_agent,
             expected_protocol_revision,
-            options.require_exact_agent_version,
+            require_exact_agent_version,
+            expected_profile,
         )?;
         validate_artifact_checksums(&installed).await?;
         return Ok(installed);
@@ -326,6 +470,29 @@ pub fn default_vz_linux_kernel_capabilities() -> BTreeSet<KernelCapability> {
     ]
     .into_iter()
     .collect()
+}
+
+/// Capabilities expected from a named `vz-linux` kernel profile.
+pub fn default_vz_linux_kernel_profile_capabilities(
+    profile: KernelProfile,
+) -> BTreeSet<KernelCapability> {
+    let mut capabilities = default_vz_linux_kernel_capabilities();
+    capabilities.extend([
+        KernelCapability::Overlayfs,
+        KernelCapability::Netns,
+        KernelCapability::Seccomp,
+        KernelCapability::IoUring,
+        KernelCapability::BtrfsSnapshots,
+    ]);
+    match profile {
+        KernelProfile::Developer => {
+            capabilities.extend([KernelCapability::NestedVirt, KernelCapability::Tun]);
+        }
+        KernelProfile::Container => {
+            capabilities.insert(KernelCapability::ContainerSandbox);
+        }
+    }
+    capabilities
 }
 
 fn capabilities_for_version(
@@ -355,12 +522,28 @@ fn validate_required_capabilities(
     }
 }
 
-fn workspace_bundle_dir() -> Option<PathBuf> {
-    workspace_bundle_dir_from_manifest_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
+fn generic_bundle_dir(bundle_dir: Option<PathBuf>) -> Option<PathBuf> {
+    bundle_dir.or_else(|| std::env::var_os("VZ_LINUX_BUNDLE_DIR").map(PathBuf::from))
 }
 
-fn workspace_bundle_dir_from_manifest_dir(manifest_dir: &Path) -> Option<PathBuf> {
-    let candidate = manifest_dir.join("../../linux/out");
+fn profile_bundle_dir(profile: KernelProfile, bundle_dir: Option<PathBuf>) -> Option<PathBuf> {
+    bundle_dir
+        .or_else(|| std::env::var_os(profile.bundle_dir_env_var()).map(PathBuf::from))
+        .or_else(|| std::env::var_os("VZ_LINUX_BUNDLE_DIR").map(PathBuf::from))
+}
+
+fn workspace_bundle_dir(profile: KernelProfile) -> Option<PathBuf> {
+    workspace_bundle_dir_from_manifest_dir(Path::new(env!("CARGO_MANIFEST_DIR")), profile)
+}
+
+fn workspace_bundle_dir_from_manifest_dir(
+    manifest_dir: &Path,
+    profile: KernelProfile,
+) -> Option<PathBuf> {
+    let candidate = match profile {
+        KernelProfile::Developer => manifest_dir.join("../../linux/out"),
+        KernelProfile::Container => manifest_dir.join("../../linux/out/container"),
+    };
     if looks_like_kernel_bundle_dir(&candidate) {
         std::fs::canonicalize(&candidate).ok().or(Some(candidate))
     } else {
@@ -436,6 +619,40 @@ fn validate_agent_version(
         });
     }
     Ok(())
+}
+
+fn validate_kernel_metadata(
+    version: &KernelVersion,
+    expected_agent: &str,
+    expected_protocol_revision: u32,
+    require_exact_agent_version: bool,
+    expected_profile: Option<KernelProfile>,
+) -> Result<(), LinuxError> {
+    validate_agent_version(
+        version,
+        expected_agent,
+        expected_protocol_revision,
+        require_exact_agent_version,
+    )?;
+    if let Some(expected_profile) = expected_profile {
+        validate_kernel_profile(version, expected_profile)?;
+    }
+    Ok(())
+}
+
+fn validate_kernel_profile(
+    version: &KernelVersion,
+    expected_profile: KernelProfile,
+) -> Result<(), LinuxError> {
+    let found = version.profile.as_deref().unwrap_or("<missing>");
+    if found == expected_profile.as_str() {
+        Ok(())
+    } else {
+        Err(LinuxError::KernelProfileMismatch {
+            expected: expected_profile.as_str().to_string(),
+            found: found.to_string(),
+        })
+    }
 }
 
 async fn validate_artifact_checksums(paths: &KernelPaths) -> Result<(), LinuxError> {
@@ -586,6 +803,24 @@ mod tests {
             .expect("version");
     }
 
+    async fn write_artifact_profile(dir: &Path, profile: KernelProfile) {
+        let mut version: KernelVersion = serde_json::from_str(
+            &tokio::fs::read_to_string(dir.join(VERSION_FILE))
+                .await
+                .expect("read version"),
+        )
+        .expect("parse version");
+        version.profile = Some(profile.as_str().to_string());
+        version.security_profile = Some(profile.security_profile().to_string());
+        version.capabilities = Some(profile.default_capabilities());
+        tokio::fs::write(
+            dir.join(VERSION_FILE),
+            serde_json::to_string_pretty(&version).expect("version json"),
+        )
+        .await
+        .expect("write version");
+    }
+
     #[tokio::test]
     async fn ensure_kernel_uses_installed_artifacts() {
         let temp = tempdir().expect("tempdir");
@@ -719,6 +954,7 @@ mod tests {
         let resolved = ensure_kernel_bundle(KernelBundleOptions {
             install_dir: Some(install),
             bundle_dir: None,
+            profile: Some(KernelProfile::Container),
             required_capabilities,
             ..KernelBundleOptions::default()
         })
@@ -741,6 +977,96 @@ mod tests {
                 .contains(&KernelCapability::BtrfsSnapshots)
         );
         assert!(resolved.capabilities.contains(&KernelCapability::IoUring));
+    }
+
+    #[tokio::test]
+    async fn ensure_kernel_profile_installs_and_validates_requested_profile() {
+        let temp = tempdir().expect("tempdir");
+        let install = temp.path().join("linux/container");
+        let bundle = temp.path().join("bundle/container");
+        let expected = env!("CARGO_PKG_VERSION").to_string();
+        write_artifacts_with_checksums(&bundle, expected.clone(), true).await;
+        write_artifact_profile(&bundle, KernelProfile::Container).await;
+
+        let paths = ensure_kernel_profile_with_options(
+            KernelProfile::Container,
+            EnsureKernelOptions {
+                install_dir: Some(install.clone()),
+                bundle_dir: Some(bundle),
+                require_exact_agent_version: true,
+            },
+        )
+        .await
+        .expect("ensure container profile");
+
+        assert_eq!(paths.version.agent, expected);
+        assert_eq!(paths.version.profile.as_deref(), Some("container"));
+        assert_eq!(paths.kernel, install.join(KERNEL_FILE));
+    }
+
+    #[tokio::test]
+    async fn ensure_kernel_profile_rejects_wrong_profile_metadata() {
+        let temp = tempdir().expect("tempdir");
+        let install = temp.path().join("linux/developer");
+        let expected = env!("CARGO_PKG_VERSION").to_string();
+        write_artifacts_with_checksums(&install, expected, true).await;
+        write_artifact_profile(&install, KernelProfile::Developer).await;
+
+        let err = ensure_kernel_profile_with_options(
+            KernelProfile::Container,
+            EnsureKernelOptions {
+                install_dir: Some(install),
+                bundle_dir: None,
+                require_exact_agent_version: true,
+            },
+        )
+        .await
+        .expect_err("must reject developer metadata for container profile");
+
+        assert!(matches!(
+            err,
+            LinuxError::KernelProfileMismatch { ref expected, ref found }
+                if expected == "container" && found == "developer"
+        ));
+    }
+
+    #[tokio::test]
+    async fn ensure_kernel_bundle_profile_requires_profile_capabilities() {
+        let temp = tempdir().expect("tempdir");
+        let install = temp.path().join("linux/container");
+        let expected = env!("CARGO_PKG_VERSION").to_string();
+        write_artifacts_with_checksums(&install, expected, true).await;
+
+        let mut version: KernelVersion = serde_json::from_str(
+            &tokio::fs::read_to_string(install.join(VERSION_FILE))
+                .await
+                .expect("read version"),
+        )
+        .expect("parse version");
+        version.profile = Some("container".to_string());
+        version.security_profile = Some("container-hardened".to_string());
+        version.capabilities = Some(default_vz_linux_kernel_capabilities());
+        tokio::fs::write(
+            install.join(VERSION_FILE),
+            serde_json::to_string_pretty(&version).expect("version json"),
+        )
+        .await
+        .expect("write version");
+
+        let err = ensure_kernel_bundle(KernelBundleOptions {
+            install_dir: Some(install),
+            bundle_dir: None,
+            profile: Some(KernelProfile::Container),
+            ..KernelBundleOptions::default()
+        })
+        .await
+        .expect_err("must reject missing profile capabilities");
+
+        assert!(matches!(
+            err,
+            LinuxError::MissingKernelCapabilities { ref missing }
+                if missing.contains(&KernelCapability::ContainerSandbox.as_str().to_string())
+        ));
     }
 
     #[tokio::test]
@@ -1014,7 +1340,29 @@ mod tests {
         let expected = env!("CARGO_PKG_VERSION").to_string();
         write_artifacts(&bundle, expected).await;
 
-        let discovered = workspace_bundle_dir_from_manifest_dir(&manifest_dir);
+        let discovered =
+            workspace_bundle_dir_from_manifest_dir(&manifest_dir, KernelProfile::Developer);
+        assert_eq!(
+            discovered
+                .as_deref()
+                .and_then(|path| path.canonicalize().ok()),
+            bundle.canonicalize().ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_bundle_dir_discovery_uses_profile_relative_linux_out() {
+        let temp = tempdir().expect("tempdir");
+        let manifest_dir = temp.path().join("crates/vz-linux");
+        let bundle = temp.path().join("linux/out/container");
+        tokio::fs::create_dir_all(&manifest_dir)
+            .await
+            .expect("manifest dir");
+        let expected = env!("CARGO_PKG_VERSION").to_string();
+        write_artifacts(&bundle, expected).await;
+
+        let discovered =
+            workspace_bundle_dir_from_manifest_dir(&manifest_dir, KernelProfile::Container);
         assert_eq!(
             discovered
                 .as_deref()
@@ -1038,7 +1386,8 @@ mod tests {
             .await
             .expect("kernel");
 
-        let discovered = workspace_bundle_dir_from_manifest_dir(&manifest_dir);
+        let discovered =
+            workspace_bundle_dir_from_manifest_dir(&manifest_dir, KernelProfile::Developer);
         assert!(discovered.is_none());
     }
 }

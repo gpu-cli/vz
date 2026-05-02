@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow, bail};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use tonic::Code;
 use vz_runtime_proto::runtime_v2;
@@ -175,9 +175,30 @@ pub struct LinuxVmInitArgs {
     /// Override initramfs artifact path (defaults to ~/.vz/linux/initramfs.img).
     #[arg(long)]
     pub initramfs: Option<PathBuf>,
+    /// Linux kernel profile to use when resolving default artifact paths.
+    #[arg(long, value_enum)]
+    pub kernel_profile: Option<LinuxKernelProfileArg>,
+    /// Override version metadata path (defaults next to the selected kernel profile).
+    #[arg(long)]
+    pub version_json: Option<PathBuf>,
     /// Replace existing image artifacts when target already exists.
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum LinuxKernelProfileArg {
+    Developer,
+    Container,
+}
+
+impl LinuxKernelProfileArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Developer => "developer",
+            Self::Container => "container",
+        }
+    }
 }
 
 /// Arguments for `vz vm linux run`.
@@ -566,15 +587,26 @@ async fn run_linux(args: LinuxVmArgs) -> anyhow::Result<()> {
 
 async fn run_linux_init(args: LinuxVmInitArgs) -> anyhow::Result<()> {
     let output_dir = expand_home_path(args.output_dir.as_str())?;
-    let kernel = args.kernel.unwrap_or_else(default_linux_kernel_path);
-    let initramfs = args.initramfs.unwrap_or_else(default_linux_initramfs_path);
-    let version_path = default_linux_version_json_path();
+    let artifact_dir = args
+        .kernel_profile
+        .map(default_linux_profile_artifact_dir)
+        .unwrap_or_else(default_linux_artifact_dir);
+    let kernel = args.kernel.unwrap_or_else(|| artifact_dir.join("vmlinux"));
+    let initramfs = args
+        .initramfs
+        .unwrap_or_else(|| artifact_dir.join("initramfs.img"));
+    let version_path = args
+        .version_json
+        .unwrap_or_else(|| artifact_dir.join("version.json"));
 
     ensure_file_exists(kernel.as_path(), "kernel")?;
     ensure_file_exists(initramfs.as_path(), "initramfs")?;
     ensure_file_exists(version_path.as_path(), "version metadata")?;
 
     let version = load_linux_version_metadata(version_path.as_path())?;
+    if let Some(profile) = args.kernel_profile {
+        validate_linux_artifact_profile(&version, profile)?;
+    }
     validate_linux_artifacts(kernel.as_path(), initramfs.as_path(), &version)?;
 
     std::fs::create_dir_all(&output_dir)
@@ -666,6 +698,8 @@ struct LinuxVmImageDescriptor {
 #[derive(Debug, Clone, Deserialize)]
 struct LinuxArtifactVersionJson {
     kernel: String,
+    #[serde(default)]
+    profile: Option<String>,
     sha256_vmlinux: String,
     sha256_initramfs: String,
 }
@@ -693,16 +727,8 @@ fn default_linux_artifact_dir() -> PathBuf {
     }
 }
 
-fn default_linux_kernel_path() -> PathBuf {
-    default_linux_artifact_dir().join("vmlinux")
-}
-
-fn default_linux_initramfs_path() -> PathBuf {
-    default_linux_artifact_dir().join("initramfs.img")
-}
-
-fn default_linux_version_json_path() -> PathBuf {
-    default_linux_artifact_dir().join("version.json")
+fn default_linux_profile_artifact_dir(profile: LinuxKernelProfileArg) -> PathBuf {
+    default_linux_artifact_dir().join(profile.as_str())
 }
 
 fn ensure_file_exists(path: &Path, label: &str) -> anyhow::Result<()> {
@@ -749,6 +775,21 @@ fn validate_linux_artifacts(
             initramfs.display(),
             version.sha256_initramfs,
             initramfs_sha
+        );
+    }
+    Ok(())
+}
+
+fn validate_linux_artifact_profile(
+    version: &LinuxArtifactVersionJson,
+    expected: LinuxKernelProfileArg,
+) -> anyhow::Result<()> {
+    let found = version.profile.as_deref().unwrap_or("<missing>");
+    if found != expected.as_str() {
+        bail!(
+            "linux artifact profile mismatch: expected {}, got {}",
+            expected.as_str(),
+            found
         );
     }
     Ok(())
@@ -2108,6 +2149,7 @@ mod tests {
 
         let version = LinuxArtifactVersionJson {
             kernel: "6.12.11".to_string(),
+            profile: None,
             sha256_vmlinux: sha256_hex(kernel_bytes),
             sha256_initramfs: sha256_hex(initramfs_bytes),
         };
@@ -2126,6 +2168,7 @@ mod tests {
 
         let version = LinuxArtifactVersionJson {
             kernel: "6.12.11".to_string(),
+            profile: None,
             sha256_vmlinux: "00".repeat(32),
             sha256_initramfs: "11".repeat(32),
         };
@@ -2134,6 +2177,20 @@ mod tests {
             .expect_err("checksum mismatch should fail");
         let message = error.to_string();
         assert!(message.contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn validate_linux_artifact_profile_rejects_mismatched_profile() {
+        let version = LinuxArtifactVersionJson {
+            kernel: "6.12.11".to_string(),
+            profile: Some("developer".to_string()),
+            sha256_vmlinux: "00".repeat(32),
+            sha256_initramfs: "11".repeat(32),
+        };
+
+        let error = validate_linux_artifact_profile(&version, LinuxKernelProfileArg::Container)
+            .expect_err("profile mismatch should fail");
+        assert!(error.to_string().contains("profile mismatch"));
     }
 
     #[test]

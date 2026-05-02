@@ -46,6 +46,24 @@ metadata. Normal `vz` releases rebuild the guest agent/initramfs and regenerate
 `version.json`, but only recompile a profile kernel image when that profile's
 kernel config, `kernel-version.mk`, or Docker build environment changes.
 
+## Profile selection API
+
+The installer lays out release artifacts as:
+
+- `~/.vz/linux/developer/` for the broad developer profile
+- `~/.vz/linux/container/` for the constrained container profile
+- `~/.vz/linux/` as a legacy developer-profile default
+
+Rust callers should select intent with `KernelProfile` and use capabilities as
+additional validation:
+
+- `vz_linux::ensure_kernel_profile(KernelProfile::Developer)`
+- `vz_linux::ensure_kernel_profile(KernelProfile::Container)`
+- `vz_linux::ensure_kernel_bundle(KernelBundleOptions { profile: Some(...), required_capabilities: ..., ..Default::default() })`
+
+OCI runtime callers can set `RuntimeConfig::linux_profile`. CLI users can pass
+`--kernel-profile developer|container` on OCI commands and `vz vm linux init`.
+
 ## Benchmark boot latency
 
 ```bash

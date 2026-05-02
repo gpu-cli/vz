@@ -39,6 +39,10 @@ pub struct ContainerOpts {
     #[arg(long)]
     pub install_dir: Option<PathBuf>,
 
+    /// Linux kernel profile to select.
+    #[arg(long, value_enum)]
+    pub kernel_profile: Option<KernelProfileArg>,
+
     /// Use credentials from local Docker credential configuration.
     #[arg(long, conflicts_with_all = ["username", "password"])]
     pub docker_config: bool,
@@ -50,6 +54,22 @@ pub struct ContainerOpts {
     /// Registry password when using basic auth.
     #[arg(long, requires = "username", conflicts_with = "docker_config")]
     pub password: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum KernelProfileArg {
+    Developer,
+    Container,
+}
+
+#[cfg(target_os = "macos")]
+impl KernelProfileArg {
+    fn into_runtime_profile(self) -> vz_oci_macos::KernelProfile {
+        match self {
+            Self::Developer => vz_oci_macos::KernelProfile::Developer,
+            Self::Container => vz_oci_macos::KernelProfile::Container,
+        }
+    }
 }
 
 // ── Execution mode ───────────────────────────────────────────────
@@ -400,6 +420,9 @@ pub(crate) fn build_macos_runtime_config(
     }
     if let Some(path) = &opts.install_dir {
         config.linux_install_dir = Some(path.clone());
+    }
+    if let Some(profile) = opts.kernel_profile {
+        config.linux_profile = Some(profile.into_runtime_profile());
     }
 
     config.auth = match (opts.docker_config, &opts.username, &opts.password) {

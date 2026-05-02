@@ -17,10 +17,7 @@ use vz::{NetworkConfig, SharedDirConfig};
 use vz_image::{
     ImageConfigSummary, ImageId, ImagePuller, ImageStore, parse_image_config_summary_from_store,
 };
-use vz_linux::{
-    EnsureKernelOptions, ExecOptions, KernelPaths, LinuxError, LinuxVm, LinuxVmConfig,
-    OciExecOptions, ensure_kernel_with_options,
-};
+use vz_linux::{ExecOptions, KernelPaths, LinuxError, LinuxVm, LinuxVmConfig, OciExecOptions};
 use vz_oci::bundle::{BundleMount, BundleSpec, write_oci_bundle};
 use vz_oci::container_store::{ContainerInfo, ContainerStatus, ContainerStore};
 
@@ -29,7 +26,7 @@ use vz::protocol::OciContainerState;
 
 use crate::config::{
     ExecConfig, ExecutionMode, MountAccess, MountSpec, MountType, OciRuntimeKind, PortMapping,
-    PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig,
+    PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig, ensure_kernel_for_config,
 };
 use crate::error::MacosOciError as OciError;
 use vz_image::{ImageInfo, PruneResult};

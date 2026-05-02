@@ -102,12 +102,7 @@ impl Runtime {
             },
         )?;
 
-        let kernel = ensure_kernel_with_options(EnsureKernelOptions {
-            install_dir: self.config.linux_install_dir.clone(),
-            bundle_dir: self.config.linux_bundle_dir.clone(),
-            require_exact_agent_version: self.config.require_exact_agent_version,
-        })
-        .await?;
+        let kernel = ensure_kernel_for_config(&self.config).await?;
         let runtime_binary = resolve_oci_runtime_binary_path(
             self.config.guest_oci_runtime,
             self.config.guest_oci_runtime_path.as_deref(),
@@ -300,12 +295,7 @@ impl Runtime {
             },
         )?;
 
-        let kernel = ensure_kernel_with_options(EnsureKernelOptions {
-            install_dir: self.config.linux_install_dir.clone(),
-            bundle_dir: self.config.linux_bundle_dir.clone(),
-            require_exact_agent_version: self.config.require_exact_agent_version,
-        })
-        .await?;
+        let kernel = ensure_kernel_for_config(&self.config).await?;
         let runtime_binary = resolve_oci_runtime_binary_path(
             self.config.guest_oci_runtime,
             self.config.guest_oci_runtime_path.as_deref(),
@@ -452,12 +442,7 @@ impl Runtime {
             .split_first()
             .ok_or_else(|| OciError::InvalidConfig("run command must not be empty".to_string()))?;
 
-        let kernel = ensure_kernel_with_options(EnsureKernelOptions {
-            install_dir: self.config.linux_install_dir.clone(),
-            bundle_dir: self.config.linux_bundle_dir.clone(),
-            require_exact_agent_version: self.config.require_exact_agent_version,
-        })
-        .await?;
+        let kernel = ensure_kernel_for_config(&self.config).await?;
         let runtime_binary = resolve_oci_runtime_binary_path(
             self.config.guest_oci_runtime,
             self.config.guest_oci_runtime_path.as_deref(),

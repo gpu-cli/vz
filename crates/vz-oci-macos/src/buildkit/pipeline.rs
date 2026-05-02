@@ -21,12 +21,11 @@ use vz::NetworkConfig;
 use vz::SharedDirConfig;
 use vz::protocol::{ExecEvent, ExecOutput};
 use vz_image::ImageStore;
-use vz_linux::{
-    EnsureKernelOptions, LinuxVm, LinuxVmConfig, default_linux_dir, ensure_kernel_with_options,
-};
+use vz_linux::{LinuxVm, LinuxVmConfig};
 
 use crate::RuntimeConfig;
 use crate::buildkit_rawjson::BuildkitRawJsonStreamDecoder;
+use crate::config::ensure_kernel_for_config;
 
 use super::artifacts::{ensure_buildkit_artifacts, import_oci_tar_to_store};
 use super::common::{
@@ -931,12 +930,8 @@ async fn start_buildkit_vm(
     ensure_virtualization_entitlement_preflight()?;
 
     let artifacts = ensure_buildkit_artifacts().await?;
-    let kernel = ensure_kernel_with_options(EnsureKernelOptions {
-        install_dir: config.linux_install_dir.clone(),
-        bundle_dir: config.linux_bundle_dir.clone(),
-        require_exact_agent_version: config.require_exact_agent_version,
-    })
-    .await?;
+    let kernel = ensure_kernel_for_config(config).await?;
+    let linux_bin_dir = kernel.youki.parent().map(Path::to_path_buf);
 
     let mut vm_config = LinuxVmConfig::new(kernel.kernel, kernel.initramfs);
     vm_config.cpus = 4;
@@ -961,10 +956,10 @@ async fn start_buildkit_vm(
             source: expand_home_dir(linux_install_dir),
             read_only: true,
         });
-    } else if let Ok(default_linux_install_dir) = default_linux_dir() {
+    } else if let Some(kernel_dir) = linux_bin_dir {
         vm_config.shared_dirs.push(SharedDirConfig {
             tag: "linux-bin".to_string(),
-            source: default_linux_install_dir,
+            source: kernel_dir,
             read_only: true,
         });
     }

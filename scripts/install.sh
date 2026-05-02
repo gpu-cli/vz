@@ -8,6 +8,7 @@
 #   VZ_VERSION     — Install a specific version (e.g., "0.2.0"). Default: latest.
 #   VZ_INSTALL_DIR — Installation directory. Default: ~/.vz
 #   VZ_NO_LINUX    — Set to "1" to skip Linux kernel/initramfs download.
+#   VZ_LINUX_PROFILE — Linux profile to install: all, developer, or container. Default: all.
 
 set -euo pipefail
 
@@ -84,6 +85,12 @@ download() {
     curl -sSfL -o "$dest" "$url"
 }
 
+download_if_available() {
+    local url="$1" dest="$2"
+    echo "  downloading: $(basename "$dest")"
+    curl -sSfL -o "$dest" "$url"
+}
+
 verify_checksum() {
     local file="$1" checksum_file="$2"
     local expected actual
@@ -141,42 +148,74 @@ install_linux_artifacts() {
         return
     fi
 
-    local base_url="https://github.com/$REPO/releases/download/v${version}"
-    local tarball_name="vz-linux-v${version}-arm64.tar.gz"
+    local profile="${VZ_LINUX_PROFILE:-all}"
+    case "$profile" in
+        all)
+            install_linux_profile_artifacts "$version" "developer" "$LINUX_DIR/developer"
+            copy_linux_profile_to_legacy_default "$LINUX_DIR/developer"
+            install_linux_profile_artifacts "$version" "container" "$LINUX_DIR/container" "optional"
+            ;;
+        developer)
+            install_linux_profile_artifacts "$version" "developer" "$LINUX_DIR/developer"
+            copy_linux_profile_to_legacy_default "$LINUX_DIR/developer"
+            ;;
+        container)
+            install_linux_profile_artifacts "$version" "container" "$LINUX_DIR/container"
+            ;;
+        *)
+            echo "error: unsupported VZ_LINUX_PROFILE=$profile (expected all, developer, or container)" >&2
+            exit 1
+            ;;
+    esac
+}
 
-    # Check if Linux artifacts are already at this version by comparing the
-    # installed kernel version against the release version.json from GitHub.
-    if [ -f "$LINUX_DIR/version.json" ] && [ -f "$LINUX_DIR/vmlinux" ]; then
-        local remote_version_json
-        remote_version_json="$(curl -sSfL "$base_url/version.json" 2>/dev/null || echo "")"
-        if [ -n "$remote_version_json" ]; then
-            local remote_kernel_hash
-            remote_kernel_hash="$(echo "$remote_version_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['sha256_vmlinux'])" 2>/dev/null || echo "")"
-            if [ -n "$remote_kernel_hash" ]; then
-                local local_kernel_hash
-                local_kernel_hash="$(shasum -a 256 "$LINUX_DIR/vmlinux" | awk '{print $1}')"
-                if [ "$remote_kernel_hash" = "$local_kernel_hash" ]; then
-                    echo "Linux artifacts already up to date."
-                    return
-                fi
+install_linux_profile_artifacts() {
+    local version="$1"
+    local profile="$2"
+    local dest_dir="$3"
+    local required="${4:-required}"
+    local base_url="https://github.com/$REPO/releases/download/v${version}"
+    local tarball_name="vz-linux-${profile}-v${version}-arm64.tar.gz"
+
+    mkdir -p "$dest_dir"
+
+    echo "Installing Linux ${profile} kernel + initramfs..."
+
+    if ! download_if_available "$base_url/$tarball_name" "$dest_dir/$tarball_name"; then
+        rm -f "$dest_dir/$tarball_name"
+        if [ "$profile" != "developer" ]; then
+            if [ "$required" = "optional" ]; then
+                echo "  warning: release v${version} does not provide ${profile} Linux artifacts; skipping"
+                return
             fi
+            echo "error: release v${version} does not provide ${profile} Linux artifacts" >&2
+            exit 1
         fi
+        tarball_name="vz-linux-v${version}-arm64.tar.gz"
+        echo "  falling back to legacy developer artifact"
+        download "$base_url/$tarball_name" "$dest_dir/$tarball_name"
     fi
 
+    download "$base_url/${tarball_name}.sha256" "$dest_dir/${tarball_name}.sha256"
+
+    verify_checksum "$dest_dir/$tarball_name" "$dest_dir/${tarball_name}.sha256"
+    rm "$dest_dir/${tarball_name}.sha256"
+
+    tar xzf "$dest_dir/$tarball_name" -C "$dest_dir"
+    rm "$dest_dir/$tarball_name"
+
+    echo "  installed ${profile}: $dest_dir"
+}
+
+copy_linux_profile_to_legacy_default() {
+    local source_dir="$1"
+    local artifact
+
     mkdir -p "$LINUX_DIR"
-
-    echo "Installing Linux kernel + initramfs..."
-
-    download "$base_url/$tarball_name" "$LINUX_DIR/$tarball_name"
-    download "$base_url/${tarball_name}.sha256" "$LINUX_DIR/${tarball_name}.sha256"
-
-    verify_checksum "$LINUX_DIR/$tarball_name" "$LINUX_DIR/${tarball_name}.sha256"
-    rm "$LINUX_DIR/${tarball_name}.sha256"
-
-    tar xzf "$LINUX_DIR/$tarball_name" -C "$LINUX_DIR"
-    rm "$LINUX_DIR/$tarball_name"
-
-    echo "  installed: vmlinux, initramfs.img, youki, version.json"
+    for artifact in vmlinux initramfs.img youki version.json; do
+        cp "$source_dir/$artifact" "$LINUX_DIR/$artifact"
+    done
+    echo "  updated legacy default: $LINUX_DIR"
 }
 
 setup_path() {

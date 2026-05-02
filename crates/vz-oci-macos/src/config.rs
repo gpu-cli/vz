@@ -3,6 +3,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub use vz_image::Auth;
+pub use vz_linux::KernelProfile;
+use vz_linux::{
+    EnsureKernelOptions, KernelPaths, LinuxError, ensure_kernel_profile_with_options,
+    ensure_kernel_with_options,
+};
 
 // Re-export shared types from the runtime contract.
 pub use vz_runtime_contract::{MountAccess, MountSpec, MountType, PortMapping, PortProtocol};
@@ -54,6 +59,8 @@ pub struct RuntimeConfig {
     pub linux_install_dir: Option<PathBuf>,
     /// Optional predownloaded bundle directory for kernel artifacts.
     pub linux_bundle_dir: Option<PathBuf>,
+    /// Optional kernel profile to select and validate.
+    pub linux_profile: Option<KernelProfile>,
     /// OCI runtime implementation used for guest lifecycle operations.
     pub guest_oci_runtime: OciRuntimeKind,
     /// Optional host path override for the guest OCI runtime binary (`youki`).
@@ -95,6 +102,7 @@ impl Default for RuntimeConfig {
             auth: Auth::default(),
             linux_install_dir: None,
             linux_bundle_dir: None,
+            linux_profile: None,
             guest_oci_runtime: OciRuntimeKind::default(),
             guest_oci_runtime_path: None,
             guest_state_dir: None,
@@ -107,6 +115,21 @@ impl Default for RuntimeConfig {
             agent_ready_timeout: env_duration_secs("VZ_AGENT_READY_TIMEOUT_SECS", 20),
             exec_timeout: Duration::from_secs(30),
         }
+    }
+}
+
+pub(crate) async fn ensure_kernel_for_config(
+    config: &RuntimeConfig,
+) -> Result<KernelPaths, LinuxError> {
+    let options = EnsureKernelOptions {
+        install_dir: config.linux_install_dir.clone(),
+        bundle_dir: config.linux_bundle_dir.clone(),
+        require_exact_agent_version: config.require_exact_agent_version,
+    };
+
+    match config.linux_profile {
+        Some(profile) => ensure_kernel_profile_with_options(profile, options).await,
+        None => ensure_kernel_with_options(options).await,
     }
 }
 

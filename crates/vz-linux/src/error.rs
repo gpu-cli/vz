@@ -71,6 +71,15 @@ pub enum LinuxError {
         missing: Vec<String>,
     },
 
+    /// Kernel bundle metadata does not match the requested profile.
+    #[error("kernel artifact profile mismatch: expected {expected}, found {found}")]
+    KernelProfileMismatch {
+        /// Requested profile name.
+        expected: String,
+        /// Profile declared by the artifact metadata, or `<missing>`.
+        found: String,
+    },
+
     /// Guest responded with a non-Linux OS identifier.
     #[error("guest agent reported unexpected os: {0}")]
     UnexpectedGuestOs(String),
