@@ -297,7 +297,10 @@ impl LinuxVm {
         })
         .await
         .map_err(|_| {
-            LinuxError::Protocol(format!("exec timed out after {:.3}s", timeout.as_secs_f64()))
+            LinuxError::Protocol(format!(
+                "exec timed out after {:.3}s",
+                timeout.as_secs_f64()
+            ))
         })?
     }
 
@@ -317,7 +320,10 @@ impl LinuxVm {
         })
         .await
         .map_err(|_| {
-            LinuxError::Protocol(format!("exec timed out after {:.3}s", timeout.as_secs_f64()))
+            LinuxError::Protocol(format!(
+                "exec timed out after {:.3}s",
+                timeout.as_secs_f64()
+            ))
         })?
     }
 
@@ -332,14 +338,8 @@ impl LinuxVm {
     where
         F: FnMut(&ExecEvent),
     {
-        self.exec_streaming_with_options(
-            command,
-            args,
-            timeout,
-            ExecOptions::default(),
-            on_event,
-        )
-        .await
+        self.exec_streaming_with_options(command, args, timeout, ExecOptions::default(), on_event)
+            .await
     }
 
     /// Run a command with explicit execution options and stream output events via callback.
@@ -355,7 +355,9 @@ impl LinuxVm {
         F: FnMut(&ExecEvent),
     {
         tokio::time::timeout(timeout, async {
-            let mut stream: GrpcExecStream = self.exec_stream_with_options(command, args, options).await?;
+            let mut stream: GrpcExecStream = self
+                .exec_stream_with_options(command, args, options)
+                .await?;
             let mut stdout_bytes: Vec<u8> = Vec::new();
             let mut stderr_bytes = Vec::new();
             let mut saw_exit = false;

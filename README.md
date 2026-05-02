@@ -48,6 +48,17 @@ cd linux && make docker-build  # requires Docker
 mkdir -p ~/.vz/linux && cp linux/out/{vmlinux,initramfs.img,youki,version.json} ~/.vz/linux/
 ```
 
+The default kernel profile is `developer` and keeps nested virtualization for
+Virgil-style Firecracker host VMs. To build the constrained container sandbox
+bundle, use:
+
+```bash
+cd linux && make docker-build KERNEL_PROFILE=container
+```
+
+Release CI caches the developer/container kernel images by kernel inputs, then
+rebuilds the initramfs and metadata for each `vz` release.
+
 ## Platform support
 
 - **Linux:** container + stack commands

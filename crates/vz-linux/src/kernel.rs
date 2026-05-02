@@ -31,6 +31,12 @@ pub struct KernelPaths {
 pub struct KernelVersion {
     /// Linux kernel version.
     pub kernel: String,
+    /// Kernel build profile, such as `developer` or `container`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Security posture descriptor for this artifact profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_profile: Option<String>,
     /// BusyBox version used in initramfs.
     pub busybox: String,
     /// Guest-agent version used in initramfs.
@@ -68,6 +74,22 @@ pub enum KernelCapability {
     Hvc0Serial,
     /// Ext4 root filesystem support.
     Ext4Root,
+    /// OverlayFS support for writable container roots.
+    Overlayfs,
+    /// Network namespace support.
+    Netns,
+    /// Seccomp syscall filtering support.
+    Seccomp,
+    /// `io_uring` asynchronous I/O interface support.
+    IoUring,
+    /// Nested virtualization support through `/dev/kvm`.
+    NestedVirt,
+    /// TUN/TAP support through `/dev/net/tun`.
+    Tun,
+    /// Btrfs subvolume/snapshot support for sandbox checkpointing.
+    BtrfsSnapshots,
+    /// Hardened container sandbox kernel profile.
+    ContainerSandbox,
 }
 
 impl KernelCapability {
@@ -78,6 +100,14 @@ impl KernelCapability {
             Self::Virtiofs => "virtiofs",
             Self::Hvc0Serial => "hvc0_serial",
             Self::Ext4Root => "ext4_root",
+            Self::Overlayfs => "overlayfs",
+            Self::Netns => "netns",
+            Self::Seccomp => "seccomp",
+            Self::IoUring => "io_uring",
+            Self::NestedVirt => "nested_virt",
+            Self::Tun => "tun",
+            Self::BtrfsSnapshots => "btrfs_snapshots",
+            Self::ContainerSandbox => "container_sandbox",
         }
     }
 }
@@ -499,6 +529,8 @@ mod tests {
     fn sample_version(agent: String) -> KernelVersion {
         KernelVersion {
             kernel: "6.12.11".to_string(),
+            profile: None,
+            security_profile: None,
             busybox: "1.37.0".to_string(),
             agent,
             agent_protocol_revision: Some(vz_agent_proto::AGENT_PROTOCOL_REVISION),
@@ -633,6 +665,82 @@ mod tests {
                 .contains(&KernelCapability::Hvc0Serial)
         );
         assert!(resolved.capabilities.contains(&KernelCapability::Ext4Root));
+    }
+
+    #[tokio::test]
+    async fn ensure_kernel_bundle_returns_declared_profile_metadata_and_capabilities() {
+        let temp = tempdir().expect("tempdir");
+        let install = temp.path().join("container/linux/vz-0.1.0");
+        let expected = env!("CARGO_PKG_VERSION").to_string();
+        write_artifacts_with_checksums(&install, expected, true).await;
+
+        let declared_capabilities = [
+            KernelCapability::Vsock,
+            KernelCapability::Virtiofs,
+            KernelCapability::Hvc0Serial,
+            KernelCapability::Ext4Root,
+            KernelCapability::Overlayfs,
+            KernelCapability::Netns,
+            KernelCapability::Seccomp,
+            KernelCapability::IoUring,
+            KernelCapability::BtrfsSnapshots,
+            KernelCapability::ContainerSandbox,
+        ]
+        .into_iter()
+        .collect();
+
+        let mut version: KernelVersion = serde_json::from_str(
+            &tokio::fs::read_to_string(install.join(VERSION_FILE))
+                .await
+                .expect("read version"),
+        )
+        .expect("parse version");
+        version.profile = Some("container".to_string());
+        version.security_profile = Some("container-hardened".to_string());
+        version.capabilities = Some(declared_capabilities);
+        tokio::fs::write(
+            install.join(VERSION_FILE),
+            serde_json::to_string_pretty(&version).expect("version json"),
+        )
+        .await
+        .expect("write version");
+
+        let required_capabilities = [
+            KernelCapability::Overlayfs,
+            KernelCapability::Netns,
+            KernelCapability::Seccomp,
+            KernelCapability::IoUring,
+            KernelCapability::BtrfsSnapshots,
+            KernelCapability::ContainerSandbox,
+        ]
+        .into_iter()
+        .collect();
+
+        let resolved = ensure_kernel_bundle(KernelBundleOptions {
+            install_dir: Some(install),
+            bundle_dir: None,
+            required_capabilities,
+            ..KernelBundleOptions::default()
+        })
+        .await
+        .expect("ensure profile kernel bundle");
+
+        assert_eq!(resolved.version.profile.as_deref(), Some("container"));
+        assert_eq!(
+            resolved.version.security_profile.as_deref(),
+            Some("container-hardened")
+        );
+        assert!(
+            resolved
+                .capabilities
+                .contains(&KernelCapability::ContainerSandbox)
+        );
+        assert!(
+            resolved
+                .capabilities
+                .contains(&KernelCapability::BtrfsSnapshots)
+        );
+        assert!(resolved.capabilities.contains(&KernelCapability::IoUring));
     }
 
     #[tokio::test]

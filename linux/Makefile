@@ -5,9 +5,28 @@ ROOT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 REPO_ROOT := $(abspath $(ROOT_DIR)/..)
 CRATES_DIR := $(REPO_ROOT)/crates
 
-OUT_DIR ?= $(ROOT_DIR)/out
+KERNEL_PROFILE ?= developer
+
+ifeq ($(KERNEL_PROFILE),developer)
+DEFAULT_OUT_DIR := $(ROOT_DIR)/out
+KERNEL_BASE_CONFIG ?= defconfig
+KERNEL_CONFIG_FRAGMENT ?= $(ROOT_DIR)/vz-linux.config
+KERNEL_SECURITY_PROFILE ?= developer-nested-virt
+KERNEL_CAPABILITIES ?= vsock virtiofs hvc0_serial ext4_root overlayfs netns seccomp io_uring nested_virt tun btrfs_snapshots
+else ifeq ($(KERNEL_PROFILE),container)
+DEFAULT_OUT_DIR := $(ROOT_DIR)/out/container
+KERNEL_BASE_CONFIG ?= allnoconfig
+KERNEL_CONFIG_FRAGMENT ?= $(ROOT_DIR)/vz-linux-container.config
+KERNEL_SECURITY_PROFILE ?= container-hardened
+KERNEL_CAPABILITIES ?= vsock virtiofs hvc0_serial ext4_root overlayfs netns seccomp io_uring btrfs_snapshots container_sandbox
+else
+$(error unsupported KERNEL_PROFILE '$(KERNEL_PROFILE)'; expected developer or container)
+endif
+
+OUT_DIR ?= $(DEFAULT_OUT_DIR)
 SRC_DIR ?= $(ROOT_DIR)/src
 CACHE_DIR ?= $(ROOT_DIR)/.cache
+TRUST_EXISTING_KERNEL_IMAGE ?= 0
 
 INITRAMFS_TEMPLATE_DIR := $(ROOT_DIR)/initramfs
 INITRAMFS_ROOT := $(OUT_DIR)/initramfs-root
@@ -16,12 +35,11 @@ ARCH ?= arm64
 CROSS_COMPILE ?= aarch64-linux-gnu-
 JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)
 
-KERNEL_VERSION ?= 6.12.11
+include $(ROOT_DIR)/kernel-version.mk
 KERNEL_URL ?= https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$(KERNEL_VERSION).tar.xz
 KERNEL_ARCHIVE := $(CACHE_DIR)/linux-$(KERNEL_VERSION).tar.xz
 KERNEL_SRC := $(SRC_DIR)/linux-$(KERNEL_VERSION)
 KERNEL_IMAGE := $(OUT_DIR)/vmlinux
-KERNEL_CONFIG_FRAGMENT := $(ROOT_DIR)/vz-linux.config
 
 BUSYBOX_VERSION ?= 1.37.0
 BUSYBOX_URL ?= https://busybox.net/downloads/busybox-$(BUSYBOX_VERSION).tar.bz2
@@ -47,20 +65,31 @@ AGENT_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' $(CRATES_DIR)/vz-gu
 AGENT_PROTOCOL_REVISION := $(shell sed -n 's/^pub const AGENT_PROTOCOL_REVISION: u32 = \([0-9][0-9]*\);/\1/p' $(CRATES_DIR)/vz-agent-proto/src/lib.rs | head -1)
 BUILD_TIMESTAMP := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-.PHONY: help all dirs clean distclean kernel initramfs guest-agent youki version docker-build
+.PHONY: help all all-profiles dirs clean distclean kernel kernel-config-summary initramfs guest-agent youki version docker-build docker-build-all
 
 help:
 	@echo "Linux artifact build targets:"
-	@echo "  make all            Build vmlinux, initramfs.img, youki, version.json"
+	@echo "  make all            Build vmlinux, initramfs.img, youki, version.json for KERNEL_PROFILE=$(KERNEL_PROFILE)"
+	@echo "  make all-profiles   Build developer and container profile artifact bundles"
 	@echo "  make kernel         Build only Linux kernel image"
+	@echo "  make kernel-config-summary  Generate .config and print enabled option counts"
 	@echo "  make initramfs      Build only initramfs image"
 	@echo "  make youki          Download pinned youki linux/arm64 runtime binary"
 	@echo "  make version        Generate version.json"
-	@echo "  make docker-build   Build all artifacts in Docker"
+	@echo "  make docker-build   Build selected profile artifacts in Docker"
+	@echo "  make docker-build-all Build developer and container profiles in Docker"
 	@echo "  make clean          Remove linux/out"
 	@echo "  make distclean      Remove out/src/cache"
+	@echo ""
+	@echo "Profiles:"
+	@echo "  KERNEL_PROFILE=developer  Broad dev/host VM kernel with nested virt"
+	@echo "  KERNEL_PROFILE=container  allnoconfig-based sandbox kernel with btrfs snapshots"
 
 all: $(KERNEL_IMAGE) $(INITRAMFS_IMAGE) $(YOUKI_BINARY) $(VERSION_JSON)
+
+all-profiles:
+	$(MAKE) KERNEL_PROFILE=developer all
+	$(MAKE) KERNEL_PROFILE=container all
 
 dirs:
 	mkdir -p "$(OUT_DIR)" "$(SRC_DIR)" "$(CACHE_DIR)"
@@ -74,15 +103,32 @@ $(KERNEL_SRC)/.extracted: $(KERNEL_ARCHIVE) | dirs
 	tar -xf "$(KERNEL_ARCHIVE)" -C "$(SRC_DIR)"
 	touch "$@"
 
+ifeq ($(TRUST_EXISTING_KERNEL_IMAGE),1)
+$(KERNEL_IMAGE):
+	@test -s "$(KERNEL_IMAGE)" || { echo "missing cached kernel image for $(KERNEL_PROFILE): $(KERNEL_IMAGE)" >&2; exit 1; }
+else
 $(KERNEL_IMAGE): $(KERNEL_SRC)/.extracted $(KERNEL_CONFIG_FRAGMENT)
-	@echo "Building Linux kernel image"
-	cd "$(KERNEL_SRC)" && make ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) defconfig
-	cd "$(KERNEL_SRC)" && scripts/kconfig/merge_config.sh .config "$(KERNEL_CONFIG_FRAGMENT)"
+	@echo "Building Linux kernel image ($(KERNEL_PROFILE) profile)"
+	cd "$(KERNEL_SRC)" && make ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) $(KERNEL_BASE_CONFIG)
+	cd "$(KERNEL_SRC)" && scripts/kconfig/merge_config.sh -m .config "$(KERNEL_CONFIG_FRAGMENT)"
 	cd "$(KERNEL_SRC)" && make ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) olddefconfig
 	cd "$(KERNEL_SRC)" && make -j"$(JOBS)" ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) Image
 	cp "$(KERNEL_SRC)/arch/arm64/boot/Image" "$(KERNEL_IMAGE)"
+endif
 
 kernel: $(KERNEL_IMAGE)
+
+kernel-config-summary: $(KERNEL_SRC)/.extracted $(KERNEL_CONFIG_FRAGMENT)
+	@echo "Generating Linux kernel config summary ($(KERNEL_PROFILE) profile)"
+	cd "$(KERNEL_SRC)" && make ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) $(KERNEL_BASE_CONFIG)
+	cd "$(KERNEL_SRC)" && scripts/kconfig/merge_config.sh -m .config "$(KERNEL_CONFIG_FRAGMENT)"
+	cd "$(KERNEL_SRC)" && make ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) olddefconfig
+	@awk '\
+		/^CONFIG_/ && /=y$$/ { y++ } \
+		/^CONFIG_/ && /=m$$/ { m++ } \
+		/^# CONFIG_/ && / is not set$$/ { n++ } \
+		END { printf "profile=$(KERNEL_PROFILE) enabled_y=%d enabled_m=%d disabled=%d\n", y+0, m+0, n+0 } \
+	' "$(KERNEL_SRC)/.config"
 
 $(BUSYBOX_ARCHIVE): | dirs
 	@echo "Downloading BusyBox $(BUSYBOX_VERSION)"
@@ -168,18 +214,32 @@ $(VERSION_JSON): $(KERNEL_IMAGE) $(INITRAMFS_IMAGE) $(YOUKI_BINARY)
 	@KERNEL_SHA="$$(shasum -a 256 "$(KERNEL_IMAGE)" | cut -d' ' -f1)"; \
 	INITRAMFS_SHA="$$(shasum -a 256 "$(INITRAMFS_IMAGE)" | cut -d' ' -f1)"; \
 	YOUKI_SHA="$$(shasum -a 256 "$(YOUKI_BINARY)" | cut -d' ' -f1)"; \
-	printf '{\n  "kernel": "$(KERNEL_VERSION)",\n  "busybox": "$(BUSYBOX_VERSION)",\n  "agent": "$(AGENT_VERSION)",\n  "agent_protocol_revision": $(AGENT_PROTOCOL_REVISION),\n  "youki": "$(YOUKI_VERSION)",\n  "built": "$(BUILD_TIMESTAMP)",\n  "sha256_vmlinux": "%s",\n  "sha256_initramfs": "%s",\n  "sha256_youki": "%s",\n  "capabilities": [\n    "vsock",\n    "virtiofs",\n    "hvc0_serial",\n    "ext4_root"\n  ]\n}\n' "$$KERNEL_SHA" "$$INITRAMFS_SHA" "$$YOUKI_SHA" > "$(VERSION_JSON)"
+	CAPABILITIES_JSON=""; \
+	for capability in $(KERNEL_CAPABILITIES); do \
+		if [[ -n "$$CAPABILITIES_JSON" ]]; then CAPABILITIES_JSON="$$CAPABILITIES_JSON,\n"; fi; \
+		CAPABILITIES_JSON="$$CAPABILITIES_JSON    \"$$capability\""; \
+	done; \
+	printf '{\n  "kernel": "$(KERNEL_VERSION)",\n  "profile": "$(KERNEL_PROFILE)",\n  "security_profile": "$(KERNEL_SECURITY_PROFILE)",\n  "busybox": "$(BUSYBOX_VERSION)",\n  "agent": "$(AGENT_VERSION)",\n  "agent_protocol_revision": $(AGENT_PROTOCOL_REVISION),\n  "youki": "$(YOUKI_VERSION)",\n  "built": "$(BUILD_TIMESTAMP)",\n  "sha256_vmlinux": "%s",\n  "sha256_initramfs": "%s",\n  "sha256_youki": "%s",\n  "capabilities": [\n%b\n  ]\n}\n' "$$KERNEL_SHA" "$$INITRAMFS_SHA" "$$YOUKI_SHA" "$$CAPABILITIES_JSON" > "$(VERSION_JSON)"
 
 version: $(VERSION_JSON)
 
 docker-build:
-	@echo "Building linux artifacts in Docker"
+	@echo "Building linux artifacts in Docker ($(KERNEL_PROFILE) profile)"
 	docker build -t vz-linux-builder "$(ROOT_DIR)"
 	docker run --rm \
 		-v "$(REPO_ROOT):/workspace" \
 		-w /workspace/linux \
 		vz-linux-builder \
-		make all CROSS_COMPILE= GUEST_AGENT_BUILD_TOOL=cargo
+		make all KERNEL_PROFILE="$(KERNEL_PROFILE)" CROSS_COMPILE= GUEST_AGENT_BUILD_TOOL=cargo
+
+docker-build-all:
+	@echo "Building all linux artifact profiles in Docker"
+	docker build -t vz-linux-builder "$(ROOT_DIR)"
+	docker run --rm \
+		-v "$(REPO_ROOT):/workspace" \
+		-w /workspace/linux \
+		vz-linux-builder \
+		make all-profiles CROSS_COMPILE= GUEST_AGENT_BUILD_TOOL=cargo
 
 clean:
 	rm -rf "$(OUT_DIR)"

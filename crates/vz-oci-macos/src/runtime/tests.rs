@@ -943,6 +943,8 @@ fn make_kernel_paths_with_youki(path: PathBuf) -> KernelPaths {
         youki: path,
         version: KernelVersion {
             kernel: "6.12.11".to_string(),
+            profile: None,
+            security_profile: None,
             busybox: "1.37.0".to_string(),
             agent: "0.1.0".to_string(),
             agent_protocol_revision: Some(1),
@@ -951,6 +953,7 @@ fn make_kernel_paths_with_youki(path: PathBuf) -> KernelPaths {
             sha256_vmlinux: None,
             sha256_initramfs: None,
             sha256_youki: None,
+            capabilities: None,
         },
     }
 }

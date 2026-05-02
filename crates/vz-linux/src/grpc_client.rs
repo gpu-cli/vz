@@ -18,8 +18,8 @@ use vz::Vm;
 use vz::protocol::{ExecOutput, OciContainerState};
 use vz_agent_proto::{
     ExecRequest as ProtoExecRequest, NetworkSetupRequest, NetworkTeardownRequest, OciCreateRequest,
-    OciDeleteRequest, OciKillRequest, OciStartRequest, OciStateRequest,
-    PingRequest, PortForwardFrame, PortForwardOpen, ResizeExecPtyRequest, ResourceStatsRequest,
+    OciDeleteRequest, OciKillRequest, OciStartRequest, OciStateRequest, PingRequest,
+    PortForwardFrame, PortForwardOpen, ResizeExecPtyRequest, ResourceStatsRequest,
     ResourceStatsResponse, SignalRequest, StdinCloseRequest, StdinWriteRequest, SystemInfoRequest,
     SystemInfoResponse, TransportMetadata as ProtoTransportMetadata,
     agent_service_client::AgentServiceClient, exec_event,

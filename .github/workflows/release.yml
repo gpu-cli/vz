@@ -184,35 +184,65 @@ jobs:
           fi
 
   build-linux-artifacts:
-    name: Build Linux kernel + initramfs
+    name: Build Linux profile artifacts
     runs-on: ubuntu-24.04-arm
     needs: validate-release-version
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Cache Linux build artifacts
-        id: linux-cache
+      - name: Cache developer Linux kernel image
+        id: linux-developer-kernel-cache
         uses: actions/cache@v4
         with:
-          path: linux/out
-          key: linux-artifacts-${{ hashFiles('linux/vz-linux.config', 'linux/Makefile', 'linux/Dockerfile', 'linux/initramfs/**', 'crates/Cargo.toml', 'crates/Cargo.lock', 'crates/vz-guest-agent/**', 'crates/vz-agent-proto/**', 'crates/vz/**') }}
+          path: linux/out/vmlinux
+          key: linux-kernel-developer-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('linux/kernel-version.mk', 'linux/Dockerfile', 'linux/vz-linux.config') }}
 
-      - name: Build Linux artifacts via Docker (native arm64)
-        if: steps.linux-cache.outputs.cache-hit != 'true'
+      - name: Cache container Linux kernel image
+        id: linux-container-kernel-cache
+        uses: actions/cache@v4
+        with:
+          path: linux/out/container/vmlinux
+          key: linux-kernel-container-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('linux/kernel-version.mk', 'linux/Dockerfile', 'linux/vz-linux-container.config') }}
+
+      - name: Build missing Linux kernel images via Docker
         run: |
           cd linux
           docker build -t vz-linux-builder .
+          for profile in developer container; do
+            out_dir="out"
+            if [ "$profile" = "container" ]; then
+              out_dir="out/container"
+            fi
+
+            if [ -s "$out_dir/vmlinux" ]; then
+              echo "Using cached $profile kernel image"
+              continue
+            fi
+
+            docker run --rm \
+              -v "$(cd .. && pwd):/workspace" \
+              -w /workspace/linux \
+              vz-linux-builder \
+              make kernel KERNEL_PROFILE="$profile" CROSS_COMPILE= GUEST_AGENT_BUILD_TOOL=cargo
+          done
+
+      - name: Build Linux userland bundles via Docker
+        run: |
+          cd linux
           docker run --rm \
             -v "$(cd .. && pwd):/workspace" \
             -w /workspace/linux \
             vz-linux-builder \
-            make all CROSS_COMPILE= GUEST_AGENT_BUILD_TOOL=cargo
+            make all-profiles TRUST_EXISTING_KERNEL_IMAGE=1 CROSS_COMPILE= GUEST_AGENT_BUILD_TOOL=cargo
 
       - name: Validate Linux artifact metadata
         run: |
-          jq -e '
+          for version_json in linux/out/version.json linux/out/container/version.json; do
+            jq -e '
             .kernel and
+            .profile and
+            .security_profile and
             .agent and
             .agent_protocol_revision and
             .youki and
@@ -222,8 +252,27 @@ jobs:
             ((.capabilities // []) | index("vsock")) and
             ((.capabilities // []) | index("virtiofs")) and
             ((.capabilities // []) | index("hvc0_serial")) and
-            ((.capabilities // []) | index("ext4_root"))
+            ((.capabilities // []) | index("ext4_root")) and
+            ((.capabilities // []) | index("overlayfs")) and
+            ((.capabilities // []) | index("netns")) and
+            ((.capabilities // []) | index("seccomp")) and
+            ((.capabilities // []) | index("io_uring")) and
+            ((.capabilities // []) | index("btrfs_snapshots"))
+            ' "$version_json" >/dev/null
+          done
+
+          jq -e '
+            .profile == "developer" and
+            .security_profile == "developer-nested-virt" and
+            ((.capabilities // []) | index("nested_virt")) and
+            ((.capabilities // []) | index("tun"))
           ' linux/out/version.json >/dev/null
+
+          jq -e '
+            .profile == "container" and
+            .security_profile == "container-hardened" and
+            ((.capabilities // []) | index("container_sandbox"))
+          ' linux/out/container/version.json >/dev/null
 
       - name: Package Linux artifacts
         env:
@@ -232,11 +281,25 @@ jobs:
           VERSION="${TAG#v}"
           mkdir -p dist
 
+          # Keep the historical artifact name mapped to the developer profile
+          # so existing installers continue to work.
           tar czf "dist/vz-linux-v${VERSION}-arm64.tar.gz" \
             -C linux/out \
             vmlinux initramfs.img youki version.json
 
           sha256sum "dist/vz-linux-v${VERSION}-arm64.tar.gz" > "dist/vz-linux-v${VERSION}-arm64.tar.gz.sha256"
+
+          tar czf "dist/vz-linux-developer-v${VERSION}-arm64.tar.gz" \
+            -C linux/out \
+            vmlinux initramfs.img youki version.json
+
+          sha256sum "dist/vz-linux-developer-v${VERSION}-arm64.tar.gz" > "dist/vz-linux-developer-v${VERSION}-arm64.tar.gz.sha256"
+
+          tar czf "dist/vz-linux-container-v${VERSION}-arm64.tar.gz" \
+            -C linux/out/container \
+            vmlinux initramfs.img youki version.json
+
+          sha256sum "dist/vz-linux-container-v${VERSION}-arm64.tar.gz" > "dist/vz-linux-container-v${VERSION}-arm64.tar.gz.sha256"
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
