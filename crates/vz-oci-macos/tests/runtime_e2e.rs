@@ -567,7 +567,10 @@ async fn shutdown_shared_vm_is_idempotent_when_in_memory_state_empty() {
 
     // Still idempotent on a second call.
     let result2 = rt.shutdown_shared_vm("does-not-exist").await;
-    assert!(result2.is_ok(), "shutdown_shared_vm should remain idempotent: {result2:?}");
+    assert!(
+        result2.is_ok(),
+        "shutdown_shared_vm should remain idempotent: {result2:?}"
+    );
 }
 
 // ── Image pull caching ──────────────────────────────────────────

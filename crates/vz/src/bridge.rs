@@ -352,9 +352,8 @@ pub(crate) fn build_objc_config(
 
             // Nested virtualization: expose /dev/kvm inside the Linux guest.
             if config.nested_virtualization {
-                let supported = unsafe {
-                    VZGenericPlatformConfiguration::isNestedVirtualizationSupported()
-                };
+                let supported =
+                    unsafe { VZGenericPlatformConfiguration::isNestedVirtualizationSupported() };
                 if supported {
                     // SAFETY: setNestedVirtualizationEnabled toggles nested virt on a
                     // validated generic platform configuration.
@@ -453,12 +452,10 @@ pub(crate) fn build_objc_config(
     if config.memory_balloon {
         // SAFETY: VZVirtioTraditionalMemoryBalloonDeviceConfiguration::new()
         // returns a default-initialized configuration object.
-        let balloon_config =
-            unsafe { VZVirtioTraditionalMemoryBalloonDeviceConfiguration::new() };
+        let balloon_config = unsafe { VZVirtioTraditionalMemoryBalloonDeviceConfiguration::new() };
         // Upcast once: VZVirtioTraditional...DeviceConfiguration → VZMemoryBalloonDeviceConfiguration
         // so the resulting NSArray matches setMemoryBalloonDevices's expected element type.
-        let balloon_devices =
-            NSArray::from_retained_slice(&[Retained::into_super(balloon_config)]);
+        let balloon_devices = NSArray::from_retained_slice(&[Retained::into_super(balloon_config)]);
         // SAFETY: setMemoryBalloonDevices accepts an NSArray of
         // VZMemoryBalloonDeviceConfiguration. Apple validates "at most one"
         // at config-time; passing more than one element would error in

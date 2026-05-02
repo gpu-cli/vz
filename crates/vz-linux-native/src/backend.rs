@@ -379,10 +379,7 @@ impl RuntimeBackend for LinuxNativeBackend {
                     let new_container_id = format!("vz-{}", &uuid_short());
                     let rootfs_dir = self
                         .image_store
-                        .assemble_rootfs_from_commit_async(
-                            cref,
-                            &new_container_id,
-                        )
+                        .assemble_rootfs_from_commit_async(cref, &new_container_id)
                         .await
                         .map_err(|e| RuntimeError::Backend {
                             message: format!("failed to restore committed rootfs: {e}"),
@@ -546,7 +543,10 @@ impl RuntimeBackend for LinuxNativeBackend {
 
         // Run setup commands, commit, and re-create from the committed rootfs.
         if has_setup {
-            info!(num_commands = config.setup_commands.len(), "running setup commands");
+            info!(
+                num_commands = config.setup_commands.len(),
+                "running setup commands"
+            );
             for (i, setup_cmd) in config.setup_commands.iter().enumerate() {
                 info!(step = i + 1, total = config.setup_commands.len(), cmd = %setup_cmd, "setup");
                 let setup_result = self
@@ -583,7 +583,11 @@ impl RuntimeBackend for LinuxNativeBackend {
                 let _ = self.runtime.stop(&container_id, true).await;
                 let _ = self.runtime.delete(&container_id, true).await;
 
-                match self.image_store.commit_rootfs_async(&container_id, cref).await {
+                match self
+                    .image_store
+                    .commit_rootfs_async(&container_id, cref)
+                    .await
+                {
                     Ok(_) => info!(commit_ref = %cref, "committed setup rootfs"),
                     Err(e) => info!(error = %e, "failed to commit setup rootfs (non-fatal)"),
                 }
@@ -721,29 +725,26 @@ impl RuntimeBackend for LinuxNativeBackend {
 
     // ── Container commit ─────────────────────────────────────────
 
-    async fn commit_container(
-        &self,
-        id: &str,
-        reference: &str,
-    ) -> Result<String, RuntimeError> {
+    async fn commit_container(&self, id: &str, reference: &str) -> Result<String, RuntimeError> {
         // Look up the container's rootfs path and extract the container_id
         // (last path component) while the lock is held, then drop the lock
         // before the async commit call.
         let container_id = {
             let containers = self.containers.lock().await;
-            let tracked = containers.get(id).ok_or_else(|| RuntimeError::ContainerNotFound {
-                id: id.to_string(),
-            })?;
-            let rootfs_path = tracked
-                .info
-                .rootfs_path
-                .as_ref()
-                .ok_or_else(|| RuntimeError::Backend {
-                    message: format!("container '{id}' has no rootfs path"),
-                    source: Box::new(crate::error::LinuxNativeError::InvalidConfig(
-                        "no rootfs path".to_string(),
-                    )),
-                })?;
+            let tracked = containers
+                .get(id)
+                .ok_or_else(|| RuntimeError::ContainerNotFound { id: id.to_string() })?;
+            let rootfs_path =
+                tracked
+                    .info
+                    .rootfs_path
+                    .as_ref()
+                    .ok_or_else(|| RuntimeError::Backend {
+                        message: format!("container '{id}' has no rootfs path"),
+                        source: Box::new(crate::error::LinuxNativeError::InvalidConfig(
+                            "no rootfs path".to_string(),
+                        )),
+                    })?;
 
             if !rootfs_path.exists() {
                 return Err(RuntimeError::Backend {

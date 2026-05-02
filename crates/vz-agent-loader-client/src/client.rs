@@ -46,17 +46,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> LoaderClient<S> {
             ));
         }
 
-        serde_json::from_str(line.trim())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        serde_json::from_str(line.trim()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// Ping the loader — returns protocol version and uptime.
     pub async fn ping(&mut self) -> io::Result<PongResponse> {
         match self.call(&Request::Ping).await? {
             Response::Pong(pong) => Ok(pong),
-            Response::Error(e) => Err(io::Error::other(
-                format!("{}: {}", e.code, e.message),
-            )),
+            Response::Error(e) => Err(io::Error::other(format!("{}: {}", e.code, e.message))),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unexpected response: {other:?}"),
@@ -69,9 +66,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> LoaderClient<S> {
         debug!(binary = %request.binary, "sending exec request");
         match self.call(&Request::Exec(request)).await? {
             Response::ExecOk(ok) => Ok(ok),
-            Response::Error(e) => Err(io::Error::other(
-                format!("{}: {}", e.code, e.message),
-            )),
+            Response::Error(e) => Err(io::Error::other(format!("{}: {}", e.code, e.message))),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unexpected response: {other:?}"),
@@ -83,9 +78,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> LoaderClient<S> {
     pub async fn list(&mut self) -> io::Result<ListOkResponse> {
         match self.call(&Request::List).await? {
             Response::ListOk(ok) => Ok(ok),
-            Response::Error(e) => Err(io::Error::other(
-                format!("{}: {}", e.code, e.message),
-            )),
+            Response::Error(e) => Err(io::Error::other(format!("{}: {}", e.code, e.message))),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unexpected response: {other:?}"),
@@ -101,9 +94,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> LoaderClient<S> {
         };
         match self.call(&Request::Kill(request)).await? {
             Response::KillOk => Ok(()),
-            Response::Error(e) => Err(io::Error::other(
-                format!("{}: {}", e.code, e.message),
-            )),
+            Response::Error(e) => Err(io::Error::other(format!("{}: {}", e.code, e.message))),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unexpected response: {other:?}"),
@@ -118,15 +109,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> LoaderClient<S> {
         service: ServiceEntry,
         start_now: bool,
     ) -> io::Result<RegisterOkResponse> {
-        let request = RegisterRequest {
-            service,
-            start_now,
-        };
+        let request = RegisterRequest { service, start_now };
         match self.call(&Request::Register(request)).await? {
             Response::RegisterOk(ok) => Ok(ok),
-            Response::Error(e) => Err(io::Error::other(
-                format!("{}: {}", e.code, e.message),
-            )),
+            Response::Error(e) => Err(io::Error::other(format!("{}: {}", e.code, e.message))),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unexpected response: {other:?}"),
@@ -143,9 +129,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> LoaderClient<S> {
         };
         match self.call(&Request::Unregister(request)).await? {
             Response::UnregisterOk => Ok(()),
-            Response::Error(e) => Err(io::Error::other(
-                format!("{}: {}", e.code, e.message),
-            )),
+            Response::Error(e) => Err(io::Error::other(format!("{}: {}", e.code, e.message))),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unexpected response: {other:?}"),

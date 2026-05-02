@@ -20,8 +20,8 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use vz_agent_loader_client::protocol::*;
 use vsock::VsockListener;
+use vz_agent_loader_client::protocol::*;
 
 /// A tracked child process.
 struct TrackedChild {
@@ -223,7 +223,10 @@ async fn start_manifest_services(state: &SharedState) {
         return;
     }
 
-    info!(count = manifest.services.len(), "starting services from manifest");
+    info!(
+        count = manifest.services.len(),
+        "starting services from manifest"
+    );
     for service in &manifest.services {
         let req = ExecRequest {
             binary: service.binary.clone(),
@@ -419,11 +422,7 @@ async fn handle_exec(req: ExecRequest, state: &SharedState) -> Response {
     }
 }
 
-async fn wait_and_supervise(
-    mut child: tokio::process::Child,
-    exec_id: String,
-    state: SharedState,
-) {
+async fn wait_and_supervise(mut child: tokio::process::Child, exec_id: String, state: SharedState) {
     let status = child.wait().await;
     let (exit_code, signal) = match &status {
         Ok(s) => {

@@ -307,11 +307,10 @@ impl Runtime {
         // Mount the setup-commits VirtioFS share inside the host VM so
         // create_container_in_stack can tar/untar setup state. Idempotent —
         // mountpoint may already exist from a prior boot of the same VM.
-        let mount_cmd =
-            "mkdir -p /vz-setup-commits && \
+        let mount_cmd = "mkdir -p /vz-setup-commits && \
              ( mountpoint -q /vz-setup-commits || \
                mount -t virtiofs vz-setup-commits /vz-setup-commits )"
-                .to_string();
+            .to_string();
         match vm
             .exec_collect(
                 "sh".to_string(),
@@ -766,9 +765,12 @@ impl Runtime {
             .await;
         match result {
             Ok(out) if out.exit_code == 0 => {
-                let bytes = fs::metadata(self.setup_commits_host_dir().join(format!("{commit_ref}.tar")))
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let bytes = fs::metadata(
+                    self.setup_commits_host_dir()
+                        .join(format!("{commit_ref}.tar")),
+                )
+                .map(|m| m.len())
+                .unwrap_or(0);
                 tracing::info!(
                     commit_ref,
                     bytes,

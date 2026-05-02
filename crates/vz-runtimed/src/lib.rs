@@ -1845,9 +1845,7 @@ mod tests {
         // reconcile reason.
         for id in ["sbx-creating", "sbx-ready", "sbx-draining"] {
             let events = daemon
-                .with_state_store(|store| {
-                    store.load_events_by_scope(id, "sandbox_", None, 20)
-                })
+                .with_state_store(|store| store.load_events_by_scope(id, "sandbox_", None, 20))
                 .expect("load sandbox events");
             assert!(
                 events.iter().any(|record| matches!(

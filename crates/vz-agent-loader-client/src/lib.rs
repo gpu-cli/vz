@@ -29,8 +29,8 @@
 //! # }
 //! ```
 
-pub mod protocol;
 mod client;
+pub mod protocol;
 
 pub use client::{LoaderClient, service_entry};
 pub use protocol::*;

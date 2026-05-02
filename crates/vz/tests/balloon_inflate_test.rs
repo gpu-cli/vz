@@ -106,9 +106,8 @@ async fn balloon_inflate_drops_guest_mem_available() {
     tokio::time::sleep(Duration::from_secs(30)).await;
 
     let log_after = std::fs::read_to_string(&serial_log).unwrap_or_default();
-    let after_kb = last_mem_available_kb(&log_after).expect(
-        "expected at least one MemAvailable sample after balloon",
-    );
+    let after_kb = last_mem_available_kb(&log_after)
+        .expect("expected at least one MemAvailable sample after balloon");
     eprintln!("guest MemAvailable AFTER  balloon: {} kB", after_kb);
 
     // Print the trailing meminfo lines for the human reader.
@@ -126,11 +125,7 @@ async fn balloon_inflate_drops_guest_mem_available() {
     // Expectation: ballooning to 512 MB target on a 2 GB VM should drop
     // guest MemAvailable by at least 1 GB (1_000_000 kB ish).
     let drop_kb = before_kb.saturating_sub(after_kb);
-    eprintln!(
-        "MemAvailable drop: {} kB ({} MB)",
-        drop_kb,
-        drop_kb / 1024
-    );
+    eprintln!("MemAvailable drop: {} kB ({} MB)", drop_kb, drop_kb / 1024);
     assert!(
         drop_kb > 500_000, // > ~500 MB
         "expected balloon to inflate by > 500 MB, observed only {} kB drop",

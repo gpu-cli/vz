@@ -829,10 +829,7 @@ async fn boot_runtime_sandbox_resources(
             if !host_path.exists() {
                 return Err(status_from_machine_error(MachineError::new(
                     MachineErrorCode::ValidationError,
-                    format!(
-                        "volume mount host_path does not exist: {}",
-                        mount.host_path
-                    ),
+                    format!("volume mount host_path does not exist: {}", mount.host_path),
                     Some(request_id.to_string()),
                     BTreeMap::new(),
                 )));

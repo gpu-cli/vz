@@ -43,7 +43,10 @@ async fn print_status(
     project_dir: &std::path::Path,
 ) -> anyhow::Result<()> {
     let handshake = client.handshake();
-    println!("Daemon:  running (v{}, pid file exists)", handshake.daemon_version);
+    println!(
+        "Daemon:  running (v{}, pid file exists)",
+        handshake.daemon_version
+    );
     println!("Backend: {}", handshake.backend_name);
 
     let mut client = client.clone();
@@ -58,7 +61,14 @@ async fn print_status(
             if let Some(sandbox) = response.sandbox {
                 println!("VM:      {} (id: {})", sandbox.state, sandbox_id);
                 println!("Project: {}", project_dir.display());
-                println!("Image:   {}", sandbox.labels.get("vz.sandbox.base_image_ref").map(String::as_str).unwrap_or("unknown"));
+                println!(
+                    "Image:   {}",
+                    sandbox
+                        .labels
+                        .get("vz.sandbox.base_image_ref")
+                        .map(String::as_str)
+                        .unwrap_or("unknown")
+                );
 
                 // Show resource info from labels
                 if let Some(workspace) = sandbox.labels.get("vz.run.workspace") {

@@ -204,7 +204,13 @@ pub fn apply_auto_config(
     }
 
     if let Some(agent_path) = guest_agent_binary {
-        install_guest_agent(mount_point, agent_path, user_config, install_mode, binary_name)?;
+        install_guest_agent(
+            mount_point,
+            agent_path,
+            user_config,
+            install_mode,
+            binary_name,
+        )?;
     }
 
     info!("auto-configuration complete");
@@ -631,8 +637,7 @@ fn install_guest_agent_user(
     // loginwindow reads this plist at /Library/Preferences/ on the Data volume.
     let loginwindow_prefs = mount_point.join("Library/Preferences");
     std::fs::create_dir_all(&loginwindow_prefs)?;
-    let hook_abs = PathBuf::from("/usr/local/bin")
-        .join(format!("{app_dir_name}-login-hook.sh"));
+    let hook_abs = PathBuf::from("/usr/local/bin").join(format!("{app_dir_name}-login-hook.sh"));
     let defaults_cmd = std::process::Command::new("defaults")
         .args([
             "write",
@@ -729,9 +734,7 @@ fn install_guest_agent_loader_manifest(
     };
 
     // Remove any existing entry with the same name, then add ours
-    existing_manifest
-        .services
-        .retain(|s| s.name != binary_name);
+    existing_manifest.services.retain(|s| s.name != binary_name);
     existing_manifest.services.extend(manifest.services);
 
     let manifest_json = serde_json::to_string_pretty(&existing_manifest)
@@ -1089,10 +1092,7 @@ pub fn provision_image(
     if needs_ownership_fix && result.is_ok() {
         let name = binary_name.unwrap_or(DEFAULT_AGENT_BINARY_NAME);
         let label = launchd_label(name);
-        let binary_path = disk
-            .mount_point
-            .join("usr/local/bin")
-            .join(name);
+        let binary_path = disk.mount_point.join("usr/local/bin").join(name);
         let plist_path = disk
             .mount_point
             .join("Library/LaunchDaemons")
@@ -1375,7 +1375,8 @@ mod tests {
 
     #[test]
     fn guest_agent_launchdaemon_plist_valid_xml() {
-        let plist = guest_agent_launchdaemon_plist("com.vz.guest-agent", "/usr/local/bin/vz-guest-agent");
+        let plist =
+            guest_agent_launchdaemon_plist("com.vz.guest-agent", "/usr/local/bin/vz-guest-agent");
         assert!(plist.contains("<?xml version="));
         assert!(plist.contains("<plist version=\"1.0\">"));
         assert!(plist.contains("com.vz.guest-agent"));
@@ -1535,10 +1536,12 @@ mod tests {
         )
         .unwrap();
 
-        let user_binary = mount.join("Users/dev/Library/Application Support/mac-agent/mac-agent-guest-agent");
+        let user_binary =
+            mount.join("Users/dev/Library/Application Support/mac-agent/mac-agent-guest-agent");
         assert!(user_binary.exists());
 
-        let plist = mount.join("Users/dev/Library/LaunchAgents/com.mac-agent.user-guest-agent.plist");
+        let plist =
+            mount.join("Users/dev/Library/LaunchAgents/com.mac-agent.user-guest-agent.plist");
         assert!(plist.exists());
         let content = std::fs::read_to_string(plist).unwrap();
         assert!(content.contains("com.mac-agent.user-guest-agent"));
@@ -1652,6 +1655,11 @@ mod tests {
         // Both entries should be in the manifest
         assert_eq!(manifest.services.len(), 2);
         assert!(manifest.services.iter().any(|s| s.name == "vz-guest-agent"));
-        assert!(manifest.services.iter().any(|s| s.name == "mac-agent-guest-agent"));
+        assert!(
+            manifest
+                .services
+                .iter()
+                .any(|s| s.name == "mac-agent-guest-agent")
+        );
     }
 }

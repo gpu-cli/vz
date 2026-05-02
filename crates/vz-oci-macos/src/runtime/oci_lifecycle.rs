@@ -74,9 +74,7 @@ impl OciLifecycleOps for LinuxVm {
             // Use streaming exec via nsenter instead of unary oci_exec RPC.
             let state = self.oci_state(id.clone()).await.map_err(OciError::from)?;
             let pid = state.pid.ok_or_else(|| {
-                OciError::InvalidConfig(format!(
-                    "container '{id}' has no running pid for exec"
-                ))
+                OciError::InvalidConfig(format!("container '{id}' has no running pid for exec"))
             })?;
             let mut nsenter_args = vec![
                 "nsenter".to_string(),

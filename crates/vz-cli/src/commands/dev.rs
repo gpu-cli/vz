@@ -154,11 +154,8 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
             .as_deref()
             .or(config.resources.memory.as_deref()),
     )?;
-    let disk_size_bytes = parse_disk_config(
-        args.disk
-            .as_deref()
-            .or(config.resources.disk.as_deref()),
-    )?;
+    let disk_size_bytes =
+        parse_disk_config(args.disk.as_deref().or(config.resources.disk.as_deref()))?;
 
     let volume_mounts = build_volume_mounts(&config, &project_dir)?;
 
@@ -278,10 +275,7 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
                 mount.guest_path.clone(),
             );
         }
-        labels.insert(
-            "vz.run.workspace".to_string(),
-            config.workspace.clone(),
-        );
+        labels.insert("vz.run.workspace".to_string(), config.workspace.clone());
 
         // Pass setup commands as indexed labels for the backend to
         // execute once and commit. Subsequent boots reuse the committed
@@ -338,7 +332,6 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
                 pm.host_port, pm.container_port, pm.protocol
             );
         }
-
     }
 
     // Resolve the container for this sandbox.
@@ -436,9 +429,7 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
                         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                     {
                         match key.code {
-                            KeyCode::Char(c)
-                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
+                            KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 vec![c as u8 & 0x1f]
                             }
                             KeyCode::Char(c) => {
@@ -488,7 +479,10 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
     // If the execution is already in a terminal state (e.g., from a previous failed run),
     // create a fresh execution and retry. This recovers from stale state_conflict errors
     // without requiring a manual daemon kill.
-    let is_terminal_err = stream_result.as_ref().err().is_some_and(is_terminal_state_error);
+    let is_terminal_err = stream_result
+        .as_ref()
+        .err()
+        .is_some_and(is_terminal_state_error);
     let mut stream = match stream_result {
         Ok(s) => s,
         Err(_) if is_terminal_err => {
@@ -812,10 +806,7 @@ fn write_filtered_stderr(bytes: &[u8]) {
 
 // ── Daemon helpers ─────────────────────────────────────────────────
 
-async fn resolve_container(
-    client: &mut DaemonClient,
-    sandbox_id: &str,
-) -> anyhow::Result<String> {
+async fn resolve_container(client: &mut DaemonClient, sandbox_id: &str) -> anyhow::Result<String> {
     let mut stream = client
         .open_sandbox_shell(runtime_v2::OpenSandboxShellRequest {
             sandbox_id: sandbox_id.to_string(),
@@ -830,8 +821,7 @@ async fn resolve_container(
         .await
         .context("failed reading open_sandbox_shell stream")?
     {
-        if let Some(runtime_v2::open_sandbox_shell_event::Payload::Completion(done)) =
-            event.payload
+        if let Some(runtime_v2::open_sandbox_shell_event::Payload::Completion(done)) = event.payload
         {
             container_id = Some(done.container_id);
             break;
@@ -843,10 +833,7 @@ async fn resolve_container(
         .ok_or_else(|| anyhow!("no container found in sandbox {sandbox_id}"))
 }
 
-async fn terminate_sandbox(
-    client: &mut DaemonClient,
-    sandbox_id: &str,
-) -> anyhow::Result<()> {
+async fn terminate_sandbox(client: &mut DaemonClient, sandbox_id: &str) -> anyhow::Result<()> {
     let mut stream = client
         .terminate_sandbox_stream(runtime_v2::TerminateSandboxRequest {
             sandbox_id: sandbox_id.to_string(),
@@ -883,9 +870,7 @@ fn is_terminal_state_error(error: &DaemonClientError) -> bool {
     )
 }
 
-fn parse_port_mappings(
-    specs: &[String],
-) -> anyhow::Result<Vec<runtime_v2::PortMapping>> {
+fn parse_port_mappings(specs: &[String]) -> anyhow::Result<Vec<runtime_v2::PortMapping>> {
     specs.iter().map(|s| parse_port_mapping(s)).collect()
 }
 
@@ -896,9 +881,7 @@ fn parse_port_mapping(spec: &str) -> anyhow::Result<runtime_v2::PortMapping> {
     };
 
     if protocol != "tcp" && protocol != "udp" {
-        bail!(
-            "invalid -p protocol '{protocol}' in '{spec}', expected tcp or udp"
-        );
+        bail!("invalid -p protocol '{protocol}' in '{spec}', expected tcp or udp");
     }
 
     let mut parts = ports_part.split(':');
@@ -947,4 +930,3 @@ fn parse_memory(raw: Option<&str>) -> anyhow::Result<u64> {
         }
     }
 }
-

@@ -284,7 +284,11 @@ fn builder_generates_locally_administered_mac_by_default() {
     assert_eq!(mac.split(':').count(), 6, "mac should be 6 octets: {mac}");
     let bytes = parse_mac_octets(mac);
     // Locally administered: second-LSB of first octet set.
-    assert_eq!(bytes[0] & 0x02, 0x02, "mac {mac} should be locally administered");
+    assert_eq!(
+        bytes[0] & 0x02,
+        0x02,
+        "mac {mac} should be locally administered"
+    );
     // Unicast: LSB of first octet clear.
     assert_eq!(bytes[0] & 0x01, 0x00, "mac {mac} should be unicast");
 }
@@ -370,7 +374,10 @@ fn build_with_multiple_disks_preserves_order() {
     assert_eq!(cfg.disks()[2].id, "metadata");
     assert!(!cfg.disks()[0].read_only);
     assert!(!cfg.disks()[1].read_only);
-    assert!(cfg.disks()[2].read_only, "metadata disk should be read-only");
+    assert!(
+        cfg.disks()[2].read_only,
+        "metadata disk should be read-only"
+    );
 }
 
 #[test]

@@ -375,8 +375,14 @@ async fn measure_n_idle_vms_host_rss() {
     eprintln!();
     eprintln!("==== After 5s idle ====");
     eprintln!("XPC helper count:    {}", after_boot.count);
-    eprintln!("sum helper RSS:      {}", fmt_mb(after_boot.total_rss_bytes));
-    eprintln!("sum helper VSZ:      {}", fmt_mb(after_boot.total_vsz_bytes));
+    eprintln!(
+        "sum helper RSS:      {}",
+        fmt_mb(after_boot.total_rss_bytes)
+    );
+    eprintln!(
+        "sum helper VSZ:      {}",
+        fmt_mb(after_boot.total_vsz_bytes)
+    );
     eprintln!(
         "delta vs baseline:   {}  ({} per VM)",
         fmt_mb(after_boot_rss),
@@ -428,7 +434,10 @@ async fn measure_n_idle_vms_host_rss() {
 
     let after_stop = helper_processes();
     eprintln!("XPC helper count:    {}", after_stop.count);
-    eprintln!("sum helper RSS:      {}", fmt_mb(after_stop.total_rss_bytes));
+    eprintln!(
+        "sum helper RSS:      {}",
+        fmt_mb(after_stop.total_rss_bytes)
+    );
     eprintln!(
         "delta vs baseline:   {}",
         fmt_mb(

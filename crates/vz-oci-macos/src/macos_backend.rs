@@ -79,9 +79,7 @@ impl MacosRuntimeBackend {
                 .map(exec_output_to_contract)
                 .map_err(oci_err)?;
             if result.exit_code != 0 {
-                let _ = self
-                    .stop_container(container_id, true, None, None)
-                    .await;
+                let _ = self.stop_container(container_id, true, None, None).await;
                 let _ = self.remove_container(container_id).await;
                 return Err(RuntimeError::Backend {
                     message: format!(

@@ -191,9 +191,7 @@ pub async fn cmd_dev_init(args: DevInitArgs) -> anyhow::Result<()> {
     let config_path = cwd.join(VZ_CONFIG_FILE);
 
     if config_path.exists() && !args.force {
-        bail!(
-            "{VZ_CONFIG_FILE} already exists. Use --force to overwrite."
-        );
+        bail!("{VZ_CONFIG_FILE} already exists. Use --force to overwrite.");
     }
 
     let project_type = match &args.template {

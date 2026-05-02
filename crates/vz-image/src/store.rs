@@ -526,10 +526,7 @@ impl ImageStore {
         if !source_rootfs.exists() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!(
-                    "container rootfs not found: {}",
-                    source_rootfs.display()
-                ),
+                format!("container rootfs not found: {}", source_rootfs.display()),
             ));
         }
 
@@ -561,11 +558,9 @@ impl ImageStore {
         let source_container_id = source_container_id.to_string();
         let reference = reference.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            store.commit_rootfs(&source_container_id, &reference)
-        })
-        .await
-        .map_err(|err| io::Error::other(err.to_string()))?
+        tokio::task::spawn_blocking(move || store.commit_rootfs(&source_container_id, &reference))
+            .await
+            .map_err(|err| io::Error::other(err.to_string()))?
     }
 
     /// Check whether a committed rootfs exists for the given reference.
