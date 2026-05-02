@@ -18,8 +18,9 @@ pub use config::LinuxVmConfig;
 pub use error::LinuxError;
 pub use grpc_client::{ExecOptions, GrpcExecStream, GrpcPortForwardStream, OciExecOptions};
 pub use kernel::{
-    EnsureKernelOptions, KernelPaths, KernelVersion, default_linux_dir, ensure_kernel,
-    ensure_kernel_with_options,
+    EnsureKernelOptions, KernelBundle, KernelBundleOptions, KernelCapability, KernelFlavor,
+    KernelPaths, KernelVersion, default_linux_dir, default_vz_linux_kernel_capabilities,
+    ensure_kernel, ensure_kernel_bundle, ensure_kernel_with_options,
 };
 pub use vm::LinuxVm;
 pub use vz::protocol::{NetworkServiceConfig, OciContainerState};

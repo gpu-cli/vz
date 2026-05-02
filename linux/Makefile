@@ -168,7 +168,7 @@ $(VERSION_JSON): $(KERNEL_IMAGE) $(INITRAMFS_IMAGE) $(YOUKI_BINARY)
 	@KERNEL_SHA="$$(shasum -a 256 "$(KERNEL_IMAGE)" | cut -d' ' -f1)"; \
 	INITRAMFS_SHA="$$(shasum -a 256 "$(INITRAMFS_IMAGE)" | cut -d' ' -f1)"; \
 	YOUKI_SHA="$$(shasum -a 256 "$(YOUKI_BINARY)" | cut -d' ' -f1)"; \
-	printf '{\n  "kernel": "$(KERNEL_VERSION)",\n  "busybox": "$(BUSYBOX_VERSION)",\n  "agent": "$(AGENT_VERSION)",\n  "agent_protocol_revision": $(AGENT_PROTOCOL_REVISION),\n  "youki": "$(YOUKI_VERSION)",\n  "built": "$(BUILD_TIMESTAMP)",\n  "sha256_vmlinux": "%s",\n  "sha256_initramfs": "%s",\n  "sha256_youki": "%s"\n}\n' "$$KERNEL_SHA" "$$INITRAMFS_SHA" "$$YOUKI_SHA" > "$(VERSION_JSON)"
+	printf '{\n  "kernel": "$(KERNEL_VERSION)",\n  "busybox": "$(BUSYBOX_VERSION)",\n  "agent": "$(AGENT_VERSION)",\n  "agent_protocol_revision": $(AGENT_PROTOCOL_REVISION),\n  "youki": "$(YOUKI_VERSION)",\n  "built": "$(BUILD_TIMESTAMP)",\n  "sha256_vmlinux": "%s",\n  "sha256_initramfs": "%s",\n  "sha256_youki": "%s",\n  "capabilities": [\n    "vsock",\n    "virtiofs",\n    "hvc0_serial",\n    "ext4_root"\n  ]\n}\n' "$$KERNEL_SHA" "$$INITRAMFS_SHA" "$$YOUKI_SHA" > "$(VERSION_JSON)"
 
 version: $(VERSION_JSON)
 

@@ -51,8 +51,13 @@ Each release includes:
 |----------|-------------|
 | `vz-v{VERSION}-darwin-arm64` | Signed + notarized CLI binary |
 | `vz-guest-agent-v{VERSION}-darwin-arm64` | Guest agent binary (ad-hoc signed) |
-| `vz-linux-v{VERSION}-arm64.tar.gz` | Linux kernel + initramfs + youki |
+| `vz-linux-v{VERSION}-arm64.tar.gz` | Linux kernel + initramfs + youki + `version.json` capability metadata |
 | `*.sha256` | SHA256 checksums for all artifacts |
+
+The Linux bundle release job validates `version.json` before publishing. The
+metadata must include artifact checksums and the declared VZ guest capabilities
+used by `vz-linux::ensure_kernel_bundle()`: `vsock`, `virtiofs`, `hvc0_serial`,
+and `ext4_root`.
 
 ## User Installation
 

@@ -47,6 +47,10 @@ Useful benchmark flags:
 
 ## Output compatibility
 
-`version.json` includes guest-agent and pinned `youki` version metadata.
-`vz-linux::ensure_kernel()` uses this to reject mismatched artifact sets,
-and verifies SHA256 checksums when present.
+`version.json` includes guest-agent and pinned `youki` version metadata,
+artifact SHA256 checksums, and declared kernel capabilities (`vsock`,
+`virtiofs`, `hvc0_serial`, `ext4_root`). `vz-linux::ensure_kernel()` uses the
+version metadata to reject mismatched artifact sets and verifies SHA256
+checksums when present. `vz-linux::ensure_kernel_bundle()` additionally lets
+external callers choose the install directory and require specific kernel
+capabilities before booting their own rootfs.

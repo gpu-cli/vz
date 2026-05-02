@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -46,6 +47,96 @@ pub struct KernelVersion {
     pub sha256_initramfs: Option<String>,
     /// Optional SHA256 of `youki`.
     pub sha256_youki: Option<String>,
+    /// Optional capability declarations for this kernel bundle.
+    ///
+    /// Older bundles predate this field; callers that use
+    /// [`ensure_kernel_bundle`] fall back to the capability set implied by the
+    /// requested [`KernelFlavor`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<BTreeSet<KernelCapability>>,
+}
+
+/// Kernel feature that external callers may require before booting a guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KernelCapability {
+    /// Virtio-vsock device support.
+    Vsock,
+    /// VirtioFS filesystem support.
+    Virtiofs,
+    /// `console=hvc0` serial console support.
+    Hvc0Serial,
+    /// Ext4 root filesystem support.
+    Ext4Root,
+}
+
+impl KernelCapability {
+    /// Stable string identifier for diagnostics and metadata.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vsock => "vsock",
+            Self::Virtiofs => "virtiofs",
+            Self::Hvc0Serial => "hvc0_serial",
+            Self::Ext4Root => "ext4_root",
+        }
+    }
+}
+
+/// Versioned kernel flavor provided by `vz-linux`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelFlavor {
+    /// Apple Virtualization.framework compatible Linux/aarch64 kernel.
+    LinuxAarch64Vz,
+}
+
+/// Caller-controlled options for resolving a versioned kernel bundle.
+#[derive(Debug, Clone)]
+pub struct KernelBundleOptions {
+    /// Kernel flavor to resolve.
+    pub flavor: KernelFlavor,
+    /// Install/cache directory. When unset, defaults to [`default_linux_dir`].
+    pub install_dir: Option<PathBuf>,
+    /// Optional predownloaded bundle directory to install from.
+    ///
+    /// If unset, `VZ_LINUX_BUNDLE_DIR` and workspace-relative `linux/out`
+    /// discovery behave the same as [`ensure_kernel_with_options`].
+    pub bundle_dir: Option<PathBuf>,
+    /// Require strict `vz-guest-agent` version/protocol compatibility.
+    ///
+    /// Callers that only need the kernel image, such as direct-rootfs guests,
+    /// can set this to `false`.
+    pub require_exact_agent_version: bool,
+    /// Capabilities the resolved kernel bundle must declare.
+    pub required_capabilities: BTreeSet<KernelCapability>,
+}
+
+impl Default for KernelBundleOptions {
+    fn default() -> Self {
+        Self {
+            flavor: KernelFlavor::LinuxAarch64Vz,
+            install_dir: None,
+            bundle_dir: None,
+            require_exact_agent_version: true,
+            required_capabilities: default_vz_linux_kernel_capabilities(),
+        }
+    }
+}
+
+/// Resolved kernel bundle with caller-facing metadata.
+#[derive(Debug, Clone)]
+pub struct KernelBundle {
+    /// Kernel flavor that was resolved.
+    pub flavor: KernelFlavor,
+    /// Linux kernel image path.
+    pub kernel: PathBuf,
+    /// Optional initramfs path from the bundle.
+    pub initramfs: Option<PathBuf>,
+    /// Optional pinned `youki` runtime path from the bundle.
+    pub youki: Option<PathBuf>,
+    /// Parsed artifact metadata from `version.json`.
+    pub version: KernelVersion,
+    /// Declared kernel capabilities after flavor fallback.
+    pub capabilities: BTreeSet<KernelCapability>,
 }
 
 /// Options for resolving kernel artifacts.
@@ -84,6 +175,42 @@ pub fn default_linux_dir() -> Result<PathBuf, LinuxError> {
 /// Ensure Linux kernel artifacts are installed and compatible.
 pub async fn ensure_kernel() -> Result<KernelPaths, LinuxError> {
     ensure_kernel_with_options(EnsureKernelOptions::default()).await
+}
+
+/// Ensure a versioned Linux kernel bundle is installed and satisfies caller requirements.
+///
+/// This is the public resolver for consumers that need explicit control over
+/// where `vz`'s Linux kernel artifacts land. The returned bundle can be passed
+/// directly to `VmConfigBuilder::boot_linux`; callers that boot their own rootfs
+/// may ignore the optional initramfs and `youki` paths.
+pub async fn ensure_kernel_bundle(
+    options: KernelBundleOptions,
+) -> Result<KernelBundle, LinuxError> {
+    let KernelBundleOptions {
+        flavor,
+        install_dir,
+        bundle_dir,
+        require_exact_agent_version,
+        required_capabilities,
+    } = options;
+
+    let paths = ensure_kernel_with_options(EnsureKernelOptions {
+        install_dir,
+        bundle_dir,
+        require_exact_agent_version,
+    })
+    .await?;
+    let capabilities = capabilities_for_version(&paths.version, flavor);
+    validate_required_capabilities(&capabilities, &required_capabilities)?;
+
+    Ok(KernelBundle {
+        flavor,
+        kernel: paths.kernel,
+        initramfs: Some(paths.initramfs),
+        youki: Some(paths.youki),
+        version: paths.version,
+        capabilities,
+    })
 }
 
 /// Ensure Linux kernel artifacts are installed and compatible.
@@ -157,6 +284,45 @@ pub async fn ensure_kernel_with_options(
     }
 
     Err(LinuxError::MissingKernelArtifacts { dir: install_dir })
+}
+
+/// Capabilities expected from the current `vz-linux` Apple VZ kernel flavor.
+pub fn default_vz_linux_kernel_capabilities() -> BTreeSet<KernelCapability> {
+    [
+        KernelCapability::Vsock,
+        KernelCapability::Virtiofs,
+        KernelCapability::Hvc0Serial,
+        KernelCapability::Ext4Root,
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn capabilities_for_version(
+    version: &KernelVersion,
+    flavor: KernelFlavor,
+) -> BTreeSet<KernelCapability> {
+    version
+        .capabilities
+        .clone()
+        .unwrap_or_else(|| match flavor {
+            KernelFlavor::LinuxAarch64Vz => default_vz_linux_kernel_capabilities(),
+        })
+}
+
+fn validate_required_capabilities(
+    capabilities: &BTreeSet<KernelCapability>,
+    required: &BTreeSet<KernelCapability>,
+) -> Result<(), LinuxError> {
+    let missing = required
+        .difference(capabilities)
+        .map(|capability| capability.as_str().to_string())
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(LinuxError::MissingKernelCapabilities { missing })
+    }
 }
 
 fn workspace_bundle_dir() -> Option<PathBuf> {
@@ -341,6 +507,7 @@ mod tests {
             sha256_vmlinux: None,
             sha256_initramfs: None,
             sha256_youki: None,
+            capabilities: None,
         }
     }
 
@@ -429,6 +596,97 @@ mod tests {
         assert!(install.join(INITRAMFS_FILE).exists());
         assert!(install.join(YOUKI_FILE).exists());
         assert!(install.join(VERSION_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn ensure_kernel_bundle_uses_caller_install_dir_and_returns_capabilities() {
+        let temp = tempdir().expect("tempdir");
+        let install = temp.path().join("virgil-controlled/linux/vz-0.1.0");
+        let bundle = temp.path().join("bundle");
+        let expected = env!("CARGO_PKG_VERSION").to_string();
+        write_artifacts_with_checksums(&bundle, expected.clone(), true).await;
+
+        let resolved = ensure_kernel_bundle(KernelBundleOptions {
+            install_dir: Some(install.clone()),
+            bundle_dir: Some(bundle),
+            ..KernelBundleOptions::default()
+        })
+        .await
+        .expect("ensure kernel bundle");
+
+        assert_eq!(resolved.flavor, KernelFlavor::LinuxAarch64Vz);
+        assert_eq!(resolved.version.agent, expected);
+        assert_eq!(resolved.kernel, install.join(KERNEL_FILE));
+        assert_eq!(
+            resolved.initramfs.as_deref(),
+            Some(install.join(INITRAMFS_FILE).as_path())
+        );
+        assert_eq!(
+            resolved.youki.as_deref(),
+            Some(install.join(YOUKI_FILE).as_path())
+        );
+        assert!(resolved.capabilities.contains(&KernelCapability::Virtiofs));
+        assert!(resolved.capabilities.contains(&KernelCapability::Vsock));
+        assert!(
+            resolved
+                .capabilities
+                .contains(&KernelCapability::Hvc0Serial)
+        );
+        assert!(resolved.capabilities.contains(&KernelCapability::Ext4Root));
+    }
+
+    #[tokio::test]
+    async fn ensure_kernel_bundle_can_skip_guest_agent_version_validation() {
+        let temp = tempdir().expect("tempdir");
+        let install = temp.path().join("install");
+        write_artifacts(&install, "not-this-crate".to_string()).await;
+
+        let resolved = ensure_kernel_bundle(KernelBundleOptions {
+            install_dir: Some(install.clone()),
+            bundle_dir: None,
+            require_exact_agent_version: false,
+            ..KernelBundleOptions::default()
+        })
+        .await
+        .expect("direct-rootfs callers can opt out of guest-agent version checks");
+
+        assert_eq!(resolved.kernel, install.join(KERNEL_FILE));
+        assert_eq!(resolved.version.agent, "not-this-crate");
+    }
+
+    #[tokio::test]
+    async fn ensure_kernel_bundle_rejects_missing_required_capability() {
+        let temp = tempdir().expect("tempdir");
+        let install = temp.path().join("linux");
+        let expected = env!("CARGO_PKG_VERSION").to_string();
+        write_artifacts(&install, expected).await;
+
+        let mut version: KernelVersion = serde_json::from_str(
+            &tokio::fs::read_to_string(install.join(VERSION_FILE))
+                .await
+                .expect("read version"),
+        )
+        .expect("parse version");
+        version.capabilities = Some([KernelCapability::Vsock].into_iter().collect());
+        tokio::fs::write(
+            install.join(VERSION_FILE),
+            serde_json::to_string_pretty(&version).expect("version json"),
+        )
+        .await
+        .expect("write version");
+
+        let err = ensure_kernel_bundle(KernelBundleOptions {
+            install_dir: Some(install),
+            bundle_dir: None,
+            ..KernelBundleOptions::default()
+        })
+        .await
+        .expect_err("must fail missing virtiofs/hvc0/ext4 capabilities");
+
+        assert!(
+            matches!(err, LinuxError::MissingKernelCapabilities { ref missing }
+                if missing.contains(&KernelCapability::Virtiofs.as_str().to_string()))
+        );
     }
 
     #[tokio::test]

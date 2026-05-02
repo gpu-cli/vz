@@ -64,6 +64,13 @@ pub enum LinuxError {
         found: String,
     },
 
+    /// Kernel bundle metadata does not satisfy caller-required capabilities.
+    #[error("kernel artifact missing required capabilities: {missing:?}")]
+    MissingKernelCapabilities {
+        /// Capability names that were required but not declared.
+        missing: Vec<String>,
+    },
+
     /// Guest responded with a non-Linux OS identifier.
     #[error("guest agent reported unexpected os: {0}")]
     UnexpectedGuestOs(String),

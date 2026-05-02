@@ -196,7 +196,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: linux/out
-          key: linux-artifacts-${{ hashFiles('linux/vz-linux.config', 'linux/Makefile', 'linux/Dockerfile', 'linux/initramfs/**', 'crates/vz-guest-agent/**') }}
+          key: linux-artifacts-${{ hashFiles('linux/vz-linux.config', 'linux/Makefile', 'linux/Dockerfile', 'linux/initramfs/**', 'crates/Cargo.toml', 'crates/Cargo.lock', 'crates/vz-guest-agent/**', 'crates/vz-agent-proto/**', 'crates/vz/**') }}
 
       - name: Build Linux artifacts via Docker (native arm64)
         if: steps.linux-cache.outputs.cache-hit != 'true'
@@ -208,6 +208,22 @@ jobs:
             -w /workspace/linux \
             vz-linux-builder \
             make all CROSS_COMPILE= GUEST_AGENT_BUILD_TOOL=cargo
+
+      - name: Validate Linux artifact metadata
+        run: |
+          jq -e '
+            .kernel and
+            .agent and
+            .agent_protocol_revision and
+            .youki and
+            .sha256_vmlinux and
+            .sha256_initramfs and
+            .sha256_youki and
+            ((.capabilities // []) | index("vsock")) and
+            ((.capabilities // []) | index("virtiofs")) and
+            ((.capabilities // []) | index("hvc0_serial")) and
+            ((.capabilities // []) | index("ext4_root"))
+          ' linux/out/version.json >/dev/null
 
       - name: Package Linux artifacts
         env:
