@@ -35,11 +35,11 @@ make -C linux docker-build-all
 | Profile | Output | Baseline | Intended use |
 | --- | --- | --- | --- |
 | `developer` | `linux/out/` | arm64 `defconfig` + `vz-linux.config` | Broad dev/host VM kernel, including nested KVM and TUN/TAP for Virgil's Firecracker host path. |
-| `container` | `linux/out/container/` | `allnoconfig` + `vz-linux-container.config` | Deployed container/sandbox VM kernel with virtio/vsock/virtiofs, overlayfs, netns, seccomp, io_uring, and btrfs snapshot support. |
+| `container` | `linux/out/container/` | `allnoconfig` + `vz-linux-container.config` | Deployed container/sandbox VM kernel with virtio/vsock/virtiofs, overlayfs, netns, seccomp, io_uring, btrfs snapshots, and kernel NFS server support. |
 
 The container profile intentionally does not expose `/proc/config.gz`
 (`IKCONFIG`) and does not include nested virtualization, TUN/TAP, USB gadget,
-SCSI/ATA, 9p, SquashFS, or FAT/VFAT.
+SCSI/ATA, NFS client support, 9p, SquashFS, or FAT/VFAT.
 
 Release CI caches each profile kernel image separately from the initramfs and
 metadata. Normal `vz` releases rebuild the guest agent/initramfs and regenerate
@@ -97,7 +97,7 @@ Useful benchmark flags:
 `version.json` includes guest-agent and pinned `youki` version metadata,
 artifact SHA256 checksums, the kernel `profile`, a `security_profile`, and
 declared kernel capabilities (`vsock`, `virtiofs`, `hvc0_serial`, `ext4_root`,
-`overlayfs`, `netns`, `seccomp`, `io_uring`, `btrfs_snapshots`, etc.).
+`overlayfs`, `netns`, `seccomp`, `io_uring`, `btrfs_snapshots`, `nfsd`, etc.).
 `vz-linux::ensure_kernel()` uses the version metadata to reject mismatched
 artifact sets and verifies SHA256 checksums when present.
 `vz-linux::ensure_kernel_bundle()` additionally lets external callers choose

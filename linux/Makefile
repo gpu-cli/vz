@@ -18,7 +18,7 @@ DEFAULT_OUT_DIR := $(ROOT_DIR)/out/container
 KERNEL_BASE_CONFIG ?= allnoconfig
 KERNEL_CONFIG_FRAGMENT ?= $(ROOT_DIR)/vz-linux-container.config
 KERNEL_SECURITY_PROFILE ?= container-hardened
-KERNEL_CAPABILITIES ?= vsock virtiofs hvc0_serial ext4_root overlayfs netns seccomp io_uring btrfs_snapshots container_sandbox
+KERNEL_CAPABILITIES ?= vsock virtiofs hvc0_serial ext4_root overlayfs netns seccomp io_uring btrfs_snapshots nfsd container_sandbox
 else
 $(error unsupported KERNEL_PROFILE '$(KERNEL_PROFILE)'; expected developer or container)
 endif
@@ -83,7 +83,7 @@ help:
 	@echo ""
 	@echo "Profiles:"
 	@echo "  KERNEL_PROFILE=developer  Broad dev/host VM kernel with nested virt"
-	@echo "  KERNEL_PROFILE=container  allnoconfig-based sandbox kernel with btrfs snapshots"
+	@echo "  KERNEL_PROFILE=container  allnoconfig sandbox kernel with btrfs snapshots and nfsd"
 
 all: $(KERNEL_IMAGE) $(INITRAMFS_IMAGE) $(YOUKI_BINARY) $(VERSION_JSON)
 

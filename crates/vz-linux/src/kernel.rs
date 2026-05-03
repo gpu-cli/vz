@@ -88,6 +88,8 @@ pub enum KernelCapability {
     Tun,
     /// Btrfs subvolume/snapshot support for sandbox checkpointing.
     BtrfsSnapshots,
+    /// Kernel NFS server support for workspace/frontend exports.
+    Nfsd,
     /// Hardened container sandbox kernel profile.
     ContainerSandbox,
 }
@@ -107,6 +109,7 @@ impl KernelCapability {
             Self::NestedVirt => "nested_virt",
             Self::Tun => "tun",
             Self::BtrfsSnapshots => "btrfs_snapshots",
+            Self::Nfsd => "nfsd",
             Self::ContainerSandbox => "container_sandbox",
         }
     }
@@ -489,6 +492,7 @@ pub fn default_vz_linux_kernel_profile_capabilities(
             capabilities.extend([KernelCapability::NestedVirt, KernelCapability::Tun]);
         }
         KernelProfile::Container => {
+            capabilities.insert(KernelCapability::Nfsd);
             capabilities.insert(KernelCapability::ContainerSandbox);
         }
     }
@@ -919,6 +923,7 @@ mod tests {
             KernelCapability::Seccomp,
             KernelCapability::IoUring,
             KernelCapability::BtrfsSnapshots,
+            KernelCapability::Nfsd,
             KernelCapability::ContainerSandbox,
         ]
         .into_iter()
@@ -946,6 +951,7 @@ mod tests {
             KernelCapability::Seccomp,
             KernelCapability::IoUring,
             KernelCapability::BtrfsSnapshots,
+            KernelCapability::Nfsd,
             KernelCapability::ContainerSandbox,
         ]
         .into_iter()
@@ -976,6 +982,7 @@ mod tests {
                 .capabilities
                 .contains(&KernelCapability::BtrfsSnapshots)
         );
+        assert!(resolved.capabilities.contains(&KernelCapability::Nfsd));
         assert!(resolved.capabilities.contains(&KernelCapability::IoUring));
     }
 
@@ -1066,6 +1073,7 @@ mod tests {
             err,
             LinuxError::MissingKernelCapabilities { ref missing }
                 if missing.contains(&KernelCapability::ContainerSandbox.as_str().to_string())
+                    && missing.contains(&KernelCapability::Nfsd.as_str().to_string())
         ));
     }
 

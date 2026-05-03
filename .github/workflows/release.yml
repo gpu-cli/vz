@@ -271,6 +271,7 @@ jobs:
           jq -e '
             .profile == "container" and
             .security_profile == "container-hardened" and
+            ((.capabilities // []) | index("nfsd")) and
             ((.capabilities // []) | index("container_sandbox"))
           ' linux/out/container/version.json >/dev/null
 
