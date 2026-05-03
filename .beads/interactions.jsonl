@@ -8,3 +8,4 @@
 {"id":"int-9d996003","kind":"field_change","created_at":"2026-05-02T04:48:48.848055Z","actor":"James Lal","issue_id":"vz-w4g","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
 {"id":"int-889ea856","kind":"field_change","created_at":"2026-05-02T05:11:38.151284Z","actor":"James Lal","issue_id":"vz-ptm","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
 {"id":"int-c7ed34f8","kind":"field_change","created_at":"2026-05-03T22:56:55.878129Z","actor":"James Lal","issue_id":"vz-ptm.1","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
+{"id":"int-a1888c0e","kind":"field_change","created_at":"2026-05-03T23:06:35.257979Z","actor":"James Lal","issue_id":"vz-ptm.2","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
