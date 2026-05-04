@@ -419,6 +419,32 @@ fn memory_balloon_can_be_opted_out() {
     assert!(!cfg.memory_balloon_enabled());
 }
 
+// ---------------------------------------------------------------------------
+// Entropy device
+// ---------------------------------------------------------------------------
+
+#[test]
+fn entropy_device_enabled_by_default() {
+    let cfg = VmConfigBuilder::new()
+        .boot_linux("/boot/vmlinuz", None::<PathBuf>, "console=ttyS0")
+        .build()
+        .unwrap();
+    assert!(
+        cfg.entropy_device_enabled(),
+        "entropy device must be on by default"
+    );
+}
+
+#[test]
+fn entropy_device_can_be_opted_out() {
+    let cfg = VmConfigBuilder::new()
+        .boot_linux("/boot/vmlinuz", None::<PathBuf>, "console=ttyS0")
+        .entropy_device(false)
+        .build()
+        .unwrap();
+    assert!(!cfg.entropy_device_enabled());
+}
+
 #[test]
 fn macos_boot_without_disks_fails() {
     let result = VmConfigBuilder::new()

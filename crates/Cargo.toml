@@ -98,6 +98,10 @@ objc2-virtualization = { version = "0.3", features = [
     "VZVirtioTraditionalMemoryBalloonDevice",
     "VZVirtioTraditionalMemoryBalloonDeviceConfiguration",
 
+    # Entropy device (guest kernel CRNG / Go/Rust CLI startup)
+    "VZEntropyDeviceConfiguration",
+    "VZVirtioEntropyDeviceConfiguration",
+
     # Display
     "VZGraphicsDeviceConfiguration",
     "VZMacGraphicsDeviceConfiguration",

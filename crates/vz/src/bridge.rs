@@ -27,9 +27,10 @@ use objc2_virtualization::{
     VZNATNetworkDeviceAttachment, VZSharedDirectory, VZSingleDirectoryShare,
     VZUSBKeyboardConfiguration, VZUSBScreenCoordinatePointingDeviceConfiguration,
     VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
-    VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
-    VZVirtioSocketDeviceConfiguration, VZVirtioTraditionalMemoryBalloonDeviceConfiguration,
-    VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineDelegate,
+    VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
+    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketDeviceConfiguration,
+    VZVirtioTraditionalMemoryBalloonDeviceConfiguration, VZVirtualMachine,
+    VZVirtualMachineConfiguration, VZVirtualMachineDelegate,
 };
 use tokio::sync::{oneshot, watch};
 
@@ -461,6 +462,20 @@ pub(crate) fn build_objc_config(
         // at config-time; passing more than one element would error in
         // VZVirtualMachineConfiguration::validateWithError.
         unsafe { vz_config.setMemoryBalloonDevices(&balloon_devices) };
+    }
+
+    // Entropy device — supplies guest kernel randomness. Minimal Linux guests
+    // can otherwise block in early `getrandom(2)` calls when booted without a
+    // NIC or hardware RNG. Apple permits at most one entropy device per VM.
+    if config.entropy_device {
+        // SAFETY: VZVirtioEntropyDeviceConfiguration::new() returns a
+        // default-initialized configuration object.
+        let entropy_config = unsafe { VZVirtioEntropyDeviceConfiguration::new() };
+        let entropy_devices = NSArray::from_retained_slice(&[Retained::into_super(entropy_config)]);
+        // SAFETY: setEntropyDevices accepts an NSArray of
+        // VZEntropyDeviceConfiguration. Apple validates "at most one" at
+        // config-time.
+        unsafe { vz_config.setEntropyDevices(&entropy_devices) };
     }
 
     // Graphics device (required by macOS guests for proper operation, even headless)

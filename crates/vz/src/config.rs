@@ -92,6 +92,7 @@ pub struct VmConfigBuilder {
     headless: bool,
     nested_virtualization: bool,
     memory_balloon: bool,
+    entropy_device: bool,
 }
 
 impl VmConfigBuilder {
@@ -112,6 +113,7 @@ impl VmConfigBuilder {
             headless: true,
             nested_virtualization: true,
             memory_balloon: true,
+            entropy_device: true,
         }
     }
 
@@ -260,6 +262,17 @@ impl VmConfigBuilder {
         self
     }
 
+    /// Enable or disable the virtio entropy device. Default: enabled.
+    ///
+    /// Linux guests use this device to seed the kernel random number
+    /// generator. Without it, early user-space programs that call
+    /// `getrandom(2)` can block indefinitely in tiny VM images with no
+    /// other entropy source.
+    pub fn entropy_device(mut self, enabled: bool) -> Self {
+        self.entropy_device = enabled;
+        self
+    }
+
     /// Validate and build the configuration.
     pub fn build(self) -> Result<VmConfig, VzError> {
         let boot_loader = self
@@ -300,6 +313,7 @@ impl VmConfigBuilder {
             headless: self.headless,
             nested_virtualization: self.nested_virtualization,
             memory_balloon: self.memory_balloon,
+            entropy_device: self.entropy_device,
         })
     }
 }
@@ -337,6 +351,9 @@ pub struct VmConfig {
     /// Attach a virtio memory balloon device. Required for runtime memory
     /// reclaim via [`Vm::set_target_memory_size`].
     pub(crate) memory_balloon: bool,
+    /// Attach a virtio entropy device. Required for reliable early
+    /// getrandom(2) in minimal Linux guests.
+    pub(crate) entropy_device: bool,
 }
 
 impl VmConfig {
@@ -362,5 +379,10 @@ impl VmConfig {
     /// the guest to release pages back to the host.
     pub fn memory_balloon_enabled(&self) -> bool {
         self.memory_balloon
+    }
+
+    /// Whether this VM was built with a virtio entropy device.
+    pub fn entropy_device_enabled(&self) -> bool {
+        self.entropy_device
     }
 }
