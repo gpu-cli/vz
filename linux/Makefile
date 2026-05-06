@@ -223,23 +223,27 @@ $(VERSION_JSON): $(KERNEL_IMAGE) $(INITRAMFS_IMAGE) $(YOUKI_BINARY)
 
 version: $(VERSION_JSON)
 
+DOCKER_BUILD_JOBS ?= 4
+
 docker-build:
-	@echo "Building linux artifacts in Docker ($(KERNEL_PROFILE) profile)"
+	@echo "Building linux artifacts in Docker ($(KERNEL_PROFILE) profile, JOBS=$(DOCKER_BUILD_JOBS))"
 	docker build -t vz-linux-builder "$(ROOT_DIR)"
 	docker run --rm \
+		--ulimit nofile=1048576:1048576 \
 		-v "$(REPO_ROOT):/workspace" \
 		-w /workspace/linux \
 		vz-linux-builder \
-		make all KERNEL_PROFILE="$(KERNEL_PROFILE)" CROSS_COMPILE= GUEST_AGENT_BUILD_TOOL=cargo
+		make all KERNEL_PROFILE="$(KERNEL_PROFILE)" JOBS="$(DOCKER_BUILD_JOBS)" CROSS_COMPILE= GUEST_AGENT_BUILD_TOOL=cargo
 
 docker-build-all:
-	@echo "Building all linux artifact profiles in Docker"
+	@echo "Building all linux artifact profiles in Docker (JOBS=$(DOCKER_BUILD_JOBS))"
 	docker build -t vz-linux-builder "$(ROOT_DIR)"
 	docker run --rm \
+		--ulimit nofile=1048576:1048576 \
 		-v "$(REPO_ROOT):/workspace" \
 		-w /workspace/linux \
 		vz-linux-builder \
-		make all-profiles CROSS_COMPILE= GUEST_AGENT_BUILD_TOOL=cargo
+		make all-profiles JOBS="$(DOCKER_BUILD_JOBS)" CROSS_COMPILE= GUEST_AGENT_BUILD_TOOL=cargo
 
 clean:
 	rm -rf "$(OUT_DIR)"

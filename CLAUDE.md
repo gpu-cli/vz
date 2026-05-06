@@ -45,7 +45,7 @@ Use the Docker build path — native macOS builds fail due to missing `elf.h` an
 
 ```bash
 # Build kernel + initramfs + youki (all artifacts)
-rm -rf linux/src/linux-6.12.11   # always clean source first to avoid stale host binaries
+rm -rf linux/src/linux-6.12.85   # always clean source first to avoid stale host binaries
 cd linux && make docker-build
 ```
 
@@ -54,7 +54,7 @@ Output goes to `linux/out/` (`vmlinux`, `initramfs.img`, `youki`, `version.json`
 The kernel config fragment is `linux/vz-linux.config`. After config changes, clean source and rebuild:
 
 ```bash
-rm -rf linux/src/linux-6.12.11 && cd linux && make docker-build
+rm -rf linux/src/linux-6.12.85 && cd linux && make docker-build
 ```
 
 **Why Docker**: macOS ships Make 3.81 (kernel needs >= 4.0), BSD sed (kernel needs GNU sed), and lacks `elf.h`. The Docker builder has everything. Apple Silicon Docker runs ARM64 natively so no cross-compilation needed.
