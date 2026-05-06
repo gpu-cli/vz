@@ -97,7 +97,8 @@ Useful benchmark flags:
 `version.json` includes guest-agent and pinned `youki` version metadata,
 artifact SHA256 checksums, the kernel `profile`, a `security_profile`, and
 declared kernel capabilities (`vsock`, `virtiofs`, `hvc0_serial`, `ext4_root`,
-`overlayfs`, `netns`, `seccomp`, `io_uring`, `btrfs_snapshots`, `nfsd`, etc.).
+`overlayfs`, `netns`, `seccomp`, `io_uring`, `btrfs_snapshots`,
+`device_mapper`, `dm_crypt`, `nfsd`, etc.).
 `vz-linux::ensure_kernel()` uses the version metadata to reject mismatched
 artifact sets and verifies SHA256 checksums when present.
 `vz-linux::ensure_kernel_bundle()` additionally lets external callers choose

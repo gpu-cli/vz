@@ -257,7 +257,9 @@ jobs:
             ((.capabilities // []) | index("netns")) and
             ((.capabilities // []) | index("seccomp")) and
             ((.capabilities // []) | index("io_uring")) and
-            ((.capabilities // []) | index("btrfs_snapshots"))
+            ((.capabilities // []) | index("btrfs_snapshots")) and
+            ((.capabilities // []) | index("device_mapper")) and
+            ((.capabilities // []) | index("dm_crypt"))
             ' "$version_json" >/dev/null
           done
 

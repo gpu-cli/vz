@@ -88,6 +88,10 @@ pub enum KernelCapability {
     Tun,
     /// Btrfs subvolume/snapshot support for sandbox checkpointing.
     BtrfsSnapshots,
+    /// Device-mapper core support for mapped block devices.
+    DeviceMapper,
+    /// dm-crypt target support for LUKS-backed volumes.
+    DmCrypt,
     /// Kernel NFS server support for workspace/frontend exports.
     Nfsd,
     /// Hardened container sandbox kernel profile.
@@ -109,6 +113,8 @@ impl KernelCapability {
             Self::NestedVirt => "nested_virt",
             Self::Tun => "tun",
             Self::BtrfsSnapshots => "btrfs_snapshots",
+            Self::DeviceMapper => "device_mapper",
+            Self::DmCrypt => "dm_crypt",
             Self::Nfsd => "nfsd",
             Self::ContainerSandbox => "container_sandbox",
         }
@@ -486,6 +492,8 @@ pub fn default_vz_linux_kernel_profile_capabilities(
         KernelCapability::Seccomp,
         KernelCapability::IoUring,
         KernelCapability::BtrfsSnapshots,
+        KernelCapability::DeviceMapper,
+        KernelCapability::DmCrypt,
     ]);
     match profile {
         KernelProfile::Developer => {
@@ -923,6 +931,8 @@ mod tests {
             KernelCapability::Seccomp,
             KernelCapability::IoUring,
             KernelCapability::BtrfsSnapshots,
+            KernelCapability::DeviceMapper,
+            KernelCapability::DmCrypt,
             KernelCapability::Nfsd,
             KernelCapability::ContainerSandbox,
         ]
@@ -951,6 +961,8 @@ mod tests {
             KernelCapability::Seccomp,
             KernelCapability::IoUring,
             KernelCapability::BtrfsSnapshots,
+            KernelCapability::DeviceMapper,
+            KernelCapability::DmCrypt,
             KernelCapability::Nfsd,
             KernelCapability::ContainerSandbox,
         ]
@@ -984,6 +996,12 @@ mod tests {
         );
         assert!(resolved.capabilities.contains(&KernelCapability::Nfsd));
         assert!(resolved.capabilities.contains(&KernelCapability::IoUring));
+        assert!(
+            resolved
+                .capabilities
+                .contains(&KernelCapability::DeviceMapper)
+        );
+        assert!(resolved.capabilities.contains(&KernelCapability::DmCrypt));
     }
 
     #[tokio::test]
