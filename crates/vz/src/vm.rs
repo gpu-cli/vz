@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use objc2::AnyThread;
 use objc2::rc::Retained;
-use objc2_virtualization::VZVirtualMachine;
+use objc2_virtualization::{VZVirtualMachine, VZVirtualMachineState};
 use tokio::sync::watch;
 
 use crate::bridge::{
@@ -19,6 +19,39 @@ use crate::vsock::{SendableConnection, VsockListener, VsockStream};
 
 /// Global counter for unique VM dispatch queue labels.
 static VM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Translate Apple's `VZVirtualMachineState` into our [`VmState`].
+///
+/// Used by `Vm::push_current_state` to mirror framework state into the
+/// watch after every API operation completes. The mapping is total
+/// across the documented Apple values; any unknown raw value (forward
+/// compat — Apple has added Saving/Restoring at macOS 14) is preserved
+/// as `VmState::Error("unknown VZVirtualMachineState(<n>)")` rather
+/// than silently dropped, so a future SDK addition shows up in logs
+/// instead of producing a phantom Stopped.
+///
+/// Note: `VZVirtualMachineState::Error` is intentionally translated to
+/// a *placeholder* `VmState::Error` with no description. The detailed
+/// `NSError` description is produced by the
+/// `virtualMachine:didStopWithError:` delegate callback (see
+/// [`crate::bridge::VMDelegate`]); it lands in the watch immediately
+/// after this placeholder. Callers that need the description should
+/// observe the next `changed()` push, not just borrow once.
+pub(crate) fn vz_state_to_vm_state(s: VZVirtualMachineState) -> VmState {
+    match s {
+        VZVirtualMachineState::Stopped => VmState::Stopped,
+        VZVirtualMachineState::Starting => VmState::Starting,
+        VZVirtualMachineState::Running => VmState::Running,
+        VZVirtualMachineState::Pausing => VmState::Pausing,
+        VZVirtualMachineState::Paused => VmState::Paused,
+        VZVirtualMachineState::Resuming => VmState::Resuming,
+        VZVirtualMachineState::Stopping => VmState::Stopping,
+        VZVirtualMachineState::Saving => VmState::Saving,
+        VZVirtualMachineState::Restoring => VmState::Restoring,
+        VZVirtualMachineState::Error => VmState::Error(String::new()),
+        other => VmState::Error(format!("unknown VZVirtualMachineState({})", other.0)),
+    }
+}
 
 /// The state of a virtual machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +112,27 @@ pub struct Vm {
     handle: Arc<VmHandle>,
     /// Serial dispatch queue for all VM operations.
     queue: SerialQueue,
+    /// Sender for VM state changes. The matching `Receiver`
+    /// distributed by [`Vm::state_stream`] is fed by two sources:
+    ///
+    /// 1. **API-driven transitions** — every `start` / `pause` / `resume`
+    ///    completion handler synchronously re-reads
+    ///    `[VZVirtualMachine state]` (the framework's authoritative
+    ///    value) from inside the dispatch queue and pushes the
+    ///    translated [`VmState`] before returning to the caller.
+    /// 2. **Delegate-driven terminal transitions** —
+    ///    `guestDidStopVirtualMachine:` and
+    ///    `virtualMachine:didStopWithError:` push `Stopped` /
+    ///    `Error(_)` from the delegate.
+    ///
+    /// Without source #1 the watcher would only ever observe the
+    /// initial `Stopped` (set in `watch::channel`) followed by a final
+    /// `Stopped` / `Error(_)` — there'd be no way to distinguish "VM
+    /// has not yet started" from "VM ran and halted." That ambiguity
+    /// caused VRT-yl5l (boon prep VMs that "succeeded" in <1ms with an
+    /// all-zeros state.ext4 because callers' `wait_for_halt` saw the
+    /// initial `Stopped` and returned immediately).
+    state_tx: watch::Sender<VmState>,
     /// Receiver for VM state changes (fed by the delegate).
     state_rx: watch::Receiver<VmState>,
     /// The validated configuration used to create this VM.
@@ -97,9 +151,15 @@ impl Vm {
         let vm_id = VM_COUNTER.fetch_add(1, Ordering::Relaxed);
         let queue = SerialQueue::new(&format!("com.vz.vm-{vm_id}"));
 
-        // Set up the state channel. The sender will be moved into the dispatch
-        // closure where it's used to create the VMDelegate.
+        // Set up the state channel. The delegate gets one clone for the
+        // terminal `guestDidStop` / `didStopWithError` callbacks; we
+        // keep our own clone on `Vm` so API calls (`start` / `pause` /
+        // `resume`) can also push transitions after they complete.
+        // Without that second clone the watch never observes anything
+        // between the initial `Stopped` and the terminal state — see
+        // VRT-yl5l for the failure mode.
         let (state_tx, state_rx) = watch::channel(VmState::Stopped);
+        let delegate_state_tx = state_tx.clone();
 
         // Build all ObjC objects AND create the VM on the dispatch queue.
         // ObjC objects are not Send, so everything must be created on the queue.
@@ -123,7 +183,7 @@ impl Vm {
                 };
 
                 // Create the delegate on this queue
-                let delegate = VMDelegate::new(state_tx);
+                let delegate = VMDelegate::new(delegate_state_tx);
 
                 // Set the delegate on the VM (weak reference)
                 // SAFETY: setDelegate must be called on the VM's queue (we are on it).
@@ -139,9 +199,35 @@ impl Vm {
         Ok(Self {
             handle,
             queue,
+            state_tx,
             state_rx,
             _config: config,
         })
+    }
+
+    /// Re-read Apple's `[VZVirtualMachine state]` property from the
+    /// dispatch queue and push the translated value into the watch.
+    ///
+    /// Called by API methods (`start` / `pause` / `resume`) immediately
+    /// after their completion handler fires — the framework's state
+    /// property reflects the post-transition state by the time
+    /// completion is invoked, so reading it here is the cheapest way to
+    /// keep the watch in sync without subscribing to KVO.
+    async fn push_current_state(&self) {
+        let handle = Arc::clone(&self.handle);
+        let state_tx = self.state_tx.clone();
+        // Best-effort — if the dispatch queue is gone (only happens if
+        // the Vm is being dropped), the watch has likely already been
+        // closed too.
+        let _ = self
+            .queue
+            .dispatch(move || {
+                // SAFETY: `state` is a queue-bound property on
+                // VZVirtualMachine; we are executing on the VM's queue.
+                let apple_state = unsafe { handle.vm.state() };
+                let _ = state_tx.send(vz_state_to_vm_state(apple_state));
+            })
+            .await;
     }
 
     /// Start (cold boot) the VM.
@@ -159,10 +245,12 @@ impl Vm {
             })
             .await?;
 
-        await_completion(rx).await.map_err(|e| match e {
+        let result = await_completion(rx).await.map_err(|e| match e {
             VzError::FrameworkError(msg) => VzError::StartFailed(msg),
             other => other,
-        })
+        });
+        self.push_current_state().await;
+        result
     }
 
     /// Pause the VM (freeze execution, keep state in memory).
@@ -180,7 +268,9 @@ impl Vm {
             })
             .await?;
 
-        await_completion(rx).await
+        let result = await_completion(rx).await;
+        self.push_current_state().await;
+        result
     }
 
     /// Resume a paused VM.
@@ -198,7 +288,9 @@ impl Vm {
             })
             .await?;
 
-        await_completion(rx).await
+        let result = await_completion(rx).await;
+        self.push_current_state().await;
+        result
     }
 
     /// Stop the VM (equivalent to pulling the power cord).
@@ -217,10 +309,12 @@ impl Vm {
             })
             .await?;
 
-        await_completion(rx).await.map_err(|e| match e {
+        let result = await_completion(rx).await.map_err(|e| match e {
             VzError::FrameworkError(msg) => VzError::StopFailed(msg),
             other => other,
-        })
+        });
+        self.push_current_state().await;
+        result
     }
 
     /// Request a graceful guest shutdown.
@@ -571,9 +665,61 @@ impl std::fmt::Debug for Vm {
 
 #[cfg(test)]
 mod tests {
-    use super::Vm;
+    use super::{Vm, VmState, vz_state_to_vm_state};
+    use objc2_virtualization::VZVirtualMachineState;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Apple's `VZVirtualMachineState` enum values must each translate
+    /// to a distinct `VmState`. Unit-level guard so a future SDK bump
+    /// that adds a variant doesn't silently collapse it to a phantom
+    /// Stopped — pre-fix that exact silent collapse is what caused
+    /// VRT-yl5l (boon prep VMs that "succeeded" with empty disks).
+    #[test]
+    fn vz_state_translation_covers_every_apple_variant() {
+        let cases = [
+            (VZVirtualMachineState::Stopped, VmState::Stopped),
+            (VZVirtualMachineState::Starting, VmState::Starting),
+            (VZVirtualMachineState::Running, VmState::Running),
+            (VZVirtualMachineState::Pausing, VmState::Pausing),
+            (VZVirtualMachineState::Paused, VmState::Paused),
+            (VZVirtualMachineState::Resuming, VmState::Resuming),
+            (VZVirtualMachineState::Stopping, VmState::Stopping),
+            (VZVirtualMachineState::Saving, VmState::Saving),
+            (VZVirtualMachineState::Restoring, VmState::Restoring),
+        ];
+        for (apple, ours) in cases {
+            assert_eq!(
+                vz_state_to_vm_state(apple),
+                ours,
+                "VZVirtualMachineState({}) should translate to {:?}",
+                apple.0,
+                ours,
+            );
+        }
+        // VZVirtualMachineState::Error is a placeholder — the
+        // descriptive NSError comes via the delegate's didStopWithError.
+        assert!(matches!(
+            vz_state_to_vm_state(VZVirtualMachineState::Error),
+            VmState::Error(s) if s.is_empty(),
+        ));
+    }
+
+    /// Forward-compat: an unknown `VZVirtualMachineState` raw value
+    /// (e.g. an enum variant Apple adds in a future macOS SDK) lands
+    /// as a tagged `VmState::Error` so it shows up in logs instead of
+    /// being silently coerced to Stopped.
+    #[test]
+    fn unknown_vz_state_becomes_tagged_error() {
+        let unknown = VZVirtualMachineState(9999);
+        match vz_state_to_vm_state(unknown) {
+            VmState::Error(msg) => {
+                assert!(msg.contains("9999"), "error msg must echo the raw value: {msg}");
+                assert!(msg.contains("unknown"), "error msg must be tagged: {msg}");
+            }
+            other => panic!("unknown raw state should become Error, got {other:?}"),
+        }
+    }
 
     fn unique_temp_dir(name: &str) -> PathBuf {
         let mut base = std::env::temp_dir();
