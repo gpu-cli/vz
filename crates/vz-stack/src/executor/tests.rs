@@ -1093,7 +1093,8 @@ fn three_service_ip_allocation() {
     let configs = executor.runtime.captured_configs.lock().unwrap();
     let web_config = configs.iter().find(|(id, _)| id == "ctr-web").unwrap();
     let web_hosts = &web_config.1.extra_hosts;
-    assert_eq!(web_hosts.len(), 2); // api + db
+    // siblings (api, db) + host.vz.internal
+    assert_eq!(web_hosts.len(), 3);
     assert!(
         web_hosts
             .iter()
@@ -1104,6 +1105,9 @@ fn three_service_ip_allocation() {
             .iter()
             .any(|(h, ip)| h == "db" && ip == "172.20.0.4")
     );
+    assert!(web_hosts.iter().any(|(h, ip)| h
+        == vz_runtime_contract::HOST_INTERNAL_ALIAS
+        && ip == vz_runtime_contract::HOST_INTERNAL_GATEWAY_IPV4));
 }
 
 #[test]
@@ -1695,15 +1699,54 @@ fn default_network_backward_compat() {
     let result = executor.execute(&spec, &actions).unwrap();
     assert!(result.all_succeeded());
 
-    // All services on same network, so all see each other.
+    // All services on same network, so all see each other (plus host.vz.internal).
     let configs = executor.runtime.captured_configs.lock().unwrap();
     let web_config = configs.iter().find(|(id, _)| id == "ctr-web").unwrap();
-    assert_eq!(web_config.1.extra_hosts.len(), 1);
-    assert_eq!(web_config.1.extra_hosts[0].0, "db");
+    assert_eq!(web_config.1.extra_hosts.len(), 2);
+    assert!(web_config.1.extra_hosts.iter().any(|(h, _)| h == "db"));
+    assert!(
+        web_config
+            .1
+            .extra_hosts
+            .iter()
+            .any(|(h, _)| h == vz_runtime_contract::HOST_INTERNAL_ALIAS)
+    );
 
     let db_config = configs.iter().find(|(id, _)| id == "ctr-db").unwrap();
-    assert_eq!(db_config.1.extra_hosts.len(), 1);
-    assert_eq!(db_config.1.extra_hosts[0].0, "web");
+    assert_eq!(db_config.1.extra_hosts.len(), 2);
+    assert!(db_config.1.extra_hosts.iter().any(|(h, _)| h == "web"));
+    assert!(
+        db_config
+            .1
+            .extra_hosts
+            .iter()
+            .any(|(h, _)| h == vz_runtime_contract::HOST_INTERNAL_ALIAS)
+    );
+}
+
+#[test]
+fn host_vz_internal_injected_into_every_service() {
+    // Even a single-service stack with no siblings should get the alias.
+    let runtime = MockContainerRuntime::with_ids(vec!["ctr-only"]);
+    let mut executor = make_executor(runtime);
+    let spec = stack("solo", vec![svc("only", "nginx:latest")]);
+
+    let actions = vec![Action::ServiceCreate {
+        service_name: "only".to_string(),
+    }];
+
+    let result = executor.execute(&spec, &actions).unwrap();
+    assert!(result.all_succeeded(), "errors: {:?}", result.errors);
+
+    let configs = executor.runtime.captured_configs.lock().unwrap();
+    let only_config = configs.iter().find(|(id, _)| id == "ctr-only").unwrap();
+    let entry = only_config
+        .1
+        .extra_hosts
+        .iter()
+        .find(|(h, _)| h == vz_runtime_contract::HOST_INTERNAL_ALIAS)
+        .expect("host.vz.internal should be injected even for solo services");
+    assert_eq!(entry.1, vz_runtime_contract::HOST_INTERNAL_GATEWAY_IPV4);
 }
 
 #[test]
