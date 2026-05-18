@@ -924,6 +924,21 @@ impl Runtime {
         self.stack_vms.lock().await.contains_key(stack_id)
     }
 
+    /// Return the shared Linux VM hosting the given stack, if any.
+    ///
+    /// Returns `None` if the stack is not currently up. Intended for
+    /// consumers that embed [`Runtime`] as a library and need direct
+    /// access to the underlying VM handle for vsock operations
+    /// (e.g., installing capability shims that dial back to a host
+    /// broker via [`vz::Vm::vsock_listen`]).
+    ///
+    /// The returned [`Arc`] keeps the VM alive for as long as the
+    /// caller holds it; normal lifecycle (shutdown via
+    /// [`Self::shutdown_shared_vm`]) remains the caller's contract.
+    pub async fn shared_vm_for(&self, stack_id: &str) -> Option<Arc<LinuxVm>> {
+        self.stack_vms.lock().await.get(stack_id).cloned()
+    }
+
     /// Save a shared stack VM snapshot to disk.
     ///
     /// The VM is paused, state is saved, then the VM is resumed and the guest

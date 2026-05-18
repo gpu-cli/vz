@@ -41,6 +41,16 @@ fn checkpoint_capabilities_disable_vm_full_by_default() {
     vz_runtime_contract::validate_backend_adapter_parity(caps).unwrap();
 }
 
+#[tokio::test]
+async fn shared_vm_for_returns_none_when_stack_absent() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("shared-vm-for-none"),
+        ..RuntimeConfig::default()
+    });
+    assert!(runtime.shared_vm_for("never-booted").await.is_none());
+    assert!(!runtime.has_shared_vm("never-booted").await);
+}
+
 #[test]
 fn ensure_checkpoint_class_supported_rejects_vm_full_without_capability() {
     let runtime = Runtime::new(RuntimeConfig {
