@@ -866,3 +866,241 @@ async fn shared_vm_inter_service_connectivity() {
         .await;
     rt.shutdown_shared_vm(stack_id).await.unwrap();
 }
+
+// ── host.vz.internal reachability ───────────────────────────────
+
+/// Verify that the `host.vz.internal` alias actually lands in a stack-managed
+/// container's `/etc/hosts` and resolves to the Apple NAT gateway.
+///
+/// This is the executor-side guarantee: the host pushes
+/// `(host.vz.internal, 192.168.64.1)` into `RunConfig::extra_hosts`, which
+/// becomes a `/etc/hosts` row in the live container. We grep for it inside
+/// a real container created through the stack VM pipeline.
+///
+/// **What this test does NOT cover:** end-to-end TCP reachability from a
+/// per-service netns container to a service running on the macOS host.
+/// That requires MASQUERADE on the stack bridge, which in turn needs
+/// `iptables` or `nft` in the guest initramfs (kernel netfilter is
+/// compiled in but the userspace tooling is not). Tracked separately —
+/// see `host_vz_internal_reaches_host_service_via_nat_gateway` and the
+/// follow-up bead it points at.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn host_vz_internal_etc_hosts_entry_present_in_container() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
+    init_tracing();
+
+    let home = std::env::var("HOME").unwrap();
+    let data_dir = std::path::PathBuf::from(home).join(".vz/oci");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let rt = test_runtime(&data_dir);
+
+    if rt.pull("alpine:latest").await.is_err() {
+        eprintln!("WARN: pull failed (rate limit?), assuming image is cached");
+    }
+
+    let stack_id = "e2e-host-internal-dns";
+
+    rt.boot_shared_vm(stack_id, vec![], Default::default())
+        .await
+        .unwrap();
+
+    let services = vec![vz_oci_macos::NetworkServiceConfig {
+        name: "client".to_string(),
+        addr: "172.20.0.2/24".to_string(),
+        network_name: "default".to_string(),
+    }];
+    rt.network_setup(stack_id, services).await.unwrap();
+
+    // Same shape as what `vz-stack::executor::create::prepare_create` injects.
+    let hosts = vec![(
+        vz_runtime_contract::HOST_INTERNAL_ALIAS.to_string(),
+        vz_runtime_contract::HOST_INTERNAL_GATEWAY_IPV4.to_string(),
+    )];
+
+    let client_id = rt
+        .create_container_in_stack(
+            stack_id,
+            "alpine:latest",
+            RunConfig {
+                cmd: vec!["sleep".into(), "300".into()],
+                execution_mode: ExecutionMode::OciRuntime,
+                extra_hosts: hosts,
+                network_namespace_path: Some("/var/run/netns/client".to_string()),
+                ..RunConfig::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create client container failed: {e:?}"));
+
+    let getent = rt
+        .exec_container(
+            &client_id,
+            ExecConfig {
+                cmd: vec![
+                    "/bin/busybox".into(),
+                    "grep".into(),
+                    vz_runtime_contract::HOST_INTERNAL_ALIAS.into(),
+                    "/etc/hosts".into(),
+                ],
+                timeout: Some(Duration::from_secs(10)),
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        getent.exit_code, 0,
+        "host.vz.internal missing from /etc/hosts: stdout={} stderr={}",
+        getent.stdout, getent.stderr
+    );
+    assert!(
+        getent
+            .stdout
+            .contains(vz_runtime_contract::HOST_INTERNAL_GATEWAY_IPV4),
+        "expected NAT gateway IP in /etc/hosts row: {}",
+        getent.stdout
+    );
+
+    let _ = rt
+        .network_teardown(stack_id, vec!["client".to_string()])
+        .await;
+    rt.shutdown_shared_vm(stack_id).await.unwrap();
+}
+
+/// End-to-end reachability over the `host.vz.internal` alias.
+///
+/// Currently **blocked** on a separate, pre-existing gap: stack-managed
+/// containers live in per-service network namespaces wired up via
+/// `vz-guest-agent::network::setup_stack_network`, and the guest agent
+/// does not program MASQUERADE / `net.ipv4.ip_forward` from the bridge
+/// subnet out to eth0. The container can resolve `host.vz.internal`, but
+/// packets to `192.168.64.1` are dropped on the way out of the netns.
+///
+/// The guest kernel has netfilter (`CONFIG_NF_NAT`, `CONFIG_NF_TABLES`)
+/// compiled in, but the initramfs lacks the userspace tooling
+/// (`iptables` / `nft`) to program rules.
+///
+/// Wire-up needed to make this pass:
+///   1. Ship `iptables-legacy` or `nft` in the initramfs.
+///   2. Have `setup_stack_network` flip `ip_forward=1` and add
+///      `-t nat -A POSTROUTING -s <bridge_subnet> ! -o <bridge> -j MASQUERADE`.
+///
+/// Tracked as a follow-up bead. Until then, this test stays ignored; the
+/// DNS-side guarantee is covered by
+/// [`host_vz_internal_etc_hosts_entry_present_in_container`].
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "blocked on stack-network MASQUERADE / iptables-in-initramfs follow-up"]
+async fn host_vz_internal_reaches_host_service_via_nat_gateway() {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+
+    if !require_virtualization_entitlement() {
+        return;
+    }
+    init_tracing();
+
+    let home = std::env::var("HOME").unwrap();
+    let data_dir = std::path::PathBuf::from(home).join(".vz/oci");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let rt = test_runtime(&data_dir);
+
+    if rt.pull("alpine:latest").await.is_err() {
+        eprintln!("WARN: pull failed (rate limit?), assuming image is cached");
+    }
+
+    let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    let host_port = listener.local_addr().unwrap().port();
+    const RESPONSE_BODY: &str = "host-vz-internal-ok";
+
+    let server_handle = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                RESPONSE_BODY.len(),
+                RESPONSE_BODY,
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    let stack_id = "e2e-host-internal-reach";
+
+    rt.boot_shared_vm(stack_id, vec![], Default::default())
+        .await
+        .unwrap();
+
+    let services = vec![vz_oci_macos::NetworkServiceConfig {
+        name: "client".to_string(),
+        addr: "172.20.0.2/24".to_string(),
+        network_name: "default".to_string(),
+    }];
+    rt.network_setup(stack_id, services).await.unwrap();
+
+    let hosts = vec![(
+        vz_runtime_contract::HOST_INTERNAL_ALIAS.to_string(),
+        vz_runtime_contract::HOST_INTERNAL_GATEWAY_IPV4.to_string(),
+    )];
+
+    let client_id = rt
+        .create_container_in_stack(
+            stack_id,
+            "alpine:latest",
+            RunConfig {
+                cmd: vec!["sleep".into(), "300".into()],
+                execution_mode: ExecutionMode::OciRuntime,
+                extra_hosts: hosts,
+                network_namespace_path: Some("/var/run/netns/client".to_string()),
+                ..RunConfig::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create client container failed: {e:?}"));
+
+    let url = format!(
+        "http://{}:{}/",
+        vz_runtime_contract::HOST_INTERNAL_ALIAS,
+        host_port
+    );
+    let wget = rt
+        .exec_container(
+            &client_id,
+            ExecConfig {
+                cmd: vec![
+                    "/bin/busybox".into(),
+                    "wget".into(),
+                    "-q".into(),
+                    "-O".into(),
+                    "-".into(),
+                    "-T".into(),
+                    "10".into(),
+                    url.clone(),
+                ],
+                timeout: Some(Duration::from_secs(30)),
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        wget.exit_code, 0,
+        "wget {url} failed: stderr={}",
+        wget.stderr
+    );
+    assert_eq!(wget.stdout.trim(), RESPONSE_BODY);
+
+    let _ = server_handle.join();
+
+    let _ = rt
+        .network_teardown(stack_id, vec!["client".to_string()])
+        .await;
+    rt.shutdown_shared_vm(stack_id).await.unwrap();
+}

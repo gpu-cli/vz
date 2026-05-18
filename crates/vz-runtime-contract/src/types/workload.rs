@@ -4,6 +4,29 @@ use serde::{Deserialize, Serialize};
 
 use super::{ContractInvariantError, MountAccess, PortProtocol};
 
+/// Hostname every sandboxed container resolves to the macOS host.
+///
+/// The Docker Desktop equivalent is `host.docker.internal`. The stack
+/// executor injects `(HOST_INTERNAL_ALIAS, HOST_INTERNAL_GATEWAY_IPV4)`
+/// into each container's `/etc/hosts` so workloads can reach services
+/// running on the host without knowing the underlying NAT layout.
+pub const HOST_INTERNAL_ALIAS: &str = "host.vz.internal";
+
+/// IPv4 address of the macOS host as seen from inside a guest VM.
+///
+/// This is the gateway address handed out by Apple's NAT
+/// (`VZNATNetworkDeviceAttachment` — see `crates/vz/src/bridge.rs`).
+/// `bootpd` on macOS assigns `192.168.64.1` to the gateway and
+/// `192.168.64.x` to guests. There is no Virtualization.framework API to
+/// query this value, so it is hardcoded; revisit if Apple changes the
+/// default subnet in a future macOS release.
+///
+/// Caveat: services bound to `127.0.0.1` on the macOS host are NOT
+/// reachable via this IP. Only services bound to `0.0.0.0` or a non-
+/// loopback interface respond. This is a property of the host's TCP/IP
+/// stack, not the VM.
+pub const HOST_INTERNAL_GATEWAY_IPV4: &str = "192.168.64.1";
+
 /// Container-level resource requests.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ContainerResources {

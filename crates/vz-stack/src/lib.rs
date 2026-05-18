@@ -46,8 +46,7 @@ pub use image_policy::{
     validate_image_reference, validate_stack_images,
 };
 pub use network::{
-    GvproxyBackend, GvproxyConfig, NetworkBackend, NetworkHandle, PortConflict, PublishedPort,
-    detect_port_conflicts, locate_gvproxy, ports_changed, resolve_ports,
+    PortConflict, PublishedPort, detect_port_conflicts, ports_changed, resolve_ports,
 };
 pub use orchestrator::{OrchestrationConfig, OrchestrationResult, RoundReport, StackOrchestrator};
 pub use reconcile::{Action, ApplyResult, DeferredService, apply, compute_actions_hash};

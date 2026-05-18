@@ -127,6 +127,37 @@ Stack networking defaults to service identity inside the stack network.
 Host-facing port publishing is explicit opt-in via Compose host bindings
 (`HOST:CONTAINER`); container-only ports remain internal.
 
+#### Reaching macOS host services from inside a container
+
+Every stack-managed container resolves the hostname **`host.vz.internal`**
+to the macOS host's NAT gateway IP (`192.168.64.1`). This is the Docker
+Desktop equivalent of `host.docker.internal` and is injected automatically
+into each container's `/etc/hosts`.
+
+```bash
+# Inside a sandboxed container:
+curl http://host.vz.internal:18080/   # reaches the host service
+```
+
+**Caveat — bind to `0.0.0.0`, not `127.0.0.1`:** services on the macOS host
+that listen only on `127.0.0.1` are **not** reachable via the NAT gateway
+IP. macOS's TCP stack does not route inbound NAT traffic to its own
+loopback. Bind your host service to `0.0.0.0` (or to `192.168.64.1`
+explicitly) so the guest can reach it. The address itself is hardcoded
+because Virtualization.framework provides no API to query Apple's NAT
+gateway — see `vz_runtime_contract::HOST_INTERNAL_GATEWAY_IPV4`.
+
+**Known limitation — netns reachability is pending.** Today
+`host.vz.internal` always resolves to `192.168.64.1` inside the container
+(`/etc/hosts` is injected by `vz-stack`), but stack-managed containers run
+in per-service network namespaces inside the guest VM, and the guest does
+not yet program `MASQUERADE` / `net.ipv4.ip_forward` from the bridge
+subnet out to `eth0`. Packets reach the bridge gateway but are dropped on
+their way out of the netns. The guest kernel already has
+`CONFIG_NF_NAT` / `CONFIG_NF_TABLES` compiled in; the gap is that the
+initramfs does not ship `iptables` or `nft`. Resolution is tracked as a
+follow-up bead.
+
 ### 3. Manage macOS VMs (macOS only)
 
 ```bash

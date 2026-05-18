@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 /// Default vsock port for the guest agent.
 pub const AGENT_PORT: u32 = 7424;
 
+// The `host.vz.internal` alias and macOS-host NAT gateway IPv4 live in
+// `vz_runtime_contract::{HOST_INTERNAL_ALIAS, HOST_INTERNAL_GATEWAY_IPV4}`
+// rather than here so portable consumers (e.g. `vz-stack`) can use them
+// without taking a dependency on the macOS-only `vz` crate.
+
 /// Output from a command executed inside the guest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecOutput {
