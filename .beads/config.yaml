@@ -65,3 +65,5 @@ no-db: true  # JSONL-only mode, no SQLite database
 # - linear.api-key
 # - github.org
 # - github.repo
+
+sync.remote: "git@github.com:gpu-cli/vz.git"
