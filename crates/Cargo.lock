@@ -3957,7 +3957,6 @@ dependencies = [
  "hyper-util",
  "oci-distribution",
  "oci-spec",
- "reqwest",
  "serde",
  "serde_json",
  "sha2",

@@ -150,7 +150,14 @@ pub fn ensure_buildkit_artifacts() -> Result<BuildkitArtifacts, BuildkitError> {
     ensure_buildkit_artifacts_in_dir(&buildkit_dir)
 }
 
-fn ensure_buildkit_artifacts_in_dir(
+/// Ensure pinned, runtime-free BuildKit artifacts are present in `buildkit_dir`.
+///
+/// This directory-taking variant is intended for platform providers that own
+/// their persistent artifact location. It uses the same strict archive,
+/// checksum, and inventory validation as [`ensure_buildkit_artifacts`],
+/// including the `VZ_BUILDKIT_ARTIFACT_ARCHIVE` and
+/// `VZ_BUILDKIT_ARTIFACT_SHA256` local bundle override.
+pub fn ensure_buildkit_artifacts_in_dir(
     buildkit_dir: &Path,
 ) -> Result<BuildkitArtifacts, BuildkitError> {
     let expected_archive_sha256 = expected_archive_sha256()?;
@@ -883,6 +890,8 @@ mod tests {
 
     use super::*;
 
+    const LOCAL_OVERRIDE_CHILD_ENV: &str = "VZ_TEST_BUILDKIT_LOCAL_OVERRIDE_CHILD";
+
     fn test_binary(marker: u8) -> Vec<u8> {
         let mut bytes = vec![0_u8; 64 + 56 + 1];
         bytes[..4].copy_from_slice(b"\x7fELF");
@@ -1222,6 +1231,36 @@ mod tests {
             artifacts.buildctl_path(),
             PathBuf::from("/tmp/vz/buildkit/bin/buildctl")
         );
+    }
+
+    #[test]
+    fn explicit_directory_provider_honors_local_bundle_override() {
+        if let Some(install_dir) = std::env::var_os(LOCAL_OVERRIDE_CHILD_ENV) {
+            let install_dir = PathBuf::from(install_dir);
+            let result = ensure_buildkit_artifacts_in_dir(&install_dir);
+            assert!(matches!(
+                result,
+                Err(BuildkitError::ArchiveChecksumMismatch { .. })
+            ));
+            assert!(install_dir.is_dir());
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let archive_path = temp.path().join("runtime-free.tar");
+        let install_dir = temp.path().join("managed-buildkit");
+        std::fs::write(&archive_path, b"local artifact bytes").unwrap();
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("buildkit::artifacts::tests::explicit_directory_provider_honors_local_bundle_override")
+            .env(LOCAL_OVERRIDE_CHILD_ENV, &install_dir)
+            .env(LOCAL_ARCHIVE_ENV, &archive_path)
+            .env(LOCAL_ARCHIVE_SHA256_ENV, "00")
+            .status()
+            .unwrap();
+
+        assert!(status.success());
     }
 
     #[test]

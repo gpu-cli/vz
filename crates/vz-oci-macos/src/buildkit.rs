@@ -38,10 +38,6 @@ pub(crate) use pipeline::{
     registries_for_build,
 };
 
-const BUILDKIT_VERSION: &str = "0.19.0";
-const BUILDKITD_BINARY: &str = "buildkitd";
-const BUILDCTL_BINARY: &str = "buildctl";
-const VERSION_FILE: &str = "version.json";
 const BUILD_OUTPUT_ARCHIVE: &str = "image.tar";
 const BUILDKITD_ADDR: &str = "tcp://127.0.0.1:8372";
 const BUILDKIT_SETUP_TIMEOUT: Duration = Duration::from_secs(90);
@@ -294,9 +290,13 @@ pub enum BuildkitError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 
-    /// Wrapped HTTP download error.
-    #[error(transparent)]
-    Http(#[from] reqwest::Error),
+    /// Runtime-free BuildKit artifact provisioning failed.
+    #[error("failed to provision runtime-free BuildKit artifacts: {0}")]
+    ArtifactProvision(#[source] vz_oci::buildkit::BuildkitError),
+
+    /// Runtime-free BuildKit artifact provisioning task failed.
+    #[error("runtime-free BuildKit artifact provisioning task failed: {0}")]
+    ArtifactProvisionTask(#[source] tokio::task::JoinError),
 
     /// Docker credential helper lookup failed.
     #[error("failed to resolve docker credentials for registry '{registry}': {source}")]

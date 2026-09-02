@@ -2,29 +2,20 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use oci_distribution::Reference;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::warn;
 use vz_image::{ImageId, ImageStore};
 
-use super::common::{default_buildkit_dir, unique_dir, unix_timestamp_secs};
-use super::{
-    BUILDCTL_BINARY, BUILDKIT_CACHE_DISK_IMAGE, BUILDKIT_CACHE_DISK_SIZE_BYTES, BUILDKIT_VERSION,
-    BUILDKITD_BINARY, BuildkitError, VERSION_FILE,
-};
+use super::common::{default_buildkit_dir, unique_dir};
+use super::{BUILDKIT_CACHE_DISK_IMAGE, BUILDKIT_CACHE_DISK_SIZE_BYTES, BuildkitError};
 
+#[derive(Debug)]
 pub(super) struct BuildkitArtifacts {
     pub(super) bin_dir: PathBuf,
     pub(super) cache_dir: PathBuf,
     pub(super) disk_image_path: PathBuf,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BuildkitVersionFile {
-    buildkit: String,
-    downloaded_at: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,127 +37,38 @@ struct OciManifest {
 }
 pub(super) async fn ensure_buildkit_artifacts() -> Result<BuildkitArtifacts, BuildkitError> {
     let base_dir = default_buildkit_dir()?;
-    let bin_dir = base_dir.join("bin");
-    let cache_dir = base_dir.join("cache");
+    ensure_buildkit_artifacts_in(base_dir, |buildkit_dir| {
+        vz_oci::buildkit::ensure_buildkit_artifacts_in_dir(buildkit_dir)
+    })
+    .await
+}
+
+async fn ensure_buildkit_artifacts_in<F>(
+    base_dir: PathBuf,
+    provider: F,
+) -> Result<BuildkitArtifacts, BuildkitError>
+where
+    F: FnOnce(
+            &Path,
+        )
+            -> Result<vz_oci::buildkit::BuildkitArtifacts, vz_oci::buildkit::BuildkitError>
+        + Send
+        + 'static,
+{
+    let provider_dir = base_dir.clone();
+    let shared = tokio::task::spawn_blocking(move || provider(&provider_dir))
+        .await
+        .map_err(BuildkitError::ArtifactProvisionTask)?
+        .map_err(BuildkitError::ArtifactProvision)?;
+
     let disk_image_path = base_dir.join(BUILDKIT_CACHE_DISK_IMAGE);
-    tokio::fs::create_dir_all(&cache_dir).await?;
     ensure_sparse_disk_image(&disk_image_path, BUILDKIT_CACHE_DISK_SIZE_BYTES)?;
 
-    if artifacts_are_current(&base_dir, &bin_dir).await? {
-        return Ok(BuildkitArtifacts {
-            bin_dir,
-            cache_dir,
-            disk_image_path,
-        });
-    }
-
-    tokio::fs::create_dir_all(&base_dir).await?;
-    let staging_dir = unique_dir(base_dir.clone(), "download");
-    tokio::fs::create_dir_all(&staging_dir).await?;
-    let tarball_path = staging_dir.join("buildkit.tar.gz");
-
-    let url = format!(
-        "https://github.com/moby/buildkit/releases/download/v{version}/buildkit-v{version}.linux-arm64.tar.gz",
-        version = BUILDKIT_VERSION
-    );
-    download_file(&url, &tarball_path).await?;
-    extract_buildkit_archive(&tarball_path, &staging_dir).await?;
-
-    let extracted_bin_dir = staging_dir.join("bin");
-    let buildkitd_path = extracted_bin_dir.join(BUILDKITD_BINARY);
-    let buildctl_path = extracted_bin_dir.join(BUILDCTL_BINARY);
-    for path in [&buildkitd_path, &buildctl_path] {
-        if !path.is_file() {
-            return Err(BuildkitError::InvalidConfig(format!(
-                "missing expected BuildKit binary: {}",
-                path.display()
-            )));
-        }
-        make_executable(path).await?;
-    }
-
-    if tokio::fs::metadata(&bin_dir).await.is_ok() {
-        tokio::fs::remove_dir_all(&bin_dir).await?;
-    }
-    tokio::fs::rename(&extracted_bin_dir, &bin_dir).await?;
-
-    let version = BuildkitVersionFile {
-        buildkit: BUILDKIT_VERSION.to_string(),
-        downloaded_at: unix_timestamp_secs(),
-    };
-    let version_json = serde_json::to_vec_pretty(&version)?;
-    tokio::fs::write(base_dir.join(VERSION_FILE), version_json).await?;
-
-    if let Err(error) = tokio::fs::remove_dir_all(&staging_dir).await {
-        warn!(
-            path = %staging_dir.display(),
-            %error,
-            "failed to clean BuildKit staging directory"
-        );
-    }
-
     Ok(BuildkitArtifacts {
-        bin_dir,
-        cache_dir,
+        bin_dir: shared.bin_dir,
+        cache_dir: shared.cache_dir,
         disk_image_path,
     })
-}
-
-async fn artifacts_are_current(base_dir: &Path, bin_dir: &Path) -> Result<bool, BuildkitError> {
-    let version_path = base_dir.join(VERSION_FILE);
-    let version_text = match tokio::fs::read_to_string(version_path).await {
-        Ok(value) => value,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(BuildkitError::Io(err)),
-    };
-    let metadata: BuildkitVersionFile = serde_json::from_str(&version_text)?;
-    if metadata.buildkit != BUILDKIT_VERSION {
-        return Ok(false);
-    }
-
-    for name in [BUILDKITD_BINARY, BUILDCTL_BINARY] {
-        if !bin_dir.join(name).is_file() {
-            return Ok(false);
-        }
-    }
-    if bin_dir.join("buildkit-runc").exists() {
-        return Ok(false);
-    }
-    Ok(true)
-}
-
-async fn download_file(url: &str, destination: &Path) -> Result<(), BuildkitError> {
-    let client = reqwest::Client::new();
-    let mut response = client.get(url).send().await?.error_for_status()?;
-    let mut file = tokio::fs::File::create(destination).await?;
-
-    while let Some(chunk) = response.chunk().await? {
-        file.write_all(&chunk).await?;
-    }
-    file.flush().await?;
-    Ok(())
-}
-
-async fn extract_buildkit_archive(
-    tarball_path: &Path,
-    destination: &Path,
-) -> Result<(), BuildkitError> {
-    let output = Command::new("tar")
-        .arg("-xzf")
-        .arg(tarball_path)
-        .arg("-C")
-        .arg(destination)
-        .arg("bin/buildkitd")
-        .arg("bin/buildctl")
-        .output()
-        .await?;
-    if !output.status.success() {
-        return Err(BuildkitError::InvalidConfig(format!(
-            "failed to extract BuildKit archive with tar: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    Ok(())
 }
 
 fn ensure_sparse_disk_image(path: &Path, desired_size: u64) -> Result<(), BuildkitError> {
@@ -186,18 +88,6 @@ fn ensure_sparse_disk_image(path: &Path, desired_size: u64) -> Result<(), Buildk
         .truncate(false)
         .open(path)?;
     file.set_len(desired_size)?;
-    Ok(())
-}
-
-async fn make_executable(path: &Path) -> Result<(), BuildkitError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut perms = tokio::fs::metadata(path).await?.permissions();
-        perms.set_mode(0o755);
-        tokio::fs::set_permissions(path, perms).await?;
-    }
     Ok(())
 }
 
@@ -322,73 +212,58 @@ mod tests {
 
     use super::*;
 
-    async fn write_current_bundle(base_dir: &Path) -> PathBuf {
-        let bin_dir = base_dir.join("bin");
-        tokio::fs::create_dir_all(&bin_dir).await.unwrap();
-        tokio::fs::write(bin_dir.join(BUILDKITD_BINARY), b"daemon")
-            .await
-            .unwrap();
-        tokio::fs::write(bin_dir.join(BUILDCTL_BINARY), b"client")
-            .await
-            .unwrap();
-        let version = BuildkitVersionFile {
-            buildkit: BUILDKIT_VERSION.to_string(),
-            downloaded_at: 1,
-        };
-        tokio::fs::write(
-            base_dir.join(VERSION_FILE),
-            serde_json::to_vec(&version).unwrap(),
-        )
-        .await
-        .unwrap();
-        bin_dir
-    }
-
     #[tokio::test]
-    async fn runtime_free_local_bundle_is_current() {
+    async fn live_provider_delegates_with_managed_directory_and_preserves_layout() {
         let temp = tempdir().unwrap();
-        let bin_dir = write_current_bundle(temp.path()).await;
-
-        assert!(artifacts_are_current(temp.path(), &bin_dir).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn local_bundle_requires_both_buildkit_executables() {
-        let temp = tempdir().unwrap();
-        let bin_dir = write_current_bundle(temp.path()).await;
-        tokio::fs::remove_file(bin_dir.join(BUILDCTL_BINARY))
-            .await
-            .unwrap();
-
-        assert!(!artifacts_are_current(temp.path(), &bin_dir).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn local_bundle_rejects_stale_buildkit_version() {
-        let temp = tempdir().unwrap();
-        let bin_dir = write_current_bundle(temp.path()).await;
-        let stale = BuildkitVersionFile {
-            buildkit: "0.0.0".to_string(),
-            downloaded_at: 1,
-        };
-        tokio::fs::write(
-            temp.path().join(VERSION_FILE),
-            serde_json::to_vec(&stale).unwrap(),
-        )
+        let base_dir = temp.path().join("managed-buildkit");
+        let expected_dir = base_dir.clone();
+        let artifacts = ensure_buildkit_artifacts_in(base_dir.clone(), move |requested_dir| {
+            assert_eq!(requested_dir, expected_dir);
+            Ok(vz_oci::buildkit::BuildkitArtifacts {
+                bin_dir: requested_dir.join("bin"),
+                cache_dir: requested_dir.join("cache"),
+                version: "test".to_string(),
+            })
+        })
         .await
         .unwrap();
 
-        assert!(!artifacts_are_current(temp.path(), &bin_dir).await.unwrap());
+        assert_eq!(artifacts.bin_dir, base_dir.join("bin"));
+        assert_eq!(artifacts.cache_dir, base_dir.join("cache"));
+        assert_eq!(
+            artifacts.disk_image_path,
+            base_dir.join(BUILDKIT_CACHE_DISK_IMAGE)
+        );
+        assert_eq!(
+            std::fs::metadata(&artifacts.disk_image_path).unwrap().len(),
+            BUILDKIT_CACHE_DISK_SIZE_BYTES
+        );
     }
 
     #[tokio::test]
-    async fn local_bundle_rejects_legacy_runtime_binary() {
+    async fn shared_provider_failure_keeps_runtime_free_context() {
         let temp = tempdir().unwrap();
-        let bin_dir = write_current_bundle(temp.path()).await;
-        tokio::fs::write(bin_dir.join("buildkit-runc"), b"legacy runtime")
-            .await
+        let error = ensure_buildkit_artifacts_in(temp.path().to_path_buf(), |_| {
+            Err(vz_oci::buildkit::BuildkitError::LocalArchiveChecksumRequired)
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, BuildkitError::ArtifactProvision(_)));
+        let message = error.to_string();
+        assert!(message.contains("runtime-free BuildKit artifacts"));
+        assert!(message.contains("VZ_BUILDKIT_ARTIFACT_SHA256"));
+    }
+
+    #[test]
+    fn live_provider_source_contains_no_private_archive_downloader() {
+        let production_source = include_str!("artifacts.rs")
+            .split("#[cfg(test)]")
+            .next()
             .unwrap();
 
-        assert!(!artifacts_are_current(temp.path(), &bin_dir).await.unwrap());
+        assert!(!production_source.contains("github.com/"));
+        assert!(!production_source.contains(".tar.gz"));
+        assert!(!production_source.contains("reqwest"));
     }
 }

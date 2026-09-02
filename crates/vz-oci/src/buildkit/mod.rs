@@ -14,7 +14,7 @@ mod session_tunnel;
 
 pub use artifacts::{
     BUILDKIT_ARTIFACT_LAYOUT, BUILDKIT_VERSION, BuildkitArtifacts, BuildkitError,
-    BuildkitVersionMetadata, ensure_buildkit_artifacts,
+    BuildkitVersionMetadata, ensure_buildkit_artifacts, ensure_buildkit_artifacts_in_dir,
 };
 pub use auth::{DockerAuthError, DockerAuthProvider, ResolvedRegistryCredential};
 pub use client::{
