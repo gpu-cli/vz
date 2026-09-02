@@ -256,18 +256,19 @@ The gate engine doesn't need to know whether the workspace is Linux or macOS. It
 | Network default | Enabled (NAT) | Disabled |
 | Session isolation | Ephemeral (VM destroyed on stop) | RestoreOnAcquire (clean snapshot) |
 
-## Future: Docker Engine API Socket
+## Historical proposal: Docker Engine API socket
 
-For broad adoption beyond Rust consumers, expose a Docker Engine API on a Unix socket:
+> Superseded by `docs/developer-environments.md` and
+> `planning/developer-environments/05-host-docker-bridge.md`.
 
-```
-~/.vz/docker.sock
-```
+For broad adoption beyond Rust consumers, every Linux Developer Environment
+exposes its own managed Docker endpoint and context. Users select an environment
+by stable identity; there is no global vz Docker socket.
 
 This would allow:
-- `DOCKER_HOST=unix://~/.vz/docker.sock docker run python:3.12 python app.py`
+- `docker --context "$(vz dev context)" run python:3.12 python app.py`
 - `docker-compose up` with a vz backend
-- IDE Docker integrations (VS Code, IntelliJ) pointing at the vz socket
+- IDE Docker integrations (VS Code, IntelliJ) selecting the managed environment context
 
 This is a significant amount of work (the Docker Engine API is large) but would make vz a drop-in Docker Desktop replacement for most workflows. Scope this as a separate project phase after the core runtime is proven.
 

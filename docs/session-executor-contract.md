@@ -1,39 +1,61 @@
-# vz Session Executor Contract
+# vz Developer Environment Executor Contract
 
 Date: 2026-09-02
-Status: draft contract for external orchestrators driving agent sessions in vz sandboxes.
-Boundary rules apply (docs/vz-innovation-planning.md): **no orchestrator-specific nouns in vz APIs, types, events, or env vars.** vz exports generic primitives; any orchestrator (prtl today) composes them. This doc names orchestrators only as consumers, never as API surface.
+Status: draft contract for tools and external orchestrators driving work in vz Developer Environments.
+Boundary rules apply (`docs/vz-innovation-planning.md`): **no orchestrator-specific nouns in vz APIs, types, events, or environment variables.** vz exports generic primitives; any orchestrator composes them.
 
-## Roles
+## Product boundary
 
-- **Orchestrator** decides *what should happen*: attempts, task references, models, policy, evidence, node selection.
-- **vz** decides *where execution happens and what it can touch*: the sandbox contract — mounts, resource caps, egress, credential brokering, checkpoints, transport.
+- **The caller** decides what work should happen: tasks, attempts, models, retry policy, evidence selection, and node placement.
+- **vz** decides where and how local execution happens: Developer Environment identity, target OS, provisioning, mounts, resource caps, services, egress, credential brokering, checkpoints, transport, and lifecycle.
 
-## Surfaces (all `--json`, stable exit codes — vz-d0s; non-interactive by design)
+The Developer Environment is the externally meaningful execution object. A sandbox, VM, container, harness process, or worktree session may implement or inhabit an environment, but none replaces it in the portable contract.
 
-1. **Lifecycle.** `spawn / status / terminate` on a sandbox, taking:
-   - **agent definition artifact** — harness pin + toolbox + broker needs + policy (format from vz-9qf; the definition IS the integration currency);
-   - **attach mode** — `spawn --worktree <existing-path>` binds a sandbox to a worktree the orchestrator already created (vz never creates/owns git objects in this mode; the solo-user create mode remains for direct UX);
-   - returns: session id, **capability report**, transport endpoints.
-2. **Session transport bridge.** Bridges the Agent Client Protocol (ACP — open standard) between the orchestrator (host) and the resident harness: over **vsock** on VM backends, **direct socket** on container backends. Same bridge pattern as buildkitd/dockerd/broker shims.
-3. **Brokered credentials.** Per-session broker identities, pluggable providers (ssh-agent signer, gh token, Keychain, env), audit feed of every use (vz-6er). Credentials usable, never readable.
-4. **Checkpoint primitives.** Idempotent checkpoint/restore/fork verbs (fs_quick; btrfs-backed on linux-native). The orchestrator composes these into rewind/retry semantics; vz does not know what an "attempt" is.
-5. **Capability report.** Per-backend profile: `vm-resident | container-resident | ...`, isolation grade, available brokers, limits (vz-bgd). Orchestrators **query, never assume** — this is how one contract spans heterogeneous nodes.
+## Surfaces
 
-## Backend matrix
+All surfaces provide structured output, stable exit codes, versioned errors, streaming responses for interactive or long-running operations, and target-qualified capability reporting.
 
-| Backend | Host | Isolation grade | Residency |
-|---|---|---|---|
-| VZ VM | macOS | hardware VM | harness-in-VM (flagship, 1.0 capstone) |
-| youki container | Linux | container (namespaces/cgroups) | harness-in-container |
-| microVM (KVM) | Linux | hardware VM | future backend, same contract |
+1. **Environment lifecycle.** Create, resolve, start, inspect, stop, recover, clone, checkpoint where supported, and delete a Developer Environment. Inputs include a reproducible definition, explicit target OS, project/worktree attachment, profile, resources, and policy. Results include stable environment identity, host×target pair, backend, state, capabilities, and endpoints.
+2. **Execution.** Start commands or an optional resident harness with streaming stdin, stdout, stderr, PTY resize, signals, cancellation, exit status, and resource telemetry.
+3. **Files, mounts, and ports.** Provide explicit, policy-checked project attachment, file operations, shared paths, and port publication without exposing backend-specific transport to ordinary callers.
+4. **Target services.** Resolve services advertised by the selected environment. For a Developer-profile Linux target this includes that environment's Docker endpoint/context; it is never a global endpoint and never silently falls back to another daemon.
+5. **Brokered credentials.** Assign per-environment broker identities and provider capabilities with an audit feed of every use. Credentials are usable according to policy but are not copied into the target as ambient secrets.
+6. **Checkpoints and forks.** Expose idempotent primitives where the backend supports them. The caller composes those primitives into retry or rewind semantics; vz does not know what an “attempt” is.
+7. **Events and capability reports.** Emit environment-scoped lifecycle/service events and a versioned capability report. Callers query, never assume.
 
-The contract is the product; backends are swappable behind it. A node reports what it offers; an orchestrator selects by capability.
+## Host×target matrix and order
 
-## What vz will not grow (the boundary, restated)
+| Order | Host | Target | Backend direction | Contract status |
+|---:|---|---|---|---|
+| 1 | macOS | Linux | Virtualization.framework Linux VM | Immediate |
+| 2 | macOS | macOS | Virtualization.framework macOS VM | Immediate |
+| 3 | Linux | Linux | Native Linux isolation / optional VM-grade backend | Next |
+| 4 | Windows | Linux | Windows-hosted Linux virtualization | Then |
+| 5 | Windows | Windows | Native Windows virtualization/isolation | Final |
 
-Attempt graphs, task references, evidence stores, node admission/transport, model selection, fleet semantics. Any feature request containing those nouns is an orchestrator feature and belongs outside vz.
+Linux is the universal target across supported hosts. Native macOS and native Windows are target-specific additions. The contract is shared; capability sets and evidence remain host×target-qualified.
+
+## Residency modes
+
+Execution location is a capability rather than a separate product tier:
+
+| Mode | Meaning |
+|---|---|
+| Direct execution | Commands run in the environment through the guest/native agent |
+| Resident harness | A harness lives inside the environment and communicates over ACP or another declared transport |
+| Nested exec zone | Harness-launched code receives a stricter environment-local sandbox |
+| Host-driven service | A normal host client drives a selected target service, such as Docker in one Linux environment |
+
+An orchestrator may attach an environment to an existing worktree without transferring ownership of Git objects. Solo workflows may ask vz to create a worktree. In both cases the environment identity, not the worktree or harness, scopes services, events, credentials, and cleanup.
+
+## What vz will not grow
+
+Attempt graphs, task references, model selection, fleet admission/transport, global evidence stores, or orchestrator-specific scheduling semantics belong outside vz. Features should be expressed as generic environment lifecycle, execution, files, ports, service, policy, broker, checkpoint, event, or capability primitives.
+
+## Historical note
+
+The original version of this contract centered a “sandbox session,” described VZ VM harness residency as the 1.0 flagship, and listed Linux containers and KVM microVMs as alternate backends. Those backend and residency patterns remain valid. The current contract lifts them under the Developer Environment object so it can also represent native macOS now, universal Linux across all hosts, and native Windows last.
 
 ## Consumer note
 
-prtl (the agent session control plane) is the first expected consumer: its nodes would gain an execution backend that drives this contract locally (prtl's remote overlay stays prtl's). The solo-user surface (`claude` in a worktree) and the orchestrator surface are the *same* primitives — one contract, two audiences.
+prtl is the first expected orchestrator consumer: a node can drive this contract locally while prtl retains its own remote overlay and work-attempt semantics. Solo users, IDEs, host CLIs, and orchestrators share the same primitives and capability truth.

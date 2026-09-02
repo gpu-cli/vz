@@ -6,56 +6,124 @@
 
 web
 
-## Stack
+The website presents a local-first developer-infrastructure product using
+static HTML, CSS, and JavaScript.
 
-User-decided: single-file static HTML/CSS/JS ("Write me a html page"). No framework, no build step. [Inferred: hosted as a GitHub Pages / static asset for the gpu-cli/vz repo.]
+## Canonical contract
+
+The authoritative product definition, platform matrix, capability boundaries,
+and status language live in
+[`docs/developer-environments.md`](docs/developer-environments.md). Product copy
+must not contradict that contract.
 
 ## Users
 
-Primary: developers on Apple-Silicon Macs who run agentic AI coding tools (Claude Code, Codex, OpenCode, Aider) and need those agents to execute arbitrary commands — builds, tests, package installs, network calls — without endangering the host. They live in the terminal, distrust heavyweight VMs, and want Docker-class workflows without Docker Desktop.
+Primary today: developers on Apple-silicon Macs who need reproducible, parallel
+Linux and native macOS environments for human and agent-driven work.
 
-Secondary: teams evaluating local sandboxing vs. hosted sandboxes (e2b, Daytona, Fly Sprites); ops-minded developers who want a fast, inspectable Linux VM on their Mac. Future: Linux hosts running the same contract.
+Next: Linux-host developers using the same Linux target contract. Planned after
+that: Windows-host developers, first with the universal Linux target and finally
+with native Windows environments.
 
-## Product Purpose
+## Product purpose
 
-vz is a local-first sandbox runtime: one CLI for OCI containers, Compose stacks, and Linux VMs on macOS (Apple Virtualization.framework), later Linux. An agent gets a real, disposable Linux VM that boots in ~3s, mounts the project via VirtioFS, runs commands over vsock, and can checkpoint/restore state. Success: an agent's riskiest command becomes a non-event — the host stays clean, the sandbox is disposable, everything is inspectable.
+**vz creates reproducible, parallel Developer Environments on local hardware.**
 
-This page is the **future-state vision**: the product after Wave 1–3 land (streaming API, filesystem API, full Docker inside the guest VM, MCP-first agent surfaces, port forwarding, checkpoint templates). It must sell the destination honestly — mechanisms and commands, not vaporware adjectives.
+The Developer Environment is the product object. It binds a project or worktree
+to stable identity, target OS, compute, files, tools, network, persistent state,
+and agent sessions. VMs, containers, sandboxes, and processes are backend
+mechanisms selected for the host/target pair.
 
-## Positioning
+Linux is the universal target across macOS, Linux, and Windows hosts. Native
+macOS environments are also part of the current macOS product; native Windows
+environments follow Linux-on-Windows. This is a multi-target product, not a
+Linux-only sandbox with future host ports.
 
-The only sandbox that is all of: (1) real VM isolation on your own hardware — no cloud round-trips, no hidden Linux VM doing unaccountable things (unlike Docker Desktop), (2) agent-native by design — MCP server, streaming exec, files API, receipts, egress policy (unlike Docker Desktop/Tart), (3) local-first but with the same runtime contract for hosted Linux later (unlike e2b's cloud-only model), (4) speed — ~3s boot, checkpoint restore, persistent warm state (unlike full-boot VM tools).
+## Core positioning
 
-The architectural claim a competitor cannot copy without changing their product: **the host only ever runs a CLI, a control daemon, and thin vsock/virtiofs plumbing — every workload, including dockerd itself, executes inside the guest VM**.
+vz makes local parallel environments explicit, inspectable, reproducible, and
+addressable. Workloads run inside the selected environment boundary, while host
+effects occur only through declared mounts, ports, credentials, and control
+channels. The concrete isolation mechanism may be a VM or a native OS facility;
+the user-facing contract remains stable.
 
-## Operating Context
+The main value is productive, repeatable development at high concurrency.
+Locked-down execution remains an available profile, but is not the organizing
+principle of the Developer Environment product.
 
-Terminal-first usage: `vz init` generates a per-project `vz.json`; `vz run cargo test` boots or reuses the VM; `vz stack up` runs Compose; `vz build` uses BuildKit inside a guest VM. Agents integrate via MCP tools (`vz_exec`, `vz_read_file`, ...) or gRPC/HTTP runtime API; humans use the real `docker` CLI through `DOCKER_HOST=~/.vz/docker.sock` proxied over vsock to dockerd inside the guest. Projects keep working directories on the host, mounted read-write via VirtioFS.
+## Docker contract
 
-## Capabilities and Constraints
+Docker is implicit for Linux Developer Environments. Every Linux environment has
+its own Docker Engine, state, BuildKit cache, networks, proxy endpoint, and Docker
+context. There is no global vz Docker socket and no optional shared Docker
+facade. The unmodified host Docker CLI must address a specific environment and
+must never fall back to Docker Desktop or another environment.
 
-Real today (repo evidence): Linux VM runtime w/ custom kernel 6.12.85 profiles, youki OCI runtime in-guest, deterministic Compose stacks (`vz stack`), BuildKit builds (`vz build`), `fs_quick` checkpoints, macOS VM flows + signed patch bundles, gRPC daemon (`vz-runtimed`) + HTTP API (`vz-api`), `vz run` + `vz.json`, ~3s VM boot, host stays clean (all workloads in guest).
+Docker is not an implicit capability of native macOS or native Windows targets.
+Those workflows select a Linux Developer Environment when they require the Linux
+Docker contract.
 
-Future (this page may show, labeled as the road we're on): sandbox lifecycle + streaming exec/stdin/PTY API, filesystem API, **real Docker inside the guest VM** (kernel `MEMCG`+`BRIDGE_NETFILTER`, dockerd/containerd in guest, vsock socket proxy — host never runs containers), MCP server + agent receipts + egress policy, port forwarding/preview URLs, checkpoint templates.
+## Current status
 
-Constraints: Apple Silicon + macOS 14+ (host); claims must stay within these facts — no invented benchmarks, customers, or pricing. Performance claims only with repo-measured evidence (planning/README: measured-claims-only rule).
+- **ACTIVE:** Apple-silicon macOS host support; local Linux VM and OCI/BuildKit
+  primitives; native macOS VM flows; deterministic stacks; checkpoint
+  primitives; gRPC/HTTP runtime services; current sandbox/run/vm command
+  surfaces.
+- **DEV:** one unified Developer Environment lifecycle; implicit per-environment
+  Docker driven by the local Mac's Docker/Compose/buildx clients; full isolation
+  and conformance evidence; Linux-host contract parity.
+- **PLANNED:** Linux Developer Environments on Windows, followed by native
+  Windows Developer Environments; hosted placement may reuse the contract later.
 
-## Brand Commitments
+These labels describe implementation maturity. They do not turn a partial
+backend into a full-product parity claim.
 
-Name: **vz**. Org: gpu-cli. License: MIT. Voice: technical, precise, mechanism-forward; no hype adjectives. [Inferred from README/planning voice — confirm if a different tone is wanted.]
+## Operating context
 
-## Evidence on Hand
+Humans and agents select a Developer Environment explicitly or through an
+unambiguous project/worktree association. A Linux environment starts with Docker
+as part of readiness; its managed Docker context is scoped to that environment.
+Multiple environments must run simultaneously without sharing identity, daemon
+state, sockets, ports, files, images, volumes, caches, networks, or credentials.
 
-Repo docs: `README.md` (command tree, architecture), `docs/vz-innovation-planning.md` (product boundary, P0–P2), `docs/e2b-vs-vz-gap-analysis.md`, `planning/agent-sandbox-api-landscape.md` (§7.5 MCP tool list — direct content source), `private-vz/vz-run-devx-improvements.md` (real usage learnings). Real command examples: `vz run cargo test`, `vz stack up`, `vz build .`, `vz docker run --rm`. Boot claim "~3s" is repo-stated. **Absences that must not be fabricated:** benchmarks, user counts, testimonials, pricing, logos of integrations.
+Existing commands such as `vz run`, `vz stack`, `vz build`, `vz docker`, and
+`vz vm` describe ACTIVE mechanisms. Their migration toward the unified `vz dev`
+experience is DEV; documentation must not present proposed command spelling as
+already shipped.
 
-## Product Principles
+## Product principles
 
-1. Local-first: the sandbox is on your hardware; cloud is an escape hatch, not a requirement.
-2. The host stays clean: nothing container-related executes on macOS, ever — and the design says so out loud.
-3. Agent-native, not agent-compatible: MCP/gRPC/HTTP are first-class surfaces, not afterthoughts.
-4. Prove with commands, not adjectives: every section demonstrates a real command or protocol.
-5. Inspectable and honest: future capabilities are framed as the road we're on, never as shipped facts.
+1. Developer Environment first: users choose a target and environment, not a bag
+   of backend mechanisms.
+2. Linux everywhere: one Linux target contract across macOS, Linux, and Windows.
+3. Native where it matters: macOS-on-macOS now; Windows-on-Windows after
+   Linux-on-Windows.
+4. Parallel by construction: identity and all mutable resources are scoped per
+   environment.
+5. Docker belongs to Linux environment readiness, not to a global daemon or
+   optional compatibility tier.
+6. Explicit host effects: mounts, ports, credentials, and policy are declared and
+   inspectable.
+7. Measured and status-tagged claims: commands and end-to-end evidence precede
+   parity claims.
 
-## Accessibility & Inclusion
+## Evidence and constraints
 
-[No project-specific requirement established; apply WCAG-grade defaults: semantic markup, contrast, keyboard operability.]
+Repository evidence includes `README.md`, the runtime and VM implementation,
+BuildKit and Linux-VM end-to-end lanes, `docs/linux-support.md`, and current macOS
+VM flows. The repo states an approximately three-second Linux VM boot; do not
+invent benchmarks, users, testimonials, pricing, integrations, or complete
+Docker parity.
+
+The currently supported macOS host baseline is Apple silicon on macOS 14+.
+Capabilities under DEV or PLANNED must read as direction, not shipped behavior.
+
+## Brand and voice
+
+Name: **vz**. Organization: gpu-cli. License: MIT. Voice: technical, precise,
+mechanism-forward, and honest about status.
+
+## Accessibility
+
+Use semantic markup, sufficient contrast, keyboard-operable controls, reduced
+motion support, and other WCAG-grade defaults in product surfaces.

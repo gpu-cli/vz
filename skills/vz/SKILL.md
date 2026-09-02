@@ -1,20 +1,25 @@
 ---
 name: vz
 description: >
-  Run commands in instant Linux VMs on macOS via vz. Use when the user needs
-  to: (1) compile or test code for Linux (cross-compile, Linux-only deps),
-  (2) run Linux-specific tools (apt-get, systemd, docker-in-VM),
-  (3) execute commands in an isolated Linux environment,
+  Work in reproducible vz Developer Environments. The current skill drives the
+  shipped Linux-on-macOS command surface. Use when the user needs to: (1)
+  compile or test code for Linux (cross-compile, Linux-only deps), (2) run
+  Linux-specific tools (apt-get, systemd, OCI workloads), (3) execute commands
+  in a reproducible Linux environment,
   (4) work on a project that has a vz.json file.
   TRIGGER when: project contains vz.json, user says "run in Linux",
   "test on Linux", "compile for Linux", "vz run", or needs Linux-only behavior.
-  DO NOT TRIGGER when: commands work fine on macOS natively.
+  DO NOT TRIGGER when: commands should intentionally run in the current host
+  shell and no vz environment was requested.
 ---
 
-# vz — Linux VM execution
+# vz — Linux Developer Environment execution
 
-Run commands inside a lightweight Linux VM on macOS via Apple's Virtualization.framework.
-The VM boots in ~3s, mounts the project directory via VirtioFS, and persists across runs.
+Run commands inside the current Linux-on-macOS Developer Environment backend,
+implemented by a lightweight Linux VM through Apple's Virtualization.framework.
+The repository documents ~3s boot, a VirtioFS project mount, and persistent
+reuse. Native macOS environments and the unified `vz dev` lifecycle are product
+direction but are not substituted for the current commands below.
 
 ## Detection
 

@@ -1,4 +1,58 @@
-# vz — Master Architecture Overview
+# vz — Current Product Mission
+
+Date: 2026-09-02
+Status: current planning authority. The historical foundation that follows is retained for architectural context; where it conflicts with this section or `docs/1.0-scope.md`, the current Developer Environment mission wins.
+
+## Mission
+
+vz delivers reproducible, parallel **Developer Environments** with native-feeling target operating systems. The Developer Environment—not a sandbox, VM, container, or resident agent—is the product object. It owns identity, project binding, target OS, configuration, mutable state, tools, services, resources, policy, endpoints, evidence, and lifecycle.
+
+Lockdown remains a selectable policy and sandboxing remains a powerful implementation primitive. Neither is the primary product value. The default Developer profile favors complete, reproducible development workflows and safe parallelism on local hardware.
+
+## Host×target rollout
+
+Implementation and conformance proceed in this exact order:
+
+| Order | Host | Target | Product intent |
+|---:|---|---|---|
+| 1 | macOS | Linux | Universal Linux Developer Environment; environment-local Docker driven by the normal Mac Docker CLI |
+| 2 | macOS | macOS | Native Apple-platform Developer Environment |
+| 3 | Linux | Linux | The same portable Linux environment contract on its native host |
+| 4 | Windows | Linux | The same portable Linux environment contract on Windows |
+| 5 | Windows | Windows | Native Windows Developer Environment |
+
+Linux is universal: macOS, Linux, and Windows hosts all gain the Linux target. Native macOS is immediate alongside Linux-on-macOS because Apple development requires a real macOS target. Native Windows is the final target in this sequence.
+
+Each host×target pair earns support through its own real end-to-end conformance evidence. Shared lifecycle semantics do not imply identical backend capabilities.
+
+## Developer Environment invariants
+
+- One project may have several named environments, and several environments may run concurrently.
+- Definitions and artifacts are reproducible, pinned, checksummed, inspectable, repairable, and portable wherever the same target contract is supported.
+- Mutable state, files, processes, endpoints, ports, caches, credentials, events, and lifecycle ownership are isolated per environment.
+- VMs, OCI containers, native isolation, pools, sandboxes, worktrees, harness residency, brokers, and shims are internal primitives or optional environment capabilities.
+- Humans, local agents, IDEs, scripts, CI jobs, and orchestrators use the same lifecycle and capability truth.
+- Target-specific behavior is declared through versioned capabilities and fails closed when unavailable.
+
+## Docker contract
+
+Docker compatibility is implicit when creating a Developer-profile **Linux** environment on a host×target pair that has passed the Docker conformance suite. It is target-qualified, never global:
+
+- every Linux environment owns its own Engine, containerd, BuildKit cache, images, volumes, networks, credentials scope, data root, host endpoint, and Docker context;
+- the normal host Docker CLI, Compose, and buildx explicitly select one environment;
+- vz never mutates the user's default Docker context and never falls back to Docker Desktop, system Docker, or another environment;
+- concurrent environments must have no Docker state, socket, network, port, or lifecycle cross-talk;
+- native macOS and native Windows environments do not inherit Docker claims from Linux.
+
+## Planning interpretation
+
+Current planning should be organized around the Developer Environment contract and the ordered host×target matrix. Existing sandbox, runtime, Docker, macOS VM, guest agent, networking, storage, checkpoint, broker, and harness work should be retained and reclassified beneath that contract rather than discarded. Historical nouns in old documents do not by themselves define the current product API.
+
+---
+
+# Historical Foundation — Original Master Architecture Overview
+
+> Historical context (pre-Developer Environment mission). This plan originally scoped vz as a macOS Virtualization.framework library for sandboxing coding agents in native macOS VMs. Its FFI, async VM, vsock, VirtioFS, signing, and native-macOS research remains relevant. Product statements such as “sandbox is the product,” “macOS host only,” “long-lived single VM,” and “agents cannot use Docker inside the guest” are not current scope constraints.
 
 ## Vision
 

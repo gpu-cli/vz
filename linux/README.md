@@ -1,10 +1,23 @@
-# Linux Kernel Artifacts
+# Linux Developer Environment Kernel Artifacts
 
-This directory builds the Linux boot artifacts used by `vz-linux`:
+This directory builds the Linux target used by `vz` Developer Environments.
+Linux is the universal target: it is shipped through Virtualization.framework
+on Apple Silicon macOS and is planned on Linux and Windows hosts. The artifacts
+here are guest artifacts; host-specific backends decide how to run them.
+
+The `developer` profile is the primary product profile:
 
 - `out/vmlinux` for the default `developer` profile
-- `out/container/vmlinux` for the constrained `container` profile
-- matching `initramfs.img`, `youki`, and `version.json` files in each bundle
+- matching `initramfs.img`, `youki`, and `version.json`
+
+The secondary hardened profile is built under `out/container/`. It exists for
+constrained workloads and compatibility while the product converges on
+Developer Environments; it is not a separate peer product.
+
+Full Docker compatibility is roadmap work. When complete, Docker will be an
+implicit, private capability of each Linux Developer Environment, never a
+global daemon or a capability of native macOS/Windows targets. Both Linux
+profiles use the pinned youki runtime; runc fallback is not supported.
 
 ## Quick start
 
@@ -12,7 +25,7 @@ This directory builds the Linux boot artifacts used by `vz-linux`:
 make -C linux all
 ```
 
-Build the constrained container-sandbox profile:
+Build the secondary hardened profile:
 
 ```bash
 make -C linux KERNEL_PROFILE=container all
@@ -34,10 +47,10 @@ make -C linux docker-build-all
 
 | Profile | Output | Baseline | Intended use |
 | --- | --- | --- | --- |
-| `developer` | `linux/out/` | arm64 `defconfig` + `vz-linux.config` | Broad dev/host VM kernel, including nested KVM and TUN/TAP for Virgil's Firecracker host path. |
-| `container` | `linux/out/container/` | `allnoconfig` + `vz-linux-container.config` | Deployed container/sandbox VM kernel with virtio/vsock/virtiofs, overlayfs, netns, seccomp, io_uring, btrfs snapshots, and kernel NFS server support. |
+| `developer` | `linux/out/` | arm64 `defconfig` + `vz-linux.config` | **Primary.** Broad Linux Developer Environment kernel, including nested KVM, TUN/TAP, user namespaces, and the capabilities needed by the private Docker roadmap. |
+| `container` | `linux/out/container/` | `allnoconfig` + `vz-linux-container.config` | **Secondary hardened option.** Constrained workload kernel with virtio/vsock/virtiofs, overlayfs, netns, seccomp, io_uring, btrfs snapshots, and kernel NFS server support. Docker compatibility is not promised for this profile. |
 
-The container profile intentionally does not expose `/proc/config.gz`
+The secondary hardened profile intentionally does not expose `/proc/config.gz`
 (`IKCONFIG`) and does not include nested virtualization, TUN/TAP, USB gadget,
 SCSI/ATA, NFS client support, 9p, SquashFS, or FAT/VFAT.
 
@@ -63,6 +76,8 @@ additional validation:
 
 OCI runtime callers can set `RuntimeConfig::linux_profile`. CLI users can pass
 `--kernel-profile developer|container` on OCI commands and `vz vm linux init`.
+New Developer Environment flows should select `developer` implicitly; the flag
+is primarily an infrastructure and compatibility control.
 
 ## Benchmark boot latency
 

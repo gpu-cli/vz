@@ -1,5 +1,11 @@
 # OCI Runtime — Planning Overview
 
+> Historical component plan. The current product contract is
+> `docs/developer-environments.md`: Linux is the universal target, Docker is
+> implicit and private per Linux Developer Environment, and native macOS and
+> Windows targets use target-native semantics. Where this document differs, the
+> current contract wins.
+
 ## Vision
 
 Extend vz with an embedded OCI container runtime that runs Linux containers in hardware-isolated VMs on macOS. Each container gets its own lightweight Linux VM (<2s cold start), with the container's rootfs mounted via VirtioFS. Combined with vz's existing macOS sandbox support, this gives a unified Rust API for running both Linux containers and macOS sandboxes — all backed by Apple's Virtualization.framework.
@@ -131,9 +137,11 @@ Extend vz-cli to support Linux containers.
 - `vz images` (list cached OCI images)
 - `vz images prune` (clean up unused layers)
 
-### Phase 4: Docker Socket (Future)
+### Phase 4: Per-environment Docker endpoint (superseded framing)
 
-Expose a Docker Engine API on a Unix socket so `docker` CLI and `docker-compose` work against vz. This is the viral open-source play but is a significant amount of work and should come after the core is proven.
+Expose an environment-owned Docker Engine endpoint and managed context for every
+Docker-capable Linux Developer Environment. No global socket or mutable current
+environment is permitted.
 
 ## Planning Documents
 
@@ -149,8 +157,8 @@ Expose a Docker Engine API on a Unix socket so `docker` CLI and `docker-compose`
 
 | Constraint | Detail |
 |-----------|--------|
-| **macOS host only** | Virtualization.framework is macOS-only. This runtime only works on macOS hosts. |
+| **Current backend** | This component's Virtualization.framework backend requires macOS; the Linux target contract also expands to Linux and Windows hosts. |
 | **Apple Silicon only** | arm64 Linux kernel, arm64 container images. No x86_64 image support (Rosetta translation is possible but adds complexity). |
 | **No GPU passthrough** | Linux VMs cannot access Metal/GPU. ML training workloads that need GPU won't work inside these VMs. |
-| **No nested containers** | Cannot run Docker inside a vz Linux VM (no nested virtualization). |
+| **Docker integration** | Docker-in-guest is DEV and uses the Linux VM's kernel; it does not require nested virtualization. |
 | **arm64 images only** | Only `linux/arm64` OCI images are supported. `linux/amd64` images require Rosetta (future). |

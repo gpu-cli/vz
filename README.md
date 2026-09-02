@@ -1,24 +1,46 @@
 # vz
 
-Cross-platform runtime for containerized workloads and macOS VM automation.
+Reproducible Developer Environments, with Linux as the universal target.
 
-`vz` provides one CLI for:
-- OCI image and container lifecycle
-- Multi-service stacks from Compose files
-- macOS VM provisioning and control (Apple Virtualization.framework)
+A **Developer Environment** is the primary `vz` product object: a named,
+persistent, reproducible workspace with an operating-system target, compute,
+storage, networking, lifecycle, and workload runtime. It is not a synonym for
+one container. Containers, stacks, VMs, and host/guest transports are
+implementation and workload surfaces behind that environment.
 
-Typical use cases:
-- Run isolated build/test workloads from OCI images
-- Launch local multi-service environments from Compose
-- Automate deterministic macOS VM test sandboxes
+The target model is deliberately asymmetric:
+
+- **Linux is universal.** Linux Developer Environments run on macOS today and
+  are planned for Linux and Windows hosts.
+- **Native targets follow the host.** Native macOS environments run on macOS;
+  native Windows environments are planned for Windows.
+- **Docker belongs to each Linux environment.** The complete Docker-compatible
+  workflow is in progress. Each Linux Developer Environment will implicitly own
+  its private Docker Engine, containerd, BuildKit cache, image and volume state,
+  network namespace, host proxy socket, and Docker context. There is no global
+  `vz` Docker daemon and no Docker capability implied for native macOS or
+  Windows targets.
+- **Hardened environments are secondary.** The constrained `container` kernel
+  profile remains available for locked-down workloads, but it is not a peer
+  product or the default Developer Environment.
+
+Today, `vz` ships Linux VM/OCI/BuildKit primitives and native macOS VM automation
+on Apple Silicon. Their convergence into the complete Developer Environment
+contract—including private per-environment Docker—is in development. Additional
+host/target combinations below are roadmap work, not shipped functionality.
 
 ## Why vz
 
-- **One interface, multiple runtimes.** Use the same CLI flow on macOS and Linux.
-- **Container-native.** Pull, run, create, exec, log, stop, and remove OCI workloads.
-- **Stack-aware.** Bring up complete Compose apps with events, logs, and service exec.
-- **VM automation on macOS.** Provision, run, exec, save, and restore macOS VMs over vsock.
-- **Script-friendly.** Consistent command model with `--json` support across commands.
+- **Environment-first.** Project configuration, state, workloads, and lifecycle
+  belong to one reproducible Developer Environment.
+- **Linux everywhere.** Keep the Linux target consistent while choosing the
+  best isolation backend for macOS, Linux, or Windows.
+- **Native where it matters.** Use native macOS environments on Apple hardware;
+  native Windows is a later target for Windows hosts.
+- **Private by construction.** Linux Docker state and endpoints are scoped to a
+  specific environment rather than shared through a global daemon.
+- **Script-friendly.** Consistent command flows and `--json` output support
+  automation.
 
 ## Install
 
@@ -59,12 +81,20 @@ cd linux && make docker-build KERNEL_PROFILE=container
 Release CI caches the developer/container kernel images by kernel inputs, then
 rebuilds the initramfs and metadata for each `vz` release.
 
-## Platform support
+## Host and target roadmap
 
-- **Linux:** container + stack commands
-- **macOS (Apple Silicon):** container + stack commands, plus `vz vm ...`
+Status describes backend maturity, not complete product parity.
 
-## Quick start
+| Host | Linux target | Native macOS target | Native Windows target |
+| --- | --- | --- | --- |
+| macOS (Apple Silicon) | **ACTIVE** primitives: Virtualization.framework Linux VM, OCI, and BuildKit; unified lifecycle and private Docker are **DEV** | **ACTIVE** `vz vm ...` provisioning and automation; unified lifecycle is **DEV** | Not applicable |
+| Linux | **DEV:** partial `linux-native` backend; complete Developer Environment parity remains in progress | Not applicable | Not applicable |
+| Windows | **PLANNED:** Linux Developer Environments using the appropriate Windows virtualization backend | Not applicable | **PLANNED later:** native Windows Developer Environments |
+
+Linux is the universal target across all three hosts. Native macOS and native
+Windows complement it; they do not replace it.
+
+## Quick start (shipped macOS/Linux-target workflow)
 
 ### 1. Run commands in a Linux VM
 
@@ -91,7 +121,14 @@ vz status
 vz stop
 ```
 
-The first `vz run` boots a Linux VM (~3s), pulls the base image, and runs setup commands from `vz.json`. Subsequent runs reuse the VM and skip setup (cached by hash).
+The first `vz run` boots the environment's Linux VM (~3s), pulls the base
+image, and runs setup commands from `vz.json`. Subsequent runs reuse that
+environment and skip setup when the setup hash is unchanged.
+
+The intended Developer Environment UX will also start and select that
+environment's private Docker endpoint implicitly. Until the Docker roadmap is
+complete, do not assume that host `docker`, Compose, or buildx commands have
+full compatibility merely because the OCI workflows below are available.
 
 #### vz.json
 
@@ -109,7 +146,7 @@ The first `vz run` boots a Linux VM (~3s), pulls the base image, and runs setup 
 }
 ```
 
-### 2. Run a Compose stack
+### 2. Run a current vz-managed Compose stack
 
 ```bash
 # Start services
@@ -250,11 +287,15 @@ vz vm run --image ~/.vz/images/base-patched.img --name delta-test --headless
 
 `init`, `run`, `run -i`, `stop`, `status`, `logs`
 
-### Containers
+These are the primary user-facing lifecycle commands. The groups below are
+current workload and infrastructure surfaces within the environment model, not
+separate environment products.
+
+### OCI workloads
 
 `pull`, `run`, `create`, `exec`, `images`, `prune`, `ps`, `stop`, `rm`, `logs`
 
-### Stacks
+### vz-managed stacks
 
 `stack up`, `stack down`, `stack ps`, `stack ls`, `stack config`, `stack events`, `stack logs`, `stack exec`, `stack run`, `stack stop`, `stack start`, `stack restart`, `stack dashboard`
 

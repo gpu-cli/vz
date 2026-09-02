@@ -14,6 +14,14 @@ bd dolt push          # Push issue DB to the beads remote
 
 **There is no `bd sync` command in this bd build** — `bd dolt push` is the sync path for issue data; git handles the code.
 
+## Product Mission
+
+- The primary product object is a reproducible, parallel **Developer Environment**. Sandboxes, containers, VMs, and processes are implementation mechanisms or advanced capabilities.
+- Host OS and target OS are separate dimensions. Linux is the universal target: Linux-on-macOS now, Linux-on-Linux next, and Linux-on-Windows later. Native macOS-on-macOS is also current; native Windows-on-Windows follows Linux-on-Windows.
+- Docker is implicit, private, and scoped to each Linux-target Developer Environment. There is no global vz Docker socket or fallback daemon. Native macOS and native Windows targets do not implicitly provide Docker.
+- Linux-target OCI execution is youki-only. The public locked-down profile is **Hardened** and remains a secondary, restricted mode.
+- Capability and release claims are qualified by host×target pair and must distinguish ACTIVE, DEV, and PLANNED behavior.
+
 ## Remote-backed DB coordination (READ BEFORE ANY bd WRITE)
 
 This beads DB is remote-backed (Dolt). When bd refuses writes with a schema-migration warning:
@@ -59,10 +67,12 @@ This beads DB is remote-backed (Dolt). When bd refuses writes with a schema-migr
 ## Verification Standard for Beads/Tasks
 
 - Do NOT consider any bead/task complete based only on unit tests.
-- Completion requires real verification in a Linux VM with end-to-end testing of the implemented behavior.
-- On macOS hosts, Linux verification should run inside a local `vz`-managed Linux VM first (via the `vz vm ...` flows), not an arbitrary external SSH host.
+- Completion requires real end-to-end verification on the relevant host×target backend.
+- On macOS hosts, Linux-target verification should run inside a local `vz`-managed Linux VM first (via the `vz vm ...` flows), not an arbitrary external SSH host.
 - Do not use ad-hoc external SSH Linux hosts for release-gate evidence collection.
-- If Linux VM end-to-end verification has not been run and passed, keep the bead/task open.
+- If the applicable host×target end-to-end gate has not run and passed, keep the bead/task open.
 - For container/stack runtime work, run `scripts/run-sandbox-vm-e2e.sh --suite all` and attach the artifact logs as evidence.
-- For Docker-in-guest work (beads `vz-5in`/`vz-yr9`/`vz-k3v`/`vz-7ez`), evidence must show youki as the only OCI runtime binary present in the guest; ship a dedicated `scripts/run-linux-docker-e2e.sh` lane when the wave lands.
+- For Linux-target Docker work (including beads `vz-5in`/`vz-yr9`/`vz-k3v`/`vz-7ez`), evidence must show youki as the only OCI runtime binary present in the target; ship and run `scripts/run-linux-docker-e2e.sh --suite all` from the host when the wave lands.
+- Native macOS work requires the native macOS-on-macOS gate; Docker evidence from a neighboring Linux environment does not certify the macOS target.
+- Future Linux-on-Linux, Linux-on-Windows, and Windows-on-Windows claims require their own release-built host×target conformance evidence.
 - For btrfs portability changes, run `scripts/run-linux-btrfs-e2e.sh` and attach `.artifacts/linux-btrfs-e2e/<timestamp>/summary.txt` + logs as evidence.

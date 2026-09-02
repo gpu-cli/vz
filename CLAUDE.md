@@ -99,6 +99,10 @@ rm -rf linux/src/linux-6.12.85 && cd linux && make docker-build
 
 ### Key Design Decisions
 
+- **Developer Environment is the product object** — sandboxes, containers, VMs, and processes are backends or advanced capabilities
+- **Linux is the universal target** — Linux-on-macOS now, Linux-on-Linux next, Linux-on-Windows later; native macOS is current and native Windows follows
+- **Docker is implicit per Linux environment** — private Engine/state/context, no global socket or fallback daemon; native targets do not inherit Docker
+- **youki-only for Linux OCI** — no runc/crun fallback; `Container` is a legacy internal name for the public Hardened profile
 - **macOS 14 (Sonoma) minimum** — required for save/restore VM state
 - **Apple Silicon only** — macOS guest VMs require Apple Silicon
 - **objc2-virtualization for FFI** — auto-generated bindings, no hand-written sys crate, compile-time verification
@@ -106,11 +110,11 @@ rm -rf linux/src/linux-6.12.85 && cd linux && make docker-build
 - **Long-lived VM model** — single VM stays running, project dirs swapped via VirtioFS mounts
 - **vsock for communication** — host↔guest channel without network config
 - **Dual backend** — `RuntimeBackend` trait in `vz-runtime-contract` with macOS (VM) and Linux-native implementations
-- **Linux-native uses OCI runtime** — shells out to youki/runc for container lifecycle, uses `ip` commands for networking
+- **Linux-native uses youki** — shells out to the pinned youki runtime for container lifecycle and uses `ip` commands for networking
 
 ### Platform Constraints
 
-- macOS host only (Virtualization.framework is macOS-only)
+- Current Virtualization.framework backends require macOS; the product contract also targets Linux-on-Linux, Linux-on-Windows, and Windows-on-Windows in that order
 - Apple Silicon only for macOS guests
 - 2 concurrent macOS VM limit (kernel-enforced)
 - VirtioFS mounts are static (configured at VM creation, not runtime)

@@ -1,17 +1,35 @@
-# Linux Native Support
+# Linux Target and Linux-Host Support
 
-vz supports running OCI containers directly on Linux hosts without a VM layer,
-using the `linux-native` backend.
+Linux is the universal `vz` Developer Environment target. The product roadmap
+supports Linux environments on macOS, Linux, and Windows hosts:
 
-## Compatibility Matrix
+| Host | Linux Developer Environment status | Backend direction |
+| --- | --- | --- |
+| Apple Silicon macOS | **ACTIVE** Linux VM/OCI/BuildKit primitives; unified lifecycle and private Docker are **DEV** | Apple Virtualization.framework |
+| Linux | **DEV:** the partial `linux-native` OCI backend exists, but complete Developer Environment parity is not shipped | Native namespaces and cgroup v2 |
+| Windows | **PLANNED:** no shipped backend yet | Windows virtualization appropriate for a Linux guest |
 
-| Distribution       | Support Tier | Notes                                   |
-|--------------------|-------------|-----------------------------------------|
-| Ubuntu 22.04+ LTS  | Primary     | cgroup v2 by default, well-tested       |
-| Debian 12+         | Primary     | cgroup v2 by default                    |
-| Fedora 38+         | Primary     | cgroup v2 by default                    |
-| Arch Linux         | Best effort | Rolling release, generally works        |
-| RHEL/CentOS 9+     | Best effort | cgroup v2 available, may need enablement|
+Native macOS Developer Environments are also a current product direction on
+macOS. Native Windows Developer Environments come later on Windows. Those
+native targets do not imply Docker: Docker is an implicit, private capability
+of each **Linux** Developer Environment only.
+
+The sections below document the current experimental Linux-host backend. They
+are not a declaration of full cross-host or Docker compatibility.
+
+## Linux-host candidate distributions
+
+These are the intended compatibility tiers for the Linux-host roadmap. Until
+the complete Linux Developer Environment conformance suite passes, treat them
+as targets rather than release certifications.
+
+| Distribution | Intended tier | Notes |
+| --- | --- | --- |
+| Ubuntu 22.04+ LTS | Primary | cgroup v2 by default |
+| Debian 12+ | Primary | cgroup v2 by default |
+| Fedora 38+ | Primary | cgroup v2 by default |
+| Arch Linux | Best effort | Rolling release |
+| RHEL/CentOS 9+ | Best effort | cgroup v2 available, may need enablement |
 
 ## Requirements
 
@@ -21,14 +39,16 @@ using the `linux-native` backend.
 - **User namespaces** -- required for rootless container execution
 - **Network namespaces** -- required for inter-service networking in stacks
 
-### Runtime Dependencies
+### Runtime dependency
 
-An OCI-compliant container runtime must be installed:
+The experimental backend requires youki. Released Developer Environment
+artifacts pin and checksum their youki binary; source-tree Linux-host testing
+may use a matching youki installed on the host. runc, crun, and undeclared OCI
+runtime fallbacks are not supported.
 
-| Runtime | Install                                              |
-|---------|------------------------------------------------------|
-| youki   | `cargo install youki` or download from GitHub releases|
-| runc    | `apt install runc` / `dnf install runc`              |
+| Runtime | Source-tree installation |
+| --- | --- |
+| youki | `cargo install youki` or download the pinned version from the youki release artifacts |
 
 ### Networking (for stacks)
 
@@ -37,9 +57,10 @@ Multi-service stacks require:
 - `iptables` -- port forwarding (DNAT) and NAT masquerade
 - Root or `CAP_NET_ADMIN` -- for network namespace and bridge operations
 
-## Backend Selection
+## Current experimental backend selection
 
-The backend is selected automatically based on the host OS:
+Current low-level OCI calls select a backend automatically based on the host
+OS:
 - macOS -> `macos-vz` (Virtualization.framework)
 - Linux -> `linux-native`
 
@@ -51,6 +72,8 @@ VZ_BACKEND=macos-vz    vz oci run alpine:latest -- echo ok
 ```
 
 Accepted values: `linux`, `linux-native`, `native`, `macos`, `macos-vz`, `vm`.
+This is an implementation control, not the intended Developer Environment UX;
+environment creation should eventually select the host backend automatically.
 
 ## Capability Probes
 
@@ -68,20 +91,32 @@ if !report.all_satisfied() {
 Probes check:
 - `cgroup-v2`: `/sys/fs/cgroup/cgroup.controllers` exists
 - `user-namespaces`: `/proc/sys/kernel/unprivileged_userns_clone` is `1` (or absent)
-- `oci-runtime`: `youki` or `runc` found on `$PATH`
+- `oci-runtime`: a usable OCI runtime is visible on `$PATH`
+
+For Developer Environment acceptance, that runtime must be the pinned youki.
+A legacy probe recognizing another runtime does not make that runtime a
+supported fallback.
 
 ## Architecture Differences
 
-| Feature                  | macOS (`macos-vz`)            | Linux (`linux-native`)         |
-|--------------------------|-------------------------------|--------------------------------|
-| Isolation                | Full VM (Virtualization.fw)   | Namespaces + cgroups           |
-| Container runtime        | youki inside VM               | youki/runc on host             |
-| Networking               | Guest agent + vsock bridge    | Linux bridge + veth pairs      |
-| Port forwarding          | Guest agent NAT               | iptables DNAT                  |
-| Service discovery        | /etc/hosts injection          | /etc/hosts injection           |
-| Filesystem               | VirtioFS                      | Direct host filesystem         |
-| Resource limits (CPU)    | VM-level CPU count            | cgroup v2 cpu.max              |
-| Resource limits (memory) | VM-level memory               | cgroup v2 memory.max (planned) |
+| Feature | macOS host, Linux target (`macos-vz`) | Linux host, Linux target (`linux-native`) |
+| --- | --- | --- |
+| Status | Shipped environment workflow; Docker parity in progress | Experimental/partial |
+| Isolation | Full VM (Virtualization.framework) | Namespaces + cgroups |
+| Container runtime | Pinned youki inside VM | youki on host today; pinned artifact integration planned |
+| Networking | Guest agent + vsock bridge | Linux bridge + veth pairs |
+| Port forwarding | Guest agent NAT | iptables DNAT |
+| Service discovery | `/etc/hosts` injection | `/etc/hosts` injection |
+| Filesystem | VirtioFS | Direct host filesystem |
+| Resource limits (CPU) | VM-level CPU count | cgroup v2 `cpu.max` |
+| Resource limits (memory) | VM-level memory | cgroup v2 `memory.max` (planned) |
+
+The end-state is one Developer Environment model despite different host
+backends. Every Linux environment owns its state and, once Docker compatibility
+lands, its own Docker Engine, containerd, BuildKit cache, image store, volumes,
+networks, proxy socket, and Docker context. No host uses a global `vz` Docker
+daemon, and one environment must never fall back to another environment or to
+Docker Desktop.
 
 ## Known Limitations
 
@@ -98,7 +133,7 @@ Probes check:
    (bridge names, netns tracking) is lost. Containers remain running but port forwarding
    rules and bridge interfaces may become orphaned. Run `vz stack down` before exiting.
 
-5. **macOS-only commands unavailable** -- `vz init`, `vz run`, `vz exec`, `vz save`,
+5. **Developer Environment parity is incomplete on Linux hosts** -- `vz init`, `vz run`, `vz exec`, `vz save`,
    `vz restore`, `vz list`, `vz stop`, `vz cache`, `vz provision`, `vz cleanup`,
    `vz self-sign`, and `vz validate` are only available on macOS.
 
@@ -130,16 +165,11 @@ sudo sysctl --system
 
 ### "no OCI runtime found"
 
-Install youki or runc:
+Install the pinned youki version required by this checkout:
 
 ```bash
-# youki (Rust-native, recommended)
+# youki is the only supported OCI runtime
 cargo install youki
-
-# runc (C, widely available)
-sudo apt install runc        # Debian/Ubuntu
-sudo dnf install runc        # Fedora
-sudo pacman -S runc          # Arch
 ```
 
 ### Orphaned network resources after crash

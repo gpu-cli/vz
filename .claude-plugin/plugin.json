@@ -1,6 +1,6 @@
 {
   "name": "vz",
-  "description": "Run commands in instant Linux VMs on macOS via vz",
+  "description": "Run reproducible vz Developer Environments; current commands target Linux on macOS",
   "version": "0.3.0",
   "author": {
     "name": "gpu-cli"

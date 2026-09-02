@@ -1,5 +1,8 @@
 # 02 — Linux Native Backend Crate
 
+> Historical component plan. The current Developer Environment contract and
+> youki-only invariant in `docs/developer-environments.md` take precedence.
+
 ## Purpose
 
 Implement Linux host primitives in a dedicated crate so Linux support ships without coupling to macOS VZ internals.
@@ -26,7 +29,7 @@ Reuse as much as possible from existing runtime model:
 
 ### Initial runtime target
 
-- Use OCI runtime binary (`youki` first, `runc` fallback optional).
+- Use the pinned youki OCI runtime only; runc/crun fallback is forbidden.
 - Bundle-based execution (reuse existing bundle generation patterns).
 - Keep lifecycle parity with existing VM-guest OCI path:
   - create

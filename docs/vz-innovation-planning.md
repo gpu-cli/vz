@@ -3,6 +3,12 @@
 Date: 2026-02-26
 Author: collaborative ideation draft
 
+> Historical ideation. The current mission is defined in
+> `docs/developer-environments.md`: reproducible parallel Developer Environments
+> are primary, Linux is the universal target across macOS/Linux/Windows hosts,
+> native macOS is current, native Windows follows Linux-on-Windows, and
+> sandboxing is an implementation capability or Hardened profile.
+
 ## Purpose
 
 Generate a wider set of differentiated product ideas, then select the strongest plans to execute.

@@ -1,5 +1,11 @@
 # Linux Native Host Support — Planning Overview
 
+> Historical component plan. Under the current contract in
+> `docs/developer-environments.md`, this is the Linux-on-Linux phase of the
+> universal Linux Developer Environment target. Sandbox/container terms below
+> name implementation mechanisms, and Docker becomes implicit and private per
+> Linux environment when the pair passes conformance.
+
 ## Vision
 
 Enable `vz` to run sandbox/container workloads on **Linux hosts** while keeping the macOS Virtualization.framework path intact. The primary principle is:
