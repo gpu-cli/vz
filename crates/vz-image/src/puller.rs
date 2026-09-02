@@ -5,8 +5,10 @@ use std::str::FromStr;
 use docker_credential::{CredentialRetrievalError, DockerCredential, get_credential};
 use oci_distribution::client::ClientConfig;
 use oci_distribution::errors::OciDistributionError;
-use oci_distribution::manifest::ImageIndexEntry;
-use oci_distribution::manifest::OciDescriptor;
+use oci_distribution::manifest::{
+    IMAGE_MANIFEST_MEDIA_TYPE, ImageIndexEntry, OCI_IMAGE_MEDIA_TYPE, OciDescriptor,
+    OciImageManifest,
+};
 use oci_distribution::secrets::RegistryAuth;
 use oci_distribution::{Client, Reference};
 use serde::{Deserialize, Deserializer};
@@ -211,15 +213,21 @@ impl ImagePuller {
 
         // Return cached image if reference is already resolved locally.
         if let Ok(cached_digest) = self.store.read_reference(&parsed.whole()) {
-            if self.store.read_manifest_json(&cached_digest).is_ok() {
+            if self.store.is_cached_image_complete(&cached_digest)? {
                 tracing::debug!(reference = %reference, digest = %cached_digest, "using cached image");
                 return Ok(ImageId(cached_digest));
             }
+
+            tracing::warn!(
+                reference = %reference,
+                digest = %cached_digest,
+                "cached image is incomplete; repairing from registry"
+            );
         }
 
         let registry_auth = resolve_registry_auth(&parsed, auth)?;
 
-        let (manifest, digest, config_json) = self
+        let (_resolved_manifest, digest, config_json) = self
             .client
             .pull_manifest_and_config(&parsed, &registry_auth)
             .await
@@ -227,8 +235,43 @@ impl ImagePuller {
 
         let _config_summary = parse_image_config_summary(&config_json)?;
 
+        // Persist the registry's exact bytes, rather than a serde
+        // reserialization, so future cache hits can verify the manifest digest.
+        let digest_reference = Reference::with_digest(
+            parsed.registry().to_string(),
+            parsed.repository().to_string(),
+            digest.clone(),
+        );
+        let (manifest_json, returned_digest) = self
+            .client
+            .pull_manifest_raw(
+                &digest_reference,
+                &registry_auth,
+                &[IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_MEDIA_TYPE],
+            )
+            .await
+            .map_err(|error| map_pull_error(reference, error))?;
+        if returned_digest != digest {
+            return Err(ImageError::InvalidConfig(format!(
+                "registry returned manifest digest {returned_digest} for requested digest {digest}"
+            )));
+        }
+        verify_blob_digest(&digest, &manifest_json)?;
+        let manifest: OciImageManifest = serde_json::from_slice(&manifest_json)?;
+        verify_blob_size(
+            &manifest.config.digest,
+            manifest.config.size,
+            config_json.len(),
+        )?;
+        verify_blob_digest(&manifest.config.digest, config_json.as_bytes())?;
+
         for layer in &manifest.layers {
-            if self.store.has_layer_blob(&layer.digest) {
+            let expected_size = descriptor_size(&layer.digest, layer.size)?;
+            if self.store.has_layer_blob_with_descriptor(
+                &layer.digest,
+                &layer.media_type,
+                expected_size,
+            )? {
                 continue;
             }
 
@@ -238,12 +281,6 @@ impl ImagePuller {
             self.store
                 .write_layer_blob(&layer.digest, &layer.media_type, &layer_bytes)?;
         }
-
-        let manifest_json = serde_json::to_vec(&manifest).map_err(|error| {
-            ImageError::InvalidConfig(format!(
-                "failed to serialize pulled manifest for {reference}: {error}"
-            ))
-        })?;
 
         let image_id = ImageId(digest);
         self.store
@@ -274,6 +311,7 @@ impl ImagePuller {
             out.extend_from_slice(&bytes);
         }
 
+        verify_blob_size(descriptor_digest, descriptor.size, out.len())?;
         verify_blob_digest(descriptor_digest, &out)?;
         Ok(out)
     }
@@ -420,6 +458,34 @@ fn verify_blob_digest(descriptor_digest: &str, bytes: &[u8]) -> Result<(), Image
     Ok(())
 }
 
+fn descriptor_size(descriptor_digest: &str, advertised_size: i64) -> Result<u64, ImageError> {
+    u64::try_from(advertised_size).map_err(|_| {
+        ImageError::InvalidConfig(format!(
+            "blob {descriptor_digest} has invalid negative size {advertised_size}"
+        ))
+    })
+}
+
+fn verify_blob_size(
+    descriptor_digest: &str,
+    advertised_size: i64,
+    actual_size: usize,
+) -> Result<u64, ImageError> {
+    let expected = descriptor_size(descriptor_digest, advertised_size)?;
+    let actual = u64::try_from(actual_size).map_err(|_| {
+        ImageError::InvalidConfig(format!("blob {descriptor_digest} is too large to validate"))
+    })?;
+    if expected != actual {
+        return Err(ImageError::BlobSizeMismatch {
+            digest: descriptor_digest.to_string(),
+            expected,
+            actual,
+        });
+    }
+
+    Ok(expected)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -496,6 +562,34 @@ mod tests {
             error,
             ImageError::UnsupportedDigestAlgorithm { .. }
         ));
+    }
+
+    // ── descriptor size tests ──────────────────────────────────
+
+    #[test]
+    fn verify_blob_size_accepts_descriptor_length() {
+        assert_eq!(verify_blob_size("sha256:test", 5, 5).unwrap(), 5);
+    }
+
+    #[test]
+    fn verify_blob_size_rejects_mismatch() {
+        let error = verify_blob_size("sha256:test", 5, 4)
+            .expect_err("must reject a truncated registry blob");
+        assert!(matches!(
+            error,
+            ImageError::BlobSizeMismatch {
+                expected: 5,
+                actual: 4,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn verify_blob_size_rejects_negative_descriptor_length() {
+        let error = verify_blob_size("sha256:test", -1, 0)
+            .expect_err("must reject negative descriptor lengths");
+        assert!(matches!(error, ImageError::InvalidConfig(_)));
     }
 
     // ── resolve_cmd tests ────────────────────────────────────────

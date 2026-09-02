@@ -37,6 +37,15 @@ pub enum ImageError {
         actual: String,
     },
 
+    /// The registry returned image data with an unexpected byte length.
+    #[error("size mismatch for '{digest}': expected {expected} bytes, got {actual} bytes")]
+    BlobSizeMismatch {
+        /// Blob descriptor digest (for example `sha256:...`).
+        digest: String,
+        expected: u64,
+        actual: u64,
+    },
+
     /// The registry returned a digest algorithm this runtime does not verify.
     #[error("unsupported digest algorithm '{algorithm}'")]
     UnsupportedDigestAlgorithm {

@@ -10,12 +10,14 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use oci_distribution::manifest::OciImageManifest;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs as unix_fs;
 
@@ -134,6 +136,55 @@ impl ImageStore {
     pub fn read_reference(&self, reference: &str) -> io::Result<String> {
         let data = fs::read_to_string(self.ref_path(reference))?;
         Ok(data.trim().to_string())
+    }
+
+    /// Return whether a cached image contains every object needed at runtime.
+    ///
+    /// A reference is only a usable cache hit when its manifest and config are
+    /// valid JSON with the expected digest, and every descriptor-backed object
+    /// is a regular file with the advertised digest and size. Pulls write
+    /// objects atomically, so an incomplete entry can safely fall through to
+    /// the normal pull path for repair.
+    pub(crate) fn is_cached_image_complete(&self, image_id: &str) -> io::Result<bool> {
+        let manifest_path = self.manifest_path(image_id);
+        let Some(manifest_json) = read_regular_file(&manifest_path)? else {
+            return Ok(false);
+        };
+        if !bytes_match_digest(&manifest_json, image_id) {
+            return Ok(false);
+        }
+        let manifest = match serde_json::from_slice::<OciImageManifest>(&manifest_json) {
+            Ok(manifest) => manifest,
+            Err(_) => return Ok(false),
+        };
+        if manifest.schema_version != 2 {
+            return Ok(false);
+        }
+
+        let config_path = self.config_path(image_id);
+        let Ok(config_size) = u64::try_from(manifest.config.size) else {
+            return Ok(false);
+        };
+        if !regular_file_has_size(&config_path, config_size)? {
+            return Ok(false);
+        }
+        let config_json = fs::read(config_path)?;
+        if !bytes_match_digest(&config_json, &manifest.config.digest)
+            || serde_json::from_slice::<serde_json::Value>(&config_json).is_err()
+        {
+            return Ok(false);
+        }
+
+        for layer in manifest.layers {
+            let Ok(layer_size) = u64::try_from(layer.size) else {
+                return Ok(false);
+            };
+            if !self.has_layer_blob_with_descriptor(&layer.digest, &layer.media_type, layer_size)? {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 
     /// List cached image references and their resolved image identifiers.
@@ -281,6 +332,7 @@ impl ImageStore {
     /// Write a compressed layer blob indexed by digest.
     pub fn write_layer_blob(&self, digest: &str, media_type: &str, data: &[u8]) -> io::Result<()> {
         self.ensure_layout()?;
+        self.invalidate_unpacked_layer(digest)?;
         let path = self.layer_blob_path(digest, LayerMediaType::from_media_type(media_type));
         self.write_atomic(&path, data)
     }
@@ -289,7 +341,17 @@ impl ImageStore {
     pub fn has_layer_blob(&self, digest: &str) -> bool {
         self.layer_file_candidates(digest)
             .into_iter()
-            .any(|candidate| candidate.exists())
+            .any(|candidate| candidate.is_file())
+    }
+
+    pub(crate) fn has_layer_blob_with_descriptor(
+        &self,
+        digest: &str,
+        media_type: &str,
+        expected_size: u64,
+    ) -> io::Result<bool> {
+        let path = self.layer_blob_path(digest, LayerMediaType::from_media_type(media_type));
+        file_matches_digest_and_size(&path, digest, expected_size)
     }
 
     /// Unpack a layer blob into `layers/<digest>/`.
@@ -319,7 +381,8 @@ impl ImageStore {
     /// directory exists but `.done` is absent, another thread is still
     /// extracting — we poll until it finishes.
     fn unpack_layer_inner(&self, digest: &str, media_type: &str) -> io::Result<PathBuf> {
-        let src = self.resolve_layer_blob_path(digest)?;
+        let media = LayerMediaType::from_media_type(media_type);
+        let src = self.resolve_layer_blob_path(digest, media)?;
         let destination = self.unpacked_layer_dir(digest);
         let done_marker = destination.with_extension("done");
 
@@ -349,8 +412,6 @@ impl ImageStore {
             let _ = fs::remove_dir_all(&tmp_dir);
         }
         fs::create_dir_all(&tmp_dir)?;
-
-        let media = LayerMediaType::from_media_type(media_type);
 
         let output = match media {
             LayerMediaType::Gzip => Command::new("tar")
@@ -673,20 +734,27 @@ impl ImageStore {
         .collect()
     }
 
-    fn resolve_layer_blob_path(&self, digest: &str) -> io::Result<PathBuf> {
-        let mut found: Option<PathBuf> = None;
-        for path in self.layer_file_candidates(digest) {
-            if path.exists() && found.is_none() {
-                found = Some(path);
-            }
-        }
-
-        found.ok_or_else(|| {
-            io::Error::new(
+    fn resolve_layer_blob_path(&self, digest: &str, media: LayerMediaType) -> io::Result<PathBuf> {
+        let path = self.layer_blob_path(digest, media);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => Ok(path),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("layer blob is not a regular file: {}", path.display()),
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("missing layer blob for digest {digest}"),
-            )
-        })
+                format!("missing layer blob for digest {digest}: {}", path.display()),
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn invalidate_unpacked_layer(&self, digest: &str) -> io::Result<()> {
+        let destination = self.unpacked_layer_dir(digest);
+        remove_path_if_exists(&destination.with_extension("done"))?;
+        remove_path_if_exists(&destination)?;
+        remove_path_if_exists(&destination.with_extension("tmp"))
     }
 
     fn unpacked_layer_dir(&self, digest: &str) -> PathBuf {
@@ -1017,8 +1085,6 @@ fn fix_ownership(_path: &Path) -> io::Result<()> {
 
 /// Produce a deterministic SHA-256 hash for a reference string.
 fn hash_reference(reference: &str) -> String {
-    use sha2::{Digest, Sha256};
-
     let hash = Sha256::digest(reference.as_bytes());
     format!("{hash:x}")
 }
@@ -1068,6 +1134,57 @@ struct ManifestLayerEntry {
     media_type: String,
 }
 
+fn regular_file_has_size(path: &Path, expected_size: u64) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file() && metadata.len() == expected_size),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_regular_file(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => fs::read(path).map(Some),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn file_matches_digest_and_size(path: &Path, digest: &str, expected_size: u64) -> io::Result<bool> {
+    if !regular_file_has_size(path, expected_size)? {
+        return Ok(false);
+    }
+
+    let Some(expected) = sha256_digest_value(digest) else {
+        return Ok(false);
+    };
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()) == expected)
+}
+
+fn bytes_match_digest(bytes: &[u8], digest: &str) -> bool {
+    let Some(expected) = sha256_digest_value(digest) else {
+        return false;
+    };
+    format!("{:x}", Sha256::digest(bytes)) == expected
+}
+
+fn sha256_digest_value(digest: &str) -> Option<String> {
+    let (algorithm, value) = digest.split_once(':')?;
+    (algorithm == "sha256" && value.len() == 64).then(|| value.to_ascii_lowercase())
+}
+
 fn parse_manifest_layers(raw_manifest: &[u8]) -> Result<Vec<LayerDescriptor>, &'static str> {
     let manifest: ManifestLayers =
         serde_json::from_slice(raw_manifest).map_err(|_| "manifest is not valid json")?;
@@ -1108,6 +1225,10 @@ mod tests {
         ));
         fs::create_dir_all(&base).unwrap();
         base
+    }
+
+    fn sha256_id(bytes: &[u8]) -> String {
+        format!("sha256:{:x}", Sha256::digest(bytes))
     }
 
     #[test]
@@ -1178,6 +1299,220 @@ mod tests {
         assert_eq!(images[0].image_id, "sha256:alpine");
         assert_eq!(images[1].reference, "library/ubuntu:24.04");
         assert_eq!(images[1].image_id, "sha256:ubuntu");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_image_completeness_rejects_missing_and_corrupt_layer_blob() {
+        let root = unique_temp_dir("incomplete-cache");
+        let store = ImageStore::new(root.clone());
+        store.ensure_layout().unwrap();
+
+        let config = br#"{"config":{}}"#;
+        let layer = b"complete-layer";
+        let config_digest = sha256_id(config);
+        let layer_digest = sha256_id(layer);
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": config.len(),
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                "digest": layer_digest,
+                "size": layer.len(),
+            }],
+        });
+        let manifest_json = serde_json::to_vec(&manifest).unwrap();
+        let image_id = sha256_id(&manifest_json);
+
+        store
+            .write_manifest_json(&image_id, &manifest_json)
+            .unwrap();
+        store.write_config_json(&image_id, config).unwrap();
+
+        assert!(!store.is_cached_image_complete(&image_id).unwrap());
+
+        store
+            .write_layer_blob(
+                &layer_digest,
+                "application/vnd.oci.image.layer.v1.tar",
+                b"corrupt-layer!",
+            )
+            .unwrap();
+        assert_eq!(b"corrupt-layer!".len(), layer.len());
+        assert!(!store.is_cached_image_complete(&image_id).unwrap());
+
+        store
+            .write_layer_blob(
+                &layer_digest,
+                "application/vnd.oci.image.layer.v1.tar",
+                layer,
+            )
+            .unwrap();
+        assert!(store.is_cached_image_complete(&image_id).unwrap());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_layer_validation_and_resolution_use_descriptor_media_type() {
+        let root = unique_temp_dir("descriptor-media-type");
+        let store = ImageStore::new(root.clone());
+        store.ensure_layout().unwrap();
+
+        let config = b"{}";
+        let layer = b"gzip-layer";
+        let layer_digest = sha256_id(layer);
+        let layer_media_type = "application/vnd.oci.image.layer.v1.tar+gzip";
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": sha256_id(config),
+                "size": config.len(),
+            },
+            "layers": [{
+                "mediaType": layer_media_type,
+                "digest": layer_digest,
+                "size": layer.len(),
+            }],
+        });
+        let manifest_json = serde_json::to_vec(&manifest).unwrap();
+        let image_id = sha256_id(&manifest_json);
+        store
+            .write_manifest_json(&image_id, &manifest_json)
+            .unwrap();
+        store.write_config_json(&image_id, config).unwrap();
+
+        let stale_tar = store.layer_blob_path(&layer_digest, LayerMediaType::Tar);
+        fs::write(&stale_tar, b"stale data").unwrap();
+        store
+            .write_layer_blob(&layer_digest, layer_media_type, layer)
+            .unwrap();
+
+        assert!(store.is_cached_image_complete(&image_id).unwrap());
+        assert_eq!(
+            store
+                .resolve_layer_blob_path(&layer_digest, LayerMediaType::Gzip)
+                .unwrap(),
+            store.layer_blob_path(&layer_digest, LayerMediaType::Gzip)
+        );
+
+        fs::remove_file(store.layer_blob_path(&layer_digest, LayerMediaType::Gzip)).unwrap();
+        fs::write(stale_tar, layer).unwrap();
+        assert!(!store.is_cached_image_complete(&image_id).unwrap());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writing_repaired_layer_invalidates_unpacked_layer() {
+        let root = unique_temp_dir("invalidate-unpacked-layer");
+        let store = ImageStore::new(root.clone());
+        store.ensure_layout().unwrap();
+        let digest = sha256_id(b"repaired layer");
+        let unpacked = store.unpacked_layer_dir(&digest);
+        let done = unpacked.with_extension("done");
+        let temp = unpacked.with_extension("tmp");
+
+        fs::create_dir_all(&unpacked).unwrap();
+        fs::write(unpacked.join("stale"), b"stale rootfs").unwrap();
+        fs::write(&done, b"").unwrap();
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(temp.join("partial"), b"partial rootfs").unwrap();
+
+        store
+            .write_layer_blob(
+                &digest,
+                "application/vnd.oci.image.layer.v1.tar",
+                b"repaired layer",
+            )
+            .unwrap();
+
+        assert!(!unpacked.exists());
+        assert!(!done.exists());
+        assert!(!temp.exists());
+        assert_eq!(
+            fs::read(store.layer_blob_path(&digest, LayerMediaType::Tar)).unwrap(),
+            b"repaired layer"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_image_completeness_rejects_missing_or_invalid_config() {
+        let root = unique_temp_dir("incomplete-config");
+        let store = ImageStore::new(root.clone());
+        store.ensure_layout().unwrap();
+
+        let valid_config = b"{}";
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": sha256_id(valid_config),
+                "size": valid_config.len(),
+            },
+            "layers": [],
+        });
+        let manifest_json = serde_json::to_vec(&manifest).unwrap();
+        let image_id = sha256_id(&manifest_json);
+        store
+            .write_manifest_json(&image_id, &manifest_json)
+            .unwrap();
+
+        assert!(!store.is_cached_image_complete(&image_id).unwrap());
+
+        let corrupt_config = b"[]";
+        assert_eq!(corrupt_config.len(), valid_config.len());
+        assert!(serde_json::from_slice::<serde_json::Value>(corrupt_config).is_ok());
+        store.write_config_json(&image_id, corrupt_config).unwrap();
+        assert!(!store.is_cached_image_complete(&image_id).unwrap());
+
+        store.write_config_json(&image_id, valid_config).unwrap();
+        assert!(store.is_cached_image_complete(&image_id).unwrap());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_image_completeness_rejects_same_size_corrupt_manifest() {
+        let root = unique_temp_dir("corrupt-manifest");
+        let store = ImageStore::new(root.clone());
+        store.ensure_layout().unwrap();
+
+        let config = b"{}";
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": sha256_id(config),
+                "size": config.len(),
+            },
+            "layers": [],
+        });
+        let manifest_json = serde_json::to_vec(&manifest).unwrap();
+        let image_id = sha256_id(&manifest_json);
+        let mut corrupt_manifest = manifest_json.clone();
+        let media_type_offset = corrupt_manifest
+            .windows(b"application".len())
+            .position(|window| window == b"application")
+            .unwrap();
+        corrupt_manifest[media_type_offset] = b'b';
+
+        store
+            .write_manifest_json(&image_id, &corrupt_manifest)
+            .unwrap();
+        store.write_config_json(&image_id, config).unwrap();
+
+        assert_eq!(corrupt_manifest.len(), manifest_json.len());
+        assert!(serde_json::from_slice::<OciImageManifest>(&corrupt_manifest).is_ok());
+        assert!(!store.is_cached_image_complete(&image_id).unwrap());
 
         fs::remove_dir_all(root).unwrap();
     }
