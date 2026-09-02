@@ -44,6 +44,7 @@ const BUILDKIT_SETUP_TIMEOUT: Duration = Duration::from_secs(90);
 const BUILDKIT_BUILD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const BUILDKIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 const BUILDKIT_OCI_RUNTIME_SHIM_GUEST_PATH: &str = "/tmp/vz-buildkit-oci-runtime";
+const BUILDKIT_RUNTIME_EXEC_EVIDENCE_GUEST_PATH: &str = "/run/vz-buildkit-runtime-exec.tsv";
 const BUILDKIT_AUTH_TAG: &str = "buildkit-auth";
 const BUILDKIT_AUTH_GUEST_DIR: &str = "/mnt/buildkit-auth";
 const BUILDKIT_AUTH_GUEST_CONFIG: &str = "/mnt/buildkit-auth/config.json";
@@ -164,6 +165,10 @@ pub struct BuildkitRuntimeInventory {
     pub shim_target: String,
     /// Runtime executable invoked by the multicall shim.
     pub runtime_binary: String,
+    /// Runtime executable paths observed immediately before the multicall `exec`.
+    pub observed_runtime_paths: Vec<String>,
+    /// OCI subcommands observed immediately before the multicall `exec`.
+    pub observed_oci_subcommands: Vec<String>,
     /// Executable ELF paths that can serve as the guest OCI runtime.
     pub oci_runtime_elf_paths: Vec<String>,
     /// Forbidden legacy runtime paths found in guest runtime locations.

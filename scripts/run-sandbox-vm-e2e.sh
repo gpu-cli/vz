@@ -426,6 +426,41 @@ suite_test_name() {
     esac
 }
 
+validate_buildkit_runtime_inventory_evidence() {
+    local evidence_file="$1"
+
+    jq -e '
+        (type == "object") and
+        ((keys | sort) == ([
+            "buildkitd_executable",
+            "buildkitd_oci_worker_binary",
+            "cgroup_filesystem",
+            "forbidden_runtime_paths",
+            "observed_oci_subcommands",
+            "observed_runtime_paths",
+            "oci_runtime_elf_paths",
+            "oci_worker_binary",
+            "runtime_binary",
+            "runtime_version",
+            "shim_target"
+        ] | sort)) and
+        (.oci_worker_binary == "/tmp/vz-buildkit-oci-runtime") and
+        (.shim_target == "/usr/bin/vz-guest-agent") and
+        (.runtime_binary == "/mnt/linux-bin/youki") and
+        (.observed_runtime_paths == ["/mnt/linux-bin/youki"]) and
+        ((.observed_oci_subcommands | type) == "array") and
+        (all(.observed_oci_subcommands[]; type == "string")) and
+        (any(.observed_oci_subcommands[]; . == "create" or . == "run")) and
+        (.oci_runtime_elf_paths == ["/mnt/linux-bin/youki"]) and
+        (.forbidden_runtime_paths == []) and
+        ((.runtime_version | type) == "string") and
+        (.runtime_version | test("youki"; "i")) and
+        (.buildkitd_executable == "/mnt/buildkit-bin/buildkitd") and
+        (.buildkitd_oci_worker_binary == "/tmp/vz-buildkit-oci-runtime") and
+        (.cgroup_filesystem == "cgroup2")
+    ' "$evidence_file" >/dev/null
+}
+
 run_and_log() {
     local suite="$1"
     local label="$2"
@@ -440,6 +475,7 @@ run_and_log() {
     if [[ "$suite" == "buildkit" ]]; then
         local buildkit_dir="$RUN_DIR/buildkit-home"
         mkdir -p "$buildkit_dir"
+        rm -f "$BUILDKIT_RUNTIME_INVENTORY_EVIDENCE"
         cmd_env+=("VZ_BUILDKIT_DIR=$buildkit_dir")
         cmd_env+=("VZ_BUILDKIT_RUNTIME_INVENTORY_EVIDENCE=$BUILDKIT_RUNTIME_INVENTORY_EVIDENCE")
     fi
@@ -454,6 +490,14 @@ run_and_log() {
     if [[ $status -eq 0 ]] && grep -q "^running 0 tests$" "$log_file"; then
         echo "scenario/suite executed zero tests ($label/$suite); check scenario_test_filter mapping" >&2
         return 86
+    fi
+
+    if [[ $status -eq 0 ]] && [[ "$suite" == "buildkit" ]]; then
+        if ! validate_buildkit_runtime_inventory_evidence "$BUILDKIT_RUNTIME_INVENTORY_EVIDENCE"; then
+            echo "BuildKit runtime inventory evidence is missing, malformed, or violates the youki-only contract" >&2
+            return 87
+        fi
+        BUILDKIT_EVIDENCE_VALIDATED=true
     fi
 
     return "$status"
@@ -486,6 +530,7 @@ FAILED=()
 PASSED=()
 should_stop=false
 BUILDKIT_SUITE_RAN=false
+BUILDKIT_EVIDENCE_VALIDATED=false
 
 for suite in "${RESOLVED_SUITES[@]}"; do
     package="$(suite_package "$suite")" || err "unknown suite '$suite'"
@@ -545,7 +590,7 @@ for suite in "${RESOLVED_SUITES[@]}"; do
 done
 
 if [[ "$BUILDKIT_SUITE_RAN" == "true" ]]; then
-    if [[ -s "$BUILDKIT_RUNTIME_INVENTORY_EVIDENCE" ]]; then
+    if [[ "$BUILDKIT_EVIDENCE_VALIDATED" == "true" ]]; then
         echo "==> retained BuildKit runtime inventory: $BUILDKIT_RUNTIME_INVENTORY_EVIDENCE"
     else
         echo "==> BuildKit suite did not retain runtime inventory evidence" >&2
@@ -561,7 +606,7 @@ action_summary="$RUN_DIR/summary.txt"
 {
     echo "passed=${PASSED[*]:-none}"
     echo "failed=${FAILED[*]:-none}"
-    if [[ -s "$BUILDKIT_RUNTIME_INVENTORY_EVIDENCE" ]]; then
+    if [[ "$BUILDKIT_EVIDENCE_VALIDATED" == "true" ]]; then
         echo "buildkit_runtime_inventory=$BUILDKIT_RUNTIME_INVENTORY_EVIDENCE"
     else
         echo "buildkit_runtime_inventory=none"

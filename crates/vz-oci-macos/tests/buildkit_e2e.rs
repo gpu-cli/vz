@@ -86,6 +86,18 @@ async fn assert_and_retain_runtime_inventory(config: &RuntimeConfig) {
     assert_eq!(inventory.shim_target, "/usr/bin/vz-guest-agent");
     assert_eq!(inventory.runtime_binary, "/mnt/linux-bin/youki");
     assert_eq!(
+        inventory.observed_runtime_paths,
+        vec!["/mnt/linux-bin/youki".to_string()],
+        "execution evidence must show only youki"
+    );
+    assert!(
+        inventory
+            .observed_oci_subcommands
+            .iter()
+            .any(|command| matches!(command.as_str(), "create" | "run")),
+        "execution evidence must include a successful-build create/run invocation"
+    );
+    assert_eq!(
         inventory.oci_runtime_elf_paths,
         vec!["/mnt/linux-bin/youki".to_string()],
         "youki must be the only OCI runtime ELF in the BuildKit guest"

@@ -507,6 +507,7 @@ pub fn default_vz_linux_kernel_profile_capabilities(
             ]);
         }
         KernelProfile::Container => {
+            capabilities.insert(KernelCapability::CgroupBpf);
             capabilities.insert(KernelCapability::Nfsd);
             capabilities.insert(KernelCapability::ContainerSandbox);
         }
@@ -937,6 +938,7 @@ mod tests {
             KernelCapability::Netns,
             KernelCapability::Seccomp,
             KernelCapability::IoUring,
+            KernelCapability::CgroupBpf,
             KernelCapability::BtrfsSnapshots,
             KernelCapability::DeviceMapper,
             KernelCapability::DmCrypt,
@@ -967,6 +969,7 @@ mod tests {
             KernelCapability::Netns,
             KernelCapability::Seccomp,
             KernelCapability::IoUring,
+            KernelCapability::CgroupBpf,
             KernelCapability::BtrfsSnapshots,
             KernelCapability::DeviceMapper,
             KernelCapability::DmCrypt,
@@ -1002,6 +1005,7 @@ mod tests {
                 .contains(&KernelCapability::BtrfsSnapshots)
         );
         assert!(resolved.capabilities.contains(&KernelCapability::Nfsd));
+        assert!(resolved.capabilities.contains(&KernelCapability::CgroupBpf));
         assert!(resolved.capabilities.contains(&KernelCapability::IoUring));
         assert!(
             resolved
@@ -1099,6 +1103,7 @@ mod tests {
             LinuxError::MissingKernelCapabilities { ref missing }
                 if missing.contains(&KernelCapability::ContainerSandbox.as_str().to_string())
                     && missing.contains(&KernelCapability::Nfsd.as_str().to_string())
+                    && missing.contains(&KernelCapability::CgroupBpf.as_str().to_string())
         ));
     }
 

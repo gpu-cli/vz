@@ -307,7 +307,9 @@ per-run artifact directory so stale host cache state does not bleed across runs.
 The complete `buildkit` suite additionally retains the guest's OCI runtime
 inventory at `buildkit-runtime-inventory.txt` in the timestamped artifact
 directory. A missing or empty inventory is a suite failure, and `summary.txt`
-records the retained evidence path.
+records the retained evidence path. Before each BuildKit invocation the harness
+removes any prior evidence, then validates the JSON schema and its youki-only
+runtime, observed create/run, empty forbidden-path, daemon, and cgroup values.
 
 ## CI
 

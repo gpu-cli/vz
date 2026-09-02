@@ -15,6 +15,10 @@ pub(crate) mod network;
 mod process_table;
 
 use std::ffi::{OsStr, OsString};
+use std::fs::OpenOptions;
+use std::io::Write as _;
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -31,6 +35,7 @@ use crate::process_table::ProcessTable;
 
 const BUILDKIT_RUNTIME_SHIM_NAME: &str = "vz-buildkit-oci-runtime";
 const BUILDKIT_RUNTIME_BINARY: &str = "/mnt/linux-bin/youki";
+const BUILDKIT_RUNTIME_EXEC_EVIDENCE: &str = "/run/vz-buildkit-runtime-exec.tsv";
 
 /// Resource usage statistics collected from the guest OS.
 pub(crate) struct ResourceStats {
@@ -94,10 +99,56 @@ fn exec_buildkit_runtime(args: Vec<OsString>) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt as _;
 
     let args = buildkit_runtime_args(args);
+    append_buildkit_runtime_evidence(Path::new(BUILDKIT_RUNTIME_EXEC_EVIDENCE), &args)?;
     let error = std::process::Command::new(BUILDKIT_RUNTIME_BINARY)
         .args(args)
         .exec();
     Err(error).with_context(|| format!("failed to execute {BUILDKIT_RUNTIME_BINARY}"))
+}
+
+fn append_buildkit_runtime_evidence(path: &Path, args: &[OsString]) -> anyhow::Result<()> {
+    let command_index = oci_command_index(args)
+        .ok_or_else(|| anyhow::anyhow!("BuildKit OCI runtime invocation omitted a subcommand"))?;
+    let subcommand = args[command_index].as_os_str().as_bytes();
+    if subcommand.is_empty()
+        || subcommand
+            .iter()
+            .any(|byte| matches!(byte, b'|' | b'\n' | b'\r'))
+    {
+        anyhow::bail!("BuildKit OCI runtime subcommand cannot be recorded safely");
+    }
+
+    let mut record = Vec::with_capacity(BUILDKIT_RUNTIME_BINARY.len() + subcommand.len() + 2);
+    record.extend_from_slice(BUILDKIT_RUNTIME_BINARY.as_bytes());
+    record.push(b'|');
+    record.extend_from_slice(subcommand);
+    record.push(b'\n');
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "failed to open BuildKit runtime evidence at {}",
+                path.display()
+            )
+        })?;
+    let written = file.write(&record).with_context(|| {
+        format!(
+            "failed to append BuildKit runtime evidence at {}",
+            path.display()
+        )
+    })?;
+    if written != record.len() {
+        anyhow::bail!(
+            "short append to BuildKit runtime evidence at {}: wrote {written} of {} bytes",
+            path.display(),
+            record.len()
+        );
+    }
+    Ok(())
 }
 
 fn buildkit_runtime_args(mut args: Vec<OsString>) -> Vec<OsString> {
@@ -628,5 +679,46 @@ mod tests {
             OsString::from("container-id"),
         ];
         assert_eq!(buildkit_runtime_args(args.clone()), args);
+    }
+
+    #[test]
+    fn runtime_multicall_appends_target_and_actual_subcommand() {
+        let temp = tempfile::tempdir().unwrap();
+        let evidence = temp.path().join("runtime.tsv");
+
+        append_buildkit_runtime_evidence(
+            &evidence,
+            &[
+                OsString::from("--root"),
+                OsString::from("/run/youki"),
+                OsString::from("create"),
+                OsString::from("container-a"),
+            ],
+        )
+        .unwrap();
+        append_buildkit_runtime_evidence(
+            &evidence,
+            &[OsString::from("delete"), OsString::from("container-a")],
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(evidence).unwrap(),
+            "/mnt/linux-bin/youki|create\n/mnt/linux-bin/youki|delete\n"
+        );
+    }
+
+    #[test]
+    fn runtime_multicall_evidence_rejects_unstructured_subcommands() {
+        let temp = tempfile::tempdir().unwrap();
+        let evidence = temp.path().join("runtime.tsv");
+        let error = append_buildkit_runtime_evidence(
+            &evidence,
+            &[OsString::from("create\nforged=/tmp/runc")],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cannot be recorded safely"));
+        assert!(!evidence.exists());
     }
 }

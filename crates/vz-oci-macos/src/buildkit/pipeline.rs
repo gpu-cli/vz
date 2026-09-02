@@ -21,7 +21,7 @@ use vz::NetworkConfig;
 use vz::SharedDirConfig;
 use vz::protocol::{ExecEvent, ExecOutput};
 use vz_image::ImageStore;
-use vz_linux::{LinuxVm, LinuxVmConfig};
+use vz_linux::{KernelCapability, KernelPaths, LinuxVm, LinuxVmConfig};
 
 use crate::RuntimeConfig;
 use crate::buildkit_rawjson::BuildkitRawJsonStreamDecoder;
@@ -35,10 +35,10 @@ use super::common::{
 use super::{
     BUILD_OUTPUT_ARCHIVE, BUILDKIT_AUTH_GUEST_CONFIG, BUILDKIT_AUTH_GUEST_DIR, BUILDKIT_AUTH_TAG,
     BUILDKIT_BUILD_TIMEOUT, BUILDKIT_CACHE_KEEP_BYTES, BUILDKIT_CACHE_KEEP_DURATION,
-    BUILDKIT_OCI_RUNTIME_SHIM_GUEST_PATH, BUILDKIT_SETUP_TIMEOUT, BUILDKIT_SHUTDOWN_TIMEOUT,
-    BUILDKIT_SNAPSHOTTER, BUILDKIT_VM_MEMORY_MB, BUILDKITD_ADDR, BuildEvent, BuildLogStream,
-    BuildOutput, BuildProgress, BuildRequest, BuildResult, BuildkitError, BuildkitRuntimeInventory,
-    CachePruneOptions,
+    BUILDKIT_OCI_RUNTIME_SHIM_GUEST_PATH, BUILDKIT_RUNTIME_EXEC_EVIDENCE_GUEST_PATH,
+    BUILDKIT_SETUP_TIMEOUT, BUILDKIT_SHUTDOWN_TIMEOUT, BUILDKIT_SNAPSHOTTER, BUILDKIT_VM_MEMORY_MB,
+    BUILDKITD_ADDR, BuildEvent, BuildLogStream, BuildOutput, BuildProgress, BuildRequest,
+    BuildResult, BuildkitError, BuildkitRuntimeInventory, CachePruneOptions,
 };
 
 const BUILDKIT_VM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -675,26 +675,156 @@ if [ "$shim_target" != "/usr/bin/vz-guest-agent" ]; then
   exit 1
 fi
 
-if [ ! -x /mnt/linux-bin/youki ]; then
-  echo "youki is missing or not executable at /mnt/linux-bin/youki" >&2
+scratch="/tmp/vz-buildkit-runtime-inventory.$$"
+/bin/busybox rm -rf "$scratch"
+/bin/busybox mkdir -p "$scratch"
+trap '/bin/busybox rm -rf "$scratch"' EXIT
+observed_paths="$scratch/observed-paths"
+observed_subcommands="$scratch/observed-subcommands"
+candidate_paths="$scratch/candidate-paths"
+candidate_elf_paths="$scratch/candidate-elf-paths"
+forbidden_paths="$scratch/forbidden-paths"
+: >"$observed_paths"
+: >"$observed_subcommands"
+: >"$candidate_paths"
+: >"$candidate_elf_paths"
+: >"$forbidden_paths"
+
+if [ ! -s {BUILDKIT_RUNTIME_EXEC_EVIDENCE_GUEST_PATH} ]; then
+  echo "BuildKit runtime execution evidence is missing" >&2
   exit 1
 fi
-forbidden_runtime_paths=$(/bin/busybox find /mnt/buildkit-bin /mnt/linux-bin /tmp -maxdepth 1 -name '*runc*' -print)
-if [ -n "$forbidden_runtime_paths" ]; then
-  echo "forbidden legacy OCI runtime path found: $forbidden_runtime_paths" >&2
+
+saw_create_or_run=0
+while IFS='|' read -r target subcommand extra; do
+  if [ -z "$target" ] || [ -z "$subcommand" ] || [ -n "$extra" ]; then
+    echo "malformed BuildKit runtime execution evidence" >&2
+    exit 1
+  fi
+  /bin/busybox printf '%s\n' "$target" >>"$observed_paths"
+  /bin/busybox printf '%s\n' "$subcommand" >>"$observed_subcommands"
+  case "$subcommand" in
+    create|run) saw_create_or_run=1 ;;
+  esac
+done <{BUILDKIT_RUNTIME_EXEC_EVIDENCE_GUEST_PATH}
+/bin/busybox sort -u "$observed_paths" -o "$observed_paths"
+/bin/busybox sort -u "$observed_subcommands" -o "$observed_subcommands"
+
+if [ "$saw_create_or_run" -ne 1 ]; then
+  echo "BuildKit runtime evidence has no successful-build create/run observation" >&2
   exit 1
 fi
-runtime_version=$(/mnt/linux-bin/youki --version | /bin/busybox head -n 1)
+
+for path in $(/bin/busybox cat "$observed_paths"); do
+  if [ ! -f "$path" ] || [ ! -x "$path" ]; then
+    echo "observed OCI runtime is missing or not executable: $path" >&2
+    exit 1
+  fi
+  runtime_magic=$(/bin/busybox od -An -tx1 -N4 "$path" | /bin/busybox tr -d ' ')
+  if [ "$runtime_magic" != "7f454c46" ]; then
+    echo "observed OCI runtime is not an ELF executable: $path" >&2
+    exit 1
+  fi
+  /bin/busybox printf '%s\n' "$path" >>"$candidate_paths"
+done
+
+for root in /mnt/buildkit-bin /mnt/linux-bin /tmp /run /bin /sbin /usr/bin /usr/local/bin; do
+  if [ ! -e "$root" ]; then
+    continue
+  fi
+  /bin/busybox find "$root" -maxdepth 3 \( \
+    -name youki -o -name runc -o -name runc-real -o \
+    -name buildkit-runc -o -name crun \
+  \) -print >>"$candidate_paths"
+done
+
+for path in \
+  /mnt/buildkit-bin/buildkit-runc /mnt/buildkit-bin/runc /mnt/buildkit-bin/crun \
+  /mnt/linux-bin/runc /mnt/linux-bin/crun \
+  /tmp/buildkit-runc /tmp/runc /tmp/runc-real /tmp/crun \
+  /run/buildkit-runc /run/runc /run/runc-real /run/crun \
+  /bin/runc /bin/crun /sbin/runc /sbin/crun \
+  /usr/bin/runc /usr/bin/crun /usr/local/bin/runc /usr/local/bin/crun
+do
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    /bin/busybox printf '%s\n' "$path" >>"$candidate_paths"
+    /bin/busybox printf '%s\n' "$path" >>"$forbidden_paths"
+  fi
+done
+
+/bin/busybox sort -u "$candidate_paths" -o "$candidate_paths"
+while IFS= read -r path; do
+  base=$(/bin/busybox basename "$path")
+  case "$base" in
+    runc|runc-real|buildkit-runc|crun)
+      /bin/busybox printf '%s\n' "$path" >>"$forbidden_paths"
+      ;;
+  esac
+  if [ ! -f "$path" ] || [ ! -x "$path" ]; then
+    continue
+  fi
+  runtime_magic=$(/bin/busybox od -An -tx1 -N4 "$path" | /bin/busybox tr -d ' ')
+  if [ "$runtime_magic" = "7f454c46" ]; then
+    /bin/busybox printf '%s\n' "$path" >>"$candidate_elf_paths"
+  fi
+done <"$candidate_paths"
+
+for proc_dir in /proc/[0-9]*; do
+  [ -d "$proc_dir" ] || continue
+  pid=${{proc_dir##*/}}
+  [ "$pid" = "$$" ] && continue
+  executable=$(/bin/busybox readlink "$proc_dir/exe" 2>/dev/null || true)
+  if [ -n "$executable" ]; then
+    base=$(/bin/busybox basename "$executable")
+    case "$base" in
+      runc|runc-real|buildkit-runc|crun|runc\ \(deleted\)|runc-real\ \(deleted\)|buildkit-runc\ \(deleted\)|crun\ \(deleted\))
+        /bin/busybox printf 'proc:%s:exe:%s\n' "$pid" "$executable" >>"$forbidden_paths"
+        ;;
+    esac
+  fi
+  if [ -r "$proc_dir/cmdline" ]; then
+    if ! /bin/busybox tr '\000' '\n' <"$proc_dir/cmdline" >"$scratch/argv.$pid" 2>/dev/null; then
+      continue
+    fi
+    while IFS= read -r argument; do
+      argument_path=${{argument#*=}}
+      base=$(/bin/busybox basename "$argument_path")
+      case "$base" in
+        runc|runc-real|buildkit-runc|crun)
+          /bin/busybox printf 'proc:%s:argv:%s\n' "$pid" "$argument" >>"$forbidden_paths"
+          ;;
+      esac
+    done <"$scratch/argv.$pid"
+  fi
+done
+
+/bin/busybox sort -u "$candidate_elf_paths" -o "$candidate_elf_paths"
+/bin/busybox sort -u "$forbidden_paths" -o "$forbidden_paths"
+if [ -s "$forbidden_paths" ]; then
+  echo "forbidden OCI runtime paths/processes found:" >&2
+  /bin/busybox cat "$forbidden_paths" >&2
+  exit 1
+fi
+
+if [ "$(/bin/busybox wc -l <"$observed_paths" | /bin/busybox tr -d ' ')" != "1" ] || \
+   ! /bin/busybox grep -Fqx /mnt/linux-bin/youki "$observed_paths"; then
+  echo "observed OCI runtime set is not exactly /mnt/linux-bin/youki" >&2
+  /bin/busybox cat "$observed_paths" >&2
+  exit 1
+fi
+if [ "$(/bin/busybox wc -l <"$candidate_elf_paths" | /bin/busybox tr -d ' ')" != "1" ] || \
+   ! /bin/busybox grep -Fqx /mnt/linux-bin/youki "$candidate_elf_paths"; then
+  echo "candidate OCI runtime ELF set is not exactly /mnt/linux-bin/youki" >&2
+  /bin/busybox cat "$candidate_elf_paths" >&2
+  exit 1
+fi
+
+runtime_binary=$(/bin/busybox cat "$observed_paths")
+runtime_version=$("$runtime_binary" --version | /bin/busybox head -n 1)
 if [ -z "$runtime_version" ]; then
-  echo "youki returned an empty version identity" >&2
+  echo "observed youki runtime returned an empty version identity" >&2
   exit 1
 fi
-runtime_magic=$(/bin/busybox od -An -tx1 -N4 /mnt/linux-bin/youki | /bin/busybox tr -d ' ')
-if [ "$runtime_magic" != "7f454c46" ]; then
-  echo "youki is not an ELF executable" >&2
-  exit 1
-fi
-forbidden_runtime_paths=$(/bin/busybox find /mnt/buildkit-bin /mnt/linux-bin /tmp -maxdepth 1 -name '*runc*' -print)
 
 pid=$(/bin/busybox cat /tmp/buildkitd.pid)
 buildkitd_executable=$(/bin/busybox readlink "/proc/$pid/exe")
@@ -709,11 +839,19 @@ fi
 
 /bin/busybox printf 'oci_worker_binary=%s\n' '{BUILDKIT_OCI_RUNTIME_SHIM_GUEST_PATH}'
 /bin/busybox printf 'shim_target=%s\n' "$shim_target"
-/bin/busybox printf 'runtime_binary=%s\n' '/mnt/linux-bin/youki'
-/bin/busybox printf 'oci_runtime_elf_path=%s\n' '/mnt/linux-bin/youki'
-for path in $forbidden_runtime_paths; do
+/bin/busybox printf 'runtime_binary=%s\n' "$runtime_binary"
+while IFS= read -r path; do
+  /bin/busybox printf 'observed_runtime_path=%s\n' "$path"
+done <"$observed_paths"
+while IFS= read -r subcommand; do
+  /bin/busybox printf 'observed_oci_subcommand=%s\n' "$subcommand"
+done <"$observed_subcommands"
+while IFS= read -r path; do
+  /bin/busybox printf 'oci_runtime_elf_path=%s\n' "$path"
+done <"$candidate_elf_paths"
+while IFS= read -r path; do
   /bin/busybox printf 'forbidden_runtime_path=%s\n' "$path"
-done
+done <"$forbidden_paths"
 /bin/busybox printf 'runtime_version=%s\n' "$runtime_version"
 /bin/busybox printf 'buildkitd_executable=%s\n' "$buildkitd_executable"
 /bin/busybox printf 'buildkitd_oci_worker_binary=%s\n' '{BUILDKIT_OCI_RUNTIME_SHIM_GUEST_PATH}'
@@ -737,7 +875,9 @@ done
             stderr: output.stderr,
         });
     }
-    parse_buildkit_runtime_inventory(&output.stdout)
+    let inventory = parse_buildkit_runtime_inventory(&output.stdout)?;
+    validate_buildkit_runtime_inventory(&inventory)?;
+    Ok(inventory)
 }
 
 fn parse_buildkit_runtime_inventory(
@@ -771,6 +911,8 @@ fn parse_buildkit_runtime_inventory(
         oci_worker_binary: required("oci_worker_binary")?,
         shim_target: required("shim_target")?,
         runtime_binary: required("runtime_binary")?,
+        observed_runtime_paths: repeated("observed_runtime_path"),
+        observed_oci_subcommands: repeated("observed_oci_subcommand"),
         oci_runtime_elf_paths: repeated("oci_runtime_elf_path"),
         forbidden_runtime_paths: repeated("forbidden_runtime_path"),
         runtime_version: required("runtime_version")?,
@@ -778,6 +920,38 @@ fn parse_buildkit_runtime_inventory(
         buildkitd_oci_worker_binary: required("buildkitd_oci_worker_binary")?,
         cgroup_filesystem: required("cgroup_filesystem")?,
     })
+}
+
+fn validate_buildkit_runtime_inventory(
+    inventory: &BuildkitRuntimeInventory,
+) -> Result<(), BuildkitError> {
+    let expected_runtime = "/mnt/linux-bin/youki";
+    let expected_shim = BUILDKIT_OCI_RUNTIME_SHIM_GUEST_PATH;
+    let has_build_subcommand = inventory
+        .observed_oci_subcommands
+        .iter()
+        .any(|command| matches!(command.as_str(), "create" | "run"));
+    let valid = inventory.oci_worker_binary == expected_shim
+        && inventory.shim_target == "/usr/bin/vz-guest-agent"
+        && inventory.runtime_binary == expected_runtime
+        && inventory.observed_runtime_paths == [expected_runtime]
+        && has_build_subcommand
+        && inventory.oci_runtime_elf_paths == [expected_runtime]
+        && inventory.forbidden_runtime_paths.is_empty()
+        && inventory
+            .runtime_version
+            .to_ascii_lowercase()
+            .contains("youki")
+        && inventory.buildkitd_executable == "/mnt/buildkit-bin/buildkitd"
+        && inventory.buildkitd_oci_worker_binary == expected_shim
+        && inventory.cgroup_filesystem == "cgroup2";
+    if valid {
+        Ok(())
+    } else {
+        Err(BuildkitError::InvalidConfig(format!(
+            "BuildKit runtime inventory violates the youki-only contract: {inventory:?}"
+        )))
+    }
 }
 
 /// Prune BuildKit cache and return command output summary.
@@ -1054,6 +1228,32 @@ async fn cleanup_temp_dir(path: &Path, label: &str) {
     }
 }
 
+fn validate_buildkit_kernel_capabilities(kernel: &KernelPaths) -> Result<(), BuildkitError> {
+    validate_declared_buildkit_kernel_capabilities(kernel.version.capabilities.as_ref())
+}
+
+fn validate_declared_buildkit_kernel_capabilities(
+    capabilities: Option<&BTreeSet<KernelCapability>>,
+) -> Result<(), BuildkitError> {
+    let required = KernelCapability::CgroupBpf;
+    if capabilities.is_some_and(|capabilities| capabilities.contains(&required)) {
+        return Ok(());
+    }
+
+    Err(BuildkitError::InvalidConfig(format!(
+        "BuildKit kernel bundle is missing required capability '{}'",
+        required.as_str()
+    )))
+}
+
+async fn ensure_buildkit_kernel_for_config(
+    config: &RuntimeConfig,
+) -> Result<KernelPaths, BuildkitError> {
+    let kernel = ensure_kernel_for_config(config).await?;
+    validate_buildkit_kernel_capabilities(&kernel)?;
+    Ok(kernel)
+}
+
 async fn start_buildkit_vm(
     config: &RuntimeConfig,
     context_dir: Option<&Path>,
@@ -1063,7 +1263,7 @@ async fn start_buildkit_vm(
     ensure_virtualization_entitlement_preflight()?;
 
     let artifacts = ensure_buildkit_artifacts().await?;
-    let kernel = ensure_kernel_for_config(config).await?;
+    let kernel = ensure_buildkit_kernel_for_config(config).await?;
     let linux_bin_dir = kernel.youki.parent().map(Path::to_path_buf);
 
     let mut vm_config = LinuxVmConfig::new(kernel.kernel, kernel.initramfs);
@@ -1154,6 +1354,7 @@ async fn run_guest_build(
     on_event: &mut impl FnMut(BuildEvent),
 ) -> Result<(), BuildkitError> {
     ensure_guest_buildkit_ready(vm).await?;
+    clear_guest_buildkit_runtime_evidence(vm).await?;
 
     let mut args = vec![
         "build".to_string(),
@@ -1223,6 +1424,21 @@ async fn run_guest_build(
     }
 
     Ok(())
+}
+
+async fn clear_guest_buildkit_runtime_evidence(vm: &LinuxVm) -> Result<(), BuildkitError> {
+    run_guest_command(
+        vm,
+        "clear BuildKit OCI runtime execution evidence",
+        "/bin/busybox",
+        vec![
+            "rm".to_string(),
+            "-f".to_string(),
+            BUILDKIT_RUNTIME_EXEC_EVIDENCE_GUEST_PATH.to_string(),
+        ],
+        BUILDKIT_SETUP_TIMEOUT,
+    )
+    .await
 }
 
 async fn shutdown_guest_buildkitd(vm: &LinuxVm) -> Result<(), BuildkitError> {
@@ -1684,11 +1900,22 @@ mod tests {
     }
 
     #[test]
+    fn buildkit_kernel_requires_declared_cgroup_bpf_for_every_profile_selection() {
+        assert!(validate_declared_buildkit_kernel_capabilities(None).is_err());
+        assert!(validate_declared_buildkit_kernel_capabilities(Some(&BTreeSet::new())).is_err());
+        let capabilities = [KernelCapability::CgroupBpf].into_iter().collect();
+        assert!(validate_declared_buildkit_kernel_capabilities(Some(&capabilities)).is_ok());
+    }
+
+    #[test]
     fn runtime_inventory_parser_keeps_path_evidence() {
         let output = concat!(
             "oci_worker_binary=/tmp/vz-buildkit-oci-runtime\n",
             "shim_target=/usr/bin/vz-guest-agent\n",
             "runtime_binary=/mnt/linux-bin/youki\n",
+            "observed_runtime_path=/mnt/linux-bin/youki\n",
+            "observed_oci_subcommand=create\n",
+            "observed_oci_subcommand=delete\n",
             "oci_runtime_elf_path=/mnt/linux-bin/youki\n",
             "runtime_version=youki 0.5.5\n",
             "buildkitd_executable=/mnt/buildkit-bin/buildkitd\n",
@@ -1702,8 +1929,10 @@ mod tests {
             vec!["/mnt/linux-bin/youki"]
         );
         assert!(inventory.forbidden_runtime_paths.is_empty());
+        assert_eq!(inventory.observed_oci_subcommands, vec!["create", "delete"]);
         assert_eq!(inventory.shim_target, "/usr/bin/vz-guest-agent");
         assert_eq!(inventory.cgroup_filesystem, "cgroup2");
+        validate_buildkit_runtime_inventory(&inventory).unwrap();
     }
 
     #[test]
@@ -1712,6 +1941,8 @@ mod tests {
             "oci_worker_binary=/tmp/vz-buildkit-oci-runtime\n",
             "shim_target=/usr/bin/vz-guest-agent\n",
             "runtime_binary=/mnt/linux-bin/youki\n",
+            "observed_runtime_path=/mnt/linux-bin/youki\n",
+            "observed_oci_subcommand=run\n",
             "oci_runtime_elf_path=/mnt/linux-bin/youki\n",
             "forbidden_runtime_path=/tmp/runc-real\n",
             "forbidden_runtime_path=/mnt/buildkit-bin/buildkit-runc\n",
@@ -1726,6 +1957,26 @@ mod tests {
             inventory.forbidden_runtime_paths,
             vec!["/tmp/runc-real", "/mnt/buildkit-bin/buildkit-runc"]
         );
+        assert!(validate_buildkit_runtime_inventory(&inventory).is_err());
+    }
+
+    #[test]
+    fn runtime_inventory_requires_an_observed_create_or_run() {
+        let output = concat!(
+            "oci_worker_binary=/tmp/vz-buildkit-oci-runtime\n",
+            "shim_target=/usr/bin/vz-guest-agent\n",
+            "runtime_binary=/mnt/linux-bin/youki\n",
+            "observed_runtime_path=/mnt/linux-bin/youki\n",
+            "observed_oci_subcommand=delete\n",
+            "oci_runtime_elf_path=/mnt/linux-bin/youki\n",
+            "runtime_version=youki 0.5.5\n",
+            "buildkitd_executable=/mnt/buildkit-bin/buildkitd\n",
+            "buildkitd_oci_worker_binary=/tmp/vz-buildkit-oci-runtime\n",
+            "cgroup_filesystem=cgroup2\n",
+        );
+
+        let inventory = parse_buildkit_runtime_inventory(output).unwrap();
+        assert!(validate_buildkit_runtime_inventory(&inventory).is_err());
     }
 
     #[tokio::test]

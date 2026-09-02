@@ -18,7 +18,7 @@ DEFAULT_OUT_DIR := $(ROOT_DIR)/out/container
 KERNEL_BASE_CONFIG ?= allnoconfig
 KERNEL_CONFIG_FRAGMENT ?= $(ROOT_DIR)/vz-linux-container.config
 KERNEL_SECURITY_PROFILE ?= container-hardened
-KERNEL_CAPABILITIES ?= vsock virtiofs hvc0_serial ext4_root overlayfs netns seccomp io_uring btrfs_snapshots nfsd container_sandbox device_mapper dm_crypt
+KERNEL_CAPABILITIES ?= vsock virtiofs hvc0_serial ext4_root overlayfs netns seccomp io_uring cgroup_bpf btrfs_snapshots nfsd container_sandbox device_mapper dm_crypt
 else
 $(error unsupported KERNEL_PROFILE '$(KERNEL_PROFILE)'; expected developer or container)
 endif
