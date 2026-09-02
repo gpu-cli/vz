@@ -9,6 +9,8 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
+#[cfg(any(target_os = "linux", test))]
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
@@ -1077,10 +1079,43 @@ impl oci_service_server::OciService for OciServiceImpl {
         // Log bundle config for diagnostics.
         match tokio::fs::read_to_string(&config_path).await {
             Ok(config) => {
-                info!(container_id = %req.container_id, config = %config, "oci: bundle config")
+                info!(container_id = %req.container_id, config = %config, "oci: bundle config");
+
+                let mountinfo = tokio::fs::read_to_string("/proc/self/mountinfo")
+                    .await
+                    .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+                let diagnostic = inspect_oci_rootfs(&req.bundle_path, &config, &mountinfo)
+                    .map_err(|diagnostic| {
+                        error!(container_id = %req.container_id, %diagnostic, "oci: rootfs preflight failed");
+                        Status::failed_precondition(diagnostic)
+                    })?;
+                info!(
+                    container_id = %req.container_id,
+                    configured_rootfs = %diagnostic.configured.display(),
+                    resolved_rootfs = %diagnostic.resolved.display(),
+                    canonical_rootfs = %diagnostic.canonical.display(),
+                    mountinfo = %diagnostic.mountinfo,
+                    "oci: rootfs preflight passed"
+                );
+
+                ensure_youki_user_namespace_procfs(Path::new("/proc/self/uid_map")).map_err(
+                    |kernel_diagnostic| {
+                        let diagnostic = format!(
+                            "{kernel_diagnostic}; config.root.path={} canonical={} mountinfo={}",
+                            diagnostic.configured.display(),
+                            diagnostic.canonical.display(),
+                            diagnostic.mountinfo
+                        );
+                        error!(container_id = %req.container_id, %diagnostic, "oci: youki kernel preflight failed");
+                        Status::failed_precondition(diagnostic)
+                    },
+                )?;
             }
             Err(e) => {
-                error!(container_id = %req.container_id, error = %e, "oci: failed to read bundle config")
+                error!(container_id = %req.container_id, error = %e, "oci: failed to read bundle config");
+                return Err(Status::failed_precondition(format!(
+                    "OCI bundle preflight failed: cannot read {config_path}: {e}"
+                )));
             }
         }
 
@@ -1239,6 +1274,91 @@ impl oci_service_server::OciService for OciServiceImpl {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq, Eq)]
+struct OciRootfsDiagnostic {
+    configured: PathBuf,
+    resolved: PathBuf,
+    canonical: PathBuf,
+    mountinfo: String,
+}
+
+/// Resolve the OCI rootfs exactly as youki does and retain the governing
+/// mountinfo entry. This turns otherwise context-free ENOENT failures into an
+/// actionable guest diagnostic before youki forks its init process.
+#[cfg(any(target_os = "linux", test))]
+fn inspect_oci_rootfs(
+    bundle_path: &str,
+    config_json: &str,
+    mountinfo: &str,
+) -> Result<OciRootfsDiagnostic, String> {
+    let config: serde_json::Value = serde_json::from_str(config_json)
+        .map_err(|error| format!("OCI rootfs preflight failed: invalid config.json: {error}"))?;
+    let configured = config
+        .pointer("/root/path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| "OCI rootfs preflight failed: config.root.path is missing".to_string())?;
+    let resolved = if configured.is_absolute() {
+        configured.clone()
+    } else {
+        Path::new(bundle_path).join(&configured)
+    };
+    let governing_mount = governing_mountinfo_entry(mountinfo, &resolved)
+        .unwrap_or_else(|| "<no matching mountinfo entry>".to_string());
+    let canonical = std::fs::canonicalize(&resolved).map_err(|error| {
+        format!(
+            "OCI rootfs preflight failed: config.root.path={} resolved={} cannot be canonicalized: {error}; mountinfo={governing_mount}",
+            configured.display(),
+            resolved.display()
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(format!(
+            "OCI rootfs preflight failed: config.root.path={} canonical={} is not a directory; mountinfo={governing_mount}",
+            configured.display(),
+            canonical.display()
+        ));
+    }
+
+    Ok(OciRootfsDiagnostic {
+        configured,
+        resolved,
+        canonical,
+        mountinfo: governing_mount,
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn governing_mountinfo_entry(mountinfo: &str, path: &Path) -> Option<String> {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let mount_point = line.split_whitespace().nth(4)?;
+            let mount_point = Path::new(mount_point);
+            path.starts_with(mount_point)
+                .then(|| (mount_point.components().count(), line.to_string()))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, line)| line)
+}
+
+/// Youki 0.5.7 unconditionally probes this procfs file from its init process.
+/// It is absent when CONFIG_USER_NS is disabled, which youki reports only as
+/// `io error: ENOENT` and can easily be mistaken for a missing OCI rootfs.
+#[cfg(any(target_os = "linux", test))]
+fn ensure_youki_user_namespace_procfs(uid_map_path: &Path) -> Result<(), String> {
+    std::fs::read_to_string(uid_map_path)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "youki kernel preflight failed: {} is unavailable: {error}; the guest kernel must enable CONFIG_USER_NS=y",
+                uid_map_path.display()
+            )
+        })
+}
+
 /// Timeout for youki lifecycle commands (create, start, kill, delete).
 #[cfg(target_os = "linux")]
 const YOUKI_LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1268,6 +1388,9 @@ async fn run_youki(args: &[&str]) -> Result<(), Status> {
     let mut cmd = tokio::process::Command::new(YOUKI_BIN);
     cmd.arg("--root").arg(YOUKI_ROOT);
     cmd.arg("--log").arg(&log_file);
+    if *subcmd == "create" {
+        cmd.arg("--log-level").arg("debug");
+    }
     cmd.kill_on_drop(true);
     // Lifecycle commands (create, start) fork child processes that inherit
     // pipe FDs. Using null stdio ensures wait() returns as soon as the
@@ -1627,6 +1750,8 @@ async fn do_network_teardown(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -1702,5 +1827,57 @@ mod tests {
         assert!(sent.is_err());
         let control = mark_ordered_control(exec_id, "signal").await;
         assert!(control.is_none());
+    }
+
+    #[test]
+    fn oci_rootfs_preflight_reports_canonical_path_and_governing_mount() {
+        let bundle = tempfile::tempdir().expect("create bundle");
+        let rootfs = bundle.path().join("rootfs");
+        std::fs::create_dir(&rootfs).expect("create rootfs");
+        let config = r#"{"root":{"path":"rootfs"}}"#;
+        let mountinfo = format!(
+            "20 1 0:1 / / rw - rootfs rootfs rw\n21 20 0:2 / {} rw - tmpfs tmpfs rw",
+            bundle.path().display()
+        );
+
+        let diagnostic = inspect_oci_rootfs(
+            bundle.path().to_str().expect("UTF-8 bundle path"),
+            config,
+            &mountinfo,
+        )
+        .expect("valid rootfs");
+
+        assert_eq!(diagnostic.configured, PathBuf::from("rootfs"));
+        assert_eq!(diagnostic.resolved, rootfs);
+        assert_eq!(diagnostic.canonical, rootfs.canonicalize().unwrap());
+        assert!(diagnostic.mountinfo.contains(" 0:2 "));
+    }
+
+    #[test]
+    fn oci_rootfs_preflight_preserves_path_and_mountinfo_on_enoent() {
+        let bundle = tempfile::tempdir().expect("create bundle");
+        let config = r#"{"root":{"path":"missing"}}"#;
+        let mountinfo = "20 1 0:1 / / rw - rootfs rootfs rw";
+
+        let error = inspect_oci_rootfs(
+            bundle.path().to_str().expect("UTF-8 bundle path"),
+            config,
+            mountinfo,
+        )
+        .expect_err("missing rootfs must fail");
+
+        assert!(error.contains("config.root.path=missing"));
+        assert!(error.contains("cannot be canonicalized"));
+        assert!(error.contains("mountinfo=20 1 0:1 / / rw"));
+    }
+
+    #[test]
+    fn youki_kernel_preflight_names_user_namespace_requirement() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let error = ensure_youki_user_namespace_procfs(&temp.path().join("uid_map"))
+            .expect_err("missing uid_map must fail");
+
+        assert!(error.contains("CONFIG_USER_NS=y"));
+        assert!(error.contains("uid_map"));
     }
 }

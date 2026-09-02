@@ -3840,6 +3840,7 @@ dependencies = [
  "portable-pty",
  "prost",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
