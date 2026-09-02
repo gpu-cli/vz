@@ -16,6 +16,19 @@ We are shipping **real Docker inside the guest VM**: actual `dockerd` + `contain
 
 This is not the existing `vz docker` shim (a translation layer with strict guardrails, which stays for vz-native containers). It is the full-compat tier: zero workflow rewrite for anyone who already knows Docker.
 
+## Layering: youki stays the substrate
+
+Both runtimes ship, but they are not peers:
+
+- **youki = substrate.** Daemonless, boots with the initramfs, invoked directly by the guest agent. It powers `vz run`, `vz stack`, the Runtime V2 contract primitives, host-side digest-verified pulls, and `fs_quick` checkpoints. The ~3s boot and minimal adversarial surface are properties of this stack. All conformance work targets it. Untouched by the Docker wave.
+- **dockerd = facade.** Optional, provisioned on demand to the persistent disk (same class as the buildkitd precedent), lazily started on first Docker use, proxied over vsock. Its only job is verbatim `docker`/Compose/buildx compatibility. Never in the initramfs, never a dependency of vz-native flows.
+
+Single-runtime rule (committed): the guest runs exactly **one** OCI runtime — youki — and no other. containerd's runc-v2 shim accepts a `BinaryName` override (the mechanism Docker uses for crun); the facade configures containerd to invoke youki through it. If validation surfaces runc-compat gaps (shim stdio protocol, cgroup delegation, exit-code handling), we close them in youki rather than shipping ruc alongside: two runtimes in the guest is the maintenance and attack-surface cost this rule exists to prevent. The Docker wave adds daemons to the guest, never a second runtime.
+
+Rejected alternatives: dropping youki for dockerd-only (invalidates the Runtime V2 conformance work, regresses `vz run` latency, grows the permanent guest surface); building Docker-API compat shims on vz-runtimed (a compatibility treadmill — the value of real dockerd is verbatim behavior); shipping runc as a second guest runtime (violates the single-runtime rule — gaps close in youki, not beside it).
+
+The original reasons to avoid dockerd — initramfs size budget, no daemon dependencies, `MEMCG=n`, a host-side pull model — still hold for the native path. They never blocked a compat tier, which is why dockerd ships as a facade and only a facade.
+
 ## The invariant nobody can copy without changing their product
 
 The host runs three things, ever:
