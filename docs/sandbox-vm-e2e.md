@@ -304,6 +304,10 @@ The harness signs:
 
 For BuildKit suites/scenarios, the harness also sets `VZ_BUILDKIT_DIR` to a
 per-run artifact directory so stale host cache state does not bleed across runs.
+The complete `buildkit` suite additionally retains the guest's OCI runtime
+inventory at `buildkit-runtime-inventory.txt` in the timestamped artifact
+directory. A missing or empty inventory is a suite failure, and `summary.txt`
+records the retained evidence path.
 
 ## CI
 

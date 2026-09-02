@@ -77,6 +77,54 @@ fn build_request(context_dir: PathBuf, tag: String) -> BuildRequest {
     }
 }
 
+async fn assert_and_retain_runtime_inventory(config: &RuntimeConfig) {
+    let inventory = vz_oci_macos::buildkit::buildkit_runtime_inventory(config)
+        .await
+        .expect("inspect retained BuildKit guest runtime inventory");
+
+    assert_eq!(inventory.oci_worker_binary, "/tmp/vz-buildkit-oci-runtime");
+    assert_eq!(inventory.shim_target, "/usr/bin/vz-guest-agent");
+    assert_eq!(inventory.runtime_binary, "/mnt/linux-bin/youki");
+    assert_eq!(
+        inventory.oci_runtime_elf_paths,
+        vec!["/mnt/linux-bin/youki".to_string()],
+        "youki must be the only OCI runtime ELF in the BuildKit guest"
+    );
+    assert!(
+        inventory.forbidden_runtime_paths.is_empty(),
+        "forbidden runc paths remain in the BuildKit guest: {:?}",
+        inventory.forbidden_runtime_paths
+    );
+    assert!(
+        inventory
+            .runtime_version
+            .to_ascii_lowercase()
+            .contains("youki"),
+        "unexpected OCI runtime identity: {}",
+        inventory.runtime_version
+    );
+    assert_eq!(
+        inventory.buildkitd_executable,
+        "/mnt/buildkit-bin/buildkitd"
+    );
+    assert_eq!(
+        inventory.buildkitd_oci_worker_binary,
+        "/tmp/vz-buildkit-oci-runtime"
+    );
+    assert_eq!(inventory.cgroup_filesystem, "cgroup2");
+
+    if let Some(path) = std::env::var_os("VZ_BUILDKIT_RUNTIME_INVENTORY_EVIDENCE") {
+        let mut evidence = serde_json::to_string_pretty(&inventory).expect("serialize inventory");
+        evidence.push('\n');
+        std::fs::write(&path, evidence).unwrap_or_else(|error| {
+            panic!(
+                "write BuildKit runtime inventory evidence to {}: {error}",
+                PathBuf::from(path).display()
+            )
+        });
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires Apple Silicon + Linux kernel artifacts + network"]
 async fn buildkit_builds_dockerfile_and_run_uses_built_image() {
@@ -109,6 +157,8 @@ CMD ["cat", "/message.txt"]
         .image_id
         .expect("vz store output should produce local image ID");
     assert!(!image_id.0.is_empty());
+
+    assert_and_retain_runtime_inventory(&config).await;
 
     let runtime = Runtime::new(config);
     let output = runtime.run(&tag, RunConfig::default()).await.unwrap();

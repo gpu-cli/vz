@@ -323,6 +323,7 @@ timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_DIR="$OUTPUT_ROOT/$timestamp"
 mkdir -p "$RUN_DIR"
 ln -sfn "$timestamp" "$OUTPUT_ROOT/latest"
+BUILDKIT_RUNTIME_INVENTORY_EVIDENCE="$RUN_DIR/buildkit-runtime-inventory.txt"
 
 BUILD_ARGS=()
 if [[ "$PROFILE" == "release" ]]; then
@@ -440,6 +441,7 @@ run_and_log() {
         local buildkit_dir="$RUN_DIR/buildkit-home"
         mkdir -p "$buildkit_dir"
         cmd_env+=("VZ_BUILDKIT_DIR=$buildkit_dir")
+        cmd_env+=("VZ_BUILDKIT_RUNTIME_INVENTORY_EVIDENCE=$BUILDKIT_RUNTIME_INVENTORY_EVIDENCE")
     fi
 
     echo "running [$label/$suite]: $binary ${args[*]}"
@@ -483,6 +485,7 @@ sign_binary "$guest_agent_binary"
 FAILED=()
 PASSED=()
 should_stop=false
+BUILDKIT_SUITE_RAN=false
 
 for suite in "${RESOLVED_SUITES[@]}"; do
     package="$(suite_package "$suite")" || err "unknown suite '$suite'"
@@ -520,6 +523,9 @@ for suite in "${RESOLVED_SUITES[@]}"; do
             fi
         done
     else
+        if [[ "$suite" == "buildkit" ]]; then
+            BUILDKIT_SUITE_RAN=true
+        fi
         if run_and_log "$suite" "$suite" "$test_binary" "${RUN_ARGS[@]}"; then
             echo "==> suite passed: $suite"
             PASSED+=("$suite")
@@ -538,6 +544,15 @@ for suite in "${RESOLVED_SUITES[@]}"; do
     fi
 done
 
+if [[ "$BUILDKIT_SUITE_RAN" == "true" ]]; then
+    if [[ -s "$BUILDKIT_RUNTIME_INVENTORY_EVIDENCE" ]]; then
+        echo "==> retained BuildKit runtime inventory: $BUILDKIT_RUNTIME_INVENTORY_EVIDENCE"
+    else
+        echo "==> BuildKit suite did not retain runtime inventory evidence" >&2
+        FAILED+=("buildkit-runtime-inventory:87")
+    fi
+fi
+
 echo "==> summary"
 echo "passed: ${PASSED[*]:-none}"
 echo "failed: ${FAILED[*]:-none}"
@@ -546,6 +561,11 @@ action_summary="$RUN_DIR/summary.txt"
 {
     echo "passed=${PASSED[*]:-none}"
     echo "failed=${FAILED[*]:-none}"
+    if [[ -s "$BUILDKIT_RUNTIME_INVENTORY_EVIDENCE" ]]; then
+        echo "buildkit_runtime_inventory=$BUILDKIT_RUNTIME_INVENTORY_EVIDENCE"
+    else
+        echo "buildkit_runtime_inventory=none"
+    fi
 } > "$action_summary"
 
 if [[ ${#FAILED[@]} -gt 0 ]]; then

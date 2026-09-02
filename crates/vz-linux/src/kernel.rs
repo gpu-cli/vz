@@ -82,6 +82,8 @@ pub enum KernelCapability {
     Seccomp,
     /// `io_uring` asynchronous I/O interface support.
     IoUring,
+    /// Cgroup BPF attachment backed by the BPF syscall.
+    CgroupBpf,
     /// Nested virtualization support through `/dev/kvm`.
     NestedVirt,
     /// TUN/TAP support through `/dev/net/tun`.
@@ -110,6 +112,7 @@ impl KernelCapability {
             Self::Netns => "netns",
             Self::Seccomp => "seccomp",
             Self::IoUring => "io_uring",
+            Self::CgroupBpf => "cgroup_bpf",
             Self::NestedVirt => "nested_virt",
             Self::Tun => "tun",
             Self::BtrfsSnapshots => "btrfs_snapshots",
@@ -497,7 +500,11 @@ pub fn default_vz_linux_kernel_profile_capabilities(
     ]);
     match profile {
         KernelProfile::Developer => {
-            capabilities.extend([KernelCapability::NestedVirt, KernelCapability::Tun]);
+            capabilities.extend([
+                KernelCapability::CgroupBpf,
+                KernelCapability::NestedVirt,
+                KernelCapability::Tun,
+            ]);
         }
         KernelProfile::Container => {
             capabilities.insert(KernelCapability::Nfsd);
@@ -1092,6 +1099,50 @@ mod tests {
             LinuxError::MissingKernelCapabilities { ref missing }
                 if missing.contains(&KernelCapability::ContainerSandbox.as_str().to_string())
                     && missing.contains(&KernelCapability::Nfsd.as_str().to_string())
+        ));
+    }
+
+    #[tokio::test]
+    async fn ensure_developer_profile_rejects_bundle_without_cgroup_bpf() {
+        let temp = tempdir().expect("tempdir");
+        let install = temp.path().join("linux/developer");
+        let expected = env!("CARGO_PKG_VERSION").to_string();
+        write_artifacts_with_checksums(&install, expected, true).await;
+        write_artifact_profile(&install, KernelProfile::Developer).await;
+
+        let mut version: KernelVersion = serde_json::from_str(
+            &tokio::fs::read_to_string(install.join(VERSION_FILE))
+                .await
+                .expect("read version"),
+        )
+        .expect("parse version");
+        version
+            .capabilities
+            .as_mut()
+            .expect("developer capabilities")
+            .remove(&KernelCapability::CgroupBpf);
+        tokio::fs::write(
+            install.join(VERSION_FILE),
+            serde_json::to_string_pretty(&version).expect("version json"),
+        )
+        .await
+        .expect("write version");
+
+        let err = ensure_kernel_profile_with_options(
+            KernelProfile::Developer,
+            EnsureKernelOptions {
+                install_dir: Some(install),
+                bundle_dir: None,
+                require_exact_agent_version: true,
+            },
+        )
+        .await
+        .expect_err("must reject a stale developer bundle before boot");
+
+        assert!(matches!(
+            err,
+            LinuxError::MissingKernelCapabilities { ref missing }
+                if missing == &[KernelCapability::CgroupBpf.as_str().to_string()]
         ));
     }
 
