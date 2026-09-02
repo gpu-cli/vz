@@ -18,13 +18,17 @@ use axum::{
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use vz_api::{ApiConfig, router};
-use vz_runtime_contract::RuntimeCapabilities;
+use vz_runtime_contract::{
+    RuntimeCapabilities, SANDBOX_LABEL_PROJECT_DIR, SANDBOX_LABEL_SPACE_MODE,
+    SANDBOX_SPACE_MODE_REQUIRED,
+};
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed::{RuntimeDaemon, RuntimedConfig, serve_runtime_uds_with_shutdown};
 use vz_runtimed_client::{DaemonClient, DaemonClientConfig};
 
 #[derive(Debug, Serialize)]
 struct CreateSandboxRequest {
+    project_dir: PathBuf,
     cpus: u8,
     memory_mb: u64,
     labels: BTreeMap<String, String>,
@@ -166,17 +170,24 @@ async fn start_api_server(
     Ok((format!("http://{address}"), shutdown_tx, server))
 }
 
-async fn create_sandbox_via_api(api_base_url: &str) -> Result<String> {
+async fn create_sandbox_via_api(api_base_url: &str, project_dir: &Path) -> Result<String> {
     let client = reqwest::Client::new();
     let response = client
         .post(format!("{api_base_url}/v1/sandboxes"))
         .json(&CreateSandboxRequest {
+            project_dir: project_dir.to_path_buf(),
             cpus: 2,
             memory_mb: 512,
-            labels: BTreeMap::from([(
-                "vz.sandbox.base_image_ref".to_string(),
-                "alpine:3.20".to_string(),
-            )]),
+            labels: BTreeMap::from([
+                (
+                    "vz.sandbox.base_image_ref".to_string(),
+                    "alpine:3.20".to_string(),
+                ),
+                (
+                    "vz.test.skip_btrfs_preflight".to_string(),
+                    "true".to_string(),
+                ),
+            ]),
         })
         .send()
         .await
@@ -653,7 +664,7 @@ async fn cli_api_http_mode_end_to_end_sandbox_and_attach_flow() -> Result<()> {
     let (api_base_url, api_shutdown_tx, api_server) =
         start_api_server(state_store_path.clone(), daemon_socket_path).await?;
 
-    let sandbox_id = create_sandbox_via_api(&api_base_url).await?;
+    let sandbox_id = create_sandbox_via_api(&api_base_url, temp_dir.path()).await?;
     let vz_bin = resolve_vz_binary()?;
 
     let image_ls_output =
@@ -1475,7 +1486,16 @@ async fn cli_daemon_grpc_linux_save_restore_commands_cover_happy_path_and_errors
             stack_name: "cli-linux-save-restore".to_string(),
             cpus: 1,
             memory_mb: 256,
-            labels: HashMap::new(),
+            labels: HashMap::from([
+                (
+                    SANDBOX_LABEL_PROJECT_DIR.to_string(),
+                    temp_dir.path().to_string_lossy().into_owned(),
+                ),
+                (
+                    SANDBOX_LABEL_SPACE_MODE.to_string(),
+                    SANDBOX_SPACE_MODE_REQUIRED.to_string(),
+                ),
+            ]),
             ..Default::default()
         })
         .await

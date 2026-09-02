@@ -670,7 +670,19 @@ fn sandbox_workspace_volume_mount(
             BTreeMap::new(),
         )));
     }
-    enforce_spaces_workspace_storage_preflight(&host_path, request_id)?;
+    // The feature-backed mock runtime has no host filesystem to inspect. Tests
+    // opt in explicitly after the path existence/type checks above; production
+    // builds cannot observe this label because the feature is disabled.
+    #[cfg(feature = "test-backend")]
+    let skip_btrfs_preflight = labels
+        .get("vz.test.skip_btrfs_preflight")
+        .is_some_and(|value| value == "true");
+    #[cfg(not(feature = "test-backend"))]
+    let skip_btrfs_preflight = false;
+
+    if !skip_btrfs_preflight {
+        enforce_spaces_workspace_storage_preflight(&host_path, request_id)?;
+    }
 
     Ok(Some(StackVolumeMount {
         tag: "vz-mount-0".to_string(),

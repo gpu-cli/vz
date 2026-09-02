@@ -328,7 +328,10 @@ async fn sandbox_create_requires_daemon_when_legacy_fallback_disabled() {
                 .method("POST")
                 .uri("/v1/sandboxes")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"stack_name":"stack-daemon-only"}"#))
+                .body(Body::from(sandbox_create_body(
+                    temp_dir.path(),
+                    serde_json::json!({"stack_name": "stack-daemon-only"}),
+                )))
                 .unwrap(),
         )
         .await
@@ -765,6 +768,26 @@ fn test_router() -> (Router, tempfile::TempDir) {
     (app, temp_dir)
 }
 
+fn sandbox_create_body(project_dir: &Path, mut body: serde_json::Value) -> String {
+    let object = body
+        .as_object_mut()
+        .expect("sandbox create fixture must be a JSON object");
+    object.insert(
+        "project_dir".to_string(),
+        serde_json::Value::String(project_dir.to_string_lossy().into_owned()),
+    );
+    object
+        .entry("labels")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .expect("sandbox create fixture labels must be a JSON object")
+        .insert(
+            "vz.test.skip_btrfs_preflight".to_string(),
+            serde_json::Value::String("true".to_string()),
+        );
+    body.to_string()
+}
+
 #[tokio::test]
 async fn sandbox_create_requires_project_dir_label() {
     let (app, _dir) = test_router();
@@ -1044,9 +1067,13 @@ async fn container_create_uses_sandbox_startup_defaults_when_image_omitted() {
                 .method("POST")
                 .uri("/v1/sandboxes")
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"base_image_ref":"alpine:3.20","main_container":"workspace-main"}"#,
-                ))
+                .body(Body::from(sandbox_create_body(
+                    temp_dir.path(),
+                    serde_json::json!({
+                        "base_image_ref": "alpine:3.20",
+                        "main_container": "workspace-main"
+                    }),
+                )))
                 .unwrap(),
         )
         .await
@@ -1114,9 +1141,13 @@ async fn container_create_preserves_explicit_overrides_when_sandbox_defaults_exi
                 .method("POST")
                 .uri("/v1/sandboxes")
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"base_image_ref":"alpine:3.20","main_container":"workspace-main"}"#,
-                ))
+                .body(Body::from(sandbox_create_body(
+                    temp_dir.path(),
+                    serde_json::json!({
+                        "base_image_ref": "alpine:3.20",
+                        "main_container": "workspace-main"
+                    }),
+                )))
                 .unwrap(),
         )
         .await
@@ -1178,7 +1209,7 @@ async fn container_create_preserves_explicit_overrides_when_sandbox_defaults_exi
 
 #[tokio::test]
 async fn sandbox_terminate() {
-    let (app, _dir) = test_router();
+    let (app, dir) = test_router();
 
     // Create a sandbox
     let create_response = app
@@ -1188,7 +1219,10 @@ async fn sandbox_terminate() {
                 .method("POST")
                 .uri("/v1/sandboxes")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{}"#))
+                .body(Body::from(sandbox_create_body(
+                    dir.path(),
+                    serde_json::json!({}),
+                )))
                 .unwrap(),
         )
         .await
@@ -1228,7 +1262,7 @@ async fn sandbox_terminate() {
         "expected terminal state, got {state}"
     );
 
-    // GET should still return it in terminal state
+    // Termination removes runtime state so the sandbox ID can be reused.
     let get_response = app
         .oneshot(
             Request::builder()
@@ -1238,17 +1272,7 @@ async fn sandbox_terminate() {
         )
         .await
         .unwrap();
-    assert_eq!(get_response.status(), StatusCode::OK);
-
-    let get_body = to_bytes(get_response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let get_payload: serde_json::Value = serde_json::from_slice(&get_body).unwrap();
-    let final_state = get_payload["sandbox"]["state"].as_str().unwrap();
-    assert!(
-        final_state == "failed" || final_state == "terminated",
-        "expected terminal state after GET, got {final_state}"
-    );
+    assert_eq!(get_response.status(), StatusCode::NOT_FOUND);
 }
 
 fn test_config_with_resize(state_store_path: PathBuf) -> ApiConfig {
@@ -2671,7 +2695,7 @@ async fn authz_sandbox_terminate_nonexistent_returns_404() {
 
 #[tokio::test]
 async fn authz_sandbox_operations_scoped_to_id() {
-    let (app, _dir) = test_router();
+    let (app, dir) = test_router();
 
     // Create a sandbox
     let create_resp = app
@@ -2681,7 +2705,10 @@ async fn authz_sandbox_operations_scoped_to_id() {
                 .method("POST")
                 .uri("/v1/sandboxes")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"cpus": 1}"#))
+                .body(Body::from(sandbox_create_body(
+                    dir.path(),
+                    serde_json::json!({"cpus": 1}),
+                )))
                 .unwrap(),
         )
         .await
@@ -3151,7 +3178,10 @@ async fn authz_idempotency_key_replay_returns_cached_response() {
     StateStore::open(&state_path).unwrap();
 
     let app = router(test_config(state_path));
-    let body_bytes = r#"{"cpus": 2, "memory_mb": 512}"#;
+    let body = sandbox_create_body(
+        temp_dir.path(),
+        serde_json::json!({"cpus": 2, "memory_mb": 512}),
+    );
 
     // First request with idempotency key
     let first_resp = app
@@ -3162,7 +3192,7 @@ async fn authz_idempotency_key_replay_returns_cached_response() {
                 .uri("/v1/sandboxes")
                 .header("content-type", "application/json")
                 .header("idempotency-key", "test-key-alpha")
-                .body(Body::from(body_bytes))
+                .body(Body::from(body.clone()))
                 .unwrap(),
         )
         .await
@@ -3184,7 +3214,7 @@ async fn authz_idempotency_key_replay_returns_cached_response() {
                 .uri("/v1/sandboxes")
                 .header("content-type", "application/json")
                 .header("idempotency-key", "test-key-alpha")
-                .body(Body::from(body_bytes))
+                .body(Body::from(body))
                 .unwrap(),
         )
         .await
@@ -3219,7 +3249,10 @@ async fn authz_idempotency_key_conflict_returns_409() {
                 .uri("/v1/sandboxes")
                 .header("content-type", "application/json")
                 .header("idempotency-key", "test-key-beta")
-                .body(Body::from(r#"{"cpus": 1}"#))
+                .body(Body::from(sandbox_create_body(
+                    temp_dir.path(),
+                    serde_json::json!({"cpus": 1}),
+                )))
                 .unwrap(),
         )
         .await
@@ -3234,7 +3267,10 @@ async fn authz_idempotency_key_conflict_returns_409() {
                 .uri("/v1/sandboxes")
                 .header("content-type", "application/json")
                 .header("idempotency-key", "test-key-beta")
-                .body(Body::from(r#"{"cpus": 4}"#))
+                .body(Body::from(sandbox_create_body(
+                    temp_dir.path(),
+                    serde_json::json!({"cpus": 4}),
+                )))
                 .unwrap(),
         )
         .await
@@ -3646,7 +3682,7 @@ async fn observability_metrics_endpoint_reports_http_counters() {
 
 #[tokio::test]
 async fn authz_mutating_operations_generate_receipt_header() {
-    let (app, _dir) = test_router();
+    let (app, dir) = test_router();
 
     // Create a sandbox and verify receipt header is present.
     let response = app
@@ -3656,7 +3692,10 @@ async fn authz_mutating_operations_generate_receipt_header() {
                 .method("POST")
                 .uri("/v1/sandboxes")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"cpus": 1}"#))
+                .body(Body::from(sandbox_create_body(
+                    dir.path(),
+                    serde_json::json!({"cpus": 1}),
+                )))
                 .unwrap(),
         )
         .await
@@ -3831,7 +3870,9 @@ async fn throughput_sequential_create_sandbox() {
         let body = serde_json::to_vec(&serde_json::json!({
             "stack_name": format!("stack-{i}"),
             "cpus": 2,
-            "memory_mb": 512
+            "memory_mb": 512,
+            "project_dir": temp_dir.path(),
+            "labels": {"vz.test.skip_btrfs_preflight": "true"}
         }))
         .unwrap();
 

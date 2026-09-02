@@ -159,7 +159,12 @@ async fn sandbox_crud_over_http() -> Result<()> {
     let create_response = client
         .post(format!("{base}/v1/sandboxes"))
         .header("content-type", "application/json")
-        .body(r#"{"cpus":2,"memory_mb":512}"#)
+        .json(&serde_json::json!({
+            "cpus": 2,
+            "memory_mb": 512,
+            "project_dir": temp_dir.path(),
+            "labels": {"vz.test.skip_btrfs_preflight": "true"}
+        }))
         .send()
         .await
         .context("POST /v1/sandboxes")?;
@@ -284,7 +289,12 @@ async fn file_service_round_trip_over_http() -> Result<()> {
     let create_response = client
         .post(format!("{base}/v1/sandboxes"))
         .header("content-type", "application/json")
-        .body(r#"{"cpus":2,"memory_mb":512}"#)
+        .json(&serde_json::json!({
+            "cpus": 2,
+            "memory_mb": 512,
+            "project_dir": temp_dir.path(),
+            "labels": {"vz.test.skip_btrfs_preflight": "true"}
+        }))
         .send()
         .await
         .context("POST /v1/sandboxes")?;
