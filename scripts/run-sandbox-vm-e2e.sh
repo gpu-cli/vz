@@ -302,6 +302,10 @@ if ! command -v codesign >/dev/null 2>&1; then
     err "codesign not found in PATH"
 fi
 
+if ! command -v jq >/dev/null 2>&1; then
+    err "jq not found in PATH (required to resolve Cargo build artifacts)"
+fi
+
 if [[ ! -f "$ENTITLEMENTS" ]]; then
     err "entitlements plist not found at $ENTITLEMENTS"
 fi
@@ -324,7 +328,50 @@ BUILD_ARGS=()
 if [[ "$PROFILE" == "release" ]]; then
     BUILD_ARGS+=(--release)
 fi
-TARGET_DIR="$REPO_ROOT/crates/target/$PROFILE"
+
+run_cargo_recording_artifacts() {
+    local artifact_log="$1"
+    shift
+
+    # Cargo is the source of truth for artifact locations. This matters when
+    # build.build-dir separates build outputs from the configured target-dir.
+    (
+        cd "$REPO_ROOT/crates"
+        cargo "$@" --message-format=json-render-diagnostics
+    ) | tee "$artifact_log" \
+        | jq --unbuffered -r \
+            'select(.reason == "compiler-message") | .message.rendered // empty' >&2
+}
+
+resolve_cargo_executable() {
+    local artifact_log="$1"
+    local target_name="$2"
+    local target_kind="$3"
+
+    jq -ers \
+        --arg target_name "$target_name" \
+        --arg target_kind "$target_kind" \
+        '
+            [
+                .[]
+                | select(
+                    .reason == "compiler-artifact"
+                    and .target.name == $target_name
+                    and (.target.kind | index($target_kind)) != null
+                    and .executable != null
+                )
+                | .executable
+            ]
+            | unique
+            | if length == 1 then
+                .[0]
+              elif length == 0 then
+                error("Cargo did not report an executable for \($target_kind) target \($target_name)")
+              else
+                error("Cargo reported multiple executables for \($target_kind) target \($target_name): \(.)")
+              end
+        ' "$artifact_log"
+}
 
 sign_binary() {
     local binary="$1"
@@ -342,28 +389,6 @@ sign_binary() {
     echo "signing: $binary"
     codesign "${args[@]}" "$binary"
     codesign --verify --verbose "$binary"
-}
-
-find_test_binary() {
-    local test_name="$1"
-    local best=""
-
-    shopt -s nullglob
-    local candidate
-    for candidate in "$TARGET_DIR"/deps/"$test_name"-*; do
-        if [[ -f "$candidate" && -x "$candidate" ]]; then
-            if [[ -z "$best" || "$candidate" -nt "$best" ]]; then
-                best="$candidate"
-            fi
-        fi
-    done
-    shopt -u nullglob
-
-    if [[ -z "$best" ]]; then
-        return 1
-    fi
-
-    echo "$best"
 }
 
 suite_package() {
@@ -429,7 +454,7 @@ run_and_log() {
         return 86
     fi
 
-    return $status
+    return "$status"
 }
 
 echo "==> output directory: $RUN_DIR"
@@ -443,17 +468,17 @@ echo "==> output directory: $RUN_DIR"
 } > "$RUN_DIR/run-info.txt"
 
 echo "==> building host binaries required for local VM flows"
-(
-    cd "$REPO_ROOT/crates"
-    cargo build "${BUILD_ARGS[@]}" -p vz-cli -p vz-guest-agent
-)
+host_artifact_log="$RUN_DIR/host-build-artifacts.jsonl"
+run_cargo_recording_artifacts "$host_artifact_log" \
+    build "${BUILD_ARGS[@]}" -p vz-cli -p vz-guest-agent
 
-if [[ -f "$TARGET_DIR/vz" ]]; then
-    sign_binary "$TARGET_DIR/vz" "$ENTITLEMENTS"
-fi
-if [[ -f "$TARGET_DIR/vz-guest-agent" ]]; then
-    sign_binary "$TARGET_DIR/vz-guest-agent"
-fi
+vz_binary="$(resolve_cargo_executable "$host_artifact_log" "vz" "bin")" \
+    || err "unable to resolve the vz executable from $host_artifact_log"
+guest_agent_binary="$(resolve_cargo_executable "$host_artifact_log" "vz-guest-agent" "bin")" \
+    || err "unable to resolve the vz-guest-agent executable from $host_artifact_log"
+
+sign_binary "$vz_binary" "$ENTITLEMENTS"
+sign_binary "$guest_agent_binary"
 
 FAILED=()
 PASSED=()
@@ -464,12 +489,12 @@ for suite in "${RESOLVED_SUITES[@]}"; do
     test_name="$(suite_test_name "$suite")" || err "unknown suite '$suite'"
 
     echo "==> building [$suite] ($package::$test_name)"
-    (
-        cd "$REPO_ROOT/crates"
-        cargo test -p "$package" "${BUILD_ARGS[@]}" --test "$test_name" --no-run
-    )
+    test_artifact_log="$RUN_DIR/${suite}-test-artifacts.jsonl"
+    run_cargo_recording_artifacts "$test_artifact_log" \
+        test -p "$package" "${BUILD_ARGS[@]}" --test "$test_name" --no-run
 
-    test_binary="$(find_test_binary "$test_name")" || err "unable to locate test binary for $test_name in $TARGET_DIR/deps"
+    test_binary="$(resolve_cargo_executable "$test_artifact_log" "$test_name" "test")" \
+        || err "unable to resolve the $test_name executable from $test_artifact_log"
 
     sign_binary "$test_binary" "$ENTITLEMENTS"
 
