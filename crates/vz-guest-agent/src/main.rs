@@ -7,6 +7,7 @@
 // The guest agent legitimately uses unsafe for libc syscalls (vsock, sysctl, etc.)
 #![allow(unsafe_code)]
 
+mod docker;
 mod grpc_server;
 mod listener;
 #[cfg(target_os = "linux")]
@@ -125,6 +126,7 @@ async fn grpc_accept_loop(listener: VsockListener) -> anyhow::Result<()> {
 
     let shared_state = SharedState {
         process_table: Arc::new(Mutex::new(ProcessTable::new())),
+        docker_supervisor: Arc::new(docker::DockerSupervisor::new()),
     };
 
     let agent_svc = AgentServiceServer::new(AgentServiceImpl::new(shared_state));

@@ -8,6 +8,7 @@ use tracing::debug;
 use vz::Vm;
 use vz::protocol::{ExecEvent, ExecOutput, NetworkServiceConfig, OciContainerState};
 use vz_agent_proto::SystemInfoResponse;
+use vz_agent_proto::{DockerEnsureEvent, docker_ensure_event};
 
 use crate::grpc_client::{GrpcAgentClient, GrpcExecStream, GrpcPortForwardStream};
 use crate::{ExecOptions, LinuxError, LinuxVmConfig};
@@ -264,6 +265,45 @@ impl LinuxVm {
     ) -> Result<GrpcExecStream, LinuxError> {
         self.exec_stream_with_options(command, args, ExecOptions::default())
             .await
+    }
+
+    /// Ensure the downstream Docker facade is ready, forwarding streamed startup events.
+    ///
+    /// This method is an explicit lazy hook for the host Docker socket proxy;
+    /// no native `vz run`, stack, or build path calls it.
+    pub async fn ensure_docker_ready_with_progress<F>(
+        &self,
+        mut on_event: F,
+    ) -> Result<String, LinuxError>
+    where
+        F: FnMut(&DockerEnsureEvent),
+    {
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
+        let mut stream = client.ensure_docker_stream().await?;
+        drop(grpc);
+        while let Some(event) = stream.message().await? {
+            on_event(&event);
+            if event.stage == docker_ensure_event::Stage::Ready as i32 {
+                if event.socket_path.is_empty() {
+                    return Err(LinuxError::Protocol(
+                        "Docker ready event omitted guest socket path".to_string(),
+                    ));
+                }
+                return Ok(event.socket_path);
+            }
+        }
+        Err(LinuxError::Protocol(
+            "Docker startup stream ended before readiness".to_string(),
+        ))
+    }
+
+    /// Ensure the downstream Docker facade is ready without rendering progress.
+    pub async fn ensure_docker_ready(&self) -> Result<String, LinuxError> {
+        self.ensure_docker_ready_with_progress(|_| {}).await
     }
 
     /// Run a command on the guest with explicit execution options and return a streaming handle.

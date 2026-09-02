@@ -18,7 +18,7 @@ pub use vz::agent::v1::*;
 ///
 /// Increment this when startup-time host assumptions require a newer guest
 /// agent capability/behavior, even if crate semver remains unchanged.
-pub const AGENT_PROTOCOL_REVISION: u32 = 1;
+pub const AGENT_PROTOCOL_REVISION: u32 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -150,6 +150,18 @@ mod tests {
         };
         let encoded = msg.encode_to_vec();
         let decoded = SignalRequest::decode(encoded.as_slice()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn docker_ensure_event_round_trip() {
+        let msg = DockerEnsureEvent {
+            stage: docker_ensure_event::Stage::Ready as i32,
+            message: "Docker facade ready".to_string(),
+            socket_path: "/run/vz-docker/docker.sock".to_string(),
+        };
+        let encoded = msg.encode_to_vec();
+        let decoded = DockerEnsureEvent::decode(encoded.as_slice()).unwrap();
         assert_eq!(msg, decoded);
     }
 
@@ -355,6 +367,7 @@ mod tests {
         let _ = StdinWriteRequest::default();
         let _ = StdinCloseRequest::default();
         let _ = SignalRequest::default();
+        let _ = DockerEnsureRequest::default();
         let _ = PortForwardFrame::default();
         let _ = PortForwardOpen::default();
         let _ = OciCreateRequest::default();
@@ -376,6 +389,7 @@ mod tests {
         let _ = StdinWriteResponse {};
         let _ = StdinCloseResponse {};
         let _ = SignalResponse {};
+        let _ = DockerEnsureEvent::default();
         let _ = OciCreateResponse {};
         let _ = OciStartResponse {};
         let _ = OciStateResponse::default();

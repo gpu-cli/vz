@@ -18,6 +18,8 @@ oci-distribution = { workspace = true }
 shell-words = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 sha2 = { workspace = true }
+libc = { workspace = true }
+fs2 = { workspace = true }
 flate2 = "1"
 tar = "0.4"
 tonic = { workspace = true }

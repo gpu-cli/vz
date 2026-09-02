@@ -108,6 +108,8 @@ fn ensure_devpts_ready() -> Result<(), Status> {
 pub struct SharedState {
     /// Process table for tracking spawned child processes.
     pub process_table: Arc<Mutex<ProcessTable>>,
+    /// Docker facade supervisor. Construction is inert; `EnsureDocker` starts it.
+    pub docker_supervisor: Arc<crate::docker::DockerSupervisor>,
 }
 
 #[derive(Clone)]
@@ -687,6 +689,8 @@ impl agent_service_server::AgentService for AgentServiceImpl {
 
     type ExecStream = ReceiverStream<Result<ExecEvent, Status>>;
 
+    type EnsureDockerStream = ReceiverStream<Result<DockerEnsureEvent, Status>>;
+
     async fn exec(
         &self,
         request: Request<ExecRequest>,
@@ -705,6 +709,85 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         } else {
             self.exec_pipe(req, request_id).await
         }
+    }
+
+    async fn ensure_docker(
+        &self,
+        request: Request<DockerEnsureRequest>,
+    ) -> Result<Response<Self::EnsureDockerStream>, Status> {
+        let request = request.into_inner();
+        let request_id = request_id_from_metadata(request.metadata.as_ref(), "ensure-docker");
+        let supervisor = Arc::clone(&self.state.docker_supervisor);
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+
+        tokio::spawn(async move {
+            use docker_ensure_event::Stage;
+
+            if sender
+                .send(Ok(DockerEnsureEvent {
+                    stage: Stage::Validating as i32,
+                    message: "Validating persistent Docker facade artifacts and mounts".to_string(),
+                    socket_path: String::new(),
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            if let Err(error) = supervisor.ensure_started().await {
+                warn!(request_id = %request_id, %error, "Docker facade startup validation failed");
+                let _ = sender
+                    .send(Err(Status::failed_precondition(format!(
+                        "Docker facade startup failed: {error}"
+                    ))))
+                    .await;
+                return;
+            }
+
+            for (stage, message) in [
+                (Stage::Starting, "Guest-agent Docker supervision started"),
+                (
+                    Stage::Waiting,
+                    "Waiting for the guest Docker Engine API socket",
+                ),
+            ] {
+                if sender
+                    .send(Ok(DockerEnsureEvent {
+                        stage: stage as i32,
+                        message: message.to_string(),
+                        socket_path: String::new(),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
+            match supervisor.wait_ready().await {
+                Ok(socket_path) => {
+                    info!(request_id = %request_id, socket_path, "Docker facade ready");
+                    let _ = sender
+                        .send(Ok(DockerEnsureEvent {
+                            stage: Stage::Ready as i32,
+                            message: "Docker facade ready".to_string(),
+                            socket_path: socket_path.to_string(),
+                        }))
+                        .await;
+                }
+                Err(error) => {
+                    warn!(request_id = %request_id, %error, "Docker facade startup failed");
+                    let _ = sender
+                        .send(Err(Status::failed_precondition(format!(
+                            "Docker facade startup failed: {error}"
+                        ))))
+                        .await;
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(receiver)))
     }
 
     async fn stdin_write(

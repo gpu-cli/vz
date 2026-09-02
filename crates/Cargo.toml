@@ -150,6 +150,7 @@ shell-words = "1"
 
 # System
 libc = "0.2"
+fs2 = "0.4"
 portable-pty = "0.8"
 
 # Signal handling

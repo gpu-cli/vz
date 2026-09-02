@@ -39,6 +39,11 @@ service AgentService {
   // Resize the PTY window for a running exec session.
   rpc ResizeExecPty(ResizeExecPtyRequest) returns (ResizeExecPtyResponse);
 
+  // Lazily start (or confirm readiness of) the downstream Docker facade.
+  // Progress is streamed because first startup mounts persistent storage and
+  // waits for containerd plus dockerd readiness.
+  rpc EnsureDocker(DockerEnsureRequest) returns (stream DockerEnsureEvent);
+
   // Bidirectional TCP relay through the guest.
   // Client sends PortForwardOpen as the first frame, then raw data
   // flows in both directions.
@@ -173,6 +178,28 @@ message ResizeExecPtyRequest {
   TransportMetadata metadata = 4;
 }
 message ResizeExecPtyResponse {}
+
+// ─── Docker Facade ─────────────────────────────────────────────
+
+message DockerEnsureRequest {
+  TransportMetadata metadata = 1;
+}
+
+message DockerEnsureEvent {
+  enum Stage {
+    STAGE_UNSPECIFIED = 0;
+    STAGE_VALIDATING = 1;
+    STAGE_STARTING = 2;
+    STAGE_WAITING = 3;
+    STAGE_READY = 4;
+  }
+
+  Stage stage = 1;
+  string message = 2;
+  // Guest-local Engine API socket. The host facade proxy consumes this path;
+  // native vz OCI paths do not.
+  string socket_path = 3;
+}
 
 // ─── Port Forward ───────────────────────────────────────────────
 

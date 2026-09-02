@@ -154,6 +154,70 @@ pub struct ResizeExecPtyRequest {
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct ResizeExecPtyResponse {}
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DockerEnsureRequest {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DockerEnsureEvent {
+    #[prost(enumeration = "docker_ensure_event::Stage", tag = "1")]
+    pub stage: i32,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+    /// Guest-local Engine API socket. The host facade proxy consumes this path;
+    /// native vz OCI paths do not.
+    #[prost(string, tag = "3")]
+    pub socket_path: ::prost::alloc::string::String,
+}
+/// Nested message and enum types in `DockerEnsureEvent`.
+pub mod docker_ensure_event {
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        PartialEq,
+        Eq,
+        Hash,
+        PartialOrd,
+        Ord,
+        ::prost::Enumeration
+    )]
+    #[repr(i32)]
+    pub enum Stage {
+        Unspecified = 0,
+        Validating = 1,
+        Starting = 2,
+        Waiting = 3,
+        Ready = 4,
+    }
+    impl Stage {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Unspecified => "STAGE_UNSPECIFIED",
+                Self::Validating => "STAGE_VALIDATING",
+                Self::Starting => "STAGE_STARTING",
+                Self::Waiting => "STAGE_WAITING",
+                Self::Ready => "STAGE_READY",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "STAGE_UNSPECIFIED" => Some(Self::Unspecified),
+                "STAGE_VALIDATING" => Some(Self::Validating),
+                "STAGE_STARTING" => Some(Self::Starting),
+                "STAGE_WAITING" => Some(Self::Waiting),
+                "STAGE_READY" => Some(Self::Ready),
+                _ => None,
+            }
+        }
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PortForwardFrame {
     #[prost(oneof = "port_forward_frame::Frame", tags = "1, 2")]
     pub frame: ::core::option::Option<port_forward_frame::Frame>,
@@ -592,6 +656,33 @@ pub mod agent_service_client {
             req.extensions_mut()
                 .insert(GrpcMethod::new("vz.agent.v1.AgentService", "ResizeExecPty"));
             self.inner.unary(req, path, codec).await
+        }
+        /// Lazily start (or confirm readiness of) the downstream Docker facade.
+        /// Progress is streamed because first startup mounts persistent storage and
+        /// waits for containerd plus dockerd readiness.
+        pub async fn ensure_docker(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DockerEnsureRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::DockerEnsureEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.agent.v1.AgentService/EnsureDocker",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("vz.agent.v1.AgentService", "EnsureDocker"));
+            self.inner.server_streaming(req, path, codec).await
         }
         /// Bidirectional TCP relay through the guest.
         /// Client sends PortForwardOpen as the first frame, then raw data
@@ -1083,6 +1174,22 @@ pub mod agent_service_server {
             tonic::Response<super::ResizeExecPtyResponse>,
             tonic::Status,
         >;
+        /// Server streaming response type for the EnsureDocker method.
+        type EnsureDockerStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::DockerEnsureEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Lazily start (or confirm readiness of) the downstream Docker facade.
+        /// Progress is streamed because first startup mounts persistent storage and
+        /// waits for containerd plus dockerd readiness.
+        async fn ensure_docker(
+            &self,
+            request: tonic::Request<super::DockerEnsureRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::EnsureDockerStream>,
+            tonic::Status,
+        >;
         /// Server streaming response type for the PortForward method.
         type PortForwardStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::PortForwardFrame, tonic::Status>,
@@ -1531,6 +1638,52 @@ pub mod agent_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.agent.v1.AgentService/EnsureDocker" => {
+                    #[allow(non_camel_case_types)]
+                    struct EnsureDockerSvc<T: AgentService>(pub Arc<T>);
+                    impl<
+                        T: AgentService,
+                    > tonic::server::ServerStreamingService<super::DockerEnsureRequest>
+                    for EnsureDockerSvc<T> {
+                        type Response = super::DockerEnsureEvent;
+                        type ResponseStream = T::EnsureDockerStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DockerEnsureRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentService>::ensure_docker(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = EnsureDockerSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

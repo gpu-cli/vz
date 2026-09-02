@@ -17,13 +17,13 @@ use tracing::debug;
 use vz::Vm;
 use vz::protocol::{ExecOutput, OciContainerState};
 use vz_agent_proto::{
-    ExecRequest as ProtoExecRequest, NetworkSetupRequest, NetworkTeardownRequest, OciCreateRequest,
-    OciDeleteRequest, OciKillRequest, OciStartRequest, OciStateRequest, PingRequest,
-    PortForwardFrame, PortForwardOpen, ResizeExecPtyRequest, ResourceStatsRequest,
-    ResourceStatsResponse, SignalRequest, StdinCloseRequest, StdinWriteRequest, SystemInfoRequest,
-    SystemInfoResponse, TransportMetadata as ProtoTransportMetadata,
-    agent_service_client::AgentServiceClient, exec_event,
-    network_service_client::NetworkServiceClient, oci_service_client::OciServiceClient,
+    DockerEnsureEvent, DockerEnsureRequest, ExecRequest as ProtoExecRequest, NetworkSetupRequest,
+    NetworkTeardownRequest, OciCreateRequest, OciDeleteRequest, OciKillRequest, OciStartRequest,
+    OciStateRequest, PingRequest, PortForwardFrame, PortForwardOpen, ResizeExecPtyRequest,
+    ResourceStatsRequest, ResourceStatsResponse, SignalRequest, StdinCloseRequest,
+    StdinWriteRequest, SystemInfoRequest, SystemInfoResponse,
+    TransportMetadata as ProtoTransportMetadata, agent_service_client::AgentServiceClient,
+    exec_event, network_service_client::NetworkServiceClient, oci_service_client::OciServiceClient,
     port_forward_frame,
 };
 use vz_runtime_contract::{
@@ -202,6 +202,23 @@ impl GrpcAgentClient {
     /// Query guest resource usage statistics.
     pub async fn resource_stats(&mut self) -> Result<ResourceStatsResponse, LinuxError> {
         let response = self.agent.resource_stats(ResourceStatsRequest {}).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Explicitly trigger lazy Docker facade supervision and stream startup progress.
+    ///
+    /// This hook is intentionally separate from all native OCI calls. The host
+    /// Docker socket proxy invokes it on first facade use.
+    pub async fn ensure_docker_stream(
+        &mut self,
+    ) -> Result<tonic::Streaming<DockerEnsureEvent>, LinuxError> {
+        let metadata = self.next_transport_metadata(None);
+        let response = self
+            .agent
+            .ensure_docker(DockerEnsureRequest {
+                metadata: Some(metadata),
+            })
+            .await?;
         Ok(response.into_inner())
     }
 

@@ -10,6 +10,7 @@
 pub mod buildkit;
 pub mod bundle;
 pub mod container_store;
+pub mod docker;
 pub mod error;
 
 pub use buildkit::{
@@ -18,6 +19,10 @@ pub use buildkit::{
 };
 pub use bundle::CONTAINER_LOG_FILE;
 pub use container_store::{ContainerInfo, ContainerStatus, ContainerStore};
+pub use docker::{
+    DOCKER_ENGINE_VERSION, DockerArtifactError, DockerArtifacts, DockerVersionMetadata,
+    ensure_docker_artifacts,
+};
 pub use error::OciError;
 
 // Re-export image types from the shared vz-image crate.
