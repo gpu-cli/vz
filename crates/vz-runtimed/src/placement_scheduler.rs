@@ -406,7 +406,7 @@ fn candidate_backend_count(
     counts
         .get(backend_id)
         .copied()
-        .or_else(|| {
+        .or({
             if candidate_count == 1 {
                 Some(fallback_single_backend_total)
             } else {

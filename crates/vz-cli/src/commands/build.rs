@@ -1156,15 +1156,14 @@ fn parse_rfc3339_nanos(ts: &str) -> Option<u128> {
     let ts = ts.trim();
     let (datetime_part, _tz) = if let Some(pos) = ts.rfind('Z') {
         (&ts[..pos], "Z")
-    } else if let Some(pos) = ts.rfind('+') {
+    } else {
+        let pos = ts.rfind('+')?;
         // Skip the '+' in the fractional part
         if pos > 10 {
             (&ts[..pos], &ts[pos..])
         } else {
             return None;
         }
-    } else {
-        return None;
     };
 
     // Split on 'T' to get date and time.

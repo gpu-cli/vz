@@ -54,6 +54,10 @@ fn io_status(request_id: &str, context: &str, error: &std::io::Error) -> Status 
     ))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn ensure_sandbox_exists(
     daemon: &RuntimeDaemon,
     sandbox_id: &str,
@@ -74,6 +78,10 @@ fn ensure_sandbox_exists(
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn resolve_scoped_path(
     root: &Path,
     raw_path: &str,

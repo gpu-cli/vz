@@ -44,6 +44,10 @@ pub(in crate::grpc) fn request_id_from_extensions<T>(request: &Request<T>) -> Op
         .map(|context| context.request_id.clone())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper implements a tonic interceptor whose error type is fixed to tonic::Status"
+)]
 pub(in crate::grpc) fn request_metadata_interceptor(
     mut request: Request<()>,
 ) -> Result<Request<()>, Status> {
@@ -67,6 +71,10 @@ pub(in crate::grpc) fn request_metadata_interceptor(
     Ok(request)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 pub(in crate::grpc) fn insert_health_headers(
     metadata: &mut MetadataMap,
     health: &DaemonHealth,

@@ -205,14 +205,16 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
         };
         if let Err(status) = boot_runtime_sandbox_resources(
             self.daemon.clone(),
-            &sandbox_id,
-            cpus,
-            memory_mb,
-            &labels,
-            &explicit_volume_mounts,
-            disk_image_path,
-            &explicit_port_mappings,
-            &request_id,
+            SandboxBootRequest {
+                sandbox_id: &sandbox_id,
+                cpus,
+                memory_mb,
+                labels: &labels,
+                explicit_mounts: &explicit_volume_mounts,
+                disk_image_path,
+                port_mappings: &explicit_port_mappings,
+                request_id: &request_id,
+            },
         )
         .await
         {

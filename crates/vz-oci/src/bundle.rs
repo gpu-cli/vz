@@ -322,7 +322,7 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
 
     // Always expose /dev/kvm and /dev/net/tun when available in the host VM kernel.
     // These are needed for nested virtualization (Firecracker) and tap networking.
-    set_default_devices(&mut spec);
+    set_default_devices(&mut spec)?;
 
     Ok(spec)
 }
@@ -774,9 +774,9 @@ fn parse_capability_name(name: &str) -> Option<Capability> {
 /// Add /dev/kvm and /dev/net/tun to the OCI spec so youki creates them
 /// during container setup. These are always useful when the host VM kernel
 /// supports them — no user configuration needed.
-fn set_default_devices(spec: &mut Spec) {
+fn set_default_devices(spec: &mut Spec) -> Result<(), OciError> {
     let Some(linux) = spec.linux_mut() else {
-        return;
+        return Ok(());
     };
 
     let devices = vec![
@@ -786,19 +786,18 @@ fn set_default_devices(spec: &mut Spec) {
             .major(10)
             .minor(232)
             .file_mode(0o666u32)
-            .build()
-            .expect("valid /dev/kvm device spec"),
+            .build()?,
         LinuxDeviceBuilder::default()
             .path("/dev/net/tun")
             .typ(LinuxDeviceType::C)
             .major(10)
             .minor(200)
             .file_mode(0o666u32)
-            .build()
-            .expect("valid /dev/net/tun device spec"),
+            .build()?,
     ];
 
     linux.set_devices(Some(devices));
+    Ok(())
 }
 
 /// Set sysctl parameters on the OCI spec's linux section.

@@ -10,6 +10,10 @@ use super::ids::{current_unix_secs, generate_receipt_id};
 use super::receipt_policy_preflight_metadata;
 use super::status::{status_from_machine_error, status_from_stack_error};
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 pub(in crate::grpc) fn enforce_mutation_policy_preflight(
     daemon: &RuntimeDaemon,
     operation: RuntimeOperation,

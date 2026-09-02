@@ -280,9 +280,11 @@ pub(crate) fn extract_request_id_from_status_message(status: &tonic::Status) -> 
 }
 
 pub(crate) fn daemon_client_config(state: &ApiState) -> DaemonClientConfig {
-    let mut config = DaemonClientConfig::default();
-    config.auto_spawn = state.daemon_auto_spawn;
-    config.state_store_path = Some(state.state_store_path.clone());
+    let mut config = DaemonClientConfig {
+        auto_spawn: state.daemon_auto_spawn,
+        state_store_path: Some(state.state_store_path.clone()),
+        ..DaemonClientConfig::default()
+    };
 
     if let Some(socket_path) = &state.daemon_socket_path {
         config.socket_path = socket_path.clone();

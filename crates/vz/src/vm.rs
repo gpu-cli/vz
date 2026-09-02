@@ -714,7 +714,10 @@ mod tests {
         let unknown = VZVirtualMachineState(9999);
         match vz_state_to_vm_state(unknown) {
             VmState::Error(msg) => {
-                assert!(msg.contains("9999"), "error msg must echo the raw value: {msg}");
+                assert!(
+                    msg.contains("9999"),
+                    "error msg must echo the raw value: {msg}"
+                );
                 assert!(msg.contains("unknown"), "error msg must be tagged: {msg}");
             }
             other => panic!("unknown raw state should become Error, got {other:?}"),

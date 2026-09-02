@@ -676,29 +676,29 @@ impl Runtime {
             }
             // Get the container's init PID for nsenter.
             let hosts_result = match vm.oci_state(oci_container_id.clone()).await {
-                Ok(state) if state.pid.is_some() => {
-                    let pid = state.pid.unwrap();
-                    vm.exec_collect(
-                        "/bin/busybox".to_string(),
-                        vec![
-                            "nsenter".to_string(),
-                            format!("--mount=/proc/{pid}/ns/mnt"),
-                            format!("--root=/proc/{pid}/root"),
-                            "--wd=/".to_string(),
-                            "--".to_string(),
-                            "/bin/sh".to_string(),
-                            "-c".to_string(),
-                            format!("printf '{printf_content}' > /etc/hosts"),
-                        ],
-                        Duration::from_secs(30),
-                    )
-                    .await
-                    .map_err(OciError::from)
-                }
-                Ok(_) => Err(OciError::InvalidConfig(format!(
-                    "container '{}' has no running pid for /etc/hosts write",
-                    oci_container_id
-                ))),
+                Ok(state) => match state.pid {
+                    Some(pid) => vm
+                        .exec_collect(
+                            "/bin/busybox".to_string(),
+                            vec![
+                                "nsenter".to_string(),
+                                format!("--mount=/proc/{pid}/ns/mnt"),
+                                format!("--root=/proc/{pid}/root"),
+                                "--wd=/".to_string(),
+                                "--".to_string(),
+                                "/bin/sh".to_string(),
+                                "-c".to_string(),
+                                format!("printf '{printf_content}' > /etc/hosts"),
+                            ],
+                            Duration::from_secs(30),
+                        )
+                        .await
+                        .map_err(OciError::from),
+                    None => Err(OciError::InvalidConfig(format!(
+                        "container '{}' has no running pid for /etc/hosts write",
+                        oci_container_id
+                    ))),
+                },
                 Err(e) => Err(OciError::from(e)),
             };
             match hosts_result {

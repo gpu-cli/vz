@@ -86,10 +86,7 @@ impl MacosRuntimeBackend {
                         "setup command failed (exit {}): {}\nstderr: {}",
                         result.exit_code, cmd, result.stderr,
                     ),
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "setup command failed",
-                    )),
+                    source: Box::new(std::io::Error::other("setup command failed")),
                 });
             }
         }

@@ -254,7 +254,7 @@ impl RuntimeBackend for LinuxNativeBackend {
         let container_id = config
             .container_id
             .clone()
-            .unwrap_or_else(|| format!("vz-{}", &uuid_short()));
+            .unwrap_or_else(|| format!("vz-{}", uuid_short()));
 
         let has_setup = !config.setup_commands.is_empty();
 
@@ -351,10 +351,7 @@ impl RuntimeBackend for LinuxNativeBackend {
                                 "setup command failed (exit {}): {}\nstderr: {}",
                                 setup_result.exit_code, setup_cmd, setup_result.stderr,
                             ),
-                            source: Box::new(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                "setup command failed",
-                            )),
+                            source: Box::new(std::io::Error::other("setup command failed")),
                         });
                     }
                 }
@@ -376,7 +373,7 @@ impl RuntimeBackend for LinuxNativeBackend {
 
                     // Re-create a fresh container from the committed rootfs
                     // for the actual command execution.
-                    let new_container_id = format!("vz-{}", &uuid_short());
+                    let new_container_id = format!("vz-{}", uuid_short());
                     let rootfs_dir = self
                         .image_store
                         .assemble_rootfs_from_commit_async(cref, &new_container_id)
@@ -458,7 +455,7 @@ impl RuntimeBackend for LinuxNativeBackend {
         let container_id = config
             .container_id
             .clone()
-            .unwrap_or_else(|| format!("vz-{}", &uuid_short()));
+            .unwrap_or_else(|| format!("vz-{}", uuid_short()));
 
         let has_setup = !config.setup_commands.is_empty();
         let commit_ref = if has_setup {
@@ -570,10 +567,7 @@ impl RuntimeBackend for LinuxNativeBackend {
                             "setup command failed (exit {}): {}\nstderr: {}",
                             setup_result.exit_code, setup_cmd, setup_result.stderr,
                         ),
-                        source: Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "setup command failed",
-                        )),
+                        source: Box::new(std::io::Error::other("setup command failed")),
                     });
                 }
             }
@@ -597,7 +591,7 @@ impl RuntimeBackend for LinuxNativeBackend {
                 let new_id = config
                     .container_id
                     .clone()
-                    .unwrap_or_else(|| format!("vz-{}", &uuid_short()));
+                    .unwrap_or_else(|| format!("vz-{}", uuid_short()));
 
                 let rootfs_dir = self
                     .image_store
@@ -783,7 +777,7 @@ impl RuntimeBackend for LinuxNativeBackend {
         let container_id = config
             .container_id
             .clone()
-            .unwrap_or_else(|| format!("vz-{}", &uuid_short()));
+            .unwrap_or_else(|| format!("vz-{}", uuid_short()));
 
         // Assemble rootfs from the committed snapshot.
         let rootfs_dir = self
@@ -937,7 +931,7 @@ impl RuntimeBackend for LinuxNativeBackend {
         let gateway = "172.20.0.1";
 
         for svc in &services {
-            let netns_name = format!("vz-{stack_id}-{}", &svc.name);
+            let netns_name = format!("vz-{stack_id}-{}", svc.name);
             let veth_host = format!("vh-{}", &svc.name[..std::cmp::min(11, svc.name.len())]);
             let veth_container = format!("vc-{}", &svc.name[..std::cmp::min(11, svc.name.len())]);
 

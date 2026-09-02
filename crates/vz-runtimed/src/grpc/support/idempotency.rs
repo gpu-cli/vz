@@ -9,6 +9,10 @@ use crate::RuntimeDaemon;
 
 use super::status::{status_from_machine_error, status_from_stack_error};
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 pub(in crate::grpc) fn load_idempotent_sandbox_replay(
     daemon: &RuntimeDaemon,
     key: &str,
@@ -47,6 +51,10 @@ pub(in crate::grpc) fn load_idempotent_sandbox_replay(
     Ok(Some(cached_sandbox))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 pub(in crate::grpc) fn load_idempotent_lease_replay(
     daemon: &RuntimeDaemon,
     key: &str,
@@ -85,6 +93,10 @@ pub(in crate::grpc) fn load_idempotent_lease_replay(
     Ok(Some(cached_lease))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 pub(in crate::grpc) fn load_idempotent_container_replay(
     daemon: &RuntimeDaemon,
     key: &str,
@@ -123,6 +135,10 @@ pub(in crate::grpc) fn load_idempotent_container_replay(
     Ok(Some(cached_container))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 pub(in crate::grpc) fn load_idempotent_execution_replay(
     daemon: &RuntimeDaemon,
     key: &str,
@@ -161,6 +177,10 @@ pub(in crate::grpc) fn load_idempotent_execution_replay(
     Ok(Some(cached_execution))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 pub(in crate::grpc) fn load_idempotent_checkpoint_replay(
     daemon: &RuntimeDaemon,
     key: &str,

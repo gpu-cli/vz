@@ -721,7 +721,12 @@ fn install_guest_agent_loader_manifest(
         .trim_start_matches('/')
         .replacen("var/", "private/var/", 1);
     let manifest_path = mount_point.join(&manifest_rel);
-    let manifest_dir = manifest_path.parent().unwrap();
+    let manifest_dir = manifest_path.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "startup manifest path has no parent: {}",
+            manifest_path.display()
+        )
+    })?;
     std::fs::create_dir_all(manifest_dir)?;
 
     // If a manifest already exists, merge our entry into it

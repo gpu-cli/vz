@@ -10,6 +10,10 @@ impl ReceiptServiceImpl {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn receipt_to_proto_payload(
     receipt: &Receipt,
     retention: Option<&vz_stack::ReceiptRetentionState>,

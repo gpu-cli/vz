@@ -200,6 +200,10 @@ async fn remove_runtime_container(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn sandbox_workspace_dir_from_labels(
     sandbox: &Sandbox,
     request_id: &str,
@@ -258,6 +262,10 @@ fn default_keepalive_container_cmd() -> Vec<String> {
     ]
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn build_runtime_run_config(
     sandbox: &Sandbox,
     container: &Container,

@@ -964,12 +964,12 @@ impl StartupLock {
                 path: path.clone(),
                 source,
             })?;
-        if let Err(source) = file.try_lock() {
-            return Err(match source {
-                std::fs::TryLockError::WouldBlock => {
+        if let Err(source) = fs2::FileExt::try_lock_exclusive(&file) {
+            return Err(match source.kind() {
+                std::io::ErrorKind::WouldBlock => {
                     RuntimedError::StartupLockAlreadyHeld { path: path.clone() }
                 }
-                std::fs::TryLockError::Error(source) => RuntimedError::AcquireStartupLock {
+                _ => RuntimedError::AcquireStartupLock {
                     path: path.clone(),
                     source,
                 },
@@ -991,7 +991,7 @@ impl StartupLock {
 
 impl Drop for StartupLock {
     fn drop(&mut self) {
-        let _ = self._file.unlock();
+        let _ = fs2::FileExt::unlock(&self._file);
         let _ = std::fs::remove_file(&self.path);
     }
 }

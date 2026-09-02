@@ -158,6 +158,10 @@ fn resolve_checkpoint_compatibility_fingerprint(daemon: &RuntimeDaemon, requeste
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn enforce_restore_checkpoint_compatibility(
     daemon: &RuntimeDaemon,
     checkpoint: &Checkpoint,
@@ -205,6 +209,10 @@ fn checkpoint_workspace_snapshot_subvolume_path(
         .join(checkpoint_id)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn sandbox_workspace_project_dir(
     labels: &BTreeMap<String, String>,
     request_id: &str,
@@ -261,6 +269,10 @@ fn sandbox_workspace_project_dir(
 }
 
 #[cfg(target_os = "linux")]
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn path_is_on_btrfs(path: &Path, request_id: &str) -> Result<bool, Status> {
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         status_from_machine_error(MachineError::new(
@@ -333,6 +345,10 @@ fn detect_filesystem_type(path: &Path) -> std::io::Result<String> {
 }
 
 #[cfg(target_os = "linux")]
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn run_btrfs_command(args: &[&str], request_id: &str, operation: &str) -> Result<(), Status> {
     let output = Command::new("btrfs").args(args).output().map_err(|error| {
         status_from_machine_error(MachineError::new(
@@ -360,6 +376,10 @@ fn run_btrfs_command(args: &[&str], request_id: &str, operation: &str) -> Result
 }
 
 #[cfg(not(target_os = "linux"))]
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn create_workspace_checkpoint_subvolume(
     _daemon: &RuntimeDaemon,
     _checkpoint: &Checkpoint,
@@ -378,6 +398,10 @@ fn create_workspace_checkpoint_subvolume(
 }
 
 #[cfg(target_os = "linux")]
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn create_workspace_checkpoint_subvolume(
     daemon: &RuntimeDaemon,
     checkpoint: &Checkpoint,
@@ -438,6 +462,10 @@ fn create_workspace_checkpoint_subvolume(
 }
 
 #[cfg(not(target_os = "linux"))]
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn restore_workspace_from_checkpoint_subvolume(
     _daemon: &RuntimeDaemon,
     _checkpoint: &Checkpoint,
@@ -456,6 +484,10 @@ fn restore_workspace_from_checkpoint_subvolume(
 }
 
 #[cfg(target_os = "linux")]
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn restore_workspace_from_checkpoint_subvolume(
     daemon: &RuntimeDaemon,
     checkpoint: &Checkpoint,
@@ -507,6 +539,10 @@ fn restore_workspace_from_checkpoint_subvolume(
 }
 
 #[cfg(not(target_os = "linux"))]
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn fork_workspace_checkpoint_subvolume(
     _daemon: &RuntimeDaemon,
     _parent_checkpoint_id: &str,
@@ -525,6 +561,10 @@ fn fork_workspace_checkpoint_subvolume(
 }
 
 #[cfg(target_os = "linux")]
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn fork_workspace_checkpoint_subvolume(
     daemon: &RuntimeDaemon,
     parent_checkpoint_id: &str,
@@ -583,6 +623,10 @@ fn fork_workspace_checkpoint_subvolume(
     )
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn required_space_workspace_root_for_checkpoint(
     daemon: &RuntimeDaemon,
     sandbox_id: &str,
@@ -599,17 +643,16 @@ fn required_space_workspace_root_for_checkpoint(
             BTreeMap::new(),
         ))
     })?;
-    sandbox_workspace_project_dir(&sandbox.labels, request_id).and_then(|value| {
-        value.ok_or_else(|| {
-            status_from_machine_error(MachineError::new(
-                MachineErrorCode::ValidationError,
-                format!(
-                    "spaces mode requires sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` with an absolute workspace directory path"
-                ),
-                Some(request_id.to_string()),
-                BTreeMap::new(),
-            ))
-        })
+    let project_dir = sandbox_workspace_project_dir(&sandbox.labels, request_id)?;
+    project_dir.ok_or_else(|| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!(
+                "spaces mode requires sandbox label `{SANDBOX_LABEL_PROJECT_DIR}` with an absolute workspace directory path"
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
     })
 }
 
@@ -634,6 +677,10 @@ fn checkpoint_relative_path(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn collect_checkpoint_file_entries(
     root: &Path,
     request_id: &str,
@@ -789,6 +836,10 @@ fn normalize_checkpoint_retention_tag(tag: &str) -> Result<Option<String>, Machi
     Ok(Some(normalized.to_string()))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn normalize_required_absolute_path(
     raw: &str,
     field_name: &str,
@@ -815,6 +866,10 @@ fn normalize_required_absolute_path(
     Ok(path)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn load_checkpoint_retention_states(
     daemon: &RuntimeDaemon,
     request_id: &str,

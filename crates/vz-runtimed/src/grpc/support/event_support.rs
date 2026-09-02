@@ -7,6 +7,10 @@ use vz_stack::EventRecord;
 
 use super::status::status_from_machine_error;
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 pub(in crate::grpc) fn event_record_to_runtime_event(
     record: &EventRecord,
 ) -> Result<runtime_v2::RuntimeEvent, Status> {

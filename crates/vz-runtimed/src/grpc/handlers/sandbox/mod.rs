@@ -395,6 +395,10 @@ fn daemon_space_cache_artifact_dir_for_identity(
         })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn daemon_materialize_verified_remote_cache_artifact(
     daemon: &RuntimeDaemon,
     key: &SpaceCacheKey,
@@ -445,6 +449,10 @@ fn daemon_materialize_verified_remote_cache_artifact(
 }
 
 #[cfg(not(target_os = "linux"))]
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn ensure_cache_artifact_directory_layout(target_dir: &Path) -> Result<(), Status> {
     let request_id = "req-space-cache-materialize-layout";
     Err(status_from_machine_error(MachineError::new(
@@ -460,6 +468,10 @@ fn ensure_cache_artifact_directory_layout(target_dir: &Path) -> Result<(), Statu
 }
 
 #[cfg(target_os = "linux")]
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn ensure_cache_artifact_directory_layout(target_dir: &Path) -> Result<(), Status> {
     let request_id = "req-space-cache-materialize-layout";
     let parent = target_dir.parent().ok_or_else(|| {
@@ -601,6 +613,10 @@ async fn terminate_runtime_sandbox_resources(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn sandbox_workspace_volume_mount(
     labels: &BTreeMap<String, String>,
     request_id: &str,
@@ -664,6 +680,10 @@ fn sandbox_workspace_volume_mount(
     }))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn validate_spaces_mode_label(
     labels: &BTreeMap<String, String>,
     request_id: &str,
@@ -686,6 +706,10 @@ fn validate_spaces_mode_label(
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn enforce_spaces_workspace_storage_preflight(
     host_path: &Path,
     request_id: &str,
@@ -722,6 +746,10 @@ fn enforce_spaces_workspace_storage_preflight(
 }
 
 #[cfg(target_os = "linux")]
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn path_is_on_btrfs(path: &Path, request_id: &str) -> Result<bool, Status> {
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         status_from_machine_error(MachineError::new(
@@ -793,17 +821,31 @@ fn detect_filesystem_type(path: &Path) -> std::io::Result<String> {
     Ok(fs_type)
 }
 
-async fn boot_runtime_sandbox_resources(
-    daemon: Arc<RuntimeDaemon>,
-    sandbox_id: &str,
+struct SandboxBootRequest<'a> {
+    sandbox_id: &'a str,
     cpus: Option<u8>,
     memory_mb: Option<u64>,
-    labels: &BTreeMap<String, String>,
-    explicit_mounts: &[vz_runtime_proto::runtime_v2::VolumeMount],
-    disk_image_path: Option<std::path::PathBuf>,
-    port_mappings: &[vz_runtime_proto::runtime_v2::PortMapping],
-    request_id: &str,
+    labels: &'a BTreeMap<String, String>,
+    explicit_mounts: &'a [vz_runtime_proto::runtime_v2::VolumeMount],
+    disk_image_path: Option<PathBuf>,
+    port_mappings: &'a [vz_runtime_proto::runtime_v2::PortMapping],
+    request_id: &'a str,
+}
+
+async fn boot_runtime_sandbox_resources(
+    daemon: Arc<RuntimeDaemon>,
+    request: SandboxBootRequest<'_>,
 ) -> Result<(), Status> {
+    let SandboxBootRequest {
+        sandbox_id,
+        cpus,
+        memory_mb,
+        labels,
+        explicit_mounts,
+        disk_image_path,
+        port_mappings,
+        request_id,
+    } = request;
     let mut volume_mounts = Vec::new();
 
     if explicit_mounts.is_empty() {
@@ -961,6 +1003,10 @@ mod tests {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn parse_main_container_startup_command(
     request_id: &str,
     main_container: &str,
@@ -999,6 +1045,10 @@ fn parse_main_container_startup_command(
     Ok(Some((command, args)))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn resolve_sandbox_shell_command(
     request_id: &str,
     sandbox: &Sandbox,
@@ -1021,9 +1071,12 @@ fn resolve_sandbox_shell_command(
             parse_main_container_startup_command(request_id, &main_container)?
     {
         if debug {
-            eprintln!(
-                "[vz-runtimed exec-control] resolved sandbox shell command from main_container sandbox_id={} request_id={} command={:?} args={:?}",
-                sandbox.sandbox_id, request_id, command, args
+            tracing::info!(
+                sandbox_id = %sandbox.sandbox_id,
+                request_id,
+                command = ?command,
+                args = ?args,
+                "resolved sandbox shell command from main container"
             );
         }
         return Ok((command, args));
@@ -1042,14 +1095,21 @@ fn resolve_sandbox_shell_command(
         });
     let command = default_shell_for_base_image(base_image_ref.as_deref()).to_string();
     if debug {
-        eprintln!(
-            "[vz-runtimed exec-control] resolved sandbox shell command from base_image sandbox_id={} request_id={} base_image_ref={:?} command={:?}",
-            sandbox.sandbox_id, request_id, base_image_ref, command
+        tracing::info!(
+            sandbox_id = %sandbox.sandbox_id,
+            request_id,
+            base_image_ref = ?base_image_ref,
+            command = ?command,
+            "resolved sandbox shell command from base image"
         );
     }
     Ok((command, Vec::new()))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn find_attachable_sandbox_container(
     daemon: &RuntimeDaemon,
     sandbox_id: &str,
@@ -1065,6 +1125,10 @@ fn find_attachable_sandbox_container(
     Ok(containers.pop())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn sandbox_shell_image_ref(request_id: &str, sandbox: &Sandbox) -> Result<String, Status> {
     sandbox
         .spec
@@ -1150,6 +1214,10 @@ fn session_registry_status(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn find_attachable_sandbox_shell_execution(
     daemon: &RuntimeDaemon,
     container_id: &str,
@@ -1176,15 +1244,15 @@ fn find_attachable_sandbox_shell_execution(
                     .env_override
                     .get(SANDBOX_SHELL_SESSION_ENV_KEY)
                     .map(|value| value.as_str());
-                eprintln!(
-                    "[vz-runtimed exec-control] execution not reusable as sandbox shell execution_id={} request_id={} expected_cmd={:?} expected_args={:?} actual_cmd={:?} actual_args={:?} shell_env={:?}",
-                    execution.execution_id,
+                tracing::info!(
+                    execution_id = %execution.execution_id,
                     request_id,
-                    shell_command,
-                    shell_args,
-                    execution.exec_spec.cmd,
-                    execution.exec_spec.args,
-                    shell_env_flag
+                    expected_command = ?shell_command,
+                    expected_args = ?shell_args,
+                    actual_command = ?execution.exec_spec.cmd,
+                    actual_args = ?execution.exec_spec.args,
+                    shell_env = ?shell_env_flag,
+                    "execution is not reusable as a sandbox shell"
                 );
             }
             continue;
@@ -1194,9 +1262,12 @@ fn find_attachable_sandbox_shell_execution(
             .contains(&execution.execution_id)
             .map_err(|error| session_registry_status(error, request_id))?;
         if debug {
-            eprintln!(
-                "[vz-runtimed exec-control] sandbox shell reuse candidate execution_id={} request_id={} has_session={} state={:?}",
-                execution.execution_id, request_id, has_session, execution.state
+            tracing::info!(
+                execution_id = %execution.execution_id,
+                request_id,
+                has_session,
+                state = ?execution.state,
+                "found sandbox shell reuse candidate"
             );
         }
         if has_session {
@@ -1205,14 +1276,21 @@ fn find_attachable_sandbox_shell_execution(
     }
 
     if debug {
-        eprintln!(
-            "[vz-runtimed exec-control] no reusable sandbox shell execution found container_id={} request_id={} expected_cmd={:?} expected_args={:?}",
-            container_id, request_id, shell_command, shell_args
+        tracing::info!(
+            container_id,
+            request_id,
+            expected_command = ?shell_command,
+            expected_args = ?shell_args,
+            "no reusable sandbox shell execution found"
         );
     }
     Ok(None)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn sandbox_container_ids(
     daemon: &RuntimeDaemon,
     sandbox_id: &str,
@@ -1231,6 +1309,10 @@ fn sandbox_container_ids(
     Ok(ids)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn find_latest_active_sandbox_shell_execution(
     daemon: &RuntimeDaemon,
     sandbox: &Sandbox,
@@ -1257,6 +1339,10 @@ fn find_latest_active_sandbox_shell_execution(
     Ok(executions.pop())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn resolve_close_sandbox_shell_execution_id(
     daemon: &RuntimeDaemon,
     sandbox: &Sandbox,
@@ -1436,9 +1522,12 @@ async fn ensure_sandbox_shell_execution(
         }
     }
     if sandbox_exec_control_debug_enabled() {
-        eprintln!(
-            "[vz-runtimed exec-control] creating new sandbox shell execution container_id={} request_id={} command={:?} args={:?}",
-            container_id, request_id, shell_command, shell_args
+        tracing::info!(
+            container_id,
+            request_id,
+            command = ?shell_command,
+            args = ?shell_args,
+            "creating a new sandbox shell execution"
         );
     }
 
@@ -1477,6 +1566,10 @@ async fn ensure_sandbox_shell_execution(
     Ok(execution.execution_id)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn sandbox_shell_secret_env_reference_overrides(
     labels: &BTreeMap<String, String>,
     request_id: &str,

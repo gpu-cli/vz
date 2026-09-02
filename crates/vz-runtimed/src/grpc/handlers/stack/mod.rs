@@ -363,6 +363,10 @@ fn default_stopped_service(service_name: &str) -> ServiceObservedState {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn load_stack_service_action_context(
     daemon: &RuntimeDaemon,
     stack_name: &str,
@@ -451,6 +455,10 @@ fn generated_stack_run_service_name(service_name: &str) -> String {
     format!("{service_name}-run-{suffix}")
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn clone_stack_spec_with_run_service(
     spec: &StackSpec,
     service_name: &str,
@@ -496,6 +504,10 @@ fn clone_stack_spec_with_run_service(
     Ok(run_spec)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn load_observed_stack_service(
     daemon: &RuntimeDaemon,
     stack_name: &str,
@@ -513,6 +525,10 @@ fn load_observed_stack_service(
         .map_err(|error| status_from_stack_error(error, request_id))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn execute_stack_service_action(
     daemon: Arc<RuntimeDaemon>,
     spec: &StackSpec,

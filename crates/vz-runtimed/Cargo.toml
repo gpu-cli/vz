@@ -11,6 +11,7 @@ repository.workspace = true
 test-backend = []
 
 [dependencies]
+fs2 = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }

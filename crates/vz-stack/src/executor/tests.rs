@@ -1105,9 +1105,12 @@ fn three_service_ip_allocation() {
             .iter()
             .any(|(h, ip)| h == "db" && ip == "172.20.0.4")
     );
-    assert!(web_hosts.iter().any(|(h, ip)| h
-        == vz_runtime_contract::HOST_INTERNAL_ALIAS
-        && ip == vz_runtime_contract::HOST_INTERNAL_GATEWAY_IPV4));
+    assert!(
+        web_hosts
+            .iter()
+            .any(|(h, ip)| h == vz_runtime_contract::HOST_INTERNAL_ALIAS
+                && ip == vz_runtime_contract::HOST_INTERNAL_GATEWAY_IPV4)
+    );
 }
 
 #[test]

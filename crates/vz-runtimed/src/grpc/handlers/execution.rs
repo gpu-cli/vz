@@ -11,6 +11,10 @@ fn resolve_inherited_exec_pty(
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn resolve_exec_pty_mode(
     daemon: &RuntimeDaemon,
     request: &runtime_v2::CreateExecutionRequest,
@@ -373,9 +377,11 @@ async fn execute_backend_execution(
     let execution_id = execution.execution_id.clone();
     let debug = exec_control_debug_enabled();
     if debug {
-        eprintln!(
-            "[vz-runtimed exec-control] execute_backend_execution start execution_id={} container_id={} pty={}",
-            execution.execution_id, execution.container_id, execution.exec_spec.pty
+        tracing::info!(
+            execution_id = %execution.execution_id,
+            container_id = %execution.container_id,
+            pty = execution.exec_spec.pty,
+            "starting backend execution"
         );
     }
     let output = daemon
@@ -404,9 +410,10 @@ async fn execute_backend_execution(
         )
         .await?;
     if debug {
-        eprintln!(
-            "[vz-runtimed exec-control] execute_backend_execution complete execution_id={} exit_code={}",
-            execution.execution_id, output.exit_code
+        tracing::info!(
+            execution_id = %execution.execution_id,
+            exit_code = output.exit_code,
+            "backend execution completed"
         );
     }
     Ok((output, true))
@@ -430,9 +437,7 @@ async fn execute_backend_execution(
 async fn run_execution_task(daemon: Arc<RuntimeDaemon>, execution_id: String) {
     let debug = exec_control_debug_enabled();
     if debug {
-        eprintln!(
-            "[vz-runtimed exec-control] run_execution_task start execution_id={execution_id}"
-        );
+        tracing::info!(execution_id, "starting execution task");
     }
     let running_execution = match update_execution_running(daemon.as_ref(), &execution_id) {
         Ok(execution) => execution,
@@ -455,22 +460,25 @@ async fn run_execution_task(daemon: Arc<RuntimeDaemon>, execution_id: String) {
         return;
     };
     if debug {
-        eprintln!(
-            "[vz-runtimed exec-control] run_execution_task execution running execution_id={} container_id={}",
-            execution.execution_id, execution.container_id
+        tracing::info!(
+            execution_id = %execution.execution_id,
+            container_id = %execution.container_id,
+            "execution transitioned to running"
         );
     }
 
     let result = execute_backend_execution(daemon.as_ref(), &execution).await;
     if debug {
         match &result {
-            Ok((output, _)) => eprintln!(
-                "[vz-runtimed exec-control] run_execution_task backend result ok execution_id={} exit_code={}",
-                execution.execution_id, output.exit_code
+            Ok((output, _)) => tracing::info!(
+                execution_id = %execution.execution_id,
+                exit_code = output.exit_code,
+                "execution backend call succeeded"
             ),
-            Err(error) => eprintln!(
-                "[vz-runtimed exec-control] run_execution_task backend result error execution_id={} error={error}",
-                execution.execution_id
+            Err(error) => tracing::info!(
+                execution_id = %execution.execution_id,
+                error = %error,
+                "execution backend call failed"
             ),
         }
     }
@@ -531,6 +539,10 @@ async fn run_execution_task(daemon: Arc<RuntimeDaemon>, execution_id: String) {
     let _ = daemon.execution_sessions().remove(&execution_id);
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn maybe_spawn_execution_task(
     daemon: Arc<RuntimeDaemon>,
     execution: &Execution,
@@ -540,9 +552,11 @@ fn maybe_spawn_execution_task(
         .map_err(|error| status_from_stack_error(error, request_id))?;
     if !should_start {
         if exec_control_debug_enabled() {
-            eprintln!(
-                "[vz-runtimed exec-control] skipping execution task spawn execution_id={} container_id={} state={:?} (container missing)",
-                execution.execution_id, execution.container_id, execution.state
+            tracing::info!(
+                execution_id = %execution.execution_id,
+                container_id = %execution.container_id,
+                state = ?execution.state,
+                "skipping execution task spawn because the container is missing"
             );
         }
         match daemon.execution_sessions().remove(&execution.execution_id) {
@@ -1076,10 +1090,11 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
             .unwrap_or_else(generate_request_id);
         let debug = exec_control_debug_enabled();
         if debug {
-            eprintln!(
-                "[vz-runtimed exec-control] write_exec_stdin received request_id={request_id} execution_id={} bytes={}",
-                request.execution_id,
-                request.data.len()
+            tracing::info!(
+                request_id,
+                execution_id = %request.execution_id,
+                bytes = request.data.len(),
+                "received execution stdin"
             );
         }
         enforce_mutation_policy_preflight(
@@ -1131,9 +1146,11 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
         let daemon = self.daemon.clone();
         let data = request.data.clone();
         if debug {
-            eprintln!(
-                "[vz-runtimed exec-control] write_exec_stdin dispatching to backend request_id={request_id} execution_id={execution_id} bytes={}",
-                data.len()
+            tracing::info!(
+                request_id,
+                execution_id,
+                bytes = data.len(),
+                "dispatching execution stdin to backend"
             );
         }
         let write_result = run_exec_control_with_startup_retry(
@@ -1155,11 +1172,16 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
         .await;
         if debug {
             match &write_result {
-                Ok(()) => eprintln!(
-                    "[vz-runtimed exec-control] write_exec_stdin backend call completed request_id={request_id} execution_id={execution_id}"
+                Ok(()) => tracing::info!(
+                    request_id,
+                    execution_id,
+                    "execution stdin backend call completed"
                 ),
-                Err(error) => eprintln!(
-                    "[vz-runtimed exec-control] write_exec_stdin backend call failed request_id={request_id} execution_id={execution_id} error={error}"
+                Err(error) => tracing::info!(
+                    request_id,
+                    execution_id,
+                    error = %error,
+                    "execution stdin backend call failed"
                 ),
             }
         }

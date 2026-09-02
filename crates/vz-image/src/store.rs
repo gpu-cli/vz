@@ -747,10 +747,7 @@ impl ImageStore {
                 continue;
             };
 
-            let image_id = match fs::read_to_string(entry.path()) {
-                Ok(data) => data.trim().to_string(),
-                Err(err) => return Err(err),
-            };
+            let image_id = fs::read_to_string(entry.path())?.trim().to_string();
 
             if image_id.is_empty() {
                 continue;

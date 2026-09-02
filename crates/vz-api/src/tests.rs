@@ -5,7 +5,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::Request;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread::JoinHandle;
 use tempfile::tempdir;
 use tower::ServiceExt;
@@ -47,22 +47,32 @@ fn ensure_test_daemon_for_state_store(state_store_path: &Path) {
     let shutdown_task = shutdown.clone();
     let daemon_task = daemon.clone();
     let socket_task = socket_path.clone();
+    let (server_result_tx, server_result_rx) = mpsc::sync_channel(1);
 
     let thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("build daemon runtime");
-        let _ = runtime.block_on(async move {
+        let result = runtime.block_on(async move {
             serve_runtime_uds_with_shutdown(daemon_task, socket_task, async move {
                 shutdown_task.notified().await;
             })
             .await
         });
+        let _ = server_result_tx.send(result);
     });
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
+        match server_result_rx.try_recv() {
+            Ok(Ok(())) => panic!("test runtimed server stopped before its socket was ready"),
+            Ok(Err(error)) => panic!("test runtimed server failed before startup: {error}"),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                panic!("test runtimed server thread stopped before startup")
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
         if socket_path.exists() {
             guard.insert(socket_path, TestDaemonHandle { shutdown, thread });
             return;

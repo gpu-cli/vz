@@ -397,6 +397,10 @@ impl runtime_v2::build_service_server::BuildService for BuildServiceImpl {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
 fn persist_build_snapshot(
     daemon: &RuntimeDaemon,
     build: &Build,
@@ -533,8 +537,5 @@ fn build_event_message(event: &vz_runtime_contract::Event) -> String {
         return status.clone();
     }
 
-    match serde_json::to_string(&event.payload) {
-        Ok(payload) => payload,
-        Err(_) => String::new(),
-    }
+    serde_json::to_string(&event.payload).unwrap_or_default()
 }
