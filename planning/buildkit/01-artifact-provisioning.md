@@ -10,8 +10,8 @@ BuildKit requires the static Linux arm64 `buildkitd` daemon and `buildctl`
 client in the guest VM. The upstream all-binaries release archive also contains
 an OCI runtime, so vz must not download or repackage it. Release automation
 instead builds only these two commands from the pinned BuildKit source. The
-guest uses the youki binary from the existing Linux artifact bundle as its sole
-OCI runtime.
+guest mounts checksum-pinned `youki` separately from the selected Linux artifact
+bundle at `/mnt/linux-bin/youki` and uses it as its sole OCI runtime.
 
 ## Design
 
@@ -22,9 +22,14 @@ OCI runtime.
 ├── bin/
 │   ├── buildkitd          # ~50 MB static arm64 binary
 │   └── buildctl           # static arm64 client
-├── cache/                 # Persistent layer cache (Phase 6)
+├── cache/                 # Provider-owned auxiliary directory
+├── cache.img              # macOS provider's sparse persistent worker disk
 └── version.json           # version, layout, source, archive, and binary hashes
 ```
+
+Only `bin/` and `version.json` belong to the runtime-free release package. The
+macOS provider creates `cache.img` separately and mounts it as the guest's
+`/var/lib/buildkit`; the cache disk never supplies an OCI runtime.
 
 ### Download Source
 
@@ -37,7 +42,7 @@ produces the candidate archive, and pre-release VM/E2E runs consume that exact
 file through the local override below. After the `v0.3.21` release publishes the
 asset, the default installer can fetch it from the immutable release URL. Until
 then, a fresh install without the override fails closed; it never falls back to
-an upstream all-binaries archive or another OCI runtime.
+an upstream all-binaries archive, runc, crun, or another OCI runtime.
 
 The archive inventory is exact:
 
@@ -105,7 +110,8 @@ Should reuse the download + extraction patterns from `vz-linux/src/kernel.rs` (t
 
 ## Done When
 
-1. No BuildKit artifact consumed or published by vz contains an OCI runtime
+1. No BuildKit artifact consumed or published by vz contains runc, crun, or any
+   other OCI runtime
 2. `buildkitd` and `buildctl` are independently checksum-pinned
 3. Archive and installed inventories are exact allowlists
 4. Legacy layouts and caches with extra binaries are replaced

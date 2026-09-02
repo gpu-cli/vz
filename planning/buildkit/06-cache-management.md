@@ -2,7 +2,7 @@
 
 ## Depends On
 
-- 02 (guest BuildKit service — VirtioFS cache mount)
+- 02 (guest BuildKit service — persistent ext4 cache disk)
 - 05 (CLI — need a place to expose cache commands)
 
 ## Problem
@@ -14,15 +14,13 @@ BuildKit's layer cache is the key to fast builds. We need persistent cache that 
 ### Cache Storage
 
 ```
-~/.vz/buildkit/cache/          # VirtioFS-mounted into guest at /var/lib/buildkit/
-├── runc-overlayfs/
-│   ├── content/               # Content-addressable blobs
-│   └── snapshots/             # Overlay snapshots (layer diffs)
-└── cache.db                   # Metadata database (bbolt)
+~/.vz/buildkit/cache.img       # 64 GiB sparse block image
+└── ext4 filesystem            # Mounted in the guest at /var/lib/buildkit/
+    └── BuildKit-managed data  # Content, snapshots, and metadata (opaque to vz)
 ```
 
-BuildKit manages this directory internally. We just need to:
-1. Ensure the VirtioFS mount exists (Phase 2)
+BuildKit manages this filesystem internally. We just need to:
+1. Ensure the sparse disk exists and mount `/dev/vda` as ext4 (Phase 2)
 2. Configure GC policy in buildkitd config
 3. Expose cache operations through CLI
 
@@ -33,6 +31,7 @@ Written to guest filesystem before starting buildkitd:
 ```toml
 # /etc/buildkit/buildkitd.toml (inside guest)
 [worker.oci]
+  binary = "/tmp/vz-buildkit-oci-runtime"
   gc = true
   snapshotter = "overlayfs"
 
@@ -93,4 +92,5 @@ pub async fn prune(channel: Channel, opts: PruneOptions) -> Result<PruneSummary>
 3. Cache persists across `vz build` invocations (VM restarts)
 4. GC policy limits cache growth automatically
 5. `vz build cache prune --all` removes everything
-6. Cache directory can be deleted manually (`rm -rf ~/.vz/buildkit/cache/`) as escape hatch
+6. With the BuildKit VM stopped, `cache.img` can be removed as an escape hatch;
+   the next build recreates an empty sparse cache disk
