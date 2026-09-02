@@ -57,6 +57,9 @@ mod tests {
     fn expected_runtime_v2_rpc_modes() -> BTreeMap<String, RpcMode> {
         [
             ("CreateSandbox", RpcMode::ServerStreaming),
+            ("PrepareSpaceCache", RpcMode::ServerStreaming),
+            ("ExportSpaceCache", RpcMode::ServerStreaming),
+            ("ImportSpaceCache", RpcMode::ServerStreaming),
             ("GetSandbox", RpcMode::Unary),
             ("ListSandboxes", RpcMode::Unary),
             ("TerminateSandbox", RpcMode::ServerStreaming),
@@ -119,6 +122,13 @@ mod tests {
             ("ChmodPath", RpcMode::Unary),
             ("ChownPath", RpcMode::Unary),
             ("GetCapabilities", RpcMode::Unary),
+            ("ValidateLinuxVm", RpcMode::ServerStreaming),
+            ("ListLinuxVmBases", RpcMode::Unary),
+            ("GetLinuxVmBase", RpcMode::Unary),
+            ("UpsertLinuxVmBase", RpcMode::ServerStreaming),
+            ("DeleteLinuxVmBase", RpcMode::ServerStreaming),
+            ("ApplyLinuxVmPatch", RpcMode::ServerStreaming),
+            ("RollbackLinuxVmPatch", RpcMode::ServerStreaming),
         ]
         .into_iter()
         .map(|(name, mode)| (name.to_string(), mode))

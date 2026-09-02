@@ -8,7 +8,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread::JoinHandle;
 use tempfile::tempdir;
+use tokio_stream::wrappers::UnixListenerStream;
 use tower::ServiceExt;
+use vz_runtime_proto::runtime_v2;
 use vz_runtimed::{RuntimeDaemon, RuntimedConfig, serve_runtime_uds_with_shutdown};
 use vz_stack::StackEvent;
 
@@ -20,6 +22,125 @@ struct TestDaemonHandle {
 }
 
 static TEST_DAEMONS: OnceLock<Mutex<HashMap<PathBuf, TestDaemonHandle>>> = OnceLock::new();
+
+struct FingerprintCheckpointService;
+
+#[tonic::async_trait]
+impl runtime_v2::checkpoint_service_server::CheckpointService for FingerprintCheckpointService {
+    async fn create_checkpoint(
+        &self,
+        _request: tonic::Request<runtime_v2::CreateCheckpointRequest>,
+    ) -> Result<tonic::Response<runtime_v2::CheckpointResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("fixture only serves restore"))
+    }
+
+    async fn get_checkpoint(
+        &self,
+        _request: tonic::Request<runtime_v2::GetCheckpointRequest>,
+    ) -> Result<tonic::Response<runtime_v2::CheckpointResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("fixture only serves restore"))
+    }
+
+    async fn list_checkpoints(
+        &self,
+        _request: tonic::Request<runtime_v2::ListCheckpointsRequest>,
+    ) -> Result<tonic::Response<runtime_v2::ListCheckpointsResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("fixture only serves restore"))
+    }
+
+    async fn restore_checkpoint(
+        &self,
+        request: tonic::Request<runtime_v2::RestoreCheckpointRequest>,
+    ) -> Result<tonic::Response<runtime_v2::CheckpointResponse>, tonic::Status> {
+        let request = request.into_inner();
+        if request.checkpoint_id != "ckpt-fp" {
+            return Err(tonic::Status::not_found("checkpoint not found"));
+        }
+        let request_id = request
+            .metadata
+            .map(|metadata| metadata.request_id)
+            .unwrap_or_default();
+        Ok(tonic::Response::new(runtime_v2::CheckpointResponse {
+            request_id,
+            checkpoint: Some(runtime_v2::CheckpointPayload {
+                checkpoint_id: "ckpt-fp".to_string(),
+                sandbox_id: "sbx-fp".to_string(),
+                checkpoint_class: "fs_quick".to_string(),
+                state: "ready".to_string(),
+                compatibility_fingerprint: "kernel-6.1-arm64".to_string(),
+                created_at: now_epoch_secs(),
+                ..runtime_v2::CheckpointPayload::default()
+            }),
+        }))
+    }
+
+    async fn fork_checkpoint(
+        &self,
+        _request: tonic::Request<runtime_v2::ForkCheckpointRequest>,
+    ) -> Result<tonic::Response<runtime_v2::CheckpointResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("fixture only serves restore"))
+    }
+
+    async fn diff_checkpoints(
+        &self,
+        _request: tonic::Request<runtime_v2::DiffCheckpointsRequest>,
+    ) -> Result<tonic::Response<runtime_v2::DiffCheckpointsResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("fixture only serves restore"))
+    }
+
+    type ExportCheckpointStream =
+        tokio_stream::Empty<Result<runtime_v2::ExportCheckpointEvent, tonic::Status>>;
+
+    async fn export_checkpoint(
+        &self,
+        _request: tonic::Request<runtime_v2::ExportCheckpointRequest>,
+    ) -> Result<tonic::Response<Self::ExportCheckpointStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("fixture only serves restore"))
+    }
+
+    type ImportCheckpointStream =
+        tokio_stream::Empty<Result<runtime_v2::ImportCheckpointEvent, tonic::Status>>;
+
+    async fn import_checkpoint(
+        &self,
+        _request: tonic::Request<runtime_v2::ImportCheckpointRequest>,
+    ) -> Result<tonic::Response<Self::ImportCheckpointStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("fixture only serves restore"))
+    }
+}
+
+#[tonic::async_trait]
+impl runtime_v2::capability_service_server::CapabilityService for FingerprintCheckpointService {
+    async fn get_capabilities(
+        &self,
+        request: tonic::Request<runtime_v2::GetCapabilitiesRequest>,
+    ) -> Result<tonic::Response<runtime_v2::GetCapabilitiesResponse>, tonic::Status> {
+        let request_id = request
+            .into_inner()
+            .metadata
+            .map(|metadata| metadata.request_id)
+            .filter(|request_id| !request_id.is_empty())
+            .unwrap_or_else(|| "req-handshake".to_string());
+        let mut response = tonic::Response::new(runtime_v2::GetCapabilitiesResponse {
+            request_id,
+            capabilities: Vec::new(),
+        });
+        response
+            .metadata_mut()
+            .insert("x-vz-runtimed-id", "test-runtimed".parse().unwrap());
+        response.metadata_mut().insert(
+            "x-vz-runtimed-version",
+            env!("CARGO_PKG_VERSION").parse().unwrap(),
+        );
+        response
+            .metadata_mut()
+            .insert("x-vz-runtimed-backend", "test".parse().unwrap());
+        response
+            .metadata_mut()
+            .insert("x-vz-runtimed-started-at", "1".parse().unwrap());
+        Ok(response)
+    }
+}
 
 fn ensure_test_daemon_for_state_store(state_store_path: &Path) {
     let runtime_data_dir = state_store_path
@@ -1790,21 +1911,38 @@ async fn checkpoint_diff_requires_query_parameters() {
 async fn checkpoint_restore_includes_fingerprint_metadata() {
     let temp_dir = tempdir().unwrap();
     let state_path = temp_dir.path().join("state.db");
-    let store = StateStore::open(&state_path).unwrap();
+    StateStore::open(&state_path).unwrap();
 
-    let mut checkpoint = Checkpoint {
-        checkpoint_id: "ckpt-fp".to_string(),
-        sandbox_id: "sbx-fp".to_string(),
-        parent_checkpoint_id: None,
-        class: CheckpointClass::FsQuick,
-        state: CheckpointState::Creating,
-        created_at: now_epoch_secs(),
-        compatibility_fingerprint: "kernel-6.1-arm64".to_string(),
-    };
-    checkpoint.transition_to(CheckpointState::Ready).unwrap();
-    store.save_checkpoint(&checkpoint).unwrap();
+    // This API contract test needs a successful daemon restore response, not a
+    // platform-specific btrfs restore. Serve the completed checkpoint payload
+    // at the transport boundary so the fixture is valid on both macOS and Linux.
+    let socket_path = temp_dir.path().join("runtimed.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+    let incoming = UnixListenerStream::new(listener);
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(
+                runtime_v2::checkpoint_service_server::CheckpointServiceServer::new(
+                    FingerprintCheckpointService,
+                ),
+            )
+            .add_service(
+                runtime_v2::capability_service_server::CapabilityServiceServer::new(
+                    FingerprintCheckpointService,
+                ),
+            )
+            .serve_with_incoming_shutdown(incoming, async move {
+                shutdown_task.notified().await;
+            })
+            .await
+    });
 
-    let config = test_config(state_path);
+    let mut config = base_test_config(state_path);
+    config.daemon_socket_path = Some(socket_path);
+    config.daemon_runtime_data_dir = Some(temp_dir.path().join("runtime"));
+    config.daemon_auto_spawn = false;
     let app = router(config);
 
     let response = app
@@ -1826,6 +1964,13 @@ async fn checkpoint_restore_includes_fingerprint_metadata() {
         "kernel-6.1-arm64"
     );
     assert!(payload["restore_note"].as_str().is_some());
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server task should succeed");
+    assert!(result.is_ok());
 }
 
 #[tokio::test]
