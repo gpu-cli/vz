@@ -16,7 +16,7 @@
 use std::process::Command;
 use std::time::Duration;
 
-use vz_oci_macos::{ExecConfig, ExecutionMode, RunConfig, Runtime, RuntimeConfig};
+use vz_oci_macos::{ExecConfig, ExecutionMode, KernelProfile, RunConfig, Runtime, RuntimeConfig};
 
 /// Set up tracing for test diagnostics.
 fn init_tracing() {
@@ -28,8 +28,16 @@ fn init_tracing() {
 
 /// Build a runtime with a unique temp data dir for test isolation.
 fn test_runtime(data_dir: &std::path::Path) -> Runtime {
+    test_runtime_for_profile(data_dir, None)
+}
+
+fn test_runtime_for_profile(
+    data_dir: &std::path::Path,
+    linux_profile: Option<KernelProfile>,
+) -> Runtime {
     let config = RuntimeConfig {
         data_dir: data_dir.to_path_buf(),
+        linux_profile,
         require_exact_agent_version: false,
         agent_ready_timeout: Duration::from_secs(15),
         exec_timeout: Duration::from_secs(30),
@@ -197,6 +205,40 @@ async fn smoke_environment_variables() {
 
     assert_eq!(output.exit_code, 0);
     assert_eq!(output.stdout.trim(), "test_value");
+}
+
+/// Verify the container kernel exposes the cgroup memory controller and
+/// bridge-netfilter sysctls required by dockerd.
+#[tokio::test]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn container_kernel_exposes_docker_prerequisites() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
+    init_tracing();
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = test_runtime_for_profile(tmp.path(), Some(KernelProfile::Container));
+
+    let output = rt
+        .run(
+            "alpine:latest",
+            RunConfig {
+                cmd: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "grep -qw memory /sys/fs/cgroup/cgroup.controllers && \
+                     test -e /proc/sys/net/bridge/bridge-nf-call-iptables && \
+                     echo docker-kernel-prerequisites-ok"
+                        .into(),
+                ],
+                ..RunConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(output.exit_code, 0, "kernel prerequisites probe failed");
+    assert_eq!(output.stdout.trim(), "docker-kernel-prerequisites-ok");
 }
 
 // ── Container lifecycle: create → exec → stop → remove ─────────
