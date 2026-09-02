@@ -32,6 +32,13 @@ The vz release workflow builds the `buildctl` and `buildkitd` Dockerfile targets
 from the immutable BuildKit v0.19.0 source commit. It publishes a deterministic
 ustar package named `vz-buildkit-v0.19.0-linux-arm64.tar` on the vz release.
 
+The `v0.3.21` rollout is intentionally two phase. The release workflow first
+produces the candidate archive, and pre-release VM/E2E runs consume that exact
+file through the local override below. After the `v0.3.21` release publishes the
+asset, the default installer can fetch it from the immutable release URL. Until
+then, a fresh install without the override fails closed; it never falls back to
+an upstream all-binaries archive or another OCI runtime.
+
 The archive inventory is exact:
 
 ```
@@ -71,6 +78,12 @@ For a release candidate or local VM lane, set both
 `VZ_BUILDKIT_ARTIFACT_ARCHIVE=/absolute/path/to/archive.tar` and
 `VZ_BUILDKIT_ARTIFACT_SHA256=<sha256>`. The local archive must satisfy the same
 pinned manifest and per-file digests as the published artifact.
+
+The source commit and every accepted output digest are pinned, but rebuilding is
+not guaranteed to be bit-for-bit reproducible if upstream builder base images or
+the release runner's archive tooling drift. Such drift fails closed because the
+workflow checks the expected binary and archive digests. Updating those pins
+requires a separately reviewed rebuild and provenance check.
 
 ### Implementation
 

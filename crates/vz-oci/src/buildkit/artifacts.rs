@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -156,21 +156,24 @@ fn ensure_buildkit_artifacts_in_dir(
     let expected_archive_sha256 = expected_archive_sha256()?;
     create_private_dir(buildkit_dir)?;
     let _install_lock = InstallLock::acquire(buildkit_dir, INSTALL_LOCK_TIMEOUT)?;
-    remove_stale_install_generations(buildkit_dir)?;
+    recover_stale_install_generations(buildkit_dir)?;
     if let Some(existing) = load_existing_artifacts(
         buildkit_dir,
         &expected_archive_sha256,
         &pinned_binary_digests(),
     )? {
+        discard_stale_rollback_generations(buildkit_dir)?;
         return Ok(existing);
     }
     let archive_bytes = load_archive_bytes()?;
-    install_archive(
+    let installed = install_archive(
         buildkit_dir,
         &archive_bytes,
         &expected_archive_sha256,
         &BuildkitArchiveManifest::pinned(),
-    )
+    )?;
+    discard_stale_rollback_generations(buildkit_dir)?;
+    Ok(installed)
 }
 
 fn expected_archive_sha256() -> Result<String, BuildkitError> {
@@ -267,15 +270,7 @@ fn load_existing_artifacts(
         return Ok(None);
     }
     for binary in REQUIRED_BINARIES {
-        let bytes = match std::fs::read(bin_dir.join(binary)) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        if sha256_hex(&bytes) != expected_binary_digests[binary] {
-            return Ok(None);
-        }
-        if validate_static_linux_arm64_elf(&bytes).is_err() {
+        if !cached_binary_matches(&bin_dir.join(binary), &expected_binary_digests[binary])? {
             return Ok(None);
         }
     }
@@ -537,31 +532,120 @@ fn commit_install(
     Ok(())
 }
 
-fn remove_stale_install_generations(buildkit_dir: &Path) -> Result<(), BuildkitError> {
+fn recover_stale_install_generations(buildkit_dir: &Path) -> Result<(), BuildkitError> {
+    let mut rollback_generations = Vec::new();
     for entry in std::fs::read_dir(buildkit_dir)? {
         let entry = entry?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
+        if name.starts_with(".bin-backup-") {
+            rollback_generations.push(entry.path());
+            continue;
+        }
         if !(name.starts_with(".staging-")
-            || name.starts_with(".bin-backup-")
             || name.starts_with(".bin-rejected-")
             || name.starts_with(".version.json-"))
         {
             continue;
         }
-        let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path)?;
+        remove_stale_path(&entry.path())?;
+    }
+
+    rollback_generations.sort();
+    let bin_dir = buildkit_dir.join("bin");
+    let bin_exists = match std::fs::symlink_metadata(&bin_dir) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if !bin_exists && rollback_generations.len() == 1 {
+        let rollback = &rollback_generations[0];
+        let metadata = std::fs::symlink_metadata(rollback)?;
         if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-            std::fs::remove_dir_all(path)?;
-        } else {
-            std::fs::remove_file(path)?;
+            std::fs::rename(rollback, bin_dir)?;
+            return Ok(());
+        }
+    }
+
+    Ok(())
+}
+
+fn discard_stale_rollback_generations(buildkit_dir: &Path) -> Result<(), BuildkitError> {
+    for entry in std::fs::read_dir(buildkit_dir)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(".bin-backup-"))
+        {
+            remove_stale_path(&entry.path())?;
         }
     }
     Ok(())
 }
 
+fn remove_stale_path(path: &Path) -> Result<(), BuildkitError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn cached_binary_matches(path: &Path, expected_sha256: &str) -> Result<bool, BuildkitError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_BINARY_BYTES {
+        return Ok(false);
+    }
+    if validate_static_linux_arm64_elf_reader(&mut file, metadata.len()).is_err() {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(0))?;
+
+    let mut bounded = file.take(MAX_BINARY_BYTES + 1);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = bounded.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > MAX_BINARY_BYTES {
+            return Ok(false);
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if total != metadata.len() {
+        return Ok(false);
+    }
+    Ok(format!("{:x}", hasher.finalize()) == expected_sha256)
+}
+
 fn validate_static_linux_arm64_elf(bytes: &[u8]) -> Result<(), String> {
+    validate_static_linux_arm64_elf_reader(&mut Cursor::new(bytes), bytes.len() as u64)
+}
+
+fn validate_static_linux_arm64_elf_reader<R: Read + Seek>(
+    reader: &mut R,
+    binary_len: u64,
+) -> Result<(), String> {
     const ELF_HEADER_SIZE: usize = 64;
     const PROGRAM_HEADER_SIZE: usize = 56;
     const EM_AARCH64: u16 = 183;
@@ -570,7 +654,17 @@ fn validate_static_linux_arm64_elf(bytes: &[u8]) -> Result<(), String> {
     const PT_DYNAMIC: u32 = 2;
     const PT_INTERP: u32 = 3;
 
-    if bytes.len() < ELF_HEADER_SIZE || &bytes[..4] != b"\x7fELF" {
+    if binary_len < ELF_HEADER_SIZE as u64 {
+        return Err("missing ELF64 header".to_string());
+    }
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
+    let mut bytes = [0_u8; ELF_HEADER_SIZE];
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|_| "missing ELF64 header".to_string())?;
+    if &bytes[..4] != b"\x7fELF" {
         return Err("missing ELF64 header".to_string());
     }
     if bytes[4] != 2 || bytes[5] != 1 {
@@ -600,21 +694,23 @@ fn validate_static_linux_arm64_elf(bytes: &[u8]) -> Result<(), String> {
     if ph_entry_size != PROGRAM_HEADER_SIZE {
         return Err("invalid program header entry size".to_string());
     }
-    let ph_offset = usize::try_from(ph_offset).map_err(|_| "program header offset overflow")?;
-    let ph_bytes = ph_entry_size
-        .checked_mul(ph_count)
+    let ph_bytes = (ph_entry_size as u64)
+        .checked_mul(ph_count as u64)
         .and_then(|size| ph_offset.checked_add(size))
         .ok_or("program header table overflow")?;
-    if ph_bytes > bytes.len() {
+    if ph_bytes > binary_len {
         return Err("truncated program header table".to_string());
     }
     for index in 0..ph_count {
-        let offset = ph_offset + index * ph_entry_size;
-        let header_type = u32::from_le_bytes(
-            bytes[offset..offset + 4]
-                .try_into()
-                .map_err(|_| "truncated program header")?,
-        );
+        let offset = ph_offset + index as u64 * ph_entry_size as u64;
+        reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(|error| error.to_string())?;
+        let mut header_type = [0_u8; 4];
+        reader
+            .read_exact(&mut header_type)
+            .map_err(|_| "truncated program header".to_string())?;
+        let header_type = u32::from_le_bytes(header_type);
         if matches!(header_type, PT_INTERP | PT_DYNAMIC) {
             return Err("ELF contains dynamic linking metadata".to_string());
         }
@@ -935,8 +1031,31 @@ mod tests {
     }
 
     #[test]
-    fn stale_install_generations_are_removed_before_cache_reuse() {
+    fn lone_valid_rollback_generation_is_recovered_before_cache_reuse() {
         let temp = tempdir().unwrap();
+        let buildctl = test_binary(1);
+        let buildkitd = test_binary(2);
+        let manifest = test_manifest(&buildctl, &buildkitd);
+        let archive = build_test_archive(&manifest, &buildctl, &buildkitd, None);
+        let archive_sha = sha256_hex(&archive);
+        install_test_archive(temp.path(), &archive, &manifest);
+        let rollback = temp.path().join(".bin-backup-crash");
+        std::fs::rename(temp.path().join("bin"), &rollback).unwrap();
+
+        recover_stale_install_generations(temp.path()).unwrap();
+
+        assert!(!rollback.exists());
+        assert!(
+            load_existing_artifacts(temp.path(), &archive_sha, &manifest.binaries)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn rollback_is_preserved_until_current_generation_is_accepted() {
+        let temp = tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("bin")).unwrap();
         for name in [".staging-crash", ".bin-backup-crash", ".bin-rejected-crash"] {
             let dir = temp.path().join(name);
             std::fs::create_dir_all(&dir).unwrap();
@@ -944,9 +1063,20 @@ mod tests {
         }
         std::fs::write(temp.path().join(".version.json-crash"), b"legacy").unwrap();
 
-        remove_stale_install_generations(temp.path()).unwrap();
+        recover_stale_install_generations(temp.path()).unwrap();
 
-        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+        assert!(temp.path().join("bin").exists());
+        assert!(temp.path().join(".bin-backup-crash").exists());
+        for name in [
+            ".staging-crash",
+            ".bin-rejected-crash",
+            ".version.json-crash",
+        ] {
+            assert!(!temp.path().join(name).exists());
+        }
+
+        discard_stale_rollback_generations(temp.path()).unwrap();
+        assert!(!temp.path().join(".bin-backup-crash").exists());
     }
 
     #[test]
@@ -968,6 +1098,48 @@ mod tests {
         std::fs::remove_file(artifacts.bin_dir.join("extra")).unwrap();
 
         std::fs::write(artifacts.buildctl_path(), b"tampered").unwrap();
+        assert!(
+            load_existing_artifacts(temp.path(), &archive_sha, &manifest.binaries)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn oversized_cached_binary_is_rejected_before_reading_contents() {
+        let temp = tempdir().unwrap();
+        let buildctl = test_binary(1);
+        let buildkitd = test_binary(2);
+        let manifest = test_manifest(&buildctl, &buildkitd);
+        let archive = build_test_archive(&manifest, &buildctl, &buildkitd, None);
+        let archive_sha = sha256_hex(&archive);
+        let artifacts = install_test_archive(temp.path(), &archive, &manifest);
+        OpenOptions::new()
+            .write(true)
+            .open(artifacts.buildctl_path())
+            .unwrap()
+            .set_len(MAX_BINARY_BYTES + 1)
+            .unwrap();
+
+        assert!(
+            load_existing_artifacts(temp.path(), &archive_sha, &manifest.binaries)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cached_binary_hash_covers_bytes_after_elf_headers() {
+        let temp = tempdir().unwrap();
+        let mut buildctl = test_binary(1);
+        let buildkitd = test_binary(2);
+        let manifest = test_manifest(&buildctl, &buildkitd);
+        let archive = build_test_archive(&manifest, &buildctl, &buildkitd, None);
+        let archive_sha = sha256_hex(&archive);
+        let artifacts = install_test_archive(temp.path(), &archive, &manifest);
+        *buildctl.last_mut().unwrap() ^= 0xff;
+        std::fs::write(artifacts.buildctl_path(), buildctl).unwrap();
+
         assert!(
             load_existing_artifacts(temp.path(), &archive_sha, &manifest.binaries)
                 .unwrap()
