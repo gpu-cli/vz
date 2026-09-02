@@ -14,6 +14,8 @@ mod listener;
 pub(crate) mod network;
 mod process_table;
 
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -26,6 +28,9 @@ use vz::protocol::AGENT_PORT;
 
 use crate::listener::VsockListener;
 use crate::process_table::ProcessTable;
+
+const BUILDKIT_RUNTIME_SHIM_NAME: &str = "vz-buildkit-oci-runtime";
+const BUILDKIT_RUNTIME_BINARY: &str = "/mnt/linux-bin/youki";
 
 /// Resource usage statistics collected from the guest OS.
 pub(crate) struct ResourceStats {
@@ -53,6 +58,10 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if invoked_as_buildkit_runtime_shim(std::env::args_os().next().as_deref()) {
+        return exec_buildkit_runtime(std::env::args_os().skip(1).collect());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -73,6 +82,59 @@ async fn main() -> anyhow::Result<()> {
     info!(port = args.port, "listening on vsock");
 
     grpc_accept_loop(listener).await
+}
+
+fn invoked_as_buildkit_runtime_shim(argv0: Option<&OsStr>) -> bool {
+    argv0
+        .and_then(|value| Path::new(value).file_name())
+        .is_some_and(|name| name == BUILDKIT_RUNTIME_SHIM_NAME)
+}
+
+fn exec_buildkit_runtime(args: Vec<OsString>) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt as _;
+
+    let args = buildkit_runtime_args(args);
+    let error = std::process::Command::new(BUILDKIT_RUNTIME_BINARY)
+        .args(args)
+        .exec();
+    Err(error).with_context(|| format!("failed to execute {BUILDKIT_RUNTIME_BINARY}"))
+}
+
+fn buildkit_runtime_args(mut args: Vec<OsString>) -> Vec<OsString> {
+    let Some(command_index) = oci_command_index(&args) else {
+        return args;
+    };
+    let command = args[command_index].as_os_str();
+    if (command == "run" || command == "create")
+        && args
+            .get(command_index + 1)
+            .is_none_or(|arg| arg != "--no-pivot")
+    {
+        args.insert(command_index + 1, OsString::from("--no-pivot"));
+    }
+    args
+}
+
+fn oci_command_index(args: &[OsString]) -> Option<usize> {
+    let mut skip_option_value = false;
+    for (index, arg) in args.iter().enumerate() {
+        if skip_option_value {
+            skip_option_value = false;
+            continue;
+        }
+        if matches!(arg.to_str(), Some("--root" | "--log" | "--log-format")) {
+            skip_option_value = true;
+            continue;
+        }
+        if arg == "--" {
+            return (index + 1 < args.len()).then_some(index + 1);
+        }
+        if arg.as_encoded_bytes().starts_with(b"-") {
+            continue;
+        }
+        return Some(index);
+    }
+    None
 }
 
 async fn bind_vsock_listener(port: u32, timeout: Duration) -> anyhow::Result<VsockListener> {
@@ -495,5 +557,76 @@ mod tests {
         assert!(table.is_empty());
         assert_eq!(table.len(), 0);
         assert!(table.get(1).is_none());
+    }
+
+    #[test]
+    fn runtime_multicall_is_selected_only_by_exact_argv0_basename() {
+        assert!(invoked_as_buildkit_runtime_shim(Some(OsStr::new(
+            "/tmp/vz-buildkit-oci-runtime"
+        ))));
+        assert!(!invoked_as_buildkit_runtime_shim(Some(OsStr::new(
+            "/usr/bin/vz-guest-agent"
+        ))));
+        assert!(!invoked_as_buildkit_runtime_shim(Some(OsStr::new(
+            "/tmp/vz-buildkit-oci-runtime-backup"
+        ))));
+    }
+
+    #[test]
+    fn runtime_multicall_adds_no_pivot_to_create_and_run_only() {
+        for command in ["create", "run"] {
+            let args = vec![
+                OsString::from("--root"),
+                OsString::from("/run/youki"),
+                OsString::from(command),
+                OsString::from("container-id"),
+            ];
+            assert_eq!(
+                buildkit_runtime_args(args),
+                vec![
+                    OsString::from("--root"),
+                    OsString::from("/run/youki"),
+                    OsString::from(command),
+                    OsString::from("--no-pivot"),
+                    OsString::from("container-id"),
+                ]
+            );
+        }
+
+        let delete = vec![
+            OsString::from("--root=/run/youki"),
+            OsString::from("delete"),
+            OsString::from("container-id"),
+        ];
+        assert_eq!(buildkit_runtime_args(delete.clone()), delete);
+    }
+
+    #[test]
+    fn runtime_multicall_preserves_arguments_without_shell_parsing() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let opaque = OsString::from_vec(vec![b'a', b' ', b'$', b'\'', 0xff]);
+        let args = vec![
+            OsString::from("create"),
+            OsString::from("--bundle"),
+            opaque.clone(),
+            OsString::from("container;touch /tmp/should-not-exist"),
+        ];
+        let prepared = buildkit_runtime_args(args);
+        assert_eq!(prepared[0], "create");
+        assert_eq!(prepared[1], "--no-pivot");
+        assert_eq!(prepared[2], "--bundle");
+        assert_eq!(prepared[3], opaque);
+        assert_eq!(prepared[4], "container;touch /tmp/should-not-exist");
+    }
+
+    #[test]
+    fn runtime_multicall_does_not_duplicate_existing_no_pivot() {
+        let args = vec![
+            OsString::from("run"),
+            OsString::from("--no-pivot"),
+            OsString::from("container-id"),
+        ];
+        assert_eq!(buildkit_runtime_args(args.clone()), args);
     }
 }

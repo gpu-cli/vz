@@ -11,8 +11,8 @@ use vz_image::{ImageId, ImageStore};
 
 use super::common::{default_buildkit_dir, unique_dir, unix_timestamp_secs};
 use super::{
-    BUILDCTL_BINARY, BUILDKIT_CACHE_DISK_IMAGE, BUILDKIT_CACHE_DISK_SIZE_BYTES,
-    BUILDKIT_RUNC_BINARY, BUILDKIT_VERSION, BUILDKITD_BINARY, BuildkitError, VERSION_FILE,
+    BUILDCTL_BINARY, BUILDKIT_CACHE_DISK_IMAGE, BUILDKIT_CACHE_DISK_SIZE_BYTES, BUILDKIT_VERSION,
+    BUILDKITD_BINARY, BuildkitError, VERSION_FILE,
 };
 
 pub(super) struct BuildkitArtifacts {
@@ -75,8 +75,7 @@ pub(super) async fn ensure_buildkit_artifacts() -> Result<BuildkitArtifacts, Bui
     let extracted_bin_dir = staging_dir.join("bin");
     let buildkitd_path = extracted_bin_dir.join(BUILDKITD_BINARY);
     let buildctl_path = extracted_bin_dir.join(BUILDCTL_BINARY);
-    let runc_path = extracted_bin_dir.join(BUILDKIT_RUNC_BINARY);
-    for path in [&buildkitd_path, &buildctl_path, &runc_path] {
+    for path in [&buildkitd_path, &buildctl_path] {
         if !path.is_file() {
             return Err(BuildkitError::InvalidConfig(format!(
                 "missing expected BuildKit binary: {}",
@@ -125,10 +124,13 @@ async fn artifacts_are_current(base_dir: &Path, bin_dir: &Path) -> Result<bool, 
         return Ok(false);
     }
 
-    for name in [BUILDKITD_BINARY, BUILDCTL_BINARY, BUILDKIT_RUNC_BINARY] {
+    for name in [BUILDKITD_BINARY, BUILDCTL_BINARY] {
         if !bin_dir.join(name).is_file() {
             return Ok(false);
         }
+    }
+    if bin_dir.join("buildkit-runc").exists() {
+        return Ok(false);
     }
     Ok(true)
 }
@@ -156,7 +158,6 @@ async fn extract_buildkit_archive(
         .arg(destination)
         .arg("bin/buildkitd")
         .arg("bin/buildctl")
-        .arg("bin/buildkit-runc")
         .output()
         .await?;
     if !output.status.success() {
@@ -311,4 +312,83 @@ fn verify_blob_digest(digest: &str, data: &[u8]) -> Result<(), BuildkitError> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    async fn write_current_bundle(base_dir: &Path) -> PathBuf {
+        let bin_dir = base_dir.join("bin");
+        tokio::fs::create_dir_all(&bin_dir).await.unwrap();
+        tokio::fs::write(bin_dir.join(BUILDKITD_BINARY), b"daemon")
+            .await
+            .unwrap();
+        tokio::fs::write(bin_dir.join(BUILDCTL_BINARY), b"client")
+            .await
+            .unwrap();
+        let version = BuildkitVersionFile {
+            buildkit: BUILDKIT_VERSION.to_string(),
+            downloaded_at: 1,
+        };
+        tokio::fs::write(
+            base_dir.join(VERSION_FILE),
+            serde_json::to_vec(&version).unwrap(),
+        )
+        .await
+        .unwrap();
+        bin_dir
+    }
+
+    #[tokio::test]
+    async fn runtime_free_local_bundle_is_current() {
+        let temp = tempdir().unwrap();
+        let bin_dir = write_current_bundle(temp.path()).await;
+
+        assert!(artifacts_are_current(temp.path(), &bin_dir).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn local_bundle_requires_both_buildkit_executables() {
+        let temp = tempdir().unwrap();
+        let bin_dir = write_current_bundle(temp.path()).await;
+        tokio::fs::remove_file(bin_dir.join(BUILDCTL_BINARY))
+            .await
+            .unwrap();
+
+        assert!(!artifacts_are_current(temp.path(), &bin_dir).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn local_bundle_rejects_stale_buildkit_version() {
+        let temp = tempdir().unwrap();
+        let bin_dir = write_current_bundle(temp.path()).await;
+        let stale = BuildkitVersionFile {
+            buildkit: "0.0.0".to_string(),
+            downloaded_at: 1,
+        };
+        tokio::fs::write(
+            temp.path().join(VERSION_FILE),
+            serde_json::to_vec(&stale).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!artifacts_are_current(temp.path(), &bin_dir).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn local_bundle_rejects_legacy_runtime_binary() {
+        let temp = tempdir().unwrap();
+        let bin_dir = write_current_bundle(temp.path()).await;
+        tokio::fs::write(bin_dir.join("buildkit-runc"), b"legacy runtime")
+            .await
+            .unwrap();
+
+        assert!(!artifacts_are_current(temp.path(), &bin_dir).await.unwrap());
+    }
 }

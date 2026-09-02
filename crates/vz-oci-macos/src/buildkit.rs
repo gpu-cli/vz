@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use docker_credential::CredentialRetrievalError;
+use serde::Serialize;
 use vz_image::ImageId;
 use vz_linux::LinuxError;
 
@@ -22,7 +23,9 @@ mod proxy;
 mod tests;
 
 pub use manager::BuildManager;
-pub use pipeline::{build_image, build_image_with_events, cache_disk_usage, cache_prune};
+pub use pipeline::{
+    build_image, build_image_with_events, buildkit_runtime_inventory, cache_disk_usage, cache_prune,
+};
 pub use proxy::{create_buildkit_channel, start_unix_proxy};
 
 #[cfg(test)]
@@ -37,7 +40,6 @@ pub(crate) use pipeline::{
 
 const BUILDKIT_VERSION: &str = "0.19.0";
 const BUILDKITD_BINARY: &str = "buildkitd";
-const BUILDKIT_RUNC_BINARY: &str = "buildkit-runc";
 const BUILDCTL_BINARY: &str = "buildctl";
 const VERSION_FILE: &str = "version.json";
 const BUILD_OUTPUT_ARCHIVE: &str = "image.tar";
@@ -45,7 +47,7 @@ const BUILDKITD_ADDR: &str = "tcp://127.0.0.1:8372";
 const BUILDKIT_SETUP_TIMEOUT: Duration = Duration::from_secs(90);
 const BUILDKIT_BUILD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const BUILDKIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
-const BUILDKIT_RUNC_GUEST_PATH: &str = "/tmp/runc";
+const BUILDKIT_OCI_RUNTIME_SHIM_GUEST_PATH: &str = "/tmp/vz-buildkit-oci-runtime";
 const BUILDKIT_AUTH_TAG: &str = "buildkit-auth";
 const BUILDKIT_AUTH_GUEST_DIR: &str = "/mnt/buildkit-auth";
 const BUILDKIT_AUTH_GUEST_CONFIG: &str = "/mnt/buildkit-auth/config.json";
@@ -155,6 +157,29 @@ pub struct BuildResult {
     pub output_path: Option<PathBuf>,
     /// Whether the image was pushed to a registry.
     pub pushed: bool,
+}
+
+/// Guest-side evidence for the OCI runtime used by the managed BuildKit VM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BuildkitRuntimeInventory {
+    /// OCI worker binary configured in `buildkitd.toml`.
+    pub oci_worker_binary: String,
+    /// Executable targeted by the guest-agent multicall symlink.
+    pub shim_target: String,
+    /// Runtime executable invoked by the multicall shim.
+    pub runtime_binary: String,
+    /// Executable ELF paths that can serve as the guest OCI runtime.
+    pub oci_runtime_elf_paths: Vec<String>,
+    /// Forbidden legacy runtime paths found in guest runtime locations.
+    pub forbidden_runtime_paths: Vec<String>,
+    /// Version identity reported by the runtime executable.
+    pub runtime_version: String,
+    /// Executable backing the retained BuildKit daemon process.
+    pub buildkitd_executable: String,
+    /// OCI worker binary present in the retained daemon's argv.
+    pub buildkitd_oci_worker_binary: String,
+    /// Cgroup filesystem type mounted for the OCI worker.
+    pub cgroup_filesystem: String,
 }
 
 /// Build manager failures.
