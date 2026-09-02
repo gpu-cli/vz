@@ -207,27 +207,11 @@ async fn create_sandbox_via_api(api_base_url: &str, project_dir: &Path) -> Resul
     Ok(payload.sandbox.sandbox_id)
 }
 
-fn resolve_vz_binary() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_vz") {
-        return Ok(PathBuf::from(path));
-    }
-
-    let current_exe = std::env::current_exe().context("resolve current test binary path")?;
-    if let Some(target_debug_dir) = current_exe.parent().and_then(|path| path.parent()) {
-        let candidate = target_debug_dir.join("vz");
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-        #[cfg(windows)]
-        {
-            let candidate_exe = target_debug_dir.join("vz.exe");
-            if candidate_exe.exists() {
-                return Ok(candidate_exe);
-            }
-        }
-    }
-
-    bail!("resolve vz binary")
+fn resolve_vz_binary() -> PathBuf {
+    // Cargo exposes binary targets to integration tests at compile time. Using
+    // the embedded path also works under nextest, which need not forward the
+    // corresponding environment variable when the test process runs.
+    PathBuf::from(env!("CARGO_BIN_EXE_vz"))
 }
 
 fn run_vz_command_blocking(
@@ -665,7 +649,7 @@ async fn cli_api_http_mode_end_to_end_sandbox_and_attach_flow() -> Result<()> {
         start_api_server(state_store_path.clone(), daemon_socket_path).await?;
 
     let sandbox_id = create_sandbox_via_api(&api_base_url, temp_dir.path()).await?;
-    let vz_bin = resolve_vz_binary()?;
+    let vz_bin = resolve_vz_binary();
 
     let image_ls_output =
         run_vz_command(&vz_bin, &api_base_url, &home_dir, &["image", "ls"]).await?;
@@ -911,7 +895,7 @@ async fn cli_api_http_mode_image_commands_work_against_stub_api_without_daemon()
     });
 
     let api_base_url = format!("http://{address}");
-    let vz_bin = resolve_vz_binary()?;
+    let vz_bin = resolve_vz_binary();
 
     let pull_output = run_vz_command(
         &vz_bin,
@@ -1121,7 +1105,7 @@ async fn cli_api_http_mode_checkpoint_commands_work_against_stub_api_without_dae
     });
 
     let api_base_url = format!("http://{address}");
-    let vz_bin = resolve_vz_binary()?;
+    let vz_bin = resolve_vz_binary();
 
     let create_output = run_vz_command(
         &vz_bin,
@@ -1346,7 +1330,7 @@ async fn cli_api_http_mode_lease_commands_work_against_stub_api_without_daemon()
     });
 
     let api_base_url = format!("http://{address}");
-    let vz_bin = resolve_vz_binary()?;
+    let vz_bin = resolve_vz_binary();
 
     let list_output = run_vz_command(
         &vz_bin,
@@ -1505,7 +1489,7 @@ async fn cli_daemon_grpc_linux_save_restore_commands_cover_happy_path_and_errors
         .context("create_sandbox missing payload")?
         .sandbox_id;
 
-    let vz_bin = resolve_vz_binary()?;
+    let vz_bin = resolve_vz_binary();
     let state_store_path_arg = state_store_path.to_string_lossy().to_string();
 
     let bad_class_output = run_vz_command_daemon(
@@ -1725,7 +1709,7 @@ async fn cli_daemon_grpc_linux_validate_reports_success_and_failure_modes() -> R
     )
     .context("write descriptor")?;
 
-    let vz_bin = resolve_vz_binary()?;
+    let vz_bin = resolve_vz_binary();
     let descriptor_path_arg = descriptor_path.to_string_lossy().to_string();
     let state_store_path_arg = state_store_path.to_string_lossy().to_string();
 
@@ -1844,7 +1828,7 @@ async fn cli_daemon_grpc_linux_base_lifecycle() -> Result<()> {
     std::fs::write(&initramfs_path, b"initramfs-bytes").context("write initramfs artifact")?;
     std::fs::write(&version_path, b"{\"kernel\":\"6.12.11\"}").context("write version json")?;
 
-    let vz_bin = resolve_vz_binary()?;
+    let vz_bin = resolve_vz_binary();
     let state_store_path_arg = state_store_path.to_string_lossy().to_string();
     let kernel_path_arg = kernel_path.to_string_lossy().to_string();
     let initramfs_path_arg = initramfs_path.to_string_lossy().to_string();
@@ -2061,7 +2045,7 @@ async fn cli_daemon_grpc_linux_patch_apply_incompatibility_and_rollback() -> Res
     )
     .context("write incompatible patch bundle")?;
 
-    let vz_bin = resolve_vz_binary()?;
+    let vz_bin = resolve_vz_binary();
     let state_store_path_arg = state_store_path.to_string_lossy().to_string();
     let kernel_path_arg = kernel_path.to_string_lossy().to_string();
     let initramfs_path_arg = initramfs_path.to_string_lossy().to_string();

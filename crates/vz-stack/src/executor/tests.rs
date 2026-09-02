@@ -230,8 +230,11 @@ fn environment_secret_source_is_staged_and_mounted() {
         .find(|mount| mount.target == std::path::PathBuf::from("/run/secrets/runtime_secret"))
         .unwrap();
     assert_eq!(mount.access, vz_runtime_contract::MountAccess::ReadOnly);
-    let staged_path = mount.source.as_ref().unwrap();
-    let staged = std::fs::read_to_string(staged_path).unwrap();
+    let staged_dir = mount.source.as_ref().unwrap();
+    let staged_subpath = mount.subpath.as_deref().unwrap();
+    assert_eq!(staged_dir, &tmp.path().join("secrets/env-secret"));
+    assert_eq!(staged_subpath, "runtime_secret");
+    let staged = std::fs::read_to_string(staged_dir.join(staged_subpath)).unwrap();
     assert_eq!(staged, std::env::var("HOME").unwrap());
 }
 
