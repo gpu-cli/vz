@@ -299,6 +299,7 @@ jobs:
             ((.capabilities // []) | index("netns")) and
             ((.capabilities // []) | index("seccomp")) and
             ((.capabilities // []) | index("io_uring")) and
+            ((.capabilities // []) | index("cgroup_bpf")) and
             ((.capabilities // []) | index("btrfs_snapshots")) and
             ((.capabilities // []) | index("device_mapper")) and
             ((.capabilities // []) | index("dm_crypt"))
@@ -308,6 +309,7 @@ jobs:
           jq -e '
             .profile == "developer" and
             .security_profile == "developer-nested-virt" and
+            ((.capabilities // []) | index("user_ns")) and
             ((.capabilities // []) | index("nested_virt")) and
             ((.capabilities // []) | index("tun"))
           ' linux/out/version.json >/dev/null
@@ -315,6 +317,7 @@ jobs:
           jq -e '
             .profile == "container" and
             .security_profile == "container-hardened" and
+            (((.capabilities // []) | index("user_ns")) == null) and
             ((.capabilities // []) | index("nfsd")) and
             ((.capabilities // []) | index("container_sandbox"))
           ' linux/out/container/version.json >/dev/null

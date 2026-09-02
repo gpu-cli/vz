@@ -19,7 +19,7 @@ use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -36,6 +36,13 @@ use crate::process_table::ProcessTable;
 const BUILDKIT_RUNTIME_SHIM_NAME: &str = "vz-buildkit-oci-runtime";
 const BUILDKIT_RUNTIME_BINARY: &str = "/mnt/linux-bin/youki";
 const BUILDKIT_RUNTIME_EXEC_EVIDENCE: &str = "/run/vz-buildkit-runtime-exec.tsv";
+const BUILDKIT_OTEL_SOCKET_SOURCE: &str = "/run/buildkit/otel-grpc.sock";
+const BUILDKIT_OTEL_SOCKET_DESTINATION: &str = "/dev/otel-grpc.sock";
+const BUILDKIT_OTEL_ENV_SUFFIX: [&str; 3] = [
+    "OTEL_TRACES_EXPORTER=otlp",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=unix:///dev/otel-grpc.sock",
+    "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=grpc",
+];
 
 /// Resource usage statistics collected from the guest OS.
 pub(crate) struct ResourceStats {
@@ -99,11 +106,102 @@ fn exec_buildkit_runtime(args: Vec<OsString>) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt as _;
 
     let args = buildkit_runtime_args(args);
+    normalize_buildkit_oci_bundle(&args)?;
     append_buildkit_runtime_evidence(Path::new(BUILDKIT_RUNTIME_EXEC_EVIDENCE), &args)?;
     let error = std::process::Command::new(BUILDKIT_RUNTIME_BINARY)
         .args(args)
         .exec();
     Err(error).with_context(|| format!("failed to execute {BUILDKIT_RUNTIME_BINARY}"))
+}
+
+fn normalize_buildkit_oci_bundle(args: &[OsString]) -> anyhow::Result<()> {
+    let Some(command_index) = oci_command_index(args) else {
+        return Ok(());
+    };
+    if !matches!(args[command_index].to_str(), Some("create" | "run")) {
+        return Ok(());
+    }
+    let Some(bundle_path) = runtime_bundle_path(args, command_index) else {
+        return Ok(());
+    };
+
+    normalize_buildkit_otel_socket_mount(&bundle_path.join("config.json"))
+}
+
+fn runtime_bundle_path(args: &[OsString], command_index: usize) -> Option<PathBuf> {
+    let command_args = args.get(command_index + 1..)?;
+    for (index, arg) in command_args.iter().enumerate() {
+        if arg == "--bundle" || arg == "-b" {
+            return command_args.get(index + 1).map(PathBuf::from);
+        }
+        let bytes = arg.as_os_str().as_bytes();
+        if let Some(path) = bytes.strip_prefix(b"--bundle=") {
+            return Some(PathBuf::from(OsStr::from_bytes(path)));
+        }
+    }
+    None
+}
+
+fn normalize_buildkit_otel_socket_mount(config_path: &Path) -> anyhow::Result<()> {
+    let bytes = std::fs::read(config_path).with_context(|| {
+        format!(
+            "failed to read BuildKit OCI bundle at {}",
+            config_path.display()
+        )
+    })?;
+    let mut config: serde_json::Value = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "failed to parse BuildKit OCI bundle at {}",
+            config_path.display()
+        )
+    })?;
+    let mut removed_buildkit_otel_mount = false;
+
+    if let Some(mounts) = config
+        .get_mut("mounts")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        let before = mounts.len();
+        mounts.retain(|mount| {
+            !(mount.get("source").and_then(serde_json::Value::as_str)
+                == Some(BUILDKIT_OTEL_SOCKET_SOURCE)
+                && mount.get("destination").and_then(serde_json::Value::as_str)
+                    == Some(BUILDKIT_OTEL_SOCKET_DESTINATION)
+                && mount.get("type").and_then(serde_json::Value::as_str) == Some("bind"))
+        });
+        removed_buildkit_otel_mount = mounts.len() != before;
+    }
+
+    if removed_buildkit_otel_mount {
+        if let Some(env) = config
+            .pointer_mut("/process/env")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            let injected_start = env
+                .windows(BUILDKIT_OTEL_ENV_SUFFIX.len())
+                .rposition(|window| {
+                    window
+                        .iter()
+                        .zip(BUILDKIT_OTEL_ENV_SUFFIX)
+                        .all(|(actual, expected)| actual.as_str() == Some(expected))
+                });
+            if let Some(start) = injected_start {
+                env.drain(start..start + BUILDKIT_OTEL_ENV_SUFFIX.len());
+            }
+        }
+    }
+
+    if removed_buildkit_otel_mount {
+        let normalized = serde_json::to_vec(&config)
+            .context("failed to serialize normalized BuildKit OCI bundle")?;
+        std::fs::write(config_path, normalized).with_context(|| {
+            format!(
+                "failed to write normalized BuildKit OCI bundle at {}",
+                config_path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn append_buildkit_runtime_evidence(path: &Path, args: &[OsString]) -> anyhow::Result<()> {
@@ -157,9 +255,9 @@ fn buildkit_runtime_args(mut args: Vec<OsString>) -> Vec<OsString> {
     };
     let command = args[command_index].as_os_str();
     if (command == "run" || command == "create")
-        && args
-            .get(command_index + 1)
-            .is_none_or(|arg| arg != "--no-pivot")
+        && !args[command_index + 1..]
+            .iter()
+            .any(|arg| arg == "--no-pivot")
     {
         args.insert(command_index + 1, OsString::from("--no-pivot"));
     }
@@ -675,10 +773,120 @@ mod tests {
     fn runtime_multicall_does_not_duplicate_existing_no_pivot() {
         let args = vec![
             OsString::from("run"),
+            OsString::from("--bundle"),
+            OsString::from("/tmp/bundle"),
             OsString::from("--no-pivot"),
             OsString::from("container-id"),
         ];
         assert_eq!(buildkit_runtime_args(args.clone()), args);
+    }
+
+    #[test]
+    fn runtime_multicall_removes_only_buildkit_otel_socket_injection() {
+        let bundle = tempfile::tempdir().unwrap();
+        let config_path = bundle.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec(&serde_json::json!({
+                "process": {
+                    "env": [
+                        "PATH=/bin",
+                        "OTEL_TRACES_EXPORTER=otlp",
+                        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://collector.example:4317",
+                        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=grpc",
+                        "OTEL_TRACES_EXPORTER=otlp",
+                        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=unix:///dev/otel-grpc.sock",
+                        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=grpc",
+                        "TRACEPARENT=00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+                        "TRACESTATE=vendor=value"
+                    ]
+                },
+                "mounts": [
+                    {
+                        "destination": BUILDKIT_OTEL_SOCKET_DESTINATION,
+                        "type": "bind",
+                        "source": BUILDKIT_OTEL_SOCKET_SOURCE,
+                        "options": ["ro", "rbind"]
+                    },
+                    {
+                        "destination": "/data",
+                        "type": "bind",
+                        "source": "/host/data",
+                        "options": ["ro", "rbind"]
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        normalize_buildkit_oci_bundle(&[
+            OsString::from("--root"),
+            OsString::from("/run/youki"),
+            OsString::from("run"),
+            OsString::from("--no-pivot"),
+            OsString::from("--bundle"),
+            bundle.path().as_os_str().to_owned(),
+            OsString::from("container-id"),
+        ])
+        .unwrap();
+
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+        assert_eq!(config["mounts"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            config["mounts"][0]["options"],
+            serde_json::json!(["ro", "rbind"])
+        );
+        assert_eq!(
+            config["process"]["env"],
+            serde_json::json!([
+                "PATH=/bin",
+                "OTEL_TRACES_EXPORTER=otlp",
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://collector.example:4317",
+                "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=grpc",
+                "TRACEPARENT=00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+                "TRACESTATE=vendor=value"
+            ])
+        );
+    }
+
+    #[test]
+    fn runtime_multicall_accepts_inline_bundle_path() {
+        let bundle = tempfile::tempdir().unwrap();
+        std::fs::write(bundle.path().join("config.json"), br#"{"mounts":[]}"#).unwrap();
+        let mut bundle_arg = OsString::from("--bundle=");
+        bundle_arg.push(bundle.path());
+
+        normalize_buildkit_oci_bundle(&[
+            OsString::from("create"),
+            bundle_arg,
+            OsString::from("container-id"),
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn runtime_multicall_preserves_otel_env_without_buildkit_socket_mount() {
+        let bundle = tempfile::tempdir().unwrap();
+        let config_path = bundle.path().join("config.json");
+        let original = serde_json::json!({
+            "process": { "env": BUILDKIT_OTEL_ENV_SUFFIX },
+            "mounts": []
+        });
+        std::fs::write(&config_path, serde_json::to_vec(&original).unwrap()).unwrap();
+
+        normalize_buildkit_oci_bundle(&[
+            OsString::from("run"),
+            OsString::from("--bundle"),
+            bundle.path().as_os_str().to_owned(),
+            OsString::from("container-id"),
+        ])
+        .unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+        assert_eq!(after, original);
     }
 
     #[test]

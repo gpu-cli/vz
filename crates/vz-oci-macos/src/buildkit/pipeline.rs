@@ -5,6 +5,8 @@
 //! - `buildctl` raw-json decode callbacks are emitted before terminal status handling.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
@@ -16,12 +18,14 @@ use base64::Engine as _;
 use docker_credential::{CredentialRetrievalError, DockerCredential, get_credential};
 use oci_distribution::Reference;
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tracing::warn;
 use vz::NetworkConfig;
 use vz::SharedDirConfig;
 use vz::protocol::{ExecEvent, ExecOutput};
 use vz_image::ImageStore;
-use vz_linux::{KernelCapability, KernelPaths, LinuxVm, LinuxVmConfig};
+use vz_linux::{KernelCapability, KernelPaths, KernelProfile, LinuxVm, LinuxVmConfig};
 
 use crate::RuntimeConfig;
 use crate::buildkit_rawjson::BuildkitRawJsonStreamDecoder;
@@ -78,6 +82,7 @@ struct BuildOutputArtifact {
 #[derive(Debug)]
 struct ManagedBuildkitVm {
     vm: Arc<LinuxVm>,
+    _runtime_dir: tempfile::TempDir,
     config: RuntimeConfig,
     context_dir: Option<PathBuf>,
     output_root: PathBuf,
@@ -92,6 +97,7 @@ struct BuildkitVmState {
     last_activity: Instant,
     idle_timeout: Duration,
     boot_in_progress: bool,
+    transition_failure: Option<String>,
 }
 
 impl Default for BuildkitVmState {
@@ -103,6 +109,7 @@ impl Default for BuildkitVmState {
             last_activity: Instant::now(),
             idle_timeout: buildkit_vm_idle_timeout(),
             boot_in_progress: false,
+            transition_failure: None,
         }
     }
 }
@@ -133,8 +140,104 @@ impl Drop for BuildkitVmLease {
 enum BuildkitVmAcquireAction {
     Reuse(Arc<LinuxVm>),
     Boot,
-    Replace(Arc<LinuxVm>),
+    Replace(Box<ManagedBuildkitVm>),
     Wait,
+}
+
+#[derive(Debug)]
+struct StartedBuildkitVm {
+    vm: LinuxVm,
+    runtime_dir: tempfile::TempDir,
+}
+
+struct StagedRuntimeGuard {
+    runtime_dir: Option<tempfile::TempDir>,
+    preserve_on_drop: bool,
+}
+
+impl StagedRuntimeGuard {
+    fn new(runtime_dir: tempfile::TempDir) -> Self {
+        Self {
+            runtime_dir: Some(runtime_dir),
+            preserve_on_drop: false,
+        }
+    }
+
+    fn path(&self) -> Result<&Path, BuildkitError> {
+        self.runtime_dir
+            .as_ref()
+            .map(tempfile::TempDir::path)
+            .ok_or_else(|| {
+                BuildkitError::InvalidConfig(
+                    "staged runtime guard lost ownership of its directory".to_string(),
+                )
+            })
+    }
+
+    fn preserve_on_drop(&mut self) {
+        self.preserve_on_drop = true;
+    }
+
+    fn cleanup_on_drop(&mut self) {
+        self.preserve_on_drop = false;
+    }
+
+    fn into_runtime_dir(mut self) -> Result<tempfile::TempDir, BuildkitError> {
+        self.runtime_dir.take().ok_or_else(|| {
+            BuildkitError::InvalidConfig(
+                "staged runtime guard lost ownership of its directory".to_string(),
+            )
+        })
+    }
+}
+
+impl Drop for StagedRuntimeGuard {
+    fn drop(&mut self) {
+        if self.preserve_on_drop
+            && let Some(runtime_dir) = self.runtime_dir.take()
+        {
+            let _ = runtime_dir.keep();
+        }
+    }
+}
+
+struct BuildkitVmTransitionGuard {
+    manager: Arc<BuildkitVmManager>,
+    managed: Option<ManagedBuildkitVm>,
+    armed: bool,
+}
+
+impl BuildkitVmTransitionGuard {
+    fn new(manager: Arc<BuildkitVmManager>, managed: Option<ManagedBuildkitVm>) -> Self {
+        Self {
+            manager,
+            managed,
+            armed: true,
+        }
+    }
+
+    fn complete(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BuildkitVmTransitionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(mut state) = self.manager.state.lock() else {
+            return;
+        };
+        state.boot_in_progress = false;
+        if state.managed.is_none() {
+            state.managed = self.managed.take();
+        }
+        state.transition_failure = Some(
+            "a BuildKit VM transition was interrupted; restart this process before retrying"
+                .to_string(),
+        );
+    }
 }
 
 impl BuildkitVmManager {
@@ -150,11 +253,16 @@ impl BuildkitVmManager {
         context_dir: Option<&Path>,
         shared_mounts: &BuildkitSharedMounts,
     ) -> Result<BuildkitVmLease, BuildkitError> {
+        let normalized_config = normalize_buildkit_config(config)?;
+        let config = &normalized_config;
         let requested_context = context_dir.map(Path::to_path_buf);
 
         loop {
             let action = {
                 let mut state = self.lock_state()?;
+                if let Some(failure) = &state.transition_failure {
+                    return Err(BuildkitError::InvalidConfig(failure.clone()));
+                }
                 if let Some((existing_vm, compatible)) = state.managed.as_ref().map(|managed| {
                     let compatible = managed.config == *config
                         && managed.output_root == shared_mounts.output_root
@@ -169,8 +277,13 @@ impl BuildkitVmManager {
                         BuildkitVmAcquireAction::Reuse(existing_vm)
                     } else if state.active_leases == 0 && !state.boot_in_progress {
                         state.boot_in_progress = true;
-                        state.managed = None;
-                        BuildkitVmAcquireAction::Replace(existing_vm)
+                        let existing = state.managed.take().ok_or_else(|| {
+                            BuildkitError::InvalidConfig(
+                                "BuildKit VM manager lost the VM selected for replacement"
+                                    .to_string(),
+                            )
+                        })?;
+                        BuildkitVmAcquireAction::Replace(Box::new(existing))
                     } else {
                         BuildkitVmAcquireAction::Wait
                     }
@@ -192,13 +305,26 @@ impl BuildkitVmManager {
                 BuildkitVmAcquireAction::Wait => {
                     tokio::time::sleep(BUILDKIT_VM_RETRY_DELAY).await;
                 }
-                BuildkitVmAcquireAction::Replace(old_vm) => {
-                    if let Err(error) = shutdown_managed_vm(old_vm.as_ref()).await {
+                BuildkitVmAcquireAction::Replace(old) => {
+                    let mut transition =
+                        BuildkitVmTransitionGuard::new(Arc::clone(self), Some(*old));
+                    let old = transition.managed.as_ref().ok_or_else(|| {
+                        BuildkitError::InvalidConfig(
+                            "BuildKit VM replacement lost ownership of the existing VM".to_string(),
+                        )
+                    })?;
+                    if let Err(error) = shutdown_managed_vm(old.vm.as_ref()).await {
                         let mut state = self.lock_state()?;
                         state.boot_in_progress = false;
+                        state.transition_failure = Some(format!(
+                            "the previous BuildKit VM could not be stopped safely: {error}"
+                        ));
+                        state.managed = transition.managed.take();
+                        transition.complete();
                         return Err(error);
                     }
-                    let vm = match start_buildkit_vm(
+                    transition.managed = None;
+                    let started = match start_buildkit_vm(
                         config,
                         context_dir,
                         &shared_mounts.output_root,
@@ -206,17 +332,20 @@ impl BuildkitVmManager {
                     )
                     .await
                     {
-                        Ok(vm) => Arc::new(vm),
+                        Ok(started) => started,
                         Err(error) => {
                             let mut state = self.lock_state()?;
                             state.boot_in_progress = false;
+                            transition.complete();
                             return Err(error);
                         }
                     };
+                    let vm = Arc::new(started.vm);
                     let mut state = self.lock_state()?;
                     state.boot_in_progress = false;
                     state.managed = Some(ManagedBuildkitVm {
                         vm: Arc::clone(&vm),
+                        _runtime_dir: started.runtime_dir,
                         config: config.clone(),
                         context_dir: requested_context.clone(),
                         output_root: shared_mounts.output_root.clone(),
@@ -225,13 +354,15 @@ impl BuildkitVmManager {
                     state.active_leases = 1;
                     state.activity_generation = state.activity_generation.saturating_add(1);
                     state.last_activity = Instant::now();
+                    transition.complete();
                     return Ok(BuildkitVmLease {
                         manager: Arc::clone(self),
                         vm,
                     });
                 }
                 BuildkitVmAcquireAction::Boot => {
-                    let vm = match start_buildkit_vm(
+                    let transition = BuildkitVmTransitionGuard::new(Arc::clone(self), None);
+                    let started = match start_buildkit_vm(
                         config,
                         context_dir,
                         &shared_mounts.output_root,
@@ -239,17 +370,20 @@ impl BuildkitVmManager {
                     )
                     .await
                     {
-                        Ok(vm) => Arc::new(vm),
+                        Ok(started) => started,
                         Err(error) => {
                             let mut state = self.lock_state()?;
                             state.boot_in_progress = false;
+                            transition.complete();
                             return Err(error);
                         }
                     };
+                    let vm = Arc::new(started.vm);
                     let mut state = self.lock_state()?;
                     state.boot_in_progress = false;
                     state.managed = Some(ManagedBuildkitVm {
                         vm: Arc::clone(&vm),
+                        _runtime_dir: started.runtime_dir,
                         config: config.clone(),
                         context_dir: requested_context.clone(),
                         output_root: shared_mounts.output_root.clone(),
@@ -258,6 +392,7 @@ impl BuildkitVmManager {
                     state.active_leases = 1;
                     state.activity_generation = state.activity_generation.saturating_add(1);
                     state.last_activity = Instant::now();
+                    transition.complete();
                     return Ok(BuildkitVmLease {
                         manager: Arc::clone(self),
                         vm,
@@ -291,8 +426,54 @@ impl BuildkitVmManager {
         });
     }
 
+    async fn shutdown_now(self: &Arc<Self>) -> Result<(), BuildkitError> {
+        let managed = {
+            let mut state = self.lock_state()?;
+            if let Some(failure) = &state.transition_failure {
+                return Err(BuildkitError::InvalidConfig(failure.clone()));
+            }
+            if state.active_leases != 0 || state.boot_in_progress {
+                return Err(BuildkitError::InvalidConfig(
+                    "BuildKit VM cannot shut down while an operation is active".to_string(),
+                ));
+            }
+            state.activity_generation = state.activity_generation.saturating_add(1);
+            state.boot_in_progress = true;
+            match state.managed.take() {
+                Some(managed) => managed,
+                None => {
+                    state.boot_in_progress = false;
+                    return Ok(());
+                }
+            }
+        };
+
+        let mut transition = BuildkitVmTransitionGuard::new(Arc::clone(self), Some(managed));
+        let managed = transition.managed.as_ref().ok_or_else(|| {
+            BuildkitError::InvalidConfig(
+                "BuildKit shutdown lost ownership of the managed VM".to_string(),
+            )
+        })?;
+        if let Err(error) = shutdown_managed_vm(managed.vm.as_ref()).await {
+            let mut state = self.lock_state()?;
+            state.boot_in_progress = false;
+            state.transition_failure = Some(format!(
+                "the BuildKit VM could not be stopped safely: {error}"
+            ));
+            state.managed = transition.managed.take();
+            transition.complete();
+            return Err(error);
+        }
+
+        transition.managed = None;
+        let mut state = self.lock_state()?;
+        state.boot_in_progress = false;
+        transition.complete();
+        Ok(())
+    }
+
     fn try_idle_shutdown(&self, generation: u64) {
-        let vm_to_shutdown = {
+        let managed_to_shutdown = {
             let mut state = match self.lock_state() {
                 Ok(state) => state,
                 Err(error) => {
@@ -309,13 +490,33 @@ impl BuildkitVmManager {
             if state.last_activity.elapsed() < state.idle_timeout {
                 return;
             }
-            state.managed.take().map(|managed| Arc::clone(&managed.vm))
+            let managed = state.managed.take();
+            if managed.is_some() {
+                state.boot_in_progress = true;
+            }
+            managed
         };
 
-        if let Some(vm) = vm_to_shutdown
-            && let Err(error) = block_on_vm_shutdown(vm.as_ref())
-        {
-            warn!(%error, "failed to shutdown idle BuildKit VM");
+        if let Some(managed) = managed_to_shutdown {
+            match block_on_managed_vm_shutdown(&managed) {
+                Ok(()) => {
+                    if let Ok(mut state) = self.lock_state() {
+                        state.boot_in_progress = false;
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "failed to shutdown idle BuildKit VM");
+                    if let Ok(mut state) = self.lock_state() {
+                        state.boot_in_progress = false;
+                        state.transition_failure = Some(format!(
+                            "the idle BuildKit VM could not be stopped safely: {error}"
+                        ));
+                        if state.managed.is_none() {
+                            state.managed = Some(managed);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -328,6 +529,11 @@ impl BuildkitVmManager {
 
 fn buildkit_vm_manager() -> Arc<BuildkitVmManager> {
     Arc::clone(BUILDKIT_VM_MANAGER.get_or_init(|| Arc::new(BuildkitVmManager::new())))
+}
+
+/// Stop the shared BuildKit VM after active operations complete.
+pub async fn shutdown_buildkit_vm() -> Result<(), BuildkitError> {
+    buildkit_vm_manager().shutdown_now().await
 }
 
 fn context_mount_compatible(existing: Option<&Path>, requested: Option<&Path>) -> bool {
@@ -419,12 +625,12 @@ and retry (or use `vz vm self-sign`)."
         .to_string()
 }
 
-fn block_on_vm_shutdown(vm: &LinuxVm) -> Result<(), BuildkitError> {
+fn block_on_managed_vm_shutdown(managed: &ManagedBuildkitVm) -> Result<(), BuildkitError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(BuildkitError::Io)?;
-    runtime.block_on(async { shutdown_managed_vm(vm).await })
+    runtime.block_on(async { shutdown_managed_vm(managed.vm.as_ref()).await })
 }
 
 async fn shutdown_managed_vm(vm: &LinuxVm) -> Result<(), BuildkitError> {
@@ -474,6 +680,20 @@ async fn prepare_output_artifact(
         guest_tar_path,
         cleanup_dir: output_dir,
     }))
+}
+
+async fn finish_managed_buildkit_operation<T>(
+    result: Result<T, BuildkitError>,
+) -> Result<T, BuildkitError> {
+    match (result, shutdown_buildkit_vm().await) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(shutdown_error)) => Err(shutdown_error),
+        (Err(operation_error), Ok(())) => Err(operation_error),
+        (Err(operation_error), Err(shutdown_error)) => {
+            warn!(%shutdown_error, "failed to shutdown BuildKit VM after operation error");
+            Err(operation_error)
+        }
+    }
 }
 
 /// Build a Dockerfile and handle the requested output mode.
@@ -623,6 +843,11 @@ where
 
 /// Return a human-readable BuildKit cache usage table (from `buildctl du`).
 pub async fn cache_disk_usage(config: &RuntimeConfig) -> Result<String, BuildkitError> {
+    let result = cache_disk_usage_inner(config).await;
+    finish_managed_buildkit_operation(result).await
+}
+
+async fn cache_disk_usage_inner(config: &RuntimeConfig) -> Result<String, BuildkitError> {
     let shared_mounts = prepare_shared_mounts().await?;
     let vm = buildkit_vm_manager()
         .acquire(config, None, &shared_mounts)
@@ -668,6 +893,8 @@ set -eu
 
 configured='  binary = "{BUILDKIT_OCI_RUNTIME_SHIM_GUEST_PATH}"'
 /bin/busybox grep -Fqx "$configured" /etc/buildkit/buildkitd.toml
+configured_enabled='  enabled = true'
+/bin/busybox grep -Fqx "$configured_enabled" /etc/buildkit/buildkitd.toml
 
 shim_target=$(/bin/busybox readlink {BUILDKIT_OCI_RUNTIME_SHIM_GUEST_PATH})
 if [ "$shim_target" != "/usr/bin/vz-guest-agent" ]; then
@@ -754,7 +981,7 @@ done
 
 /bin/busybox sort -u "$candidate_paths" -o "$candidate_paths"
 while IFS= read -r path; do
-  base=$(/bin/busybox basename "$path")
+  base=${{path##*/}}
   case "$base" in
     runc|runc-real|buildkit-runc|crun)
       /bin/busybox printf '%s\n' "$path" >>"$forbidden_paths"
@@ -775,7 +1002,7 @@ for proc_dir in /proc/[0-9]*; do
   [ "$pid" = "$$" ] && continue
   executable=$(/bin/busybox readlink "$proc_dir/exe" 2>/dev/null || true)
   if [ -n "$executable" ]; then
-    base=$(/bin/busybox basename "$executable")
+    base=${{executable##*/}}
     case "$base" in
       runc|runc-real|buildkit-runc|crun|runc\ \(deleted\)|runc-real\ \(deleted\)|buildkit-runc\ \(deleted\)|crun\ \(deleted\))
         /bin/busybox printf 'proc:%s:exe:%s\n' "$pid" "$executable" >>"$forbidden_paths"
@@ -788,7 +1015,7 @@ for proc_dir in /proc/[0-9]*; do
     fi
     while IFS= read -r argument; do
       argument_path=${{argument#*=}}
-      base=$(/bin/busybox basename "$argument_path")
+      base=${{argument_path##*/}}
       case "$base" in
         runc|runc-real|buildkit-runc|crun)
           /bin/busybox printf 'proc:%s:argv:%s\n' "$pid" "$argument" >>"$forbidden_paths"
@@ -956,6 +1183,14 @@ fn validate_buildkit_runtime_inventory(
 
 /// Prune BuildKit cache and return command output summary.
 pub async fn cache_prune(
+    config: &RuntimeConfig,
+    options: CachePruneOptions,
+) -> Result<String, BuildkitError> {
+    let result = cache_prune_inner(config, options).await;
+    finish_managed_buildkit_operation(result).await
+}
+
+async fn cache_prune_inner(
     config: &RuntimeConfig,
     options: CachePruneOptions,
 ) -> Result<String, BuildkitError> {
@@ -1235,23 +1470,125 @@ fn validate_buildkit_kernel_capabilities(kernel: &KernelPaths) -> Result<(), Bui
 fn validate_declared_buildkit_kernel_capabilities(
     capabilities: Option<&BTreeSet<KernelCapability>>,
 ) -> Result<(), BuildkitError> {
-    let required = KernelCapability::CgroupBpf;
-    if capabilities.is_some_and(|capabilities| capabilities.contains(&required)) {
+    let required = [KernelCapability::CgroupBpf, KernelCapability::UserNs];
+    let missing = required
+        .into_iter()
+        .filter(|capability| {
+            capabilities.is_none_or(|capabilities| !capabilities.contains(capability))
+        })
+        .map(KernelCapability::as_str)
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
         return Ok(());
     }
 
     Err(BuildkitError::InvalidConfig(format!(
-        "BuildKit kernel bundle is missing required capability '{}'",
-        required.as_str()
+        "BuildKit kernel bundle is missing required capabilities: {}",
+        missing.join(", ")
     )))
+}
+
+fn normalize_buildkit_config(config: &RuntimeConfig) -> Result<RuntimeConfig, BuildkitError> {
+    if config.linux_profile == Some(KernelProfile::Container) {
+        return Err(BuildkitError::InvalidConfig(
+            "BuildKit requires the developer Linux profile; the container profile intentionally omits user namespaces"
+                .to_string(),
+        ));
+    }
+    let mut normalized = config.clone();
+    normalized.linux_profile = Some(KernelProfile::Developer);
+    Ok(normalized)
 }
 
 async fn ensure_buildkit_kernel_for_config(
     config: &RuntimeConfig,
 ) -> Result<KernelPaths, BuildkitError> {
-    let kernel = ensure_kernel_for_config(config).await?;
+    let developer_config = normalize_buildkit_config(config)?;
+    let kernel = ensure_kernel_for_config(&developer_config).await?;
     validate_buildkit_kernel_capabilities(&kernel)?;
     Ok(kernel)
+}
+
+async fn stage_buildkit_runtime(
+    kernel: &KernelPaths,
+    stage_root: &Path,
+) -> Result<tempfile::TempDir, BuildkitError> {
+    let expected_sha256 = kernel
+        .version
+        .sha256_youki
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            BuildkitError::InvalidConfig(
+                "BuildKit requires sha256_youki metadata for the selected youki runtime"
+                    .to_string(),
+            )
+        })?
+        .trim()
+        .to_ascii_lowercase();
+
+    tokio::fs::create_dir_all(stage_root).await?;
+    tokio::fs::set_permissions(stage_root, std::fs::Permissions::from_mode(0o700)).await?;
+    let runtime_dir = tempfile::Builder::new()
+        .prefix("youki-")
+        .tempdir_in(stage_root)?;
+    std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))?;
+
+    let mut source = tokio::fs::File::open(&kernel.youki).await?;
+    if !source.metadata().await?.is_file() {
+        return Err(BuildkitError::InvalidConfig(format!(
+            "selected youki runtime is not a regular file: {}",
+            kernel.youki.display()
+        )));
+    }
+
+    let staged_path = runtime_dir.path().join("youki");
+    let staged_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o500)
+        .open(&staged_path)?;
+    let mut staged = tokio::fs::File::from_std(staged_file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        staged.write_all(&buffer[..read]).await?;
+    }
+    staged.flush().await?;
+    staged.sync_all().await?;
+    drop(staged);
+    tokio::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o555)).await?;
+
+    let found_sha256 = format!("{:x}", hasher.finalize());
+    if found_sha256 != expected_sha256 {
+        return Err(BuildkitError::InvalidConfig(format!(
+            "selected youki checksum mismatch while staging: expected {expected_sha256}, found {found_sha256}"
+        )));
+    }
+
+    let mut entries = tokio::fs::read_dir(runtime_dir.path()).await?;
+    let entry = entries.next_entry().await?.ok_or_else(|| {
+        BuildkitError::InvalidConfig("staged BuildKit runtime directory is empty".to_string())
+    })?;
+    let file_type = entry.file_type().await?;
+    if entry.file_name() != OsStr::new("youki")
+        || !file_type.is_file()
+        || file_type.is_symlink()
+        || entries.next_entry().await?.is_some()
+    {
+        return Err(BuildkitError::InvalidConfig(
+            "staged BuildKit runtime directory must contain exactly one regular youki file"
+                .to_string(),
+        ));
+    }
+    std::fs::File::open(runtime_dir.path())?.sync_all()?;
+
+    Ok(runtime_dir)
 }
 
 async fn start_buildkit_vm(
@@ -1259,12 +1596,17 @@ async fn start_buildkit_vm(
     context_dir: Option<&Path>,
     output_root: &Path,
     auth_dir: &Path,
-) -> Result<LinuxVm, BuildkitError> {
+) -> Result<StartedBuildkitVm, BuildkitError> {
     ensure_virtualization_entitlement_preflight()?;
 
     let artifacts = ensure_buildkit_artifacts().await?;
     let kernel = ensure_buildkit_kernel_for_config(config).await?;
-    let linux_bin_dir = kernel.youki.parent().map(Path::to_path_buf);
+    let runtime_dir = stage_buildkit_runtime(
+        &kernel,
+        &default_buildkit_dir()?.join("runtime").join("oci-runtime"),
+    )
+    .await?;
+    let mut runtime_guard = StagedRuntimeGuard::new(runtime_dir);
 
     let mut vm_config = LinuxVmConfig::new(kernel.kernel, kernel.initramfs);
     vm_config.cpus = 4;
@@ -1283,19 +1625,11 @@ async fn start_buildkit_vm(
         },
     ];
 
-    if let Some(linux_install_dir) = &config.linux_install_dir {
-        vm_config.shared_dirs.push(SharedDirConfig {
-            tag: "linux-bin".to_string(),
-            source: expand_home_dir(linux_install_dir),
-            read_only: true,
-        });
-    } else if let Some(kernel_dir) = linux_bin_dir {
-        vm_config.shared_dirs.push(SharedDirConfig {
-            tag: "linux-bin".to_string(),
-            source: kernel_dir,
-            read_only: true,
-        });
-    }
+    vm_config.shared_dirs.push(SharedDirConfig {
+        tag: "linux-bin".to_string(),
+        source: runtime_guard.path()?.to_path_buf(),
+        read_only: true,
+    });
 
     if let Some(host_ssl_dir) = host_ssl_dir() {
         vm_config.shared_dirs.push(SharedDirConfig {
@@ -1328,21 +1662,30 @@ async fn start_buildkit_vm(
         vm_config.network = Some(NetworkConfig::None);
     }
 
-    let vm = LinuxVm::create(vm_config)
-        .await
-        .map_err(BuildkitError::from)
-        .map_err(map_vm_boot_error)?;
-    vm.start()
-        .await
-        .map_err(BuildkitError::from)
-        .map_err(map_vm_boot_error)?;
+    runtime_guard.preserve_on_drop();
+    let vm = match LinuxVm::create(vm_config).await {
+        Ok(vm) => vm,
+        Err(error) => {
+            runtime_guard.cleanup_on_drop();
+            return Err(map_vm_boot_error(BuildkitError::from(error)));
+        }
+    };
+    if let Err(error) = vm.start().await {
+        if vm.stop().await.is_ok() {
+            runtime_guard.cleanup_on_drop();
+        }
+        return Err(map_vm_boot_error(BuildkitError::from(error)));
+    }
 
     if let Err(err) = vm.wait_for_agent(config.agent_ready_timeout).await {
-        let _ = vm.stop().await;
+        if vm.stop().await.is_ok() {
+            runtime_guard.cleanup_on_drop();
+        }
         return Err(err.into());
     }
 
-    Ok(vm)
+    let runtime_dir = runtime_guard.into_runtime_dir()?;
+    Ok(StartedBuildkitVm { vm, runtime_dir })
 }
 
 async fn run_guest_build(
@@ -1459,13 +1802,24 @@ if /bin/busybox kill -0 "$pid" 2>/dev/null; then
   i=0
   while [ "$i" -lt 15 ]; do
     if ! /bin/busybox kill -0 "$pid" 2>/dev/null; then
-      exit 0
+      break
     fi
     i=$((i + 1))
     /bin/busybox sleep 1
   done
-  /bin/busybox kill -9 "$pid" 2>/dev/null || true
+  if /bin/busybox kill -0 "$pid" 2>/dev/null; then
+    /bin/busybox kill -9 "$pid" 2>/dev/null || true
+  fi
 fi
+
+# Virtualization.framework stop is equivalent to pulling the power cord. Flush
+# and detach the persistent cache filesystem before the host stops the VM.
+/bin/busybox sync
+if /bin/busybox grep -q " /var/lib/buildkit " /proc/mounts; then
+  /bin/busybox umount /var/lib/buildkit
+fi
+/bin/busybox sync
+/bin/busybox rm -f /tmp/buildkitd.pid
 exit 0
 "#;
 
@@ -1536,6 +1890,12 @@ if [ ! -x /mnt/linux-bin/youki ]; then
   echo "youki is missing or not executable at /mnt/linux-bin/youki" >&2
   exit 1
 fi
+runtime_share_entries=$(/bin/busybox find /mnt/linux-bin -mindepth 1 -maxdepth 1 -print)
+if [ "$runtime_share_entries" != "/mnt/linux-bin/youki" ]; then
+  echo "BuildKit runtime share must contain exactly /mnt/linux-bin/youki" >&2
+  /bin/busybox printf '%s\n' "$runtime_share_entries" >&2
+  exit 1
+fi
 forbidden_runtime_paths=$(/bin/busybox find /mnt/buildkit-bin /mnt/linux-bin /tmp -maxdepth 1 -name '*runc*' -print)
 if [ -n "$forbidden_runtime_paths" ]; then
   echo "forbidden legacy OCI runtime path found: $forbidden_runtime_paths" >&2
@@ -1581,6 +1941,7 @@ export DOCKER_CONFIG=/root/.docker
 
 /bin/busybox cat >/etc/buildkit/buildkitd.toml <<'CFG'
 [worker.oci]
+  enabled = true
   binary = "{BUILDKIT_OCI_RUNTIME_SHIM_GUEST_PATH}"
   gc = true
   snapshotter = "{BUILDKIT_SNAPSHOTTER}"
@@ -1843,6 +2204,9 @@ fn host_ssl_dir() -> Option<PathBuf> {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use std::ffi::OsString;
+    use std::os::unix::fs::symlink;
+
     use tempfile::tempdir;
 
     use super::*;
@@ -1861,6 +2225,30 @@ mod tests {
             Some(requested.as_path())
         ));
         assert!(!context_mount_compatible(None, Some(existing.as_path())));
+    }
+
+    #[test]
+    fn interrupted_vm_transition_fails_closed_without_stuck_boot_flag() {
+        let manager = Arc::new(BuildkitVmManager::new());
+        manager.state.lock().unwrap().boot_in_progress = true;
+        drop(BuildkitVmTransitionGuard::new(Arc::clone(&manager), None));
+
+        let state = manager.state.lock().unwrap();
+        assert!(!state.boot_in_progress);
+        assert!(state.transition_failure.is_some());
+    }
+
+    #[test]
+    fn buildkit_config_normalizes_default_to_explicit_developer() {
+        let implicit = RuntimeConfig::default();
+        let explicit = RuntimeConfig {
+            linux_profile: Some(KernelProfile::Developer),
+            ..implicit.clone()
+        };
+        assert_eq!(
+            normalize_buildkit_config(&implicit).unwrap(),
+            normalize_buildkit_config(&explicit).unwrap()
+        );
     }
 
     #[test]
@@ -1889,22 +2277,164 @@ mod tests {
 
         assert!(script.contains("mount -t virtiofs linux-bin /mnt/linux-bin"));
         assert!(script.contains("[ ! -x /mnt/linux-bin/youki ]"));
+        assert!(script.contains("runtime share must contain exactly"));
         assert!(script.contains("mount -t cgroup2 none /sys/fs/cgroup"));
         assert!(script.contains(" /sys/fs/cgroup cgroup2 "));
         assert!(script.contains("ln -sf /usr/bin/vz-guest-agent /tmp/vz-buildkit-oci-runtime"));
         assert!(script.contains("binary = \"/tmp/vz-buildkit-oci-runtime\""));
+        assert!(script.contains("enabled = true"));
         assert!(script.contains("--oci-worker-binary /tmp/vz-buildkit-oci-runtime"));
         assert!(!script.contains("eval"));
+        assert!(!script.contains("/bin/busybox basename"));
         assert!(!script.contains("mount -t virtiofs linux-bin /mnt/linux-bin 2>/dev/null || true"));
         assert!(!script.contains("mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true"));
     }
 
     #[test]
-    fn buildkit_kernel_requires_declared_cgroup_bpf_for_every_profile_selection() {
+    fn buildkit_kernel_requires_declared_youki_capabilities_for_every_profile_selection() {
         assert!(validate_declared_buildkit_kernel_capabilities(None).is_err());
         assert!(validate_declared_buildkit_kernel_capabilities(Some(&BTreeSet::new())).is_err());
-        let capabilities = [KernelCapability::CgroupBpf].into_iter().collect();
+        for incomplete in [
+            [KernelCapability::CgroupBpf].into_iter().collect(),
+            [KernelCapability::UserNs].into_iter().collect(),
+        ] {
+            assert!(validate_declared_buildkit_kernel_capabilities(Some(&incomplete)).is_err());
+        }
+        let capabilities = [KernelCapability::CgroupBpf, KernelCapability::UserNs]
+            .into_iter()
+            .collect();
         assert!(validate_declared_buildkit_kernel_capabilities(Some(&capabilities)).is_ok());
+    }
+
+    #[test]
+    fn developer_profile_satisfies_buildkit_while_container_remains_hardened() {
+        let developer = vz_linux::KernelProfile::Developer.default_capabilities();
+        validate_declared_buildkit_kernel_capabilities(Some(&developer)).unwrap();
+
+        let container = vz_linux::KernelProfile::Container.default_capabilities();
+        let error = validate_declared_buildkit_kernel_capabilities(Some(&container)).unwrap_err();
+        assert!(error.to_string().contains("user_ns"));
+        assert!(!error.to_string().contains("cgroup_bpf"));
+    }
+
+    fn test_kernel_paths(youki: PathBuf, sha256_youki: Option<String>) -> KernelPaths {
+        KernelPaths {
+            kernel: PathBuf::from("vmlinux"),
+            initramfs: PathBuf::from("initramfs.img"),
+            youki,
+            version: vz_linux::KernelVersion {
+                kernel: "test".to_string(),
+                profile: Some("developer".to_string()),
+                security_profile: Some("developer-nested-virt".to_string()),
+                busybox: "test".to_string(),
+                agent: "test".to_string(),
+                agent_protocol_revision: Some(1),
+                youki: "test".to_string(),
+                built: None,
+                sha256_vmlinux: None,
+                sha256_initramfs: None,
+                sha256_youki,
+                capabilities: Some(
+                    [KernelCapability::CgroupBpf, KernelCapability::UserNs]
+                        .into_iter()
+                        .collect(),
+                ),
+            },
+        }
+    }
+
+    fn sha256_bytes(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    #[tokio::test]
+    async fn stages_only_selected_checksum_verified_youki() {
+        let temp = tempdir().unwrap();
+        let bundle = temp.path().join("bundle");
+        std::fs::create_dir_all(bundle.join("container/tools")).unwrap();
+        std::fs::write(bundle.join("youki"), b"selected-youki").unwrap();
+        std::fs::write(bundle.join("container/youki"), b"other-youki").unwrap();
+        std::fs::write(bundle.join("container/tools/runc"), b"runc").unwrap();
+        std::fs::write(bundle.join("notes.txt"), b"unrelated").unwrap();
+        let kernel = test_kernel_paths(bundle.join("youki"), Some(sha256_bytes(b"selected-youki")));
+
+        let staged = stage_buildkit_runtime(&kernel, &temp.path().join("stage"))
+            .await
+            .unwrap();
+        let entries = std::fs::read_dir(staged.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![OsString::from("youki")]);
+        assert_eq!(
+            std::fs::read(staged.path().join("youki")).unwrap(),
+            b"selected-youki"
+        );
+        assert!(
+            !std::fs::symlink_metadata(staged.path().join("youki"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_staging_dereferences_source_symlink() {
+        let temp = tempdir().unwrap();
+        let target = temp.path().join("youki-real");
+        let source = temp.path().join("youki-link");
+        std::fs::write(&target, b"selected-youki").unwrap();
+        symlink(&target, &source).unwrap();
+        let kernel = test_kernel_paths(source, Some(sha256_bytes(b"selected-youki")));
+
+        let staged = stage_buildkit_runtime(&kernel, &temp.path().join("stage"))
+            .await
+            .unwrap();
+        assert!(
+            !std::fs::symlink_metadata(staged.path().join("youki"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_staging_requires_matching_checksum_metadata() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("youki");
+        std::fs::write(&source, b"selected-youki").unwrap();
+
+        let missing = test_kernel_paths(source.clone(), None);
+        assert!(
+            stage_buildkit_runtime(&missing, &temp.path().join("missing"))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("sha256_youki")
+        );
+
+        let mismatch = test_kernel_paths(source, Some(sha256_bytes(b"different")));
+        assert!(
+            stage_buildkit_runtime(&mismatch, &temp.path().join("mismatch"))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("checksum mismatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn buildkit_rejects_container_profile_before_artifact_resolution() {
+        let config = RuntimeConfig {
+            linux_profile: Some(KernelProfile::Container),
+            ..RuntimeConfig::default()
+        };
+        let error = ensure_buildkit_kernel_for_config(&config)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("developer Linux profile"));
     }
 
     #[test]

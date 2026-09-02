@@ -171,6 +171,9 @@ CMD ["cat", "/message.txt"]
     assert!(!image_id.0.is_empty());
 
     assert_and_retain_runtime_inventory(&config).await;
+    vz_oci_macos::buildkit::shutdown_buildkit_vm()
+        .await
+        .unwrap();
 
     let runtime = Runtime::new(config);
     let output = runtime.run(&tag, RunConfig::default()).await.unwrap();
@@ -198,6 +201,9 @@ async fn buildkit_cache_disk_usage_health_smoke() {
         !usage.trim().is_empty(),
         "expected non-empty buildctl du output"
     );
+    vz_oci_macos::buildkit::shutdown_buildkit_vm()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -250,4 +256,7 @@ RUN echo "cache-probe" > /cache-probe.txt
         "expected BuildKit cache hit after VM restart, output was:\n{}",
         output_text
     );
+    vz_oci_macos::buildkit::shutdown_buildkit_vm()
+        .await
+        .unwrap();
 }

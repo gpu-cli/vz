@@ -12,7 +12,7 @@ DEFAULT_OUT_DIR := $(ROOT_DIR)/out
 KERNEL_BASE_CONFIG ?= defconfig
 KERNEL_CONFIG_FRAGMENT ?= $(ROOT_DIR)/vz-linux.config
 KERNEL_SECURITY_PROFILE ?= developer-nested-virt
-KERNEL_CAPABILITIES ?= vsock virtiofs hvc0_serial ext4_root overlayfs netns seccomp io_uring cgroup_bpf nested_virt tun btrfs_snapshots device_mapper dm_crypt
+KERNEL_CAPABILITIES ?= vsock virtiofs hvc0_serial ext4_root overlayfs netns seccomp io_uring cgroup_bpf user_ns nested_virt tun btrfs_snapshots device_mapper dm_crypt
 else ifeq ($(KERNEL_PROFILE),container)
 DEFAULT_OUT_DIR := $(ROOT_DIR)/out/container
 KERNEL_BASE_CONFIG ?= allnoconfig

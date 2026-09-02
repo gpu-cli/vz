@@ -24,7 +24,8 @@ mod tests;
 
 pub use manager::BuildManager;
 pub use pipeline::{
-    build_image, build_image_with_events, buildkit_runtime_inventory, cache_disk_usage, cache_prune,
+    build_image, build_image_with_events, buildkit_runtime_inventory, cache_disk_usage,
+    cache_prune, shutdown_buildkit_vm,
 };
 pub use proxy::{create_buildkit_channel, start_unix_proxy};
 
@@ -42,7 +43,7 @@ const BUILD_OUTPUT_ARCHIVE: &str = "image.tar";
 const BUILDKITD_ADDR: &str = "tcp://127.0.0.1:8372";
 const BUILDKIT_SETUP_TIMEOUT: Duration = Duration::from_secs(90);
 const BUILDKIT_BUILD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-const BUILDKIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
+const BUILDKIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const BUILDKIT_OCI_RUNTIME_SHIM_GUEST_PATH: &str = "/tmp/vz-buildkit-oci-runtime";
 const BUILDKIT_RUNTIME_EXEC_EVIDENCE_GUEST_PATH: &str = "/run/vz-buildkit-runtime-exec.tsv";
 const BUILDKIT_AUTH_TAG: &str = "buildkit-auth";

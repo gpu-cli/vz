@@ -84,6 +84,8 @@ pub enum KernelCapability {
     IoUring,
     /// Cgroup BPF attachment backed by the BPF syscall.
     CgroupBpf,
+    /// User namespace support, required by youki's runtime preflight.
+    UserNs,
     /// Nested virtualization support through `/dev/kvm`.
     NestedVirt,
     /// TUN/TAP support through `/dev/net/tun`.
@@ -113,6 +115,7 @@ impl KernelCapability {
             Self::Seccomp => "seccomp",
             Self::IoUring => "io_uring",
             Self::CgroupBpf => "cgroup_bpf",
+            Self::UserNs => "user_ns",
             Self::NestedVirt => "nested_virt",
             Self::Tun => "tun",
             Self::BtrfsSnapshots => "btrfs_snapshots",
@@ -502,6 +505,7 @@ pub fn default_vz_linux_kernel_profile_capabilities(
         KernelProfile::Developer => {
             capabilities.extend([
                 KernelCapability::CgroupBpf,
+                KernelCapability::UserNs,
                 KernelCapability::NestedVirt,
                 KernelCapability::Tun,
             ]);
