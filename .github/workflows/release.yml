@@ -236,6 +236,48 @@ jobs:
             vz-linux-builder \
             make all-profiles TRUST_EXISTING_KERNEL_IMAGE=1 CROSS_COMPILE= GUEST_AGENT_BUILD_TOOL=cargo
 
+      - name: Build runtime-free BuildKit binaries from pinned source
+        env:
+          BUILDKIT_VERSION: "0.19.0"
+          BUILDKIT_SOURCE_COMMIT: "3637d1b15a13fc3cdd0c16fcf3be0845ae68f53d"
+          BUILDCTL_SHA256: "725c7416fc7212805d301194df723939fc9e51f84157d7bcfba6fd2f1ee319c9"
+          BUILDKITD_SHA256: "38f1e204552fb19f661eb1da18f537fd2d4d5d790d09619d379e2dd0a034ffaf"
+        run: |
+          mkdir -p buildkit-build/buildctl buildkit-build/buildkitd
+          docker buildx build \
+            --platform linux/arm64 \
+            --target buildctl \
+            --build-arg BUILDKIT_CONTEXT_KEEP_GIT_DIR=1 \
+            --output type=local,dest=buildkit-build/buildctl \
+            "https://github.com/moby/buildkit.git?tag=v${BUILDKIT_VERSION}&checksum=${BUILDKIT_SOURCE_COMMIT}"
+          docker buildx build \
+            --platform linux/arm64 \
+            --target buildkitd \
+            --build-arg BUILDKIT_CONTEXT_KEEP_GIT_DIR=1 \
+            --output type=local,dest=buildkit-build/buildkitd \
+            "https://github.com/moby/buildkit.git?tag=v${BUILDKIT_VERSION}&checksum=${BUILDKIT_SOURCE_COMMIT}"
+
+          echo "$BUILDCTL_SHA256  buildkit-build/buildctl/usr/bin/buildctl" | sha256sum -c -
+          echo "$BUILDKITD_SHA256  buildkit-build/buildkitd/usr/bin/buildkitd" | sha256sum -c -
+          for binary in \
+            buildkit-build/buildctl/usr/bin/buildctl \
+            buildkit-build/buildkitd/usr/bin/buildkitd; do
+            readelf -h "$binary" | grep -q 'Machine:.*AArch64'
+            if readelf -l "$binary" | grep -q 'INTERP'; then
+              echo "$binary has a dynamic interpreter" >&2
+              exit 1
+            fi
+            if readelf -d "$binary" | grep -q 'NEEDED'; then
+              echo "$binary has a dynamic dependency" >&2
+              exit 1
+            fi
+          done
+
+      - name: Install deterministic archive tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libarchive-tools
+
       - name: Validate Linux artifact metadata
         run: |
           for version_json in linux/out/version.json linux/out/container/version.json; do
@@ -280,6 +322,12 @@ jobs:
       - name: Package Linux artifacts
         env:
           TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('vdev-{0}', github.run_number) }}
+          BUILDKIT_VERSION: "0.19.0"
+          BUILDKIT_LAYOUT: "2"
+          BUILDKIT_SOURCE_COMMIT: "3637d1b15a13fc3cdd0c16fcf3be0845ae68f53d"
+          BUILDCTL_SHA256: "725c7416fc7212805d301194df723939fc9e51f84157d7bcfba6fd2f1ee319c9"
+          BUILDKITD_SHA256: "38f1e204552fb19f661eb1da18f537fd2d4d5d790d09619d379e2dd0a034ffaf"
+          BUILDKIT_ARCHIVE_SHA256: "a611138d4675290f96b83b440156b16224626bd6b3fea55cba9c7f3ea2e06c09"
         run: |
           VERSION="${TAG#v}"
           mkdir -p dist
@@ -303,6 +351,45 @@ jobs:
             vmlinux initramfs.img youki version.json
 
           sha256sum "dist/vz-linux-container-v${VERSION}-arm64.tar.gz" > "dist/vz-linux-container-v${VERSION}-arm64.tar.gz.sha256"
+
+          buildkit_stage="buildkit-package"
+          buildkit_archive="dist/vz-buildkit-v${BUILDKIT_VERSION}-linux-arm64.tar"
+          mkdir -p "$buildkit_stage/bin"
+          install -m 0755 buildkit-build/buildctl/usr/bin/buildctl "$buildkit_stage/bin/buildctl"
+          install -m 0755 buildkit-build/buildkitd/usr/bin/buildkitd "$buildkit_stage/bin/buildkitd"
+          printf '%s\n' \
+            '{' \
+            "  \"buildkit\": \"${BUILDKIT_VERSION}\"," \
+            "  \"layout\": ${BUILDKIT_LAYOUT}," \
+            '  "platform": "linux/arm64",' \
+            "  \"source_commit\": \"${BUILDKIT_SOURCE_COMMIT}\"," \
+            '  "binaries": {' \
+            "    \"buildctl\": \"${BUILDCTL_SHA256}\"," \
+            "    \"buildkitd\": \"${BUILDKITD_SHA256}\"" \
+            '  }' \
+            '}' > "$buildkit_stage/manifest.json"
+          chmod 0644 "$buildkit_stage/manifest.json"
+          touch -d @0 \
+            "$buildkit_stage/manifest.json" \
+            "$buildkit_stage/bin/buildctl" \
+            "$buildkit_stage/bin/buildkitd"
+          bsdtar -cf "$buildkit_archive" \
+            --format=ustar \
+            --uid 0 \
+            --gid 0 \
+            --uname root \
+            --gname root \
+            --no-xattrs \
+            --no-acls \
+            --no-fflags \
+            -C "$buildkit_stage" \
+            manifest.json bin/buildctl bin/buildkitd
+
+          printf '%s\n' manifest.json bin/buildctl bin/buildkitd > "$RUNNER_TEMP/buildkit-expected-inventory"
+          bsdtar -tf "$buildkit_archive" > "$RUNNER_TEMP/buildkit-actual-inventory"
+          diff -u "$RUNNER_TEMP/buildkit-expected-inventory" "$RUNNER_TEMP/buildkit-actual-inventory"
+          echo "$BUILDKIT_ARCHIVE_SHA256  $buildkit_archive" | sha256sum -c -
+          sha256sum "$buildkit_archive" > "${buildkit_archive}.sha256"
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4

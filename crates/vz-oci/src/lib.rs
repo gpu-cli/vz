@@ -14,8 +14,8 @@ pub mod docker;
 pub mod error;
 
 pub use buildkit::{
-    BUILDKIT_VERSION, BuildkitArtifacts, BuildkitError, BuildkitVersionMetadata,
-    ensure_buildkit_artifacts,
+    BUILDKIT_ARTIFACT_LAYOUT, BUILDKIT_VERSION, BuildkitArtifacts, BuildkitError,
+    BuildkitVersionMetadata, ensure_buildkit_artifacts,
 };
 pub use bundle::CONTAINER_LOG_FILE;
 pub use container_store::{ContainerInfo, ContainerStatus, ContainerStore};

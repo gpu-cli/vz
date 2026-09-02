@@ -1,7 +1,8 @@
 //! BuildKit artifact provisioning support.
 //!
-//! Downloads and validates pinned BuildKit binaries for linux/arm64 and
-//! installs only the runtime binaries needed by the BuildKit VM.
+//! Downloads and validates the runtime-free BuildKit package for linux/arm64.
+//! The package contains only `buildkitd` and `buildctl`; OCI runtime selection
+//! belongs to the guest runtime layer.
 
 mod artifacts;
 mod auth;
@@ -12,8 +13,8 @@ mod progress;
 mod session_tunnel;
 
 pub use artifacts::{
-    BUILDKIT_VERSION, BuildkitArtifacts, BuildkitError, BuildkitVersionMetadata,
-    ensure_buildkit_artifacts,
+    BUILDKIT_ARTIFACT_LAYOUT, BUILDKIT_VERSION, BuildkitArtifacts, BuildkitError,
+    BuildkitVersionMetadata, ensure_buildkit_artifacts,
 };
 pub use auth::{DockerAuthError, DockerAuthProvider, ResolvedRegistryCredential};
 pub use client::{

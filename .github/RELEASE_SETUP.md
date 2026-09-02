@@ -52,12 +52,20 @@ Each release includes:
 | `vz-v{VERSION}-darwin-arm64` | Signed + notarized CLI binary |
 | `vz-guest-agent-v{VERSION}-darwin-arm64` | Guest agent binary (ad-hoc signed) |
 | `vz-linux-v{VERSION}-arm64.tar.gz` | Linux kernel + initramfs + youki + `version.json` capability metadata |
+| `vz-buildkit-v0.19.0-linux-arm64.tar` | Runtime-free BuildKit package containing only `buildkitd`, `buildctl`, and its checksum manifest |
 | `*.sha256` | SHA256 checksums for all artifacts |
 
 The Linux bundle release job validates `version.json` before publishing. The
 metadata must include artifact checksums and the declared VZ guest capabilities
 used by `vz-linux::ensure_kernel_bundle()`: `vsock`, `virtiofs`, `hvc0_serial`,
 and `ext4_root`.
+
+The BuildKit package is built from the pinned upstream source commit without
+building or downloading an OCI runtime. Its deterministic archive inventory,
+archive checksum, and per-file checksums must match the constants in
+`vz-oci::buildkit`. Before the pinned release exists, local VM testing can set
+`VZ_BUILDKIT_ARTIFACT_ARCHIVE` and `VZ_BUILDKIT_ARTIFACT_SHA256` to a package
+produced by this workflow.
 
 ## User Installation
 
