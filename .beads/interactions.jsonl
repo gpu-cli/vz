@@ -23,3 +23,5 @@
 {"id":"int-d772672c7cb75046251490769e61ec5c","kind":"field_change","created_at":"2026-09-02T16:55:58.807572Z","actor":"James Lal","issue_id":"vz-eab","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
 {"id":"int-185d9dcd0296ef9cd18864c24cdab03f","kind":"field_change","created_at":"2026-09-02T16:55:59.321598Z","actor":"James Lal","issue_id":"vz-d8a","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
 {"id":"int-592c29a245b2cb1be80ec88d5534e7da","kind":"field_change","created_at":"2026-09-02T16:56:29.687127Z","actor":"James Lal","issue_id":"vz-1ff","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
+{"id":"int-19ee938131015d4d8661fb34c34e28c6","kind":"field_change","created_at":"2026-09-02T19:20:24.397281Z","actor":"James Lal","issue_id":"vz-356","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
+{"id":"int-1b4d632543e892dfe086da340d7fd956","kind":"field_change","created_at":"2026-09-02T21:46:55.070042Z","actor":"James Lal","issue_id":"vz-356","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
