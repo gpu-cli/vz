@@ -209,6 +209,280 @@ fn checkpoint_workspace_snapshot_subvolume_path(
         .join(checkpoint_id)
 }
 
+#[cfg(any(test, feature = "test-backend"))]
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
+fn test_backend_checkpoint_snapshot_requested(
+    daemon: &RuntimeDaemon,
+    sandbox_id: &str,
+    request_id: &str,
+) -> Result<bool, Status> {
+    daemon
+        .with_state_store(|store| store.load_sandbox(sandbox_id))
+        .map_err(|error| status_from_stack_error(error, request_id))
+        .map(|sandbox| {
+            sandbox.is_some_and(|sandbox| {
+                sandbox
+                    .labels
+                    .get(TEST_SKIP_BTRFS_PREFLIGHT_LABEL)
+                    .is_some_and(|value| value == "true")
+            })
+        })
+}
+
+#[cfg(any(test, feature = "test-backend"))]
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
+fn copy_test_workspace_snapshot(
+    workspace_root: &Path,
+    snapshot_root: &Path,
+    request_id: &str,
+) -> Result<(), Status> {
+    fn canonicalize_with_missing_tail(path: &Path) -> std::io::Result<PathBuf> {
+        let mut existing_ancestor = path;
+        let mut missing_components = Vec::new();
+        while !existing_ancestor.exists() {
+            let component = existing_ancestor.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("path has no existing ancestor: {}", path.display()),
+                )
+            })?;
+            missing_components.push(component.to_os_string());
+            existing_ancestor = existing_ancestor.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("path has no existing ancestor: {}", path.display()),
+                )
+            })?;
+        }
+
+        let mut resolved = std::fs::canonicalize(existing_ancestor)?;
+        for component in missing_components.iter().rev() {
+            resolved.push(component);
+        }
+        Ok(resolved)
+    }
+
+    fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                copy_tree(&source_path, &destination_path)?;
+            } else if file_type.is_file() {
+                std::fs::copy(&source_path, &destination_path)?;
+            } else if file_type.is_symlink() {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(std::fs::read_link(&source_path)?, &destination_path)?;
+            }
+        }
+        Ok(())
+    }
+
+    if snapshot_root.exists() {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::StateConflict,
+            format!(
+                "workspace checkpoint snapshot already exists: {}",
+                snapshot_root.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+
+    let resolved_workspace = std::fs::canonicalize(workspace_root).map_err(|error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::BackendUnavailable,
+            format!(
+                "failed to resolve test workspace {}: {error}",
+                workspace_root.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })?;
+    let resolved_snapshot = canonicalize_with_missing_tail(snapshot_root).map_err(|error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::BackendUnavailable,
+            format!(
+                "failed to resolve test checkpoint snapshot path {}: {error}",
+                snapshot_root.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })?;
+    if resolved_snapshot.starts_with(&resolved_workspace)
+        || resolved_workspace.starts_with(&resolved_snapshot)
+    {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!(
+                "test workspace and checkpoint snapshot paths must not overlap: {} and {}",
+                workspace_root.display(),
+                snapshot_root.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+
+    if let Err(error) = copy_tree(workspace_root, snapshot_root) {
+        let _ = std::fs::remove_dir_all(snapshot_root);
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::BackendUnavailable,
+            format!(
+                "failed to create test workspace checkpoint snapshot {}: {error}",
+                snapshot_root.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-backend"))]
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
+fn replace_test_workspace_with_snapshot<F>(
+    snapshot_root: &Path,
+    workspace_root: &Path,
+    request_id: &str,
+    copy_snapshot: F,
+) -> Result<(), Status>
+where
+    F: FnOnce(&Path, &Path, &str) -> Result<(), Status>,
+{
+    let workspace_parent = workspace_root.parent().ok_or_else(|| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::ValidationError,
+            format!(
+                "test workspace has no parent directory: {}",
+                workspace_root.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })?;
+    let staging_dir = workspace_parent.join(format!(
+        ".vz-checkpoint-restore-{}",
+        generate_checkpoint_id()
+    ));
+    let replacement_root = staging_dir.join("replacement");
+    let original_root = staging_dir.join("original");
+    std::fs::create_dir(&staging_dir).map_err(|error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::BackendUnavailable,
+            format!(
+                "failed to prepare test checkpoint restore staging directory {}: {error}",
+                staging_dir.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })?;
+
+    if let Err(error) = copy_snapshot(snapshot_root, &replacement_root, request_id) {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(workspace_root, &original_root) {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::BackendUnavailable,
+            format!(
+                "failed to preserve test workspace before checkpoint restore {}: {error}",
+                workspace_root.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+
+    if let Err(swap_error) = std::fs::rename(&replacement_root, workspace_root) {
+        return match std::fs::rename(&original_root, workspace_root) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                Err(status_from_machine_error(MachineError::new(
+                    MachineErrorCode::BackendUnavailable,
+                    format!(
+                        "failed to install staged test workspace checkpoint restore {}: {swap_error}",
+                        workspace_root.display()
+                    ),
+                    Some(request_id.to_string()),
+                    BTreeMap::new(),
+                )))
+            }
+            Err(rollback_error) => Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::InternalError,
+                format!(
+                    "failed to install staged test workspace checkpoint restore {}: {swap_error}; original workspace is preserved at {} after rollback failed: {rollback_error}",
+                    workspace_root.display(),
+                    original_root.display()
+                ),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            ))),
+        };
+    }
+
+    std::fs::remove_dir_all(&staging_dir).map_err(|error| {
+        status_from_machine_error(MachineError::new(
+            MachineErrorCode::BackendUnavailable,
+            format!(
+                "restored test workspace but failed to remove preserved original at {}: {error}",
+                staging_dir.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        ))
+    })
+}
+
+#[cfg(any(test, feature = "test-backend"))]
+#[expect(
+    clippy::result_large_err,
+    reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
+)]
+fn restore_test_workspace_snapshot(
+    daemon: &RuntimeDaemon,
+    checkpoint: &Checkpoint,
+    workspace_root: &Path,
+    request_id: &str,
+) -> Result<(), Status> {
+    let snapshot_root =
+        checkpoint_workspace_snapshot_subvolume_path(daemon, &checkpoint.checkpoint_id);
+    if !snapshot_root.is_dir() {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::NotFound,
+            format!(
+                "workspace checkpoint snapshot is missing for restore: {}",
+                snapshot_root.display()
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+    replace_test_workspace_with_snapshot(
+        &snapshot_root,
+        workspace_root,
+        request_id,
+        copy_test_workspace_snapshot,
+    )
+}
+
 #[expect(
     clippy::result_large_err,
     reason = "this helper feeds tonic service methods whose error type is fixed to tonic::Status"
@@ -386,6 +660,17 @@ fn create_workspace_checkpoint_subvolume(
     _workspace_root: &Path,
     request_id: &str,
 ) -> Result<(), Status> {
+    #[cfg(any(test, feature = "test-backend"))]
+    if test_backend_checkpoint_snapshot_requested(
+        _daemon,
+        _checkpoint.sandbox_id.as_str(),
+        request_id,
+    )? {
+        let snapshot_root =
+            checkpoint_workspace_snapshot_subvolume_path(_daemon, &_checkpoint.checkpoint_id);
+        return copy_test_workspace_snapshot(_workspace_root, &snapshot_root, request_id);
+    }
+
     Err(status_from_machine_error(MachineError::new(
         MachineErrorCode::UnsupportedOperation,
         format!(
@@ -408,6 +693,17 @@ fn create_workspace_checkpoint_subvolume(
     workspace_root: &Path,
     request_id: &str,
 ) -> Result<(), Status> {
+    #[cfg(any(test, feature = "test-backend"))]
+    if test_backend_checkpoint_snapshot_requested(
+        daemon,
+        checkpoint.sandbox_id.as_str(),
+        request_id,
+    )? {
+        let snapshot_root =
+            checkpoint_workspace_snapshot_subvolume_path(daemon, &checkpoint.checkpoint_id);
+        return copy_test_workspace_snapshot(workspace_root, &snapshot_root, request_id);
+    }
+
     if !path_is_on_btrfs(workspace_root, request_id)? {
         return Err(status_from_machine_error(MachineError::new(
             MachineErrorCode::UnsupportedOperation,
@@ -472,6 +768,15 @@ fn restore_workspace_from_checkpoint_subvolume(
     _workspace_root: &Path,
     request_id: &str,
 ) -> Result<(), Status> {
+    #[cfg(any(test, feature = "test-backend"))]
+    if test_backend_checkpoint_snapshot_requested(
+        _daemon,
+        _checkpoint.sandbox_id.as_str(),
+        request_id,
+    )? {
+        return restore_test_workspace_snapshot(_daemon, _checkpoint, _workspace_root, request_id);
+    }
+
     Err(status_from_machine_error(MachineError::new(
         MachineErrorCode::UnsupportedOperation,
         format!(
@@ -494,6 +799,15 @@ fn restore_workspace_from_checkpoint_subvolume(
     workspace_root: &Path,
     request_id: &str,
 ) -> Result<(), Status> {
+    #[cfg(any(test, feature = "test-backend"))]
+    if test_backend_checkpoint_snapshot_requested(
+        daemon,
+        checkpoint.sandbox_id.as_str(),
+        request_id,
+    )? {
+        return restore_test_workspace_snapshot(daemon, checkpoint, workspace_root, request_id);
+    }
+
     if !path_is_on_btrfs(workspace_root, request_id)? {
         return Err(status_from_machine_error(MachineError::new(
             MachineErrorCode::UnsupportedOperation,
@@ -1931,6 +2245,57 @@ mod tests {
                 ("new-name.txt".to_string(), "A".to_string()),
                 ("old-name.txt".to_string(), "D".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn test_snapshot_copy_rejects_destination_nested_in_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::write(workspace_root.join("marker.txt"), "original").expect("seed workspace");
+        let nested_snapshot = workspace_root.join("runtime/checkpoints/checkpoint-a");
+
+        let error = copy_test_workspace_snapshot(&workspace_root, &nested_snapshot, "req-overlap")
+            .expect_err("nested snapshot must be rejected before copying");
+
+        assert!(error.message().contains("must not overlap"));
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join("marker.txt"))
+                .expect("workspace remains readable"),
+            "original"
+        );
+        assert!(!nested_snapshot.exists());
+    }
+
+    #[test]
+    fn test_snapshot_restore_copy_failure_preserves_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_root = tmp.path().join("workspace");
+        let snapshot_root = tmp.path().join("snapshot");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&snapshot_root).expect("create snapshot");
+        std::fs::write(workspace_root.join("marker.txt"), "original").expect("seed workspace");
+        std::fs::write(snapshot_root.join("marker.txt"), "snapshot").expect("seed snapshot");
+
+        let error = replace_test_workspace_with_snapshot(
+            &snapshot_root,
+            &workspace_root,
+            "req-copy-failure",
+            |_source, _destination, _request_id| Err(Status::unavailable("injected copy failure")),
+        )
+        .expect_err("copy failure must abort restore");
+
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join("marker.txt"))
+                .expect("original workspace remains readable"),
+            "original"
+        );
+        assert_eq!(
+            std::fs::read_to_string(snapshot_root.join("marker.txt"))
+                .expect("snapshot remains readable"),
+            "snapshot"
         );
     }
 }

@@ -1285,6 +1285,14 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
                 "persisting sandbox termination state and receipt",
             )));
             let receipt_id = generate_receipt_id();
+            let terminated_response_json = serde_json::to_string(&sandbox).map_err(|error| {
+                status_from_machine_error(MachineError::new(
+                    MachineErrorCode::InternalError,
+                    format!("failed to serialize terminated sandbox result: {error}"),
+                    Some(request_id.clone()),
+                    BTreeMap::new(),
+                ))
+            })?;
             let persist_result = self.daemon.with_state_store(|store| {
                 store.with_immediate_transaction(|tx| {
                     tx.save_sandbox(&sandbox)?;
@@ -1314,7 +1322,7 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
                             key: key.to_string(),
                             operation: "terminate_sandbox".to_string(),
                             request_hash: request_hash.clone(),
-                            response_json: sandbox.sandbox_id.clone(),
+                            response_json: terminated_response_json,
                             status_code: 200,
                             created_at: now,
                             expires_at: now.saturating_add(IDEMPOTENCY_TTL_SECS),

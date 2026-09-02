@@ -36,13 +36,14 @@ pub(in crate::grpc) fn load_idempotent_sandbox_replay(
         )));
     }
 
-    let Some(cached_sandbox) = daemon
+    let cached_sandbox = daemon
         .with_state_store(|store| store.load_sandbox(&record.response_json))
         .map_err(|error| status_from_stack_error(error, request_id))?
-    else {
+        .or_else(|| serde_json::from_str(&record.response_json).ok());
+    let Some(cached_sandbox) = cached_sandbox else {
         return Err(status_from_machine_error(MachineError::new(
             MachineErrorCode::InternalError,
-            "idempotency record references missing sandbox".to_string(),
+            "idempotency record references missing or invalid sandbox result".to_string(),
             Some(request_id.to_string()),
             BTreeMap::new(),
         )));

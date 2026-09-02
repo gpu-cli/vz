@@ -71,6 +71,8 @@ const BTRFS_HEALTH_EVENT_STACK: &str = "daemon";
 const BTRFS_HEALTH_OPERATION: &str = "btrfs_health_probe";
 const CHECKPOINT_GC_EVENT_STACK: &str = "daemon";
 const CHECKPOINT_GC_OPERATION: &str = "checkpoint_gc_compact";
+#[cfg(any(test, feature = "test-backend"))]
+const TEST_SKIP_BTRFS_PREFLIGHT_LABEL: &str = "vz.test.skip_btrfs_preflight";
 
 #[derive(Debug, serde::Serialize)]
 struct BtrfsHealthReceiptMetadata<'a> {

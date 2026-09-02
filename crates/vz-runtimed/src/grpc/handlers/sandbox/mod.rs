@@ -673,11 +673,11 @@ fn sandbox_workspace_volume_mount(
     // The feature-backed mock runtime has no host filesystem to inspect. Tests
     // opt in explicitly after the path existence/type checks above; production
     // builds cannot observe this label because the feature is disabled.
-    #[cfg(feature = "test-backend")]
+    #[cfg(any(test, feature = "test-backend"))]
     let skip_btrfs_preflight = labels
-        .get("vz.test.skip_btrfs_preflight")
+        .get(TEST_SKIP_BTRFS_PREFLIGHT_LABEL)
         .is_some_and(|value| value == "true");
-    #[cfg(not(feature = "test-backend"))]
+    #[cfg(not(any(test, feature = "test-backend")))]
     let skip_btrfs_preflight = false;
 
     if !skip_btrfs_preflight {

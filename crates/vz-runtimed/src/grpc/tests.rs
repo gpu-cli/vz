@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use std::process::Command;
@@ -18,6 +18,40 @@ use vz_runtime_contract::{
 use super::*;
 use crate::btrfs_health::{BtrfsHealthProbe, BtrfsHealthSeverity};
 use crate::{RuntimeDaemon, RuntimedConfig};
+
+fn test_sandbox_labels(project_dir: &Path) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            SANDBOX_LABEL_PROJECT_DIR.to_string(),
+            project_dir.to_string_lossy().into_owned(),
+        ),
+        (
+            TEST_SKIP_BTRFS_PREFLIGHT_LABEL.to_string(),
+            "true".to_string(),
+        ),
+    ])
+}
+
+fn seed_test_sandbox(daemon: &RuntimeDaemon, sandbox_id: &str, project_dir: &Path) {
+    std::fs::create_dir_all(project_dir).expect("create test sandbox project directory");
+    let now = current_unix_secs();
+    daemon
+        .with_state_store(|store| {
+            store.with_immediate_transaction(|tx| {
+                tx.save_sandbox(&Sandbox {
+                    sandbox_id: sandbox_id.to_string(),
+                    backend: SandboxBackend::MacosVz,
+                    spec: SandboxSpec::default(),
+                    state: SandboxState::Ready,
+                    created_at: now,
+                    updated_at: now,
+                    labels: test_sandbox_labels(project_dir).into_iter().collect(),
+                })?;
+                Ok(())
+            })
+        })
+        .expect("seed test sandbox");
+}
 
 #[cfg(target_os = "macos")]
 fn require_virtualization_entitlement() -> bool {
@@ -1088,7 +1122,7 @@ async fn create_sandbox_writes_policy_allow_audit_receipt() {
                 stack_name: "stack-policy-allow".to_string(),
                 cpus: 1,
                 memory_mb: 512,
-                labels: std::collections::HashMap::new(),
+                labels: test_sandbox_labels(tmp.path()),
                 ..Default::default()
             }))
             .await
@@ -1310,6 +1344,8 @@ async fn create_sandbox_is_persisted_in_state_store() {
     wait_for_socket(&config.socket_path).await;
 
     let mut client = connect_sandbox_client(&config.socket_path).await;
+    let mut labels = test_sandbox_labels(tmp.path());
+    labels.insert("env".to_string(), "test".to_string());
     let created = read_create_sandbox_completion_response(
         client
             .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
@@ -1321,7 +1357,7 @@ async fn create_sandbox_is_persisted_in_state_store() {
                 stack_name: "stack-a".to_string(),
                 cpus: 2,
                 memory_mb: 1024,
-                labels: std::collections::HashMap::from([("env".to_string(), "test".to_string())]),
+                labels,
                 ..Default::default()
             }))
             .await
@@ -1424,7 +1460,7 @@ async fn create_sandbox_stream_slow_consumer_preserves_order_and_completion() {
             stack_name: "stack-slow-consumer".to_string(),
             cpus: 1,
             memory_mb: 512,
-            labels: std::collections::HashMap::new(),
+            labels: test_sandbox_labels(tmp.path()),
             ..Default::default()
         }))
         .await
@@ -1498,7 +1534,7 @@ async fn create_sandbox_applies_legacy_base_image_default_and_audit_label() {
     wait_for_socket(&config.socket_path).await;
 
     let mut client = connect_sandbox_client(&config.socket_path).await;
-    let mut labels = std::collections::HashMap::new();
+    let mut labels = test_sandbox_labels(tmp.path());
     labels.insert(
         SANDBOX_LABEL_BASE_IMAGE_DEFAULT_SOURCE.to_string(),
         "policy_config".to_string(),
@@ -1599,7 +1635,7 @@ async fn create_sandbox_strips_spoofed_default_source_labels_when_defaults_not_a
     wait_for_socket(&config.socket_path).await;
 
     let mut client = connect_sandbox_client(&config.socket_path).await;
-    let mut labels = std::collections::HashMap::new();
+    let mut labels = test_sandbox_labels(tmp.path());
     labels.insert(
         SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
         "alpine:3.20".to_string(),
@@ -1717,7 +1753,7 @@ async fn open_sandbox_shell_creates_container_and_resolves_default_shell() {
 
     wait_for_socket(&config.socket_path).await;
 
-    let mut labels = std::collections::HashMap::new();
+    let mut labels = test_sandbox_labels(tmp.path());
     labels.insert(
         SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
         "debian:bookworm".to_string(),
@@ -1766,9 +1802,10 @@ async fn open_sandbox_shell_creates_container_and_resolves_default_shell() {
         .expect("load container from state store")
         .expect("container should be persisted");
     assert_eq!(persisted.sandbox_id, sandbox.sandbox_id);
-    assert!(
-        persisted.container_spec.cwd.is_none(),
-        "sandbox shell keepalive container should not force `/workspace` cwd when no workspace mount is configured"
+    assert_eq!(
+        persisted.container_spec.cwd.as_deref(),
+        Some("/"),
+        "sandbox shell keepalive container should not force the workspace mount as its cwd"
     );
     let persisted_execution = daemon
         .with_state_store(|store| store.load_execution(&opened.execution_id))
@@ -1808,7 +1845,7 @@ async fn open_sandbox_shell_prefers_main_container_command_override() {
 
     wait_for_socket(&config.socket_path).await;
 
-    let mut labels = std::collections::HashMap::new();
+    let mut labels = test_sandbox_labels(tmp.path());
     labels.insert(
         SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
         "alpine:3.20".to_string(),
@@ -1885,7 +1922,7 @@ async fn open_sandbox_shell_reuses_existing_active_execution_session() {
 
     wait_for_socket(&config.socket_path).await;
 
-    let mut labels = std::collections::HashMap::new();
+    let mut labels = test_sandbox_labels(tmp.path());
     labels.insert(
         SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
         "debian:bookworm".to_string(),
@@ -2004,7 +2041,7 @@ async fn open_sandbox_shell_persists_external_secret_env_references_only() {
 
     wait_for_socket(&config.socket_path).await;
 
-    let mut labels = std::collections::HashMap::new();
+    let mut labels = test_sandbox_labels(tmp.path());
     labels.insert(
         SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
         "debian:bookworm".to_string(),
@@ -2098,7 +2135,7 @@ async fn open_sandbox_shell_rejects_missing_external_secret_env_source() {
     wait_for_socket(&config.socket_path).await;
 
     let missing_env_var = "VZ_RUNTIME_TEST_MISSING_SPACE_SECRET_8319";
-    let mut labels = std::collections::HashMap::new();
+    let mut labels = test_sandbox_labels(tmp.path());
     labels.insert(
         SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
         "debian:bookworm".to_string(),
@@ -2183,7 +2220,7 @@ async fn close_sandbox_shell_closes_active_execution_and_clears_session() {
 
     wait_for_socket(&config.socket_path).await;
 
-    let mut labels = std::collections::HashMap::new();
+    let mut labels = test_sandbox_labels(tmp.path());
     labels.insert(
         SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
         "debian:bookworm".to_string(),
@@ -2448,7 +2485,7 @@ async fn create_sandbox_honors_idempotency_key_and_conflict() {
                 stack_name: "stack-idem".to_string(),
                 cpus: 1,
                 memory_mb: 256,
-                labels: std::collections::HashMap::new(),
+                labels: test_sandbox_labels(tmp.path()),
                 ..Default::default()
             }))
             .await
@@ -2473,7 +2510,7 @@ async fn create_sandbox_honors_idempotency_key_and_conflict() {
                 stack_name: "stack-idem".to_string(),
                 cpus: 1,
                 memory_mb: 256,
-                labels: std::collections::HashMap::new(),
+                labels: test_sandbox_labels(tmp.path()),
                 ..Default::default()
             }))
             .await
@@ -2498,7 +2535,7 @@ async fn create_sandbox_honors_idempotency_key_and_conflict() {
             stack_name: "stack-idem-different".to_string(),
             cpus: 1,
             memory_mb: 256,
-            labels: std::collections::HashMap::new(),
+            labels: test_sandbox_labels(tmp.path()),
             ..Default::default()
         }))
         .await
@@ -4398,7 +4435,7 @@ async fn create_container_then_get_list_and_remove_round_trip() {
                 stack_name: "stack-container-test".to_string(),
                 cpus: 0,
                 memory_mb: 0,
-                labels: std::collections::HashMap::new(),
+                labels: test_sandbox_labels(tmp.path()),
                 ..Default::default()
             }))
             .await
@@ -4534,7 +4571,7 @@ async fn create_container_denied_when_scheduler_capacity_is_exhausted() {
                 stack_name: "stack-container-pressure".to_string(),
                 cpus: 0,
                 memory_mb: 0,
-                labels: std::collections::HashMap::new(),
+                labels: test_sandbox_labels(tmp.path()),
                 ..Default::default()
             }))
             .await
@@ -4603,7 +4640,7 @@ async fn create_container_uses_sandbox_startup_defaults_when_request_omits_image
 
     wait_for_socket(&config.socket_path).await;
 
-    let mut labels = std::collections::HashMap::new();
+    let mut labels = test_sandbox_labels(tmp.path());
     labels.insert(
         SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
         "alpine:3.20".to_string(),
@@ -4693,7 +4730,7 @@ async fn create_container_preserves_explicit_image_and_cmd_over_sandbox_defaults
 
     wait_for_socket(&config.socket_path).await;
 
-    let mut labels = std::collections::HashMap::new();
+    let mut labels = test_sandbox_labels(tmp.path());
     labels.insert(
         SANDBOX_LABEL_BASE_IMAGE_REF.to_string(),
         "alpine:3.20".to_string(),
@@ -4792,17 +4829,20 @@ async fn list_events_returns_persisted_stack_events() {
     wait_for_socket(&config.socket_path).await;
 
     let mut sandbox_client = connect_sandbox_client(&config.socket_path).await;
-    let _ = sandbox_client
-        .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
-            metadata: None,
-            stack_name: "stack-events-test".to_string(),
-            cpus: 0,
-            memory_mb: 0,
-            labels: std::collections::HashMap::new(),
-            ..Default::default()
-        }))
-        .await
-        .expect("create sandbox to emit event");
+    read_create_sandbox_completion_response(
+        sandbox_client
+            .create_sandbox(Request::new(runtime_v2::CreateSandboxRequest {
+                metadata: None,
+                stack_name: "stack-events-test".to_string(),
+                cpus: 0,
+                memory_mb: 0,
+                labels: test_sandbox_labels(tmp.path()),
+                ..Default::default()
+            }))
+            .await
+            .expect("create sandbox to emit event"),
+    )
+    .await;
 
     let mut event_client = connect_event_client(&config.socket_path).await;
     let response = event_client
@@ -4990,6 +5030,11 @@ async fn create_checkpoint_with_retention_tag_is_protected() {
 
     wait_for_socket(&config.socket_path).await;
 
+    seed_test_sandbox(
+        daemon.as_ref(),
+        "sbx-ckpt-tagged",
+        &tmp.path().join("workspace"),
+    );
     let mut checkpoint_client = connect_checkpoint_client(&config.socket_path).await;
     let created = checkpoint_client
         .create_checkpoint(Request::new(runtime_v2::CreateCheckpointRequest {
@@ -5045,6 +5090,11 @@ async fn create_checkpoint_defaults_runtime_compatibility_fingerprint_when_unset
 
     wait_for_socket(&config.socket_path).await;
 
+    seed_test_sandbox(
+        daemon.as_ref(),
+        "sbx-ckpt-default-fp",
+        &tmp.path().join("workspace"),
+    );
     let mut checkpoint_client = connect_checkpoint_client(&config.socket_path).await;
     let created = checkpoint_client
         .create_checkpoint(Request::new(runtime_v2::CreateCheckpointRequest {
@@ -5163,6 +5213,11 @@ async fn checkpoint_state_survives_daemon_restart() {
     wait_for_socket(&config.socket_path).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
+    seed_test_sandbox(
+        daemon.as_ref(),
+        "sbx-restart-checkpoint",
+        &tmp.path().join("workspace"),
+    );
     let mut checkpoint_client = connect_checkpoint_client(&config.socket_path).await;
     let created = checkpoint_client
         .create_checkpoint(Request::new(runtime_v2::CreateCheckpointRequest {
@@ -5434,10 +5489,7 @@ async fn diff_checkpoints_returns_real_file_level_deltas() {
                 stack_name: "stack-checkpoint-diff".to_string(),
                 cpus: 0,
                 memory_mb: 0,
-                labels: std::collections::HashMap::from([(
-                    SANDBOX_LABEL_PROJECT_DIR.to_string(),
-                    workspace_root.to_string_lossy().to_string(),
-                )]),
+                labels: test_sandbox_labels(&workspace_root),
                 ..Default::default()
             }))
             .await
@@ -6057,7 +6109,7 @@ async fn file_service_write_read_list_round_trip_with_receipts() {
                 stack_name: "stack-file-ops".to_string(),
                 cpus: 0,
                 memory_mb: 0,
-                labels: std::collections::HashMap::new(),
+                labels: test_sandbox_labels(tmp.path()),
                 ..Default::default()
             }))
             .await
@@ -6185,7 +6237,7 @@ async fn file_service_rejects_path_traversal() {
                 stack_name: "stack-file-validate".to_string(),
                 cpus: 0,
                 memory_mb: 0,
-                labels: std::collections::HashMap::new(),
+                labels: test_sandbox_labels(tmp.path()),
                 ..Default::default()
             }))
             .await
@@ -6248,7 +6300,7 @@ async fn terminate_sandbox_honors_idempotency_and_emits_receipt_header() {
                 stack_name: "stack-term-a".to_string(),
                 cpus: 0,
                 memory_mb: 0,
-                labels: std::collections::HashMap::new(),
+                labels: test_sandbox_labels(tmp.path()),
                 ..Default::default()
             }))
             .await
@@ -6264,7 +6316,7 @@ async fn terminate_sandbox_honors_idempotency_and_emits_receipt_header() {
                 stack_name: "stack-term-b".to_string(),
                 cpus: 0,
                 memory_mb: 0,
-                labels: std::collections::HashMap::new(),
+                labels: test_sandbox_labels(tmp.path()),
                 ..Default::default()
             }))
             .await
@@ -6350,9 +6402,11 @@ async fn concurrent_create_sandbox_replays_idempotent_result_with_single_mutatio
     wait_for_socket(&config.socket_path).await;
 
     const CONCURRENCY: usize = 8;
+    let labels = test_sandbox_labels(tmp.path());
     let mut handles = Vec::with_capacity(CONCURRENCY);
     for index in 0..CONCURRENCY {
         let socket = config.socket_path.clone();
+        let labels = labels.clone();
         handles.push(tokio::spawn(async move {
             let mut client = connect_sandbox_client(&socket).await;
             let response = client
@@ -6365,7 +6419,7 @@ async fn concurrent_create_sandbox_replays_idempotent_result_with_single_mutatio
                     stack_name: "stack-concurrent-idem".to_string(),
                     cpus: 2,
                     memory_mb: 512,
-                    labels: std::collections::HashMap::new(),
+                    labels,
                     ..Default::default()
                 }))
                 .await?;
@@ -6738,9 +6792,11 @@ async fn concurrent_create_without_idempotency_returns_conflict_not_internal() {
     wait_for_socket(&config.socket_path).await;
 
     const CONCURRENCY: usize = 8;
+    let labels = test_sandbox_labels(tmp.path());
     let mut handles = Vec::with_capacity(CONCURRENCY);
     for index in 0..CONCURRENCY {
         let socket = config.socket_path.clone();
+        let labels = labels.clone();
         handles.push(tokio::spawn(async move {
             let mut client = connect_sandbox_client(&socket).await;
             let response = client
@@ -6753,7 +6809,7 @@ async fn concurrent_create_without_idempotency_returns_conflict_not_internal() {
                     stack_name: "stack-race-no-idem".to_string(),
                     cpus: 1,
                     memory_mb: 256,
-                    labels: std::collections::HashMap::new(),
+                    labels,
                     ..Default::default()
                 }))
                 .await?;
