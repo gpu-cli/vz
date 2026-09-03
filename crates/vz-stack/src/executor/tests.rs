@@ -342,6 +342,7 @@ fn pull_failure_marks_service_failed() {
     let observed = executor.store().load_observed_state("myapp").unwrap();
     let web = observed.iter().find(|o| o.service_name == "web").unwrap();
     assert_eq!(web.phase, ServicePhase::Failed);
+    assert!(web.container_id.is_none());
     assert!(web.last_error.is_some());
 
     // ServiceFailed event emitted.
@@ -370,6 +371,7 @@ fn create_failure_marks_service_failed() {
     let observed = executor.store().load_observed_state("myapp").unwrap();
     let web = observed.iter().find(|o| o.service_name == "web").unwrap();
     assert_eq!(web.phase, ServicePhase::Failed);
+    assert_eq!(web.container_id.as_deref(), Some("web"));
 }
 
 #[test]
@@ -1096,8 +1098,7 @@ fn three_service_ip_allocation() {
     let configs = executor.runtime.captured_configs.lock().unwrap();
     let web_config = configs.iter().find(|(id, _)| id == "ctr-web").unwrap();
     let web_hosts = &web_config.1.extra_hosts;
-    // siblings (api, db) + host.vz.internal
-    assert_eq!(web_hosts.len(), 3);
+    assert_eq!(web_hosts.len(), 2);
     assert!(
         web_hosts
             .iter()
@@ -1108,12 +1109,7 @@ fn three_service_ip_allocation() {
             .iter()
             .any(|(h, ip)| h == "db" && ip == "172.20.0.4")
     );
-    assert!(
-        web_hosts
-            .iter()
-            .any(|(h, ip)| h == vz_runtime_contract::HOST_INTERNAL_ALIAS
-                && ip == vz_runtime_contract::HOST_INTERNAL_GATEWAY_IPV4)
-    );
+    assert!(!web_hosts.iter().any(|(h, _)| h == "host.vz.internal"));
 }
 
 #[test]
@@ -1705,37 +1701,42 @@ fn default_network_backward_compat() {
     let result = executor.execute(&spec, &actions).unwrap();
     assert!(result.all_succeeded());
 
-    // All services on same network, so all see each other (plus host.vz.internal).
+    // All services on the same network see each other, with no implicit host alias.
     let configs = executor.runtime.captured_configs.lock().unwrap();
     let web_config = configs.iter().find(|(id, _)| id == "ctr-web").unwrap();
-    assert_eq!(web_config.1.extra_hosts.len(), 2);
+    assert_eq!(web_config.1.extra_hosts.len(), 1);
     assert!(web_config.1.extra_hosts.iter().any(|(h, _)| h == "db"));
     assert!(
-        web_config
+        !web_config
             .1
             .extra_hosts
             .iter()
-            .any(|(h, _)| h == vz_runtime_contract::HOST_INTERNAL_ALIAS)
+            .any(|(h, _)| h == "host.vz.internal")
     );
 
     let db_config = configs.iter().find(|(id, _)| id == "ctr-db").unwrap();
-    assert_eq!(db_config.1.extra_hosts.len(), 2);
+    assert_eq!(db_config.1.extra_hosts.len(), 1);
     assert!(db_config.1.extra_hosts.iter().any(|(h, _)| h == "web"));
     assert!(
-        db_config
+        !db_config
             .1
             .extra_hosts
             .iter()
-            .any(|(h, _)| h == vz_runtime_contract::HOST_INTERNAL_ALIAS)
+            .any(|(h, _)| h == "host.vz.internal")
     );
 }
 
 #[test]
-fn host_vz_internal_injected_into_every_service() {
-    // Even a single-service stack with no siblings should get the alias.
+fn caller_declared_extra_hosts_are_preserved_without_implicit_aliases() {
     let runtime = MockContainerRuntime::with_ids(vec!["ctr-only"]);
     let mut executor = make_executor(runtime);
-    let spec = stack("solo", vec![svc("only", "nginx:latest")]);
+    let mut service = svc("only", "nginx:latest");
+    service.extra_hosts = vec![
+        ("host.example.test".to_string(), "203.0.113.17".to_string()),
+        ("db.example.test".to_string(), "198.51.100.9".to_string()),
+    ];
+    let expected = service.extra_hosts.clone();
+    let spec = stack("solo", vec![service]);
 
     let actions = vec![Action::ServiceCreate {
         service_name: "only".to_string(),
@@ -1746,13 +1747,7 @@ fn host_vz_internal_injected_into_every_service() {
 
     let configs = executor.runtime.captured_configs.lock().unwrap();
     let only_config = configs.iter().find(|(id, _)| id == "ctr-only").unwrap();
-    let entry = only_config
-        .1
-        .extra_hosts
-        .iter()
-        .find(|(h, _)| h == vz_runtime_contract::HOST_INTERNAL_ALIAS)
-        .expect("host.vz.internal should be injected even for solo services");
-    assert_eq!(entry.1, vz_runtime_contract::HOST_INTERNAL_GATEWAY_IPV4);
+    assert_eq!(only_config.1.extra_hosts, expected);
 }
 
 #[test]
@@ -1897,7 +1892,7 @@ fn stop_failure_still_attempts_remove() {
 }
 
 #[test]
-fn remove_failure_still_updates_state_to_stopped() {
+fn remove_failure_retains_failed_state_and_container_for_retry() {
     let mut runtime = MockContainerRuntime::new();
     runtime.fail_remove = true;
     let mut executor = make_executor(runtime);
@@ -1923,20 +1918,23 @@ fn remove_failure_still_updates_state_to_stopped() {
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
-    assert!(
-        result.all_succeeded(),
-        "remove should succeed even when runtime remove fails"
-    );
+    assert_eq!(result.failed, 1);
+    assert!(!result.all_succeeded());
 
-    // State should be Stopped (not stuck in Running).
+    // Cleanup did not complete, so preserve the runtime ID for reconciliation.
     let observed = executor.store().load_observed_state("myapp").unwrap();
     let web = observed.iter().find(|o| o.service_name == "web").unwrap();
-    assert_eq!(web.phase, ServicePhase::Stopped);
-    assert!(web.container_id.is_none());
+    assert_eq!(web.phase, ServicePhase::Failed);
+    assert_eq!(web.container_id.as_deref(), Some("ctr-web"));
+    assert!(
+        web.last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("container cleanup failed"))
+    );
 }
 
 #[test]
-fn stop_and_remove_both_fail_still_updates_state() {
+fn stop_and_remove_failure_retains_container_for_retry() {
     let mut runtime = MockContainerRuntime::new();
     runtime.fail_stop = true;
     runtime.fail_remove = true;
@@ -1962,13 +1960,98 @@ fn stop_and_remove_both_fail_still_updates_state() {
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
-    // Executor marks result as succeeded because state is updated
-    // regardless of stop/remove runtime errors (best-effort cleanup).
-    assert!(result.all_succeeded());
+    assert_eq!(result.failed, 1);
+    assert!(!result.all_succeeded());
 
     let observed = executor.store().load_observed_state("myapp").unwrap();
     let web = observed.iter().find(|o| o.service_name == "web").unwrap();
-    assert_eq!(web.phase, ServicePhase::Stopped);
+    assert_eq!(web.phase, ServicePhase::Failed);
+    assert_eq!(web.container_id.as_deref(), Some("ctr-web"));
+}
+
+#[test]
+fn failed_cleanup_blocks_deterministic_id_recreation() {
+    let mut runtime = MockContainerRuntime::new();
+    runtime.fail_remove = true;
+    let mut executor = make_executor(runtime);
+    let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
+
+    executor
+        .store()
+        .save_observed_state(
+            "myapp",
+            &ServiceObservedState {
+                service_name: "web".to_string(),
+                phase: ServicePhase::Failed,
+                container_id: Some("web".to_string()),
+                last_error: Some("activation rollback retained OCI state".to_string()),
+                ready: false,
+            },
+        )
+        .unwrap();
+
+    let result = executor
+        .execute(
+            &spec,
+            &[Action::ServiceCreate {
+                service_name: "web".to_string(),
+            }],
+        )
+        .unwrap();
+
+    assert_eq!(result.failed, 1);
+    let calls = executor.runtime().call_log();
+    assert!(calls.iter().any(|(operation, _)| operation == "remove"));
+    assert!(
+        !calls
+            .iter()
+            .any(|(operation, _)| operation == "create_in_sandbox")
+    );
+    let observed = executor.store().load_observed_state("myapp").unwrap();
+    assert_eq!(observed[0].phase, ServicePhase::Failed);
+    assert_eq!(observed[0].container_id.as_deref(), Some("web"));
+}
+
+#[test]
+fn already_absent_cleanup_allows_deterministic_id_recreation() {
+    let mut runtime = MockContainerRuntime::new();
+    runtime.remove_not_found = true;
+    let mut executor = make_executor(runtime);
+    let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
+
+    executor
+        .store()
+        .save_observed_state(
+            "myapp",
+            &ServiceObservedState {
+                service_name: "web".to_string(),
+                phase: ServicePhase::Failed,
+                container_id: Some("web".to_string()),
+                last_error: Some("create failed before OCI state existed".to_string()),
+                ready: false,
+            },
+        )
+        .unwrap();
+
+    let result = executor
+        .execute(
+            &spec,
+            &[Action::ServiceCreate {
+                service_name: "web".to_string(),
+            }],
+        )
+        .unwrap();
+
+    assert!(result.all_succeeded());
+    let calls = executor.runtime().call_log();
+    assert!(calls.iter().any(|(operation, _)| operation == "remove"));
+    assert!(
+        calls
+            .iter()
+            .any(|(operation, _)| operation == "create_in_sandbox")
+    );
+    let observed = executor.store().load_observed_state("myapp").unwrap();
+    assert_eq!(observed[0].phase, ServicePhase::Running);
 }
 
 #[test]

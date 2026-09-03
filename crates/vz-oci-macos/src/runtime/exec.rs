@@ -1,5 +1,6 @@
 use super::networking::ensure_interactive_exec_pty_prerequisites;
 use super::oci_lifecycle::parse_signal_number;
+use super::stack_vm::require_running_pid;
 use super::*;
 use tracing::debug;
 
@@ -65,11 +66,7 @@ impl Runtime {
                 );
             }
             let state = vm.oci_state(id.to_string()).await?;
-            let Some(pid) = state.pid else {
-                return Err(OciError::InvalidConfig(format!(
-                    "container '{id}' has no running pid for interactive exec"
-                )));
-            };
+            let pid = require_running_pid(id, "interactive exec", &state)?;
             if debug {
                 debug!(
                     "[vz-oci-macos exec-control] interactive exec container pid resolved execution_id={execution_id} container_id={id} pid={pid}"
@@ -218,11 +215,7 @@ impl Runtime {
         // Non-PTY streaming path: use nsenter via the streaming exec RPC
         // so output is delivered incrementally instead of buffered until exit.
         let state = vm.oci_state(id.to_string()).await?;
-        let Some(pid) = state.pid else {
-            return Err(OciError::InvalidConfig(format!(
-                "container '{id}' has no running pid for exec"
-            )));
-        };
+        let pid = require_running_pid(id, "exec", &state)?;
 
         let mut nsenter_args: Vec<String> = vec![
             format!("--mount=/proc/{pid}/ns/mnt"),

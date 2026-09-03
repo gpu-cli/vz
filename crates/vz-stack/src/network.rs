@@ -4,12 +4,13 @@
 //!
 //! This module does **not** implement guest networking. The real model is:
 //!
-//! - **Guest → Internet / macOS host**: Apple's user-mode NAT via
+//! - **Outer guest transport**: Apple's user-mode NAT via
 //!   [`VZNATNetworkDeviceAttachment`] (`crates/vz/src/bridge.rs:409-441`,
 //!   also `install.rs:505-512`). The guest receives an IPv4 via DHCP (BusyBox
-//!   `udhcpc` in `linux/initramfs/init`) from Apple's `bootpd`. The router
-//!   handed out by Apple's NAT is `192.168.64.1`, which is reachable from
-//!   the guest as the macOS host (see `vz::protocol::HOST_INTERNAL_GATEWAY_IPV4`).
+//!   `udhcpc` in `linux/initramfs/init`) from Apple's `bootpd`. Nested Machine
+//!   networks remain deny-first and require explicit egress policy. This
+//!   transport does not authorize access to host services; those require a
+//!   separately declared, authenticated host import.
 //!
 //! - **Container → container DNS (sibling service discovery)**: per-container
 //!   `/etc/hosts` populated from `RunConfig::extra_hosts`. The bundle writer
@@ -35,10 +36,9 @@
 //!   Bytes flow via `tokio::io::copy_bidirectional`. Limitations: TCP only;
 //!   host listener bound to loopback only (no LAN exposure).
 //!
-//! There is no gvproxy. A reserved tracking issue exists for reviving
-//! gvproxy as a production network backend (it would solve both
-//! `host.vz.internal` properly and give portable host-port forwarding);
-//! see the network-related beads for the live tracker.
+//! There is no gvproxy or implicit host-gateway alias. Portable host imports
+//! and host-port forwarding must remain explicit control-plane operations;
+//! see the network-related beads for the live trackers.
 //!
 //! [`VZNATNetworkDeviceAttachment`]: https://developer.apple.com/documentation/virtualization/vznatnetworkdeviceattachment
 //! [`PortTracker`]: crate::executor::PortTracker

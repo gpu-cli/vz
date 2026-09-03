@@ -44,6 +44,21 @@ Capability matrix:
 - `stack-user-journey-checkpoint` → `complex_stack_snapshot_restore_rewinds_shared_vm_state`
 - `buildkit-roundtrip` → `buildkit_builds_dockerfile_and_run_uses_built_image`
 
+Before any VM starts, the harness cross-builds the current Linux guest agent
+with `cargo zigbuild`, rebuilds both Developer and Hardened/container
+initramfs bundles, and records their SHA-256 digests in `run-info.txt`. Each
+test lane is pinned to those workspace bundles. This prevents a freshly built
+macOS host binary from being tested against a stale guest agent embedded in an
+older initramfs. Set `VZ_E2E_GUEST_AGENT_BUILD_TOOL` only when deliberately
+using another compatible cross-build tool.
+
+The complete `runtime` suite also includes
+`undeclared_host_import_does_not_inject_host_vz_internal`. This real-VM
+regression creates a stack-network-namespace container with no declared import
+and requires `host.vz.internal` to be absent from `/etc/hosts`. It is not a
+positive host-import test: the authenticated relay is tracked separately and
+must not be replaced by arbitrary gateway reachability.
+
 Scenario groups:
 
 - `sandbox-usecases` → runtime + stack use-cases (no buildkit)

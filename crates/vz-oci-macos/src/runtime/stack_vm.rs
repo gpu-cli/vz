@@ -9,8 +9,75 @@ use super::resolve::{
 };
 use super::*;
 
+pub(super) fn require_running_pid(
+    container_id: &str,
+    phase: &str,
+    state: &OciContainerState,
+) -> Result<u32, OciError> {
+    if state.status != "running" {
+        return Err(OciError::InvalidConfig(format!(
+            "container '{container_id}' is not running during {phase}: status='{}', pid={:?}",
+            state.status, state.pid
+        )));
+    }
+
+    state.pid.filter(|pid| *pid > 0).ok_or_else(|| {
+        OciError::InvalidConfig(format!(
+            "container '{container_id}' has no running pid during {phase}"
+        ))
+    })
+}
+
+pub(super) fn require_successful_hosts_write(
+    container_id: &str,
+    output: &ExecOutput,
+) -> Result<(), OciError> {
+    if output.exit_code == 0 {
+        return Ok(());
+    }
+    Err(OciError::InvalidConfig(format!(
+        "container '{}' /etc/hosts write failed with exit code {}: {}",
+        container_id,
+        output.exit_code,
+        output.stderr.trim()
+    )))
+}
+
+pub(super) fn activation_error_with_rollback(
+    activation_error: OciError,
+    rollback: Result<(), OciError>,
+) -> OciError {
+    match rollback {
+        Ok(()) => activation_error,
+        Err(rollback_error) => OciError::InvalidConfig(format!(
+            "stack container activation failed: {activation_error}; rollback also failed: {rollback_error}"
+        )),
+    }
+}
+
+fn diagnostic_file_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 impl Runtime {
     // ── Shared stack VM API ──────────────────────────────────────────
+
+    pub(super) async fn stack_activation_lock(&self, stack_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.stack_activation_locks.lock().await;
+        locks
+            .entry(stack_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
 
     /// Return the rootfs store directory where assembled rootfs trees are stored.
     ///
@@ -72,6 +139,9 @@ impl Runtime {
         ports: Vec<PortMapping>,
         resources: vz_runtime_contract::StackResourceHint,
     ) -> Result<(), OciError> {
+        let activation_lock = self.stack_activation_lock(stack_id).await;
+        let _activation_guard = activation_lock.lock().await;
+
         // Snapshot lock-protected counters into locals so the lock guards
         // don't span the tracing::info! call (which was captured across
         // the next .await and broke Send).
@@ -178,8 +248,15 @@ impl Runtime {
             vm_config.disk_image = Some(disk_path.clone());
         }
 
-        // Debug: capture serial log for shared VM diagnostics.
-        if let Ok(log_path) = std::env::var("VZ_STACK_SERIAL_LOG") {
+        // Capture one serial log per shared VM when the E2E harness provides
+        // an artifact directory. Preserve the older exact-path override for
+        // focused/manual debugging.
+        if let Ok(log_dir) = std::env::var("VZ_STACK_SERIAL_LOG_DIR") {
+            let log_dir = PathBuf::from(log_dir);
+            fs::create_dir_all(&log_dir)?;
+            vm_config.serial_log_file =
+                Some(log_dir.join(format!("{}.log", diagnostic_file_component(stack_id))));
+        } else if let Ok(log_path) = std::env::var("VZ_STACK_SERIAL_LOG") {
             vm_config.serial_log_file = Some(std::path::PathBuf::from(log_path));
         }
 
@@ -608,6 +685,44 @@ impl Runtime {
             },
         )?;
 
+        // Serialize only the guest-critical activation transaction for this
+        // stack. Rootfs assembly and bundle generation above remain parallel,
+        // while independent stacks use independent locks.
+        let activation_lock = self.stack_activation_lock(stack_id).await;
+        let _activation_guard = activation_lock.lock().await;
+
+        let vm_is_current = self
+            .stack_vms
+            .lock()
+            .await
+            .get(stack_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &vm));
+        if !vm_is_current {
+            container.status = ContainerStatus::Stopped { exit_code: -1 };
+            container.stopped_unix_secs = Some(current_unix_secs());
+            container.host_pid = None;
+            self.container_store
+                .upsert(container)
+                .map_err(OciError::from)?;
+            self.cleanup_rootfs_dir(rootfs_dir.as_ref());
+            return Err(OciError::InvalidConfig(format!(
+                "shared VM for stack '{stack_id}' changed while container '{container_id}' was being prepared"
+            )));
+        }
+
+        // Publish the stack route before the first guest OCI mutation. A task
+        // cancelled during create/start/rollback is therefore still visible to
+        // stack shutdown. The per-container handle is published second because
+        // container_stack alone is sufficient to reach the shared VM.
+        self.container_stack
+            .lock()
+            .await
+            .insert(container_id.to_string(), stack_id.to_string());
+        self.vm_handles
+            .lock()
+            .await
+            .insert(container_id.to_string(), Arc::clone(&vm));
+
         // OCI create + start inside the shared VM.
         if let Err(err) = vm
             .oci_create(oci_container_id.clone(), bundle_guest_path.clone())
@@ -618,29 +733,169 @@ impl Runtime {
                 error = %err,
                 "step 4 FAILED: oci_create"
             );
-            container.status = ContainerStatus::Stopped { exit_code: -1 };
-            container.stopped_unix_secs = Some(current_unix_secs());
-            container.host_pid = None;
-            self.container_store
-                .upsert(container)
-                .map_err(OciError::from)?;
-            self.cleanup_rootfs_dir(rootfs_dir.as_ref());
-            return Err(OciError::from(err));
+            let error = OciError::from(err);
+            let rollback = self
+                .rollback_stack_container_activation(
+                    &vm,
+                    stack_id,
+                    &oci_container_id,
+                    &container_id,
+                    &mut container,
+                    rootfs_dir.as_ref(),
+                )
+                .await;
+            return Err(activation_error_with_rollback(error, rollback));
         }
 
         if let Err(err) = vm.oci_start(oci_container_id.clone()).await {
-            let _ = vm.oci_delete(oci_container_id, true).await;
-            container.status = ContainerStatus::Stopped { exit_code: -1 };
-            container.stopped_unix_secs = Some(current_unix_secs());
-            container.host_pid = None;
-            self.container_store
-                .upsert(container)
-                .map_err(OciError::from)?;
-            self.cleanup_rootfs_dir(rootfs_dir.as_ref());
-            return Err(OciError::from(err));
+            let error = OciError::from(err);
+            let rollback = self
+                .rollback_stack_container_activation(
+                    &vm,
+                    stack_id,
+                    &oci_container_id,
+                    &container_id,
+                    &mut container,
+                    rootfs_dir.as_ref(),
+                )
+                .await;
+            return Err(activation_error_with_rollback(error, rollback));
         }
 
-        // Register VM handle for exec/stop and track stack membership.
+        // Step 5: Write /etc/hosts inside the running container via oci_exec.
+        // This writes directly into the container's mount namespace after
+        // pivot_root, avoiding VirtioFS caching and overlay visibility issues.
+        let initial_pid = match self
+            .validate_stack_container_running(&vm, &oci_container_id, "post-start")
+            .await
+        {
+            Ok(pid) => pid,
+            Err(error) => {
+                let rollback = self
+                    .rollback_stack_container_activation(
+                        &vm,
+                        stack_id,
+                        &oci_container_id,
+                        &container_id,
+                        &mut container,
+                        rootfs_dir.as_ref(),
+                    )
+                    .await;
+                return Err(activation_error_with_rollback(error, rollback));
+            }
+        };
+
+        if !run.extra_hosts.is_empty() {
+            tracing::debug!(
+                container_id = %oci_container_id,
+                pid = initial_pid,
+                "step 5: write /etc/hosts via nsenter streaming exec"
+            );
+            let mut printf_content = String::from("127.0.0.1\\tlocalhost\\n::1\\tlocalhost\\n");
+            for (hostname, ip) in &run.extra_hosts {
+                printf_content.push_str(&format!("{ip}\\t{hostname}\\n"));
+            }
+            let hosts_result = vm
+                .exec_collect(
+                    "/bin/busybox".to_string(),
+                    vec![
+                        "nsenter".to_string(),
+                        format!("--mount=/proc/{initial_pid}/ns/mnt"),
+                        format!("--root=/proc/{initial_pid}/root"),
+                        "--wd=/".to_string(),
+                        "--".to_string(),
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        format!("printf '{printf_content}' > /etc/hosts"),
+                    ],
+                    Duration::from_secs(30),
+                )
+                .await
+                .map_err(OciError::from)
+                .and_then(|output| require_successful_hosts_write(&oci_container_id, &output));
+            if let Err(error) = hosts_result {
+                tracing::error!(
+                    container_id = %oci_container_id,
+                    pid = initial_pid,
+                    error = %error,
+                    "step 5 FAILED: /etc/hosts write"
+                );
+                let rollback = self
+                    .rollback_stack_container_activation(
+                        &vm,
+                        stack_id,
+                        &oci_container_id,
+                        &container_id,
+                        &mut container,
+                        rootfs_dir.as_ref(),
+                    )
+                    .await;
+                return Err(activation_error_with_rollback(error, rollback));
+            }
+            tracing::debug!(
+                container_id = %oci_container_id,
+                pid = initial_pid,
+                "step 5 OK: /etc/hosts written"
+            );
+        }
+
+        if let Err(error) = self
+            .validate_stack_container_running(&vm, &oci_container_id, "activation-finalize")
+            .await
+        {
+            let rollback = self
+                .rollback_stack_container_activation(
+                    &vm,
+                    stack_id,
+                    &oci_container_id,
+                    &container_id,
+                    &mut container,
+                    rootfs_dir.as_ref(),
+                )
+                .await;
+            return Err(activation_error_with_rollback(error, rollback));
+        }
+
+        if let Err(error) = self
+            .start_log_rotation_task_if_needed(container_id.as_str(), Arc::clone(&vm), &run)
+            .await
+        {
+            let rollback = self
+                .rollback_stack_container_activation(
+                    &vm,
+                    stack_id,
+                    &oci_container_id,
+                    &container_id,
+                    &mut container,
+                    rootfs_dir.as_ref(),
+                )
+                .await;
+            return Err(activation_error_with_rollback(error, rollback));
+        }
+
+        container.status = ContainerStatus::Running;
+        container.started_unix_secs = Some(current_unix_secs());
+        container.host_pid = Some(process::id());
+        if let Err(error) = self.container_store.upsert(container.clone()) {
+            let rollback = self
+                .rollback_stack_container_activation(
+                    &vm,
+                    stack_id,
+                    &oci_container_id,
+                    &container_id,
+                    &mut container,
+                    rootfs_dir.as_ref(),
+                )
+                .await;
+            return Err(activation_error_with_rollback(
+                OciError::from(error),
+                rollback,
+            ));
+        }
+
+        // Publish in-memory handles only after every required post-start
+        // action, final liveness validation, and durable Running metadata have
+        // succeeded. The map updates themselves are infallible.
         self.vm_handles
             .lock()
             .await
@@ -649,15 +904,6 @@ impl Runtime {
             .lock()
             .await
             .insert(container_id.to_string(), stack_id.to_string());
-        self.start_log_rotation_task_if_needed(container_id.as_str(), Arc::clone(&vm), &run)
-            .await?;
-
-        container.status = ContainerStatus::Running;
-        container.started_unix_secs = Some(current_unix_secs());
-        container.host_pid = Some(process::id());
-        self.container_store
-            .upsert(container)
-            .map_err(OciError::from)?;
         self.track_active_lifecycle(container_id.clone(), lifecycle)
             .await;
         self.container_exec_env
@@ -665,60 +911,168 @@ impl Runtime {
             .await
             .insert(container_id.clone(), run.env.clone());
 
-        // Step 5: Write /etc/hosts inside the running container via oci_exec.
-        // This writes directly into the container's mount namespace after
-        // pivot_root, avoiding VirtioFS caching and overlay visibility issues.
-        if !run.extra_hosts.is_empty() {
-            tracing::debug!("step 5: write /etc/hosts via nsenter streaming exec");
-            let mut printf_content = String::from("127.0.0.1\\tlocalhost\\n::1\\tlocalhost\\n");
-            for (hostname, ip) in &run.extra_hosts {
-                printf_content.push_str(&format!("{ip}\\t{hostname}\\n"));
+        Ok(container_id)
+    }
+
+    async fn validate_stack_container_running(
+        &self,
+        vm: &LinuxVm,
+        container_id: &str,
+        phase: &str,
+    ) -> Result<u32, OciError> {
+        let state = vm.oci_state(container_id.to_string()).await?;
+        let pid = require_running_pid(container_id, phase, &state)?;
+        let proc_root = format!("/proc/{pid}/root");
+        let liveness = vm
+            .exec_collect(
+                "/bin/busybox".to_string(),
+                vec!["test".to_string(), "-d".to_string(), proc_root.clone()],
+                Duration::from_secs(5),
+            )
+            .await?;
+        if liveness.exit_code != 0 {
+            return Err(OciError::InvalidConfig(format!(
+                "container '{container_id}' reported status='{}' pid={pid} during {phase}, but {proc_root} is not live: {}",
+                state.status,
+                liveness.stderr.trim()
+            )));
+        }
+        tracing::debug!(
+            container_id,
+            phase,
+            status = %state.status,
+            pid,
+            "validated running OCI container"
+        );
+        Ok(pid)
+    }
+
+    async fn rollback_stack_container_activation(
+        &self,
+        vm: &Arc<LinuxVm>,
+        stack_id: &str,
+        oci_container_id: &str,
+        container_id: &str,
+        container: &mut ContainerInfo,
+        rootfs_dir: &Path,
+    ) -> Result<(), OciError> {
+        // Publish recovery routing before any await. This keeps the container
+        // discoverable even if rollback is cancelled while stopping log
+        // rotation, collecting diagnostics, or deleting guest OCI state.
+        self.vm_handles
+            .lock()
+            .await
+            .insert(container_id.to_string(), Arc::clone(vm));
+        self.container_stack
+            .lock()
+            .await
+            .insert(container_id.to_string(), stack_id.to_string());
+
+        self.stop_log_rotation_task(container_id).await;
+        self.log_stack_activation_diagnostics(vm, oci_container_id)
+            .await;
+
+        if let Err(error) = vm.oci_delete(oci_container_id.to_string(), true).await {
+            // The guest may still have a live process or OCI state. Keep every
+            // resource needed for a later stack shutdown retry instead of
+            // publishing Stopped and orphaning the guest workload.
+            container.status = ContainerStatus::Created;
+            container.started_unix_secs = None;
+            container.stopped_unix_secs = None;
+            container.host_pid = Some(process::id());
+            let persist_error = self.container_store.upsert(container.clone()).err();
+
+            tracing::error!(
+                container_id = %oci_container_id,
+                stack_id,
+                error = %error,
+                "activation rollback could not delete OCI state; retained VM tracking and rootfs"
+            );
+            let mut message = format!(
+                "activation rollback could not delete OCI state for container '{oci_container_id}'; retained stack '{stack_id}' tracking and rootfs for shutdown retry: {error}"
+            );
+            if let Some(persist_error) = persist_error {
+                message.push_str(&format!(
+                    "; could not persist activation-incomplete state: {persist_error}"
+                ));
             }
-            // Get the container's init PID for nsenter.
-            let hosts_result = match vm.oci_state(oci_container_id.clone()).await {
-                Ok(state) => match state.pid {
-                    Some(pid) => vm
-                        .exec_collect(
-                            "/bin/busybox".to_string(),
-                            vec![
-                                "nsenter".to_string(),
-                                format!("--mount=/proc/{pid}/ns/mnt"),
-                                format!("--root=/proc/{pid}/root"),
-                                "--wd=/".to_string(),
-                                "--".to_string(),
-                                "/bin/sh".to_string(),
-                                "-c".to_string(),
-                                format!("printf '{printf_content}' > /etc/hosts"),
-                            ],
-                            Duration::from_secs(30),
-                        )
-                        .await
-                        .map_err(OciError::from),
-                    None => Err(OciError::InvalidConfig(format!(
-                        "container '{}' has no running pid for /etc/hosts write",
-                        oci_container_id
-                    ))),
-                },
-                Err(e) => Err(OciError::from(e)),
-            };
-            match hosts_result {
-                Ok(r) if r.exit_code == 0 => {
-                    tracing::debug!("step 5 OK: /etc/hosts written");
-                }
-                Ok(r) => {
-                    tracing::warn!(
-                        exit_code = r.exit_code,
-                        stderr = %r.stderr.trim(),
-                        "step 5: /etc/hosts write returned non-zero"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "step 5: /etc/hosts write failed");
-                }
+            return Err(OciError::InvalidConfig(message));
+        }
+        self.vm_handles.lock().await.remove(container_id);
+        self.container_stack.lock().await.remove(container_id);
+        self.active_lifecycle.lock().await.remove(container_id);
+        self.container_exec_env.lock().await.remove(container_id);
+        self.setup_restored_containers
+            .lock()
+            .await
+            .remove(container_id);
+
+        container.status = ContainerStatus::Stopped { exit_code: -1 };
+        container.stopped_unix_secs = Some(current_unix_secs());
+        container.host_pid = None;
+        let persist_result = self
+            .container_store
+            .upsert(container.clone())
+            .map_err(OciError::from);
+        self.cleanup_rootfs_dir(rootfs_dir);
+        persist_result
+    }
+
+    async fn log_stack_activation_diagnostics(&self, vm: &LinuxVm, container_id: &str) {
+        let commands = [
+            (
+                "process-table",
+                "/bin/busybox",
+                vec!["ps".to_string(), "-ef".to_string()],
+            ),
+            (
+                "youki-create-log",
+                "/bin/busybox",
+                vec![
+                    "cat".to_string(),
+                    format!("/run/vz-oci/logs/{container_id}-create.log"),
+                ],
+            ),
+            (
+                "youki-start-log",
+                "/bin/busybox",
+                vec![
+                    "cat".to_string(),
+                    format!("/run/vz-oci/logs/{container_id}-start.log"),
+                ],
+            ),
+            (
+                "container-output",
+                "/bin/busybox",
+                vec![
+                    "cat".to_string(),
+                    format!("/run/vz-oci/logs/{container_id}/output.log"),
+                ],
+            ),
+            ("kernel-log", "/bin/busybox", vec!["dmesg".to_string()]),
+        ];
+
+        for (diagnostic, command, args) in commands {
+            match vm
+                .exec_collect(command.to_string(), args, Duration::from_secs(5))
+                .await
+            {
+                Ok(output) => tracing::error!(
+                    container_id,
+                    diagnostic,
+                    exit_code = output.exit_code,
+                    stdout = %output.stdout.trim(),
+                    stderr = %output.stderr.trim(),
+                    "stack activation diagnostic"
+                ),
+                Err(error) => tracing::error!(
+                    container_id,
+                    diagnostic,
+                    error = %error,
+                    "stack activation diagnostic unavailable"
+                ),
             }
         }
-
-        Ok(container_id)
     }
 
     /// Tar the container's overlay upperdir to host as the cached commit
@@ -799,6 +1153,8 @@ impl Runtime {
     /// Each container is stopped via `oci_kill` + `oci_delete`, then the
     /// shared VM is torn down. Container metadata is updated to `Stopped`.
     pub async fn shutdown_shared_vm(&self, stack_id: &str) -> Result<(), OciError> {
+        let activation_lock = self.stack_activation_lock(stack_id).await;
+        let _activation_guard = activation_lock.lock().await;
         let (stack_vms_count, stack_port_forwards_count) = {
             let vms = self.stack_vms.lock().await;
             let pfs = self.stack_port_forwards.lock().await;
@@ -915,7 +1271,6 @@ impl Runtime {
             stack_port_forwards_count_after,
             "[L4/stack-vm] shutdown_shared_vm complete"
         );
-
         Ok(())
     }
 

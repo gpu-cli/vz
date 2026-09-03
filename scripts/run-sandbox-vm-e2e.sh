@@ -51,6 +51,8 @@ Options:
 
 Environment:
   VZ_SKIP_KERNEL_CHECK=1      Skip ~/.vz/linux preflight check
+  VZ_E2E_GUEST_AGENT_BUILD_TOOL=<tool>
+                              Linux guest-agent build tool (default: zigbuild)
 USAGE
 }
 
@@ -325,6 +327,22 @@ mkdir -p "$RUN_DIR"
 ln -sfn "$timestamp" "$OUTPUT_ROOT/latest"
 BUILDKIT_RUNTIME_INVENTORY_EVIDENCE="$RUN_DIR/buildkit-runtime-inventory.txt"
 
+# The VM executes the Linux guest agent embedded in each profile's initramfs,
+# not the macOS host binary built below. Rebuild both bundles on every run so
+# source changes cannot be silently tested against a stale guest executable.
+GUEST_AGENT_BUILD_TOOL="${VZ_E2E_GUEST_AGENT_BUILD_TOOL:-zigbuild}"
+for kernel_profile in developer container; do
+    echo "==> rebuilding Linux $kernel_profile guest bundle"
+    make -C "$REPO_ROOT/linux" \
+        KERNEL_PROFILE="$kernel_profile" \
+        TRUST_EXISTING_KERNEL_IMAGE=1 \
+        GUEST_AGENT_BUILD_TOOL="$GUEST_AGENT_BUILD_TOOL" \
+        initramfs version 2>&1 | tee "$RUN_DIR/linux-$kernel_profile-build.log"
+done
+
+DEVELOPER_INITRAMFS_SHA256="$(shasum -a 256 "$REPO_ROOT/linux/out/initramfs.img" | cut -d' ' -f1)"
+CONTAINER_INITRAMFS_SHA256="$(shasum -a 256 "$REPO_ROOT/linux/out/container/initramfs.img" | cut -d' ' -f1)"
+
 BUILD_ARGS=()
 if [[ "$PROFILE" == "release" ]]; then
     BUILD_ARGS+=(--release)
@@ -480,6 +498,15 @@ run_and_log() {
         cmd_env+=("VZ_BUILDKIT_RUNTIME_INVENTORY_EVIDENCE=$BUILDKIT_RUNTIME_INVENTORY_EVIDENCE")
     fi
 
+    if [[ "$suite" == "stack" ]]; then
+        local stack_serial_dir="$RUN_DIR/${label}-vm-serial"
+        mkdir -p "$stack_serial_dir"
+        cmd_env+=("VZ_STACK_SERIAL_LOG_DIR=$stack_serial_dir")
+    fi
+
+    cmd_env+=("VZ_LINUX_DEVELOPER_BUNDLE_DIR=$REPO_ROOT/linux/out")
+    cmd_env+=("VZ_LINUX_CONTAINER_BUNDLE_DIR=$REPO_ROOT/linux/out/container")
+
     echo "running [$label/$suite]: $binary ${args[*]}"
 
     set +e
@@ -511,6 +538,9 @@ echo "==> output directory: $RUN_DIR"
     echo "suites=${RESOLVED_SUITES[*]}"
     echo "scenarios=${RESOLVED_SCENARIOS[*]:-none}"
     echo "run_args=${RUN_ARGS[*]}"
+    echo "guest_agent_build_tool=$GUEST_AGENT_BUILD_TOOL"
+    echo "developer_initramfs_sha256=$DEVELOPER_INITRAMFS_SHA256"
+    echo "container_initramfs_sha256=$CONTAINER_INITRAMFS_SHA256"
 } > "$RUN_DIR/run-info.txt"
 
 echo "==> building host binaries required for local VM flows"

@@ -105,7 +105,8 @@ supported fallback.
 | Container runtime | Pinned youki inside VM | youki on host today; pinned artifact integration planned |
 | Networking | Guest agent + vsock bridge | Linux bridge + veth pairs |
 | Port forwarding | Guest agent NAT | iptables DNAT |
-| Service discovery | `/etc/hosts` injection | `/etc/hosts` injection |
+| Service discovery | Declared Machine-local identities | Declared Machine-local identities |
+| Host imports | Explicit authenticated relay planned; undeclared access is default-deny | Explicit authenticated relay planned; undeclared access is default-deny |
 | Filesystem | VirtioFS | Direct host filesystem |
 | Resource limits (CPU) | VM-level CPU count | cgroup v2 `cpu.max` |
 | Resource limits (memory) | VM-level memory | cgroup v2 `memory.max` (planned) |
@@ -116,6 +117,12 @@ its own Docker Engine, containerd, BuildKit cache, image store, volumes,
 networks, endpoint, and context. No host uses an Environment-global or global
 `vz` daemon, and a Machine never falls back to a sibling, another Environment,
 system Docker, or Docker Desktop.
+
+Host access is separate from service discovery and external egress. A Linux
+Machine without a declared host import must not receive `host.vz.internal` or
+another implicit gateway route. Binding a host service to a wildcard or LAN
+address is not a supported substitute for the planned exact host-loopback,
+authenticated import relay.
 
 ## Known Limitations
 

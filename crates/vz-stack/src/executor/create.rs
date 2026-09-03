@@ -148,23 +148,9 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             })
             .collect();
 
-        // Inject `host.vz.internal` → macOS host's NAT gateway IP for
-        // sandbox→host reachability. Pushed before the sibling-service loop
-        // so a service literally named `host.vz.internal` (if a user ever
-        // does that) wins via the existing dedup check below.
-        if !run_config
-            .extra_hosts
-            .iter()
-            .any(|(h, _)| h == vz_runtime_contract::HOST_INTERNAL_ALIAS)
-        {
-            run_config.extra_hosts.push((
-                vz_runtime_contract::HOST_INTERNAL_ALIAS.to_string(),
-                vz_runtime_contract::HOST_INTERNAL_GATEWAY_IPV4.to_string(),
-            ));
-        }
-
         // Auto-inject sibling service hostnames for inter-service resolution.
-        // Only inject hosts for services that share at least one network.
+        // Only inject hosts for services that share at least one network, and
+        // never replace an entry explicitly declared by the caller.
         let my_networks: HashSet<&str> = svc_spec.networks.iter().map(|n| n.as_str()).collect();
 
         for svc in &spec.services {

@@ -438,6 +438,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             // Recreates always remove the old container. For creates from a
             // Failed state, the old container may still exist in the runtime
             // — clean it up to avoid "container already exists" errors.
+            let mut cleanup_failed = HashSet::new();
             for action in level {
                 let should_remove = match action {
                     Action::ServiceRecreate { .. } => true,
@@ -455,6 +456,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 if should_remove {
                     if let Err(e) = self.execute_remove(spec, action.service_name()) {
                         error!(service = %action.service_name(), error = %e, "failed to remove old container");
+                        cleanup_failed.insert(action.service_name().to_string());
+                        result.failed += 1;
+                        result
+                            .errors
+                            .push((action.service_name().to_string(), e.to_string()));
                     }
                 }
             }
@@ -464,6 +470,9 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             let mut prepared: Vec<PreparedCreate> = Vec::new();
             for action in level {
                 let service_name = action.service_name();
+                if cleanup_failed.contains(service_name) {
+                    continue;
+                }
 
                 // Get replica count for this service
                 let replicas = if let Some(svc_spec) = service_map.get(service_name) {
@@ -525,6 +534,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 // Single container — execute inline, no thread overhead.
                 for prep in ok_prepared {
                     let full_name = prep.full_name();
+                    let requested_container_id = prep.run_config.container_id.clone();
                     info!(service = %full_name, image = %prep.image, "creating container");
                     let create_result =
                         self.runtime
@@ -535,7 +545,12 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                             result.succeeded += 1;
                         }
                         Err(e) => {
-                            self.mark_failed(spec, &full_name, &e.to_string())?;
+                            self.mark_failed_with_container(
+                                spec,
+                                &full_name,
+                                &e.to_string(),
+                                requested_container_id.as_deref(),
+                            )?;
                             result.failed += 1;
                             result.errors.push((full_name, e.to_string()));
                         }
@@ -545,6 +560,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 // Parallel create for multiple containers at the same level.
                 // Images are already pulled; only create_in_sandbox runs in threads.
                 let full_names: Vec<String> = ok_prepared.iter().map(|p| p.full_name()).collect();
+                let requested_container_ids: Vec<Option<String>> = ok_prepared
+                    .iter()
+                    .map(|p| p.run_config.container_id.clone())
+                    .collect();
                 info!(
                     services = ?full_names,
                     "creating {} containers in parallel",
@@ -580,14 +599,23 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 });
 
                 // Serial post: update state for each outcome.
-                for (service_name, outcome) in full_names.iter().zip(outcomes) {
+                for ((service_name, requested_container_id), outcome) in full_names
+                    .iter()
+                    .zip(requested_container_ids.iter())
+                    .zip(outcomes)
+                {
                     match outcome {
                         Ok(container_id) => {
                             self.finalize_create(spec, service_name, &container_id)?;
                             result.succeeded += 1;
                         }
                         Err(e) => {
-                            self.mark_failed(spec, service_name, &e.to_string())?;
+                            self.mark_failed_with_container(
+                                spec,
+                                service_name,
+                                &e.to_string(),
+                                requested_container_id.as_deref(),
+                            )?;
                             result.failed += 1;
                             result.errors.push((service_name.clone(), e.to_string()));
                         }

@@ -38,8 +38,21 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             }
 
             info!(service = %service_name, container = %cid, "removing container");
-            if let Err(e) = self.runtime.remove(cid) {
-                error!(service = %service_name, error = %e, "failed to remove container");
+            match self.runtime.remove(cid) {
+                Ok(()) => {}
+                Err(e) if e.machine_code() == vz_runtime_contract::MachineErrorCode::NotFound => {
+                    info!(service = %service_name, container = %cid, "container already absent; treating remove as complete");
+                }
+                Err(e) => {
+                    error!(service = %service_name, error = %e, "failed to remove container");
+                    self.mark_failed_with_container(
+                        spec,
+                        service_name,
+                        &format!("container cleanup failed: {e}"),
+                        Some(cid),
+                    )?;
+                    return Err(e);
+                }
             }
         }
 
@@ -77,12 +90,24 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         service_name: &str,
         error_msg: &str,
     ) -> Result<(), StackError> {
+        self.mark_failed_with_container(spec, service_name, error_msg, None)
+    }
+
+    /// Mark a service as failed while retaining a runtime container identifier
+    /// when cleanup must be retried before the next deterministic-ID create.
+    pub(super) fn mark_failed_with_container(
+        &self,
+        spec: &StackSpec,
+        service_name: &str,
+        error_msg: &str,
+        container_id: Option<&str>,
+    ) -> Result<(), StackError> {
         self.store.save_observed_state(
             &spec.name,
             &ServiceObservedState {
                 service_name: service_name.to_string(),
                 phase: ServicePhase::Failed,
-                container_id: None,
+                container_id: container_id.map(str::to_string),
                 last_error: Some(error_msg.to_string()),
                 ready: false,
             },

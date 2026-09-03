@@ -1177,8 +1177,17 @@ impl oci_service_server::OciService for OciServiceImpl {
             run_youki_output(&["state", &req.container_id], YOUKI_LIFECYCLE_TIMEOUT).await?;
         let state: serde_json::Value = serde_json::from_slice(&state_output.stdout)
             .map_err(|e| Status::internal(format!("failed to parse youki state: {e}")))?;
+        let runtime_status = state["status"].as_str().unwrap_or("unknown");
+        if runtime_status != "running" {
+            return Err(Status::failed_precondition(format!(
+                "container '{}' is not running for exec: status='{runtime_status}', pid={}",
+                req.container_id,
+                state["pid"].as_u64().unwrap_or(0)
+            )));
+        }
         let pid = state["pid"]
             .as_u64()
+            .filter(|pid| *pid > 0)
             .ok_or_else(|| Status::internal("youki state missing pid field"))?;
 
         let mut nsenter_args: Vec<String> = vec![
@@ -1265,8 +1274,36 @@ impl oci_service_server::OciService for OciServiceImpl {
             "oci: delete"
         );
 
+        let mut id_components = Path::new(&req.container_id).components();
+        let state_name = match (id_components.next(), id_components.next()) {
+            (Some(std::path::Component::Normal(name)), None) => name,
+            _ => return Err(Status::invalid_argument("invalid OCI container ID")),
+        };
+        let state_path = Path::new(YOUKI_ROOT).join(state_name);
+        if req.force && !state_path.exists() {
+            debug!(
+                request_id = %request_id,
+                container_id = %req.container_id,
+                "oci: forced delete is already complete"
+            );
+            return Ok(Response::new(OciDeleteResponse {}));
+        }
+
         if req.force {
-            run_youki(&["delete", "--force", &req.container_id]).await?;
+            let delete = run_youki(&["delete", "--force", &req.container_id]).await;
+            if delete.is_err() && !state_path.exists() {
+                // youki may report failure after another cleanup wins the race.
+                // Exact absence from its configured state root makes forced
+                // delete idempotently complete; transport and genuine cleanup
+                // failures retain state and continue to surface.
+                debug!(
+                    request_id = %request_id,
+                    container_id = %req.container_id,
+                    "oci: forced delete completed concurrently"
+                );
+            } else {
+                delete?;
+            }
         } else {
             run_youki(&["delete", &req.container_id]).await?;
         }

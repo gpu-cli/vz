@@ -3,6 +3,9 @@
 use std::env;
 use std::io;
 
+use super::stack_vm::{
+    activation_error_with_rollback, require_running_pid, require_successful_hosts_write,
+};
 use super::*;
 use vz_linux::KernelVersion;
 
@@ -49,6 +52,87 @@ async fn shared_vm_for_returns_none_when_stack_absent() {
     });
     assert!(runtime.shared_vm_for("never-booted").await.is_none());
     assert!(!runtime.has_shared_vm("never-booted").await);
+}
+
+#[test]
+fn running_pid_validation_rejects_stopped_state_with_stale_pid() {
+    let state = OciContainerState {
+        id: "web".to_string(),
+        status: "stopped".to_string(),
+        pid: Some(221),
+        bundle_path: None,
+    };
+
+    let error = require_running_pid("web", "exec", &state).unwrap_err();
+    assert!(matches!(
+        error,
+        OciError::InvalidConfig(ref message)
+            if message.contains("not running")
+                && message.contains("stopped")
+                && message.contains("221")
+    ));
+}
+
+#[test]
+fn hosts_write_validation_rejects_nonzero_exit() {
+    let output = ExecOutput {
+        exit_code: 1,
+        stdout: String::new(),
+        stderr: "nsenter: /proc/221/root is gone".to_string(),
+    };
+
+    let error = require_successful_hosts_write("web", &output).unwrap_err();
+    assert!(matches!(
+        error,
+        OciError::InvalidConfig(ref message)
+            if message.contains("/etc/hosts write failed")
+                && message.contains("exit code 1")
+                && message.contains("/proc/221/root")
+    ));
+}
+
+#[test]
+fn activation_failure_reports_rollback_failure_without_losing_primary_error() {
+    let error = activation_error_with_rollback(
+        OciError::InvalidConfig("post-start liveness failed".to_string()),
+        Err(OciError::InvalidConfig(
+            "OCI delete failed; tracking retained".to_string(),
+        )),
+    );
+
+    let message = error.to_string();
+    assert!(message.contains("post-start liveness failed"));
+    assert!(message.contains("OCI delete failed; tracking retained"));
+}
+
+#[tokio::test]
+async fn activation_locks_serialize_one_stack_but_not_distinct_stacks() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("activation-locks"),
+        ..RuntimeConfig::default()
+    });
+    let same_a = runtime.stack_activation_lock("stack-a").await;
+    let same_a_again = runtime.stack_activation_lock("stack-a").await;
+    let stack_b = runtime.stack_activation_lock("stack-b").await;
+    assert!(Arc::ptr_eq(&same_a, &same_a_again));
+    assert!(!Arc::ptr_eq(&same_a, &stack_b));
+
+    let first_guard = same_a.lock().await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let waiter = tokio::spawn(async move {
+        let _guard = same_a_again.lock().await;
+        let _ = entered_tx.send(());
+    });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished(), "same-stack activation must wait");
+
+    // A different stack lock remains independently acquirable while stack-a
+    // is held.
+    let stack_b_guard = stack_b.try_lock().expect("distinct stack must not wait");
+    drop(stack_b_guard);
+    drop(first_guard);
+    entered_rx.await.unwrap();
+    waiter.await.unwrap();
 }
 
 #[test]

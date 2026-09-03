@@ -21,6 +21,8 @@ pub struct MockContainerRuntime {
     pub fail_stop: bool,
     /// Whether remove should fail.
     pub fail_remove: bool,
+    /// Whether remove should report the container as already absent.
+    pub remove_not_found: bool,
     /// Exit code to return from exec calls.
     pub exec_exit_code: i32,
     /// Whether exec should fail with an error (not just non-zero exit).
@@ -52,6 +54,7 @@ impl MockContainerRuntime {
             fail_create: false,
             fail_stop: false,
             fail_remove: false,
+            remove_not_found: false,
             exec_exit_code: 0,
             fail_exec: false,
             exec_delay: None,
@@ -146,6 +149,11 @@ impl ContainerRuntime for MockContainerRuntime {
             .lock()
             .unwrap()
             .push(("remove".to_string(), container_id.to_string()));
+        if self.remove_not_found {
+            return Err(StackError::Network(format!(
+                "container '{container_id}' not found"
+            )));
+        }
         if self.fail_remove {
             return Err(StackError::InvalidSpec("mock remove failure".to_string()));
         }

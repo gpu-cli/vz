@@ -33,9 +33,9 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::net::Ipv4Addr;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -394,43 +394,88 @@ fn find_veth_peer(host_name: &str) -> io::Result<String> {
 /// Move a network interface into a named network namespace.
 ///
 /// Uses `ip link set <dev> netns <pid>` by forking a child process
-/// that enters the target namespace and sleeps briefly while the
-/// parent moves the interface using the child's PID.
+/// that enters the target namespace and waits while the parent moves
+/// the interface using the child's PID.
 fn move_link_to_netns(dev: &str, ns_path: &str) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-
     let ns_file = fs::File::open(ns_path)?;
     let ns_fd = ns_file.as_raw_fd();
+    let mut ready_pipe = [0; 2];
+    if unsafe { libc::pipe2(ready_pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
 
-    // Fork a child that enters the target namespace and sleeps.
-    // The parent uses the child's PID with `ip link set ... netns <pid>`.
+    // Fork a child that enters the target namespace and signals readiness.
+    // Waiting for that byte is essential: without it, the parent can invoke BusyBox ip
+    // before the child completes setns(), producing a successful no-op move
+    // into the root namespace and an irrecoverable in-namespace rename failure.
     unsafe {
         let pid = libc::fork();
         if pid < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            libc::close(ready_pipe[0]);
+            libc::close(ready_pipe[1]);
+            return Err(error);
         }
 
         if pid == 0 {
-            // Child: enter target namespace and sleep.
+            libc::close(ready_pipe[0]);
             if libc::setns(ns_fd, libc::CLONE_NEWNET) != 0 {
                 libc::_exit(1);
             }
-            // Sleep long enough for parent to move the interface.
-            libc::sleep(5);
-            libc::_exit(0);
+            let ready = [1_u8];
+            loop {
+                let written = libc::write(ready_pipe[1], ready.as_ptr().cast(), ready.len());
+                if written == 1 {
+                    break;
+                }
+                if written < 0 && *libc::__errno_location() == libc::EINTR {
+                    continue;
+                }
+                libc::_exit(2);
+            }
+            libc::close(ready_pipe[1]);
+            libc::alarm(30);
+            loop {
+                libc::pause();
+            }
         }
 
-        // Parent: use child's PID to move the interface.
+        libc::close(ready_pipe[1]);
+        let mut ready_reader = fs::File::from_raw_fd(ready_pipe[0]);
+        if let Err(error) = wait_for_namespace_holder_ready(&mut ready_reader) {
+            libc::kill(pid, libc::SIGKILL);
+            let mut status: libc::c_int = 0;
+            libc::waitpid(pid, &mut status, 0);
+            return Err(io::Error::new(
+                error.kind(),
+                format!("namespace holder for {ns_path} failed before handoff: {error}"),
+            ));
+        }
+
+        // The child has completed setns, so its PID now names the intended
+        // target namespace for the BusyBox ip handoff.
         let pid_str = pid.to_string();
         let result = ip_run(&["link", "set", dev, "netns", &pid_str]);
 
-        // Kill the sleeping child and reap it.
+        // Kill the waiting child and reap it.
         libc::kill(pid, libc::SIGKILL);
         let mut status: libc::c_int = 0;
         libc::waitpid(pid, &mut status, 0);
 
         result
     }
+}
+
+fn wait_for_namespace_holder_ready(reader: &mut impl Read) -> io::Result<()> {
+    let mut ready = [0_u8; 1];
+    reader.read_exact(&mut ready)?;
+    if ready[0] != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected namespace readiness byte {}", ready[0]),
+        ));
+    }
+    Ok(())
 }
 
 // ── Command-based network operations ───────────────────────────────
@@ -597,5 +642,16 @@ mod tests {
     fn transient_link_rename_error_detection_rejects_unrelated_messages() {
         let err = io::Error::other("permission denied");
         assert!(!is_transient_link_rename_error(&err));
+    }
+
+    #[test]
+    fn namespace_holder_readiness_requires_success_byte() {
+        wait_for_namespace_holder_ready(&mut &b"\x01"[..]).unwrap();
+
+        let unexpected = wait_for_namespace_holder_ready(&mut &b"\x02"[..]).unwrap_err();
+        assert_eq!(unexpected.kind(), io::ErrorKind::InvalidData);
+
+        let missing = wait_for_namespace_holder_ready(&mut &b""[..]).unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

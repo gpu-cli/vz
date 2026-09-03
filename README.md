@@ -179,40 +179,17 @@ Host-facing port publishing is explicit opt-in via Compose host bindings
 
 #### Reaching macOS host services from inside a container
 
-> **Legacy 0.3 behavior—not the 0.4 contract.** The unconditional alias and
-> wildcard-listener guidance below describe the currently shipped stack
-> mechanism. 0.4 replaces it with an explicit Environment/Machine-owned import
-> to one host-loopback protocol/port over a private authenticated relay. Host
-> imports remain independent from Internet egress and do not expose the LAN.
+Developer Environments do not expose the macOS host through an unconditional
+gateway alias. In particular, an undeclared Machine must not receive
+`host.vz.internal` in `/etc/hosts`, and external egress does not authorize host
+access.
 
-Every stack-managed container resolves the hostname **`host.vz.internal`**
-to the macOS host's NAT gateway IP (`192.168.64.1`). This is the Docker
-Desktop equivalent of `host.docker.internal` and is injected automatically
-into each container's `/etc/hosts`.
-
-```bash
-# Inside a sandboxed container:
-curl http://host.vz.internal:18080/   # intended path; currently times out
-```
-
-**Historical caveat:** the v0.3 design cannot reach services listening only on
-`127.0.0.1`; it expected a service on `0.0.0.0` or `192.168.64.1`. That can
-expose the service to the physical LAN and is not recommended as a security
-boundary. The address is hardcoded because Virtualization.framework provides no
-API to query Apple's NAT gateway—see
-`vz_runtime_contract::HOST_INTERNAL_GATEWAY_IPV4`. The 0.4 declared relay removes
-both assumptions.
-
-**Known limitation — netns reachability is pending.** Today
-`host.vz.internal` always resolves to `192.168.64.1` inside the container
-(`/etc/hosts` is injected by `vz-stack`), but stack-managed containers run
-in per-service network namespaces inside the guest VM, and the guest does
-not yet program `MASQUERADE` / `net.ipv4.ip_forward` from the bridge
-subnet out to `eth0`. Packets reach the bridge gateway but are dropped on
-their way out of the netns. The guest kernel already has
-`CONFIG_NF_NAT` / `CONFIG_NF_TABLES` compiled in; the gap is that the
-initramfs does not ship `iptables` or `nft`. Resolution is tracked as a
-follow-up bead.
+The 0.4 design requires an explicit Environment/Machine-owned host import for
+one host-loopback protocol and port, carried over a private authenticated relay.
+That relay is still under development; do not bind a host service to a wildcard
+or LAN address as a substitute. See
+[`docs/developer-environments.md`](docs/developer-environments.md) for the
+normative network contract.
 
 ### 3. Manage macOS VMs (macOS only)
 

@@ -129,6 +129,7 @@ struct InteractiveExecSession {
 }
 
 type ContainerExecEnvMap = HashMap<String, Vec<(String, String)>>;
+type StackActivationLockMap = HashMap<String, Arc<Mutex<()>>>;
 
 /// Unified runtime entrypoint.
 #[derive(Clone)]
@@ -145,6 +146,13 @@ pub struct Runtime {
     /// points to the same [`LinuxVm`] instance stored here. Individual
     /// container stop/remove should not tear down the shared VM.
     stack_vms: Arc<Mutex<HashMap<String, Arc<LinuxVm>>>>,
+    /// Serializes the guest-critical OCI activation transaction per stack.
+    ///
+    /// Image/rootfs preparation remains parallel, and distinct stacks use
+    /// distinct locks. The lock only covers create, start, post-start setup,
+    /// and final liveness validation because the bundled youki runtime has
+    /// exhibited stale init state when those transactions interleave.
+    stack_activation_locks: Arc<Mutex<StackActivationLockMap>>,
     /// Maps container IDs to the stack they belong to (if any).
     ///
     /// Used to determine whether a container's VM is shared and should
@@ -207,6 +215,7 @@ impl Runtime {
             puller,
             vm_handles: Arc::new(Mutex::new(HashMap::new())),
             stack_vms: Arc::new(Mutex::new(HashMap::new())),
+            stack_activation_locks: Arc::new(Mutex::new(HashMap::new())),
             container_stack: Arc::new(Mutex::new(HashMap::new())),
             port_forwards: Arc::new(Mutex::new(HashMap::new())),
             stack_port_forwards: Arc::new(Mutex::new(HashMap::new())),
@@ -283,7 +292,7 @@ impl Runtime {
         self.container_store.load_all().map_err(OciError::from)
     }
 
-    /// Remove container metadata and best-effort rootfs artifacts.
+    /// Remove container metadata and rootfs artifacts.
     ///
     /// If a VM handle is still active for this container, sends an OCI delete
     /// to the guest runtime before cleaning up host metadata.
@@ -310,39 +319,38 @@ impl Runtime {
             pf.shutdown().await;
         }
         self.stop_log_rotation_task(id).await;
-        self.container_exec_env.lock().await.remove(id);
-
-        // Best-effort OCI delete via guest runtime if VM is still up.
+        // Delete OCI state via the guest runtime if its VM is still up. Keep
+        // recovery routing, metadata, and rootfs intact if deletion fails so a
+        // later explicit remove or stack shutdown can safely retry.
         // Try the per-container handle first; fall back to the shared stack VM
         // (the per-container handle may have been removed by stop_container).
-        let vm = self.vm_handles.lock().await.remove(id);
-        let stack_id = self.container_stack.lock().await.remove(id);
+        let vm = self.vm_handles.lock().await.get(id).cloned();
+        let stack_id = self.container_stack.lock().await.get(id).cloned();
         if let Some(vm) = vm {
-            match vm.oci_delete(id.to_string(), true).await {
-                Ok(_) => {
-                    tracing::debug!(container_id = %id, "remove_container: oci_delete via vm_handle succeeded")
-                }
-                Err(e) => {
-                    tracing::warn!(container_id = %id, error = %e, "remove_container: oci_delete via vm_handle failed")
-                }
-            }
+            vm.oci_delete(id.to_string(), true).await.map_err(|error| {
+                OciError::InvalidConfig(format!(
+                    "cannot remove container '{id}': OCI delete failed; retained metadata, recovery routing, and rootfs for retry: {error}"
+                ))
+            })?;
+            tracing::debug!(container_id = %id, "remove_container: oci_delete via vm_handle succeeded");
         } else if let Some(sid) = &stack_id {
             if let Some(vm) = self.stack_vms.lock().await.get(sid) {
-                match vm.oci_delete(id.to_string(), true).await {
-                    Ok(_) => {
-                        tracing::debug!(container_id = %id, stack_id = %sid, "remove_container: oci_delete via stack_vm succeeded")
-                    }
-                    Err(e) => {
-                        tracing::warn!(container_id = %id, stack_id = %sid, error = %e, "remove_container: oci_delete via stack_vm failed")
-                    }
-                }
+                vm.oci_delete(id.to_string(), true).await.map_err(|error| {
+                    OciError::InvalidConfig(format!(
+                        "cannot remove container '{id}' from stack '{sid}': OCI delete failed; retained metadata, recovery routing, and rootfs for retry: {error}"
+                    ))
+                })?;
+                tracing::debug!(container_id = %id, stack_id = %sid, "remove_container: oci_delete via stack_vm succeeded");
             } else {
                 tracing::warn!(container_id = %id, stack_id = %sid, "remove_container: stack_vm not found");
             }
         } else {
             tracing::debug!(container_id = %id, "remove_container: no vm_handle or stack_id, skipping oci_delete");
         }
+        self.vm_handles.lock().await.remove(id);
+        self.container_stack.lock().await.remove(id);
         self.active_lifecycle.lock().await.remove(id);
+        self.container_exec_env.lock().await.remove(id);
 
         self.container_store.remove(id).map_err(OciError::from)?;
 
@@ -406,12 +414,16 @@ impl Runtime {
         self.container_exec_env.lock().await.remove(id);
 
         // Best-effort OCI delete.
-        match vm.oci_delete(id.to_string(), true).await {
-            Ok(_) => tracing::debug!(container_id = %id, "stop_container: oci_delete succeeded"),
-            Err(e) => {
-                tracing::warn!(container_id = %id, error = %e, "stop_container: oci_delete failed (best-effort)")
+        let delete_succeeded = match vm.oci_delete(id.to_string(), true).await {
+            Ok(_) => {
+                tracing::debug!(container_id = %id, "stop_container: oci_delete succeeded");
+                true
             }
-        }
+            Err(e) => {
+                tracing::warn!(container_id = %id, error = %e, "stop_container: oci_delete failed; retaining stack routing for remove retry");
+                false
+            }
+        };
 
         // Only tear down the VM if the container does NOT belong to a shared stack VM.
         let is_stack_container = self.container_stack.lock().await.contains_key(id);
@@ -419,8 +431,11 @@ impl Runtime {
             let _ = vm.stop().await;
         }
         self.vm_handles.lock().await.remove(id);
-        // Keep container_stack entry so remove_container can find the stack VM
-        // for a retry oci_delete if the best-effort delete above failed.
+        if delete_succeeded {
+            // Avoid issuing a duplicate delete from remove_container. On
+            // failure, retain the stack route so remove can retry safely.
+            self.container_stack.lock().await.remove(id);
+        }
 
         // Shut down port forwarding for this container.
         if let Some(pf) = self.port_forwards.lock().await.remove(id) {

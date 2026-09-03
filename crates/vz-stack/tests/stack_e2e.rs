@@ -92,6 +92,15 @@ impl OciContainerRuntime {
     /// Exec with full stdout/stderr capture (bypasses ContainerRuntime trait).
     /// Returns `(exit_code, stdout, stderr)`.
     fn exec_with_output(&self, container_id: &str, cmd: Vec<String>) -> (i32, String, String) {
+        self.try_exec_with_output(container_id, cmd)
+            .unwrap_or_else(|error| panic!("exec in container '{container_id}' failed: {error}"))
+    }
+
+    fn try_exec_with_output(
+        &self,
+        container_id: &str,
+        cmd: Vec<String>,
+    ) -> Result<(i32, String, String), String> {
         tokio::task::block_in_place(|| {
             let out = self
                 .handle
@@ -103,8 +112,8 @@ impl OciContainerRuntime {
                         ..ExecConfig::default()
                     },
                 ))
-                .unwrap();
-            (out.exit_code, out.stdout, out.stderr)
+                .map_err(|error| error.to_string())?;
+            Ok((out.exit_code, out.stdout, out.stderr))
         })
     }
 
@@ -3019,6 +3028,38 @@ networks:
     };
     let web_cid = cid_of("web");
     let api_cid = cid_of("api");
+    let db_cid = cid_of("db");
+
+    let assert_all_services_alive = |phase: &str| {
+        for (service, container_id) in [
+            ("web", web_cid.as_str()),
+            ("api", api_cid.as_str()),
+            ("db", db_cid.as_str()),
+        ] {
+            let result = orchestrator.executor().runtime().try_exec_with_output(
+                container_id,
+                vec![
+                    "/bin/busybox".into(),
+                    "kill".into(),
+                    "-0".into(),
+                    "1".into(),
+                ],
+            );
+            let (exit_code, stdout, stderr) = result.unwrap_or_else(|error| {
+                panic!(
+                    "{service} must remain alive during {phase}: container={container_id}, error={error}"
+                )
+            });
+            assert_eq!(
+                exit_code, 0,
+                "{service} must remain alive during {phase}: container={container_id}, stdout={stdout}, stderr={stderr}"
+            );
+        }
+    };
+
+    assert_all_services_alive("immediate post-convergence validation");
+    std::thread::sleep(Duration::from_millis(250));
+    assert_all_services_alive("delayed post-convergence validation");
 
     // web → api should succeed (both on frontend network).
     let (exit_code, stdout, stderr) = orchestrator.executor().runtime().exec_with_output(
