@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -19,7 +20,7 @@ const BUILDKIT_PLATFORM: &str = "linux/arm64";
 const BUILDKIT_SOURCE_COMMIT: &str = "3637d1b15a13fc3cdd0c16fcf3be0845ae68f53d";
 const BUILDKIT_ARTIFACT_RELEASE_TAG: &str = "v0.3.21";
 const BUILDKIT_ARCHIVE_SHA256_LINUX_ARM64: &str =
-    "a611138d4675290f96b83b440156b16224626bd6b3fea55cba9c7f3ea2e06c09";
+    "5737e6c1f51f21024c6eca1b05814d36aeaa48d393b1beaa3871f22efac659c7";
 const MAX_ARCHIVE_BYTES: u64 = 160 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 96 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024;
@@ -40,11 +41,11 @@ const REQUIRED_ARCHIVE_ENTRIES: [&str; 3] = ["manifest.json", "bin/buildctl", "b
 const PINNED_BINARY_DIGESTS: [(&str, &str); 2] = [
     (
         BUILDCTL_BINARY,
-        "725c7416fc7212805d301194df723939fc9e51f84157d7bcfba6fd2f1ee319c9",
+        "0b1ba4b978096333973a36e346e091c2242eff443376ee6fea462bcd4f43ee35",
     ),
     (
         BUILDKITD_BINARY,
-        "38f1e204552fb19f661eb1da18f537fd2d4d5d790d09619d379e2dd0a034ffaf",
+        "7dba4d777568504e8ec102d8e80223c5805b6de822366c0c44a7454178b6956d",
     ),
 ];
 
@@ -76,6 +77,67 @@ pub struct BuildkitVersionMetadata {
     pub downloaded_at: u64,
     pub archive_sha256: String,
     pub binaries: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BuildkitArchiveSource {
+    Published,
+    Local { path: PathBuf, sha256: String },
+}
+
+impl BuildkitArchiveSource {
+    fn from_environment() -> Result<Self, BuildkitError> {
+        Self::from_values(
+            std::env::var_os(LOCAL_ARCHIVE_ENV),
+            std::env::var_os(LOCAL_ARCHIVE_SHA256_ENV),
+        )
+    }
+
+    fn from_values(
+        archive: Option<OsString>,
+        checksum: Option<OsString>,
+    ) -> Result<Self, BuildkitError> {
+        match (archive, checksum) {
+            (None, None) => Ok(Self::Published),
+            (Some(_), None) | (None, Some(_)) => Err(BuildkitError::LocalArchiveOverrideIncomplete),
+            (Some(archive), Some(checksum)) => {
+                if archive.to_string_lossy().trim().is_empty() {
+                    return Err(BuildkitError::LocalArchiveOverrideBlank {
+                        variable: LOCAL_ARCHIVE_ENV,
+                    });
+                }
+                let checksum = checksum
+                    .into_string()
+                    .map_err(|_| BuildkitError::InvalidLocalArchiveChecksum)?;
+                if checksum.trim().is_empty() {
+                    return Err(BuildkitError::LocalArchiveOverrideBlank {
+                        variable: LOCAL_ARCHIVE_SHA256_ENV,
+                    });
+                }
+                let checksum = normalize_sha256(&checksum)?;
+                if checksum != BUILDKIT_ARCHIVE_SHA256_LINUX_ARM64 {
+                    return Err(BuildkitError::UnpinnedLocalArchiveChecksum {
+                        expected: BUILDKIT_ARCHIVE_SHA256_LINUX_ARM64.to_string(),
+                        found: checksum,
+                    });
+                }
+
+                let path = PathBuf::from(archive);
+                validate_local_archive_path(&path)?;
+                Ok(Self::Local {
+                    path,
+                    sha256: checksum,
+                })
+            }
+        }
+    }
+
+    fn expected_sha256(&self) -> &str {
+        match self {
+            Self::Published => BUILDKIT_ARCHIVE_SHA256_LINUX_ARM64,
+            Self::Local { sha256, .. } => sha256,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,8 +172,16 @@ pub enum BuildkitError {
     DownloadStatus { url: String, status: u16 },
     #[error("BuildKit archive exceeds the {limit_bytes}-byte size limit")]
     ArchiveTooLarge { limit_bytes: u64 },
-    #[error("{LOCAL_ARCHIVE_SHA256_ENV} must be set when {LOCAL_ARCHIVE_ENV} is used")]
-    LocalArchiveChecksumRequired,
+    #[error("{LOCAL_ARCHIVE_ENV} and {LOCAL_ARCHIVE_SHA256_ENV} must be set together")]
+    LocalArchiveOverrideIncomplete,
+    #[error("{variable} must not be blank")]
+    LocalArchiveOverrideBlank { variable: &'static str },
+    #[error("{LOCAL_ARCHIVE_SHA256_ENV} must be exactly 64 hexadecimal characters")]
+    InvalidLocalArchiveChecksum,
+    #[error(
+        "{LOCAL_ARCHIVE_SHA256_ENV} does not match the pinned BuildKit archive checksum: expected {expected}, found {found}"
+    )]
+    UnpinnedLocalArchiveChecksum { expected: String, found: String },
     #[error("BuildKit archive checksum mismatch: expected {expected}, found {found}")]
     ArchiveChecksumMismatch { expected: String, found: String },
     #[error("BuildKit archive missing required entry: {entry}")]
@@ -160,7 +230,19 @@ pub fn ensure_buildkit_artifacts() -> Result<BuildkitArtifacts, BuildkitError> {
 pub fn ensure_buildkit_artifacts_in_dir(
     buildkit_dir: &Path,
 ) -> Result<BuildkitArtifacts, BuildkitError> {
-    let expected_archive_sha256 = expected_archive_sha256()?;
+    // Resolve and validate the explicit override before creating or recovering
+    // anything in the managed install directory. A broken local candidate must
+    // fail closed and must never turn into a published-asset download.
+    let archive_source = BuildkitArchiveSource::from_environment()?;
+    let expected_archive_sha256 = archive_source.expected_sha256().to_string();
+    let local_archive_bytes = match &archive_source {
+        BuildkitArchiveSource::Published => None,
+        BuildkitArchiveSource::Local { .. } => {
+            let bytes = load_archive_bytes(&archive_source)?;
+            verify_archive_checksum(&bytes, &expected_archive_sha256)?;
+            Some(bytes)
+        }
+    };
     create_private_dir(buildkit_dir)?;
     let _install_lock = InstallLock::acquire(buildkit_dir, INSTALL_LOCK_TIMEOUT)?;
     recover_stale_install_generations(buildkit_dir)?;
@@ -172,7 +254,10 @@ pub fn ensure_buildkit_artifacts_in_dir(
         discard_stale_rollback_generations(buildkit_dir)?;
         return Ok(existing);
     }
-    let archive_bytes = load_archive_bytes()?;
+    let archive_bytes = match local_archive_bytes {
+        Some(bytes) => bytes,
+        None => load_archive_bytes(&archive_source)?,
+    };
     let installed = install_archive(
         buildkit_dir,
         &archive_bytes,
@@ -183,22 +268,36 @@ pub fn ensure_buildkit_artifacts_in_dir(
     Ok(installed)
 }
 
-fn expected_archive_sha256() -> Result<String, BuildkitError> {
-    if std::env::var_os(LOCAL_ARCHIVE_ENV).is_some() {
-        return std::env::var(LOCAL_ARCHIVE_SHA256_ENV)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| value.trim().to_ascii_lowercase())
-            .ok_or(BuildkitError::LocalArchiveChecksumRequired);
-    }
-    Ok(BUILDKIT_ARCHIVE_SHA256_LINUX_ARM64.to_string())
-}
-
-fn load_archive_bytes() -> Result<Vec<u8>, BuildkitError> {
-    if let Some(path) = std::env::var_os(LOCAL_ARCHIVE_ENV) {
-        return read_local_archive(Path::new(&path));
+fn load_archive_bytes(source: &BuildkitArchiveSource) -> Result<Vec<u8>, BuildkitError> {
+    if let BuildkitArchiveSource::Local { path, .. } = source {
+        return read_local_archive(path);
     }
     download_archive_bytes(&buildkit_archive_url())
+}
+
+fn normalize_sha256(value: &str) -> Result<String, BuildkitError> {
+    let value = value.trim();
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(BuildkitError::InvalidLocalArchiveChecksum);
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn validate_local_archive_path(path: &Path) -> Result<(), BuildkitError> {
+    if !path.is_absolute() {
+        return Err(BuildkitError::UnsafePath {
+            path: path.display().to_string(),
+            reason: "local archive path must be absolute".to_string(),
+        });
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(BuildkitError::UnsafePath {
+            path: path.display().to_string(),
+            reason: "local archive must be a regular non-symlink file".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn install_archive(
@@ -888,6 +987,30 @@ mod tests {
 
     use tempfile::tempdir;
 
+    #[test]
+    fn compiled_pins_match_the_checked_in_artifact_contract() {
+        let contract: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../config/buildkit-artifact-v0.19.0.json"
+        ))
+        .unwrap();
+
+        assert_eq!(contract["buildkit_version"], BUILDKIT_VERSION);
+        assert_eq!(contract["layout"], BUILDKIT_ARTIFACT_LAYOUT);
+        assert_eq!(contract["platform"], BUILDKIT_PLATFORM);
+        assert_eq!(contract["source_commit"], BUILDKIT_SOURCE_COMMIT);
+        assert_eq!(
+            contract["archive_sha256"],
+            BUILDKIT_ARCHIVE_SHA256_LINUX_ARM64
+        );
+        for (binary, digest) in PINNED_BINARY_DIGESTS {
+            assert_eq!(contract[format!("{binary}_sha256")], digest);
+        }
+        assert_eq!(
+            contract["inventory"],
+            serde_json::json!(REQUIRED_ARCHIVE_ENTRIES)
+        );
+    }
+
     use super::*;
 
     const LOCAL_OVERRIDE_CHILD_ENV: &str = "VZ_TEST_BUILDKIT_LOCAL_OVERRIDE_CHILD";
@@ -1234,7 +1357,127 @@ mod tests {
     }
 
     #[test]
-    fn explicit_directory_provider_honors_local_bundle_override() {
+    fn local_override_requires_exactly_two_values() {
+        assert_eq!(
+            BuildkitArchiveSource::from_values(None, None).unwrap(),
+            BuildkitArchiveSource::Published
+        );
+        assert!(matches!(
+            BuildkitArchiveSource::from_values(Some(OsString::from("/archive.tar")), None),
+            Err(BuildkitError::LocalArchiveOverrideIncomplete)
+        ));
+        assert!(matches!(
+            BuildkitArchiveSource::from_values(
+                None,
+                Some(OsString::from(BUILDKIT_ARCHIVE_SHA256_LINUX_ARM64))
+            ),
+            Err(BuildkitError::LocalArchiveOverrideIncomplete)
+        ));
+
+        let temp = tempdir().unwrap();
+        let archive_path = temp.path().join("runtime-free.tar");
+        std::fs::write(&archive_path, b"candidate").unwrap();
+        let source = BuildkitArchiveSource::from_values(
+            Some(archive_path.clone().into_os_string()),
+            Some(OsString::from(
+                BUILDKIT_ARCHIVE_SHA256_LINUX_ARM64.to_ascii_uppercase(),
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            source,
+            BuildkitArchiveSource::Local {
+                path: archive_path,
+                sha256: BUILDKIT_ARCHIVE_SHA256_LINUX_ARM64.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn local_override_rejects_blank_values() {
+        let temp = tempdir().unwrap();
+        let archive_path = temp.path().join("runtime-free.tar");
+        std::fs::write(&archive_path, b"candidate").unwrap();
+
+        assert!(matches!(
+            BuildkitArchiveSource::from_values(
+                Some(OsString::from(" \t ")),
+                Some(OsString::from(BUILDKIT_ARCHIVE_SHA256_LINUX_ARM64))
+            ),
+            Err(BuildkitError::LocalArchiveOverrideBlank {
+                variable: LOCAL_ARCHIVE_ENV
+            })
+        ));
+        assert!(matches!(
+            BuildkitArchiveSource::from_values(
+                Some(archive_path.into_os_string()),
+                Some(OsString::from(" \n "))
+            ),
+            Err(BuildkitError::LocalArchiveOverrideBlank {
+                variable: LOCAL_ARCHIVE_SHA256_ENV
+            })
+        ));
+    }
+
+    #[test]
+    fn local_override_rejects_malformed_and_unpinned_checksums() {
+        let temp = tempdir().unwrap();
+        let archive_path = temp.path().join("runtime-free.tar");
+        std::fs::write(&archive_path, b"candidate").unwrap();
+
+        for checksum in ["00".to_string(), "g".repeat(64), "0".repeat(63)] {
+            assert!(matches!(
+                BuildkitArchiveSource::from_values(
+                    Some(archive_path.clone().into_os_string()),
+                    Some(OsString::from(&checksum))
+                ),
+                Err(BuildkitError::InvalidLocalArchiveChecksum)
+            ));
+        }
+        assert!(matches!(
+            BuildkitArchiveSource::from_values(
+                Some(archive_path.into_os_string()),
+                Some(OsString::from("0".repeat(64)))
+            ),
+            Err(BuildkitError::UnpinnedLocalArchiveChecksum { .. })
+        ));
+    }
+
+    #[test]
+    fn local_override_rejects_relative_archive_path() {
+        assert!(matches!(
+            BuildkitArchiveSource::from_values(
+                Some(OsString::from("runtime-free.tar")),
+                Some(OsString::from(BUILDKIT_ARCHIVE_SHA256_LINUX_ARM64))
+            ),
+            Err(BuildkitError::UnsafePath { reason, .. })
+                if reason == "local archive path must be absolute"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_override_rejects_symlink_archive_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let archive_path = temp.path().join("runtime-free.tar");
+        let symlink_path = temp.path().join("runtime-free-link.tar");
+        std::fs::write(&archive_path, b"candidate").unwrap();
+        symlink(&archive_path, &symlink_path).unwrap();
+
+        assert!(matches!(
+            BuildkitArchiveSource::from_values(
+                Some(symlink_path.into_os_string()),
+                Some(OsString::from(BUILDKIT_ARCHIVE_SHA256_LINUX_ARM64))
+            ),
+            Err(BuildkitError::UnsafePath { reason, .. })
+                if reason == "local archive must be a regular non-symlink file"
+        ));
+    }
+
+    #[test]
+    fn explicit_local_checksum_failure_does_not_mutate_install_or_fallback() {
         if let Some(install_dir) = std::env::var_os(LOCAL_OVERRIDE_CHILD_ENV) {
             let install_dir = PathBuf::from(install_dir);
             let result = ensure_buildkit_artifacts_in_dir(&install_dir);
@@ -1242,7 +1485,7 @@ mod tests {
                 result,
                 Err(BuildkitError::ArchiveChecksumMismatch { .. })
             ));
-            assert!(install_dir.is_dir());
+            assert!(!install_dir.exists());
             return;
         }
 
@@ -1253,10 +1496,13 @@ mod tests {
 
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
-            .arg("buildkit::artifacts::tests::explicit_directory_provider_honors_local_bundle_override")
+            .arg("buildkit::artifacts::tests::explicit_local_checksum_failure_does_not_mutate_install_or_fallback")
             .env(LOCAL_OVERRIDE_CHILD_ENV, &install_dir)
             .env(LOCAL_ARCHIVE_ENV, &archive_path)
-            .env(LOCAL_ARCHIVE_SHA256_ENV, "00")
+            .env(
+                LOCAL_ARCHIVE_SHA256_ENV,
+                BUILDKIT_ARCHIVE_SHA256_LINUX_ARM64,
+            )
             .status()
             .unwrap();
 

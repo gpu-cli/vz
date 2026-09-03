@@ -55,6 +55,10 @@ Environment:
   VZ_SKIP_KERNEL_CHECK=1      Skip ~/.vz/linux preflight check
   VZ_E2E_GUEST_AGENT_BUILD_TOOL=<tool>
                               Linux guest-agent build tool (default: zigbuild)
+  VZ_BUILDKIT_ARTIFACT_ARCHIVE=<absolute-path>
+  VZ_BUILDKIT_ARTIFACT_SHA256=<64-hex-digest>
+                              Optional paired operator override for BuildKit.
+                              When neither is set, the pinned candidate is built.
 USAGE
 }
 
@@ -309,6 +313,70 @@ if [[ ${#RESOLVED_SUITES[@]} -eq 0 ]]; then
     err "no suites selected"
 fi
 
+BUILDKIT_SELECTED=false
+for selected_suite in "${RESOLVED_SUITES[@]}"; do
+    if [[ "$selected_suite" == "buildkit" ]]; then
+        BUILDKIT_SELECTED=true
+        break
+    fi
+done
+
+BUILDKIT_ARTIFACT_SOURCE_MODE="not-selected"
+BUILDKIT_BUILDER_INVOCATIONS=0
+BUILDKIT_OPERATOR_ARCHIVE=""
+BUILDKIT_EXPECTED_SHA256="none"
+BUILDKIT_RELEASE_GATE_QUALIFIED="not-applicable"
+
+# Validate the paired operator override before any guest rebuild, Cargo build,
+# or VM startup. Runtime/stack-only runs intentionally ignore these variables.
+if [[ "$BUILDKIT_SELECTED" == "true" ]]; then
+    buildkit_archive_is_set=false
+    buildkit_sha_is_set=false
+    if [[ "${VZ_BUILDKIT_ARTIFACT_ARCHIVE+x}" == "x" ]]; then
+        buildkit_archive_is_set=true
+    fi
+    if [[ "${VZ_BUILDKIT_ARTIFACT_SHA256+x}" == "x" ]]; then
+        buildkit_sha_is_set=true
+    fi
+
+    if [[ "$buildkit_archive_is_set" == "false" && "$buildkit_sha_is_set" == "false" ]]; then
+        BUILDKIT_ARTIFACT_SOURCE_MODE="candidate-build"
+    elif [[ "$buildkit_archive_is_set" == "true" && "$buildkit_sha_is_set" == "true" ]]; then
+        if [[ ! "${VZ_BUILDKIT_ARTIFACT_ARCHIVE:-}" =~ [^[:space:]] ]]; then
+            err "VZ_BUILDKIT_ARTIFACT_ARCHIVE must not be blank"
+        fi
+        if [[ "$VZ_BUILDKIT_ARTIFACT_ARCHIVE" != /* ]]; then
+            err "VZ_BUILDKIT_ARTIFACT_ARCHIVE must be an absolute path"
+        fi
+        if [[ ! "${VZ_BUILDKIT_ARTIFACT_SHA256:-}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            err "VZ_BUILDKIT_ARTIFACT_SHA256 must be exactly 64 hexadecimal characters"
+        fi
+        if [[ -L "$VZ_BUILDKIT_ARTIFACT_ARCHIVE" || ! -f "$VZ_BUILDKIT_ARTIFACT_ARCHIVE" ]]; then
+            err "VZ_BUILDKIT_ARTIFACT_ARCHIVE must name a regular, non-symlink file"
+        fi
+
+        BUILDKIT_OPERATOR_ARCHIVE="$(
+            cd "$(dirname "$VZ_BUILDKIT_ARTIFACT_ARCHIVE")"
+            printf '%s/%s\n' "$PWD" "$(basename "$VZ_BUILDKIT_ARTIFACT_ARCHIVE")"
+        )"
+        BUILDKIT_EXPECTED_SHA256="$(printf '%s' "$VZ_BUILDKIT_ARTIFACT_SHA256" | tr '[:upper:]' '[:lower:]')"
+        buildkit_actual_sha256="$(shasum -a 256 "$BUILDKIT_OPERATOR_ARCHIVE" | cut -d' ' -f1)"
+        if [[ "$buildkit_actual_sha256" != "$BUILDKIT_EXPECTED_SHA256" ]]; then
+            err "BuildKit operator override checksum mismatch: expected $BUILDKIT_EXPECTED_SHA256, got $buildkit_actual_sha256"
+        fi
+        BUILDKIT_ARTIFACT_SOURCE_MODE="operator-override"
+    else
+        err "VZ_BUILDKIT_ARTIFACT_ARCHIVE and VZ_BUILDKIT_ARTIFACT_SHA256 must be set together"
+    fi
+
+    if [[ "$PROFILE" == "release" ]]; then
+        if [[ "$BUILDKIT_ARTIFACT_SOURCE_MODE" != "candidate-build" ]]; then
+            err "release-profile BuildKit evidence requires the pinned candidate builder; operator overrides are debug-only"
+        fi
+        BUILDKIT_RELEASE_GATE_QUALIFIED="pending"
+    fi
+fi
+
 if [[ "$(uname -s)" != "Darwin" ]]; then
     err "VM E2E suites require macOS"
 fi
@@ -339,14 +407,160 @@ if [[ "${VZ_SKIP_KERNEL_CHECK:-0}" != "1" ]]; then
 fi
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$OUTPUT_ROOT"
+OUTPUT_ROOT="$(cd "$OUTPUT_ROOT" && pwd)"
 RUN_DIR="$OUTPUT_ROOT/$timestamp"
-mkdir -p "$RUN_DIR"
-ln -sfn "$timestamp" "$OUTPUT_ROOT/latest"
+if ! mkdir "$RUN_DIR" 2>/dev/null; then
+    RUN_DIR="$(mktemp -d "$OUTPUT_ROOT/${timestamp}.XXXXXX")"
+fi
+RUN_NAME="$(basename "$RUN_DIR")"
+ln -sfn "$RUN_NAME" "$OUTPUT_ROOT/latest"
 BUILDKIT_RUNTIME_INVENTORY_EVIDENCE="$RUN_DIR/buildkit-runtime-inventory.txt"
 CONTAINER_ID_OWNERSHIP_EVIDENCE="$RUN_DIR/container-id-ownership.json"
 CONTAINER_ID_OWNERSHIP_SHA256="$RUN_DIR/container-id-ownership.json.sha256"
 STACK_TEARDOWN_EVIDENCE="$RUN_DIR/stack-port-forwarding-teardown.json"
 STACK_TEARDOWN_SHA256="$RUN_DIR/stack-port-forwarding-teardown.json.sha256"
+
+BUILDKIT_ARCHIVE_BASENAME="vz-buildkit-v0.19.0-linux-arm64.tar"
+BUILDKIT_SHA256_BASENAME="$BUILDKIT_ARCHIVE_BASENAME.sha256"
+BUILDKIT_ARTIFACT_EVIDENCE_DIR="$RUN_DIR/buildkit-artifact"
+BUILDKIT_ARTIFACT_ARCHIVE_EVIDENCE="none"
+BUILDKIT_ARTIFACT_SHA256_EVIDENCE="none"
+BUILDKIT_ARTIFACT_MANIFEST_EVIDENCE="none"
+BUILDKIT_ARTIFACT_INVENTORY_EVIDENCE="none"
+BUILDKIT_ARTIFACT_PROVENANCE_EVIDENCE="none"
+BUILDKIT_ARTIFACT_VERIFICATION_EVIDENCE="none"
+BUILDKIT_ARTIFACT_EVIDENCE_CHECKSUMS="none"
+BUILDKIT_BUILDER_OUTPUT_CHECKSUMS="none"
+
+provision_buildkit_artifact() {
+    local builder="$REPO_ROOT/scripts/build-runtime-free-buildkit.sh"
+    local validator="$REPO_ROOT/scripts/validate-runtime-free-buildkit.sh"
+    local source_dir=""
+    local source_archive=""
+    local source_sha_file=""
+    local validation_dir="$RUN_DIR/buildkit-artifact-validation"
+    local sidecar_digest=""
+    local sidecar_name=""
+    local sidecar_extra=""
+
+    [[ -x "$validator" ]] || err "BuildKit artifact validator is not executable: $validator"
+
+    if [[ "$BUILDKIT_ARTIFACT_SOURCE_MODE" == "candidate-build" ]]; then
+        [[ -x "$builder" ]] || err "BuildKit artifact builder is not executable: $builder"
+        source_dir="$RUN_DIR/buildkit-candidate-output"
+        BUILDKIT_BUILDER_INVOCATIONS=1
+        "$builder" --output-dir "$source_dir"
+        source_archive="$source_dir/$BUILDKIT_ARCHIVE_BASENAME"
+        source_sha_file="$source_dir/$BUILDKIT_SHA256_BASENAME"
+        [[ -f "$source_archive" && ! -L "$source_archive" ]] \
+            || err "candidate builder did not produce $BUILDKIT_ARCHIVE_BASENAME"
+        [[ -f "$source_sha_file" && ! -L "$source_sha_file" ]] \
+            || err "candidate builder did not produce $BUILDKIT_SHA256_BASENAME"
+        IFS=' ' read -r sidecar_digest sidecar_name sidecar_extra < "$source_sha_file" \
+            || err "candidate BuildKit checksum sidecar must contain exactly one line"
+        if [[ "$(wc -l < "$source_sha_file" | tr -d '[:space:]')" != "1" \
+            || -n "$sidecar_extra" || "$sidecar_name" != "$BUILDKIT_ARCHIVE_BASENAME" ]]; then
+            err "candidate BuildKit checksum sidecar must contain only the digest and exact archive basename"
+        fi
+        BUILDKIT_EXPECTED_SHA256="$sidecar_digest"
+        if [[ ! "$BUILDKIT_EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            err "candidate BuildKit checksum sidecar does not contain a lowercase SHA-256 digest"
+        fi
+    else
+        source_archive="$BUILDKIT_OPERATOR_ARCHIVE"
+    fi
+
+    mkdir "$BUILDKIT_ARTIFACT_EVIDENCE_DIR"
+    BUILDKIT_ARTIFACT_ARCHIVE_EVIDENCE="$BUILDKIT_ARTIFACT_EVIDENCE_DIR/$BUILDKIT_ARCHIVE_BASENAME"
+    BUILDKIT_ARTIFACT_SHA256_EVIDENCE="$BUILDKIT_ARTIFACT_EVIDENCE_DIR/$BUILDKIT_SHA256_BASENAME"
+    cp "$source_archive" "$BUILDKIT_ARTIFACT_ARCHIVE_EVIDENCE"
+    printf '%s  %s\n' "$BUILDKIT_EXPECTED_SHA256" "$BUILDKIT_ARCHIVE_BASENAME" \
+        > "$BUILDKIT_ARTIFACT_SHA256_EVIDENCE"
+
+    # Preserve genuine builder provenance beside the immutable copy so the
+    # validator can bind it into candidate-build evidence. Operator overrides
+    # intentionally report provenance as unavailable rather than inventing it.
+    if [[ "$BUILDKIT_ARTIFACT_SOURCE_MODE" == "candidate-build" ]]; then
+        [[ -f "$source_dir/buildkit-artifact-provenance.json" ]] \
+            || err "candidate builder did not produce buildkit-artifact-provenance.json"
+        cp "$source_dir/buildkit-artifact-provenance.json" \
+            "$BUILDKIT_ARTIFACT_EVIDENCE_DIR/buildkit-artifact-provenance.json"
+    fi
+
+    chmod 0444 "$BUILDKIT_ARTIFACT_ARCHIVE_EVIDENCE" "$BUILDKIT_ARTIFACT_SHA256_EVIDENCE"
+    "$validator" \
+        --archive "$BUILDKIT_ARTIFACT_ARCHIVE_EVIDENCE" \
+        --expected-sha256 "$BUILDKIT_EXPECTED_SHA256" \
+        --output-dir "$validation_dir" \
+        --source-mode "$BUILDKIT_ARTIFACT_SOURCE_MODE"
+
+    BUILDKIT_ARTIFACT_MANIFEST_EVIDENCE="$BUILDKIT_ARTIFACT_EVIDENCE_DIR/manifest.json"
+    BUILDKIT_ARTIFACT_INVENTORY_EVIDENCE="$BUILDKIT_ARTIFACT_EVIDENCE_DIR/buildkit-artifact-inventory.txt"
+    BUILDKIT_ARTIFACT_VERIFICATION_EVIDENCE="$BUILDKIT_ARTIFACT_EVIDENCE_DIR/buildkit-artifact-verification.json"
+    for validated_name in manifest.json buildkit-artifact-inventory.txt buildkit-artifact-verification.json; do
+        [[ -s "$validation_dir/$validated_name" ]] \
+            || err "BuildKit validator did not produce $validated_name"
+        cp "$validation_dir/$validated_name" "$BUILDKIT_ARTIFACT_EVIDENCE_DIR/$validated_name"
+    done
+
+    if [[ -s "$validation_dir/buildkit-artifact-provenance.json" ]]; then
+        BUILDKIT_ARTIFACT_PROVENANCE_EVIDENCE="$BUILDKIT_ARTIFACT_EVIDENCE_DIR/buildkit-artifact-provenance.json"
+        if [[ "$BUILDKIT_ARTIFACT_SOURCE_MODE" == "candidate-build" ]] \
+            && ! cmp -s "$source_dir/buildkit-artifact-provenance.json" \
+                "$validation_dir/buildkit-artifact-provenance.json"; then
+            err "BuildKit validator provenance does not match the candidate builder output"
+        fi
+        cp "$validation_dir/buildkit-artifact-provenance.json" "$BUILDKIT_ARTIFACT_PROVENANCE_EVIDENCE"
+    elif [[ "$BUILDKIT_ARTIFACT_SOURCE_MODE" == "candidate-build" ]]; then
+        err "BuildKit validator did not retain candidate build provenance"
+    fi
+    rm -rf "$validation_dir"
+
+    BUILDKIT_ARTIFACT_EVIDENCE_CHECKSUMS="$BUILDKIT_ARTIFACT_EVIDENCE_DIR/buildkit-artifact-evidence.sha256"
+    local evidence_files=(
+        "$BUILDKIT_ARCHIVE_BASENAME"
+        "$BUILDKIT_SHA256_BASENAME"
+        "manifest.json"
+        "buildkit-artifact-inventory.txt"
+        "buildkit-artifact-verification.json"
+    )
+    if [[ "$BUILDKIT_ARTIFACT_PROVENANCE_EVIDENCE" != "none" ]]; then
+        evidence_files+=("buildkit-artifact-provenance.json")
+    fi
+    (
+        cd "$BUILDKIT_ARTIFACT_EVIDENCE_DIR"
+        shasum -a 256 "${evidence_files[@]}" > "$(basename "$BUILDKIT_ARTIFACT_EVIDENCE_CHECKSUMS")"
+        shasum -a 256 -c "$(basename "$BUILDKIT_ARTIFACT_EVIDENCE_CHECKSUMS")" >/dev/null
+    )
+    chmod 0444 "$BUILDKIT_ARTIFACT_EVIDENCE_DIR"/*
+    chmod 0555 "$BUILDKIT_ARTIFACT_EVIDENCE_DIR"
+
+    if [[ "$BUILDKIT_ARTIFACT_SOURCE_MODE" == "candidate-build" ]]; then
+        BUILDKIT_BUILDER_OUTPUT_CHECKSUMS="$source_dir/buildkit-candidate-output.sha256"
+        local builder_output_files=()
+        local builder_output_path
+        for builder_output_path in "$source_dir"/*; do
+            [[ -f "$builder_output_path" && ! -L "$builder_output_path" ]] \
+                || err "candidate builder left a non-regular output: $builder_output_path"
+            builder_output_files+=("$(basename "$builder_output_path")")
+        done
+        [[ ${#builder_output_files[@]} -gt 0 ]] || err "candidate builder retained no outputs"
+        (
+            cd "$source_dir"
+            shasum -a 256 "${builder_output_files[@]}" \
+                > "$(basename "$BUILDKIT_BUILDER_OUTPUT_CHECKSUMS")"
+            shasum -a 256 -c "$(basename "$BUILDKIT_BUILDER_OUTPUT_CHECKSUMS")" >/dev/null
+        )
+        chmod 0444 "$source_dir"/*
+        chmod 0555 "$source_dir"
+    fi
+}
+
+if [[ "$BUILDKIT_SELECTED" == "true" ]]; then
+    echo "==> provisioning BuildKit artifact ($BUILDKIT_ARTIFACT_SOURCE_MODE)"
+    provision_buildkit_artifact
+fi
 
 # The VM executes the Linux guest agent embedded in each profile's initramfs,
 # not the macOS host binary built below. Rebuild both bundles on every run so
@@ -761,6 +975,8 @@ run_and_log() {
         rm -f "$BUILDKIT_RUNTIME_INVENTORY_EVIDENCE"
         cmd_env+=("VZ_BUILDKIT_DIR=$buildkit_dir")
         cmd_env+=("VZ_BUILDKIT_RUNTIME_INVENTORY_EVIDENCE=$BUILDKIT_RUNTIME_INVENTORY_EVIDENCE")
+        cmd_env+=("VZ_BUILDKIT_ARTIFACT_ARCHIVE=$BUILDKIT_ARTIFACT_ARCHIVE_EVIDENCE")
+        cmd_env+=("VZ_BUILDKIT_ARTIFACT_SHA256=$BUILDKIT_EXPECTED_SHA256")
     fi
 
     if [[ "$suite" == "stack" || "$suite" == "runtime" ]]; then
@@ -818,6 +1034,15 @@ run_and_log() {
     if [[ $status -eq 0 ]] && grep -q "VZ_E2E_REQUIRED_SKIP:" "$log_file"; then
         echo "scenario/suite reported a required skip despite a successful exit ($label/$suite)" >&2
         return 88
+    fi
+
+    if [[ $status -eq 0 && "$PROFILE" == "release" \
+        && "$suite" == "buildkit" && "$label" == "buildkit" ]] \
+        && ! grep -Fqx \
+            "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished" \
+            <(sed -E 's/; finished in .*/; finished/' "$log_file"); then
+        echo "complete BuildKit suite did not report exactly 3/3 passing tests with zero ignored or filtered tests" >&2
+        return 96
     fi
 
     if [[ $status -eq 0 ]] && [[ "$suite" == "stack" ]] \
@@ -897,6 +1122,18 @@ echo "==> output directory: $RUN_DIR"
     echo "guest_agent_build_tool=$GUEST_AGENT_BUILD_TOOL"
     echo "developer_initramfs_sha256=$DEVELOPER_INITRAMFS_SHA256"
     echo "container_initramfs_sha256=$CONTAINER_INITRAMFS_SHA256"
+    echo "buildkit_artifact_source_mode=$BUILDKIT_ARTIFACT_SOURCE_MODE"
+    echo "buildkit_builder_invocations=$BUILDKIT_BUILDER_INVOCATIONS"
+    echo "buildkit_release_gate_qualified=$BUILDKIT_RELEASE_GATE_QUALIFIED"
+    echo "buildkit_artifact_archive=$BUILDKIT_ARTIFACT_ARCHIVE_EVIDENCE"
+    echo "buildkit_artifact_sha256=$BUILDKIT_EXPECTED_SHA256"
+    echo "buildkit_artifact_checksum_file=$BUILDKIT_ARTIFACT_SHA256_EVIDENCE"
+    echo "buildkit_artifact_manifest=$BUILDKIT_ARTIFACT_MANIFEST_EVIDENCE"
+    echo "buildkit_artifact_inventory=$BUILDKIT_ARTIFACT_INVENTORY_EVIDENCE"
+    echo "buildkit_artifact_provenance=$BUILDKIT_ARTIFACT_PROVENANCE_EVIDENCE"
+    echo "buildkit_artifact_verification=$BUILDKIT_ARTIFACT_VERIFICATION_EVIDENCE"
+    echo "buildkit_artifact_evidence_checksums=$BUILDKIT_ARTIFACT_EVIDENCE_CHECKSUMS"
+    echo "buildkit_builder_output_checksums=$BUILDKIT_BUILDER_OUTPUT_CHECKSUMS"
 } > "$RUN_DIR/run-info.txt"
 
 echo "==> building host binaries required for local VM flows"
@@ -915,7 +1152,7 @@ sign_binary "$guest_agent_binary"
 FAILED=()
 PASSED=()
 should_stop=false
-BUILDKIT_SUITE_RAN=false
+BUILDKIT_SUITE_RAN="$BUILDKIT_SELECTED"
 BUILDKIT_EVIDENCE_VALIDATED=false
 RUNTIME_ID_EVIDENCE_VALIDATED=false
 RUNTIME_ID_EVIDENCE_REQUIRED=false
@@ -968,9 +1205,6 @@ for suite in "${RESOLVED_SUITES[@]}"; do
         if [[ "$suite" == "runtime" ]]; then
             RUNTIME_ID_EVIDENCE_REQUIRED=true
         fi
-        if [[ "$suite" == "buildkit" ]]; then
-            BUILDKIT_SUITE_RAN=true
-        fi
         if run_and_log "$suite" "$suite" "$test_binary" "${RUN_ARGS[@]}"; then
             echo "==> suite passed: $suite"
             PASSED+=("$suite")
@@ -1008,6 +1242,14 @@ if [[ "$STACK_TEARDOWN_EVIDENCE_REQUIRED" == "true" && "$STACK_TEARDOWN_EVIDENCE
     FAILED+=("stack-teardown-evidence:92")
 fi
 
+if [[ "$BUILDKIT_RELEASE_GATE_QUALIFIED" == "pending" ]]; then
+    if [[ "$BUILDKIT_EVIDENCE_VALIDATED" == "true" && ${#FAILED[@]} -eq 0 ]]; then
+        BUILDKIT_RELEASE_GATE_QUALIFIED="true"
+    else
+        BUILDKIT_RELEASE_GATE_QUALIFIED="false"
+    fi
+fi
+
 echo "==> summary"
 echo "passed: ${PASSED[*]:-none}"
 echo "failed: ${FAILED[*]:-none}"
@@ -1021,6 +1263,18 @@ action_summary="$RUN_DIR/summary.txt"
     else
         echo "buildkit_runtime_inventory=none"
     fi
+    echo "buildkit_artifact_source_mode=$BUILDKIT_ARTIFACT_SOURCE_MODE"
+    echo "buildkit_builder_invocations=$BUILDKIT_BUILDER_INVOCATIONS"
+    echo "buildkit_release_gate_qualified=$BUILDKIT_RELEASE_GATE_QUALIFIED"
+    echo "buildkit_artifact_archive=$BUILDKIT_ARTIFACT_ARCHIVE_EVIDENCE"
+    echo "buildkit_artifact_sha256=$BUILDKIT_EXPECTED_SHA256"
+    echo "buildkit_artifact_checksum_file=$BUILDKIT_ARTIFACT_SHA256_EVIDENCE"
+    echo "buildkit_artifact_manifest=$BUILDKIT_ARTIFACT_MANIFEST_EVIDENCE"
+    echo "buildkit_artifact_inventory=$BUILDKIT_ARTIFACT_INVENTORY_EVIDENCE"
+    echo "buildkit_artifact_provenance=$BUILDKIT_ARTIFACT_PROVENANCE_EVIDENCE"
+    echo "buildkit_artifact_verification=$BUILDKIT_ARTIFACT_VERIFICATION_EVIDENCE"
+    echo "buildkit_artifact_evidence_checksums=$BUILDKIT_ARTIFACT_EVIDENCE_CHECKSUMS"
+    echo "buildkit_builder_output_checksums=$BUILDKIT_BUILDER_OUTPUT_CHECKSUMS"
     if [[ "$RUNTIME_ID_EVIDENCE_VALIDATED" == "true" ]]; then
         echo "container_id_ownership=$CONTAINER_ID_OWNERSHIP_EVIDENCE"
         echo "container_id_ownership_sha256=$CONTAINER_ID_OWNERSHIP_SHA256"

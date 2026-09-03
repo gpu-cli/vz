@@ -14,6 +14,8 @@ Use `scripts/run-sandbox-vm-e2e.sh` to run sandbox-focused integration tests tha
 - macOS on Apple Silicon (`arm64`).
 - Linux VM artifacts installed under `~/.vz/linux/`.
 - `codesign` available.
+- `jq`, `shasum`, and the tools required by
+  `scripts/build-runtime-free-buildkit.sh` when a BuildKit lane is selected.
 - Network access for first-time image pulls.
 
 ## Default Command
@@ -131,8 +133,16 @@ Each run creates a timestamped directory containing:
   scenario or complete stack lane runs
 - `stack-port-forwarding-teardown.json.sha256`, verified by the harness before
   stack success
+- `buildkit-artifact/` when a BuildKit lane is selected, containing the
+  immutable archive, checksum sidecar, validated manifest and inventory,
+  validation report, candidate build provenance when available, and a
+  checksum file binding the retained evidence set
 
 A `latest` symlink points to the most recent run.
+
+Run directories are created exclusively. If two runs begin during the same UTC
+second, the later run gets a collision-safe suffix rather than sharing or
+overwriting the first run's evidence.
 
 Stack lanes use a run-scoped OCI data directory under the timestamped artifact
 directory. Stable service/container IDs therefore cannot collide with a user's
@@ -215,6 +225,8 @@ Archive at least:
 - `container-id-ownership.json.sha256`
 - `runtime.log`, `stack.log`, and `buildkit.log` from the full run
 - `runtime-test-artifacts.jsonl`, `stack-test-artifacts.jsonl`, and the VM serial logs
+- the complete `buildkit-artifact/` directory, including
+  `buildkit-artifact-evidence.sha256`
 
 ## Spaces Release Gate
 
@@ -408,6 +420,55 @@ The harness signs:
 
 For BuildKit suites/scenarios, the harness also sets `VZ_BUILDKIT_DIR` to a
 per-run artifact directory so stale host cache state does not bleed across runs.
+The artifact input is also run-scoped; the test process never consumes an
+inherited path directly.
+
+Before `v0.3.21` is published, the normal local BuildKit gate leaves both
+artifact override variables unset:
+
+```bash
+env -u VZ_BUILDKIT_ARTIFACT_ARCHIVE \
+    -u VZ_BUILDKIT_ARTIFACT_SHA256 \
+    ./scripts/run-sandbox-vm-e2e.sh --profile release --suite all
+```
+
+The harness invokes `scripts/build-runtime-free-buildkit.sh` exactly once,
+validates the pinned candidate through
+`scripts/validate-runtime-free-buildkit.sh`, copies it into the exclusive run
+directory, makes the retained input read-only, and passes only that copy and
+its verified digest to the BuildKit test. There is no fallback to a published
+asset, an upstream all-binaries archive, a system Docker installation, or a
+different OCI runtime. `run-info.txt` and `summary.txt` record
+`buildkit_artifact_source_mode=candidate-build`,
+`buildkit_builder_invocations=1`, and every retained evidence path.
+`run-info.txt` records `buildkit_release_gate_qualified=pending` before VM work;
+the final green summary records `buildkit_release_gate_qualified=true` only
+after all selected suites and required evidence pass. The builder's source,
+toolchain, and build logs remain in `buildkit-candidate-output/`; its
+`buildkit-candidate-output.sha256` binds every retained builder output.
+
+An operator can instead test a specific unpublished archive by setting the
+pair together:
+
+```bash
+VZ_BUILDKIT_ARTIFACT_ARCHIVE=/absolute/path/vz-buildkit-v0.19.0-linux-arm64.tar \
+VZ_BUILDKIT_ARTIFACT_SHA256=<exact-64-hex-sha256> \
+./scripts/run-sandbox-vm-e2e.sh --profile debug --suite buildkit
+```
+
+The pair is checked before any guest rebuild, Cargo build, or VM start. Blank,
+singleton, non-file, symlink, malformed-digest, checksum-mismatch, or invalid
+archive inputs fail closed. A valid override is copied before validation to
+prevent the operator-owned file changing beneath the run. This mode records
+`operator-override` and zero builder invocations. Its validation evidence is
+retained, but build provenance is reported as unavailable unless it came from
+the pinned candidate builder; an operator override is therefore diagnostic and
+does not replace candidate-build provenance in a release gate. Operator
+overrides are accepted only with the debug profile. A release-profile BuildKit
+run rejects them before guest/Cargo/VM work and records
+`buildkit_release_gate_qualified=true` only for a validated candidate build
+with one builder invocation and complete provenance.
+
 The complete `buildkit` suite additionally retains the guest's OCI runtime
 inventory at `buildkit-runtime-inventory.txt` in the timestamped artifact
 directory. A missing or empty inventory is a suite failure, and `summary.txt`
@@ -415,20 +476,16 @@ records the retained evidence path. Before each BuildKit invocation the harness
 removes any prior evidence, then validates the JSON schema and its youki-only
 runtime, observed create/run, empty forbidden-path, daemon, and cgroup values.
 
-## CI
+After `v0.3.21` publishes the immutable BuildKit asset, add and run a separate,
+explicit published-source clean-install lane with both override variables
+absent and the local candidate cache removed. That lane must prove the default
+downloader consumes the published asset. It is deliberately separate from the
+pre-release candidate gate so neither source can silently substitute for the
+other; publication must never cause this harness to switch sources implicitly.
 
-Self-hosted VM E2E automation is in:
+## Automation
 
-- `.github/workflows/vm-e2e.yml`
-
-The workflow calls the same script so local and CI behavior stay aligned.
-
-The scheduled workflow now runs:
-
-- `vm-e2e-smoke` (`sandbox` suite)
-- `vm-e2e-nightly-full` (`all` suite, depends on smoke)
-
-Artifacts are published as:
-
-- `sandbox-vm-e2e-smoke-artifacts`
-- `sandbox-vm-e2e-nightly-full-artifacts`
+The release workflow in `.github/workflows/release.yml` uses the same pinned
+BuildKit builder and validator as this local harness. Real Virtualization.framework
+E2E release evidence is collected by running this host harness on Apple-silicon
+macOS; there is currently no checked-in `.github/workflows/vm-e2e.yml`.

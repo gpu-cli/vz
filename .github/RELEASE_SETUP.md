@@ -64,17 +64,39 @@ The BuildKit package is built from the pinned upstream source commit without
 building or downloading an OCI runtime. Its deterministic archive inventory,
 archive checksum, and per-file checksums must match the constants in
 `vz-oci::buildkit`. The `v0.3.21` bootstrap is intentionally two phase: the
-workflow first produces the candidate package, and local VM/E2E testing sets
-`VZ_BUILDKIT_ARTIFACT_ARCHIVE` and `VZ_BUILDKIT_ARTIFACT_SHA256` to that exact
-file before the release exists. Once `v0.3.21` publishes the asset, the default
-installer uses its immutable release URL. Before publication, a fresh install
-without the override fails closed; it never falls back to an upstream
-all-binaries archive or another OCI runtime.
+workflow and local release gate both call
+`scripts/build-runtime-free-buildkit.sh`; the local gate does so automatically
+and exactly once when a BuildKit suite is selected and both override variables
+are absent. The gate then validates and retains an immutable run-owned copy,
+its checksum, manifest, exact archive inventory, verification report, and build
+provenance. `run-info.txt` and `summary.txt` record the source mode, builder
+invocation count, digest, and evidence paths.
 
-The source commit and accepted output digests are pinned, but upstream builder
-base images and release-runner archive tooling can still drift between rebuilds.
-The workflow therefore fails closed on any binary or archive digest change;
-updating a pin requires a separately reviewed rebuild and provenance check.
+Setting `VZ_BUILDKIT_ARTIFACT_ARCHIVE` and
+`VZ_BUILDKIT_ARTIFACT_SHA256` together selects an explicit operator override.
+The harness copies it before validation and does not invoke the builder. This
+mode is useful for debug-profile diagnosis, but it cannot supply or replace the
+pinned builder's provenance. A release-profile BuildKit run rejects it before
+guest/Cargo/VM work. Its run metadata starts with qualification pending and the
+final summary records `buildkit_release_gate_qualified=true` only after a
+validated candidate build, one builder invocation, complete provenance, and all
+selected suites pass. Setting only one variable, setting either to blank, or
+supplying an invalid path, checksum, or archive also fails before guest/Cargo/VM work begins.
+There is no fallback among candidate, override, and published sources.
+
+Once `v0.3.21` publishes the asset, add and run a separate, explicitly selected
+published-source clean-install lane with no override and no candidate cache to
+prove the default installer downloads the immutable release URL. Publication
+must not silently change this harness from candidate-build mode. The
+post-publication lane is distinct from the pre-release candidate-build lane;
+neither may fall back to an upstream all-binaries archive, system Docker, or
+another OCI runtime.
+
+The source commit, Go patch toolchain downloads, build flags, and accepted output
+digests are pinned. Host archive-tool changes can still alter package bytes, so
+the workflow fails closed on any binary, header, inventory, or archive digest
+change. Updating a pin requires a separately reviewed cross-host rebuild and
+provenance check.
 
 ## User Installation
 

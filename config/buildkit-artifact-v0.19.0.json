@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "buildkit_version": "0.19.0",
+  "layout": 2,
+  "platform": "linux/arm64",
+  "source_repository": "https://github.com/moby/buildkit.git",
+  "source_tag": "v0.19.0",
+  "source_commit": "3637d1b15a13fc3cdd0c16fcf3be0845ae68f53d",
+  "go_version": "1.23.5",
+  "go_darwin_arm64_sha256": "047bfce4fbd0da6426bd30cd19716b35a466b1c15a45525ce65b9824acb33285",
+  "go_linux_amd64_sha256": "cbcad4a6482107c7c7926df1608106c189417163428200ce357695cc7e01d091",
+  "go_linux_arm64_sha256": "47c84d332123883653b70da2db7dd57d2a865921ba4724efcdf56b5da7021db0",
+  "buildctl_sha256": "0b1ba4b978096333973a36e346e091c2242eff443376ee6fea462bcd4f43ee35",
+  "buildkitd_sha256": "7dba4d777568504e8ec102d8e80223c5805b6de822366c0c44a7454178b6956d",
+  "archive_name": "vz-buildkit-v0.19.0-linux-arm64.tar",
+  "archive_sha256": "5737e6c1f51f21024c6eca1b05814d36aeaa48d393b1beaa3871f22efac659c7",
+  "inventory": ["manifest.json", "bin/buildctl", "bin/buildkitd"]
+}
