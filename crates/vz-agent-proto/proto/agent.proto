@@ -130,6 +130,14 @@ message ExecRequest {
   bool allocate_pty = 7;      // allocate a PTY for interactive use
   uint32 term_rows = 8;       // initial terminal rows (PTY only)
   uint32 term_cols = 9;       // initial terminal cols (PTY only)
+  // When present, execute inside this running OCI container. The guest agent
+  // resolves and pins the container target; callers must send the original
+  // command rather than constructing namespace-enter arguments themselves.
+  ContainerExecTarget container_target = 10;
+}
+
+message ContainerExecTarget {
+  string container_id = 1;
 }
 
 // Server-streamed event for a running exec. The last event is always

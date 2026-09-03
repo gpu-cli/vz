@@ -78,6 +78,16 @@ pub struct ExecRequest {
     /// initial terminal cols (PTY only)
     #[prost(uint32, tag = "9")]
     pub term_cols: u32,
+    /// When present, execute inside this running OCI container. The guest agent
+    /// resolves and pins the container target; callers must send the original
+    /// command rather than constructing namespace-enter arguments themselves.
+    #[prost(message, optional, tag = "10")]
+    pub container_target: ::core::option::Option<ContainerExecTarget>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ContainerExecTarget {
+    #[prost(string, tag = "1")]
+    pub container_id: ::prost::alloc::string::String,
 }
 /// Server-streamed event for a running exec. The last event is always
 /// exit_code (or error if the command failed to start).

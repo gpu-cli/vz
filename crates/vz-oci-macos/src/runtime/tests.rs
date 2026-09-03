@@ -4,7 +4,8 @@ use std::env;
 use std::io;
 
 use super::stack_vm::{
-    activation_error_with_rollback, require_running_pid, require_successful_hosts_write,
+    activation_error_with_rollback, hosts_write_command, require_running_pid,
+    require_successful_hosts_write,
 };
 use super::*;
 use vz_linux::KernelVersion;
@@ -88,6 +89,73 @@ fn hosts_write_validation_rejects_nonzero_exit() {
             if message.contains("/etc/hosts write failed")
                 && message.contains("exit code 1")
                 && message.contains("/proc/221/root")
+    ));
+}
+
+#[test]
+fn hosts_write_passes_user_data_as_an_opaque_positional_argument() {
+    let content = "127.0.0.1\tlocal'host\n10.0.0.8\t$(touch /tmp/escaped)\n".to_string();
+    let (command, args) = hosts_write_command(content.clone());
+
+    assert_eq!(command, "/bin/sh");
+    assert_eq!(args[0], "-c");
+    assert_eq!(args[1], "set -eu; printf '%s' \"$1\" > /etc/hosts");
+    assert_eq!(args[2], "vz-write-hosts");
+    assert_eq!(args[3], content);
+    assert!(!args[1].contains("local'host"));
+    assert!(!args[1].contains("touch /tmp/escaped"));
+}
+
+#[test]
+fn macos_runtime_container_exec_adapters_never_construct_namespace_argv() {
+    let exec_source = include_str!("exec.rs");
+    let lifecycle_source = include_str!("oci_lifecycle.rs");
+    let stack_source = include_str!("stack_vm.rs");
+
+    for (name, source) in [
+        ("exec", exec_source),
+        ("lifecycle", lifecycle_source),
+        ("stack", stack_source),
+    ] {
+        assert!(
+            !source.contains("nsenter"),
+            "{name} adapter must send container identity and raw argv to the guest"
+        );
+    }
+    assert!(exec_source.contains("exec_container_stream_with_options"));
+    assert!(exec_source.contains("exec_container_interactive"));
+    assert!(exec_source.contains("vm.oci_exec("));
+    assert!(exec_source.matches("id.to_string(),").count() >= 3);
+    assert!(exec_source.matches("command").count() >= 3);
+    assert!(lifecycle_source.contains("exec_container_collect_with_options"));
+    assert!(lifecycle_source.contains(
+        "                    id,\n                    command,\n                    args,"
+    ));
+    assert!(stack_source.contains("exec_container_collect_with_options"));
+    assert!(stack_source.contains("                    oci_container_id.clone(),\n                    hosts_command,\n                    hosts_args,"));
+}
+
+#[tokio::test]
+async fn oci_unary_adapter_rejects_pty_before_resolving_a_vm() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("oci-unary-pty"),
+        ..RuntimeConfig::default()
+    });
+    let error = runtime
+        .exec_container_oci_unary(
+            "missing",
+            ExecConfig {
+                cmd: vec!["/bin/true".to_string()],
+                pty: true,
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        OciError::ExecutionControlUnsupported { operation, reason }
+            if operation == "exec_container_oci_unary" && reason.contains("does not support PTY")
     ));
 }
 

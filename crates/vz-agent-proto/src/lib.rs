@@ -18,7 +18,7 @@ pub use vz::agent::v1::*;
 ///
 /// Increment this when startup-time host assumptions require a newer guest
 /// agent capability/behavior, even if crate semver remains unchanged.
-pub const AGENT_PROTOCOL_REVISION: u32 = 2;
+pub const AGENT_PROTOCOL_REVISION: u32 = 3;
 
 #[cfg(test)]
 mod tests {
@@ -84,6 +84,9 @@ mod tests {
             allocate_pty: false,
             term_rows: 0,
             term_cols: 0,
+            container_target: Some(ContainerExecTarget {
+                container_id: "svc-web".to_string(),
+            }),
         };
         let encoded = msg.encode_to_vec();
         let decoded = ExecRequest::decode(encoded.as_slice()).unwrap();
@@ -364,6 +367,7 @@ mod tests {
         let _ = SystemInfoRequest {};
         let _ = ResourceStatsRequest {};
         let _ = ExecRequest::default();
+        let _ = ContainerExecTarget::default();
         let _ = StdinWriteRequest::default();
         let _ = StdinCloseRequest::default();
         let _ = SignalRequest::default();

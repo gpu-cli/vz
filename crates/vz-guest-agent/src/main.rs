@@ -7,6 +7,7 @@
 // The guest agent legitimately uses unsafe for libc syscalls (vsock, sysctl, etc.)
 #![allow(unsafe_code)]
 
+mod container_exec;
 mod docker;
 mod grpc_server;
 mod listener;
@@ -70,12 +71,26 @@ struct Args {
     bind_timeout_secs: u64,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     if invoked_as_buildkit_runtime_shim(std::env::args_os().next().as_deref()) {
         return exec_buildkit_runtime(std::env::args_os().skip(1).collect());
     }
 
+    // The trampoline must run as a single-threaded process before Tokio,
+    // tracing, or clap can allocate worker state inherited across cgroups.
+    #[cfg(target_os = "linux")]
+    {
+        let trampoline_args = std::env::args_os().skip(1).collect::<Vec<_>>();
+        if container_exec::is_trampoline_request(&trampoline_args) {
+            return container_exec::run_trampoline(trampoline_args);
+        }
+    }
+
+    run_agent()
+}
+
+#[tokio::main]
+async fn run_agent() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

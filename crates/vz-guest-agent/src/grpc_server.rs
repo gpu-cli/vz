@@ -231,6 +231,58 @@ pub struct AgentServiceImpl {
     state: SharedState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedAgentExec {
+    command: String,
+    args: Vec<String>,
+    spawn_working_dir: Option<String>,
+    spawn_user: Option<String>,
+    container_targeted: bool,
+}
+
+fn prepare_agent_exec(req: &ExecRequest) -> Result<PreparedAgentExec, Status> {
+    if let Some(target) = &req.container_target {
+        let trampoline = crate::container_exec::prepare_trampoline(
+            &target.container_id,
+            &req.command,
+            &req.args,
+            (!req.working_dir.is_empty()).then_some(req.working_dir.as_str()),
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        return Ok(PreparedAgentExec {
+            command: trampoline.program,
+            args: trampoline.args,
+            // Cwd and user are container properties. Applying either to the
+            // trampoline in the guest namespace would be incorrect. Existing
+            // container exec paths do not implement user switching.
+            spawn_working_dir: None,
+            spawn_user: None,
+            container_targeted: true,
+        });
+    }
+
+    Ok(PreparedAgentExec {
+        command: req.command.clone(),
+        args: req.args.clone(),
+        spawn_working_dir: (!req.working_dir.is_empty()).then(|| req.working_dir.clone()),
+        spawn_user: (!req.user.is_empty()).then(|| req.user.clone()),
+        container_targeted: false,
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn prepare_oci_exec(
+    req: &OciExecRequest,
+) -> Result<crate::container_exec::TrampolineCommand, Status> {
+    crate::container_exec::prepare_trampoline(
+        &req.container_id,
+        &req.command,
+        &req.args,
+        (!req.working_dir.is_empty()).then_some(req.working_dir.as_str()),
+    )
+    .map_err(|error| Status::invalid_argument(error.to_string()))
+}
+
 impl AgentServiceImpl {
     /// Create a new `AgentServiceImpl` with the given shared state.
     pub fn new(state: SharedState) -> Self {
@@ -246,34 +298,30 @@ impl AgentServiceImpl {
     ) -> Result<Response<ReceiverStream<Result<ExecEvent, Status>>>, Status> {
         use tokio::io::AsyncReadExt;
 
+        let launch = prepare_agent_exec(&req)?;
         let env: Vec<(String, String)> = req.env.into_iter().collect();
-        let working_dir = if req.working_dir.is_empty() {
-            None
-        } else {
-            Some(req.working_dir)
-        };
-        let user = if req.user.is_empty() {
-            None
-        } else {
-            Some(req.user)
-        };
 
-        let spawn_result = if let Some(ref username) = user {
+        let spawn_result = if let Some(ref username) = launch.spawn_user {
             crate::spawn_as_user(
                 username,
-                &req.command,
-                &req.args,
-                working_dir.as_deref(),
+                &launch.command,
+                &launch.args,
+                launch.spawn_working_dir.as_deref(),
                 &env,
             )
         } else {
-            crate::spawn_direct(&req.command, &req.args, working_dir.as_deref(), &env)
+            crate::spawn_direct(
+                &launch.command,
+                &launch.args,
+                launch.spawn_working_dir.as_deref(),
+                &env,
+            )
         };
 
         let mut child = match spawn_result {
             Ok(child) => child,
             Err(e) => {
-                warn!(request_id = %request_id, command = %req.command, error = %e, "grpc: exec spawn failed");
+                warn!(request_id = %request_id, command = %launch.command, error = %e, "grpc: exec spawn failed");
                 let (tx, rx) = tokio::sync::mpsc::channel(1);
                 let _ = tx
                     .send(Ok(ExecEvent {
@@ -287,7 +335,7 @@ impl AgentServiceImpl {
             }
         };
 
-        info!(request_id = %request_id, command = %req.command, args = ?req.args, "grpc: process spawned");
+        info!(request_id = %request_id, command = %launch.command, args = ?launch.args, container_targeted = launch.container_targeted, "grpc: process spawned");
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -427,6 +475,7 @@ impl AgentServiceImpl {
             "grpc: pty exec request received"
         );
 
+        let launch = prepare_agent_exec(&req)?;
         let rows = if req.term_rows == 0 {
             24
         } else {
@@ -458,11 +507,11 @@ impl AgentServiceImpl {
             .map_err(|e| Status::internal(format!("openpty failed: {e}")))?;
         info!(request_id = %request_id, "grpc: PTY pair opened");
 
-        let mut cmd = CommandBuilder::new(&req.command);
-        cmd.args(&req.args);
+        let mut cmd = CommandBuilder::new(&launch.command);
+        cmd.args(&launch.args);
 
-        if !req.working_dir.is_empty() {
-            cmd.cwd(&req.working_dir);
+        if let Some(working_dir) = &launch.spawn_working_dir {
+            cmd.cwd(working_dir);
         }
 
         cmd.env("TERM", "xterm-256color");
@@ -472,11 +521,11 @@ impl AgentServiceImpl {
 
         info!(
             request_id = %request_id,
-            command = %req.command,
+            command = %launch.command,
             "grpc: spawning PTY process"
         );
         let child = pair.slave.spawn_command(cmd).map_err(|e| {
-            warn!(command = %req.command, error = %e, "grpc: pty exec spawn failed");
+            warn!(command = %launch.command, error = %e, "grpc: pty exec spawn failed");
             Status::internal(format!("failed to spawn PTY process: {e}"))
         })?;
         info!(request_id = %request_id, "grpc: PTY process spawned");
@@ -486,8 +535,9 @@ impl AgentServiceImpl {
 
         let exec_id = child.process_id().unwrap_or(0) as u64;
         info!(
-            request_id = %request_id, exec_id, command = %req.command,
-            args = ?req.args, rows, cols, "grpc: pty process spawned"
+            request_id = %request_id, exec_id, command = %launch.command,
+            args = ?launch.args, rows, cols, container_targeted = launch.container_targeted,
+            "grpc: pty process spawned"
         );
 
         // Get reader (cloned handle) and writer from the master.
@@ -1039,11 +1089,11 @@ impl agent_service_server::AgentService for AgentServiceImpl {
 
 /// Path to the youki OCI runtime binary (delivered via VirtioFS).
 #[cfg(target_os = "linux")]
-const YOUKI_BIN: &str = "/run/vz-oci/bin/youki";
+const YOUKI_BIN: &str = crate::container_exec::YOUKI_BIN;
 
 /// Root directory for youki container state.
 #[cfg(target_os = "linux")]
-const YOUKI_ROOT: &str = "/run/vz-oci/state";
+const YOUKI_ROOT: &str = crate::container_exec::YOUKI_ROOT;
 
 /// gRPC implementation of the `OciService` trait.
 ///
@@ -1169,49 +1219,11 @@ impl oci_service_server::OciService for OciServiceImpl {
             "oci: exec"
         );
 
-        // Youki 0.5.7 exec doesn't properly enter the container's mount
-        // namespace, causing commands to see the initramfs instead of the
-        // container rootfs. Work around this by using nsenter: get the init
-        // PID from `youki state`, then nsenter into its namespaces.
-        let state_output =
-            run_youki_output(&["state", &req.container_id], YOUKI_LIFECYCLE_TIMEOUT).await?;
-        let state: serde_json::Value = serde_json::from_slice(&state_output.stdout)
-            .map_err(|e| Status::internal(format!("failed to parse youki state: {e}")))?;
-        let runtime_status = state["status"].as_str().unwrap_or("unknown");
-        if runtime_status != "running" {
-            return Err(Status::failed_precondition(format!(
-                "container '{}' is not running for exec: status='{runtime_status}', pid={}",
-                req.container_id,
-                state["pid"].as_u64().unwrap_or(0)
-            )));
-        }
-        let pid = state["pid"]
-            .as_u64()
-            .filter(|pid| *pid > 0)
-            .ok_or_else(|| Status::internal("youki state missing pid field"))?;
+        let trampoline = prepare_oci_exec(&req)?;
+        info!(args = ?trampoline.args, "oci: exec via verified container trampoline");
 
-        let mut nsenter_args: Vec<String> = vec![
-            format!("--mount=/proc/{pid}/ns/mnt"),
-            format!("--net=/proc/{pid}/ns/net"),
-            format!("--pid=/proc/{pid}/ns/pid"),
-            format!("--ipc=/proc/{pid}/ns/ipc"),
-            format!("--uts=/proc/{pid}/ns/uts"),
-            format!("--root=/proc/{pid}/root"),
-        ];
-        if !req.working_dir.is_empty() {
-            nsenter_args.push(format!("--wd={}", req.working_dir));
-        }
-        nsenter_args.push("--".into());
-
-        nsenter_args.push(req.command.clone());
-        nsenter_args.extend(req.args.clone());
-
-        info!(pid = pid, args = ?nsenter_args, "oci: exec via nsenter");
-
-        let mut cmd = tokio::process::Command::new("nsenter");
-        for arg in nsenter_args {
-            cmd.arg(arg);
-        }
+        let mut cmd = tokio::process::Command::new(&trampoline.program);
+        cmd.args(&trampoline.args);
 
         cmd.env_clear();
         let has_path = req.env.keys().any(|k| k == "PATH");
@@ -1227,7 +1239,9 @@ impl oci_service_server::OciService for OciServiceImpl {
         let output = match tokio::time::timeout(YOUKI_EXEC_TIMEOUT, cmd.output()).await {
             Ok(Ok(output)) => output,
             Ok(Err(e)) => {
-                return Err(Status::internal(format!("failed to execute nsenter: {e}")));
+                return Err(Status::internal(format!(
+                    "failed to execute container command: {e}"
+                )));
             }
             Err(_) => {
                 return Err(Status::internal(format!(
@@ -1797,6 +1811,8 @@ async fn do_network_teardown(
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+    use std::collections::HashMap;
+    use std::ffi::OsString;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -1804,6 +1820,79 @@ mod tests {
     fn test_exec_id() -> u64 {
         static NEXT_EXEC_ID: AtomicU64 = AtomicU64::new(10_000);
         NEXT_EXEC_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn exec_request(container_id: Option<&str>, allocate_pty: bool) -> ExecRequest {
+        ExecRequest {
+            command: "/bin/printf".to_string(),
+            args: vec!["%s".to_string(), "$HOME;not-a-shell".to_string()],
+            working_dir: "/workspace".to_string(),
+            env: [("MODE".to_string(), "test".to_string())]
+                .into_iter()
+                .collect(),
+            user: String::new(),
+            metadata: None,
+            allocate_pty,
+            term_rows: 24,
+            term_cols: 80,
+            container_target: container_id.map(|container_id| ContainerExecTarget {
+                container_id: container_id.to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn ordinary_guest_exec_remains_direct_and_does_not_select_trampoline() {
+        let prepared = prepare_agent_exec(&exec_request(None, false)).unwrap();
+        assert!(!prepared.container_targeted);
+        assert_eq!(prepared.command, "/bin/printf");
+        assert_eq!(prepared.args, ["%s", "$HOME;not-a-shell"]);
+        assert_eq!(prepared.spawn_working_dir.as_deref(), Some("/workspace"));
+        assert!(!crate::container_exec::is_trampoline_request(
+            &prepared
+                .args
+                .iter()
+                .cloned()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        ));
+    }
+
+    #[test]
+    fn pipe_and_pty_container_requests_route_through_one_trampoline() {
+        let pipe = prepare_agent_exec(&exec_request(Some("web"), false)).unwrap();
+        let pty = prepare_agent_exec(&exec_request(Some("web"), true)).unwrap();
+        assert!(pipe.container_targeted);
+        assert_eq!(pipe, pty);
+        assert_eq!(pipe.command, "/proc/self/exe");
+        assert!(crate::container_exec::is_trampoline_request(
+            &pipe
+                .args
+                .iter()
+                .cloned()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        ));
+        assert!(pipe.spawn_working_dir.is_none());
+        assert!(pipe.spawn_user.is_none());
+    }
+
+    #[test]
+    fn unary_oci_exec_uses_the_same_trampoline_and_preserves_argv() {
+        let agent = prepare_agent_exec(&exec_request(Some("web"), false)).unwrap();
+        let unary = prepare_oci_exec(&OciExecRequest {
+            container_id: "web".to_string(),
+            command: "/bin/printf".to_string(),
+            args: vec!["%s".to_string(), "$HOME;not-a-shell".to_string()],
+            env: HashMap::new(),
+            working_dir: "/workspace".to_string(),
+            user: String::new(),
+            metadata: None,
+        })
+        .unwrap();
+
+        assert_eq!(agent.command, unary.program);
+        assert_eq!(agent.args, unary.args);
     }
 
     #[tokio::test]

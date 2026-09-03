@@ -1,6 +1,5 @@
 use super::networking::ensure_interactive_exec_pty_prerequisites;
 use super::oci_lifecycle::parse_signal_number;
-use super::stack_vm::require_running_pid;
 use super::*;
 use tracing::debug;
 
@@ -51,6 +50,20 @@ impl Runtime {
 
         let timeout = exec.timeout.unwrap_or(self.config.exec_timeout);
         let execution_id = exec.execution_id.clone();
+        let mut merged_env = self
+            .container_exec_env
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .unwrap_or_default();
+        for (key, value) in &exec.env {
+            if let Some((_, existing_value)) = merged_env.iter_mut().find(|(k, _)| k == key) {
+                *existing_value = value.clone();
+            } else {
+                merged_env.push((key.clone(), value.clone()));
+            }
+        }
 
         if exec.pty {
             let Some(execution_id) = execution_id else {
@@ -60,40 +73,14 @@ impl Runtime {
                 });
             };
 
-            if debug {
-                debug!(
-                    "[vz-oci-macos exec-control] interactive exec resolving container state execution_id={execution_id} container_id={id}"
-                );
-            }
-            let state = vm.oci_state(id.to_string()).await?;
-            let pid = require_running_pid(id, "interactive exec", &state)?;
-            if debug {
-                debug!(
-                    "[vz-oci-macos exec-control] interactive exec container pid resolved execution_id={execution_id} container_id={id} pid={pid}"
-                );
-            }
-
-            let mut nsenter_args: Vec<String> = vec![
-                "nsenter".to_string(),
-                format!("--mount=/proc/{pid}/ns/mnt"),
-                format!("--net=/proc/{pid}/ns/net"),
-                format!("--pid=/proc/{pid}/ns/pid"),
-                format!("--ipc=/proc/{pid}/ns/ipc"),
-                format!("--uts=/proc/{pid}/ns/uts"),
-                format!("--root=/proc/{pid}/root"),
-            ];
-            if let Some(working_dir) = exec.working_dir.clone()
-                && !working_dir.is_empty()
-            {
-                nsenter_args.push(format!("--wd={working_dir}"));
-            }
-            nsenter_args.push("--".to_string());
-            nsenter_args.push(command.clone());
-            nsenter_args.extend(args.to_vec());
-
-            let nsenter_arg_refs: Vec<&str> = nsenter_args.iter().map(String::as_str).collect();
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let term_rows = u32::from(exec.term_rows.unwrap_or(DEFAULT_INTERACTIVE_EXEC_ROWS));
             let term_cols = u32::from(exec.term_cols.unwrap_or(DEFAULT_INTERACTIVE_EXEC_COLS));
+            let options = ExecOptions {
+                working_dir: exec.working_dir.clone(),
+                env: merged_env,
+                user: exec.user.clone(),
+            };
 
             let vm_key = Arc::as_ptr(&vm) as usize;
             let should_prepare_pty = {
@@ -123,15 +110,16 @@ impl Runtime {
             if debug {
                 debug!(
                     "[vz-oci-macos exec-control] interactive exec invoking guest exec RPC execution_id={execution_id} command={:?} args={:?} rows={} cols={}",
-                    "/bin/busybox", nsenter_arg_refs, term_rows, term_cols
+                    command, args, term_rows, term_cols
                 );
             }
             let (mut stream, guest_exec_id) = tokio::time::timeout(
                 timeout,
-                vm.exec_interactive(
-                    "/bin/busybox",
-                    &nsenter_arg_refs,
-                    None,
+                vm.exec_container_interactive(
+                    id.to_string(),
+                    command,
+                    &arg_refs,
+                    options,
                     term_rows,
                     term_cols,
                 ),
@@ -212,30 +200,98 @@ impl Runtime {
             return result;
         }
 
-        // Non-PTY streaming path: use nsenter via the streaming exec RPC
-        // so output is delivered incrementally instead of buffered until exit.
-        let state = vm.oci_state(id.to_string()).await?;
-        let pid = require_running_pid(id, "exec", &state)?;
-
-        let mut nsenter_args: Vec<String> = vec![
-            format!("--mount=/proc/{pid}/ns/mnt"),
-            format!("--net=/proc/{pid}/ns/net"),
-            format!("--pid=/proc/{pid}/ns/pid"),
-            format!("--ipc=/proc/{pid}/ns/ipc"),
-            format!("--uts=/proc/{pid}/ns/uts"),
-            format!("--root=/proc/{pid}/root"),
-        ];
-        // Always set --wd to avoid inheriting the guest agent's CWD which
-        // sits on a stacked overlay+VirtioFS mount where getcwd() fails.
+        // Always set a container cwd so execution never inherits the guest
+        // agent's cwd from outside the target mount namespace.
         let wd = exec
             .working_dir
-            .as_deref()
-            .filter(|d| !d.is_empty())
-            .unwrap_or("/");
-        nsenter_args.push(format!("--wd={wd}"));
-        nsenter_args.push("--".to_string());
+            .filter(|directory| !directory.is_empty())
+            .unwrap_or_else(|| "/".to_string());
+        let options = ExecOptions {
+            working_dir: Some(wd),
+            env: merged_env,
+            user: exec.user.clone(),
+        };
 
-        // Build env export prefix for merged environment.
+        tokio::time::timeout(timeout, async {
+            let mut stream = vm
+                .exec_container_stream_with_options(
+                    id.to_string(),
+                    command.clone(),
+                    args.to_vec(),
+                    options,
+                )
+                .await?;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut saw_exit = false;
+            let mut exit_code = -1;
+            while let Some(event) = stream.next().await {
+                match event {
+                    ExecEvent::Stdout(data) => {
+                        on_event(InteractiveExecEvent::Stdout(data.clone()));
+                        stdout.extend_from_slice(&data);
+                    }
+                    ExecEvent::Stderr(data) => {
+                        on_event(InteractiveExecEvent::Stderr(data.clone()));
+                        stderr.extend_from_slice(&data);
+                    }
+                    ExecEvent::Exit(code) => {
+                        on_event(InteractiveExecEvent::Exit(code));
+                        saw_exit = true;
+                        exit_code = code;
+                        break;
+                    }
+                }
+            }
+            if !saw_exit {
+                return Err(OciError::InvalidConfig(
+                    "container exec stream ended without exit code".to_string(),
+                ));
+            }
+            Ok(ExecOutput {
+                exit_code,
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            })
+        })
+        .await
+        .map_err(|_| {
+            OciError::InvalidConfig(format!(
+                "exec timed out after {:.3}s",
+                timeout.as_secs_f64()
+            ))
+        })?
+    }
+
+    /// Execute through the bounded OCI unary compatibility RPC.
+    #[doc(hidden)]
+    pub async fn exec_container_oci_unary(
+        &self,
+        id: &str,
+        exec: ExecConfig,
+    ) -> Result<ExecOutput, OciError> {
+        if exec.pty {
+            return Err(OciError::ExecutionControlUnsupported {
+                operation: "exec_container_oci_unary".to_string(),
+                reason: "OCI unary exec does not support PTY allocation".to_string(),
+            });
+        }
+        let vm = self
+            .vm_handles
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                OciError::InvalidConfig(format!(
+                    "no active VM handle for container '{id}'; container may not be running"
+                ))
+            })?;
+        let (command, args) = exec
+            .cmd
+            .split_first()
+            .ok_or_else(|| OciError::InvalidConfig("exec command must not be empty".to_string()))?;
+        let timeout = exec.timeout.unwrap_or(self.config.exec_timeout);
         let mut merged_env = self
             .container_exec_env
             .lock()
@@ -243,55 +299,34 @@ impl Runtime {
             .get(id)
             .cloned()
             .unwrap_or_default();
-        for (key, value) in exec.env.clone() {
-            if let Some((_, existing_value)) = merged_env.iter_mut().find(|(k, _)| *k == key) {
+        for (key, value) in exec.env {
+            if let Some((_, existing_value)) = merged_env.iter_mut().find(|(k, _)| k == &key) {
                 *existing_value = value;
             } else {
                 merged_env.push((key, value));
             }
         }
-
-        // Wrap in env + shell so environment variables are applied.
-        if merged_env.is_empty() {
-            nsenter_args.push(command.clone());
-            nsenter_args.extend(args.to_vec());
-        } else {
-            nsenter_args.push("env".to_string());
-            for (key, value) in &merged_env {
-                nsenter_args.push(format!("{key}={value}"));
-            }
-            nsenter_args.push(command.clone());
-            nsenter_args.extend(args.to_vec());
-        }
-
-        let options = ExecOptions::default();
-
-        let result = vm
-            .exec_streaming_with_options(
-                "/bin/busybox".to_string(),
-                {
-                    let mut full_args = vec!["nsenter".to_string()];
-                    full_args.extend(nsenter_args);
-                    full_args
+        tokio::time::timeout(
+            timeout,
+            vm.oci_exec(
+                id.to_string(),
+                command.clone(),
+                args.to_vec(),
+                OciExecOptions {
+                    env: merged_env,
+                    cwd: exec.working_dir,
+                    user: exec.user,
                 },
-                timeout,
-                options,
-                |event| match event {
-                    ExecEvent::Stdout(data) => {
-                        on_event(InteractiveExecEvent::Stdout(data.clone()));
-                    }
-                    ExecEvent::Stderr(data) => {
-                        on_event(InteractiveExecEvent::Stderr(data.clone()));
-                    }
-                    ExecEvent::Exit(code) => {
-                        on_event(InteractiveExecEvent::Exit(*code));
-                    }
-                },
-            )
-            .await
-            .map_err(OciError::from)?;
-
-        Ok(result)
+            ),
+        )
+        .await
+        .map_err(|_| {
+            OciError::InvalidConfig(format!(
+                "OCI unary exec timed out after {:.3}s",
+                timeout.as_secs_f64()
+            ))
+        })?
+        .map_err(OciError::from)
     }
 
     /// Write stdin bytes into an active interactive execution session.
@@ -392,7 +427,7 @@ impl Runtime {
 
     /// Execute a command at the VM level (not inside a container namespace).
     ///
-    /// Uses the guest agent's direct exec path (no nsenter). This works even
+    /// Uses the guest agent's direct exec path. This works even
     /// when the container's init process has exited, making it suitable for
     /// reading logs from the VM-level log directory.
     pub async fn exec_host(

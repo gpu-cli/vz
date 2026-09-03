@@ -4,7 +4,6 @@
 //! over gRPC/protobuf. The gRPC channel runs over vsock via a custom
 //! tonic connector.
 
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -17,13 +16,14 @@ use tracing::debug;
 use vz::Vm;
 use vz::protocol::{ExecOutput, OciContainerState};
 use vz_agent_proto::{
-    DockerEnsureEvent, DockerEnsureRequest, ExecRequest as ProtoExecRequest, NetworkSetupRequest,
-    NetworkTeardownRequest, OciCreateRequest, OciDeleteRequest, OciKillRequest, OciStartRequest,
-    OciStateRequest, PingRequest, PortForwardFrame, PortForwardOpen, ResizeExecPtyRequest,
-    ResourceStatsRequest, ResourceStatsResponse, SignalRequest, StdinCloseRequest,
-    StdinWriteRequest, SystemInfoRequest, SystemInfoResponse,
-    TransportMetadata as ProtoTransportMetadata, agent_service_client::AgentServiceClient,
-    exec_event, network_service_client::NetworkServiceClient, oci_service_client::OciServiceClient,
+    ContainerExecTarget, DockerEnsureEvent, DockerEnsureRequest, ExecRequest as ProtoExecRequest,
+    NetworkSetupRequest, NetworkTeardownRequest, OciCreateRequest, OciDeleteRequest,
+    OciExecRequest, OciKillRequest, OciStartRequest, OciStateRequest, PingRequest,
+    PortForwardFrame, PortForwardOpen, ResizeExecPtyRequest, ResourceStatsRequest,
+    ResourceStatsResponse, SignalRequest, StdinCloseRequest, StdinWriteRequest, SystemInfoRequest,
+    SystemInfoResponse, TransportMetadata as ProtoTransportMetadata,
+    agent_service_client::AgentServiceClient, exec_event,
+    network_service_client::NetworkServiceClient, oci_service_client::OciServiceClient,
     port_forward_frame,
 };
 use vz_runtime_contract::{
@@ -64,6 +64,53 @@ pub struct ExecOptions {
     pub env: Vec<(String, String)>,
     /// Optional user to run as.
     pub user: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ExecTerminal {
+    allocate_pty: bool,
+    rows: u32,
+    cols: u32,
+}
+
+fn build_exec_request(
+    command: String,
+    args: Vec<String>,
+    options: ExecOptions,
+    container_target: Option<String>,
+    metadata: ProtoTransportMetadata,
+    terminal: ExecTerminal,
+) -> ProtoExecRequest {
+    ProtoExecRequest {
+        command,
+        args,
+        working_dir: options.working_dir.unwrap_or_default(),
+        env: options.env.into_iter().collect(),
+        user: options.user.unwrap_or_default(),
+        metadata: Some(metadata),
+        allocate_pty: terminal.allocate_pty,
+        term_rows: terminal.rows,
+        term_cols: terminal.cols,
+        container_target: container_target.map(|container_id| ContainerExecTarget { container_id }),
+    }
+}
+
+fn build_oci_exec_request(
+    id: String,
+    command: String,
+    args: Vec<String>,
+    options: OciExecOptions,
+    metadata: ProtoTransportMetadata,
+) -> OciExecRequest {
+    OciExecRequest {
+        container_id: id,
+        command,
+        args,
+        env: options.env.into_iter().collect(),
+        working_dir: options.cwd.unwrap_or_default(),
+        user: options.user.unwrap_or_default(),
+        metadata: Some(metadata),
+    }
 }
 
 /// Options for OCI exec requests.
@@ -233,7 +280,17 @@ impl GrpcAgentClient {
         args: Vec<String>,
         options: ExecOptions,
     ) -> Result<GrpcExecStream, LinuxError> {
-        let env = options.env.into_iter().collect::<HashMap<String, String>>();
+        self.exec_stream_with_target(command, args, options, None)
+            .await
+    }
+
+    async fn exec_stream_with_target(
+        &mut self,
+        command: String,
+        args: Vec<String>,
+        options: ExecOptions,
+        container_target: Option<String>,
+    ) -> Result<GrpcExecStream, LinuxError> {
         let metadata = self.next_transport_metadata(Some(RuntimeOperation::ExecContainer));
         let expected_request_id = if metadata.request_id.is_empty() {
             None
@@ -241,23 +298,35 @@ impl GrpcAgentClient {
             Some(metadata.request_id.clone())
         };
 
-        let request = ProtoExecRequest {
+        let request = build_exec_request(
             command,
             args,
-            working_dir: options.working_dir.unwrap_or_default(),
-            env,
-            user: options.user.unwrap_or_default(),
-            metadata: Some(metadata),
-            allocate_pty: false,
-            term_rows: 0,
-            term_cols: 0,
-        };
+            options,
+            container_target,
+            metadata,
+            ExecTerminal::default(),
+        );
 
         let response = self.agent.exec(request).await?;
         Ok(GrpcExecStream::new(
             response.into_inner(),
             expected_request_id,
         ))
+    }
+
+    /// Execute a raw command inside a running OCI container and stream output.
+    ///
+    /// Container identity is sent as a typed target. Namespace and cgroup
+    /// resolution are deliberately guest-owned.
+    pub async fn exec_container_stream(
+        &mut self,
+        container_id: String,
+        command: String,
+        args: Vec<String>,
+        options: ExecOptions,
+    ) -> Result<GrpcExecStream, LinuxError> {
+        self.exec_stream_with_target(command, args, options, Some(container_id))
+            .await
     }
 
     /// Execute `buildctl` inside the guest and collect output.
@@ -365,6 +434,27 @@ impl GrpcAgentClient {
             } else {
                 Some(state.bundle_path)
             },
+        })
+    }
+
+    /// Execute through the OCI service's bounded unary compatibility RPC.
+    pub async fn oci_exec(
+        &mut self,
+        id: String,
+        command: String,
+        args: Vec<String>,
+        options: OciExecOptions,
+    ) -> Result<ExecOutput, LinuxError> {
+        let metadata = self.next_transport_metadata(Some(RuntimeOperation::ExecContainer));
+        let response = self
+            .oci
+            .exec(build_oci_exec_request(id, command, args, options, metadata))
+            .await?
+            .into_inner();
+        Ok(ExecOutput {
+            exit_code: response.exit_code,
+            stdout: response.stdout,
+            stderr: response.stderr,
         })
     }
 
@@ -550,8 +640,20 @@ impl GrpcAgentClient {
         rows: u32,
         cols: u32,
     ) -> Result<(GrpcExecStream, u64), LinuxError> {
+        self.exec_stream_interactive_with_target(command, args, options, None, rows, cols)
+            .await
+    }
+
+    async fn exec_stream_interactive_with_target(
+        &mut self,
+        command: String,
+        args: Vec<String>,
+        options: ExecOptions,
+        container_target: Option<String>,
+        rows: u32,
+        cols: u32,
+    ) -> Result<(GrpcExecStream, u64), LinuxError> {
         let debug = exec_control_debug_enabled();
-        let env = options.env.into_iter().collect::<HashMap<String, String>>();
         let metadata = self.next_transport_metadata(Some(RuntimeOperation::ExecContainer));
         let request_id = metadata.request_id.clone();
         let expected_request_id = if metadata.request_id.is_empty() {
@@ -568,17 +670,18 @@ impl GrpcAgentClient {
             );
         }
 
-        let request = ProtoExecRequest {
+        let request = build_exec_request(
             command,
             args,
-            working_dir: options.working_dir.unwrap_or_default(),
-            env,
-            user: options.user.unwrap_or_default(),
-            metadata: Some(metadata),
-            allocate_pty: true,
-            term_rows: rows,
-            term_cols: cols,
-        };
+            options,
+            container_target,
+            metadata,
+            ExecTerminal {
+                allocate_pty: true,
+                rows,
+                cols,
+            },
+        );
 
         let response_result =
             tokio::time::timeout(std::time::Duration::from_secs(10), self.agent.exec(request))
@@ -646,6 +749,27 @@ impl GrpcAgentClient {
         }
 
         Ok((stream, exec_id))
+    }
+
+    /// Execute a raw command inside a running OCI container with a PTY.
+    pub async fn exec_container_stream_interactive(
+        &mut self,
+        container_id: String,
+        command: String,
+        args: Vec<String>,
+        options: ExecOptions,
+        rows: u32,
+        cols: u32,
+    ) -> Result<(GrpcExecStream, u64), LinuxError> {
+        self.exec_stream_interactive_with_target(
+            command,
+            args,
+            options,
+            Some(container_id),
+            rows,
+            cols,
+        )
+        .await
     }
 }
 
@@ -955,6 +1079,87 @@ mod tests {
         assert_eq!(args[3], GUEST_BUILDCTL_BINARY);
         assert_eq!(args[4], "--addr");
         assert_eq!(args[6], "debug");
+    }
+
+    #[test]
+    fn ordinary_exec_request_has_no_container_target_and_preserves_argv() {
+        let request = build_exec_request(
+            "printf".to_string(),
+            vec!["%s".to_string(), "a; $b ' c".to_string()],
+            ExecOptions::default(),
+            None,
+            ProtoTransportMetadata::default(),
+            ExecTerminal::default(),
+        );
+
+        assert!(request.container_target.is_none());
+        assert_eq!(request.command, "printf");
+        assert_eq!(request.args, ["%s", "a; $b ' c"]);
+    }
+
+    #[test]
+    fn pipe_and_pty_requests_carry_the_same_typed_container_target() {
+        let options = ExecOptions {
+            working_dir: Some("/workspace".to_string()),
+            env: vec![("MODE".to_string(), "test".to_string())],
+            ..ExecOptions::default()
+        };
+        let pipe = build_exec_request(
+            "/bin/tool".to_string(),
+            vec!["--literal=$HOME;echo".to_string()],
+            options.clone(),
+            Some("machine-web".to_string()),
+            ProtoTransportMetadata::default(),
+            ExecTerminal::default(),
+        );
+        let pty = build_exec_request(
+            "/bin/tool".to_string(),
+            vec!["--literal=$HOME;echo".to_string()],
+            options,
+            Some("machine-web".to_string()),
+            ProtoTransportMetadata::default(),
+            ExecTerminal {
+                allocate_pty: true,
+                rows: 33,
+                cols: 101,
+            },
+        );
+
+        assert_eq!(pipe.container_target, pty.container_target);
+        assert_eq!(
+            pipe.container_target
+                .as_ref()
+                .map(|target| target.container_id.as_str()),
+            Some("machine-web")
+        );
+        assert_eq!(pipe.command, pty.command);
+        assert_eq!(pipe.args, pty.args);
+        assert_eq!(pipe.working_dir, pty.working_dir);
+        assert_eq!(pipe.env, pty.env);
+        assert!(!pipe.allocate_pty);
+        assert!(pty.allocate_pty);
+    }
+
+    #[test]
+    fn unary_oci_request_preserves_raw_command_options_and_identity() {
+        let request = build_oci_exec_request(
+            "web".to_string(),
+            "/bin/printf".to_string(),
+            vec!["%s".to_string(), "$HOME;still-argv".to_string()],
+            OciExecOptions {
+                env: vec![("PATH".to_string(), "/bin".to_string())],
+                cwd: Some("/workspace".to_string()),
+                user: Some("1000:1000".to_string()),
+            },
+            ProtoTransportMetadata::default(),
+        );
+
+        assert_eq!(request.container_id, "web");
+        assert_eq!(request.command, "/bin/printf");
+        assert_eq!(request.args, ["%s", "$HOME;still-argv"]);
+        assert_eq!(request.working_dir, "/workspace");
+        assert_eq!(request.env.get("PATH").map(String::as_str), Some("/bin"));
+        assert_eq!(request.user, "1000:1000");
     }
 
     #[test]

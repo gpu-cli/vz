@@ -1,5 +1,4 @@
 use super::bundle::container_log_dir;
-use super::stack_vm::require_running_pid;
 use super::*;
 
 pub(super) type OciLifecycleFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, OciError>> + 'a>>;
@@ -72,27 +71,16 @@ impl OciLifecycleOps for LinuxVm {
         _options: OciExecOptions,
     ) -> OciLifecycleFuture<'a, ExecOutput> {
         Box::pin(async move {
-            // Use streaming exec via nsenter instead of unary oci_exec RPC.
-            let state = self.oci_state(id.clone()).await.map_err(OciError::from)?;
-            let pid = require_running_pid(&id, "OCI lifecycle exec", &state)?;
-            let mut nsenter_args = vec![
-                "nsenter".to_string(),
-                format!("--mount=/proc/{pid}/ns/mnt"),
-                format!("--net=/proc/{pid}/ns/net"),
-                format!("--pid=/proc/{pid}/ns/pid"),
-                format!("--ipc=/proc/{pid}/ns/ipc"),
-                format!("--uts=/proc/{pid}/ns/uts"),
-                format!("--root=/proc/{pid}/root"),
-                "--wd=/".to_string(),
-                "--".to_string(),
-                command,
-            ];
-            nsenter_args.extend(args);
             let result = self
-                .exec_collect(
-                    "/bin/busybox".to_string(),
-                    nsenter_args,
+                .exec_container_collect_with_options(
+                    id,
+                    command,
+                    args,
                     Duration::from_secs(300),
+                    ExecOptions {
+                        working_dir: Some("/".to_string()),
+                        ..ExecOptions::default()
+                    },
                 )
                 .await
                 .map_err(OciError::from)?;

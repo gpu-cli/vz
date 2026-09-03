@@ -16,7 +16,10 @@
 use std::process::Command;
 use std::time::Duration;
 
-use vz_oci_macos::{ExecConfig, ExecutionMode, KernelProfile, RunConfig, Runtime, RuntimeConfig};
+use vz_oci_macos::{
+    ExecConfig, ExecutionMode, InteractiveExecEvent, KernelProfile, RunConfig, Runtime,
+    RuntimeConfig,
+};
 
 /// Set up tracing for test diagnostics.
 fn init_tracing() {
@@ -656,13 +659,148 @@ async fn pull_nonexistent_image_fails() {
 
 // ── Cgroup resource limits ───────────────────────────────────────
 
-/// Verify that cgroup v2 CPU bandwidth is enforced inside the container.
-///
-/// Creates a container with `cpu_quota=50000` and `cpu_period=100000`
-/// (equivalent to `cpus=0.5`), then reads `/sys/fs/cgroup/cpu.max` inside
-/// the running container, asserts the kernel exposes the expected
-/// `"50000 100000"` throttle values, and proves a bounded CPU load increments
-/// the cgroup's throttling counter.
+const CGROUP_EXEC_PROBE: &str = r#"set -eu
+self_cgroup=$(/bin/busybox cat /proc/self/cgroup)
+self_pid=$$
+cgroup_procs=$(/bin/busybox cat /sys/fs/cgroup/cgroup.procs)
+printf '%s\n' "$cgroup_procs" | /bin/busybox grep -qx "$self_pid"
+init_pid=$(printf '%s\n' "$cgroup_procs" | /bin/busybox sort -n | /bin/busybox head -n 1)
+test -n "$init_pid"
+init_cgroup=$(/bin/busybox cat "/proc/$init_pid/cgroup")
+cwd_identity=$(/bin/busybox stat -c '%d:%i' .)
+root_identity=$(/bin/busybox stat -c '%d:%i' /)
+leaked_namespace_fds=0
+for fd in /proc/self/fd/*; do
+    case "$fd" in */0|*/1|*/2) continue ;; esac
+    target=$(/bin/busybox readlink "$fd" 2>/dev/null || true)
+    case "$target" in mnt:\[*|net:\[*|pid:\[*|ipc:\[*|uts:\[*|cgroup:\[* )
+        leaked_namespace_fds=$((leaked_namespace_fds + 1))
+        ;;
+    esac
+done
+cgroup_filesystem=$(/bin/busybox awk '$2 == "/sys/fs/cgroup" { print $3 }' /proc/mounts)
+controllers=$(/bin/busybox cat /sys/fs/cgroup/cgroup.controllers)
+cpu_max=$(/bin/busybox cat /sys/fs/cgroup/cpu.max)
+pids_max=$(/bin/busybox cat /sys/fs/cgroup/pids.max)
+pids_current=$(/bin/busybox cat /sys/fs/cgroup/pids.current)
+if [ -f /sys/fs/cgroup/memory.max ]; then
+    memory_max=$(/bin/busybox cat /sys/fs/cgroup/memory.max)
+    memory_current=$(/bin/busybox cat /sys/fs/cgroup/memory.current)
+else
+    memory_max=absent
+    memory_current=absent
+fi
+before=$(/bin/busybox awk '$1 == "nr_throttled" { print $2 }' /sys/fs/cgroup/cpu.stat)
+/bin/busybox timeout 2 /bin/busybox yes >/dev/null || true
+after=$(/bin/busybox awk '$1 == "nr_throttled" { print $2 }' /sys/fs/cgroup/cpu.stat)
+printf 'mode=%s\nself_pid=%s\nself_cgroup=%s\ninit_pid=%s\ninit_cgroup=%s\ncwd_identity=%s\nroot_identity=%s\nleaked_namespace_fds=%s\ncgroup_filesystem=%s\ncontrollers=%s\ncpu_max=%s\npids_max=%s\npids_current=%s\nmemory_max=%s\nmemory_current=%s\nnr_throttled_before=%s\nnr_throttled_after=%s\n' \
+    "$0" "$self_pid" "$self_cgroup" "$init_pid" "$init_cgroup" "$cwd_identity" "$root_identity" "$leaked_namespace_fds" "$cgroup_filesystem" "$controllers" \
+    "$cpu_max" "$pids_max" "$pids_current" \
+    "$memory_max" "$memory_current" "$before" "$after"
+test "$self_cgroup" = "$init_cgroup"
+test "$cwd_identity" = "$root_identity"
+test "$leaked_namespace_fds" -eq 0
+test "$cgroup_filesystem" = cgroup2
+echo "$controllers" | /bin/busybox grep -qw cpu
+echo "$controllers" | /bin/busybox grep -qw pids
+test "$cpu_max" = '50000 100000'
+test "$pids_max" = '64'
+test "$pids_current" -gt 0
+test "$pids_current" -le "$pids_max"
+if [ "$memory_current" != absent ]; then
+    test "$memory_max" = max || test "$memory_max" -gt 0
+    test "$memory_current" -ge 0
+fi
+test "$after" -gt "$before""#;
+
+fn cgroup_probe_config(mode: &str, pty: bool) -> ExecConfig {
+    ExecConfig {
+        execution_id: pty.then(|| format!("cgroup-probe-{mode}")),
+        cmd: vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            CGROUP_EXEC_PROBE.to_string(),
+            mode.to_string(),
+        ],
+        pty,
+        timeout: Some(Duration::from_secs(30)),
+        ..ExecConfig::default()
+    }
+}
+
+fn normalized_probe_output(output: &str) -> String {
+    output.replace('\r', "")
+}
+
+#[allow(clippy::print_stderr)]
+fn assert_cgroup_probe(mode: &str, output: &vz::protocol::ExecOutput) {
+    let stdout = normalized_probe_output(&output.stdout);
+    eprintln!("cgroup exec evidence ({mode}):\n{stdout}");
+    assert_eq!(
+        output.exit_code, 0,
+        "{mode} cgroup probe failed: stdout={stdout} stderr={}",
+        output.stderr
+    );
+    let evidence: std::collections::HashMap<&str, &str> = stdout
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    assert_eq!(evidence.get("mode"), Some(&mode));
+    assert!(
+        evidence
+            .get("self_pid")
+            .is_some_and(|pid| pid.parse::<u32>().is_ok())
+    );
+    assert!(
+        evidence
+            .get("init_pid")
+            .is_some_and(|pid| pid.parse::<u32>().is_ok())
+    );
+    assert_eq!(evidence.get("self_cgroup"), evidence.get("init_cgroup"));
+    assert_eq!(evidence.get("cwd_identity"), evidence.get("root_identity"));
+    assert_eq!(evidence.get("leaked_namespace_fds"), Some(&"0"));
+    assert_eq!(evidence.get("cgroup_filesystem"), Some(&"cgroup2"));
+    let controllers = evidence["controllers"];
+    assert!(controllers.split_whitespace().any(|item| item == "cpu"));
+    assert!(controllers.split_whitespace().any(|item| item == "pids"));
+    assert_eq!(evidence.get("cpu_max"), Some(&"50000 100000"));
+    assert_eq!(evidence.get("pids_max"), Some(&"64"));
+    let pids_current: u64 = evidence["pids_current"].parse().unwrap();
+    assert!((1..=64).contains(&pids_current));
+    match (evidence.get("memory_max"), evidence.get("memory_current")) {
+        (Some(&"absent"), Some(&"absent")) => {}
+        (Some(memory_max), Some(memory_current)) => {
+            assert!(*memory_max == "max" || memory_max.parse::<u64>().is_ok());
+            let _: u64 = memory_current.parse().unwrap();
+        }
+        values => panic!("incomplete memory controller evidence for {mode}: {values:?}"),
+    }
+    let before: u64 = evidence["nr_throttled_before"].parse().unwrap();
+    let after: u64 = evidence["nr_throttled_after"].parse().unwrap();
+    assert!(
+        after > before,
+        "{mode} CPU work was not throttled: before={before} after={after}"
+    );
+}
+
+fn assert_callback_stdout_precedes_exit(mode: &str, events: &[InteractiveExecEvent]) {
+    assert!(
+        matches!(events.last(), Some(InteractiveExecEvent::Exit(0))),
+        "{mode} callback must end with Exit(0): {events:?}"
+    );
+    let exit_index = events.len() - 1;
+    assert!(
+        events[..exit_index].iter().any(|event| matches!(
+            event,
+            InteractiveExecEvent::Stdout(bytes)
+                if !normalized_probe_output(&String::from_utf8_lossy(bytes)).is_empty()
+        )),
+        "{mode} callback emitted no stdout before Exit(0): {events:?}"
+    );
+}
+
+/// Verify every Linux container exec adapter joins the target cgroup before
+/// launching bounded CPU work and inherits its CPU, pids, and memory controls.
 #[tokio::test]
 #[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn cgroup_cpu_max_enforcement() {
@@ -673,105 +811,72 @@ async fn cgroup_cpu_max_enforcement() {
     let tmp = tempfile::tempdir().unwrap();
     let rt = test_runtime(tmp.path());
 
-    // Create a long-lived container with cpu_quota=50000 / cpu_period=100000
-    // (0.5 CPU). Its init process saturates one CPU for at most 30 seconds,
-    // leaving ample time for the observer exec below while bounding the load
-    // independently of test cleanup.
-    let container_id = rt
+    let create_result = rt
         .create_container(
             "alpine:latest",
             RunConfig {
-                cmd: vec![
-                    "sh".into(),
-                    "-c".into(),
-                    "/bin/busybox timeout 30 /bin/busybox sh -c 'while :; do :; done' || true; exec /bin/busybox sleep 300".into(),
-                ],
+                cmd: vec!["/bin/busybox".into(), "sleep".into(), "300".into()],
                 execution_mode: ExecutionMode::OciRuntime,
                 cpu_quota: Some(50_000),
                 cpu_period: Some(100_000),
+                pids_limit: Some(64),
                 ..RunConfig::default()
             },
         )
-        .await
-        .unwrap();
-
-    // Require the declared cgroup v2 contract and observe the init process's
-    // bounded CPU load. Exec is intentionally only an observer: exec cgroup
-    // membership is covered separately from creation-time quota enforcement.
-    let exec_result = rt
-        .exec_container(
-            &container_id,
-            ExecConfig {
-                cmd: vec![
-                    "sh".into(),
-                    "-c".into(),
-                    "set -eu; \
-                     grep -q ' /sys/fs/cgroup cgroup2 ' /proc/mounts; \
-                     controllers=$(cat /sys/fs/cgroup/cgroup.controllers); \
-                     echo \"$controllers\" | grep -qw cpu; \
-                     cpu_max=$(cat /sys/fs/cgroup/cpu.max); \
-                     before=$(awk '$1 == \"nr_throttled\" { print $2 }' /sys/fs/cgroup/cpu.stat); \
-                     test -n \"$before\"; \
-                     sleep 3; \
-                     after=$(awk '$1 == \"nr_throttled\" { print $2 }' /sys/fs/cgroup/cpu.stat); \
-                     test -n \"$after\"; \
-                     printf 'cgroup_filesystem=cgroup2\\ncontrollers=%s\\ncpu_max=%s\\nnr_throttled_before=%s\\nnr_throttled_after=%s\\n' \
-                         \"$controllers\" \"$cpu_max\" \"$before\" \"$after\"; \
-                     test \"$after\" -gt \"$before\""
-                        .into(),
-                ],
-                ..ExecConfig::default()
-            },
-        )
         .await;
+    let mut streaming_events = Vec::new();
+    let mut pty_events = Vec::new();
+    let (unary_result, streaming_result, pty_result, stop_result, remove_result) =
+        match &create_result {
+            Ok(container_id) => {
+                let unary_result = rt
+                    .exec_container_oci_unary(container_id, cgroup_probe_config("oci-unary", false))
+                    .await;
+                let streaming_result = rt
+                    .exec_container_streaming(
+                        container_id,
+                        cgroup_probe_config("streaming", false),
+                        |event| streaming_events.push(event),
+                    )
+                    .await;
+                let pty_result = rt
+                    .exec_container_streaming(
+                        container_id,
+                        cgroup_probe_config("pty", true),
+                        |event| pty_events.push(event),
+                    )
+                    .await;
+                let stop_result = rt.stop_container(container_id, true, None, None).await;
+                let remove_result = rt.remove_container(container_id).await;
+                (
+                    Some(unary_result),
+                    Some(streaming_result),
+                    Some(pty_result),
+                    Some(stop_result),
+                    Some(remove_result),
+                )
+            }
+            Err(_) => (None, None, None, None, None),
+        };
 
-    // Always attempt cleanup before evaluating evidence so a failing
-    // assertion cannot leave the CPU workload or VM running.
-    let stop_result = rt.stop_container(&container_id, true, None, None).await;
-    let remove_result = rt.remove_container(&container_id).await;
+    let container_id = create_result.unwrap();
+    let unary = unary_result.unwrap().unwrap();
+    let streaming = streaming_result.unwrap().unwrap();
+    let pty = pty_result.unwrap().unwrap();
+    assert!(
+        stop_result.unwrap().is_ok(),
+        "container cleanup stop failed for {container_id}"
+    );
+    assert!(
+        remove_result.unwrap().is_ok(),
+        "container cleanup remove failed for {container_id}"
+    );
 
-    let exec_out = exec_result.unwrap();
-    eprintln!("cgroup CPU enforcement evidence:\n{}", exec_out.stdout);
-
-    assert_eq!(
-        exec_out.exit_code, 0,
-        "cgroup v2 CPU enforcement probe should succeed: stdout={} stderr={}",
-        exec_out.stdout, exec_out.stderr
-    );
-
-    let evidence: std::collections::HashMap<&str, &str> = exec_out
-        .stdout
-        .lines()
-        .filter_map(|line| line.split_once('='))
-        .collect();
-    assert_eq!(evidence.get("cgroup_filesystem"), Some(&"cgroup2"));
-    assert!(
-        evidence
-            .get("controllers")
-            .is_some_and(|controllers| controllers.split_whitespace().any(|item| item == "cpu")),
-        "cgroup.controllers should contain cpu: {}",
-        exec_out.stdout
-    );
-    assert_eq!(
-        evidence.get("cpu_max"),
-        Some(&"50000 100000"),
-        "cpu.max should reflect quota=50000 period=100000 (0.5 CPU): {}",
-        exec_out.stdout
-    );
-    let before: u64 = evidence["nr_throttled_before"].parse().unwrap();
-    let after: u64 = evidence["nr_throttled_after"].parse().unwrap();
-    assert!(
-        after > before,
-        "CPU saturation should increment nr_throttled: before={before} after={after}"
-    );
-    assert!(
-        stop_result.is_ok(),
-        "container cleanup stop failed: {stop_result:?}"
-    );
-    assert!(
-        remove_result.is_ok(),
-        "container cleanup remove failed: {remove_result:?}"
-    );
+    assert_cgroup_probe("oci-unary", &unary);
+    assert_cgroup_probe("streaming", &streaming);
+    assert_cgroup_probe("pty", &pty);
+    assert_callback_stdout_precedes_exit("streaming", &streaming_events);
+    assert_callback_stdout_precedes_exit("pty", &pty_events);
 }
 
 // ── Shared VM inter-service connectivity ────────────────────────
@@ -897,7 +1002,32 @@ async fn shared_vm_inter_service_connectivity() {
         ping_by_ip.stderr
     );
 
-    // 5. Exec ping by hostname: db → web.
+    // 5. Retain the actual post-start hosts file before relying on it for
+    // hostname connectivity. This proves the typed container exec write
+    // reached the target mount namespace rather than merely exiting zero.
+    let hosts_evidence = rt
+        .exec_container(
+            &db_id,
+            ExecConfig {
+                cmd: vec!["/bin/busybox".into(), "cat".into(), "/etc/hosts".into()],
+                timeout: Some(Duration::from_secs(30)),
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    eprintln!("db /etc/hosts evidence:\n{}", hosts_evidence.stdout);
+    assert_eq!(hosts_evidence.exit_code, 0);
+    assert!(
+        hosts_evidence.stdout.lines().any(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            fields == ["172.20.0.2", "web"]
+        }),
+        "db /etc/hosts omitted web mapping: {}",
+        hosts_evidence.stdout
+    );
+
+    // 6. Exec ping by hostname: db → web.
     let ping_by_name = rt
         .exec_container(
             &db_id,
@@ -924,7 +1054,7 @@ async fn shared_vm_inter_service_connectivity() {
         ping_by_name.stderr
     );
 
-    // 6. Tear down.
+    // 7. Tear down.
     let _ = rt
         .network_teardown(stack_id, vec!["web".to_string(), "db".to_string()])
         .await;

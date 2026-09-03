@@ -50,6 +50,20 @@ pub(super) fn require_successful_hosts_write(
     )))
 }
 
+const WRITE_HOSTS_SCRIPT: &str = "set -eu; printf '%s' \"$1\" > /etc/hosts";
+
+pub(super) fn hosts_write_command(content: String) -> (String, Vec<String>) {
+    (
+        "/bin/sh".to_string(),
+        vec![
+            "-c".to_string(),
+            WRITE_HOSTS_SCRIPT.to_string(),
+            "vz-write-hosts".to_string(),
+            content,
+        ],
+    )
+}
+
 pub(super) fn activation_error_with_rollback(
     activation_error: OciError,
     rollback: Result<(), OciError>,
@@ -679,7 +693,7 @@ impl Runtime {
         }
 
         // extra_hosts are written AFTER the container starts (step 5) via
-        // oci_exec inside the container's mount namespace. Writing before
+        // typed container exec. Writing before
         // start (via guest exec or bind mount) fails due to VirtioFS caching
         // and youki's pivot_root creating an isolated mount tree.
 
@@ -784,50 +798,43 @@ impl Runtime {
         // Step 5: Write /etc/hosts inside the running container via oci_exec.
         // This writes directly into the container's mount namespace after
         // pivot_root, avoiding VirtioFS caching and overlay visibility issues.
-        let initial_pid = match self
+        if let Err(error) = self
             .validate_stack_container_running(&vm, &oci_container_id, "post-start")
             .await
         {
-            Ok(pid) => pid,
-            Err(error) => {
-                let rollback = self
-                    .rollback_stack_container_activation(
-                        &vm,
-                        stack_id,
-                        &oci_container_id,
-                        &container_id,
-                        &mut container,
-                        rootfs_dir.as_ref(),
-                    )
-                    .await;
-                return Err(activation_error_with_rollback(error, rollback));
-            }
-        };
+            let rollback = self
+                .rollback_stack_container_activation(
+                    &vm,
+                    stack_id,
+                    &oci_container_id,
+                    &container_id,
+                    &mut container,
+                    rootfs_dir.as_ref(),
+                )
+                .await;
+            return Err(activation_error_with_rollback(error, rollback));
+        }
 
         if !run.extra_hosts.is_empty() {
             tracing::debug!(
                 container_id = %oci_container_id,
-                pid = initial_pid,
-                "step 5: write /etc/hosts via nsenter streaming exec"
+                "step 5: write /etc/hosts via typed container exec"
             );
-            let mut printf_content = String::from("127.0.0.1\\tlocalhost\\n::1\\tlocalhost\\n");
+            let mut printf_content = String::from("127.0.0.1\tlocalhost\n::1\tlocalhost\n");
             for (hostname, ip) in &run.extra_hosts {
-                printf_content.push_str(&format!("{ip}\\t{hostname}\\n"));
+                printf_content.push_str(&format!("{ip}\t{hostname}\n"));
             }
+            let (hosts_command, hosts_args) = hosts_write_command(printf_content);
             let hosts_result = vm
-                .exec_collect(
-                    "/bin/busybox".to_string(),
-                    vec![
-                        "nsenter".to_string(),
-                        format!("--mount=/proc/{initial_pid}/ns/mnt"),
-                        format!("--root=/proc/{initial_pid}/root"),
-                        "--wd=/".to_string(),
-                        "--".to_string(),
-                        "/bin/sh".to_string(),
-                        "-c".to_string(),
-                        format!("printf '{printf_content}' > /etc/hosts"),
-                    ],
+                .exec_container_collect_with_options(
+                    oci_container_id.clone(),
+                    hosts_command,
+                    hosts_args,
                     Duration::from_secs(30),
+                    ExecOptions {
+                        working_dir: Some("/".to_string()),
+                        ..ExecOptions::default()
+                    },
                 )
                 .await
                 .map_err(OciError::from)
@@ -835,7 +842,6 @@ impl Runtime {
             if let Err(error) = hosts_result {
                 tracing::error!(
                     container_id = %oci_container_id,
-                    pid = initial_pid,
                     error = %error,
                     "step 5 FAILED: /etc/hosts write"
                 );
@@ -853,7 +859,6 @@ impl Runtime {
             }
             tracing::debug!(
                 container_id = %oci_container_id,
-                pid = initial_pid,
                 "step 5 OK: /etc/hosts written"
             );
         }

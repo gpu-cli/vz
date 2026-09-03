@@ -11,7 +11,7 @@ use vz_agent_proto::SystemInfoResponse;
 use vz_agent_proto::{DockerEnsureEvent, docker_ensure_event};
 
 use crate::grpc_client::{GrpcAgentClient, GrpcExecStream, GrpcPortForwardStream};
-use crate::{ExecOptions, LinuxError, LinuxVmConfig};
+use crate::{ExecOptions, LinuxError, LinuxVmConfig, OciExecOptions};
 
 const AGENT_POLL_INITIAL: Duration = Duration::from_millis(50);
 const AGENT_POLL_MAX: Duration = Duration::from_secs(1);
@@ -321,6 +321,48 @@ impl LinuxVm {
         client.exec_stream(command, args, options).await
     }
 
+    /// Run a raw command inside a running OCI container and return its stream.
+    pub async fn exec_container_stream_with_options(
+        &self,
+        container_id: String,
+        command: String,
+        args: Vec<String>,
+        options: ExecOptions,
+    ) -> Result<GrpcExecStream, LinuxError> {
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
+        client
+            .exec_container_stream(container_id, command, args, options)
+            .await
+    }
+
+    /// Run and collect a raw command inside a running OCI container.
+    pub async fn exec_container_collect_with_options(
+        &self,
+        container_id: String,
+        command: String,
+        args: Vec<String>,
+        timeout: Duration,
+        options: ExecOptions,
+    ) -> Result<ExecOutput, LinuxError> {
+        tokio::time::timeout(timeout, async {
+            let stream = self
+                .exec_container_stream_with_options(container_id, command, args, options)
+                .await?;
+            Ok::<ExecOutput, LinuxError>(stream.collect().await)
+        })
+        .await
+        .map_err(|_| {
+            LinuxError::Protocol(format!(
+                "container exec timed out after {:.3}s",
+                timeout.as_secs_f64()
+            ))
+        })?
+    }
+
     /// Run a command on the guest, collect output via streaming, with a timeout.
     ///
     /// Convenience wrapper: opens a stream, collects all events, applies timeout.
@@ -501,6 +543,22 @@ impl LinuxVm {
         state_result
     }
 
+    /// Execute through the OCI service's bounded unary compatibility RPC.
+    pub async fn oci_exec(
+        &self,
+        id: String,
+        command: String,
+        args: Vec<String>,
+        options: OciExecOptions,
+    ) -> Result<ExecOutput, LinuxError> {
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
+        client.oci_exec(id, command, args, options).await
+    }
+
     /// Signal a running container in the guest OCI runtime.
     pub async fn oci_kill(&self, id: String, signal: String) -> Result<(), LinuxError> {
         self.ensure_grpc().await?;
@@ -599,6 +657,34 @@ impl LinuxVm {
             }
         }
         interactive_result
+    }
+
+    /// Execute a raw command inside a running OCI container with a PTY.
+    pub async fn exec_container_interactive(
+        &self,
+        container_id: String,
+        command: &str,
+        args: &[&str],
+        options: ExecOptions,
+        rows: u32,
+        cols: u32,
+    ) -> Result<(crate::grpc_client::GrpcExecStream, u64), LinuxError> {
+        let mut client =
+            GrpcAgentClient::connect(Arc::clone(&self.vm), vz::protocol::AGENT_PORT).await?;
+        client.ping().await?;
+        let info = client.system_info().await?;
+        validate_guest_system_info(&info)?;
+        let args_owned = args.iter().map(|arg| (*arg).to_string()).collect();
+        client
+            .exec_container_stream_interactive(
+                container_id,
+                command.to_string(),
+                args_owned,
+                options,
+                rows,
+                cols,
+            )
+            .await
     }
 
     /// Write data to a running exec's stdin (or PTY master).
