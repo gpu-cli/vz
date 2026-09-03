@@ -17,7 +17,10 @@ use vz::{NetworkConfig, SharedDirConfig};
 use vz_image::{
     ImageConfigSummary, ImageId, ImagePuller, ImageStore, parse_image_config_summary_from_store,
 };
-use vz_linux::{ExecOptions, KernelPaths, LinuxError, LinuxVm, LinuxVmConfig, OciExecOptions};
+use vz_linux::{
+    ContainerExecDispatchGate, ExecOptions, KernelPaths, LinuxError, LinuxVm, LinuxVmConfig,
+    OciExecOptions,
+};
 use vz_oci::bundle::{BundleMount, BundleSpec, write_oci_bundle};
 use vz_oci::container_store::{
     ContainerGeneration, ContainerGenerationDiagnostic, ContainerIdLease, ContainerInfo,
@@ -63,7 +66,8 @@ use self::bundle::{
 };
 #[cfg(test)]
 use self::exec::{
-    container_ready_generation, resolve_container_exec_binding, resolve_container_exec_options,
+    ExecStartInterruption, await_exec_start, container_ready_generation,
+    resolve_container_exec_binding, resolve_container_exec_options,
 };
 #[cfg(test)]
 use self::oci_lifecycle::{
@@ -233,7 +237,9 @@ pub struct RuntimeLifecycleDiagnostics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeLifecycleAdmissionKind {
     CreateBeforeReservation,
+    CreateAfterReservation,
     ExecBeforeGuestRpc,
+    ExecGuestRpcReadyBeforeOwner,
     ExecGuestReady,
     StackRoutePublishedBeforeOverlay,
     StackOverlaySetupStarting,
@@ -271,10 +277,41 @@ pub type RuntimeLifecycleObserver =
     tokio::sync::mpsc::UnboundedReceiver<RuntimeLifecycleAdmissionEvent>;
 
 #[derive(Clone)]
-struct InteractiveExecSession {
+struct ContainerExecSession {
     vm: Arc<LinuxVm>,
-    guest_exec_id: u64,
     pty_enabled: bool,
+    control: Arc<Mutex<()>>,
+    state: Arc<Mutex<ContainerExecSessionState>>,
+    start_cancel: Arc<tokio::sync::Notify>,
+    terminal: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Debug)]
+enum ContainerExecSessionState {
+    Starting {
+        pending: PendingExecControls,
+        dispatch_gate: Option<ContainerExecDispatchGate>,
+    },
+    Running {
+        guest_exec_id: u64,
+        cancel_requested: bool,
+    },
+    Finished,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PendingExecControls {
+    operations: Vec<PendingExecControl>,
+    stdin_bytes: usize,
+    cancel_requested: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PendingExecControl {
+    Signal(i32),
+    Stdin(Vec<u8>),
+    Resize { rows: u32, cols: u32 },
+    Cancel,
 }
 
 /// Immutable process defaults captured from the fully resolved container
@@ -469,7 +506,7 @@ pub struct Runtime {
     /// the guest VM with copy-truncate semantics.
     log_rotation_tasks: Arc<Mutex<HashMap<String, LogRotationTask>>>,
     /// Active interactive execution sessions keyed by daemon execution_id.
-    exec_sessions: Arc<Mutex<HashMap<String, InteractiveExecSession>>>,
+    exec_sessions: Arc<Mutex<HashMap<String, ContainerExecSession>>>,
     /// Public exec bindings for durably running containers.
     ///
     /// Each record atomically couples a VM generation to its immutable
@@ -693,21 +730,30 @@ impl Runtime {
             .container_store
             .reserve_generation_with_write_lease(&id, &os_guard)
             .map_err(|error| Self::map_container_store_error(&id, error))?;
-        self.setup_restored_containers.lock().await.remove(&id);
-        self.oci_deleted_pending_overlay
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id);
-        Ok(ContainerLifecycleTransaction {
+        // Take cleanup ownership before the next await. If the caller drops
+        // this future after the durable reservation, the lease releases that
+        // exact unpublished generation instead of stranding the ID.
+        let transaction = ContainerLifecycleTransaction {
             lease: Some(ContainerLifecycleLease {
-                container_id: id,
+                container_id: id.clone(),
                 generation,
                 container_store: self.container_store.clone(),
                 _os_guard: os_guard,
                 _stack_guard: stack_guard,
                 _container_guard: container_guard,
             }),
-        })
+        };
+        self.observe_lifecycle_admission(
+            RuntimeLifecycleAdmissionKind::CreateAfterReservation,
+            &id,
+        )
+        .await;
+        self.setup_restored_containers.lock().await.remove(&id);
+        self.oci_deleted_pending_overlay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+        Ok(transaction)
     }
 
     async fn begin_existing_container(
@@ -1486,7 +1532,22 @@ impl Runtime {
     /// Pull an image, assemble its rootfs and execute a command.
     pub async fn run(&self, image: &str, mut run: RunConfig) -> Result<ExecOutput, OciError> {
         let mut transaction = self.begin_container_create(&mut run, None).await?;
-        self.run_in_transaction(image, run, &mut transaction).await
+        let runtime = self.clone();
+        let image = image.to_string();
+        // The worker owns the lifecycle transaction. Dropping the public
+        // future therefore detaches a task that still completes VM shutdown,
+        // rootfs cleanup, metadata finalization, and generation release.
+        tokio::spawn(async move {
+            runtime
+                .run_in_transaction(&image, run, &mut transaction)
+                .await
+        })
+        .await
+        .map_err(|error| {
+            OciError::InvalidConfig(format!(
+                "one-shot container lifecycle task failed while retaining its owned generation: {error}"
+            ))
+        })?
     }
 
     async fn run_in_transaction(
@@ -1518,10 +1579,9 @@ impl Runtime {
             host_pid: Some(process::id()),
         };
 
-        self.persist_owned(transaction, container.clone())?;
-
-        // Resolve fallible config before starting assembly. Assembly is kept in
-        // this transaction instead of a detached spawn_blocking task.
+        // Resolve every fallible image/run/lifecycle option before publishing
+        // Created metadata. If any of these steps rejects the request, dropping
+        // the still-unpublished transaction releases its exact generation.
         let image_config = parse_image_config_summary_from_store(&self.store, &image_id.0)?;
         let run = resolve_run_config(image_config, run, &container_id)?;
         let lifecycle = resolve_container_lifecycle(
@@ -1529,6 +1589,7 @@ impl Runtime {
             ContainerLifecycleClass::Ephemeral,
             true,
         )?;
+        self.persist_owned(transaction, container.clone())?;
 
         let rootfs_dir = match self
             .assemble_rootfs_in_transaction(&image_id.0, transaction)
@@ -1562,8 +1623,9 @@ impl Runtime {
             }
         };
 
-        // Deregister VM handle after run completes.
-        self.vm_handles.lock().await.remove(&container_id);
+        // Each transient runner removes only its pointer-identical recovery
+        // route after terminal VM proof. An unconditional removal here could
+        // race a later public rootfs run that legitimately reused the ID.
         self.cleanup_owned_rootfs(transaction, rootfs_dir.as_ref());
 
         container.status = match &output {

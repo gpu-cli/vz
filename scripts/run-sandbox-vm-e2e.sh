@@ -32,13 +32,14 @@ Build, sign, and execute real-VM sandbox E2E suites.
 
 Options:
   --profile <debug|release>   Cargo profile for builds (default: debug)
+                              complete runtime-containing lanes require release
   --suite <name>              Suite to run (repeatable, comma-separated allowed)
                               names: runtime, stack, buildkit, sandbox, all
                               default: sandbox (runtime + stack)
   --scenario <name>           Run named use-case scenario(s) (repeatable/comma-separated)
                               names:
                                 runtime-smoke, runtime-lifecycle, runtime-container-id-ownership,
-                                runtime-exec-semantics,
+                                runtime-exec-semantics, runtime-exec-supervision,
                                 runtime-exec-defaults,
                                 runtime-port-forwarding, runtime-shared-vm-net, stack-real-services,
                                 stack-control-socket, stack-port-forwarding,
@@ -141,7 +142,7 @@ expand_scenario_token() {
         case "$part" in
             "")
                 ;;
-            runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net|stack-real-services|stack-control-socket|stack-port-forwarding|stack-container-ownership|stack-snapshot-restore|stack-user-journey-checkpoint|buildkit-roundtrip)
+            runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-supervision|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net|stack-real-services|stack-control-socket|stack-port-forwarding|stack-container-ownership|stack-snapshot-restore|stack-user-journey-checkpoint|buildkit-roundtrip)
                 append_unique_scenario "$part"
                 ;;
             sandbox-usecases)
@@ -162,6 +163,7 @@ expand_scenario_token() {
                 append_unique_scenario "runtime-lifecycle"
                 append_unique_scenario "runtime-container-id-ownership"
                 append_unique_scenario "runtime-exec-semantics"
+                append_unique_scenario "runtime-exec-supervision"
                 append_unique_scenario "runtime-exec-defaults"
                 append_unique_scenario "runtime-port-forwarding"
                 append_unique_scenario "runtime-shared-vm-net"
@@ -181,7 +183,7 @@ expand_scenario_token() {
 
 scenario_suite() {
     case "$1" in
-        runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net)
+        runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-supervision|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net)
             echo "runtime"
             ;;
         stack-real-services|stack-control-socket|stack-port-forwarding|stack-container-ownership|stack-snapshot-restore)
@@ -212,6 +214,9 @@ scenario_test_filter() {
             ;;
         runtime-exec-semantics)
             echo "container_exec_user_environment_semantics"
+            ;;
+        runtime-exec-supervision)
+            echo "runtime_exec_supervision"
             ;;
         runtime-exec-defaults)
             echo "container_exec_inherits_image_process_defaults"
@@ -317,6 +322,21 @@ fi
 
 if [[ ${#RESOLVED_SUITES[@]} -eq 0 ]]; then
     err "no suites selected"
+fi
+
+EXEC_SUPERVISION_LANE_SELECTED=false
+if [[ ${#RESOLVED_SCENARIOS[@]} -eq 0 ]]; then
+    for selected_suite in "${RESOLVED_SUITES[@]}"; do
+        if [[ "$selected_suite" == "runtime" ]]; then
+            EXEC_SUPERVISION_LANE_SELECTED=true
+            break
+        fi
+    done
+elif [[ " ${RESOLVED_SCENARIOS[*]} " == *" runtime-exec-supervision "* ]]; then
+    EXEC_SUPERVISION_LANE_SELECTED=true
+fi
+if [[ "$EXEC_SUPERVISION_LANE_SELECTED" == "true" && "$PROFILE" != "release" ]]; then
+    err "every lane that emits runtime-exec-supervision evidence requires --profile release"
 fi
 
 BUILDKIT_SELECTED=false
@@ -428,6 +448,8 @@ STACK_TEARDOWN_EVIDENCE="$RUN_DIR/stack-port-forwarding-teardown.json"
 STACK_TEARDOWN_SHA256="$RUN_DIR/stack-port-forwarding-teardown.json.sha256"
 STACK_CONTAINER_OWNERSHIP_EVIDENCE="$RUN_DIR/stack-container-ownership.json"
 STACK_CONTAINER_OWNERSHIP_SHA256="$RUN_DIR/stack-container-ownership.json.sha256"
+EXEC_SUPERVISION_EVIDENCE="$RUN_DIR/runtime-exec-supervision.json"
+EXEC_SUPERVISION_SHA256="$RUN_DIR/runtime-exec-supervision.json.sha256"
 
 BUILDKIT_ARCHIVE_BASENAME="vz-buildkit-v0.19.0-linux-arm64.tar"
 BUILDKIT_SHA256_BASENAME="$BUILDKIT_ARCHIVE_BASENAME.sha256"
@@ -787,6 +809,459 @@ validate_container_id_ownership_evidence() {
         (.final.generation_released == true) and
         (.final.host_maps_clean == true) and
         (.final.orphan_setup_tmp == [])
+    ' "$evidence_file" >/dev/null
+}
+
+validate_exec_supervision_evidence() {
+    local evidence_file="$1"
+    local expected_profile="$2"
+    local expected_test_binary_sha256="$3"
+    local expected_developer_initramfs_sha256="$4"
+
+    # The stable `unary` evidence label denotes the synchronous/unary-shaped
+    # host adapter. It runs over the supervised stream; raw legacy
+    # OciService.Exec is retired and cannot satisfy this release gate.
+    jq -e \
+        --arg expected_profile "$expected_profile" \
+        --arg expected_test_binary_sha256 "$expected_test_binary_sha256" \
+        --arg expected_developer_initramfs_sha256 "$expected_developer_initramfs_sha256" '
+        def integer: type == "number" and . >= 0 and . == floor;
+        def sha256: type == "string" and test("^[0-9a-f]{64}$");
+        def build_identity:
+            ((keys | sort) == ([
+                "developer_initramfs_sha256", "profile", "test_binary_sha256"
+            ] | sort)) and
+            (.profile == "release") and
+            (.profile == $expected_profile) and
+            (.test_binary_sha256 | sha256) and
+            (.test_binary_sha256 == $expected_test_binary_sha256) and
+            (.developer_initramfs_sha256 | sha256) and
+            (.developer_initramfs_sha256 == $expected_developer_initramfs_sha256);
+        def member:
+            ((keys | sort) == (["pgid", "pid", "start_time"] | sort)) and
+            (.pid | integer) and (.pid > 0) and
+            (.start_time | integer) and (.start_time > 0) and
+            (.pgid | integer) and (.pgid > 0);
+        def identity:
+            ((keys | sort) == ([
+                "cgroup_path", "child_container_pgid", "child_container_pid",
+                "child_host_pgid", "child_host_pid", "child_start_time",
+                "container_pgid", "container_pid", "host_pgid", "host_pid",
+                "start_time"
+            ] | sort)) and
+            ((.cgroup_path | type) == "string") and
+            (.cgroup_path | startswith("/")) and
+            (.container_pid | integer) and (.container_pid > 0) and
+            (.host_pid | integer) and (.host_pid > 0) and
+            (.start_time | integer) and (.start_time > 0) and
+            (.container_pgid | integer) and (.container_pgid > 0) and
+            (.host_pgid | integer) and (.host_pgid > 0) and
+            (.child_container_pid | integer) and (.child_container_pid > 0) and
+            (.child_host_pid | integer) and (.child_host_pid > 0) and
+            (.child_start_time | integer) and (.child_start_time > 0) and
+            (.child_container_pgid | integer) and (.child_container_pgid > 0) and
+            (.child_host_pgid | integer) and (.child_host_pgid > 0) and
+            (.child_container_pgid == .container_pgid) and
+            (.child_host_pgid == .host_pgid) and
+            (.child_host_pid != .host_pid);
+        def cell($cgroup_path):
+            ((keys | sort) == ([
+                "active_cgroup_members", "adapter", "baseline_cgroup_members",
+                "cgroup_restored", "elapsed_ms", "execution_id",
+                "expected_exit_code", "identity", "marker_removed",
+                "observed_exit_code", "post_case_probe", "process_identity_absent",
+                "pty_resized", "session_reaped", "signal", "termination",
+                "timed_out", "timeout_requested_ms"
+            ] | sort)) and
+            (.adapter == "unary" or .adapter == "streaming" or .adapter == "pty") and
+            (.termination == "term" or .termination == "int" or
+                .termination == "kill" or .termination == "timeout") and
+            (.execution_id == ("exec-supervision-" + .adapter + "-" + .termination)) and
+            (.identity | identity) and
+            (.identity.cgroup_path == $cgroup_path) and
+            ((.baseline_cgroup_members | type) == "array") and
+            ((.baseline_cgroup_members | length) == 1) and
+            (all(.baseline_cgroup_members[]; member)) and
+            ((.active_cgroup_members | type) == "array") and
+            ((.active_cgroup_members | length) > (.baseline_cgroup_members | length)) and
+            (all(.active_cgroup_members[]; member)) and
+            (.identity.host_pid as $pid |
+                any(.active_cgroup_members[]; .pid == $pid)) and
+            (.identity.child_host_pid as $pid |
+                any(.active_cgroup_members[]; .pid == $pid)) and
+            (.cgroup_restored == true) and
+            (.process_identity_absent == true) and
+            (.session_reaped == true) and
+            (.marker_removed == true) and
+            (.post_case_probe == true) and
+            (.pty_resized == (.adapter == "pty")) and
+            (.elapsed_ms | integer) and (.elapsed_ms > 0) and
+            (if .termination == "timeout" then
+                .signal == null and .expected_exit_code == null and
+                .observed_exit_code == null and .timed_out == true and
+                .timeout_requested_ms == 2000 and
+                .elapsed_ms >= .timeout_requested_ms and
+                .elapsed_ms <= (.timeout_requested_ms + 4000)
+             elif .termination == "term" then
+                .signal == "SIGTERM" and .expected_exit_code == 143 and
+                .observed_exit_code == 143 and .timed_out == false and
+                .timeout_requested_ms == null
+             elif .termination == "int" then
+                .signal == "SIGINT" and .expected_exit_code == 130 and
+                .observed_exit_code == 130 and .timed_out == false and
+                .timeout_requested_ms == null
+             else
+                .signal == "SIGKILL" and .expected_exit_code == 137 and
+                .observed_exit_code == 137 and .timed_out == false and
+                .timeout_requested_ms == null
+             end);
+        def normal_exit($cgroup_path):
+            ((keys | sort) == ([
+                "active_cgroup_members", "adapter", "baseline_cgroup_members",
+                "cgroup_restored", "child_identity_absent", "execution_id",
+                "exit_code", "identity", "leader_identity_absent",
+                "markers_removed", "post_case_probe", "session_reaped"
+            ] | sort)) and
+            (.adapter == "streaming") and
+            (.execution_id == "exec-supervision-normal-exit") and
+            (.exit_code == 0) and
+            (.identity | identity) and
+            (.identity.cgroup_path == $cgroup_path) and
+            ((.baseline_cgroup_members | type) == "array") and
+            ((.baseline_cgroup_members | length) == 1) and
+            (all(.baseline_cgroup_members[]; member)) and
+            ((.active_cgroup_members | type) == "array") and
+            ((.active_cgroup_members | length) > (.baseline_cgroup_members | length)) and
+            (all(.active_cgroup_members[]; member)) and
+            (.identity.host_pid as $pid |
+                any(.active_cgroup_members[]; .pid == $pid)) and
+            (.identity.child_host_pid as $pid |
+                any(.active_cgroup_members[]; .pid == $pid)) and
+            (.cgroup_restored == true) and
+            (.leader_identity_absent == true) and
+            (.child_identity_absent == true) and
+            (.session_reaped == true) and
+            (.markers_removed == true) and
+            (.post_case_probe == true);
+        def cancellation($cgroup_path):
+            ((keys | sort) == ([
+                "active_cgroup_members", "adapter", "baseline_cgroup_members",
+                "cgroup_restored", "child_identity_absent", "execution_id",
+                "exit_code", "identity", "leader_identity_absent",
+                "marker_removed", "post_case_probe", "session_reaped"
+            ] | sort)) and
+            (.adapter == "streaming") and
+            (.execution_id == "exec-supervision-cancel") and
+            (.exit_code == 143) and
+            (.identity | identity) and
+            (.identity.cgroup_path == $cgroup_path) and
+            ((.baseline_cgroup_members | type) == "array") and
+            ((.baseline_cgroup_members | length) == 1) and
+            (all(.baseline_cgroup_members[]; member)) and
+            ((.active_cgroup_members | type) == "array") and
+            ((.active_cgroup_members | length) > (.baseline_cgroup_members | length)) and
+            (all(.active_cgroup_members[]; member)) and
+            (.identity.host_pid as $pid |
+                any(.active_cgroup_members[]; .pid == $pid)) and
+            (.identity.child_host_pid as $pid |
+                any(.active_cgroup_members[]; .pid == $pid)) and
+            (.cgroup_restored == true) and
+            (.leader_identity_absent == true) and
+            (.child_identity_absent == true) and
+            (.session_reaped == true) and
+            (.marker_removed == true) and
+            (.post_case_probe == true);
+        def cancel_before_ready:
+            ((keys | sort) == ([
+                "adapter", "admission", "cgroup_restored",
+                "container_ready_events", "execution_id", "marker_absent",
+                "post_case_probe", "session_reaped", "terminal_error"
+            ] | sort)) and
+            (.adapter == "streaming") and
+            (.execution_id == "exec-supervision-cancel-before-ready") and
+            (.admission == "exec-before-guest-rpc") and
+            (.container_ready_events == 0) and
+            ((.terminal_error | type) == "string") and
+            (.terminal_error | contains("cancelled during startup")) and
+            (.marker_absent == true) and
+            (.cgroup_restored == true) and
+            (.session_reaped == true) and
+            (.post_case_probe == true);
+        def pre_spawn_rejection:
+            ((keys | sort) == ([
+                "adapter", "attempts", "authenticated_definite_error",
+                "cgroup_members_after", "cgroup_members_before", "execution_id",
+                "interactive_events", "invalid_environment_key",
+                "lifecycle_writer_available", "post_case_probe",
+                "session_count_after", "session_count_before",
+                "stale_control_rejected", "target", "terminal_error"
+            ] | sort)) and
+            (.attempts == 1) and
+            (.adapter == "streaming") and
+            (.target == "container") and
+            (.execution_id == "exec-supervision-pre-spawn-rejection") and
+            (.invalid_environment_key == "INVALID=ENVIRONMENT_KEY") and
+            (.authenticated_definite_error == true) and
+            ((.terminal_error | type) == "string") and
+            (.terminal_error | contains("invalid key")) and
+            (.terminal_error | contains("lifecycle authority was retained") | not) and
+            (.interactive_events == 0) and
+            (.session_count_before == 0) and
+            (.session_count_after == 0) and
+            ((.cgroup_members_before | type) == "array") and
+            ((.cgroup_members_before | length) == 1) and
+            (all(.cgroup_members_before[]; member)) and
+            (.cgroup_members_after == .cgroup_members_before) and
+            (.stale_control_rejected == true) and
+            (.lifecycle_writer_available == true) and
+            (.post_case_probe == true);
+        def slow_live_consumer:
+            ((keys | sort) == ([
+                "adapter", "attempts", "cgroup_restored",
+                "channel_capacity_events", "content_exact", "execution_id",
+                "exit_code", "exit_events", "exit_last",
+                "expected_stdout_bytes", "lifecycle_writer_available",
+                "max_chunk_bytes", "observed_stdout_bytes", "pause_ms",
+                "post_case_probe", "ready_events", "retired_drain_threshold_ms",
+                "session_reaped", "stderr_bytes", "stdout_sha256"
+            ] | sort)) and
+            (.attempts == 1) and
+            (.adapter == "streaming") and
+            (.execution_id == "exec-supervision-slow-live-consumer") and
+            (.pause_ms == 6000) and
+            (.retired_drain_threshold_ms == 5000) and
+            (.pause_ms > .retired_drain_threshold_ms) and
+            (.channel_capacity_events == 64) and
+            (.max_chunk_bytes == 65536) and
+            (.expected_stdout_bytes == 5242880) and
+            (.expected_stdout_bytes > (.channel_capacity_events * .max_chunk_bytes)) and
+            (.observed_stdout_bytes == .expected_stdout_bytes) and
+            (.stdout_sha256 == "d07bf203cd25e8dcd5b467d29f1d43ef2a33afa886f9f9d99dd036de8d1d4a45") and
+            (.content_exact == true) and
+            (.ready_events == 1) and
+            (.exit_events == 1) and
+            (.stderr_bytes == 0) and
+            (.exit_code == 0) and
+            (.exit_last == true) and
+            (.cgroup_restored == true) and
+            (.session_reaped == true) and
+            (.lifecycle_writer_available == true) and
+            (.post_case_probe == true);
+        def response_loss_before_ready($cgroup_path):
+            ((keys | sort) == ([
+                "active_cgroup_members", "adapter", "attempts",
+                "baseline_cgroup_members", "cgroup_restored",
+                "child_identity_absent", "execution_id", "fault_dwell_ms",
+                "fault_selector", "identity", "injected_error_observed",
+                "injection_error_marker", "interactive_events",
+                "leader_identity_absent",
+                "lifecycle_writer_available", "marker_removed",
+                "marker_observed_during_fault_dwell",
+                "post_case_probe", "request_id_reconcile_outcome",
+                "request_id_reconciled_to_terminal_proof", "session_reaped",
+                "stale_control_rejected", "target", "terminal_error"
+            ] | sort)) and
+            (.attempts == 1) and
+            (.adapter == "streaming") and
+            (.target == "container") and
+            (.execution_id == "exec-supervision-response-loss-before-ready") and
+            (.fault_selector == "/vz-exec-response-loss-command/sh") and
+            (.fault_dwell_ms == 5000) and
+            (.injection_error_marker == "test-injected container exec response loss before readiness") and
+            (.injected_error_observed == true) and
+            ((.terminal_error | type) == "string") and
+            (.injection_error_marker as $marker | .terminal_error | contains($marker)) and
+            (.terminal_error | contains("; reconciliation=TERMINAL_REAPED")) and
+            (.marker_observed_during_fault_dwell == true) and
+            (.interactive_events == 0) and
+            (.identity | identity) and
+            (.identity.cgroup_path == $cgroup_path) and
+            ((.baseline_cgroup_members | type) == "array") and
+            ((.baseline_cgroup_members | length) == 1) and
+            (all(.baseline_cgroup_members[]; member)) and
+            ((.active_cgroup_members | type) == "array") and
+            ((.active_cgroup_members | length) > (.baseline_cgroup_members | length)) and
+            (all(.active_cgroup_members[]; member)) and
+            (.identity.host_pid as $pid |
+                any(.active_cgroup_members[]; .pid == $pid)) and
+            (.identity.child_host_pid as $pid |
+                any(.active_cgroup_members[]; .pid == $pid)) and
+            (.request_id_reconcile_outcome == "TERMINAL_REAPED") and
+            (.request_id_reconciled_to_terminal_proof == true) and
+            (.cgroup_restored == true) and
+            (.leader_identity_absent == true) and
+            (.child_identity_absent == true) and
+            (.session_reaped == true) and
+            (.stale_control_rejected == true) and
+            (.lifecycle_writer_available == true) and
+            (.marker_removed == true) and
+            (.post_case_probe == true);
+        def dropped_future($cgroup_path):
+            ((keys | sort) == ([
+                "active_cgroup_members", "adapter", "baseline_cgroup_members",
+                "cgroup_restored", "child_identity_absent", "execution_id",
+                "identity", "join_cancelled", "leader_identity_absent",
+                "marker_removed", "post_case_probe", "session_reaped"
+            ] | sort)) and
+            (.adapter == "streaming") and
+            (.execution_id == "exec-supervision-dropped-future") and
+            (.join_cancelled == true) and
+            (.identity | identity) and
+            (.identity.cgroup_path == $cgroup_path) and
+            ((.baseline_cgroup_members | type) == "array") and
+            ((.baseline_cgroup_members | length) == 1) and
+            (all(.baseline_cgroup_members[]; member)) and
+            ((.active_cgroup_members | type) == "array") and
+            ((.active_cgroup_members | length) > (.baseline_cgroup_members | length)) and
+            (all(.active_cgroup_members[]; member)) and
+            (.identity.host_pid as $pid |
+                any(.active_cgroup_members[]; .pid == $pid)) and
+            (.identity.child_host_pid as $pid |
+                any(.active_cgroup_members[]; .pid == $pid)) and
+            (.cgroup_restored == true) and
+            (.leader_identity_absent == true) and
+            (.child_identity_absent == true) and
+            (.session_reaped == true) and
+            (.marker_removed == true) and
+            (.post_case_probe == true);
+        def ready_before_owner_abort($cgroup_path):
+            ((keys | sort) == ([
+                "active_cgroup_members", "adapter", "admission",
+                "baseline_cgroup_members", "case", "cgroup_restored",
+                "child_identity_absent", "execution_id", "identity",
+                "join_cancelled", "leader_identity_absent", "marker_removed",
+                "post_case_probe", "session_reaped",
+                "session_registered_before_abort", "stale_control_rejected"
+            ] | sort)) and
+            (.case == "ready-before-owner-named" or
+                .case == "ready-before-owner-anonymous") and
+            (.admission == "exec-guest-rpc-ready-before-owner") and
+            (.join_cancelled == true) and
+            (.identity | identity) and
+            (.identity.cgroup_path == $cgroup_path) and
+            ((.baseline_cgroup_members | type) == "array") and
+            ((.baseline_cgroup_members | length) == 1) and
+            (all(.baseline_cgroup_members[]; member)) and
+            ((.active_cgroup_members | type) == "array") and
+            ((.active_cgroup_members | length) > (.baseline_cgroup_members | length)) and
+            (all(.active_cgroup_members[]; member)) and
+            (.identity.host_pid as $pid |
+                any(.active_cgroup_members[]; .pid == $pid)) and
+            (.identity.child_host_pid as $pid |
+                any(.active_cgroup_members[]; .pid == $pid)) and
+            (.cgroup_restored == true) and
+            (.leader_identity_absent == true) and
+            (.child_identity_absent == true) and
+            (.session_reaped == true) and
+            (.marker_removed == true) and
+            (.post_case_probe == true) and
+            (if .case == "ready-before-owner-named" then
+                .adapter == "streaming" and
+                .execution_id == "exec-supervision-ready-before-owner" and
+                .session_registered_before_abort == true and
+                .stale_control_rejected == true
+             else
+                .adapter == "unary" and
+                .execution_id == null and
+                .session_registered_before_abort == false and
+                .stale_control_rejected == null
+             end);
+        def outer_identity:
+            ((keys | sort) == ([
+                "cgroup_path", "pgid", "pid", "start_time",
+                "target_cgroup_member"
+            ] | sort)) and
+            (.cgroup_path == "/") and
+            (.target_cgroup_member == false) and
+            (.pid | integer) and (.pid > 0) and
+            (.start_time | integer) and (.start_time > 0) and
+            # The outer supervisor remains outside the container PID
+            # namespace, so procfs may render its process group as zero from
+            # the guest view even though its exact PID/start-time are visible.
+            (.pgid | integer);
+        def outer_trampoline_kill($cgroup_path):
+            ((keys | sort) == ([
+                "active_cgroup_members", "adapter", "baseline_cgroup_members",
+                "cgroup_restored", "child_identity_absent", "execution_id",
+                "exit_code", "identity", "leader_identity_absent",
+                "marker_removed", "outer_identity", "outer_identity_absent",
+                "post_case_probe", "session_reaped"
+            ] | sort)) and
+            (.adapter == "streaming") and
+            (.execution_id == "exec-supervision-outer-trampoline-kill") and
+            (.exit_code == 137) and
+            (.identity | identity) and
+            (.identity.cgroup_path == $cgroup_path) and
+            (.outer_identity | outer_identity) and
+            (.outer_identity.pid != .identity.host_pid) and
+            (.outer_identity.pid != .identity.child_host_pid) and
+            ((.baseline_cgroup_members | type) == "array") and
+            ((.baseline_cgroup_members | length) == 1) and
+            (all(.baseline_cgroup_members[]; member)) and
+            ((.active_cgroup_members | type) == "array") and
+            ((.active_cgroup_members | length) > (.baseline_cgroup_members | length)) and
+            (all(.active_cgroup_members[]; member)) and
+            (.outer_identity.pid as $pid |
+                all(.active_cgroup_members[]; .pid != $pid)) and
+            (.identity.host_pid as $pid |
+                any(.active_cgroup_members[]; .pid == $pid)) and
+            (.identity.child_host_pid as $pid |
+                any(.active_cgroup_members[]; .pid == $pid)) and
+            (.cgroup_restored == true) and
+            (.outer_identity_absent == true) and
+            (.leader_identity_absent == true) and
+            (.child_identity_absent == true) and
+            (.session_reaped == true) and
+            (.marker_removed == true) and
+            (.post_case_probe == true);
+
+        .cgroup_path as $cgroup_path |
+        (type == "object") and
+        ((keys | sort) == ([
+            "build", "cancel_before_ready", "cancellation", "cgroup_path",
+            "container_id", "dropped_future", "final", "matrix", "normal_exit",
+            "outer_trampoline_kill", "pre_spawn_rejection",
+            "ready_before_owner_aborts", "response_loss_before_ready", "scenario",
+            "schema_version", "slow_live_consumer"
+        ] | sort)) and
+        (.schema_version == 4) and
+        (.scenario == "runtime-exec-supervision") and
+        (.build | build_identity) and
+        (.container_id == "exec-supervision-e2e") and
+        ((.cgroup_path | type) == "string") and
+        (.cgroup_path | startswith("/")) and
+        ((.matrix | type) == "array") and
+        ((.matrix | length) == 12) and
+        ([.matrix[] | (.adapter + "-" + .termination)] | sort) == ([
+            "pty-int", "pty-kill", "pty-term", "pty-timeout",
+            "streaming-int", "streaming-kill", "streaming-term", "streaming-timeout",
+            "unary-int", "unary-kill", "unary-term", "unary-timeout"
+        ] | sort) and
+        (all(.matrix[]; cell($cgroup_path))) and
+        (.normal_exit | normal_exit($cgroup_path)) and
+        (.cancellation | cancellation($cgroup_path)) and
+        (.cancel_before_ready | cancel_before_ready) and
+        (.pre_spawn_rejection | pre_spawn_rejection) and
+        (.slow_live_consumer | slow_live_consumer) and
+        (.response_loss_before_ready | response_loss_before_ready($cgroup_path)) and
+        (.dropped_future | dropped_future($cgroup_path)) and
+        ((.ready_before_owner_aborts | type) == "array") and
+        ((.ready_before_owner_aborts | length) == 2) and
+        ([.ready_before_owner_aborts[].case] | sort) == ([
+            "ready-before-owner-anonymous", "ready-before-owner-named"
+        ] | sort) and
+        (all(.ready_before_owner_aborts[]; ready_before_owner_abort($cgroup_path))) and
+        (.outer_trampoline_kill | outer_trampoline_kill($cgroup_path)) and
+        ((.final | keys | sort) == ([
+            "diagnostics", "metadata_absent", "rootfs_absent",
+            "tracked_container_absent", "zero_leaks"
+        ] | sort)) and
+        (.final.zero_leaks == true) and
+        (.final.tracked_container_absent == true) and
+        (.final.metadata_absent == true) and
+        (.final.rootfs_absent == true) and
+        ((.final.diagnostics | type) == "string") and
+        ((.final.diagnostics | length) > 0)
     ' "$evidence_file" >/dev/null
 }
 
@@ -1159,6 +1634,17 @@ write_and_validate_container_id_ownership_checksum() {
     (cd "$(dirname "$evidence_file")" && shasum -a 256 -c "$(basename "$checksum_file")") >/dev/null
 }
 
+write_and_validate_exec_supervision_checksum() {
+    local evidence_file="$1"
+    local checksum_file="$2"
+    local evidence_name
+    evidence_name="$(basename "$evidence_file")"
+    local digest
+    digest="$(shasum -a 256 "$evidence_file" | cut -d' ' -f1)"
+    printf '%s  %s\n' "$digest" "$evidence_name" > "$checksum_file"
+    (cd "$(dirname "$evidence_file")" && shasum -a 256 -c "$(basename "$checksum_file")") >/dev/null
+}
+
 write_and_validate_stack_teardown_checksum() {
     local evidence_file="$1"
     local checksum_file="$2"
@@ -1189,6 +1675,7 @@ run_and_log() {
     local args=("$@")
     local log_file="$RUN_DIR/${label}.log"
     local cmd_env=()
+    local exec_supervision_test_binary_sha256=""
 
     # BuildKit tests are sensitive to stale shared cache state under ~/.vz/buildkit.
     # Pin a per-run directory so CI/local harness executions are deterministic.
@@ -1235,6 +1722,21 @@ run_and_log() {
             rm -f "$CONTAINER_ID_OWNERSHIP_SHA256"
         fi
         cmd_env+=("VZ_CONTAINER_ID_OWNERSHIP_EVIDENCE=$CONTAINER_ID_OWNERSHIP_EVIDENCE")
+        if [[ "$label" == "runtime" || "$label" == "runtime-exec-supervision" ]]; then
+            if [[ "$PROFILE" != "release" ]]; then
+                echo "exec supervision release evidence cannot run under profile '$PROFILE'" >&2
+                return 103
+            fi
+            exec_supervision_test_binary_sha256="$(shasum -a 256 "$binary" | cut -d' ' -f1)"
+            rm -f "$EXEC_SUPERVISION_EVIDENCE"
+            rm -f "$EXEC_SUPERVISION_SHA256"
+            cmd_env+=("VZ_EXEC_SUPERVISION_EVIDENCE=$EXEC_SUPERVISION_EVIDENCE")
+            cmd_env+=("VZ_EXEC_SUPERVISION_BUILD_PROFILE=$PROFILE")
+            cmd_env+=("VZ_EXEC_SUPERVISION_TEST_BINARY_SHA256=$exec_supervision_test_binary_sha256")
+            cmd_env+=("VZ_EXEC_SUPERVISION_DEVELOPER_INITRAMFS_SHA256=$DEVELOPER_INITRAMFS_SHA256")
+            cmd_env+=("VZ_TEST_DROP_CONTAINER_EXEC_RESPONSE_BEFORE_READY_COMMAND=/vz-exec-response-loss-command/sh")
+            cmd_env+=("VZ_TEST_DROP_CONTAINER_EXEC_RESPONSE_DWELL_MS=5000")
+        fi
     fi
 
     cmd_env+=("VZ_LINUX_DEVELOPER_BUNDLE_DIR=$REPO_ROOT/linux/out")
@@ -1280,6 +1782,15 @@ run_and_log() {
             <(sed -E 's/; finished in .*/; finished/' "$log_file"); then
         echo "complete stack suite did not report exactly 21/21 real-VM tests with zero ignored failures" >&2
         return 99
+    fi
+
+    if [[ $status -eq 0 && "$PROFILE" == "release" \
+        && "$suite" == "runtime" && "$label" == "runtime" ]] \
+        && ! grep -Fqx \
+            "test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished" \
+            <(sed -E 's/; finished in .*/; finished/' "$log_file"); then
+        echo "complete runtime suite did not report exactly 18/18 real-VM tests with zero ignored failures" >&2
+        return 100
     fi
 
     if [[ $status -eq 0 ]] && [[ "$suite" == "stack" ]] \
@@ -1358,6 +1869,23 @@ run_and_log() {
             echo "container-ID ownership scenario did not retain its required evidence" >&2
             return 89
         fi
+        if [[ "$label" == "runtime" || "$label" == "runtime-exec-supervision" ]]; then
+            if [[ ! -f "$EXEC_SUPERVISION_EVIDENCE" ]] \
+                || ! validate_exec_supervision_evidence \
+                    "$EXEC_SUPERVISION_EVIDENCE" \
+                    "$PROFILE" \
+                    "$exec_supervision_test_binary_sha256" \
+                    "$DEVELOPER_INITRAMFS_SHA256"; then
+                echo "exec supervision evidence is missing, malformed, or violates the schema-v4 release contract" >&2
+                return 101
+            fi
+            if ! write_and_validate_exec_supervision_checksum \
+                "$EXEC_SUPERVISION_EVIDENCE" "$EXEC_SUPERVISION_SHA256"; then
+                echo "exec supervision evidence checksum creation or verification failed" >&2
+                return 102
+            fi
+            EXEC_SUPERVISION_EVIDENCE_VALIDATED=true
+        fi
     fi
 
     return "$status"
@@ -1408,6 +1936,8 @@ BUILDKIT_SUITE_RAN="$BUILDKIT_SELECTED"
 BUILDKIT_EVIDENCE_VALIDATED=false
 RUNTIME_ID_EVIDENCE_VALIDATED=false
 RUNTIME_ID_EVIDENCE_REQUIRED=false
+EXEC_SUPERVISION_EVIDENCE_VALIDATED=false
+EXEC_SUPERVISION_EVIDENCE_REQUIRED=false
 STACK_TEARDOWN_EVIDENCE_VALIDATED=false
 STACK_TEARDOWN_EVIDENCE_REQUIRED=false
 STACK_CONTAINER_OWNERSHIP_EVIDENCE_VALIDATED=false
@@ -1445,6 +1975,9 @@ for suite in "${RESOLVED_SUITES[@]}"; do
             if [[ "$scenario" == "runtime-container-id-ownership" ]]; then
                 RUNTIME_ID_EVIDENCE_REQUIRED=true
             fi
+            if [[ "$scenario" == "runtime-exec-supervision" ]]; then
+                EXEC_SUPERVISION_EVIDENCE_REQUIRED=true
+            fi
 
             if run_and_log "$suite" "$scenario" "$test_binary" "${scenario_args[@]}"; then
                 echo "==> scenario passed: $scenario"
@@ -1462,6 +1995,7 @@ for suite in "${RESOLVED_SUITES[@]}"; do
     else
         if [[ "$suite" == "runtime" ]]; then
             RUNTIME_ID_EVIDENCE_REQUIRED=true
+            EXEC_SUPERVISION_EVIDENCE_REQUIRED=true
         fi
         if run_and_log "$suite" "$suite" "$test_binary" "${RUN_ARGS[@]}"; then
             echo "==> suite passed: $suite"
@@ -1493,6 +2027,12 @@ fi
 if [[ "$RUNTIME_ID_EVIDENCE_REQUIRED" == "true" && "$RUNTIME_ID_EVIDENCE_VALIDATED" != "true" ]]; then
     echo "==> required container-ID ownership evidence was not validated" >&2
     FAILED+=("container-id-ownership-evidence:89")
+fi
+
+if [[ "$EXEC_SUPERVISION_EVIDENCE_REQUIRED" == "true" \
+    && "$EXEC_SUPERVISION_EVIDENCE_VALIDATED" != "true" ]]; then
+    echo "==> required exec supervision evidence was not validated" >&2
+    FAILED+=("exec-supervision-evidence:101")
 fi
 
 if [[ "$STACK_TEARDOWN_EVIDENCE_REQUIRED" == "true" && "$STACK_TEARDOWN_EVIDENCE_VALIDATED" != "true" ]]; then
@@ -1545,6 +2085,13 @@ action_summary="$RUN_DIR/summary.txt"
     else
         echo "container_id_ownership=none"
         echo "container_id_ownership_sha256=none"
+    fi
+    if [[ "$EXEC_SUPERVISION_EVIDENCE_VALIDATED" == "true" ]]; then
+        echo "exec_supervision=$EXEC_SUPERVISION_EVIDENCE"
+        echo "exec_supervision_sha256=$EXEC_SUPERVISION_SHA256"
+    else
+        echo "exec_supervision=none"
+        echo "exec_supervision_sha256=none"
     fi
     if [[ "$STACK_TEARDOWN_EVIDENCE_VALIDATED" == "true" ]]; then
         echo "stack_teardown=$STACK_TEARDOWN_EVIDENCE"

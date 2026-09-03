@@ -6,6 +6,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -16,14 +17,15 @@ use tracing::debug;
 use vz::Vm;
 use vz::protocol::{ExecOutput, OciContainerState};
 use vz_agent_proto::{
-    ContainerExecTarget, ContainerGeneration, DockerEnsureEvent, DockerEnsureRequest,
-    ExecRequest as ProtoExecRequest, NetworkSetupRequest, NetworkTeardownRequest, OciCreateRequest,
-    OciDeleteRequest, OciExecRequest, OciKillRequest, OciStartRequest, OciStateRequest,
-    PingRequest, PortForwardFrame, PortForwardOpen, ResizeExecPtyRequest, ResourceStatsRequest,
-    ResourceStatsResponse, SignalRequest, StdinCloseRequest, StdinWriteRequest, SystemInfoRequest,
-    SystemInfoResponse, TransportMetadata as ProtoTransportMetadata,
-    agent_service_client::AgentServiceClient, exec_event,
-    network_service_client::NetworkServiceClient, oci_service_client::OciServiceClient,
+    AllocateExecRequestRequest, CancelExecRequest, CancelExecResponse, ContainerExecTarget,
+    ContainerGeneration, DockerEnsureEvent, DockerEnsureRequest, ExecRequest as ProtoExecRequest,
+    NetworkSetupRequest, NetworkTeardownRequest, OciCreateRequest, OciDeleteRequest,
+    OciKillRequest, OciStartRequest, OciStateRequest, PingRequest, PortForwardFrame,
+    PortForwardOpen, ReconcileExecRequest, ReconcileExecResponse, ResizeExecPtyRequest,
+    ResourceStatsRequest, ResourceStatsResponse, SignalRequest, StdinCloseRequest,
+    StdinWriteRequest, SystemInfoRequest, SystemInfoResponse,
+    TransportMetadata as ProtoTransportMetadata, agent_service_client::AgentServiceClient,
+    exec_event, network_service_client::NetworkServiceClient, oci_service_client::OciServiceClient,
     port_forward_frame,
 };
 use vz_runtime_contract::{
@@ -43,6 +45,63 @@ const GUEST_BUILDCTL_BINARY: &str = "/mnt/buildkit-bin/buildctl";
 
 /// Timeout for establishing the vsock connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const ALLOCATE_EXEC_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+const EXEC_DISPATCH_PENDING: u8 = 0;
+const EXEC_DISPATCH_AUTHORIZED: u8 = 1;
+const EXEC_DISPATCH_CANCELLED: u8 = 2;
+
+/// Per-request linearization gate between connection preflight and the exact
+/// container Exec RPC send.
+///
+/// Cancellation or deadline expiry that closes a pending gate proves that no
+/// Exec RPC was dispatched. Once dispatch authorization wins, the request ID
+/// is instead ambiguous until readiness or reconciliation proves its outcome.
+#[derive(Clone, Debug)]
+pub struct ContainerExecDispatchGate {
+    state: Arc<AtomicU8>,
+    deadline: tokio::time::Instant,
+}
+
+impl ContainerExecDispatchGate {
+    pub fn new(deadline: tokio::time::Instant) -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(EXEC_DISPATCH_PENDING)),
+            deadline,
+        }
+    }
+
+    /// Prevent dispatch if the gate is still pending.
+    ///
+    /// Returns `true` only when this call proved the request was never
+    /// authorized for dispatch. `false` means dispatch already owns the
+    /// request identity and must be reconciled on an uncertain outcome.
+    pub fn cancel_before_dispatch(&self) -> bool {
+        self.state
+            .compare_exchange(
+                EXEC_DISPATCH_PENDING,
+                EXEC_DISPATCH_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+            || self.state.load(Ordering::Acquire) == EXEC_DISPATCH_CANCELLED
+    }
+
+    fn authorize_dispatch(&self) -> bool {
+        if tokio::time::Instant::now() >= self.deadline {
+            self.cancel_before_dispatch();
+        }
+        self.state
+            .compare_exchange(
+                EXEC_DISPATCH_PENDING,
+                EXEC_DISPATCH_AUTHORIZED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
 
 fn exec_control_debug_enabled() -> bool {
     std::env::var("VZ_LINUX_EXEC_CONTROL_DEBUG")
@@ -95,22 +154,11 @@ fn build_exec_request(
     }
 }
 
-fn build_oci_exec_request(
-    id: String,
-    command: String,
-    args: Vec<String>,
-    options: OciExecOptions,
-    metadata: ProtoTransportMetadata,
-) -> OciExecRequest {
-    OciExecRequest {
-        container_id: id,
-        command,
-        args,
-        env: options.env.into_iter().collect(),
-        working_dir: options.cwd.unwrap_or_default(),
-        user: options.user.unwrap_or_default(),
-        metadata: Some(metadata),
-    }
+fn retired_oci_exec_error() -> LinuxError {
+    LinuxError::Protocol(
+        "legacy OciService.Exec is retired; use supervised AgentService.Exec stream collection"
+            .to_string(),
+    )
 }
 
 /// Options for OCI exec requests.
@@ -143,31 +191,169 @@ pub struct GrpcAgentClient {
     next_request_sequence: u64,
 }
 
+/// Failure while establishing a container exec's addressable ready state.
+///
+/// `Definite` means the request was rejected before a guest process could remain
+/// live. `Ambiguous` means transport or protocol state prevented the host from
+/// proving that no process was registered, so callers must retain lifecycle
+/// authority rather than treating the start as finished.
+#[derive(Debug)]
+pub enum ContainerExecStartError {
+    /// The guest definitively rejected the request without leaving live work.
+    Definite(LinuxError),
+    /// The host cannot prove whether the guest registered live work.
+    Ambiguous(LinuxError),
+}
+
+impl ContainerExecStartError {
+    /// Consume the classification and return the underlying error.
+    pub fn into_inner(self) -> LinuxError {
+        match self {
+            Self::Definite(error) | Self::Ambiguous(error) => error,
+        }
+    }
+
+    /// Whether lifecycle ownership must be retained after this failure.
+    pub fn is_ambiguous(&self) -> bool {
+        matches!(self, Self::Ambiguous(_))
+    }
+}
+
+impl std::fmt::Display for ContainerExecStartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Definite(error) | Self::Ambiguous(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ContainerExecStartError {}
+
+fn classify_exec_rpc_status(status: tonic::Status) -> ContainerExecStartError {
+    // A tonic Status does not prove where the server stopped: even an
+    // application-looking code can race transport loss after registration.
+    // Only an authenticated in-stream rejection frame is classified definite.
+    ContainerExecStartError::Ambiguous(LinuxError::from(status))
+}
+
+async fn inject_container_exec_response_loss(command: &str) -> bool {
+    static INJECTED: AtomicBool = AtomicBool::new(false);
+
+    let Ok(expected) = std::env::var("VZ_TEST_DROP_CONTAINER_EXEC_RESPONSE_BEFORE_READY_COMMAND")
+    else {
+        return false;
+    };
+    if expected != command {
+        return false;
+    }
+    if INJECTED.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    let dwell_ms = std::env::var("VZ_TEST_DROP_CONTAINER_EXEC_RESPONSE_DWELL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1000)
+        .min(30_000);
+    tokio::time::sleep(Duration::from_millis(dwell_ms)).await;
+    true
+}
+
+fn validate_reconcile_exec_response(
+    response: &ReconcileExecResponse,
+    expected_request_id: &str,
+) -> Result<(), LinuxError> {
+    use vz_agent_proto::reconcile_exec_response::Outcome;
+
+    if response.exec_request_id != expected_request_id {
+        return Err(LinuxError::Protocol(format!(
+            "exec reconciliation request mismatch: expected `{expected_request_id}`, got `{}`",
+            response.exec_request_id
+        )));
+    }
+    match Outcome::try_from(response.outcome) {
+        Ok(Outcome::FencedNeverStarted)
+            if response.exec_id == 0 && response.exit_code == 0 && !response.forced => {}
+        Ok(Outcome::TerminalReaped)
+            if response.exec_id > 0 && (0..=255).contains(&response.exit_code) => {}
+        Ok(Outcome::StaleUnknown)
+            if response.exec_id == 0 && response.exit_code == 0 && !response.forced => {}
+        Err(_) | Ok(Outcome::Unspecified) => {
+            return Err(LinuxError::Protocol(format!(
+                "exec reconciliation returned unknown outcome {}",
+                response.outcome
+            )));
+        }
+        Ok(outcome) => {
+            return Err(LinuxError::Protocol(format!(
+                "exec reconciliation returned invalid fields for {outcome:?}: exec_id={}, exit_code={}, forced={}",
+                response.exec_id, response.exit_code, response.forced
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_allocated_exec_request_id(request_id: &str) -> Result<(), LinuxError> {
+    let (encoded_boot_id, sequence) = request_id
+        .strip_prefix("exec_req_")
+        .and_then(|value| value.split_once('_'))
+        .ok_or_else(|| {
+            LinuxError::Protocol("allocated exec request ID has an invalid shape".to_string())
+        })?;
+    let boot_id = uuid::Uuid::parse_str(encoded_boot_id).map_err(|_| {
+        LinuxError::Protocol("allocated exec request ID has an invalid boot UUID".to_string())
+    })?;
+    if encoded_boot_id.len() != 36
+        || boot_id.get_version_num() != 4
+        || boot_id.get_variant() != uuid::Variant::RFC4122
+        || boot_id.to_string() != encoded_boot_id
+        || sequence.len() != 16
+        || !sequence
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || u64::from_str_radix(sequence, 16)
+            .ok()
+            .filter(|value| *value != 0)
+            .is_none()
+    {
+        return Err(LinuxError::Protocol(
+            "allocated exec request ID is not a canonical boot ticket".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_exec_event_metadata(
     last_sequence: &mut u64,
     expected_request_id: &mut Option<String>,
     sequence: u64,
     request_id: &str,
 ) -> Result<(), LinuxError> {
-    if sequence > 0 {
-        if sequence <= *last_sequence {
+    if sequence == 0 {
+        return Err(LinuxError::Protocol(
+            "exec event omitted required sequence".to_string(),
+        ));
+    }
+    if sequence <= *last_sequence {
+        return Err(LinuxError::Protocol(format!(
+            "exec event ordering violation: got sequence {sequence} after {last_sequence}"
+        )));
+    }
+    *last_sequence = sequence;
+
+    if request_id.is_empty() {
+        return Err(LinuxError::Protocol(
+            "exec event omitted required request_id".to_string(),
+        ));
+    }
+    if let Some(expected) = expected_request_id {
+        if expected != request_id {
             return Err(LinuxError::Protocol(format!(
-                "exec event ordering violation: got sequence {sequence} after {last_sequence}"
+                "exec request_id mismatch: expected `{expected}`, got `{request_id}`"
             )));
         }
-        *last_sequence = sequence;
-    }
-
-    if !request_id.is_empty() {
-        if let Some(expected) = expected_request_id {
-            if expected != request_id {
-                return Err(LinuxError::Protocol(format!(
-                    "exec request_id mismatch: expected `{expected}`, got `{request_id}`"
-                )));
-            }
-        } else {
-            *expected_request_id = Some(request_id.to_string());
-        }
+    } else {
+        *expected_request_id = Some(request_id.to_string());
     }
 
     Ok(())
@@ -229,6 +415,54 @@ impl GrpcAgentClient {
         }
     }
 
+    fn container_exec_metadata(&mut self, request_id: String) -> ProtoTransportMetadata {
+        let mut metadata = self.next_transport_metadata(Some(RuntimeOperation::ExecContainer));
+        metadata.request_id = request_id.clone();
+        metadata.idempotency_key = format!("exec_container:{request_id}");
+        metadata
+    }
+
+    /// Allocate a guest-incarnation-bound request ticket. Allocation cannot
+    /// spawn work, so any transport failure is a definite pre-dispatch error.
+    pub async fn prepare_container_exec_request(&mut self) -> Result<String, LinuxError> {
+        let metadata = self.next_transport_metadata(None);
+        let response = tokio::time::timeout(
+            ALLOCATE_EXEC_REQUEST_TIMEOUT,
+            self.agent
+                .allocate_exec_request(AllocateExecRequestRequest {
+                    metadata: Some(metadata),
+                }),
+        )
+        .await
+        .map_err(|_| {
+            LinuxError::Protocol(format!(
+                "exec request allocation timed out after {:.3}s before dispatch",
+                ALLOCATE_EXEC_REQUEST_TIMEOUT.as_secs_f64()
+            ))
+        })??
+        .into_inner();
+        validate_allocated_exec_request_id(&response.exec_request_id)?;
+        Ok(response.exec_request_id)
+    }
+
+    /// Fence or cancel/reap an ambiguously-started exec by its prepared request ID.
+    pub async fn reconcile_exec_request(
+        &mut self,
+        exec_request_id: String,
+    ) -> Result<ReconcileExecResponse, LinuxError> {
+        let metadata = self.next_transport_metadata(None);
+        let response = self
+            .agent
+            .reconcile_exec(ReconcileExecRequest {
+                exec_request_id: exec_request_id.clone(),
+                metadata: Some(metadata),
+            })
+            .await?
+            .into_inner();
+        validate_reconcile_exec_response(&response, &exec_request_id)?;
+        Ok(response)
+    }
+
     /// Establish a gRPC channel using the default agent port.
     pub async fn connect_default(vm: Arc<Vm>) -> Result<Self, LinuxError> {
         Self::connect(vm, GRPC_AGENT_PORT).await
@@ -280,16 +514,14 @@ impl GrpcAgentClient {
         args: Vec<String>,
         options: ExecOptions,
     ) -> Result<GrpcExecStream, LinuxError> {
-        self.exec_stream_with_target(command, args, options, None)
-            .await
+        self.exec_stream_direct(command, args, options).await
     }
 
-    async fn exec_stream_with_target(
+    async fn exec_stream_direct(
         &mut self,
         command: String,
         args: Vec<String>,
         options: ExecOptions,
-        container_target: Option<String>,
     ) -> Result<GrpcExecStream, LinuxError> {
         let metadata = self.next_transport_metadata(Some(RuntimeOperation::ExecContainer));
         let expected_request_id = if metadata.request_id.is_empty() {
@@ -298,55 +530,37 @@ impl GrpcAgentClient {
             Some(metadata.request_id.clone())
         };
 
-        let expected_container_id = container_target.clone();
         let request = build_exec_request(
             command,
             args,
             options,
-            container_target,
+            None,
             metadata,
             ExecTerminal::default(),
         );
 
         let response = self.agent.exec(request).await?;
-        let stream = GrpcExecStream::new(response.into_inner(), expected_request_id);
-        if let Some(container_id) = expected_container_id {
-            stream
-                .wait_container_ready(&container_id)
-                .await
-                .map(|(stream, _)| stream)
-        } else {
-            Ok(stream)
-        }
+        Ok(GrpcExecStream::new(
+            response.into_inner(),
+            expected_request_id,
+        ))
     }
 
-    /// Execute a raw command inside a running OCI container and stream output.
-    ///
-    /// Container identity is sent as a typed target. Namespace and cgroup
-    /// resolution are deliberately guest-owned.
-    pub async fn exec_container_stream(
+    /// Start a container-targeted pipe exec using an identity the caller owns.
+    /// On an ambiguous result, the caller must reconcile this exact request ID
+    /// while retaining the VM and any lifecycle/admission authority.
+    pub async fn exec_container_stream_ready_for_request(
         &mut self,
+        dispatch_gate: ContainerExecDispatchGate,
+        request_id: String,
         container_id: String,
         command: String,
         args: Vec<String>,
         options: ExecOptions,
-    ) -> Result<GrpcExecStream, LinuxError> {
-        self.exec_stream_with_target(command, args, options, Some(container_id))
-            .await
-    }
-
-    /// Start a container-targeted pipe exec and return its exact pinned guest
-    /// generation. Completion means the inner process successfully exec'd.
-    pub async fn exec_container_stream_ready(
-        &mut self,
-        container_id: String,
-        command: String,
-        args: Vec<String>,
-        options: ExecOptions,
-    ) -> Result<(GrpcExecStream, ContainerGeneration), LinuxError> {
-        let metadata = self.next_transport_metadata(Some(RuntimeOperation::ExecContainer));
-        let expected_request_id =
-            (!metadata.request_id.is_empty()).then(|| metadata.request_id.clone());
+    ) -> Result<(GrpcExecStream, u64, ContainerGeneration), ContainerExecStartError> {
+        let command_for_fault = command.clone();
+        let metadata = self.container_exec_metadata(request_id.clone());
+        let expected_request_id = Some(request_id);
         let request = build_exec_request(
             command,
             args,
@@ -355,7 +569,22 @@ impl GrpcAgentClient {
             metadata,
             ExecTerminal::default(),
         );
-        let response = self.agent.exec(request).await?;
+        if !dispatch_gate.authorize_dispatch() {
+            return Err(ContainerExecStartError::Definite(LinuxError::Protocol(
+                "container exec was cancelled or timed out before dispatch".to_string(),
+            )));
+        }
+        let response = self
+            .agent
+            .exec(request)
+            .await
+            .map_err(classify_exec_rpc_status)?;
+        if inject_container_exec_response_loss(&command_for_fault).await {
+            drop(response);
+            return Err(ContainerExecStartError::Ambiguous(LinuxError::Protocol(
+                "test-injected container exec response loss before readiness".to_string(),
+            )));
+        }
         GrpcExecStream::new(response.into_inner(), expected_request_id)
             .wait_container_ready(&container_id)
             .await
@@ -469,25 +698,17 @@ impl GrpcAgentClient {
         })
     }
 
-    /// Execute through the OCI service's bounded unary compatibility RPC.
+    /// Legacy OCI unary exec is retired because it cannot expose supervised
+    /// process identity or terminal cleanup receipts.
+    #[deprecated(note = "use exec_container_stream_ready and collect the supervised stream")]
     pub async fn oci_exec(
         &mut self,
-        id: String,
-        command: String,
-        args: Vec<String>,
-        options: OciExecOptions,
+        _id: String,
+        _command: String,
+        _args: Vec<String>,
+        _options: OciExecOptions,
     ) -> Result<ExecOutput, LinuxError> {
-        let metadata = self.next_transport_metadata(Some(RuntimeOperation::ExecContainer));
-        let response = self
-            .oci
-            .exec(build_oci_exec_request(id, command, args, options, metadata))
-            .await?
-            .into_inner();
-        Ok(ExecOutput {
-            exit_code: response.exit_code,
-            stdout: response.stdout,
-            stderr: response.stderr,
-        })
+        Err(retired_oci_exec_error())
     }
 
     /// Send a signal to a running OCI container.
@@ -629,6 +850,19 @@ impl GrpcAgentClient {
         Ok(())
     }
 
+    /// Cancel an exec and wait for the guest to report terminal/reaped state.
+    pub async fn cancel_exec(&mut self, exec_id: u64) -> Result<CancelExecResponse, LinuxError> {
+        let metadata = self.next_transport_metadata(None);
+        let response = self
+            .agent
+            .cancel_exec(CancelExecRequest {
+                exec_id,
+                metadata: Some(metadata),
+            })
+            .await?;
+        Ok(response.into_inner())
+    }
+
     /// Close a running exec's stdin.
     pub async fn stdin_close(&mut self, exec_id: u64) -> Result<(), LinuxError> {
         let metadata = self.next_transport_metadata(None);
@@ -672,21 +906,40 @@ impl GrpcAgentClient {
         rows: u32,
         cols: u32,
     ) -> Result<(GrpcExecStream, u64), LinuxError> {
-        self.exec_stream_interactive_with_target(command, args, options, None, rows, cols)
-            .await
+        self.exec_stream_interactive_with_target(
+            command, args, options, None, None, None, rows, cols,
+        )
+        .await
+        .map_err(ContainerExecStartError::into_inner)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn exec_stream_interactive_with_target(
         &mut self,
         command: String,
         args: Vec<String>,
         options: ExecOptions,
         container_target: Option<String>,
+        prepared_request_id: Option<String>,
+        dispatch_gate: Option<ContainerExecDispatchGate>,
         rows: u32,
         cols: u32,
-    ) -> Result<(GrpcExecStream, u64), LinuxError> {
+    ) -> Result<(GrpcExecStream, u64), ContainerExecStartError> {
         let debug = exec_control_debug_enabled();
-        let metadata = self.next_transport_metadata(Some(RuntimeOperation::ExecContainer));
+        let metadata = match (container_target.is_some(), prepared_request_id) {
+            (true, Some(request_id)) => self.container_exec_metadata(request_id),
+            (true, None) => {
+                return Err(ContainerExecStartError::Definite(LinuxError::Protocol(
+                    "container PTY exec requires an explicit request identity".to_string(),
+                )));
+            }
+            (false, Some(_)) => {
+                return Err(ContainerExecStartError::Definite(LinuxError::Protocol(
+                    "ordinary PTY exec must not carry a container request identity".to_string(),
+                )));
+            }
+            (false, None) => self.next_transport_metadata(Some(RuntimeOperation::ExecContainer)),
+        };
         let request_id = metadata.request_id.clone();
         let expected_request_id = if metadata.request_id.is_empty() {
             None
@@ -716,6 +969,14 @@ impl GrpcAgentClient {
             },
         );
 
+        if let Some(dispatch_gate) = dispatch_gate
+            && !dispatch_gate.authorize_dispatch()
+        {
+            return Err(ContainerExecStartError::Definite(LinuxError::Protocol(
+                "container PTY exec was cancelled or timed out before dispatch".to_string(),
+            )));
+        }
+
         let response_result =
             tokio::time::timeout(std::time::Duration::from_secs(10), self.agent.exec(request))
                 .await;
@@ -737,13 +998,32 @@ impl GrpcAgentClient {
         }
         let response = match response_result {
             Ok(Ok(response)) => response,
-            Ok(Err(error)) => return Err(error.into()),
+            Ok(Err(error)) => {
+                return Err(if expected_container_id.is_some() {
+                    classify_exec_rpc_status(error)
+                } else {
+                    ContainerExecStartError::Definite(error.into())
+                });
+            }
             Err(_) => {
-                return Err(LinuxError::Protocol(
+                let error = LinuxError::Protocol(
                     "timeout waiting for interactive exec RPC headers from guest".to_string(),
-                ));
+                );
+                return Err(if expected_container_id.is_some() {
+                    ContainerExecStartError::Ambiguous(error)
+                } else {
+                    ContainerExecStartError::Definite(error)
+                });
             }
         };
+        if expected_container_id.is_some()
+            && inject_container_exec_response_loss(&command_debug).await
+        {
+            drop(response);
+            return Err(ContainerExecStartError::Ambiguous(LinuxError::Protocol(
+                "test-injected container exec response loss before readiness".to_string(),
+            )));
+        }
         let inner_stream = response.into_inner();
 
         let interactive_result = tokio::time::timeout(
@@ -773,9 +1053,14 @@ impl GrpcAgentClient {
                         request_id
                     );
                 }
-                return Err(LinuxError::Protocol(
+                let error = LinuxError::Protocol(
                     "timeout waiting for initial exec event from guest".to_string(),
-                ));
+                );
+                return Err(if expected_container_id.is_some() {
+                    ContainerExecStartError::Ambiguous(error)
+                } else {
+                    ContainerExecStartError::Definite(error)
+                });
             }
         };
         if debug {
@@ -788,50 +1073,37 @@ impl GrpcAgentClient {
         Ok((stream, exec_id))
     }
 
-    /// Execute a raw command inside a running OCI container with a PTY.
-    pub async fn exec_container_stream_interactive(
+    /// Start a container-targeted PTY exec using an identity the caller owns.
+    /// Ambiguous results carry no release proof; the caller must reconcile the
+    /// supplied request ID before releasing lifecycle authority.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn exec_container_stream_interactive_ready_for_request(
         &mut self,
+        dispatch_gate: ContainerExecDispatchGate,
+        request_id: String,
         container_id: String,
         command: String,
         args: Vec<String>,
         options: ExecOptions,
         rows: u32,
         cols: u32,
-    ) -> Result<(GrpcExecStream, u64), LinuxError> {
-        self.exec_stream_interactive_with_target(
-            command,
-            args,
-            options,
-            Some(container_id),
-            rows,
-            cols,
-        )
-        .await
-    }
-
-    /// Start a container-targeted PTY exec and return its exec ID plus exact
-    /// pinned guest generation.
-    pub async fn exec_container_stream_interactive_ready(
-        &mut self,
-        container_id: String,
-        command: String,
-        args: Vec<String>,
-        options: ExecOptions,
-        rows: u32,
-        cols: u32,
-    ) -> Result<(GrpcExecStream, u64, ContainerGeneration), LinuxError> {
+    ) -> Result<(GrpcExecStream, u64, ContainerGeneration), ContainerExecStartError> {
         let (stream, exec_id) = self
             .exec_stream_interactive_with_target(
                 command,
                 args,
                 options,
                 Some(container_id),
+                Some(request_id),
+                Some(dispatch_gate),
                 rows,
                 cols,
             )
             .await?;
         let generation = stream.container_generation.clone().ok_or_else(|| {
-            LinuxError::Protocol("container PTY exec omitted ready generation".to_string())
+            ContainerExecStartError::Ambiguous(LinuxError::Protocol(
+                "container PTY exec omitted ready generation".to_string(),
+            ))
         })?;
         Ok((stream, exec_id, generation))
     }
@@ -848,6 +1120,55 @@ pub struct GrpcExecStream {
     /// Buffered first proto event consumed during interactive session setup.
     buffered_first: Option<vz_agent_proto::ExecEvent>,
     container_generation: Option<ContainerGeneration>,
+    /// Container-ready streams pin every subsequent frame to this logical exec.
+    expected_exec_id: Option<u64>,
+}
+
+enum ExecStreamReadError {
+    Protocol(LinuxError),
+    Transport(LinuxError),
+}
+
+fn decode_exec_stream_event(
+    last_sequence: &mut u64,
+    expected_request_id: &mut Option<String>,
+    expected_exec_id: Option<u64>,
+    proto_event: vz_agent_proto::ExecEvent,
+) -> Result<Option<vz::protocol::ExecEvent>, LinuxError> {
+    if let Some(expected_exec_id) = expected_exec_id
+        && (proto_event.exec_id == 0 || proto_event.exec_id != expected_exec_id)
+    {
+        return Err(LinuxError::Protocol(format!(
+            "container exec_id mismatch: expected {expected_exec_id}, got {}",
+            proto_event.exec_id
+        )));
+    }
+    validate_exec_event_metadata(
+        last_sequence,
+        expected_request_id,
+        proto_event.sequence,
+        proto_event.request_id.as_str(),
+    )?;
+    match proto_event.event {
+        Some(exec_event::Event::Stdout(data)) => Ok(Some(vz::protocol::ExecEvent::Stdout(data))),
+        Some(exec_event::Event::Stderr(data)) => Ok(Some(vz::protocol::ExecEvent::Stderr(data))),
+        Some(exec_event::Event::ExitCode(code)) => Ok(Some(vz::protocol::ExecEvent::Exit(code))),
+        Some(exec_event::Event::Error(detail)) => Err(LinuxError::Protocol(format!(
+            "exec stream reported an error: {detail}"
+        ))),
+        Some(exec_event::Event::ContainerReady(_)) => Err(LinuxError::Protocol(
+            "exec stream repeated container readiness".to_string(),
+        )),
+        None => Ok(None),
+    }
+}
+
+impl ExecStreamReadError {
+    fn error(self) -> LinuxError {
+        match self {
+            Self::Protocol(error) | Self::Transport(error) => error,
+        }
+    }
 }
 
 fn require_container_ready(
@@ -898,7 +1219,80 @@ fn require_container_ready(
     Ok(generation)
 }
 
+fn definite_initial_exec_rejection(
+    event: &vz_agent_proto::ExecEvent,
+    expected_request_id: &str,
+) -> Option<ContainerExecStartError> {
+    match event.event.as_ref() {
+        Some(exec_event::Event::Error(detail))
+            if event.sequence == 1
+                && event.request_id == expected_request_id
+                && event.exec_id == 0 =>
+        {
+            Some(ContainerExecStartError::Definite(LinuxError::Protocol(
+                format!("exec stream reported an error: {detail}"),
+            )))
+        }
+        _ => None,
+    }
+}
+
 impl GrpcExecStream {
+    async fn next_checked_inner(
+        &mut self,
+    ) -> Result<Option<vz::protocol::ExecEvent>, ExecStreamReadError> {
+        if self.done {
+            return Ok(None);
+        }
+
+        loop {
+            let next_event = if let Some(buffered) = self.buffered_first.take() {
+                Ok(Some(buffered))
+            } else {
+                self.inner.message().await
+            };
+
+            match next_event {
+                Ok(Some(proto_event)) => {
+                    let decoded = decode_exec_stream_event(
+                        &mut self.last_sequence,
+                        &mut self.expected_request_id,
+                        self.expected_exec_id,
+                        proto_event,
+                    );
+                    match decoded {
+                        Ok(Some(event @ vz::protocol::ExecEvent::Exit(_))) => {
+                            self.done = true;
+                            return Ok(Some(event));
+                        }
+                        Ok(Some(event)) => return Ok(Some(event)),
+                        Ok(None) => continue,
+                        Err(error) => {
+                            self.done = true;
+                            return Err(ExecStreamReadError::Protocol(error));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    self.done = true;
+                    return Ok(None);
+                }
+                Err(error) => {
+                    self.done = true;
+                    return Err(ExecStreamReadError::Transport(error.into()));
+                }
+            }
+        }
+    }
+
+    /// Read the next exec event without conflating transport or protocol
+    /// failures with a guest-reported terminal status.
+    pub async fn next_checked(&mut self) -> Result<Option<vz::protocol::ExecEvent>, LinuxError> {
+        self.next_checked_inner()
+            .await
+            .map_err(ExecStreamReadError::error)
+    }
+
     /// Wrap a tonic streaming response.
     fn new(
         inner: tonic::Streaming<vz_agent_proto::ExecEvent>,
@@ -911,6 +1305,7 @@ impl GrpcExecStream {
             expected_request_id,
             buffered_first: None,
             container_generation: None,
+            expected_exec_id: None,
         }
     }
 
@@ -921,19 +1316,17 @@ impl GrpcExecStream {
         mut inner: tonic::Streaming<vz_agent_proto::ExecEvent>,
         expected_request_id: Option<String>,
         expected_container_id: Option<&str>,
-    ) -> Result<(Self, u64), LinuxError> {
+    ) -> Result<(Self, u64), ContainerExecStartError> {
         // Read the first event to extract exec_id.
         let first = inner
             .message()
-            .await?
-            .ok_or_else(|| LinuxError::Protocol("interactive exec stream empty".to_string()))?;
-
-        let exec_id = first.exec_id;
-        if exec_id == 0 {
-            return Err(LinuxError::Protocol(
-                "interactive exec missing exec_id in first event".to_string(),
-            ));
-        }
+            .await
+            .map_err(|error| ContainerExecStartError::Ambiguous(error.into()))?
+            .ok_or_else(|| {
+                ContainerExecStartError::Ambiguous(LinuxError::Protocol(
+                    "interactive exec stream empty".to_string(),
+                ))
+            })?;
 
         let mut stream = Self::new(inner, expected_request_id);
         if let Some(container_id) = expected_container_id {
@@ -942,34 +1335,67 @@ impl GrpcExecStream {
                 &mut stream.expected_request_id,
                 first.sequence,
                 first.request_id.as_str(),
-            )?;
-            stream.container_generation = Some(require_container_ready(&first, container_id)?);
+            )
+            .map_err(ContainerExecStartError::Ambiguous)?;
+            let expected_request_id = stream.expected_request_id.as_deref().unwrap_or_default();
+            if let Some(rejection) = definite_initial_exec_rejection(&first, expected_request_id) {
+                return Err(rejection);
+            }
+            if first.exec_id == 0 {
+                return Err(ContainerExecStartError::Ambiguous(LinuxError::Protocol(
+                    "interactive container exec missing exec_id in first event".to_string(),
+                )));
+            }
+            stream.container_generation = Some(
+                require_container_ready(&first, container_id)
+                    .map_err(ContainerExecStartError::Ambiguous)?,
+            );
+            let exec_id = first.exec_id;
+            stream.expected_exec_id = Some(exec_id);
+            Ok((stream, exec_id))
         } else {
+            let exec_id = first.exec_id;
+            if exec_id == 0 {
+                return Err(ContainerExecStartError::Definite(LinuxError::Protocol(
+                    "interactive exec missing exec_id in first event".to_string(),
+                )));
+            }
             stream.buffered_first = Some(first);
+            Ok((stream, exec_id))
         }
-
-        // Buffer ordinary guest PTY correlation frames. Container readiness is
-        // protocol control data and is deliberately not exposed as stdout.
-
-        Ok((stream, exec_id))
     }
 
     async fn wait_container_ready(
         mut self,
         expected_container_id: &str,
-    ) -> Result<(Self, ContainerGeneration), LinuxError> {
-        let first = self.inner.message().await?.ok_or_else(|| {
-            LinuxError::Protocol("container exec stream ended before readiness".to_string())
-        })?;
+    ) -> Result<(Self, u64, ContainerGeneration), ContainerExecStartError> {
+        let first = self
+            .inner
+            .message()
+            .await
+            .map_err(|error| ContainerExecStartError::Ambiguous(error.into()))?
+            .ok_or_else(|| {
+                ContainerExecStartError::Ambiguous(LinuxError::Protocol(
+                    "container exec stream ended before readiness".to_string(),
+                ))
+            })?;
         validate_exec_event_metadata(
             &mut self.last_sequence,
             &mut self.expected_request_id,
             first.sequence,
             first.request_id.as_str(),
-        )?;
-        let generation = require_container_ready(&first, expected_container_id)?;
+        )
+        .map_err(ContainerExecStartError::Ambiguous)?;
+        let expected_request_id = self.expected_request_id.as_deref().unwrap_or_default();
+        if let Some(rejection) = definite_initial_exec_rejection(&first, expected_request_id) {
+            return Err(rejection);
+        }
+        let exec_id = first.exec_id;
+        let generation = require_container_ready(&first, expected_container_id)
+            .map_err(ContainerExecStartError::Ambiguous)?;
         self.container_generation = Some(generation.clone());
-        Ok((self, generation))
+        self.expected_exec_id = Some(exec_id);
+        Ok((self, exec_id, generation))
     }
 
     /// Exact guest-observed container generation pinned by this exec.
@@ -982,61 +1408,10 @@ impl GrpcExecStream {
     /// Returns `None` after the command has exited (after yielding
     /// [`ExecEvent::Exit`](vz::protocol::ExecEvent::Exit)).
     pub async fn next(&mut self) -> Option<vz::protocol::ExecEvent> {
-        if self.done {
-            return None;
-        }
-
-        loop {
-            // Return the buffered first event if present (from interactive setup).
-            let next_event = if let Some(buffered) = self.buffered_first.take() {
-                Ok(Some(buffered))
-            } else {
-                self.inner.message().await
-            };
-
-            match next_event {
-                Ok(Some(proto_event)) => {
-                    if validate_exec_event_metadata(
-                        &mut self.last_sequence,
-                        &mut self.expected_request_id,
-                        proto_event.sequence,
-                        proto_event.request_id.as_str(),
-                    )
-                    .is_err()
-                    {
-                        self.done = true;
-                        return Some(vz::protocol::ExecEvent::Exit(-1));
-                    }
-                    match proto_event.event {
-                        Some(exec_event::Event::Stdout(data)) => {
-                            return Some(vz::protocol::ExecEvent::Stdout(data));
-                        }
-                        Some(exec_event::Event::Stderr(data)) => {
-                            return Some(vz::protocol::ExecEvent::Stderr(data));
-                        }
-                        Some(exec_event::Event::ExitCode(code)) => {
-                            self.done = true;
-                            return Some(vz::protocol::ExecEvent::Exit(code));
-                        }
-                        Some(exec_event::Event::Error(_)) => {
-                            self.done = true;
-                            return Some(vz::protocol::ExecEvent::Exit(-1));
-                        }
-                        Some(exec_event::Event::ContainerReady(_)) => {
-                            self.done = true;
-                            return Some(vz::protocol::ExecEvent::Exit(-1));
-                        }
-                        None => {
-                            // Empty event frame, skip.
-                            continue;
-                        }
-                    }
-                }
-                Ok(None) | Err(_) => {
-                    self.done = true;
-                    return None;
-                }
-            }
+        match self.next_checked_inner().await {
+            Ok(event) => event,
+            Err(ExecStreamReadError::Protocol(_)) => Some(vz::protocol::ExecEvent::Exit(-1)),
+            Err(ExecStreamReadError::Transport(_)) => None,
         }
     }
 
@@ -1212,6 +1587,44 @@ fn buildctl_guest_command(args: Vec<String>) -> (String, Vec<String>) {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn cancellation_during_preflight_closes_dispatch_gate_before_send() {
+        let gate =
+            ContainerExecDispatchGate::new(tokio::time::Instant::now() + Duration::from_secs(1));
+        let task_gate = gate.clone();
+        let (release_preflight, preflight_blocked) = tokio::sync::oneshot::channel();
+        let start = tokio::spawn(async move {
+            let _ = preflight_blocked.await;
+            task_gate.authorize_dispatch()
+        });
+
+        assert!(gate.cancel_before_dispatch());
+        assert!(release_preflight.send(()).is_ok());
+        assert!(
+            matches!(start.await, Ok(false)),
+            "cancelled request reached send gate"
+        );
+    }
+
+    #[test]
+    fn dispatch_authorization_owns_racing_cancellation() {
+        let gate =
+            ContainerExecDispatchGate::new(tokio::time::Instant::now() + Duration::from_secs(1));
+        assert!(gate.authorize_dispatch());
+        assert!(
+            !gate.cancel_before_dispatch(),
+            "authorized request must remain under request-ID reconciliation"
+        );
+        assert!(!gate.authorize_dispatch(), "dispatch is one-shot");
+    }
+
+    #[tokio::test]
+    async fn expired_dispatch_gate_cannot_authorize_send() {
+        let gate = ContainerExecDispatchGate::new(tokio::time::Instant::now());
+        assert!(!gate.authorize_dispatch());
+        assert!(gate.cancel_before_dispatch());
+    }
+
     fn ready_generation(container_id: &str) -> ContainerGeneration {
         let object = || vz_agent_proto::KernelObjectIdentity {
             device: 8,
@@ -1252,9 +1665,32 @@ mod tests {
 
         let output_before_ready = vz_agent_proto::ExecEvent {
             event: Some(exec_event::Event::Stdout(Vec::new())),
-            ..event
+            ..event.clone()
         };
         assert!(require_container_ready(&output_before_ready, "web").is_err());
+
+        let missing_exec_identity = vz_agent_proto::ExecEvent {
+            exec_id: 0,
+            ..event
+        };
+        assert!(require_container_ready(&missing_exec_identity, "web").is_err());
+    }
+
+    #[test]
+    fn cancel_receipt_retains_normalized_terminal_status() {
+        let receipt = CancelExecResponse {
+            exit_code: 143,
+            forced: false,
+        };
+        assert_eq!(receipt.exit_code, 128 + 15);
+        assert!(!receipt.forced);
+
+        let forced = CancelExecResponse {
+            exit_code: 137,
+            forced: true,
+        };
+        assert_eq!(forced.exit_code, 128 + 9);
+        assert!(forced.forced);
     }
 
     #[test]
@@ -1340,25 +1776,10 @@ mod tests {
     }
 
     #[test]
-    fn unary_oci_request_preserves_raw_command_options_and_identity() {
-        let request = build_oci_exec_request(
-            "web".to_string(),
-            "/bin/printf".to_string(),
-            vec!["%s".to_string(), "$HOME;still-argv".to_string()],
-            OciExecOptions {
-                env: vec![("PATH".to_string(), "/bin".to_string())],
-                cwd: Some("/workspace".to_string()),
-                user: Some("1000:1000".to_string()),
-            },
-            ProtoTransportMetadata::default(),
-        );
-
-        assert_eq!(request.container_id, "web");
-        assert_eq!(request.command, "/bin/printf");
-        assert_eq!(request.args, ["%s", "$HOME;still-argv"]);
-        assert_eq!(request.working_dir, "/workspace");
-        assert_eq!(request.env.get("PATH").map(String::as_str), Some("/bin"));
-        assert_eq!(request.user, "1000:1000");
+    fn legacy_unary_oci_exec_is_retired_fail_closed() {
+        let message = retired_oci_exec_error().to_string();
+        assert!(message.contains("OciService.Exec is retired"));
+        assert!(message.contains("supervised AgentService.Exec"));
     }
 
     #[test]
@@ -1419,6 +1840,275 @@ mod tests {
             validate_exec_event_metadata(&mut last_sequence, &mut expected_request_id, 2, "req_2")
                 .unwrap_err();
         assert!(err.to_string().contains("request_id mismatch"));
+    }
+
+    #[test]
+    fn validate_exec_event_metadata_rejects_missing_revision_five_fields() {
+        let mut last_sequence = 0;
+        let mut expected_request_id = Some("req_1".to_string());
+        let zero_sequence =
+            validate_exec_event_metadata(&mut last_sequence, &mut expected_request_id, 0, "req_1")
+                .unwrap_err();
+        assert!(zero_sequence.to_string().contains("required sequence"));
+
+        let empty_request_id =
+            validate_exec_event_metadata(&mut last_sequence, &mut expected_request_id, 1, "")
+                .unwrap_err();
+        assert!(empty_request_id.to_string().contains("required request_id"));
+    }
+
+    #[test]
+    fn allocated_container_exec_request_ids_require_canonical_boot_ticket() {
+        let valid = "exec_req_00000000-0000-4000-8000-000000000001_0000000000000001";
+        validate_allocated_exec_request_id(valid).unwrap();
+        for invalid in [
+            "exec_req_00000000-0000-4000-8000-000000000001",
+            "exec_req_00000000-0000-4000-8000-000000000001_0000000000000000",
+            "exec_req_00000000-0000-4000-8000-000000000001_000000000000000g",
+            "exec_req_00000000-0000-4000-0000-000000000001_0000000000000001",
+            "exec_req_00000000-0000-4000-8000-000000000001_1",
+        ] {
+            assert!(validate_allocated_exec_request_id(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn reconciliation_response_requires_exact_normalized_proof_fields() {
+        use vz_agent_proto::reconcile_exec_response::Outcome;
+
+        let request_id = "exec_req_00000000-0000-4000-8000-000000000004_0000000000000001";
+        let fenced = ReconcileExecResponse {
+            outcome: Outcome::FencedNeverStarted as i32,
+            exec_request_id: request_id.to_string(),
+            exec_id: 0,
+            exit_code: 0,
+            forced: false,
+        };
+        validate_reconcile_exec_response(&fenced, request_id).unwrap();
+
+        let terminal = ReconcileExecResponse {
+            outcome: Outcome::TerminalReaped as i32,
+            exec_request_id: request_id.to_string(),
+            exec_id: 42,
+            exit_code: 137,
+            forced: true,
+        };
+        validate_reconcile_exec_response(&terminal, request_id).unwrap();
+
+        for invalid in [
+            ReconcileExecResponse {
+                exec_id: 1,
+                ..fenced.clone()
+            },
+            ReconcileExecResponse {
+                forced: true,
+                ..fenced.clone()
+            },
+            ReconcileExecResponse {
+                exec_id: 0,
+                ..terminal.clone()
+            },
+            ReconcileExecResponse {
+                exit_code: -1,
+                ..terminal.clone()
+            },
+            ReconcileExecResponse {
+                exit_code: 256,
+                ..terminal.clone()
+            },
+            ReconcileExecResponse {
+                exec_request_id: "different".to_string(),
+                ..terminal
+            },
+        ] {
+            assert!(validate_reconcile_exec_response(&invalid, request_id).is_err());
+        }
+    }
+
+    #[test]
+    fn response_loss_hook_consumes_only_after_exact_command_match() {
+        let source = include_str!("grpc_client.rs");
+        let hook = source
+            .split_once("async fn inject_container_exec_response_loss")
+            .unwrap()
+            .1
+            .split_once("fn validate_reconcile_exec_response")
+            .unwrap()
+            .0;
+        assert!(hook.contains("expected != command"));
+        assert!(hook.contains("VZ_TEST_DROP_CONTAINER_EXEC_RESPONSE_DWELL_MS"));
+        assert!(hook.find("expected != command") < hook.find("INJECTED.swap"));
+    }
+
+    #[test]
+    fn exec_start_status_classification_is_conservative() {
+        for status in [
+            tonic::Status::invalid_argument("server rejection without stage proof"),
+            tonic::Status::unavailable("transport lost"),
+            tonic::Status::cancelled("caller lost"),
+            tonic::Status::internal("server state unknown"),
+        ] {
+            assert!(classify_exec_rpc_status(status).is_ambiguous());
+        }
+    }
+
+    #[test]
+    fn only_exact_first_authenticated_error_frame_is_a_definite_start_rejection() {
+        let rejected = vz_agent_proto::ExecEvent {
+            event: Some(exec_event::Event::Error("spawn failed".to_string())),
+            sequence: 1,
+            request_id: "req_1".to_string(),
+            exec_id: 0,
+        };
+        assert!(matches!(
+            definite_initial_exec_rejection(&rejected, "req_1"),
+            Some(ContainerExecStartError::Definite(_))
+        ));
+
+        let addressed_error = vz_agent_proto::ExecEvent {
+            exec_id: 41,
+            ..rejected.clone()
+        };
+        assert!(definite_initial_exec_rejection(&addressed_error, "req_1").is_none());
+
+        let wrong_sequence = vz_agent_proto::ExecEvent {
+            sequence: 2,
+            ..rejected.clone()
+        };
+        assert!(definite_initial_exec_rejection(&wrong_sequence, "req_1").is_none());
+
+        let wrong_request = vz_agent_proto::ExecEvent {
+            request_id: "req_other".to_string(),
+            ..rejected.clone()
+        };
+        assert!(definite_initial_exec_rejection(&wrong_request, "req_1").is_none());
+
+        let malformed_ready = vz_agent_proto::ExecEvent {
+            event: Some(exec_event::Event::ContainerReady(
+                vz_agent_proto::ContainerExecReady {
+                    generation: Some(ready_generation("web")),
+                },
+            )),
+            ..rejected
+        };
+        assert!(definite_initial_exec_rejection(&malformed_ready, "req_1").is_none());
+    }
+
+    #[test]
+    fn checked_exec_decode_never_synthesizes_terminal_status_for_protocol_failure() {
+        let event = vz_agent_proto::ExecEvent {
+            event: Some(exec_event::Event::Error("launcher lost".to_string())),
+            sequence: 1,
+            request_id: "req_1".to_string(),
+            exec_id: 41,
+        };
+        let mut last_sequence = 0;
+        let mut expected_request_id = Some("req_1".to_string());
+        let error =
+            decode_exec_stream_event(&mut last_sequence, &mut expected_request_id, None, event)
+                .unwrap_err();
+        assert!(error.to_string().contains("launcher lost"));
+
+        let repeated_ready = vz_agent_proto::ExecEvent {
+            event: Some(exec_event::Event::ContainerReady(
+                vz_agent_proto::ContainerExecReady {
+                    generation: Some(ready_generation("web")),
+                },
+            )),
+            sequence: 2,
+            request_id: "req_1".to_string(),
+            exec_id: 41,
+        };
+        let error = decode_exec_stream_event(
+            &mut last_sequence,
+            &mut expected_request_id,
+            None,
+            repeated_ready,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("repeated container readiness"));
+    }
+
+    #[test]
+    fn checked_exec_decode_preserves_only_genuine_exit_frames_as_terminal() {
+        let event = vz_agent_proto::ExecEvent {
+            event: Some(exec_event::Event::ExitCode(143)),
+            sequence: 1,
+            request_id: "req_1".to_string(),
+            exec_id: 41,
+        };
+        let mut last_sequence = 0;
+        let mut expected_request_id = Some("req_1".to_string());
+        assert_eq!(
+            decode_exec_stream_event(&mut last_sequence, &mut expected_request_id, None, event)
+                .unwrap(),
+            Some(vz::protocol::ExecEvent::Exit(143))
+        );
+    }
+
+    #[test]
+    fn container_exec_decode_rejects_missing_or_mismatched_exec_identity() {
+        for (observed, expected_fragment) in [(0, "got 0"), (42, "got 42")] {
+            let event = vz_agent_proto::ExecEvent {
+                event: Some(exec_event::Event::ExitCode(0)),
+                sequence: 2,
+                request_id: "req_1".to_string(),
+                exec_id: observed,
+            };
+            let mut last_sequence = 1;
+            let mut expected_request_id = Some("req_1".to_string());
+            let error = decode_exec_stream_event(
+                &mut last_sequence,
+                &mut expected_request_id,
+                Some(41),
+                event,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected_fragment));
+            assert_eq!(
+                last_sequence, 1,
+                "identity must fail before ordering state changes"
+            );
+        }
+    }
+
+    #[test]
+    fn container_exec_decode_accepts_matching_terminal_identity() {
+        let event = vz_agent_proto::ExecEvent {
+            event: Some(exec_event::Event::ExitCode(143)),
+            sequence: 2,
+            request_id: "req_1".to_string(),
+            exec_id: 41,
+        };
+        let mut last_sequence = 1;
+        let mut expected_request_id = Some("req_1".to_string());
+        assert_eq!(
+            decode_exec_stream_event(
+                &mut last_sequence,
+                &mut expected_request_id,
+                Some(41),
+                event,
+            )
+            .unwrap(),
+            Some(vz::protocol::ExecEvent::Exit(143))
+        );
+    }
+
+    #[test]
+    fn ordinary_exec_decode_does_not_require_container_exec_identity() {
+        let event = vz_agent_proto::ExecEvent {
+            event: Some(exec_event::Event::Stdout(b"ordinary".to_vec())),
+            sequence: 1,
+            request_id: "req_ordinary".to_string(),
+            exec_id: 0,
+        };
+        let mut last_sequence = 0;
+        let mut expected_request_id = Some("req_ordinary".to_string());
+        assert_eq!(
+            decode_exec_stream_event(&mut last_sequence, &mut expected_request_id, None, event)
+                .unwrap(),
+            Some(vz::protocol::ExecEvent::Stdout(b"ordinary".to_vec()))
+        );
     }
 
     #[test]

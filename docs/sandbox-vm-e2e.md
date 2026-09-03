@@ -21,13 +21,18 @@ Use `scripts/run-sandbox-vm-e2e.sh` to run sandbox-focused integration tests tha
 ## Default Command
 
 ```bash
-./scripts/run-sandbox-vm-e2e.sh
+./scripts/run-sandbox-vm-e2e.sh --profile release
 ```
 
 Default suite is `sandbox`, which expands to:
 
 - `runtime` (`vz-oci-macos/tests/runtime_e2e.rs`)
 - `stack` (`vz-stack/tests/stack_e2e.rs`)
+
+The script's profile option defaults to `debug` for focused development
+scenarios. The complete `runtime`, `sandbox`, and `all` lanes include strict
+exec-supervision release evidence and therefore fail preflight unless
+`--profile release` is explicit.
 
 ## Use-Case Scenarios
 
@@ -38,6 +43,7 @@ Capability matrix:
 - `runtime-smoke` → `smoke_pull_and_run_alpine`
 - `runtime-lifecycle` → `lifecycle_create_exec_stop_remove`
 - `runtime-container-id-ownership` → `container_id_lifecycle_serialization_and_generation_ownership`
+- `runtime-exec-supervision` → `runtime_exec_supervision`
 - `runtime-port-forwarding` → `port_forwarding_tcp`
 - `runtime-shared-vm-net` → `shared_vm_inter_service_connectivity`
 - `stack-real-services` → `real_services_postgres_and_redis`
@@ -63,23 +69,66 @@ and requires `host.vz.internal` to be absent from `/etc/hosts`. It is not a
 positive host-import test: the authenticated relay is tracked separately and
 must not be replaced by arbitrary gateway reachability.
 
+The complete `runtime` suite also runs the strict exec-supervision matrix. It
+exercises the synchronous/unary-shaped host adapter, streaming, and PTY
+container exec against `SIGTERM`, `SIGINT`, `SIGKILL`, and deadline
+cancellation (12 exact cells). The synchronous adapter uses the same supervised
+stream internally; the raw legacy `OciService.Exec` path is retired and is not
+release evidence. Every cell
+retains the target's raw container/guest PID, `/proc` start time, process-group
+ID, exact cgroup path and membership, then requires synchronous process/session
+reaping, exact baseline cgroup restoration, marker cleanup, and a post-case
+container-health probe. Signal exits must be exactly 143, 130, and 137. The
+timeout is fixed at two seconds and must complete within the schema's bounded
+window. PTY cells also prove resize control. There are no optional cells,
+required skips, or scenario retries. Additional retained-child cases prove the
+explicit cancellation receipt and the normal-leader-exit path both kill and
+reap the remaining process group before returning. Further required cases
+cancel at the deterministic registered/pre-guest-RPC boundary, drop a live host
+execution future after normal readiness, and kill the exact outer trampoline by
+PID/start-time identity. Two additional caller-abort cases pause after the guest
+has returned its post-execve readiness proof but before the outer task can take
+ownership: one uses a named streaming execution and the other the anonymous
+unary adapter. While that boundary is held, both must expose a live leader and
+retained child in the exact container cgroup. Aborting the caller must then
+remove both exact PID/start-time identities, restore baseline cgroup membership,
+remove any named host session and marker, and leave the container healthy. Each
+case must retain cleanup authority and publish no invalid readiness.
+
+Schema v4 adds three exact-once regressions. An authenticated, container-targeted
+request with an invalid environment key must return a definite pre-spawn error,
+leave both the host session count and exact cgroup membership unchanged, release
+the lifecycle writer, and pass a post-case exec. A slow but live streaming
+consumer pauses for six seconds while the guest emits 5 MiB (more than the
+64 × 65,536-byte bounded channel capacity); the gate requires the exact byte
+count and SHA-256, one readiness event, one exit event, and `Exit(0)` last. The
+third case injects a single authenticated response loss after dispatch but
+before the host observes readiness. Its prepared request ID must take the
+reconciliation path and return the stable caller-visible
+`reconciliation=TERMINAL_REAPED` outcome, with exact process/cgroup/session
+cleanup, released lifecycle admission, and a healthy post-case exec. The fault
+selector is supplied only by the strict harness and targets that unique command,
+so a parallel full runtime suite cannot consume it in another exec.
+
 Scenario groups:
 
-- `sandbox-usecases` → runtime + stack use-cases (no buildkit)
-- `all-usecases` → runtime + stack + buildkit use-cases
+- `sandbox-usecases` → runtime + stack use-cases (no buildkit and no
+  release-only exec-supervision evidence)
+- `all-usecases` → runtime + stack + buildkit use-cases, including
+  exec-supervision; select `--profile release`
 
 ## Suite Selection
 
 ```bash
 # Only runtime sandbox behavior
-./scripts/run-sandbox-vm-e2e.sh --suite runtime
+./scripts/run-sandbox-vm-e2e.sh --profile release --suite runtime
 
 # Runtime + stack + buildkit
-./scripts/run-sandbox-vm-e2e.sh --suite all
+./scripts/run-sandbox-vm-e2e.sh --profile release --suite all
 
 # Multiple flags or comma-separated tokens both work
-./scripts/run-sandbox-vm-e2e.sh --suite runtime --suite buildkit
-./scripts/run-sandbox-vm-e2e.sh --suite runtime,buildkit
+./scripts/run-sandbox-vm-e2e.sh --profile release --suite runtime --suite buildkit
+./scripts/run-sandbox-vm-e2e.sh --profile release --suite runtime,buildkit
 ```
 
 Supported suite tokens:
@@ -94,7 +143,7 @@ Supported suite tokens:
 
 ```bash
 # Keep running all suites even if one fails
-./scripts/run-sandbox-vm-e2e.sh --suite all --keep-going
+./scripts/run-sandbox-vm-e2e.sh --profile release --suite all --keep-going
 
 # Use release profile
 ./scripts/run-sandbox-vm-e2e.sh --profile release
@@ -107,7 +156,18 @@ Supported suite tokens:
 
 # Run only snapshot/restore use-case scenario
 ./scripts/run-sandbox-vm-e2e.sh --scenario stack-snapshot-restore
+
+# Run the release-built Mac→vz Linux exec-supervision gate
+./scripts/run-sandbox-vm-e2e.sh --profile release --scenario runtime-exec-supervision
 ```
+
+The focused `runtime-exec-supervision` scenario is release evidence, as is any
+complete suite lane containing `runtime`. The harness rejects every such lane
+unless `--profile release` is selected. A complete release `runtime`, `sandbox`,
+or `all` run includes the scenario and validates its evidence. The evidence
+records and the validator independently bind the `release` profile, the signed
+test-binary SHA-256, and the rebuilt Developer initramfs SHA-256 used by that
+run.
 
 Default rust test args are:
 
@@ -130,6 +190,16 @@ Each run creates a timestamped directory containing:
 - `summary.txt`
 - `container-id-ownership.json` when the runtime container-ID ownership test runs
 - `container-id-ownership.json.sha256`, verified by the harness before success
+- `runtime-exec-supervision.json` when the focused exec-supervision scenario or
+  complete runtime lane runs; its strict schema version 4 binds the release
+  profile plus signed test-binary and rebuilt Developer-initramfs SHA-256
+  identities, and contains all 12 adapter × termination cells, pre-ready
+  cancellation, authenticated pre-spawn rejection, slow-consumer backpressure,
+  request-ID reconciliation after pre-ready response loss, post-ready caller
+  loss, named and anonymous caller abort at the guest-ready-before-owner
+  boundary, exact outer-death, normal-exit descendant cleanup, and final
+  zero-leak evidence
+- `runtime-exec-supervision.json.sha256`, verified by the harness before success
 - `stack-port-forwarding-teardown.json` when the focused port-forwarding
   scenario or complete stack lane runs
 - `stack-port-forwarding-teardown.json.sha256`, verified by the harness before

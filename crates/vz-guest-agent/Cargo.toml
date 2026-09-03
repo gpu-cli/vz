@@ -16,6 +16,7 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 anyhow = { workspace = true }
 libc = { workspace = true }
 portable-pty = { workspace = true }

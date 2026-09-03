@@ -8,6 +8,173 @@ use super::oci_lifecycle::{run_oci_lifecycle, spawn_log_rotation_task};
 use super::resolve::parse_compose_log_rotation;
 use super::*;
 
+const TRANSIENT_VM_STOP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+const TRANSIENT_VM_STOP_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Retains a one-shot VM until its force-stop is proven.
+///
+/// The normal path calls [`TransientVmCleanupGuard::stop`] before returning.
+/// If its owner is cancelled at any await point, `Drop` transfers the VM and
+/// its recovery-route cleanup to a background task that keeps retrying bounded
+/// stop attempts. This prevents an aborted one-shot or rootfs lifecycle from
+/// dropping the last cleanup authority while guest work may still be live.
+struct TransientVmCleanupGuard {
+    vm: Option<Arc<LinuxVm>>,
+    registered_container_id: String,
+    vm_handles: Arc<Mutex<HashMap<String, Arc<LinuxVm>>>>,
+}
+
+impl TransientVmCleanupGuard {
+    fn new(
+        vm: Arc<LinuxVm>,
+        registered_container_id: &str,
+        vm_handles: Arc<Mutex<HashMap<String, Arc<LinuxVm>>>>,
+    ) -> Self {
+        Self {
+            vm: Some(vm),
+            registered_container_id: registered_container_id.to_string(),
+            vm_handles,
+        }
+    }
+
+    async fn stop(&mut self) -> Result<(), LinuxError> {
+        let Some(vm) = self.vm.as_ref().cloned() else {
+            return Ok(());
+        };
+        if matches!(
+            vm.inner().state(),
+            vz::VmState::Stopped | vz::VmState::Error(_)
+        ) {
+            self.finish_stopped(&vm).await;
+            return Ok(());
+        }
+
+        let result = tokio::time::timeout(TRANSIENT_VM_STOP_ATTEMPT_TIMEOUT, vm.stop())
+            .await
+            .map_err(|_| {
+                LinuxError::Protocol(format!(
+                    "transient VM stop timed out after {:.3}s; cleanup continues under retained authority",
+                    TRANSIENT_VM_STOP_ATTEMPT_TIMEOUT.as_secs_f64()
+                ))
+            });
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error))
+                if matches!(
+                    vm.inner().state(),
+                    vz::VmState::Stopped | vz::VmState::Error(_)
+                ) =>
+            {
+                warn!(
+                    container_id = %self.registered_container_id,
+                    %error,
+                    "transient VM stop reported an error after reaching a terminal state"
+                );
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(error)
+                if matches!(
+                    vm.inner().state(),
+                    vz::VmState::Stopped | vz::VmState::Error(_)
+                ) =>
+            {
+                warn!(
+                    container_id = %self.registered_container_id,
+                    %error,
+                    "transient VM stop waiter timed out after the VM reached a terminal state"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+
+        self.finish_stopped(&vm).await;
+        Ok(())
+    }
+
+    async fn finish_stopped(&mut self, vm: &Arc<LinuxVm>) {
+        let mut vm_handles = self.vm_handles.lock().await;
+        if vm_handles
+            .get(&self.registered_container_id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, vm))
+        {
+            vm_handles.remove(&self.registered_container_id);
+        }
+        self.vm.take();
+    }
+}
+
+impl Drop for TransientVmCleanupGuard {
+    fn drop(&mut self) {
+        let Some(vm) = self.vm.take() else {
+            return;
+        };
+        let registered_container_id = self.registered_container_id.clone();
+        let vm_handles = Arc::clone(&self.vm_handles);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                container_id = %registered_container_id,
+                "transient VM cleanup lost its Tokio runtime; retaining VM authority"
+            );
+            std::mem::forget(vm);
+            return;
+        };
+
+        runtime.spawn(async move {
+            loop {
+                if matches!(
+                    vm.inner().state(),
+                    vz::VmState::Stopped | vz::VmState::Error(_)
+                ) {
+                    break;
+                }
+                match tokio::time::timeout(TRANSIENT_VM_STOP_ATTEMPT_TIMEOUT, vm.stop()).await {
+                    Ok(Ok(())) => break,
+                    Ok(Err(error))
+                        if matches!(
+                            vm.inner().state(),
+                            vz::VmState::Stopped | vz::VmState::Error(_)
+                        ) =>
+                    {
+                        warn!(
+                            container_id = %registered_container_id,
+                            %error,
+                            "transient VM background stop reached a terminal state"
+                        );
+                        break;
+                    }
+                    Ok(Err(error)) => warn!(
+                        container_id = %registered_container_id,
+                        %error,
+                        "transient VM background stop failed; retaining authority and retrying"
+                    ),
+                    Err(_)
+                        if matches!(
+                            vm.inner().state(),
+                            vz::VmState::Stopped | vz::VmState::Error(_)
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(_) => warn!(
+                        container_id = %registered_container_id,
+                        timeout_secs = TRANSIENT_VM_STOP_ATTEMPT_TIMEOUT.as_secs_f64(),
+                        "transient VM background stop timed out; retaining authority and retrying"
+                    ),
+                }
+                tokio::time::sleep(TRANSIENT_VM_STOP_RETRY_DELAY).await;
+            }
+
+            let mut vm_handles = vm_handles.lock().await;
+            if vm_handles
+                .get(&registered_container_id)
+                .is_some_and(|registered| Arc::ptr_eq(registered, &vm))
+            {
+                vm_handles.remove(&registered_container_id);
+            }
+        });
+    }
+}
+
 impl Runtime {
     pub(super) async fn boot_and_start_container(
         &self,
@@ -320,12 +487,22 @@ impl Runtime {
             vm_config.network = Some(NetworkConfig::None);
         }
 
-        let vm = LinuxVm::create(vm_config).await?;
-        vm.start().await?;
+        let vm = Arc::new(LinuxVm::create(vm_config).await?);
+        // Arm cancellation cleanup before the first VM operation that can be
+        // interrupted after Virtualization.framework has accepted work.
+        let mut vm_cleanup = TransientVmCleanupGuard::new(
+            Arc::clone(&vm),
+            registered_container_id,
+            Arc::clone(&self.vm_handles),
+        );
+        if let Err(error) = vm.start().await {
+            let stop = vm_cleanup.stop().await;
+            return finish_transient_execution(Err::<ExecOutput, _>(error), Ok(()), stop);
+        }
 
         if let Err(err) = vm.wait_for_agent(self.config.agent_ready_timeout).await {
-            let _ = vm.stop().await;
-            return Err(err.into());
+            let stop = vm_cleanup.stop().await;
+            return finish_transient_execution(Err::<ExecOutput, _>(err), Ok(()), stop);
         }
 
         // Set up per-container overlay so youki can mknod on tmpfs.
@@ -333,14 +510,13 @@ impl Runtime {
         if let Err(err) =
             setup_unshared_guest_container_overlay(&vm, "/vz-rootfs", &container_id, None).await
         {
-            let _ = vm.stop().await;
-            return Err(err);
+            let stop = vm_cleanup.stop().await;
+            return finish_transient_execution(Err(err), Ok(()), stop);
         }
 
         // One-off execution is transient and carries its resolved options
         // directly through run_oci_lifecycle. It intentionally has no public
         // container-exec binding; this handle is recovery/lifecycle routing.
-        let vm = Arc::new(vm);
         self.vm_handles
             .lock()
             .await
@@ -349,13 +525,13 @@ impl Runtime {
         let port_forwards = match start_port_forwarding(vm.inner_shared(), &ports).await {
             Ok(port_forwards) => port_forwards,
             Err(err) => {
-                let _ = vm.stop().await;
-                return Err(err);
+                let stop = vm_cleanup.stop().await;
+                return finish_transient_execution(Err(err), Ok(()), stop);
             }
         };
 
         let lifecycle_timeout = timeout.unwrap_or(self.config.exec_timeout);
-        let lifecycle = tokio::time::timeout(
+        let lifecycle = match tokio::time::timeout(
             lifecycle_timeout,
             run_oci_lifecycle(
                 vm.as_ref(),
@@ -371,27 +547,45 @@ impl Runtime {
             ),
         )
         .await
-        .map_err(|_| {
-            OciError::InvalidConfig(format!(
+        {
+            Ok(result) => result,
+            Err(_) => Err(OciError::InvalidConfig(format!(
                 "oci runtime exec timed out after {:.3}s",
                 lifecycle_timeout.as_secs_f64()
-            ))
-        })?;
+            ))),
+        };
 
         let forwarding_shutdown = match port_forwards {
             Some(mut port_forwards) => port_forwards.shutdown().await,
             None => Ok(()),
         };
-        let stop = vm.stop().await;
+        let stop = vm_cleanup.stop().await;
         finish_transient_execution(lifecycle, forwarding_shutdown, stop)
     }
 
     /// Run a command against a local rootfs mounted as VirtioFS `rootfs`.
     ///
-    /// This is a stepping stone toward full OCI image lifecycle support.
+    /// The spawned worker owns the complete transient lifecycle. Dropping this
+    /// public future therefore cannot interrupt VM/forwarding cleanup.
     pub async fn run_rootfs(
         &self,
         rootfs_dir: impl AsRef<Path>,
+        run: RunConfig,
+    ) -> Result<ExecOutput, OciError> {
+        let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
+        let runtime = self.clone();
+        tokio::spawn(async move { runtime.run_rootfs_owned(rootfs_dir, run).await })
+            .await
+            .map_err(|error| {
+                OciError::InvalidConfig(format!(
+                    "rootfs lifecycle worker failed while retaining VM cleanup authority: {error}"
+                ))
+            })?
+    }
+
+    async fn run_rootfs_owned(
+        &self,
+        rootfs_dir: PathBuf,
         run: RunConfig,
     ) -> Result<ExecOutput, OciError> {
         let RunConfig {
@@ -408,7 +602,7 @@ impl Runtime {
             serial_log_file,
             execution_mode: _,
             timeout,
-            container_id: _,
+            container_id,
             oci_annotations: _,
             extra_hosts: _,
             network_namespace_path: _,
@@ -429,8 +623,6 @@ impl Runtime {
             share_host_network: _,
             mount_tag_offset: _,
         } = run;
-
-        let rootfs_dir = rootfs_dir.as_ref().to_path_buf();
 
         if !rootfs_dir.is_dir() {
             return Err(OciError::InvalidRootfs { path: rootfs_dir });
@@ -478,19 +670,44 @@ impl Runtime {
             vm_config.network = Some(NetworkConfig::None);
         }
 
-        let vm = LinuxVm::create(vm_config).await?;
-        vm.start().await?;
+        let registered_container_id = container_id.unwrap_or_else(new_container_id);
+        validate_container_id(&registered_container_id)?;
+        let vm = Arc::new(LinuxVm::create(vm_config).await?);
+        let mut vm_cleanup = TransientVmCleanupGuard::new(
+            Arc::clone(&vm),
+            &registered_container_id,
+            Arc::clone(&self.vm_handles),
+        );
+        {
+            let mut vm_handles = self.vm_handles.lock().await;
+            if vm_handles.contains_key(&registered_container_id) {
+                drop(vm_handles);
+                let stop = vm_cleanup.stop().await;
+                return finish_transient_execution(
+                    Err::<ExecOutput, _>(OciError::ContainerAlreadyExists {
+                        id: registered_container_id,
+                    }),
+                    Ok(()),
+                    stop,
+                );
+            }
+            vm_handles.insert(registered_container_id.clone(), Arc::clone(&vm));
+        }
+        if let Err(error) = vm.start().await {
+            let stop = vm_cleanup.stop().await;
+            return finish_transient_execution(Err::<ExecOutput, _>(error), Ok(()), stop);
+        }
 
         if let Err(err) = vm.wait_for_agent(self.config.agent_ready_timeout).await {
-            let _ = vm.stop().await;
-            return Err(err.into());
+            let stop = vm_cleanup.stop().await;
+            return finish_transient_execution(Err::<ExecOutput, _>(err), Ok(()), stop);
         }
 
         let port_forwards = match start_port_forwarding(vm.inner_shared(), &ports).await {
             Ok(port_forwards) => port_forwards,
             Err(err) => {
-                let _ = vm.stop().await;
-                return Err(err);
+                let stop = vm_cleanup.stop().await;
+                return finish_transient_execution(Err(err), Ok(()), stop);
             }
         };
 
@@ -512,7 +729,7 @@ impl Runtime {
             Some(mut port_forwards) => port_forwards.shutdown().await,
             None => Ok(()),
         };
-        let stop = vm.stop().await;
+        let stop = vm_cleanup.stop().await;
         finish_transient_execution(exec, forwarding_shutdown, stop)
     }
 

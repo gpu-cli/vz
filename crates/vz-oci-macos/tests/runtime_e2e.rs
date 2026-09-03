@@ -323,7 +323,7 @@ async fn expect_lifecycle_admission(
 
 // ── Smoke test: pull + run ──────────────────────────────────────
 
-/// Pull alpine:latest and run `echo hello` via one-shot `Runtime::run()`.
+/// Pull pinned Alpine and run `echo hello` via one-shot `Runtime::run()`.
 ///
 /// This is the most fundamental E2E test: proves the full pipeline
 /// from image pull → rootfs assembly → VM boot → guest agent → exec → output.
@@ -338,7 +338,7 @@ async fn smoke_pull_and_run_alpine() {
     let rt = test_runtime(tmp.path());
 
     // Pull alpine (arm64 only, ~7 MB).
-    let image_id = rt.pull("alpine:latest").await.unwrap();
+    let image_id = rt.pull("alpine:3.20").await.unwrap();
     assert!(
         !image_id.0.is_empty(),
         "image ID should be non-empty after pull"
@@ -348,7 +348,7 @@ async fn smoke_pull_and_run_alpine() {
     let serial_log = tmp.path().join("serial.log");
     let output = rt
         .run(
-            "alpine:latest",
+            "alpine:3.20",
             RunConfig {
                 cmd: vec!["echo".into(), "hello".into()],
                 serial_log_file: Some(serial_log.clone()),
@@ -382,7 +382,7 @@ async fn smoke_run_oci_runtime_mode() {
 
     let output = rt
         .run(
-            "alpine:latest",
+            "alpine:3.20",
             RunConfig {
                 cmd: vec!["echo".into(), "oci-hello".into()],
                 execution_mode: ExecutionMode::OciRuntime,
@@ -409,7 +409,7 @@ async fn smoke_nonzero_exit_code() {
 
     let output = rt
         .run(
-            "alpine:latest",
+            "alpine:3.20",
             RunConfig {
                 cmd: vec!["sh".into(), "-c".into(), "exit 42".into()],
                 ..RunConfig::default()
@@ -434,7 +434,7 @@ async fn smoke_environment_variables() {
 
     let output = rt
         .run(
-            "alpine:latest",
+            "alpine:3.20",
             RunConfig {
                 cmd: vec!["sh".into(), "-c".into(), "echo $MY_VAR".into()],
                 env: vec![("MY_VAR".into(), "test_value".into())],
@@ -462,7 +462,7 @@ async fn container_kernel_exposes_docker_prerequisites() {
 
     let output = rt
         .run(
-            "alpine:latest",
+            "alpine:3.20",
             RunConfig {
                 cmd: vec![
                     "sh".into(),
@@ -499,7 +499,7 @@ async fn lifecycle_create_exec_stop_remove() {
     // Create a long-lived container with a sleep init process.
     let container_id = rt
         .create_container(
-            "alpine:latest",
+            "alpine:3.20",
             RunConfig {
                 cmd: vec!["sleep".into(), "300".into()],
                 execution_mode: ExecutionMode::OciRuntime,
@@ -582,7 +582,7 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
     }
     init_tracing();
 
-    const IMAGE: &str = "alpine:latest";
+    const IMAGE: &str = "alpine:3.20";
     const CONTAINER_ID: &str = "id-serialization-e2e";
     const STACK_ID: &str = "id-owner-stack";
     const SERVICE_NAME: &str = "owner";
@@ -626,6 +626,13 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
     let in_flight_standalone_duplicate_rejected =
         standalone_duplicate_id_was_rejected(&in_flight_standalone_duplicate);
     first_create_admission.resume();
+    let first_create_reserved = expect_lifecycle_admission(
+        &mut standalone_admissions,
+        RuntimeLifecycleAdmissionKind::CreateAfterReservation,
+        CONTAINER_ID,
+    )
+    .await;
+    first_create_reserved.resume();
     let first_standalone_id = tokio::time::timeout(Duration::from_secs(120), first_standalone)
         .await
         .expect("first standalone create timed out after admission release")
@@ -985,6 +992,16 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
     stop_requested.resume();
     exec_before_guest.resume();
 
+    let guest_rpc_ready = tokio::select! {
+        event = expect_lifecycle_admission(
+            &mut lifecycle_observer,
+            RuntimeLifecycleAdmissionKind::ExecGuestRpcReadyBeforeOwner,
+            CONTAINER_ID,
+        ) => event,
+        result = &mut replacement => panic!("replacement crossed exec admission before guest RPC readiness: {result:?}"),
+    };
+    guest_rpc_ready.resume();
+
     // If stop bypasses exec's read admission, StopWriterAcquired arrives here
     // and this exact event-order assertion fails.
     let guest_ready_boundary = tokio::select! {
@@ -1049,6 +1066,15 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
         result = &mut replacement => panic!("replacement completed before recreate admission: {result:?}"),
     };
     recreate_admitted.resume();
+    let recreate_reserved = tokio::select! {
+        event = expect_lifecycle_admission(
+            &mut lifecycle_observer,
+            RuntimeLifecycleAdmissionKind::CreateAfterReservation,
+            CONTAINER_ID,
+        ) => event,
+        result = &mut replacement => panic!("replacement completed before recreate reservation: {result:?}"),
+    };
+    recreate_reserved.resume();
     let recovery_route_published = tokio::select! {
         event = expect_lifecycle_admission(
             &mut lifecycle_observer,
@@ -1326,7 +1352,7 @@ async fn interactive_exec_control_session_round_trip() {
 
     let container_id = rt
         .create_container(
-            "alpine:latest",
+            "alpine:3.20",
             RunConfig {
                 cmd: vec!["sleep".into(), "300".into()],
                 execution_mode: ExecutionMode::OciRuntime,
@@ -1408,6 +1434,2053 @@ async fn interactive_exec_control_session_round_trip() {
 
 // ── Container logs ──────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecSupervisionAdapter {
+    Unary,
+    Streaming,
+    Pty,
+}
+
+impl ExecSupervisionAdapter {
+    const ALL: [Self; 3] = [Self::Unary, Self::Streaming, Self::Pty];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Unary => "unary",
+            Self::Streaming => "streaming",
+            Self::Pty => "pty",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecSupervisionTermination {
+    Term,
+    Int,
+    Kill,
+    Timeout,
+}
+
+impl ExecSupervisionTermination {
+    const ALL: [Self; 4] = [Self::Term, Self::Int, Self::Kill, Self::Timeout];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Term => "term",
+            Self::Int => "int",
+            Self::Kill => "kill",
+            Self::Timeout => "timeout",
+        }
+    }
+
+    const fn signal(self) -> Option<&'static str> {
+        match self {
+            Self::Term => Some("SIGTERM"),
+            Self::Int => Some("SIGINT"),
+            Self::Kill => Some("SIGKILL"),
+            Self::Timeout => None,
+        }
+    }
+
+    const fn expected_exit_code(self) -> Option<i32> {
+        match self {
+            Self::Term => Some(143),
+            Self::Int => Some(130),
+            Self::Kill => Some(137),
+            Self::Timeout => None,
+        }
+    }
+}
+
+fn parse_exec_supervision_fields(output: &str) -> std::collections::BTreeMap<String, String> {
+    output
+        .replace('\r', "")
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+async fn exec_supervision_host_command(
+    rt: &Runtime,
+    container_id: &str,
+    script: String,
+) -> vz::protocol::ExecOutput {
+    let output = rt
+        .exec_host(
+            container_id,
+            ExecConfig {
+                cmd: vec!["/bin/sh".into(), "-c".into(), script],
+                timeout: Some(Duration::from_secs(15)),
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("guest supervision probe failed: {error}"));
+    assert_eq!(
+        output.exit_code, 0,
+        "guest supervision probe failed: stdout={} stderr={}",
+        output.stdout, output.stderr
+    );
+    output
+}
+
+async fn exec_supervision_cgroup(
+    rt: &Runtime,
+    container_id: &str,
+) -> (String, Vec<(u32, u64, u32)>) {
+    let output = exec_supervision_host_command(
+        rt,
+        container_id,
+        format!(
+            r#"state=$(/run/vz-oci/bin/youki --root /run/vz-oci/state state {container_id})
+init_pid=$(printf '%s\n' "$state" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+test -n "$init_pid"
+cgroup_path=$(sed -n 's/^[^:]*:[^:]*://p' /proc/$init_pid/cgroup | head -n1)
+test -n "$cgroup_path"
+printf 'cgroup_path=%s\n' "$cgroup_path"
+for pid in $(sort -n /sys/fs/cgroup$cgroup_path/cgroup.procs); do
+    test -r /proc/$pid/stat || continue
+    printf 'member=%s:%s:%s\n' "$pid" "$(awk '{{print $22}}' /proc/$pid/stat)" "$(awk '{{print $5}}' /proc/$pid/stat)"
+done"#
+        ),
+    )
+    .await;
+    let fields = parse_exec_supervision_fields(&output.stdout);
+    let cgroup_path = fields
+        .get("cgroup_path")
+        .cloned()
+        .expect("cgroup probe omitted cgroup_path");
+    let members = output
+        .stdout
+        .replace('\r', "")
+        .lines()
+        .filter_map(|line| line.strip_prefix("member="))
+        .map(|member| {
+            let mut fields = member.split(':');
+            let pid = fields.next().unwrap().parse().unwrap();
+            let start_time = fields.next().unwrap().parse().unwrap();
+            let pgid = fields.next().unwrap().parse().unwrap();
+            assert!(fields.next().is_none(), "malformed cgroup member: {member}");
+            (pid, start_time, pgid)
+        })
+        .collect();
+    (cgroup_path, members)
+}
+
+async fn exec_supervision_marker(
+    rt: &Runtime,
+    container_id: &str,
+    marker_name: &str,
+) -> std::collections::BTreeMap<String, String> {
+    let marker =
+        format!("/run/vz-oci/containers/{container_id}/merged/vz-exec-supervision/{marker_name}");
+    let output = exec_supervision_host_command(
+        rt,
+        container_id,
+        format!(
+            r#"i=0
+while test ! -s '{marker}'; do
+    i=$((i + 1))
+    test "$i" -lt 200
+    sleep 0.02
+done
+cat '{marker}'"#
+        ),
+    )
+    .await;
+    let fields = parse_exec_supervision_fields(&output.stdout);
+    for required in [
+        "pid",
+        "start_time",
+        "pgid",
+        "child_pid",
+        "child_start_time",
+        "child_pgid",
+        "cgroup_path",
+    ] {
+        assert!(
+            fields.get(required).is_some_and(|value| !value.is_empty()),
+            "exec marker omitted {required}: {}",
+            output.stdout
+        );
+    }
+    fields
+}
+
+async fn assert_exec_supervision_identity_live(
+    rt: &Runtime,
+    container_id: &str,
+    expected_cgroup: &str,
+    marker_name: &str,
+    marker: &std::collections::BTreeMap<String, String>,
+    active_members: &[(u32, u64, u32)],
+) -> serde_json::Value {
+    assert_eq!(
+        marker["cgroup_path"], expected_cgroup,
+        "exec target entered the wrong cgroup"
+    );
+    let start_time: u64 = marker["start_time"].parse().unwrap();
+    let child_start_time: u64 = marker["child_start_time"].parse().unwrap();
+    let output = exec_supervision_host_command(
+        rt,
+        container_id,
+        format!(
+            r#"matches=0
+child_matches=0
+host_pid=
+child_host_pid=
+for candidate in $(cat '/sys/fs/cgroup{expected_cgroup}/cgroup.procs'); do
+    test -r /proc/$candidate/cmdline || continue
+    if test "$(cat /proc/$candidate/comm)" = sh \
+        && test "$(awk '{{print $22}}' /proc/$candidate/stat)" = '{start_time}' \
+        && tr '\000' ' ' < /proc/$candidate/cmdline | grep -Fq '/vz-exec-supervision/{marker_name}'; then
+        matches=$((matches + 1))
+        host_pid=$candidate
+    fi
+    if test "$(cat /proc/$candidate/comm)" = sh \
+        && test "$(awk '{{print $22}}' /proc/$candidate/stat)" = '{child_start_time}' \
+        && tr '\000' ' ' < /proc/$candidate/cmdline | grep -Fq 'vz-child-{marker_name}' \
+        && ! tr '\000' ' ' < /proc/$candidate/cmdline | grep -Fq '/vz-exec-supervision/{marker_name}'; then
+        child_matches=$((child_matches + 1))
+        child_host_pid=$candidate
+    fi
+done
+test "$matches" -eq 1
+test "$child_matches" -eq 1
+test -r /proc/$host_pid/stat
+test -r /proc/$child_host_pid/stat
+printf 'host_pid=%s\n' "$host_pid"
+printf 'start_time=%s\n' "$(awk '{{print $22}}' /proc/$host_pid/stat)"
+printf 'host_pgid=%s\n' "$(awk '{{print $5}}' /proc/$host_pid/stat)"
+printf 'child_host_pid=%s\n' "$child_host_pid"
+printf 'child_start_time=%s\n' "$(awk '{{print $22}}' /proc/$child_host_pid/stat)"
+printf 'child_host_pgid=%s\n' "$(awk '{{print $5}}' /proc/$child_host_pid/stat)"
+printf 'cgroup_path=%s\n' "$(sed -n 's/^[^:]*:[^:]*://p' /proc/$host_pid/cgroup | head -n1)"
+grep -qx "$host_pid" '/sys/fs/cgroup{expected_cgroup}/cgroup.procs'
+grep -qx "$child_host_pid" '/sys/fs/cgroup{expected_cgroup}/cgroup.procs'"#
+        ),
+    )
+    .await;
+    let observed = parse_exec_supervision_fields(&output.stdout);
+    let host_pid = observed["host_pid"].parse::<u32>().unwrap();
+    assert_eq!(observed["start_time"].parse::<u64>().unwrap(), start_time);
+    let host_pgid = observed["host_pgid"].parse::<u32>().unwrap();
+    let child_host_pid = observed["child_host_pid"].parse::<u32>().unwrap();
+    let child_start_time = observed["child_start_time"].parse::<u64>().unwrap();
+    let child_host_pgid = observed["child_host_pgid"].parse::<u32>().unwrap();
+    assert_eq!(
+        child_start_time,
+        marker["child_start_time"].parse::<u64>().unwrap()
+    );
+    assert_eq!(
+        marker["child_pgid"].parse::<u32>().unwrap(),
+        marker["pgid"].parse::<u32>().unwrap(),
+        "container leader and retained child were not in one process group"
+    );
+    assert_eq!(
+        child_host_pgid, host_pgid,
+        "guest leader and retained child were not in one host process group"
+    );
+    assert_eq!(observed["cgroup_path"], expected_cgroup);
+    assert!(
+        active_members.contains(&(host_pid, start_time, host_pgid)),
+        "resolved target identity was absent from raw cgroup snapshot: {active_members:?}"
+    );
+    assert!(
+        active_members.contains(&(child_host_pid, child_start_time, child_host_pgid)),
+        "resolved child identity was absent from raw cgroup snapshot: {active_members:?}"
+    );
+    json!({
+        "container_pid": marker["pid"].parse::<u32>().unwrap(),
+        "host_pid": host_pid,
+        "start_time": start_time,
+        "container_pgid": marker["pgid"].parse::<u32>().unwrap(),
+        "host_pgid": host_pgid,
+        "child_container_pid": marker["child_pid"].parse::<u32>().unwrap(),
+        "child_host_pid": child_host_pid,
+        "child_start_time": child_start_time,
+        "child_container_pgid": marker["child_pgid"].parse::<u32>().unwrap(),
+        "child_host_pgid": child_host_pgid,
+        "cgroup_path": expected_cgroup,
+    })
+}
+
+async fn exec_supervision_identity_absent(
+    rt: &Runtime,
+    container_id: &str,
+    pid: u32,
+    start_time: u64,
+) -> bool {
+    let output = exec_supervision_host_command(
+        rt,
+        container_id,
+        format!(
+            "if test ! -r /proc/{pid}/stat; then echo absent=true; \
+             elif test \"$(awk '{{print $22}}' /proc/{pid}/stat)\" != '{start_time}'; then echo absent=true; \
+             else echo absent=false; fi"
+        ),
+    )
+    .await;
+    parse_exec_supervision_fields(&output.stdout).get("absent") == Some(&"true".to_string())
+}
+
+async fn exec_supervision_outer_identity(
+    rt: &Runtime,
+    container_id: &str,
+    expected_cgroup: &str,
+    marker_name: &str,
+    target_host_pid: u32,
+) -> serde_json::Value {
+    let output = exec_supervision_host_command(
+        rt,
+        container_id,
+        format!(
+            r#"set -eu
+test -r /proc/{target_host_pid}/status
+outer_pid=$(awk '$1 == "PPid:" {{print $2}}' /proc/{target_host_pid}/status)
+test -n "$outer_pid"
+tr '\000' ' ' < /proc/$outer_pid/cmdline | grep -Fq '__vz_container_exec_v4'
+tr '\000' ' ' < /proc/$outer_pid/cmdline | grep -Fq '/vz-exec-supervision/{marker_name}'
+if grep -qx "$outer_pid" '/sys/fs/cgroup{expected_cgroup}/cgroup.procs'; then
+    target_cgroup_member=true
+else
+    target_cgroup_member=false
+fi
+printf 'pid=%s\n' "$outer_pid"
+printf 'start_time=%s\n' "$(awk '{{print $22}}' /proc/$outer_pid/stat)"
+printf 'pgid=%s\n' "$(awk '{{print $5}}' /proc/$outer_pid/stat)"
+printf 'cgroup_path=%s\n' "$(sed -n 's/^[^:]*:[^:]*://p' /proc/$outer_pid/cgroup | head -n1)"
+printf 'target_cgroup_member=%s\n' "$target_cgroup_member""#
+        ),
+    )
+    .await;
+    let fields = parse_exec_supervision_fields(&output.stdout);
+    assert_eq!(fields["cgroup_path"], "/");
+    assert_eq!(fields["target_cgroup_member"], "false");
+    json!({
+        "pid": fields["pid"].parse::<u32>().unwrap(),
+        "start_time": fields["start_time"].parse::<u64>().unwrap(),
+        "pgid": fields["pgid"].parse::<u32>().unwrap(),
+        "cgroup_path": fields["cgroup_path"],
+        "target_cgroup_member": false,
+    })
+}
+
+async fn await_exec_supervision_cleanup(
+    rt: &Runtime,
+    container_id: &str,
+    baseline_members: &[(u32, u64, u32)],
+    identities: &[(u32, u64)],
+    context: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let diagnostics = rt.lifecycle_diagnostics().await.unwrap();
+            let identities_absent = {
+                let mut absent = true;
+                for (pid, start_time) in identities {
+                    absent &=
+                        exec_supervision_identity_absent(rt, container_id, *pid, *start_time).await;
+                }
+                absent
+            };
+            let restored = exec_supervision_cgroup(rt, container_id).await.1 == baseline_members;
+            if diagnostics.exec_sessions == 0 && identities_absent && restored {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{context} cleanup did not converge within 10s"));
+}
+
+fn write_exec_supervision_evidence(evidence: &serde_json::Value) {
+    let rendered = serde_json::to_string_pretty(evidence).unwrap();
+    eprintln!("VZ_EXEC_SUPERVISION_EVIDENCE={rendered}");
+    let path = std::env::var("VZ_EXEC_SUPERVISION_EVIDENCE")
+        .expect("VZ_EXEC_SUPERVISION_EVIDENCE must be set by the strict VM harness");
+    assert!(
+        Path::new(&path).is_absolute(),
+        "exec supervision evidence path must be absolute"
+    );
+    std::fs::write(path, format!("{rendered}\n")).unwrap();
+}
+
+fn exec_supervision_build_identity() -> serde_json::Value {
+    let profile = std::env::var("VZ_EXEC_SUPERVISION_BUILD_PROFILE")
+        .expect("VZ_EXEC_SUPERVISION_BUILD_PROFILE must be set by the strict VM harness");
+    assert_eq!(
+        profile, "release",
+        "exec supervision release evidence cannot be emitted by a non-release build"
+    );
+    let required_digest = |name: &str| {
+        let digest = std::env::var(name)
+            .unwrap_or_else(|_| panic!("{name} must be set by the strict VM harness"));
+        assert_eq!(
+            digest.len(),
+            64,
+            "{name} must contain a lowercase SHA-256 digest"
+        );
+        assert!(
+            digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "{name} must contain a lowercase SHA-256 digest"
+        );
+        digest
+    };
+    json!({
+        "profile": profile,
+        "test_binary_sha256": required_digest("VZ_EXEC_SUPERVISION_TEST_BINARY_SHA256"),
+        "developer_initramfs_sha256": required_digest(
+            "VZ_EXEC_SUPERVISION_DEVELOPER_INITRAMFS_SHA256"
+        ),
+    })
+}
+
+async fn assert_exec_supervision_lifecycle_writer_available(
+    rt: &Runtime,
+    container_id: &str,
+    context: &str,
+) -> bool {
+    let error = tokio::time::timeout(Duration::from_secs(10), rt.remove_container(container_id))
+        .await
+        .unwrap_or_else(|_| panic!("{context} left the lifecycle writer blocked"))
+        .expect_err("lifecycle writer unexpectedly removed a running container");
+    let expected = format!("cannot remove running container '{container_id}'; stop it first");
+    assert!(
+        matches!(
+            error,
+            vz_oci_macos::MacosOciError::InvalidConfig(ref message) if message == &expected
+        ),
+        "{context} lifecycle writer returned the wrong result: {error}"
+    );
+    true
+}
+
+/// Prove all three container-exec adapters supervise the actual target process
+/// group and synchronously reap it on signals and deadline cancellation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires release-built Apple Silicon host + Linux VM artifacts"]
+async fn runtime_exec_supervision() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
+    init_tracing();
+    let build_identity = exec_supervision_build_identity();
+
+    const IMAGE: &str = "alpine:3.20";
+    const CONTAINER_ID: &str = "exec-supervision-e2e";
+    const TIMEOUT_MS: u64 = 2_000;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = test_runtime(tmp.path());
+    let container_id = rt
+        .create_container(
+            IMAGE,
+            RunConfig {
+                container_id: Some(CONTAINER_ID.into()),
+                cmd: vec!["/bin/busybox".into(), "sleep".into(), "300".into()],
+                execution_mode: ExecutionMode::OciRuntime,
+                ..RunConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(container_id, CONTAINER_ID);
+
+    let setup = rt
+        .exec_container(
+            CONTAINER_ID,
+            ExecConfig {
+                cmd: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "mkdir -p /vz-exec-supervision; \
+                     rm -f /vz-exec-supervision/*; \
+                     mkdir -p /vz-exec-response-loss-command; \
+                     ln -sf /bin/busybox /vz-exec-response-loss-command/sh"
+                        .into(),
+                ],
+                timeout: Some(Duration::from_secs(10)),
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(setup.exit_code, 0, "marker setup failed: {}", setup.stderr);
+
+    let (cgroup_path, baseline_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
+    assert_eq!(
+        baseline_members.len(),
+        1,
+        "idle container cgroup must contain only init: {baseline_members:?}"
+    );
+
+    // An authenticated container-targeted request rejected by guest-side
+    // validation is a definite pre-spawn failure. It must not be confused
+    // with transport ambiguity or retain either exec or lifecycle authority.
+    const PRE_SPAWN_CASE: &str = "pre-spawn-rejection";
+    const PRE_SPAWN_EXECUTION_ID: &str = "exec-supervision-pre-spawn-rejection";
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_START={PRE_SPAWN_CASE}");
+    let pre_spawn_sessions_before = rt.lifecycle_diagnostics().await.unwrap().exec_sessions;
+    let (_, pre_spawn_members_before) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
+    let pre_spawn_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let pre_spawn_callback_events = std::sync::Arc::clone(&pre_spawn_events);
+    let pre_spawn_error = tokio::time::timeout(
+        Duration::from_secs(10),
+        rt.exec_container_streaming(
+            CONTAINER_ID,
+            ExecConfig {
+                execution_id: Some(PRE_SPAWN_EXECUTION_ID.into()),
+                cmd: vec!["/bin/busybox".into(), "true".into()],
+                env: vec![("INVALID=ENVIRONMENT_KEY".into(), "rejected".into())],
+                timeout: Some(Duration::from_secs(10)),
+                ..ExecConfig::default()
+            },
+            move |event| pre_spawn_callback_events.lock().unwrap().push(event),
+        ),
+    )
+    .await
+    .expect("authenticated pre-spawn rejection did not become definite")
+    .expect_err("invalid environment key unexpectedly spawned an exec")
+    .to_string();
+    assert!(
+        pre_spawn_error.contains("invalid key"),
+        "pre-spawn rejection lost the authenticated guest error: {pre_spawn_error}"
+    );
+    assert!(
+        !pre_spawn_error.contains("lifecycle authority was retained"),
+        "definite pre-spawn rejection was misclassified as transport ambiguity: {pre_spawn_error}"
+    );
+    assert!(
+        pre_spawn_events.lock().unwrap().is_empty(),
+        "pre-spawn rejection published an interactive event"
+    );
+    let pre_spawn_sessions_after = rt.lifecycle_diagnostics().await.unwrap().exec_sessions;
+    let (_, pre_spawn_members_after) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
+    assert_eq!(pre_spawn_sessions_before, 0);
+    assert_eq!(pre_spawn_sessions_after, pre_spawn_sessions_before);
+    assert_eq!(pre_spawn_members_before, baseline_members);
+    assert_eq!(pre_spawn_members_after, pre_spawn_members_before);
+    let pre_spawn_stale_control_rejected = matches!(
+        rt.cancel_exec(PRE_SPAWN_EXECUTION_ID).await,
+        Err(vz_oci_macos::MacosOciError::ExecutionSessionNotFound { .. })
+    );
+    assert!(pre_spawn_stale_control_rejected);
+    let pre_spawn_lifecycle_writer =
+        assert_exec_supervision_lifecycle_writer_available(&rt, CONTAINER_ID, PRE_SPAWN_CASE).await;
+    let pre_spawn_post = rt
+        .exec_container(
+            CONTAINER_ID,
+            ExecConfig {
+                cmd: vec!["/bin/busybox".into(), "true".into()],
+                timeout: Some(Duration::from_secs(10)),
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    let pre_spawn_post_case_probe = pre_spawn_post.exit_code == 0
+        && exec_supervision_cgroup(&rt, CONTAINER_ID).await.1 == baseline_members;
+    assert!(pre_spawn_post_case_probe);
+    let pre_spawn_rejection = json!({
+        "attempts": 1,
+        "adapter": "streaming",
+        "target": "container",
+        "execution_id": PRE_SPAWN_EXECUTION_ID,
+        "invalid_environment_key": "INVALID=ENVIRONMENT_KEY",
+        "authenticated_definite_error": true,
+        "terminal_error": pre_spawn_error,
+        "interactive_events": pre_spawn_events.lock().unwrap().len(),
+        "session_count_before": pre_spawn_sessions_before,
+        "session_count_after": pre_spawn_sessions_after,
+        "cgroup_members_before": pre_spawn_members_before.iter().map(|(pid, start, pgid)| json!({"pid": pid, "start_time": start, "pgid": pgid})).collect::<Vec<_>>(),
+        "cgroup_members_after": pre_spawn_members_after.iter().map(|(pid, start, pgid)| json!({"pid": pid, "start_time": start, "pgid": pgid})).collect::<Vec<_>>(),
+        "stale_control_rejected": pre_spawn_stale_control_rejected,
+        "lifecycle_writer_available": pre_spawn_lifecycle_writer,
+        "post_case_probe": pre_spawn_post_case_probe,
+    });
+
+    // Hold a live callback beyond the retired five-second drain heuristic
+    // while the guest emits more than the complete bounded channel capacity.
+    // No liveness shortcut may truncate or reorder the terminal stream.
+    const SLOW_CONSUMER_CASE: &str = "slow-live-consumer";
+    const SLOW_CONSUMER_EXECUTION_ID: &str = "exec-supervision-slow-live-consumer";
+    const SLOW_CONSUMER_PAUSE_MS: u64 = 6_000;
+    const EXEC_EVENT_CHANNEL_CAPACITY: usize = 64;
+    const EXEC_EVENT_MAX_CHUNK_BYTES: usize = 65_536;
+    const SLOW_CONSUMER_STDOUT_BYTES: usize = 5 * 1024 * 1024;
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_START={SLOW_CONSUMER_CASE}");
+    const {
+        assert!(
+            SLOW_CONSUMER_STDOUT_BYTES > EXEC_EVENT_CHANNEL_CAPACITY * EXEC_EVENT_MAX_CHUNK_BYTES
+        );
+    }
+    let slow_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let slow_callback_events = std::sync::Arc::clone(&slow_events);
+    let mut callback_paused = false;
+    let slow_output = tokio::time::timeout(
+        Duration::from_secs(40),
+        rt.exec_container_streaming(
+            CONTAINER_ID,
+            ExecConfig {
+                execution_id: Some(SLOW_CONSUMER_EXECUTION_ID.into()),
+                cmd: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!(
+                        "/bin/busybox yes 0123456789abcdef | /bin/busybox head -c {SLOW_CONSUMER_STDOUT_BYTES}"
+                    ),
+                ],
+                timeout: Some(Duration::from_secs(35)),
+                ..ExecConfig::default()
+            },
+            move |event| {
+                if !callback_paused && matches!(event, InteractiveExecEvent::Stdout(_)) {
+                    callback_paused = true;
+                    std::thread::sleep(Duration::from_millis(SLOW_CONSUMER_PAUSE_MS));
+                }
+                slow_callback_events.lock().unwrap().push(event);
+            },
+        ),
+    )
+    .await
+    .expect("slow live consumer did not terminate within its outer bound")
+    .expect("slow live consumer was treated as abandoned");
+    assert_eq!(slow_output.exit_code, 0);
+    assert!(slow_output.stderr.is_empty());
+    let (slow_ready_events, slow_exit_events, slow_stderr_bytes, slow_stdout, slow_exit_last) = {
+        let slow_events = slow_events.lock().unwrap();
+        let ready_events = slow_events
+            .iter()
+            .filter(|event| matches!(event, InteractiveExecEvent::ContainerReady(_)))
+            .count();
+        let exit_events = slow_events
+            .iter()
+            .filter(|event| matches!(event, InteractiveExecEvent::Exit(_)))
+            .count();
+        let stderr_bytes = slow_events
+            .iter()
+            .filter_map(|event| match event {
+                InteractiveExecEvent::Stderr(bytes) => Some(bytes.len()),
+                _ => None,
+            })
+            .sum::<usize>();
+        let stdout = slow_events
+            .iter()
+            .filter_map(|event| match event {
+                InteractiveExecEvent::Stdout(bytes) => Some(bytes.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        let exit_last = matches!(slow_events.last(), Some(InteractiveExecEvent::Exit(0)));
+        (ready_events, exit_events, stderr_bytes, stdout, exit_last)
+    };
+    let expected_slow_stdout = b"0123456789abcdef\n"
+        .iter()
+        .copied()
+        .cycle()
+        .take(SLOW_CONSUMER_STDOUT_BYTES)
+        .collect::<Vec<_>>();
+    assert_eq!(slow_ready_events, 1);
+    assert_eq!(slow_exit_events, 1);
+    assert_eq!(slow_stderr_bytes, 0);
+    assert_eq!(slow_stdout, expected_slow_stdout);
+    assert_eq!(slow_output.stdout.as_bytes(), expected_slow_stdout);
+    assert!(slow_exit_last);
+    let slow_stdout_sha256 = format!("{:x}", Sha256::digest(&slow_stdout));
+    let slow_diagnostics = rt.lifecycle_diagnostics().await.unwrap();
+    let (_, slow_members_after) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
+    assert_eq!(slow_diagnostics.exec_sessions, 0);
+    assert_eq!(slow_members_after, baseline_members);
+    let slow_stale_control_rejected = matches!(
+        rt.signal_exec(SLOW_CONSUMER_EXECUTION_ID, "SIGTERM").await,
+        Err(vz_oci_macos::MacosOciError::ExecutionSessionNotFound { .. })
+    );
+    assert!(slow_stale_control_rejected);
+    let slow_lifecycle_writer =
+        assert_exec_supervision_lifecycle_writer_available(&rt, CONTAINER_ID, SLOW_CONSUMER_CASE)
+            .await;
+    let slow_post = rt
+        .exec_container(
+            CONTAINER_ID,
+            ExecConfig {
+                cmd: vec!["/bin/busybox".into(), "true".into()],
+                timeout: Some(Duration::from_secs(10)),
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    let slow_post_case_probe = slow_post.exit_code == 0
+        && exec_supervision_cgroup(&rt, CONTAINER_ID).await.1 == baseline_members;
+    assert!(slow_post_case_probe);
+    let slow_live_consumer = json!({
+        "attempts": 1,
+        "adapter": "streaming",
+        "execution_id": SLOW_CONSUMER_EXECUTION_ID,
+        "pause_ms": SLOW_CONSUMER_PAUSE_MS,
+        "retired_drain_threshold_ms": 5_000,
+        "channel_capacity_events": EXEC_EVENT_CHANNEL_CAPACITY,
+        "max_chunk_bytes": EXEC_EVENT_MAX_CHUNK_BYTES,
+        "expected_stdout_bytes": SLOW_CONSUMER_STDOUT_BYTES,
+        "observed_stdout_bytes": slow_stdout.len(),
+        "stdout_sha256": slow_stdout_sha256,
+        "content_exact": slow_stdout == expected_slow_stdout,
+        "ready_events": slow_ready_events,
+        "exit_events": slow_exit_events,
+        "stderr_bytes": slow_stderr_bytes,
+        "exit_code": slow_output.exit_code,
+        "exit_last": slow_exit_last,
+        "cgroup_restored": slow_members_after == baseline_members,
+        "session_reaped": slow_diagnostics.exec_sessions == 0 && slow_stale_control_rejected,
+        "lifecycle_writer_available": slow_lifecycle_writer,
+        "post_case_probe": slow_post_case_probe,
+    });
+
+    let mut cells = Vec::new();
+
+    for adapter in ExecSupervisionAdapter::ALL {
+        for termination in ExecSupervisionTermination::ALL {
+            let case_name = format!("{}-{}", adapter.name(), termination.name());
+            eprintln!("VZ_EXEC_SUPERVISION_CASE_START={case_name}");
+            let execution_id = format!("exec-supervision-{case_name}");
+            let timeout = if termination == ExecSupervisionTermination::Timeout {
+                Duration::from_millis(TIMEOUT_MS)
+            } else {
+                Duration::from_secs(20)
+            };
+            let command = format!(
+                r#"marker=/vz-exec-supervision/{case_name}
+pid=$$
+start_time=$(awk '{{print $22}}' /proc/$pid/stat)
+pgid=$(awk '{{print $5}}' /proc/$pid/stat)
+cgroup_path=$(sed -n 's/^[^:]*:[^:]*://p' /proc/$pid/cgroup | head -n1)
+/bin/sh -c 'while :; do /bin/busybox sleep 300; done' 'vz-child-{case_name}' &
+child_pid=$!
+child_start_time=$(awk '{{print $22}}' /proc/$child_pid/stat)
+child_pgid=$(awk '{{print $5}}' /proc/$child_pid/stat)
+printf 'pid=%s\nstart_time=%s\npgid=%s\nchild_pid=%s\nchild_start_time=%s\nchild_pgid=%s\ncgroup_path=%s\n' \
+  "$pid" "$start_time" "$pgid" "$child_pid" "$child_start_time" "$child_pgid" "$cgroup_path" > "$marker"
+trap 'exit 143' TERM
+trap 'exit 130' INT
+while :; do wait "$child_pid"; done"#
+            );
+            let config = ExecConfig {
+                execution_id: Some(execution_id.clone()),
+                cmd: vec!["/bin/sh".into(), "-c".into(), command],
+                pty: adapter == ExecSupervisionAdapter::Pty,
+                term_rows: (adapter == ExecSupervisionAdapter::Pty).then_some(24),
+                term_cols: (adapter == ExecSupervisionAdapter::Pty).then_some(80),
+                timeout: Some(timeout),
+                ..ExecConfig::default()
+            };
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let callback_events = std::sync::Arc::clone(&events);
+            let task_rt = rt.clone();
+            let task_container_id = container_id.clone();
+            let started = std::time::Instant::now();
+            let task = match adapter {
+                ExecSupervisionAdapter::Unary => tokio::spawn(async move {
+                    task_rt
+                        .exec_container_oci_unary(&task_container_id, config)
+                        .await
+                }),
+                ExecSupervisionAdapter::Streaming | ExecSupervisionAdapter::Pty => {
+                    tokio::spawn(async move {
+                        task_rt
+                            .exec_container_streaming(&task_container_id, config, move |event| {
+                                callback_events.lock().unwrap().push(event)
+                            })
+                            .await
+                    })
+                }
+            };
+
+            let marker = exec_supervision_marker(&rt, CONTAINER_ID, &case_name).await;
+            eprintln!("VZ_EXEC_SUPERVISION_CASE_MARKER={case_name}");
+            let (_, active_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
+            assert!(
+                active_members.len() > baseline_members.len(),
+                "{case_name} did not add a target process to the exact container cgroup"
+            );
+            let identity = assert_exec_supervision_identity_live(
+                &rt,
+                CONTAINER_ID,
+                &cgroup_path,
+                &case_name,
+                &marker,
+                &active_members,
+            )
+            .await;
+            let host_pid = identity["host_pid"].as_u64().unwrap() as u32;
+            assert!(
+                active_members.iter().any(|member| member.0 == host_pid),
+                "{case_name} target PID was absent from the exact cgroup: {active_members:?}"
+            );
+
+            if adapter != ExecSupervisionAdapter::Unary {
+                let observed_events = events.lock().unwrap();
+                assert!(
+                    observed_events
+                        .iter()
+                        .any(|event| matches!(event, InteractiveExecEvent::ContainerReady(_))),
+                    "{case_name} exposed its process marker before ContainerReady"
+                );
+            }
+            let pty_resized = if adapter == ExecSupervisionAdapter::Pty {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    rt.resize_exec_pty(&execution_id, 111, 37),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{case_name} PTY resize did not complete within 10s"))
+                .unwrap();
+                true
+            } else {
+                false
+            };
+            if let Some(signal) = termination.signal() {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    rt.signal_exec(&execution_id, signal),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{case_name} signal control did not complete within 10s")
+                })
+                .unwrap_or_else(|error| {
+                    panic!("{case_name} was not control-registered at process readiness: {error}")
+                });
+                eprintln!("VZ_EXEC_SUPERVISION_CASE_SIGNALLED={case_name}");
+            }
+
+            let result = tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .unwrap_or_else(|_| panic!("{case_name} did not terminate and reap within 10s"))
+                .unwrap_or_else(|error| panic!("{case_name} exec task panicked: {error}"));
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            eprintln!("VZ_EXEC_SUPERVISION_CASE_TERMINAL={case_name}:{elapsed_ms}");
+            let (observed_exit_code, timed_out) = match termination.expected_exit_code() {
+                Some(expected) => {
+                    let output = result.unwrap_or_else(|error| {
+                        panic!("{case_name} returned an error instead of exit {expected}: {error}")
+                    });
+                    assert_eq!(
+                        output.exit_code, expected,
+                        "{case_name} did not preserve signal exit semantics: stdout={} stderr={}",
+                        output.stdout, output.stderr
+                    );
+                    (Some(output.exit_code), false)
+                }
+                None => {
+                    let error =
+                        result.expect_err("deadline cancellation unexpectedly returned output");
+                    let rendered = error.to_string();
+                    assert!(
+                        rendered.contains("timed out"),
+                        "deadline cancellation returned the wrong error: {rendered}"
+                    );
+                    assert!(
+                        (TIMEOUT_MS..=TIMEOUT_MS + 4_000).contains(&elapsed_ms),
+                        "deadline was not bounded and stable: requested={TIMEOUT_MS}ms observed={elapsed_ms}ms"
+                    );
+                    (None, true)
+                }
+            };
+
+            let stale_control_rejected = matches!(
+                rt.signal_exec(&execution_id, "SIGTERM").await,
+                Err(vz_oci_macos::MacosOciError::ExecutionSessionNotFound { .. })
+            );
+            assert!(
+                stale_control_rejected,
+                "{case_name} retained a control session after terminal reap"
+            );
+            let diagnostics = rt.lifecycle_diagnostics().await.unwrap();
+            assert_eq!(
+                diagnostics.exec_sessions, 0,
+                "{case_name} leaked a host execution session: {diagnostics:?}"
+            );
+            assert!(
+                exec_supervision_identity_absent(
+                    &rt,
+                    CONTAINER_ID,
+                    host_pid,
+                    identity["start_time"].as_u64().unwrap(),
+                )
+                .await,
+                "{case_name} retained the exact /proc process identity"
+            );
+            assert!(
+                exec_supervision_identity_absent(
+                    &rt,
+                    CONTAINER_ID,
+                    identity["child_host_pid"].as_u64().unwrap() as u32,
+                    identity["child_start_time"].as_u64().unwrap(),
+                )
+                .await,
+                "{case_name} retained the exact child /proc process identity"
+            );
+            let (_, restored_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
+            assert_eq!(
+                restored_members, baseline_members,
+                "{case_name} did not restore exact cgroup membership"
+            );
+            let marker_removed = exec_supervision_host_command(
+                &rt,
+                CONTAINER_ID,
+                format!(
+                    "rm -f '/run/vz-oci/containers/{CONTAINER_ID}/merged/vz-exec-supervision/{case_name}'; \
+                     test ! -e '/run/vz-oci/containers/{CONTAINER_ID}/merged/vz-exec-supervision/{case_name}'"
+                ),
+            )
+            .await
+            .exit_code
+                == 0;
+            assert!(marker_removed, "{case_name} marker did not clean up");
+            let post_case = rt
+                .exec_container(
+                    CONTAINER_ID,
+                    ExecConfig {
+                        cmd: vec![
+                            "/bin/busybox".into(),
+                            "printf".into(),
+                            format!("post-case:{case_name}"),
+                        ],
+                        timeout: Some(Duration::from_secs(10)),
+                        ..ExecConfig::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let post_case_probe = post_case.exit_code == 0
+                && post_case.stdout.replace('\r', "") == format!("post-case:{case_name}");
+            assert!(post_case_probe, "{case_name} left the container unhealthy");
+            let (_, post_probe_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
+            assert_eq!(post_probe_members, baseline_members);
+
+            cells.push(json!({
+                "adapter": adapter.name(),
+                "termination": termination.name(),
+                "execution_id": execution_id,
+                "signal": termination.signal(),
+                "expected_exit_code": termination.expected_exit_code(),
+                "observed_exit_code": observed_exit_code,
+                "timed_out": timed_out,
+                "timeout_requested_ms": (termination == ExecSupervisionTermination::Timeout).then_some(TIMEOUT_MS),
+                "elapsed_ms": elapsed_ms,
+                "identity": identity,
+                "baseline_cgroup_members": baseline_members.iter().map(|(pid, start, pgid)| json!({"pid": pid, "start_time": start, "pgid": pgid})).collect::<Vec<_>>(),
+                "active_cgroup_members": active_members.iter().map(|(pid, start, pgid)| json!({"pid": pid, "start_time": start, "pgid": pgid})).collect::<Vec<_>>(),
+                "cgroup_restored": restored_members == baseline_members && post_probe_members == baseline_members,
+                "process_identity_absent": true,
+                "session_reaped": diagnostics.exec_sessions == 0 && stale_control_rejected,
+                "marker_removed": marker_removed,
+                "pty_resized": pty_resized,
+                "post_case_probe": post_case_probe,
+            }));
+        }
+    }
+
+    // A normal leader exit is also terminal ownership: a retained background
+    // child must be killed and reaped before the successful result is exposed.
+    const NORMAL_CASE: &str = "normal-exit";
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_START={NORMAL_CASE}");
+    let normal_execution_id = "exec-supervision-normal-exit".to_string();
+    let normal_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let normal_callback_events = std::sync::Arc::clone(&normal_events);
+    let normal_rt = rt.clone();
+    let normal_container_id = container_id.clone();
+    let normal_task = tokio::spawn(async move {
+        normal_rt
+            .exec_container_streaming(
+                &normal_container_id,
+                ExecConfig {
+                    execution_id: Some(normal_execution_id.clone()),
+                    cmd: vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        format!(
+                            r#"marker=/vz-exec-supervision/{NORMAL_CASE}
+pid=$$
+start_time=$(awk '{{print $22}}' /proc/$pid/stat)
+pgid=$(awk '{{print $5}}' /proc/$pid/stat)
+cgroup_path=$(sed -n 's/^[^:]*:[^:]*://p' /proc/$pid/cgroup | head -n1)
+/bin/sh -c 'while :; do /bin/busybox sleep 300; done' 'vz-child-{NORMAL_CASE}' &
+child_pid=$!
+child_start_time=$(awk '{{print $22}}' /proc/$child_pid/stat)
+child_pgid=$(awk '{{print $5}}' /proc/$child_pid/stat)
+printf 'pid=%s\nstart_time=%s\npgid=%s\nchild_pid=%s\nchild_start_time=%s\nchild_pgid=%s\ncgroup_path=%s\n' \
+  "$pid" "$start_time" "$pgid" "$child_pid" "$child_start_time" "$child_pgid" "$cgroup_path" > "$marker"
+while test ! -e /vz-exec-supervision/normal-release; do /bin/busybox sleep 0.02; done
+exit 0"#
+                        ),
+                    ],
+                    timeout: Some(Duration::from_secs(20)),
+                    ..ExecConfig::default()
+                },
+                move |event| normal_callback_events.lock().unwrap().push(event),
+            )
+            .await
+    });
+    let normal_marker = exec_supervision_marker(&rt, CONTAINER_ID, NORMAL_CASE).await;
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_MARKER={NORMAL_CASE}");
+    let (_, normal_active_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
+    let normal_identity = assert_exec_supervision_identity_live(
+        &rt,
+        CONTAINER_ID,
+        &cgroup_path,
+        NORMAL_CASE,
+        &normal_marker,
+        &normal_active_members,
+    )
+    .await;
+    exec_supervision_host_command(
+        &rt,
+        CONTAINER_ID,
+        format!(
+            "touch '/run/vz-oci/containers/{CONTAINER_ID}/merged/vz-exec-supervision/normal-release'"
+        ),
+    )
+    .await;
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_RELEASED={NORMAL_CASE}");
+    let normal_output = tokio::time::timeout(Duration::from_secs(10), normal_task)
+        .await
+        .expect("normal leader exit did not synchronously reap its child")
+        .expect("normal leader-exit task panicked")
+        .expect("normal leader-exit exec failed");
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_TERMINAL={NORMAL_CASE}");
+    assert_eq!(normal_output.exit_code, 0);
+    assert!(matches!(
+        normal_events.lock().unwrap().last(),
+        Some(InteractiveExecEvent::Exit(0))
+    ));
+    let normal_leader_absent = exec_supervision_identity_absent(
+        &rt,
+        CONTAINER_ID,
+        normal_identity["host_pid"].as_u64().unwrap() as u32,
+        normal_identity["start_time"].as_u64().unwrap(),
+    )
+    .await;
+    let normal_child_absent = exec_supervision_identity_absent(
+        &rt,
+        CONTAINER_ID,
+        normal_identity["child_host_pid"].as_u64().unwrap() as u32,
+        normal_identity["child_start_time"].as_u64().unwrap(),
+    )
+    .await;
+    assert!(normal_leader_absent && normal_child_absent);
+    let normal_diagnostics = rt.lifecycle_diagnostics().await.unwrap();
+    let normal_session_reaped = normal_diagnostics.exec_sessions == 0
+        && matches!(
+            rt.signal_exec("exec-supervision-normal-exit", "SIGTERM")
+                .await,
+            Err(vz_oci_macos::MacosOciError::ExecutionSessionNotFound { .. })
+        );
+    assert!(normal_session_reaped);
+    let (_, normal_restored_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
+    let normal_cgroup_restored = normal_restored_members == baseline_members;
+    assert!(normal_cgroup_restored);
+    let normal_markers_removed = exec_supervision_host_command(
+        &rt,
+        CONTAINER_ID,
+        format!(
+            "rm -f '/run/vz-oci/containers/{CONTAINER_ID}/merged/vz-exec-supervision/{NORMAL_CASE}' \
+                '/run/vz-oci/containers/{CONTAINER_ID}/merged/vz-exec-supervision/normal-release'; \
+             test -z \"$(find '/run/vz-oci/containers/{CONTAINER_ID}/merged/vz-exec-supervision' -mindepth 1 -maxdepth 1 -print -quit)\""
+        ),
+    )
+    .await
+    .exit_code
+        == 0;
+    assert!(normal_markers_removed);
+    let normal_post_case = rt
+        .exec_container(
+            CONTAINER_ID,
+            ExecConfig {
+                cmd: vec!["/bin/busybox".into(), "true".into()],
+                timeout: Some(Duration::from_secs(10)),
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    let normal_post_case_probe = normal_post_case.exit_code == 0;
+    assert!(normal_post_case_probe);
+    let normal_exit = json!({
+        "adapter": "streaming",
+        "execution_id": "exec-supervision-normal-exit",
+        "exit_code": normal_output.exit_code,
+        "identity": normal_identity,
+        "baseline_cgroup_members": baseline_members.iter().map(|(pid, start, pgid)| json!({"pid": pid, "start_time": start, "pgid": pgid})).collect::<Vec<_>>(),
+        "active_cgroup_members": normal_active_members.iter().map(|(pid, start, pgid)| json!({"pid": pid, "start_time": start, "pgid": pgid})).collect::<Vec<_>>(),
+        "cgroup_restored": normal_cgroup_restored,
+        "leader_identity_absent": normal_leader_absent,
+        "child_identity_absent": normal_child_absent,
+        "session_reaped": normal_session_reaped,
+        "markers_removed": normal_markers_removed,
+        "post_case_probe": normal_post_case_probe,
+    });
+
+    // Exercise the explicit CancelExec receipt path independently of host
+    // deadline cancellation. It must carry the same descendant-reap proof.
+    const CANCEL_CASE: &str = "cancel";
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_START={CANCEL_CASE}");
+    let cancel_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cancel_callback_events = std::sync::Arc::clone(&cancel_events);
+    let cancel_rt = rt.clone();
+    let cancel_container_id = container_id.clone();
+    let cancel_task = tokio::spawn(async move {
+        cancel_rt
+            .exec_container_streaming(
+                &cancel_container_id,
+                ExecConfig {
+                    execution_id: Some("exec-supervision-cancel".into()),
+                    cmd: vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        format!(
+                            r#"marker=/vz-exec-supervision/{CANCEL_CASE}
+pid=$$
+start_time=$(awk '{{print $22}}' /proc/$pid/stat)
+pgid=$(awk '{{print $5}}' /proc/$pid/stat)
+cgroup_path=$(sed -n 's/^[^:]*:[^:]*://p' /proc/$pid/cgroup | head -n1)
+/bin/sh -c 'while :; do /bin/busybox sleep 300; done' 'vz-child-{CANCEL_CASE}' &
+child_pid=$!
+child_start_time=$(awk '{{print $22}}' /proc/$child_pid/stat)
+child_pgid=$(awk '{{print $5}}' /proc/$child_pid/stat)
+printf 'pid=%s\nstart_time=%s\npgid=%s\nchild_pid=%s\nchild_start_time=%s\nchild_pgid=%s\ncgroup_path=%s\n' \
+  "$pid" "$start_time" "$pgid" "$child_pid" "$child_start_time" "$child_pgid" "$cgroup_path" > "$marker"
+trap 'exit 143' TERM
+while :; do wait "$child_pid"; done"#
+                        ),
+                    ],
+                    timeout: Some(Duration::from_secs(20)),
+                    ..ExecConfig::default()
+                },
+                move |event| cancel_callback_events.lock().unwrap().push(event),
+            )
+            .await
+    });
+    let cancel_marker = exec_supervision_marker(&rt, CONTAINER_ID, CANCEL_CASE).await;
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_MARKER={CANCEL_CASE}");
+    let (_, cancel_active_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
+    let cancel_identity = assert_exec_supervision_identity_live(
+        &rt,
+        CONTAINER_ID,
+        &cgroup_path,
+        CANCEL_CASE,
+        &cancel_marker,
+        &cancel_active_members,
+    )
+    .await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        rt.cancel_exec("exec-supervision-cancel"),
+    )
+    .await
+    .expect("explicit cancellation receipt timed out")
+    .unwrap();
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_CANCELLED={CANCEL_CASE}");
+    let cancel_output = tokio::time::timeout(Duration::from_secs(10), cancel_task)
+        .await
+        .expect("explicit cancellation did not synchronously reap its child")
+        .expect("explicit cancellation task panicked")
+        .expect("explicit cancellation exec failed");
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_TERMINAL={CANCEL_CASE}");
+    assert_eq!(cancel_output.exit_code, 143);
+    assert!(matches!(
+        cancel_events.lock().unwrap().last(),
+        Some(InteractiveExecEvent::Exit(143))
+    ));
+    let cancel_leader_absent = exec_supervision_identity_absent(
+        &rt,
+        CONTAINER_ID,
+        cancel_identity["host_pid"].as_u64().unwrap() as u32,
+        cancel_identity["start_time"].as_u64().unwrap(),
+    )
+    .await;
+    let cancel_child_absent = exec_supervision_identity_absent(
+        &rt,
+        CONTAINER_ID,
+        cancel_identity["child_host_pid"].as_u64().unwrap() as u32,
+        cancel_identity["child_start_time"].as_u64().unwrap(),
+    )
+    .await;
+    assert!(cancel_leader_absent && cancel_child_absent);
+    let cancel_diagnostics = rt.lifecycle_diagnostics().await.unwrap();
+    let cancel_session_reaped = cancel_diagnostics.exec_sessions == 0
+        && matches!(
+            rt.cancel_exec("exec-supervision-cancel").await,
+            Err(vz_oci_macos::MacosOciError::ExecutionSessionNotFound { .. })
+        );
+    assert!(cancel_session_reaped);
+    let (_, cancel_restored_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
+    let cancel_cgroup_restored = cancel_restored_members == baseline_members;
+    assert!(cancel_cgroup_restored);
+    let cancel_marker_removed = exec_supervision_host_command(
+        &rt,
+        CONTAINER_ID,
+        format!(
+            "rm -f '/run/vz-oci/containers/{CONTAINER_ID}/merged/vz-exec-supervision/{CANCEL_CASE}'; \
+             test ! -e '/run/vz-oci/containers/{CONTAINER_ID}/merged/vz-exec-supervision/{CANCEL_CASE}'"
+        ),
+    )
+    .await
+    .exit_code
+        == 0;
+    assert!(cancel_marker_removed);
+    let cancel_post_case = rt
+        .exec_container(
+            CONTAINER_ID,
+            ExecConfig {
+                cmd: vec!["/bin/busybox".into(), "true".into()],
+                timeout: Some(Duration::from_secs(10)),
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    let cancel_post_case_probe = cancel_post_case.exit_code == 0;
+    assert!(cancel_post_case_probe);
+    assert_eq!(
+        exec_supervision_cgroup(&rt, CONTAINER_ID).await.1,
+        baseline_members
+    );
+    let cancellation = json!({
+        "adapter": "streaming",
+        "execution_id": "exec-supervision-cancel",
+        "exit_code": cancel_output.exit_code,
+        "identity": cancel_identity,
+        "baseline_cgroup_members": baseline_members.iter().map(|(pid, start, pgid)| json!({"pid": pid, "start_time": start, "pgid": pgid})).collect::<Vec<_>>(),
+        "active_cgroup_members": cancel_active_members.iter().map(|(pid, start, pgid)| json!({"pid": pid, "start_time": start, "pgid": pgid})).collect::<Vec<_>>(),
+        "cgroup_restored": cancel_cgroup_restored,
+        "leader_identity_absent": cancel_leader_absent,
+        "child_identity_absent": cancel_child_absent,
+        "session_reaped": cancel_session_reaped,
+        "marker_removed": cancel_marker_removed,
+        "post_case_probe": cancel_post_case_probe,
+    });
+
+    // Pause after host registration but before any guest RPC, queue cancel,
+    // and prove that readiness and the target process never become observable.
+    const CANCEL_BEFORE_READY_ID: &str = "exec-supervision-cancel-before-ready";
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_START=cancel-before-ready");
+    let mut pre_ready_observer = rt.install_lifecycle_observer();
+    let pre_ready_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let pre_ready_callback_events = std::sync::Arc::clone(&pre_ready_events);
+    let pre_ready_rt = rt.clone();
+    let pre_ready_container_id = container_id.clone();
+    let pre_ready_task = tokio::spawn(async move {
+        pre_ready_rt
+            .exec_container_streaming(
+                &pre_ready_container_id,
+                ExecConfig {
+                    execution_id: Some(CANCEL_BEFORE_READY_ID.into()),
+                    cmd: vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "touch /vz-exec-supervision/cancel-before-ready; sleep 300".into(),
+                    ],
+                    timeout: Some(Duration::from_secs(20)),
+                    ..ExecConfig::default()
+                },
+                move |event| pre_ready_callback_events.lock().unwrap().push(event),
+            )
+            .await
+    });
+    let pre_ready_admission =
+        tokio::time::timeout(Duration::from_secs(10), pre_ready_observer.recv())
+            .await
+            .expect("pre-ready exec did not reach deterministic admission")
+            .expect("pre-ready lifecycle observer closed");
+    assert_eq!(
+        pre_ready_admission.kind(),
+        RuntimeLifecycleAdmissionKind::ExecBeforeGuestRpc
+    );
+    assert_eq!(pre_ready_admission.container_id(), CONTAINER_ID);
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_ADMITTED=cancel-before-ready");
+    assert!(
+        pre_ready_events.lock().unwrap().is_empty(),
+        "ContainerReady was published before ExecBeforeGuestRpc cancellation"
+    );
+    let mut pre_ready_cancel = Box::pin(rt.cancel_exec(CANCEL_BEFORE_READY_ID));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut pre_ready_cancel)
+            .await
+            .is_err(),
+        "pre-ready cancel returned before the paused exec consumed its queued cancellation"
+    );
+    pre_ready_admission.resume();
+    tokio::time::timeout(Duration::from_secs(10), &mut pre_ready_cancel)
+        .await
+        .expect("pre-ready cancellation receipt timed out")
+        .expect("pre-ready cancellation failed");
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_CANCELLED=cancel-before-ready");
+    let pre_ready_result = tokio::time::timeout(Duration::from_secs(10), pre_ready_task)
+        .await
+        .expect("pre-ready exec did not become terminal")
+        .expect("pre-ready exec task panicked");
+    let pre_ready_error = pre_ready_result
+        .expect_err("pre-ready cancellation unexpectedly launched and returned command output")
+        .to_string();
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_TERMINAL=cancel-before-ready");
+    assert!(pre_ready_error.contains("cancelled during startup"));
+    assert!(pre_ready_events.lock().unwrap().is_empty());
+    // The observer deliberately pauses every exec admission. Remove it before
+    // issuing cleanup probes, otherwise those probes wait for a resume handle
+    // that this test never consumes.
+    drop(pre_ready_observer);
+    let pre_ready_marker_absent = exec_supervision_host_command(
+        &rt,
+        CONTAINER_ID,
+        format!(
+            "test ! -e '/run/vz-oci/containers/{CONTAINER_ID}/merged/vz-exec-supervision/cancel-before-ready'"
+        ),
+    )
+    .await
+    .exit_code
+        == 0;
+    let pre_ready_cgroup_restored =
+        exec_supervision_cgroup(&rt, CONTAINER_ID).await.1 == baseline_members;
+    let pre_ready_session_reaped = rt.lifecycle_diagnostics().await.unwrap().exec_sessions == 0
+        && matches!(
+            rt.cancel_exec(CANCEL_BEFORE_READY_ID).await,
+            Err(vz_oci_macos::MacosOciError::ExecutionSessionNotFound { .. })
+        );
+    let pre_ready_post_case = rt
+        .exec_container(
+            CONTAINER_ID,
+            ExecConfig {
+                cmd: vec!["/bin/busybox".into(), "true".into()],
+                timeout: Some(Duration::from_secs(10)),
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(pre_ready_marker_absent);
+    assert!(pre_ready_cgroup_restored);
+    assert!(pre_ready_session_reaped);
+    assert_eq!(pre_ready_post_case.exit_code, 0);
+    let cancel_before_ready = json!({
+        "adapter": "streaming",
+        "execution_id": CANCEL_BEFORE_READY_ID,
+        "admission": "exec-before-guest-rpc",
+        "container_ready_events": pre_ready_events.lock().unwrap().iter().filter(|event| matches!(event, InteractiveExecEvent::ContainerReady(_))).count(),
+        "terminal_error": pre_ready_error,
+        "marker_absent": pre_ready_marker_absent,
+        "cgroup_restored": pre_ready_cgroup_restored,
+        "session_reaped": pre_ready_session_reaped,
+        "post_case_probe": pre_ready_post_case.exit_code == 0,
+    });
+    // Dropping the host execution future models abrupt transport ownership
+    // loss. The registration drop guard must retain cleanup authority.
+    const DROP_CASE: &str = "dropped-future";
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_START={DROP_CASE}");
+    let drop_rt = rt.clone();
+    let drop_container_id = container_id.clone();
+    let drop_task = tokio::spawn(async move {
+        drop_rt
+            .exec_container_streaming(
+                &drop_container_id,
+                ExecConfig {
+                    execution_id: Some("exec-supervision-dropped-future".into()),
+                    cmd: vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        format!(
+                            r#"marker=/vz-exec-supervision/{DROP_CASE}
+pid=$$
+start_time=$(awk '{{print $22}}' /proc/$pid/stat)
+pgid=$(awk '{{print $5}}' /proc/$pid/stat)
+cgroup_path=$(sed -n 's/^[^:]*:[^:]*://p' /proc/$pid/cgroup | head -n1)
+/bin/sh -c 'while :; do /bin/busybox sleep 300; done' 'vz-child-{DROP_CASE}' &
+child_pid=$!
+child_start_time=$(awk '{{print $22}}' /proc/$child_pid/stat)
+child_pgid=$(awk '{{print $5}}' /proc/$child_pid/stat)
+printf 'pid=%s\nstart_time=%s\npgid=%s\nchild_pid=%s\nchild_start_time=%s\nchild_pgid=%s\ncgroup_path=%s\n' \
+  "$pid" "$start_time" "$pgid" "$child_pid" "$child_start_time" "$child_pgid" "$cgroup_path" > "$marker"
+while :; do wait "$child_pid"; done"#
+                        ),
+                    ],
+                    timeout: Some(Duration::from_secs(20)),
+                    ..ExecConfig::default()
+                },
+                |_| {},
+            )
+            .await
+    });
+    let drop_marker = exec_supervision_marker(&rt, CONTAINER_ID, DROP_CASE).await;
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_MARKER={DROP_CASE}");
+    let (_, drop_active_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
+    let drop_identity = assert_exec_supervision_identity_live(
+        &rt,
+        CONTAINER_ID,
+        &cgroup_path,
+        DROP_CASE,
+        &drop_marker,
+        &drop_active_members,
+    )
+    .await;
+    drop_task.abort();
+    let drop_join = drop_task
+        .await
+        .expect_err("aborted execution future unexpectedly completed");
+    assert!(drop_join.is_cancelled());
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_ABORTED={DROP_CASE}");
+    let drop_identities = [
+        (
+            drop_identity["host_pid"].as_u64().unwrap() as u32,
+            drop_identity["start_time"].as_u64().unwrap(),
+        ),
+        (
+            drop_identity["child_host_pid"].as_u64().unwrap() as u32,
+            drop_identity["child_start_time"].as_u64().unwrap(),
+        ),
+    ];
+    await_exec_supervision_cleanup(
+        &rt,
+        CONTAINER_ID,
+        &baseline_members,
+        &drop_identities,
+        DROP_CASE,
+    )
+    .await;
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_CLEAN={DROP_CASE}");
+    let drop_marker_removed = exec_supervision_host_command(
+        &rt,
+        CONTAINER_ID,
+        format!(
+            "rm -f '/run/vz-oci/containers/{CONTAINER_ID}/merged/vz-exec-supervision/{DROP_CASE}'; \
+             test ! -e '/run/vz-oci/containers/{CONTAINER_ID}/merged/vz-exec-supervision/{DROP_CASE}'"
+        ),
+    )
+    .await
+    .exit_code
+        == 0;
+    let drop_post_case = rt
+        .exec_container(
+            CONTAINER_ID,
+            ExecConfig {
+                cmd: vec!["/bin/busybox".into(), "true".into()],
+                timeout: Some(Duration::from_secs(10)),
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(drop_marker_removed);
+    assert_eq!(drop_post_case.exit_code, 0);
+    let dropped_future = json!({
+        "adapter": "streaming",
+        "execution_id": "exec-supervision-dropped-future",
+        "join_cancelled": drop_join.is_cancelled(),
+        "identity": drop_identity,
+        "baseline_cgroup_members": baseline_members.iter().map(|(pid, start, pgid)| json!({"pid": pid, "start_time": start, "pgid": pgid})).collect::<Vec<_>>(),
+        "active_cgroup_members": drop_active_members.iter().map(|(pid, start, pgid)| json!({"pid": pid, "start_time": start, "pgid": pgid})).collect::<Vec<_>>(),
+        "cgroup_restored": exec_supervision_cgroup(&rt, CONTAINER_ID).await.1 == baseline_members,
+        "leader_identity_absent": exec_supervision_identity_absent(&rt, CONTAINER_ID, drop_identities[0].0, drop_identities[0].1).await,
+        "child_identity_absent": exec_supervision_identity_absent(&rt, CONTAINER_ID, drop_identities[1].0, drop_identities[1].1).await,
+        "session_reaped": rt.lifecycle_diagnostics().await.unwrap().exec_sessions == 0,
+        "marker_removed": drop_marker_removed,
+        "post_case_probe": drop_post_case.exit_code == 0,
+    });
+
+    // Lose the authenticated response after the guest has dispatched the
+    // uniquely selected command but before the host polls ContainerReady.
+    // Request-ID reconciliation must retain lifecycle authority until the
+    // exact leader and descendant are terminal and reaped.
+    const RESPONSE_LOSS_CASE: &str = "response-loss-before-ready";
+    const RESPONSE_LOSS_EXECUTION_ID: &str = "exec-supervision-response-loss-before-ready";
+    const RESPONSE_LOSS_COMMAND: &str = "/vz-exec-response-loss-command/sh";
+    const RESPONSE_LOSS_ERROR_MARKER: &str =
+        "test-injected container exec response loss before readiness";
+    let response_loss_selector =
+        std::env::var("VZ_TEST_DROP_CONTAINER_EXEC_RESPONSE_BEFORE_READY_COMMAND")
+            .expect("strict exec-supervision harness must provide the exact response-loss command");
+    assert_eq!(response_loss_selector, RESPONSE_LOSS_COMMAND);
+    let response_loss_dwell_ms = std::env::var("VZ_TEST_DROP_CONTAINER_EXEC_RESPONSE_DWELL_MS")
+        .expect("strict exec-supervision harness must provide the response-loss dwell")
+        .parse::<u64>()
+        .expect("response-loss dwell must be an integer");
+    assert_eq!(response_loss_dwell_ms, 5_000);
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_START={RESPONSE_LOSS_CASE}");
+    let response_loss_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let response_loss_callback_events = std::sync::Arc::clone(&response_loss_events);
+    let response_loss_rt = rt.clone();
+    let response_loss_container_id = container_id.clone();
+    let response_loss_task = tokio::spawn(async move {
+        response_loss_rt
+            .exec_container_streaming(
+                &response_loss_container_id,
+                ExecConfig {
+                    execution_id: Some(RESPONSE_LOSS_EXECUTION_ID.into()),
+                    cmd: vec![
+                        RESPONSE_LOSS_COMMAND.into(),
+                        "-c".into(),
+                        format!(
+                            r#"marker=/vz-exec-supervision/{RESPONSE_LOSS_CASE}
+pid=$$
+start_time=$(awk '{{print $22}}' /proc/$pid/stat)
+pgid=$(awk '{{print $5}}' /proc/$pid/stat)
+cgroup_path=$(sed -n 's/^[^:]*:[^:]*://p' /proc/$pid/cgroup | head -n1)
+/bin/sh -c 'while :; do /bin/busybox sleep 300; done' 'vz-child-{RESPONSE_LOSS_CASE}' &
+child_pid=$!
+child_start_time=$(awk '{{print $22}}' /proc/$child_pid/stat)
+child_pgid=$(awk '{{print $5}}' /proc/$child_pid/stat)
+printf 'pid=%s\nstart_time=%s\npgid=%s\nchild_pid=%s\nchild_start_time=%s\nchild_pgid=%s\ncgroup_path=%s\n' \
+  "$pid" "$start_time" "$pgid" "$child_pid" "$child_start_time" "$child_pgid" "$cgroup_path" > "$marker"
+while :; do wait "$child_pid"; done"#
+                        ),
+                    ],
+                    timeout: Some(Duration::from_secs(20)),
+                    ..ExecConfig::default()
+                },
+                move |event| response_loss_callback_events.lock().unwrap().push(event),
+            )
+            .await
+    });
+    let response_loss_marker = exec_supervision_marker(&rt, CONTAINER_ID, RESPONSE_LOSS_CASE).await;
+    let response_loss_marker_observed = response_loss_marker
+        .get("start_time")
+        .is_some_and(|value| !value.is_empty());
+    assert!(response_loss_marker_observed);
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_MARKER={RESPONSE_LOSS_CASE}");
+    let (_, response_loss_active_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
+    assert!(response_loss_active_members.len() > baseline_members.len());
+    let response_loss_identity = assert_exec_supervision_identity_live(
+        &rt,
+        CONTAINER_ID,
+        &cgroup_path,
+        RESPONSE_LOSS_CASE,
+        &response_loss_marker,
+        &response_loss_active_members,
+    )
+    .await;
+    let response_loss_result = tokio::time::timeout(Duration::from_secs(15), response_loss_task)
+        .await
+        .expect("response-loss exec did not return its injected error")
+        .expect("response-loss exec task panicked");
+    let response_loss_error = response_loss_result
+        .expect_err("response-loss exec unexpectedly returned output")
+        .to_string();
+    let response_loss_injected_error_observed =
+        response_loss_error.contains(RESPONSE_LOSS_ERROR_MARKER);
+    assert!(
+        response_loss_injected_error_observed,
+        "response-loss hook did not produce its stable injected error: {response_loss_error}"
+    );
+    let response_loss_reconciled = response_loss_error.contains("; reconciliation=TERMINAL_REAPED");
+    assert!(
+        response_loss_reconciled,
+        "response-loss error did not expose exact request-ID terminal reconciliation: {response_loss_error}"
+    );
+    let response_loss_reconcile_outcome = if response_loss_reconciled {
+        "TERMINAL_REAPED"
+    } else {
+        unreachable!("asserted exact reconciliation outcome")
+    };
+    assert!(
+        response_loss_events.lock().unwrap().is_empty(),
+        "response-loss case published readiness or terminal output before reconciliation"
+    );
+    let response_loss_identities = [
+        (
+            response_loss_identity["host_pid"].as_u64().unwrap() as u32,
+            response_loss_identity["start_time"].as_u64().unwrap(),
+        ),
+        (
+            response_loss_identity["child_host_pid"].as_u64().unwrap() as u32,
+            response_loss_identity["child_start_time"].as_u64().unwrap(),
+        ),
+    ];
+    await_exec_supervision_cleanup(
+        &rt,
+        CONTAINER_ID,
+        &baseline_members,
+        &response_loss_identities,
+        RESPONSE_LOSS_CASE,
+    )
+    .await;
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_CLEAN={RESPONSE_LOSS_CASE}");
+    let response_loss_diagnostics = rt.lifecycle_diagnostics().await.unwrap();
+    let (_, response_loss_restored_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
+    let response_loss_leader_absent = exec_supervision_identity_absent(
+        &rt,
+        CONTAINER_ID,
+        response_loss_identities[0].0,
+        response_loss_identities[0].1,
+    )
+    .await;
+    let response_loss_child_absent = exec_supervision_identity_absent(
+        &rt,
+        CONTAINER_ID,
+        response_loss_identities[1].0,
+        response_loss_identities[1].1,
+    )
+    .await;
+    let response_loss_stale_control_rejected = matches!(
+        rt.cancel_exec(RESPONSE_LOSS_EXECUTION_ID).await,
+        Err(vz_oci_macos::MacosOciError::ExecutionSessionNotFound { .. })
+    );
+    assert!(response_loss_leader_absent);
+    assert!(response_loss_child_absent);
+    assert!(response_loss_stale_control_rejected);
+    assert_eq!(response_loss_diagnostics.exec_sessions, 0);
+    assert_eq!(response_loss_restored_members, baseline_members);
+    let response_loss_marker_removed = exec_supervision_host_command(
+        &rt,
+        CONTAINER_ID,
+        format!(
+            "rm -f '/run/vz-oci/containers/{CONTAINER_ID}/merged/vz-exec-supervision/{RESPONSE_LOSS_CASE}'; \
+             test ! -e '/run/vz-oci/containers/{CONTAINER_ID}/merged/vz-exec-supervision/{RESPONSE_LOSS_CASE}'"
+        ),
+    )
+    .await
+    .exit_code
+        == 0;
+    assert!(response_loss_marker_removed);
+    let response_loss_lifecycle_writer =
+        assert_exec_supervision_lifecycle_writer_available(&rt, CONTAINER_ID, RESPONSE_LOSS_CASE)
+            .await;
+    let response_loss_post = rt
+        .exec_container(
+            CONTAINER_ID,
+            ExecConfig {
+                cmd: vec!["/bin/busybox".into(), "true".into()],
+                timeout: Some(Duration::from_secs(10)),
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    let response_loss_post_case_probe = response_loss_post.exit_code == 0
+        && exec_supervision_cgroup(&rt, CONTAINER_ID).await.1 == baseline_members;
+    assert!(response_loss_post_case_probe);
+    let response_loss_before_ready = json!({
+        "attempts": 1,
+        "adapter": "streaming",
+        "target": "container",
+        "execution_id": RESPONSE_LOSS_EXECUTION_ID,
+        "fault_selector": response_loss_selector,
+        "fault_dwell_ms": response_loss_dwell_ms,
+        "injection_error_marker": RESPONSE_LOSS_ERROR_MARKER,
+        "injected_error_observed": response_loss_injected_error_observed,
+        "terminal_error": response_loss_error,
+        "marker_observed_during_fault_dwell": response_loss_marker_observed,
+        "interactive_events": response_loss_events.lock().unwrap().len(),
+        "identity": response_loss_identity,
+        "baseline_cgroup_members": baseline_members.iter().map(|(pid, start, pgid)| json!({"pid": pid, "start_time": start, "pgid": pgid})).collect::<Vec<_>>(),
+        "active_cgroup_members": response_loss_active_members.iter().map(|(pid, start, pgid)| json!({"pid": pid, "start_time": start, "pgid": pgid})).collect::<Vec<_>>(),
+        "request_id_reconcile_outcome": response_loss_reconcile_outcome,
+        "request_id_reconciled_to_terminal_proof": response_loss_reconciled,
+        "cgroup_restored": response_loss_restored_members == baseline_members,
+        "leader_identity_absent": response_loss_leader_absent,
+        "child_identity_absent": response_loss_child_absent,
+        "session_reaped": response_loss_diagnostics.exec_sessions == 0,
+        "stale_control_rejected": response_loss_stale_control_rejected,
+        "lifecycle_writer_available": response_loss_lifecycle_writer,
+        "marker_removed": response_loss_marker_removed,
+        "post_case_probe": response_loss_post_case_probe,
+    });
+
+    // Abort while the guest RPC has returned Ready but its JoinHandle is
+    // deliberately held before the outer owner can promote it. The pending
+    // startup lease must retain both named and anonymous exec cleanup.
+    let mut ready_before_owner_aborts = Vec::new();
+    for (case_name, execution_id) in [
+        (
+            "ready-before-owner-named",
+            Some("exec-supervision-ready-before-owner".to_string()),
+        ),
+        ("ready-before-owner-anonymous", None),
+    ] {
+        eprintln!("VZ_EXEC_SUPERVISION_STAGE_START={case_name}");
+        let mut observer = rt.install_lifecycle_observer();
+        let abort_rt = rt.clone();
+        let abort_container_id = container_id.clone();
+        let task_execution_id = execution_id.clone();
+        let adapter = if execution_id.is_some() {
+            "streaming"
+        } else {
+            "unary"
+        };
+        let command = format!(
+            r#"marker=/vz-exec-supervision/{case_name}
+pid=$$
+start_time=$(awk '{{print $22}}' /proc/$pid/stat)
+pgid=$(awk '{{print $5}}' /proc/$pid/stat)
+cgroup_path=$(sed -n 's/^[^:]*:[^:]*://p' /proc/$pid/cgroup | head -n1)
+/bin/sh -c 'while :; do /bin/busybox sleep 300; done' 'vz-child-{case_name}' &
+child_pid=$!
+child_start_time=$(awk '{{print $22}}' /proc/$child_pid/stat)
+child_pgid=$(awk '{{print $5}}' /proc/$child_pid/stat)
+printf 'pid=%s\nstart_time=%s\npgid=%s\nchild_pid=%s\nchild_start_time=%s\nchild_pgid=%s\ncgroup_path=%s\n' \
+  "$pid" "$start_time" "$pgid" "$child_pid" "$child_start_time" "$child_pgid" "$cgroup_path" > "$marker"
+while :; do wait "$child_pid"; done"#
+        );
+        let abort_task = tokio::spawn(async move {
+            let config = ExecConfig {
+                execution_id: task_execution_id.clone(),
+                cmd: vec!["/bin/sh".into(), "-c".into(), command],
+                timeout: Some(Duration::from_secs(20)),
+                ..ExecConfig::default()
+            };
+            if task_execution_id.is_some() {
+                abort_rt
+                    .exec_container_streaming(&abort_container_id, config, |_| {})
+                    .await
+            } else {
+                abort_rt
+                    .exec_container_oci_unary(&abort_container_id, config)
+                    .await
+            }
+        });
+        let before_rpc = expect_lifecycle_admission(
+            &mut observer,
+            RuntimeLifecycleAdmissionKind::ExecBeforeGuestRpc,
+            CONTAINER_ID,
+        )
+        .await;
+        before_rpc.resume();
+        let ready_before_owner = expect_lifecycle_admission(
+            &mut observer,
+            RuntimeLifecycleAdmissionKind::ExecGuestRpcReadyBeforeOwner,
+            CONTAINER_ID,
+        )
+        .await;
+        let marker = exec_supervision_marker(&rt, CONTAINER_ID, case_name).await;
+        eprintln!("VZ_EXEC_SUPERVISION_STAGE_MARKER={case_name}");
+        let (_, active_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
+        assert!(
+            active_members.len() > baseline_members.len(),
+            "{case_name} did not add a target process to the exact container cgroup"
+        );
+        let identity = assert_exec_supervision_identity_live(
+            &rt,
+            CONTAINER_ID,
+            &cgroup_path,
+            case_name,
+            &marker,
+            &active_members,
+        )
+        .await;
+        let pre_abort_diagnostics = rt.lifecycle_diagnostics().await.unwrap();
+        let session_registered_before_abort = pre_abort_diagnostics.exec_sessions == 1;
+        assert_eq!(
+            pre_abort_diagnostics.exec_sessions,
+            usize::from(execution_id.is_some()),
+            "{case_name} had the wrong host session count before abort: {pre_abort_diagnostics:?}"
+        );
+        abort_task.abort();
+        let abort_join = abort_task
+            .await
+            .expect_err("ready-before-owner execution unexpectedly completed");
+        assert!(abort_join.is_cancelled());
+        ready_before_owner.resume();
+        drop(observer);
+        let identities = [
+            (
+                identity["host_pid"].as_u64().unwrap() as u32,
+                identity["start_time"].as_u64().unwrap(),
+            ),
+            (
+                identity["child_host_pid"].as_u64().unwrap() as u32,
+                identity["child_start_time"].as_u64().unwrap(),
+            ),
+        ];
+        await_exec_supervision_cleanup(
+            &rt,
+            CONTAINER_ID,
+            &baseline_members,
+            &identities,
+            case_name,
+        )
+        .await;
+        eprintln!("VZ_EXEC_SUPERVISION_STAGE_CLEAN={case_name}");
+        let stale_control_rejected = if let Some(execution_id) = execution_id.as_deref() {
+            Some(matches!(
+                rt.signal_exec(execution_id, "SIGTERM").await,
+                Err(vz_oci_macos::MacosOciError::ExecutionSessionNotFound { .. })
+            ))
+        } else {
+            None
+        };
+        assert!(
+            stale_control_rejected.unwrap_or(true),
+            "{case_name} retained a named control session after cleanup"
+        );
+        let marker_removed = exec_supervision_host_command(
+            &rt,
+            CONTAINER_ID,
+            format!(
+                "rm -f '/run/vz-oci/containers/{CONTAINER_ID}/merged/vz-exec-supervision/{case_name}'; \
+                 test ! -e '/run/vz-oci/containers/{CONTAINER_ID}/merged/vz-exec-supervision/{case_name}'"
+            ),
+        )
+        .await
+        .exit_code
+            == 0;
+        assert!(marker_removed, "{case_name} marker did not clean up");
+        let post_case = rt
+            .exec_container(
+                CONTAINER_ID,
+                ExecConfig {
+                    cmd: vec![
+                        "/bin/busybox".into(),
+                        "printf".into(),
+                        format!("post-case:{case_name}"),
+                    ],
+                    timeout: Some(Duration::from_secs(10)),
+                    ..ExecConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+        let post_case_probe = post_case.exit_code == 0
+            && post_case.stdout.replace('\r', "") == format!("post-case:{case_name}");
+        assert!(post_case_probe, "{case_name} left the container unhealthy");
+        let (_, restored_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
+        assert_eq!(
+            restored_members, baseline_members,
+            "{case_name} did not retain exact cgroup restoration after its health probe"
+        );
+        let diagnostics = rt.lifecycle_diagnostics().await.unwrap();
+        assert_eq!(
+            diagnostics.exec_sessions, 0,
+            "{case_name} leaked a host execution session: {diagnostics:?}"
+        );
+        ready_before_owner_aborts.push(json!({
+            "case": case_name,
+            "adapter": adapter,
+            "execution_id": execution_id,
+            "admission": "exec-guest-rpc-ready-before-owner",
+            "join_cancelled": abort_join.is_cancelled(),
+            "identity": identity,
+            "baseline_cgroup_members": baseline_members.iter().map(|(pid, start, pgid)| json!({"pid": pid, "start_time": start, "pgid": pgid})).collect::<Vec<_>>(),
+            "active_cgroup_members": active_members.iter().map(|(pid, start, pgid)| json!({"pid": pid, "start_time": start, "pgid": pgid})).collect::<Vec<_>>(),
+            "session_registered_before_abort": session_registered_before_abort,
+            "cgroup_restored": restored_members == baseline_members,
+            "leader_identity_absent": exec_supervision_identity_absent(&rt, CONTAINER_ID, identities[0].0, identities[0].1).await,
+            "child_identity_absent": exec_supervision_identity_absent(&rt, CONTAINER_ID, identities[1].0, identities[1].1).await,
+            "session_reaped": diagnostics.exec_sessions == 0,
+            "stale_control_rejected": stale_control_rejected,
+            "marker_removed": marker_removed,
+            "post_case_probe": post_case_probe,
+        }));
+    }
+
+    // Killing the exact outer trampoline exercises the sentinel PDEATHSIG
+    // path rather than any cooperative control-plane cancellation.
+    const OUTER_KILL_CASE: &str = "outer-trampoline-kill";
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_START={OUTER_KILL_CASE}");
+    let outer_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let outer_callback_events = std::sync::Arc::clone(&outer_events);
+    let outer_rt = rt.clone();
+    let outer_container_id = container_id.clone();
+    let outer_task = tokio::spawn(async move {
+        outer_rt
+            .exec_container_streaming(
+                &outer_container_id,
+                ExecConfig {
+                    execution_id: Some("exec-supervision-outer-trampoline-kill".into()),
+                    cmd: vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        format!(
+                            r#"marker=/vz-exec-supervision/{OUTER_KILL_CASE}
+pid=$$
+start_time=$(awk '{{print $22}}' /proc/$pid/stat)
+pgid=$(awk '{{print $5}}' /proc/$pid/stat)
+cgroup_path=$(sed -n 's/^[^:]*:[^:]*://p' /proc/$pid/cgroup | head -n1)
+/bin/sh -c 'while :; do /bin/busybox sleep 300; done' 'vz-child-{OUTER_KILL_CASE}' &
+child_pid=$!
+child_start_time=$(awk '{{print $22}}' /proc/$child_pid/stat)
+child_pgid=$(awk '{{print $5}}' /proc/$child_pid/stat)
+printf 'pid=%s\nstart_time=%s\npgid=%s\nchild_pid=%s\nchild_start_time=%s\nchild_pgid=%s\ncgroup_path=%s\n' \
+  "$pid" "$start_time" "$pgid" "$child_pid" "$child_start_time" "$child_pgid" "$cgroup_path" > "$marker"
+while :; do wait "$child_pid"; done"#
+                        ),
+                    ],
+                    timeout: Some(Duration::from_secs(20)),
+                    ..ExecConfig::default()
+                },
+                move |event| outer_callback_events.lock().unwrap().push(event),
+            )
+            .await
+    });
+    let outer_marker = exec_supervision_marker(&rt, CONTAINER_ID, OUTER_KILL_CASE).await;
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_MARKER={OUTER_KILL_CASE}");
+    let (_, outer_active_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
+    let outer_target_identity = assert_exec_supervision_identity_live(
+        &rt,
+        CONTAINER_ID,
+        &cgroup_path,
+        OUTER_KILL_CASE,
+        &outer_marker,
+        &outer_active_members,
+    )
+    .await;
+    let outer_identity = exec_supervision_outer_identity(
+        &rt,
+        CONTAINER_ID,
+        &cgroup_path,
+        OUTER_KILL_CASE,
+        outer_target_identity["host_pid"].as_u64().unwrap() as u32,
+    )
+    .await;
+    assert!(
+        outer_active_members
+            .iter()
+            .all(|member| member.0 != outer_identity["pid"].as_u64().unwrap() as u32),
+        "outer supervisor consumed a target cgroup slot: {outer_active_members:?}"
+    );
+    exec_supervision_host_command(
+        &rt,
+        CONTAINER_ID,
+        format!(
+            "test \"$(awk '{{print $22}}' /proc/{}/stat)\" = '{}'; kill -KILL {}",
+            outer_identity["pid"].as_u64().unwrap(),
+            outer_identity["start_time"].as_u64().unwrap(),
+            outer_identity["pid"].as_u64().unwrap(),
+        ),
+    )
+    .await;
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_KILLED={OUTER_KILL_CASE}");
+    let outer_output = tokio::time::timeout(Duration::from_secs(10), outer_task)
+        .await
+        .expect("outer trampoline death did not terminate the host task")
+        .expect("outer trampoline task panicked")
+        .expect("outer trampoline death did not preserve terminal output");
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_TERMINAL={OUTER_KILL_CASE}");
+    assert_eq!(outer_output.exit_code, 137);
+    assert!(matches!(
+        outer_events.lock().unwrap().last(),
+        Some(InteractiveExecEvent::Exit(137))
+    ));
+    let outer_identities = [
+        (
+            outer_target_identity["host_pid"].as_u64().unwrap() as u32,
+            outer_target_identity["start_time"].as_u64().unwrap(),
+        ),
+        (
+            outer_target_identity["child_host_pid"].as_u64().unwrap() as u32,
+            outer_target_identity["child_start_time"].as_u64().unwrap(),
+        ),
+        (
+            outer_identity["pid"].as_u64().unwrap() as u32,
+            outer_identity["start_time"].as_u64().unwrap(),
+        ),
+    ];
+    await_exec_supervision_cleanup(
+        &rt,
+        CONTAINER_ID,
+        &baseline_members,
+        &outer_identities,
+        OUTER_KILL_CASE,
+    )
+    .await;
+    eprintln!("VZ_EXEC_SUPERVISION_STAGE_CLEAN={OUTER_KILL_CASE}");
+    let outer_marker_removed = exec_supervision_host_command(
+        &rt,
+        CONTAINER_ID,
+        format!(
+            "rm -f '/run/vz-oci/containers/{CONTAINER_ID}/merged/vz-exec-supervision/{OUTER_KILL_CASE}'; \
+             test ! -e '/run/vz-oci/containers/{CONTAINER_ID}/merged/vz-exec-supervision/{OUTER_KILL_CASE}'"
+        ),
+    )
+    .await
+    .exit_code
+        == 0;
+    let outer_post_case = rt
+        .exec_container(
+            CONTAINER_ID,
+            ExecConfig {
+                cmd: vec!["/bin/busybox".into(), "true".into()],
+                timeout: Some(Duration::from_secs(10)),
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(outer_marker_removed);
+    assert_eq!(outer_post_case.exit_code, 0);
+    let outer_trampoline_kill = json!({
+        "adapter": "streaming",
+        "execution_id": "exec-supervision-outer-trampoline-kill",
+        "exit_code": outer_output.exit_code,
+        "identity": outer_target_identity,
+        "outer_identity": outer_identity,
+        "baseline_cgroup_members": baseline_members.iter().map(|(pid, start, pgid)| json!({"pid": pid, "start_time": start, "pgid": pgid})).collect::<Vec<_>>(),
+        "active_cgroup_members": outer_active_members.iter().map(|(pid, start, pgid)| json!({"pid": pid, "start_time": start, "pgid": pgid})).collect::<Vec<_>>(),
+        "cgroup_restored": exec_supervision_cgroup(&rt, CONTAINER_ID).await.1 == baseline_members,
+        "outer_identity_absent": exec_supervision_identity_absent(&rt, CONTAINER_ID, outer_identities[2].0, outer_identities[2].1).await,
+        "leader_identity_absent": exec_supervision_identity_absent(&rt, CONTAINER_ID, outer_identities[0].0, outer_identities[0].1).await,
+        "child_identity_absent": exec_supervision_identity_absent(&rt, CONTAINER_ID, outer_identities[1].0, outer_identities[1].1).await,
+        "session_reaped": rt.lifecycle_diagnostics().await.unwrap().exec_sessions == 0,
+        "marker_removed": outer_marker_removed,
+        "post_case_probe": outer_post_case.exit_code == 0,
+    });
+
+    rt.stop_container(CONTAINER_ID, true, None, None)
+        .await
+        .unwrap();
+    rt.remove_container(CONTAINER_ID).await.unwrap();
+    let final_diagnostics = rt.lifecycle_diagnostics().await.unwrap();
+    let final_zero_leaks = final_diagnostics.vm_handles == 0
+        && final_diagnostics.container_routes == 0
+        && final_diagnostics.exec_bindings == 0
+        && final_diagnostics.active_lifecycles == 0
+        && final_diagnostics.exec_sessions == 0
+        && final_diagnostics.setup_restore_entries == 0
+        && final_diagnostics.rootfs_directories == 0
+        && final_diagnostics.overlay_cleanup_pending == 0
+        && rt
+            .list_containers()
+            .unwrap()
+            .iter()
+            .all(|container| container.id != CONTAINER_ID)
+        && !tmp.path().join("rootfs").join(CONTAINER_ID).exists();
+    assert!(
+        final_zero_leaks,
+        "exec supervision scenario leaked runtime resources: {final_diagnostics:?}"
+    );
+    assert_eq!(cells.len(), 12);
+    write_exec_supervision_evidence(&json!({
+        "schema_version": 4,
+        "scenario": "runtime-exec-supervision",
+        "build": build_identity,
+        "container_id": CONTAINER_ID,
+        "cgroup_path": cgroup_path,
+        "matrix": cells,
+        "normal_exit": normal_exit,
+        "cancellation": cancellation,
+        "cancel_before_ready": cancel_before_ready,
+        "pre_spawn_rejection": pre_spawn_rejection,
+        "slow_live_consumer": slow_live_consumer,
+        "response_loss_before_ready": response_loss_before_ready,
+        "dropped_future": dropped_future,
+        "ready_before_owner_aborts": ready_before_owner_aborts,
+        "outer_trampoline_kill": outer_trampoline_kill,
+        "final": {
+            "zero_leaks": final_zero_leaks,
+            "tracked_container_absent": true,
+            "metadata_absent": true,
+            "rootfs_absent": true,
+            "diagnostics": format!("{final_diagnostics:?}"),
+        },
+    }));
+}
+
+// Container logs.
+
 /// Create a container with capture_logs, run a command that writes output,
 /// then verify we can read the logs via exec.
 #[tokio::test(flavor = "multi_thread")]
@@ -1424,7 +3497,7 @@ async fn container_logs_capture_and_retrieve() {
     // The init process writes output that gets captured to /var/log/vz-oci/output.log.
     let container_id = rt
         .create_container(
-            "alpine:latest",
+            "alpine:3.20",
             RunConfig {
                 cmd: vec![
                     "sh".into(),
@@ -1511,7 +3584,7 @@ async fn port_forwarding_tcp() {
     // mapped to host port 18080. Use nc to echo a response.
     let container_id = rt
         .create_container(
-            "alpine:latest",
+            "alpine:3.20",
             RunConfig {
                 cmd: vec![
                     "sh".into(),
@@ -1614,8 +3687,8 @@ async fn pull_is_idempotent() {
     let tmp = tempfile::tempdir().unwrap();
     let rt = test_runtime(tmp.path());
 
-    let id1 = rt.pull("alpine:latest").await.unwrap();
-    let id2 = rt.pull("alpine:latest").await.unwrap();
+    let id1 = rt.pull("alpine:3.20").await.unwrap();
+    let id2 = rt.pull("alpine:3.20").await.unwrap();
     assert_eq!(id1.0, id2.0, "same image should produce same ID");
 
     let images = rt.images().unwrap();
@@ -1796,7 +3869,7 @@ async fn cgroup_cpu_max_enforcement() {
 
     let create_result = rt
         .create_container(
-            "alpine:latest",
+            "alpine:3.20",
             RunConfig {
                 cmd: vec!["/bin/busybox".into(), "sleep".into(), "300".into()],
                 execution_mode: ExecutionMode::OciRuntime,
@@ -2193,52 +4266,36 @@ async fn container_exec_user_environment_semantics() {
     );
 
     for (adapter, sentinel_name, (result, events)) in missing_identity_results {
-        match adapter {
-            ExecSemanticsAdapter::OciUnary => {
-                let output = result.expect("unary setup failure must remain result-shaped");
-                assert_ne!(
-                    output.exit_code, 0,
-                    "unary accepted a missing named identity"
-                );
-                let message = format!("{}{}", output.stdout, output.stderr);
-                eprintln!(
-                    "container exec missing-identity evidence ({}): exit_code={} diagnostic={message:?}",
-                    adapter.name(),
-                    output.exit_code
-                );
-                assert!(
-                    message.contains("vz-user-does-not-exist")
-                        && message.contains("does not exist"),
-                    "unary returned an unactionable missing-user error: {message}"
-                );
+        let error = result.expect_err("container setup failure must fail before readiness");
+        let vz_oci_macos::MacosOciError::Linux(vz_linux::LinuxError::Protocol(diagnostic)) = error
+        else {
+            panic!(
+                "{} returned the wrong pre-readiness error: {error}",
+                adapter.name()
+            );
+        };
+        let rejection = match adapter {
+            ExecSemanticsAdapter::Pty => "PTY exec rejected before readiness",
+            ExecSemanticsAdapter::OciUnary | ExecSemanticsAdapter::StreamingPipe => {
+                "exec rejected before readiness"
             }
-            ExecSemanticsAdapter::StreamingPipe | ExecSemanticsAdapter::Pty => {
-                let error = result.expect_err("streaming setup failure must fail before readiness");
-                let vz_oci_macos::MacosOciError::Linux(vz_linux::LinuxError::Grpc(status)) = error
-                else {
-                    panic!(
-                        "{} returned the wrong pre-readiness error: {error}",
-                        adapter.name()
-                    );
-                };
-                assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-                assert_eq!(
-                    status.message(),
-                    "container trampoline failed before readiness: container exec user `vz-user-does-not-exist` does not exist"
-                );
-                assert!(
-                    events.is_empty(),
-                    "{} emitted events before rejecting the missing identity: {events:?}",
-                    adapter.name()
-                );
-                eprintln!(
-                    "container exec missing-identity evidence ({}): status={:?} diagnostic={:?} events=0",
-                    adapter.name(),
-                    status.code(),
-                    status.message()
-                );
-            }
-        }
+        };
+        assert_eq!(
+            diagnostic,
+            format!(
+                "exec stream reported an error: {rejection}; spawned process reaped: container trampoline failed before readiness: container exec user `vz-user-does-not-exist` does not exist"
+            )
+        );
+        assert!(
+            events.is_empty(),
+            "{} emitted events before rejecting the missing identity: {events:?}",
+            adapter.name()
+        );
+        eprintln!(
+            "container exec missing-identity evidence ({}): diagnostic={:?} events=0",
+            adapter.name(),
+            diagnostic
+        );
         assert!(
             !sentinel_dir.join(&sentinel_name).exists(),
             "{} ran the sentinel command for a missing named identity",
@@ -2674,7 +4731,7 @@ async fn shared_vm_inter_service_connectivity() {
     let rt = test_runtime(&data_dir);
 
     // Pull alpine (skip if already cached to avoid Docker Hub rate limits).
-    if rt.pull("alpine:latest").await.is_err() {
+    if rt.pull("alpine:3.20").await.is_err() {
         eprintln!("WARN: pull failed (rate limit?), assuming image is cached");
     }
 
@@ -2714,7 +4771,7 @@ async fn shared_vm_inter_service_connectivity() {
     let web_id = rt
         .create_container_in_stack(
             stack_id,
-            "alpine:latest",
+            "alpine:3.20",
             RunConfig {
                 cmd: vec!["sleep".into(), "300".into()],
                 execution_mode: ExecutionMode::OciRuntime,
@@ -2730,7 +4787,7 @@ async fn shared_vm_inter_service_connectivity() {
     let db_id = rt
         .create_container_in_stack(
             stack_id,
-            "alpine:latest",
+            "alpine:3.20",
             RunConfig {
                 cmd: vec!["sleep".into(), "300".into()],
                 execution_mode: ExecutionMode::OciRuntime,
@@ -2855,7 +4912,7 @@ async fn undeclared_host_import_does_not_inject_host_vz_internal() {
     std::fs::create_dir_all(&data_dir).unwrap();
     let rt = test_runtime(&data_dir);
 
-    if rt.pull("alpine:latest").await.is_err() {
+    if rt.pull("alpine:3.20").await.is_err() {
         eprintln!("WARN: pull failed (rate limit?), assuming image is cached");
     }
 
@@ -2875,7 +4932,7 @@ async fn undeclared_host_import_does_not_inject_host_vz_internal() {
     let client_id = rt
         .create_container_in_stack(
             stack_id,
-            "alpine:latest",
+            "alpine:3.20",
             RunConfig {
                 cmd: vec!["sleep".into(), "300".into()],
                 execution_mode: ExecutionMode::OciRuntime,

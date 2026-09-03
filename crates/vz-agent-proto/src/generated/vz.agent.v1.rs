@@ -51,6 +51,17 @@ pub struct TransportMetadata {
     pub idempotency_key: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AllocateExecRequestRequest {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AllocateExecRequestResponse {
+    /// Single-use ticket accepted only by this guest-agent incarnation.
+    #[prost(string, tag = "1")]
+    pub exec_request_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecRequest {
     #[prost(string, tag = "1")]
     pub command: ::prost::alloc::string::String,
@@ -198,6 +209,91 @@ pub struct SignalRequest {
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct SignalResponse {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CancelExecRequest {
+    #[prost(uint64, tag = "1")]
+    pub exec_id: u64,
+    #[prost(message, optional, tag = "2")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct CancelExecResponse {
+    /// Normalized shell-compatible exit status (128 + signal for signaled exits).
+    #[prost(int32, tag = "1")]
+    pub exit_code: i32,
+    /// True when cancellation had to escalate from TERM to KILL.
+    #[prost(bool, tag = "2")]
+    pub forced: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReconcileExecRequest {
+    /// Exact request_id from the original authenticated ExecRequest metadata.
+    #[prost(string, tag = "1")]
+    pub exec_request_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReconcileExecResponse {
+    #[prost(enumeration = "reconcile_exec_response::Outcome", tag = "1")]
+    pub outcome: i32,
+    #[prost(string, tag = "2")]
+    pub exec_request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub exec_id: u64,
+    #[prost(int32, tag = "4")]
+    pub exit_code: i32,
+    #[prost(bool, tag = "5")]
+    pub forced: bool,
+}
+/// Nested message and enum types in `ReconcileExecResponse`.
+pub mod reconcile_exec_response {
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        PartialEq,
+        Eq,
+        Hash,
+        PartialOrd,
+        Ord,
+        ::prost::Enumeration
+    )]
+    #[repr(i32)]
+    pub enum Outcome {
+        Unspecified = 0,
+        /// The request was atomically fenced before it could spawn.
+        FencedNeverStarted = 1,
+        /// The exact published exec was forced terminal and reaped.
+        TerminalReaped = 2,
+        /// The bounded receipt was evicted, so exact terminal proof is unavailable.
+        StaleUnknown = 3,
+    }
+    impl Outcome {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Unspecified => "OUTCOME_UNSPECIFIED",
+                Self::FencedNeverStarted => "FENCED_NEVER_STARTED",
+                Self::TerminalReaped => "TERMINAL_REAPED",
+                Self::StaleUnknown => "STALE_UNKNOWN",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "OUTCOME_UNSPECIFIED" => Some(Self::Unspecified),
+                "FENCED_NEVER_STARTED" => Some(Self::FencedNeverStarted),
+                "TERMINAL_REAPED" => Some(Self::TerminalReaped),
+                "STALE_UNKNOWN" => Some(Self::StaleUnknown),
+                _ => None,
+            }
+        }
+    }
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResizeExecPtyRequest {
     #[prost(uint64, tag = "1")]
@@ -592,6 +688,34 @@ pub mod agent_service_client {
                 .insert(GrpcMethod::new("vz.agent.v1.AgentService", "ResourceStats"));
             self.inner.unary(req, path, codec).await
         }
+        /// Allocate a guest-incarnation-bound, monotonically ordered request ticket
+        /// for one container-targeted Exec. Allocation retains no execution state.
+        pub async fn allocate_exec_request(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AllocateExecRequestRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::AllocateExecRequestResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.agent.v1.AgentService/AllocateExecRequest",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("vz.agent.v1.AgentService", "AllocateExecRequest"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         /// Execute a command in the guest. Returns a stream of stdout/stderr
         /// chunks followed by an exit code.
         pub async fn exec(
@@ -688,6 +812,57 @@ pub mod agent_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("vz.agent.v1.AgentService", "Signal"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Cancel a running exec, escalating from TERM to KILL and returning only
+        /// after the guest has observed and reaped the supervised process.
+        pub async fn cancel_exec(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CancelExecRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CancelExecResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.agent.v1.AgentService/CancelExec",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("vz.agent.v1.AgentService", "CancelExec"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Fence or reap an exec whose stream failed before the host learned exec_id.
+        pub async fn reconcile_exec(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ReconcileExecRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ReconcileExecResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.agent.v1.AgentService/ReconcileExec",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("vz.agent.v1.AgentService", "ReconcileExec"));
             self.inner.unary(req, path, codec).await
         }
         /// Resize the PTY window for a running exec session.
@@ -1191,6 +1366,15 @@ pub mod agent_service_server {
             tonic::Response<super::ResourceStatsResponse>,
             tonic::Status,
         >;
+        /// Allocate a guest-incarnation-bound, monotonically ordered request ticket
+        /// for one container-targeted Exec. Allocation retains no execution state.
+        async fn allocate_exec_request(
+            &self,
+            request: tonic::Request<super::AllocateExecRequestRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::AllocateExecRequestResponse>,
+            tonic::Status,
+        >;
         /// Server streaming response type for the Exec method.
         type ExecStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::ExecEvent, tonic::Status>,
@@ -1224,6 +1408,23 @@ pub mod agent_service_server {
             &self,
             request: tonic::Request<super::SignalRequest>,
         ) -> std::result::Result<tonic::Response<super::SignalResponse>, tonic::Status>;
+        /// Cancel a running exec, escalating from TERM to KILL and returning only
+        /// after the guest has observed and reaped the supervised process.
+        async fn cancel_exec(
+            &self,
+            request: tonic::Request<super::CancelExecRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CancelExecResponse>,
+            tonic::Status,
+        >;
+        /// Fence or reap an exec whose stream failed before the host learned exec_id.
+        async fn reconcile_exec(
+            &self,
+            request: tonic::Request<super::ReconcileExecRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ReconcileExecResponse>,
+            tonic::Status,
+        >;
         /// Resize the PTY window for a running exec session.
         async fn resize_exec_pty(
             &self,
@@ -1474,6 +1675,52 @@ pub mod agent_service_server {
                     };
                     Box::pin(fut)
                 }
+                "/vz.agent.v1.AgentService/AllocateExecRequest" => {
+                    #[allow(non_camel_case_types)]
+                    struct AllocateExecRequestSvc<T: AgentService>(pub Arc<T>);
+                    impl<
+                        T: AgentService,
+                    > tonic::server::UnaryService<super::AllocateExecRequestRequest>
+                    for AllocateExecRequestSvc<T> {
+                        type Response = super::AllocateExecRequestResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::AllocateExecRequestRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentService>::allocate_exec_request(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AllocateExecRequestSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/vz.agent.v1.AgentService/Exec" => {
                     #[allow(non_camel_case_types)]
                     struct ExecSvc<T: AgentService>(pub Arc<T>);
@@ -1640,6 +1887,96 @@ pub mod agent_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = SignalSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.agent.v1.AgentService/CancelExec" => {
+                    #[allow(non_camel_case_types)]
+                    struct CancelExecSvc<T: AgentService>(pub Arc<T>);
+                    impl<
+                        T: AgentService,
+                    > tonic::server::UnaryService<super::CancelExecRequest>
+                    for CancelExecSvc<T> {
+                        type Response = super::CancelExecResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CancelExecRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentService>::cancel_exec(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CancelExecSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.agent.v1.AgentService/ReconcileExec" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReconcileExecSvc<T: AgentService>(pub Arc<T>);
+                    impl<
+                        T: AgentService,
+                    > tonic::server::UnaryService<super::ReconcileExecRequest>
+                    for ReconcileExecSvc<T> {
+                        type Response = super::ReconcileExecResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ReconcileExecRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentService>::reconcile_exec(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReconcileExecSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

@@ -1,7 +1,8 @@
 use super::bundle::container_log_dir;
 use super::*;
 
-pub(super) type OciLifecycleFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, OciError>> + 'a>>;
+pub(super) type OciLifecycleFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, OciError>> + Send + 'a>>;
 
 pub(super) fn parse_signal_number(signal: &str) -> Option<i32> {
     let trimmed = signal.trim();

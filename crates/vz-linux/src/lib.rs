@@ -16,7 +16,10 @@ pub use benchmark::{
 };
 pub use config::LinuxVmConfig;
 pub use error::LinuxError;
-pub use grpc_client::{ExecOptions, GrpcExecStream, GrpcPortForwardStream, OciExecOptions};
+pub use grpc_client::{
+    ContainerExecDispatchGate, ContainerExecStartError, ExecOptions, GrpcExecStream,
+    GrpcPortForwardStream, OciExecOptions,
+};
 pub use kernel::{
     EnsureKernelOptions, KernelBundle, KernelBundleOptions, KernelCapability, KernelFlavor,
     KernelPaths, KernelProfile, KernelVersion, default_linux_dir, default_linux_profile_dir,
@@ -26,4 +29,7 @@ pub use kernel::{
 };
 pub use vm::LinuxVm;
 pub use vz::protocol::{NetworkServiceConfig, OciContainerState};
-pub use vz_agent_proto::{ContainerGeneration, ContainerNamespaceIdentity, KernelObjectIdentity};
+pub use vz_agent_proto::{
+    ContainerGeneration, ContainerNamespaceIdentity, KernelObjectIdentity, ReconcileExecResponse,
+    reconcile_exec_response,
+};

@@ -18,7 +18,7 @@ pub use vz::agent::v1::*;
 ///
 /// Increment this when startup-time host assumptions require a newer guest
 /// agent capability/behavior, even if crate semver remains unchanged.
-pub const AGENT_PROTOCOL_REVISION: u32 = 4;
+pub const AGENT_PROTOCOL_REVISION: u32 = 6;
 
 #[cfg(test)]
 mod tests {
@@ -94,6 +94,29 @@ mod tests {
     }
 
     #[test]
+    fn allocate_exec_request_round_trip() {
+        let request = AllocateExecRequestRequest {
+            metadata: Some(TransportMetadata {
+                request_id: "allocate-exec-1".to_string(),
+                idempotency_key: String::new(),
+            }),
+        };
+        assert_eq!(
+            AllocateExecRequestRequest::decode(request.encode_to_vec().as_slice()).unwrap(),
+            request
+        );
+
+        let response = AllocateExecRequestResponse {
+            exec_request_id: "exec_req_00000000-0000-4000-8000-000000000005_0000000000000001"
+                .to_string(),
+        };
+        assert_eq!(
+            AllocateExecRequestResponse::decode(response.encode_to_vec().as_slice()).unwrap(),
+            response
+        );
+    }
+
+    #[test]
     fn exec_event_stdout() {
         let msg = ExecEvent {
             event: Some(exec_event::Event::Stdout(b"hello world\n".to_vec())),
@@ -124,6 +147,52 @@ mod tests {
         let encoded = msg.encode_to_vec();
         let decoded = ExecEvent::decode(encoded.as_slice()).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn cancel_exec_receipt_round_trip() {
+        let request = CancelExecRequest {
+            exec_id: 91,
+            metadata: Some(TransportMetadata {
+                request_id: "cancel-91".to_string(),
+                idempotency_key: String::new(),
+            }),
+        };
+        let decoded = CancelExecRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, request);
+
+        let response = CancelExecResponse {
+            exit_code: 137,
+            forced: true,
+        };
+        let decoded = CancelExecResponse::decode(response.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn reconcile_exec_proof_round_trip() {
+        let request = ReconcileExecRequest {
+            exec_request_id: "exec_req_00000000-0000-4000-8000-000000000005".to_string(),
+            metadata: Some(TransportMetadata {
+                request_id: "reconcile-control".to_string(),
+                idempotency_key: String::new(),
+            }),
+        };
+        assert_eq!(
+            ReconcileExecRequest::decode(request.encode_to_vec().as_slice()).unwrap(),
+            request
+        );
+        let response = ReconcileExecResponse {
+            outcome: reconcile_exec_response::Outcome::TerminalReaped as i32,
+            exec_request_id: request.exec_request_id,
+            exec_id: 91,
+            exit_code: 137,
+            forced: true,
+        };
+        assert_eq!(
+            ReconcileExecResponse::decode(response.encode_to_vec().as_slice()).unwrap(),
+            response
+        );
     }
 
     #[test]
@@ -402,11 +471,14 @@ mod tests {
         let _ = PingRequest {};
         let _ = SystemInfoRequest {};
         let _ = ResourceStatsRequest {};
+        let _ = AllocateExecRequestRequest::default();
         let _ = ExecRequest::default();
         let _ = ContainerExecTarget::default();
         let _ = StdinWriteRequest::default();
         let _ = StdinCloseRequest::default();
         let _ = SignalRequest::default();
+        let _ = CancelExecRequest::default();
+        let _ = ReconcileExecRequest::default();
         let _ = DockerEnsureRequest::default();
         let _ = PortForwardFrame::default();
         let _ = PortForwardOpen::default();
@@ -425,10 +497,13 @@ mod tests {
         let _ = PingResponse {};
         let _ = SystemInfoResponse::default();
         let _ = ResourceStatsResponse::default();
+        let _ = AllocateExecRequestResponse::default();
         let _ = ExecEvent::default();
         let _ = StdinWriteResponse {};
         let _ = StdinCloseResponse {};
         let _ = SignalResponse {};
+        let _ = CancelExecResponse::default();
+        let _ = ReconcileExecResponse::default();
         let _ = DockerEnsureEvent::default();
         let _ = OciCreateResponse {};
         let _ = OciStartResponse {};

@@ -25,7 +25,15 @@ use vz_agent_proto::*;
 
 #[cfg(target_os = "linux")]
 use crate::process_table::SpawnedProcessIdentity;
-use crate::process_table::{ProcessIdentity, ProcessTable};
+use crate::process_table::{ExecCancellation, ExecTerminalReceipt, ProcessIdentity, ProcessTable};
+use crate::process_table::{ExecRequestClaimError, ExecRequestPermit, ExecRequestReconcile};
+
+const EXEC_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+const EXEC_CANCEL_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const EXEC_CANCEL_DRIVER_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+const PTY_READER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const MAX_STDIN_WRITE_BYTES: usize = 1024 * 1024;
+const STDIN_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(target_os = "linux")]
 const CONTAINER_READY_ROOT: &str = "/run/vz-agent-exec";
@@ -222,6 +230,307 @@ fn container_generation(
 
 // ── PTY handle tracking ─────────────────────────────────────────
 
+/// Owns a newly-spawned pipe child until it is registered in ProcessTable.
+///
+/// Every ordinary error path transfers the child to durable cleanup before
+/// awaiting bounded reap proof. Drop is the cancellation backstop: kill-on-drop
+/// alone is not enough because it does not prove the trampoline was reaped.
+trait PendingPipeProcess: Send + 'static {
+    fn process_id(&self) -> Option<u32>;
+    fn start_kill(&mut self) -> std::io::Result<()>;
+    fn try_wait_reaped(&mut self) -> std::io::Result<bool>;
+}
+
+impl PendingPipeProcess for tokio::process::Child {
+    fn process_id(&self) -> Option<u32> {
+        self.id()
+    }
+
+    fn start_kill(&mut self) -> std::io::Result<()> {
+        self.start_kill()
+    }
+
+    fn try_wait_reaped(&mut self) -> std::io::Result<bool> {
+        self.try_wait().map(|status| status.is_some())
+    }
+}
+
+struct PendingPipeChild<C: PendingPipeProcess = tokio::process::Child> {
+    child: Option<C>,
+    request_permit: RetainedExecRequestPermit,
+}
+
+impl<C: PendingPipeProcess> PendingPipeChild<C> {
+    #[cfg(test)]
+    fn new(child: C) -> Self {
+        Self::with_request_permit(child, None)
+    }
+
+    fn with_request_permit(child: C, request_permit: Option<ExecRequestPermit>) -> Self {
+        Self {
+            child: Some(child),
+            request_permit: RetainedExecRequestPermit(request_permit),
+        }
+    }
+
+    async fn terminate_and_reap_with_timeout(
+        mut self,
+        timeout: std::time::Duration,
+        retry: std::time::Duration,
+    ) -> PendingChildCleanupOutcome {
+        let Some(child) = self.child.take() else {
+            return PendingChildCleanupOutcome::Missing;
+        };
+        let (proof_tx, proof_rx) = tokio::sync::oneshot::channel();
+        retain_pending_pipe_cleanup(
+            child,
+            std::mem::take(&mut self.request_permit),
+            Some(proof_tx),
+            retry,
+        );
+        match tokio::time::timeout(timeout, proof_rx).await {
+            Ok(Ok(())) => PendingChildCleanupOutcome::Reaped,
+            Ok(Err(_)) | Err(_) => PendingChildCleanupOutcome::Retained,
+        }
+    }
+}
+
+impl PendingPipeChild<tokio::process::Child> {
+    fn child_mut(&mut self) -> Result<&mut tokio::process::Child, Status> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| Status::internal("pending pipe child is missing"))
+    }
+
+    fn take(mut self) -> Result<(tokio::process::Child, RetainedExecRequestPermit), Status> {
+        let child = self
+            .child
+            .take()
+            .ok_or_else(|| Status::internal("pending pipe child is missing"))?;
+        Ok((child, std::mem::take(&mut self.request_permit)))
+    }
+}
+
+impl<C: PendingPipeProcess> Drop for PendingPipeChild<C> {
+    fn drop(&mut self) {
+        let Some(child) = self.child.take() else {
+            return;
+        };
+        retain_pending_pipe_cleanup(
+            child,
+            std::mem::take(&mut self.request_permit),
+            None,
+            EXEC_CANCEL_DRIVER_RETRY,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingChildCleanupOutcome {
+    Reaped,
+    Retained,
+    Missing,
+}
+
+#[derive(Default)]
+struct RetainedExecRequestPermit(Option<ExecRequestPermit>);
+
+impl RetainedExecRequestPermit {
+    fn take_for_publish(&mut self) -> Option<ExecRequestPermit> {
+        self.0.take()
+    }
+
+    fn fence_after_reap(mut self) {
+        drop(self.0.take());
+    }
+}
+
+impl Drop for RetainedExecRequestPermit {
+    fn drop(&mut self) {
+        // If cleanup itself is cancelled or panics, preserving Starting is the
+        // only safe state: fencing would incorrectly assert that no child can
+        // still exist. The permit is released explicitly only after reap proof
+        // or transferred for publication.
+        if let Some(permit) = self.0.take() {
+            std::mem::forget(permit);
+        }
+    }
+}
+
+/// Schedule blocking cleanup without ever making the public rejection path
+/// perform an unbounded synchronous reap. This is only the fallback for OS
+/// thread creation failure. If there is no Tokio runtime, deliberately retain
+/// the work forever rather than dropping the sole child authority.
+fn retain_cleanup_with_tokio_or_leak<T, F>(work: Arc<StdMutex<T>>, cleanup: F)
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<StdMutex<T>>) + Send + 'static,
+{
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn_blocking(move || cleanup(work));
+    } else {
+        std::mem::forget(work);
+    }
+}
+
+fn drive_pending_pipe_cleanup<C: PendingPipeProcess>(
+    mut child: C,
+    request_permit: RetainedExecRequestPermit,
+    proof: Option<tokio::sync::oneshot::Sender<()>>,
+    retry: std::time::Duration,
+) {
+    let pid = child.process_id();
+    #[cfg(target_os = "linux")]
+    let force_deadline = std::time::Instant::now() + EXEC_CANCEL_GRACE;
+    #[cfg(not(target_os = "linux"))]
+    let force_deadline = std::time::Instant::now();
+    loop {
+        request_pending_child_force_cancel(pid);
+        if std::time::Instant::now() >= force_deadline
+            && let Err(error) = child.start_kill()
+        {
+            warn!(?pid, %error, "grpc: pending pipe child kill failed; retaining and retrying");
+        }
+        match child.try_wait_reaped() {
+            Ok(true) => {
+                request_permit.fence_after_reap();
+                if let Some(proof) = proof {
+                    let _ = proof.send(());
+                }
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(?pid, %error, "grpc: pending pipe child terminal poll failed; retaining and retrying");
+            }
+        }
+        std::thread::sleep(retry);
+    }
+}
+
+struct PendingPipeCleanupWork<C: PendingPipeProcess> {
+    child: Option<C>,
+    request_permit: Option<RetainedExecRequestPermit>,
+    proof: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+fn retain_pending_pipe_cleanup<C: PendingPipeProcess>(
+    child: C,
+    request_permit: RetainedExecRequestPermit,
+    proof: Option<tokio::sync::oneshot::Sender<()>>,
+    retry: std::time::Duration,
+) {
+    let work = Arc::new(StdMutex::new(PendingPipeCleanupWork {
+        child: Some(child),
+        request_permit: Some(request_permit),
+        proof,
+    }));
+    let worker_work = Arc::clone(&work);
+    let spawn = std::thread::Builder::new()
+        .name("vz-pending-pipe-reap".to_string())
+        .spawn(move || {
+            let (child, request_permit, proof) = {
+                let mut work = worker_work.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    work.child.take(),
+                    work.request_permit.take(),
+                    work.proof.take(),
+                )
+            };
+            if let (Some(child), Some(request_permit)) = (child, request_permit) {
+                drive_pending_pipe_cleanup(child, request_permit, proof, retry);
+            }
+        });
+    if let Err(error) = spawn {
+        warn!(%error, "grpc: failed to spawn pending pipe cleanup thread; retaining fallback authority");
+        retain_cleanup_with_tokio_or_leak(work, move |work| {
+            let (child, request_permit, proof) = {
+                let mut work = work.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    work.child.take(),
+                    work.request_permit.take(),
+                    work.proof.take(),
+                )
+            };
+            if let (Some(child), Some(request_permit)) = (child, request_permit) {
+                drive_pending_pipe_cleanup(child, request_permit, proof, retry);
+            }
+        });
+    }
+}
+
+fn request_pending_child_force_cancel(pid: Option<u32>) {
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = pid {
+        // The Child handle remains owned until wait completes, so this PID
+        // cannot be recycled between lookup and delivery.
+        // SAFETY: kill receives the exact positive PID returned by Child::id.
+        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGRTMIN()) };
+        return;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = pid;
+}
+
+fn definite_exec_rejection(
+    request_id: &str,
+    detail: String,
+) -> Response<ReceiverStream<Result<ExecEvent, Status>>> {
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let _ = sender.try_send(Ok(ExecEvent {
+        event: Some(exec_event::Event::Error(detail)),
+        sequence: 1,
+        request_id: request_id.to_string(),
+        // This reserved value is the protocol proof that no logical exec was
+        // published and lets the host distinguish a definite rejection from a
+        // transport failure whose remote process state is unknowable.
+        exec_id: 0,
+    }));
+    Response::new(ReceiverStream::new(receiver))
+}
+
+async fn reject_pending_pipe(
+    child: PendingPipeChild,
+    request_id: &str,
+    rejection: Status,
+) -> Result<Response<ReceiverStream<Result<ExecEvent, Status>>>, Status> {
+    reject_pending_pipe_with_timeout(
+        child,
+        request_id,
+        rejection,
+        EXEC_CANCEL_REAP_TIMEOUT,
+        EXEC_CANCEL_DRIVER_RETRY,
+    )
+    .await
+}
+
+async fn reject_pending_pipe_with_timeout<C: PendingPipeProcess>(
+    child: PendingPipeChild<C>,
+    request_id: &str,
+    rejection: Status,
+    timeout: std::time::Duration,
+    retry: std::time::Duration,
+) -> Result<Response<ReceiverStream<Result<ExecEvent, Status>>>, Status> {
+    match child.terminate_and_reap_with_timeout(timeout, retry).await {
+        PendingChildCleanupOutcome::Reaped => Ok(definite_exec_rejection(
+            request_id,
+            format!(
+                "exec rejected before readiness; spawned process reaped: {}",
+                rejection.message()
+            ),
+        )),
+        PendingChildCleanupOutcome::Retained => Err(Status::unavailable(format!(
+            "exec rejected before readiness; cleanup proof remains pending under retained authority: {}",
+            rejection.message()
+        ))),
+        PendingChildCleanupOutcome::Missing => Err(Status::internal(format!(
+            "exec rejected before readiness but its child owner was missing: {}",
+            rejection.message()
+        ))),
+    }
+}
+
 /// Holds the writer and master PTY for a PTY session, supporting
 /// stdin writes and terminal resizing.
 struct PtyMasterHandle {
@@ -232,28 +541,207 @@ struct PtyMasterHandle {
 /// Owns a just-spawned PTY trampoline until its ready handshake completes.
 /// Cancellation of the gRPC handler must not leave an untracked trampoline
 /// resolving a mutable container ID in the background.
-struct PendingPtyChild(Option<Box<dyn portable_pty::Child + Send>>);
+struct PendingPtyChild {
+    child: Option<Box<dyn portable_pty::Child + Send>>,
+    request_permit: RetainedExecRequestPermit,
+}
+
+fn drive_pending_pty_cleanup(
+    mut child: Box<dyn portable_pty::Child + Send>,
+    request_permit: RetainedExecRequestPermit,
+    proof: Option<tokio::sync::oneshot::Sender<()>>,
+    retry: std::time::Duration,
+) {
+    let pid = child.process_id();
+    #[cfg(target_os = "linux")]
+    let force_deadline = std::time::Instant::now() + EXEC_CANCEL_GRACE;
+    #[cfg(not(target_os = "linux"))]
+    let force_deadline = std::time::Instant::now();
+    loop {
+        request_pending_child_force_cancel(pid);
+        if std::time::Instant::now() >= force_deadline
+            && let Err(error) = child.kill()
+        {
+            warn!(?pid, %error, "grpc: pending PTY child kill failed; retaining and retrying");
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                request_permit.fence_after_reap();
+                if let Some(proof) = proof {
+                    let _ = proof.send(());
+                }
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(?pid, %error, "grpc: pending PTY child terminal poll failed; retaining and retrying");
+            }
+        }
+        std::thread::sleep(retry);
+    }
+}
+
+struct PendingPtyCleanupWork {
+    child: Option<Box<dyn portable_pty::Child + Send>>,
+    request_permit: Option<RetainedExecRequestPermit>,
+    proof: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+fn retain_pending_pty_cleanup(
+    child: Box<dyn portable_pty::Child + Send>,
+    request_permit: RetainedExecRequestPermit,
+    proof: Option<tokio::sync::oneshot::Sender<()>>,
+    retry: std::time::Duration,
+) {
+    let work = Arc::new(StdMutex::new(PendingPtyCleanupWork {
+        child: Some(child),
+        request_permit: Some(request_permit),
+        proof,
+    }));
+    let worker_work = Arc::clone(&work);
+    let spawn = std::thread::Builder::new()
+        .name("vz-pending-pty-reap".to_string())
+        .spawn(move || {
+            let (child, request_permit, proof) = {
+                let mut work = worker_work.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    work.child.take(),
+                    work.request_permit.take(),
+                    work.proof.take(),
+                )
+            };
+            if let (Some(child), Some(request_permit)) = (child, request_permit) {
+                drive_pending_pty_cleanup(child, request_permit, proof, retry);
+            }
+        });
+    if let Err(error) = spawn {
+        warn!(%error, "grpc: failed to spawn pending PTY cleanup thread; retaining fallback authority");
+        retain_cleanup_with_tokio_or_leak(work, move |work| {
+            let (child, request_permit, proof) = {
+                let mut work = work.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    work.child.take(),
+                    work.request_permit.take(),
+                    work.proof.take(),
+                )
+            };
+            if let (Some(child), Some(request_permit)) = (child, request_permit) {
+                drive_pending_pty_cleanup(child, request_permit, proof, retry);
+            }
+        });
+    }
+}
 
 impl PendingPtyChild {
+    fn new(
+        child: Box<dyn portable_pty::Child + Send>,
+        request_permit: Option<ExecRequestPermit>,
+    ) -> Self {
+        Self {
+            child: Some(child),
+            request_permit: RetainedExecRequestPermit(request_permit),
+        }
+    }
+
     fn child_mut(&mut self) -> Result<&mut Box<dyn portable_pty::Child + Send>, Status> {
-        self.0
+        self.child
             .as_mut()
             .ok_or_else(|| Status::internal("pending PTY child is missing"))
     }
 
-    fn take(mut self) -> Result<Box<dyn portable_pty::Child + Send>, Status> {
-        self.0
+    fn take(
+        mut self,
+    ) -> Result<
+        (
+            Box<dyn portable_pty::Child + Send>,
+            RetainedExecRequestPermit,
+        ),
+        Status,
+    > {
+        let child = self
+            .child
             .take()
-            .ok_or_else(|| Status::internal("pending PTY child is missing"))
+            .ok_or_else(|| Status::internal("pending PTY child is missing"))?;
+        Ok((child, std::mem::take(&mut self.request_permit)))
+    }
+
+    async fn terminate_and_reap_with_timeout(
+        mut self,
+        timeout: std::time::Duration,
+        retry: std::time::Duration,
+    ) -> PendingChildCleanupOutcome {
+        let Some(child) = self.child.take() else {
+            return PendingChildCleanupOutcome::Missing;
+        };
+        let (proof_tx, proof_rx) = tokio::sync::oneshot::channel();
+        // This durable worker becomes the sole child owner before the public
+        // rejection path awaits anything. Dropping or timing out that await
+        // cannot orphan the spawned trampoline.
+        retain_pending_pty_cleanup(
+            child,
+            std::mem::take(&mut self.request_permit),
+            Some(proof_tx),
+            retry,
+        );
+        match tokio::time::timeout(timeout, proof_rx).await {
+            Ok(Ok(())) => PendingChildCleanupOutcome::Reaped,
+            Ok(Err(_)) | Err(_) => PendingChildCleanupOutcome::Retained,
+        }
     }
 }
 
 impl Drop for PendingPtyChild {
     fn drop(&mut self) {
-        if let Some(child) = self.0.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        let Some(child) = self.child.take() else {
+            return;
+        };
+        retain_pending_pty_cleanup(
+            child,
+            std::mem::take(&mut self.request_permit),
+            None,
+            EXEC_CANCEL_DRIVER_RETRY,
+        );
+    }
+}
+
+async fn reject_pending_pty(
+    child: PendingPtyChild,
+    request_id: &str,
+    rejection: Status,
+) -> Result<Response<ReceiverStream<Result<ExecEvent, Status>>>, Status> {
+    reject_pending_pty_with_timeout(
+        child,
+        request_id,
+        rejection,
+        EXEC_CANCEL_REAP_TIMEOUT,
+        EXEC_CANCEL_DRIVER_RETRY,
+    )
+    .await
+}
+
+async fn reject_pending_pty_with_timeout(
+    child: PendingPtyChild,
+    request_id: &str,
+    rejection: Status,
+    timeout: std::time::Duration,
+    retry: std::time::Duration,
+) -> Result<Response<ReceiverStream<Result<ExecEvent, Status>>>, Status> {
+    match child.terminate_and_reap_with_timeout(timeout, retry).await {
+        PendingChildCleanupOutcome::Reaped => Ok(definite_exec_rejection(
+            request_id,
+            format!(
+                "PTY exec rejected before readiness; spawned process reaped: {}",
+                rejection.message()
+            ),
+        )),
+        PendingChildCleanupOutcome::Retained => Err(Status::unavailable(format!(
+            "PTY exec rejected before readiness; cleanup proof remains pending under retained authority: {}",
+            rejection.message()
+        ))),
+        PendingChildCleanupOutcome::Missing => Err(Status::internal(format!(
+            "PTY exec rejected before readiness but its child owner was missing: {}",
+            rejection.message()
+        ))),
     }
 }
 
@@ -339,7 +827,8 @@ pub struct SharedState {
 #[derive(Clone)]
 struct ExecOrderContext {
     sender: tokio::sync::mpsc::Sender<Result<ExecEvent, Status>>,
-    gate: Arc<Mutex<()>>,
+    event_gate: Arc<Mutex<()>>,
+    control_gate: Arc<Mutex<()>>,
     sequence: Arc<AtomicU64>,
     request_id: String,
 }
@@ -360,7 +849,8 @@ impl ExecOrderContext {
     ) -> Self {
         Self {
             sender,
-            gate: Arc::new(Mutex::new(())),
+            event_gate: Arc::new(Mutex::new(())),
+            control_gate: Arc::new(Mutex::new(())),
             sequence: Arc::new(AtomicU64::new(initial_sequence)),
             request_id,
         }
@@ -437,11 +927,100 @@ fn request_id_from_metadata(metadata: Option<&TransportMetadata>, prefix: &str) 
         .unwrap_or_else(|| generated_request_id(prefix))
 }
 
+fn validate_container_exec_request_id(request_id: &str) -> Result<(), Status> {
+    let Some(encoded_ticket) = request_id.strip_prefix("exec_req_") else {
+        return Err(Status::invalid_argument(
+            "invalid container exec request ID prefix",
+        ));
+    };
+    let Some((encoded_uuid, encoded_sequence)) = encoded_ticket.split_once('_') else {
+        return Err(Status::invalid_argument(
+            "container exec request ID must be one canonical 62-byte guest ticket",
+        ));
+    };
+    let parsed = uuid::Uuid::parse_str(encoded_uuid).map_err(|_| {
+        Status::invalid_argument(
+            "container exec request ID must be one canonical 62-byte guest ticket",
+        )
+    })?;
+    let sequence = u64::from_str_radix(encoded_sequence, 16).ok();
+    if request_id.len() != 62
+        || parsed.get_version_num() != 4
+        || parsed.get_variant() != uuid::Variant::RFC4122
+        || parsed.to_string() != encoded_uuid
+        || encoded_sequence.len() != 16
+        || !encoded_sequence
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || sequence == Some(0)
+        || sequence.is_none()
+    {
+        return Err(Status::invalid_argument(
+            "container exec request ID must be one canonical 62-byte guest ticket",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_allocate_exec_transport_metadata(
+    metadata: Option<&TransportMetadata>,
+) -> Result<(), Status> {
+    let metadata = metadata.ok_or_else(|| {
+        Status::invalid_argument("allocate_exec_request transport metadata is required")
+    })?;
+    let request_id = metadata.request_id.trim();
+    if request_id.is_empty() || request_id.len() > 128 {
+        return Err(Status::invalid_argument(
+            "allocate_exec_request metadata request_id must contain 1..=128 bytes",
+        ));
+    }
+    if metadata.idempotency_key.len() > 256 {
+        return Err(Status::invalid_argument(
+            "allocate_exec_request metadata idempotency_key exceeds 256 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reconcile_transport_metadata(
+    metadata: Option<&TransportMetadata>,
+) -> Result<(), Status> {
+    let metadata = metadata
+        .ok_or_else(|| Status::invalid_argument("reconcile_exec transport metadata is required"))?;
+    let request_id = metadata.request_id.trim();
+    if request_id.is_empty() || request_id.len() > 128 {
+        return Err(Status::invalid_argument(
+            "reconcile_exec metadata request_id must contain 1..=128 bytes",
+        ));
+    }
+    if metadata.idempotency_key.len() > 256 {
+        return Err(Status::invalid_argument(
+            "reconcile_exec metadata idempotency_key exceeds 256 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exec_signal(signal: i32) -> Result<(), Status> {
+    if signal <= 0 || signal > 64 {
+        return Err(Status::invalid_argument(format!(
+            "unsupported signal {signal}"
+        )));
+    }
+    #[cfg(target_os = "linux")]
+    if !crate::container_exec::supports_forwarded_signal(signal) {
+        return Err(Status::invalid_argument(
+            "signal cannot be forwarded safely by the exec supervisor",
+        ));
+    }
+    Ok(())
+}
+
 async fn send_ordered_exec_event(exec_id: u64, event: exec_event::Event) -> Result<u64, ()> {
     let Some(context) = lookup_exec_order_context(exec_id) else {
         return Err(());
     };
-    let _guard = context.gate.lock().await;
+    let _guard = context.event_gate.lock().await;
     let sequence = context.sequence.fetch_add(1, Ordering::Relaxed) + 1;
     context
         .sender
@@ -449,22 +1028,389 @@ async fn send_ordered_exec_event(exec_id: u64, event: exec_event::Event) -> Resu
             event: Some(event),
             sequence,
             request_id: context.request_id.clone(),
-            exec_id: 0,
+            exec_id,
         }))
         .await
         .map_err(|_| ())?;
     Ok(sequence)
 }
 
-async fn mark_ordered_control(exec_id: u64, operation: &str) -> Option<u64> {
+type OutputReaderResult = Result<(), String>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputDrain {
+    Drained,
+    ReceiverClosed,
+}
+
+async fn await_pipe_output_drain(
+    exec_id: u64,
+    sender: tokio::sync::mpsc::Sender<Result<ExecEvent, Status>>,
+    stdout: &mut tokio::task::JoinHandle<OutputReaderResult>,
+    stderr: &mut tokio::task::JoinHandle<OutputReaderResult>,
+) -> OutputDrain {
+    tokio::select! {
+        joined = async { tokio::join!(&mut *stdout, &mut *stderr) } => {
+            match joined {
+                (Ok(Ok(())), Ok(Ok(()))) => OutputDrain::Drained,
+                (stdout_result, stderr_result) => {
+                    warn!(
+                        exec_id,
+                        ?stdout_result,
+                        ?stderr_result,
+                        "grpc: output reader failed; retaining finish authority until receiver closes"
+                    );
+                    sender.closed().await;
+                    OutputDrain::ReceiverClosed
+                }
+            }
+        }
+        () = sender.closed() => {
+            stdout.abort();
+            stderr.abort();
+            let _ = stdout.await;
+            let _ = stderr.await;
+            OutputDrain::ReceiverClosed
+        }
+    }
+}
+
+async fn await_pty_output_drain(
+    exec_id: u64,
+    sender: tokio::sync::mpsc::Sender<Result<ExecEvent, Status>>,
+    cancel_reader: Arc<std::sync::atomic::AtomicBool>,
+    reader: &mut tokio::task::JoinHandle<OutputReaderResult>,
+) -> OutputDrain {
+    tokio::select! {
+        result = &mut *reader => {
+            match result {
+                Ok(Ok(())) => OutputDrain::Drained,
+                result => {
+                    warn!(
+                        exec_id,
+                        ?result,
+                        "grpc: PTY output reader failed; retaining finish authority until receiver closes"
+                    );
+                    sender.closed().await;
+                    OutputDrain::ReceiverClosed
+                }
+            }
+        }
+        () = sender.closed() => {
+            cancel_reader.store(true, Ordering::Release);
+            let _ = reader.await;
+            OutputDrain::ReceiverClosed
+        }
+    }
+}
+
+async fn finish_exec_stream(
+    process_table: &Arc<Mutex<ProcessTable>>,
+    exec_id: u64,
+    exit_code: i32,
+    output_drain: OutputDrain,
+) {
+    // The watcher calling this function is the sole finish authority and only
+    // arrives here after child reap plus either complete output EOF or explicit
+    // receiver closure and reader shutdown.
+    process_table.lock().await.finish(exec_id, exit_code);
+
+    if output_drain == OutputDrain::Drained {
+        if let Ok(sequence) =
+            send_ordered_exec_event(exec_id, exec_event::Event::ExitCode(exit_code)).await
+        {
+            debug!(exec_id, sequence, "grpc: exit event");
+        }
+    }
+    remove_exec_order_context(exec_id);
+}
+
+struct OrderedControl {
+    sequence: u64,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+async fn begin_ordered_control(exec_id: u64, operation: &str) -> Option<OrderedControl> {
     let context = lookup_exec_order_context(exec_id)?;
-    let _guard = context.gate.lock().await;
+    // Control operations serialize with each other, but never wait behind an
+    // output send blocked by bounded mpsc backpressure. Their sequence still
+    // shares the stream-wide atomic counter.
+    let guard = context.control_gate.clone().lock_owned().await;
     let sequence = context.sequence.fetch_add(1, Ordering::Relaxed) + 1;
     debug!(
         exec_id,
         sequence, operation, "grpc: exec control op ordered"
     );
+    Some(OrderedControl {
+        sequence,
+        _guard: guard,
+    })
+}
+
+fn mark_nonblocking_control(exec_id: u64, operation: &str) -> Option<u64> {
+    let context = lookup_exec_order_context(exec_id)?;
+    let sequence = context.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+    debug!(
+        exec_id,
+        sequence, operation, "grpc: nonblocking exec control op ordered"
+    );
     Some(sequence)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CancelOutcome {
+    exit_code: i32,
+    forced: bool,
+}
+
+impl From<ExecTerminalReceipt> for CancelOutcome {
+    fn from(receipt: ExecTerminalReceipt) -> Self {
+        Self {
+            exit_code: receipt.exit_code,
+            forced: receipt.forced,
+        }
+    }
+}
+
+#[cfg(test)]
+fn terminal_cancel_outcome(table: &ProcessTable, exec_id: u64) -> Result<CancelOutcome, Status> {
+    table
+        .terminal_receipt(exec_id)
+        .map(CancelOutcome::from)
+        .ok_or_else(|| Status::not_found(format!("process {exec_id} not found")))
+}
+
+async fn write_pipe_stdin(
+    process_table: &Arc<Mutex<ProcessTable>>,
+    exec_id: u64,
+    data: &[u8],
+) -> Result<(), Status> {
+    use tokio::io::AsyncWriteExt as _;
+
+    if data.len() > MAX_STDIN_WRITE_BYTES {
+        return Err(Status::resource_exhausted(format!(
+            "stdin write exceeds {MAX_STDIN_WRITE_BYTES} bytes"
+        )));
+    }
+    let mut stdin = {
+        let mut table = process_table.lock().await;
+        table
+            .get_mut(exec_id)
+            .ok_or_else(|| Status::not_found(format!("process {exec_id} not found")))?
+            .stdin
+            .take()
+            .ok_or_else(|| Status::failed_precondition("stdin already closed or busy"))?
+    };
+
+    let write_result = tokio::time::timeout(STDIN_WRITE_TIMEOUT, stdin.write_all(data)).await;
+    {
+        let mut table = process_table.lock().await;
+        if let Some(entry) = table.get_mut(exec_id)
+            && entry.stdin.is_none()
+        {
+            entry.stdin = Some(stdin);
+        }
+    }
+    match write_result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(Status::internal(format!("stdin write failed: {error}"))),
+        Err(_) => Err(Status::deadline_exceeded(format!(
+            "stdin write exceeded {} ms",
+            STDIN_WRITE_TIMEOUT.as_millis()
+        ))),
+    }
+}
+
+async fn cancel_active_exec(
+    process_table: &Arc<Mutex<ProcessTable>>,
+    exec_id: u64,
+) -> Result<CancelOutcome, Status> {
+    cancel_active_exec_with_grace(process_table, exec_id, EXEC_CANCEL_GRACE).await
+}
+
+async fn cancel_active_exec_with_grace(
+    process_table: &Arc<Mutex<ProcessTable>>,
+    exec_id: u64,
+    grace: std::time::Duration,
+) -> Result<CancelOutcome, Status> {
+    let cancellation = {
+        let mut table = process_table.lock().await;
+        table
+            .begin_cancel(exec_id, tokio::time::Instant::now() + grace)
+            .ok_or_else(|| Status::not_found(format!("process {exec_id} not found")))?
+    };
+    let (completion, force_deadline, start_driver, driver_identity, initial_term_failed) =
+        match cancellation {
+            ExecCancellation::Completed(receipt) => return Ok(receipt.into()),
+            ExecCancellation::Active {
+                completion,
+                force_deadline,
+                start_driver,
+                driver_identity,
+                initial_term_failed,
+            } => (
+                completion,
+                force_deadline,
+                start_driver,
+                driver_identity,
+                initial_term_failed,
+            ),
+        };
+
+    if start_driver {
+        spawn_exec_cancel_driver(
+            Arc::clone(process_table),
+            exec_id,
+            completion.clone(),
+            force_deadline,
+            driver_identity,
+            initial_term_failed,
+        );
+    }
+
+    let receipt = tokio::time::timeout(EXEC_CANCEL_REAP_TIMEOUT, completion.wait())
+        .await
+        .map_err(|_| Status::deadline_exceeded(format!("timed out reaping exec {exec_id}")))?
+        .ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "exec {exec_id} retired without a terminal reap receipt"
+            ))
+        })?;
+    Ok(receipt.into())
+}
+
+fn spawn_exec_cancel_driver(
+    process_table: Arc<Mutex<ProcessTable>>,
+    exec_id: u64,
+    completion: crate::process_table::ExecCompletion,
+    force_deadline: tokio::time::Instant,
+    identity: Arc<ProcessIdentity>,
+    initial_term_failed: bool,
+) {
+    tokio::spawn(async move {
+        if initial_term_failed {
+            loop {
+                match tokio::time::timeout_at(
+                    std::cmp::min(
+                        force_deadline,
+                        tokio::time::Instant::now() + EXEC_CANCEL_DRIVER_RETRY,
+                    ),
+                    completion.clone().wait(),
+                )
+                .await
+                {
+                    Ok(Some(_)) => return,
+                    Ok(None) => {
+                        let _ = identity.force_cancel();
+                        return;
+                    }
+                    Err(_) if tokio::time::Instant::now() >= force_deadline => break,
+                    Err(_) => match identity.signal(libc::SIGTERM) {
+                        Ok(()) => break,
+                        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => break,
+                        Err(error) => {
+                            warn!(exec_id, %error, "grpc: durable cancellation TERM retry failed");
+                        }
+                    },
+                }
+            }
+        }
+        match tokio::time::timeout_at(force_deadline, completion.clone().wait()).await {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                let _ = identity.force_cancel();
+                warn!(
+                    exec_id,
+                    "grpc: cancellation lost cleanup authority before reap"
+                );
+                return;
+            }
+            Err(_) => {}
+        }
+
+        loop {
+            let signal_result = {
+                let mut table = process_table.lock().await;
+                if table.terminal_receipt(exec_id).is_some() {
+                    return;
+                }
+                table.force_cancel(exec_id)
+            };
+            match signal_result {
+                Some(Ok(())) => {}
+                Some(Err(error)) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                Some(Err(error)) => {
+                    warn!(exec_id, %error, "grpc: durable cancellation force signal failed; retrying");
+                }
+                None => {
+                    let result = identity.force_cancel();
+                    warn!(
+                        exec_id,
+                        ?result,
+                        "grpc: table control disappeared; retained driver identity forced cleanup"
+                    );
+                }
+            }
+
+            match tokio::time::timeout(EXEC_CANCEL_DRIVER_RETRY, completion.clone().wait()).await {
+                Ok(Some(_)) => return,
+                Ok(None) => {
+                    let _ = identity.force_cancel();
+                    warn!(
+                        exec_id,
+                        "grpc: cancellation completion disappeared before reap"
+                    );
+                    return;
+                }
+                Err(_) => {}
+            }
+        }
+    });
+}
+
+fn spawn_exec_cleanup(process_table: Arc<Mutex<ProcessTable>>, exec_id: u64) {
+    tokio::spawn(async move {
+        cancel_until_terminal_receipt(&process_table, exec_id).await;
+    });
+}
+
+async fn cancel_until_terminal_receipt(process_table: &Arc<Mutex<ProcessTable>>, exec_id: u64) {
+    loop {
+        match cancel_active_exec(process_table, exec_id).await {
+            Ok(_) => return,
+            Err(error) if error.code() == tonic::Code::NotFound => return,
+            Err(error) => {
+                warn!(exec_id, %error, "grpc: cleanup subscriber retrying until reap receipt");
+                tokio::time::sleep(EXEC_CANCEL_DRIVER_RETRY).await;
+            }
+        }
+    }
+}
+
+fn classify_child_wait(
+    result: std::io::Result<Option<std::process::ExitStatus>>,
+) -> std::io::Result<Option<i32>> {
+    result.map(|status| status.map(crate::process_table::normalized_exit_status))
+}
+
+fn monitor_exec_stream_loss(process_table: Arc<Mutex<ProcessTable>>, exec_id: u64) {
+    tokio::spawn(async move {
+        loop {
+            let Some(context) = lookup_exec_order_context(exec_id) else {
+                return;
+            };
+            if context.sender.is_closed() {
+                warn!(
+                    exec_id,
+                    "grpc: exec stream lost; cancelling supervised process"
+                );
+                cancel_until_terminal_receipt(&process_table, exec_id).await;
+                return;
+            }
+            drop(context);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    });
 }
 
 // ── AgentService ────────────────────────────────────────────────────
@@ -584,6 +1530,20 @@ fn prepare_agent_exec(
 }
 
 #[cfg(any(target_os = "linux", test))]
+fn validate_claimed_container_exec(
+    req: &ExecRequest,
+    request_id: &str,
+    transport: &str,
+) -> Result<(), Response<ReceiverStream<Result<ExecEvent, Status>>>> {
+    prepare_agent_exec(req, None).map(|_| ()).map_err(|error| {
+        definite_exec_rejection(
+            request_id,
+            format!("container {transport} exec validation rejected before spawn: {error}"),
+        )
+    })
+}
+
+#[cfg(test)]
 fn prepare_oci_exec(req: &OciExecRequest) -> Result<ContainerExecProcessSpec, Status> {
     normalized_container_exec(
         &req.container_id,
@@ -608,33 +1568,84 @@ impl AgentServiceImpl {
         &self,
         req: ExecRequest,
         request_id: String,
+        mut request_permit: Option<ExecRequestPermit>,
     ) -> Result<Response<ReceiverStream<Result<ExecEvent, Status>>>, Status> {
         use tokio::io::AsyncReadExt;
 
+        // Request-ID claim/authentication already happened in Exec. Therefore
+        // even malformed container launch input is a definite no-child result.
+        #[cfg(target_os = "linux")]
+        if req.container_target.is_some() {
+            if let Err(rejection) = validate_claimed_container_exec(&req, &request_id, "pipe") {
+                return Ok(rejection);
+            }
+        }
         #[cfg(target_os = "linux")]
         let server_admission = if let Some(target) = req.container_target.as_ref() {
-            Some(acquire_shared_container_admission(&target.container_id).await?)
+            match acquire_shared_container_admission(&target.container_id).await {
+                Ok(admission) => Some(admission),
+                Err(error) => {
+                    return Ok(definite_exec_rejection(
+                        &request_id,
+                        format!("container pipe exec admission rejected before spawn: {error}"),
+                    ));
+                }
+            }
         } else {
             None
         };
         #[cfg(target_os = "linux")]
         let ready_listener = if req.container_target.is_some() {
-            Some(ContainerReadyListener::bind()?)
+            match ContainerReadyListener::bind() {
+                Ok(listener) => Some(listener),
+                Err(error) => {
+                    return Ok(definite_exec_rejection(
+                        &request_id,
+                        format!("container pipe exec readiness rejected before spawn: {error}"),
+                    ));
+                }
+            }
         } else {
             None
         };
         #[cfg(target_os = "linux")]
-        let ready_endpoint = ready_listener
+        let ready_endpoint = match ready_listener
             .as_ref()
             .map(ContainerReadyListener::endpoint)
-            .transpose()?;
-        let launch = prepare_agent_exec(
+            .transpose()
+        {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                return Ok(definite_exec_rejection(
+                    &request_id,
+                    format!("container pipe exec endpoint rejected before spawn: {error}"),
+                ));
+            }
+        };
+        let launch = match prepare_agent_exec(
             &req,
             #[cfg(target_os = "linux")]
             ready_endpoint,
             #[cfg(not(target_os = "linux"))]
             None,
-        )?;
+        ) {
+            Ok(launch) => launch,
+            Err(error) if req.container_target.is_some() => {
+                return Ok(definite_exec_rejection(
+                    &request_id,
+                    format!("container pipe exec rejected before spawn: {error}"),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(permit) = request_permit.as_mut() {
+            if permit.authorize_start().is_err() {
+                return Ok(definite_exec_rejection(
+                    &request_id,
+                    "container pipe exec was fenced before spawn authorization".to_string(),
+                ));
+            }
+        }
         let spawn_result = if let Some(ref username) = launch.spawn_user {
             crate::spawn_as_user(
                 username,
@@ -654,62 +1665,69 @@ impl AgentServiceImpl {
             )
         };
 
-        let mut child = match spawn_result {
+        let child = match spawn_result {
             Ok(child) => child,
             Err(e) => {
                 warn!(request_id = %request_id, command = %launch.command, error = %e, "grpc: exec spawn failed");
-                let (tx, rx) = tokio::sync::mpsc::channel(1);
-                let _ = tx
-                    .send(Ok(ExecEvent {
-                        event: Some(exec_event::Event::Error(e.to_string())),
-                        sequence: 1,
-                        request_id: request_id.clone(),
-                        exec_id: 0,
-                    }))
-                    .await;
-                return Ok(Response::new(ReceiverStream::new(rx)));
+                return Ok(definite_exec_rejection(
+                    &request_id,
+                    format!("exec rejected before spawn: {e}"),
+                ));
             }
         };
+        let mut pending_child = PendingPipeChild::with_request_permit(child, request_permit.take());
 
         info!(request_id = %request_id, command = %launch.command, arg_count = launch.args.len(), container_targeted = launch.container_targeted, "grpc: process spawned");
 
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let stdin = child.stdin.take();
-        let spawned_pid = child.id().unwrap_or(0);
+        let spawned_pid = match pending_child.child_mut() {
+            Ok(child) => child.id().unwrap_or(0),
+            Err(rejection) => {
+                return reject_pending_pipe(pending_child, &request_id, rejection).await;
+            }
+        };
         if spawned_pid == 0 {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            return Err(Status::internal("spawned exec has no process ID"));
+            let rejection = Status::internal("spawned exec has no process ID");
+            return reject_pending_pipe(pending_child, &request_id, rejection).await;
         }
-        let exec_id = allocate_logical_exec_id()?;
+        let exec_id = match allocate_logical_exec_id() {
+            Ok(exec_id) => exec_id,
+            Err(rejection) => {
+                return reject_pending_pipe(pending_child, &request_id, rejection).await;
+            }
+        };
 
         #[cfg(target_os = "linux")]
         let (ready_generation, process_identity) = if let Some(listener) = ready_listener {
             let Some(target) = req.container_target.as_ref() else {
-                return Err(Status::internal("ready listener lost container target"));
+                let rejection = Status::internal("ready listener lost container target");
+                return reject_pending_pipe(pending_child, &request_id, rejection).await;
             };
-            let spawned_process =
-                SpawnedProcessIdentity::capture(spawned_pid).map_err(|error| {
-                    Status::failed_precondition(format!(
+            let spawned_process = match SpawnedProcessIdentity::capture(spawned_pid) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    let rejection = Status::failed_precondition(format!(
                         "cannot capture spawned container exec identity: {error}"
-                    ))
-                })?;
+                    ));
+                    return reject_pending_pipe(pending_child, &request_id, rejection).await;
+                }
+            };
             let container_id = target.container_id.clone();
             let wait = tokio::spawn(async move {
                 let result = listener.wait(&spawned_process, &container_id).await;
                 drop(server_admission);
                 (result, spawned_process)
             });
-            let (result, spawned_process) = wait
-                .await
-                .map_err(|error| Status::internal(format!("exec-ready task failed: {error}")))?;
+            let (result, spawned_process) = match wait.await {
+                Ok(result) => result,
+                Err(error) => {
+                    let rejection = Status::internal(format!("exec-ready task failed: {error}"));
+                    return reject_pending_pipe(pending_child, &request_id, rejection).await;
+                }
+            };
             match result {
                 Ok(generation) => (Some(generation), spawned_process.into_process_identity()),
                 Err(error) => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    return Err(error);
+                    return reject_pending_pipe(pending_child, &request_id, error).await;
                 }
             }
         } else {
@@ -718,42 +1736,67 @@ impl AgentServiceImpl {
         #[cfg(not(target_os = "linux"))]
         let process_identity = ProcessIdentity::from_pid(spawned_pid);
 
+        let (stdout, stderr, stdin) = match pending_child.child_mut() {
+            Ok(child) => (child.stdout.take(), child.stderr.take(), child.stdin.take()),
+            Err(rejection) => {
+                return reject_pending_pipe(pending_child, &request_id, rejection).await;
+            }
+        };
+
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ExecEvent, Status>>(64);
         #[cfg(target_os = "linux")]
-        let initial_sequence = if let Some(generation) = ready_generation {
-            tx.send(Ok(ExecEvent {
-                event: Some(exec_event::Event::ContainerReady(ContainerExecReady {
-                    generation: Some(generation),
-                })),
-                sequence: 1,
-                request_id: request_id.clone(),
-                exec_id,
-            }))
-            .await
-            .map_err(|_| Status::cancelled("container exec stream closed before readiness"))?;
-            1
-        } else {
-            0
-        };
+        let initial_sequence = u64::from(ready_generation.is_some());
         #[cfg(not(target_os = "linux"))]
         let initial_sequence = 0;
 
         let process_table = self.state.process_table.clone();
         {
             let mut table = self.state.process_table.lock().await;
-            table.insert(exec_id, child, stdin, process_identity);
+            let (child, mut retained_permit) = match pending_child.take() {
+                Ok(owned) => owned,
+                Err(rejection) => {
+                    return Err(Status::internal(format!(
+                        "exec rejected before registration with missing cleanup authority: {rejection}"
+                    )));
+                }
+            };
+            let _ = table.insert(
+                exec_id,
+                child,
+                stdin,
+                process_identity,
+                launch.container_targeted,
+            );
+            if let Some(permit) = retained_permit.take_for_publish() {
+                permit.publish(exec_id);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(generation) = ready_generation {
+            let _ = tx
+                .send(Ok(ExecEvent {
+                    event: Some(exec_event::Event::ContainerReady(ContainerExecReady {
+                        generation: Some(generation),
+                    })),
+                    sequence: 1,
+                    request_id: request_id.clone(),
+                    exec_id,
+                }))
+                .await;
         }
         register_exec_order_context(
             exec_id,
             ExecOrderContext::with_initial_sequence(tx.clone(), request_id, initial_sequence),
         );
+        monitor_exec_stream_loss(self.state.process_table.clone(), exec_id);
+        let finish_sender = tx.clone();
 
-        let stdout_handle = tokio::spawn(async move {
+        let mut stdout_handle = tokio::spawn(async move {
             if let Some(mut stdout) = stdout {
                 let mut buf = vec![0u8; 65536];
                 loop {
                     match stdout.read(&mut buf).await {
-                        Ok(0) => break,
+                        Ok(0) => return Ok(()),
                         Ok(n) => {
                             match send_ordered_exec_event(
                                 exec_id,
@@ -764,24 +1807,27 @@ impl AgentServiceImpl {
                                 Ok(sequence) => {
                                     debug!(exec_id, sequence, bytes = n, "grpc: stdout chunk");
                                 }
-                                Err(_) => break,
+                                Err(_) => {
+                                    return Err("exec stream closed while sending stdout".into());
+                                }
                             }
                         }
                         Err(e) => {
                             warn!(exec_id, error = %e, "grpc: stdout read error");
-                            break;
+                            return Err(format!("stdout read failed: {e}"));
                         }
                     }
                 }
             }
+            Ok(())
         });
 
-        let stderr_handle = tokio::spawn(async move {
+        let mut stderr_handle = tokio::spawn(async move {
             if let Some(mut stderr) = stderr {
                 let mut buf = vec![0u8; 65536];
                 loop {
                     match stderr.read(&mut buf).await {
-                        Ok(0) => break,
+                        Ok(0) => return Ok(()),
                         Ok(n) => {
                             match send_ordered_exec_event(
                                 exec_id,
@@ -792,62 +1838,65 @@ impl AgentServiceImpl {
                                 Ok(sequence) => {
                                     debug!(exec_id, sequence, bytes = n, "grpc: stderr chunk");
                                 }
-                                Err(_) => break,
+                                Err(_) => {
+                                    return Err("exec stream closed while sending stderr".into());
+                                }
                             }
                         }
                         Err(e) => {
                             warn!(exec_id, error = %e, "grpc: stderr read error");
-                            break;
+                            return Err(format!("stderr read failed: {e}"));
                         }
                     }
                 }
             }
+            Ok(())
         });
 
         let exit_table = process_table;
         tokio::spawn(async move {
             // Never hold the global process table lock while waiting for process exit.
             // Otherwise a slow/hung non-PTY command can block unrelated PTY exec setup.
+            let mut cleanup_started = false;
             let exit_code = loop {
                 let poll = {
                     let mut table = exit_table.lock().await;
-                    let Some(entry) = table.get_mut(exec_id) else {
-                        break -1;
-                    };
-                    match entry.child.try_wait() {
-                        Ok(Some(status)) => Some(status.code().unwrap_or(-1)),
-                        Ok(None) => None,
-                        Err(error) => {
-                            warn!(exec_id, error = %error, "grpc: wait error");
-                            Some(-1)
-                        }
+                    if let Some(entry) = table.get_mut(exec_id) {
+                        classify_child_wait(entry.child.try_wait())
+                    } else if table.terminal_receipt(exec_id).is_some() {
+                        remove_exec_order_context(exec_id);
+                        return;
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "exec wait handle is missing",
+                        ))
                     }
                 };
-                if let Some(code) = poll {
-                    break code;
+                match poll {
+                    Ok(Some(code)) => break code,
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(exec_id, %error, "grpc: wait failed; retaining cleanup authority");
+                        if !cleanup_started {
+                            cleanup_started = true;
+                            spawn_exec_cleanup(exit_table.clone(), exec_id);
+                        }
+                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             };
 
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
-                let _ = stdout_handle.await;
-                let _ = stderr_handle.await;
-            })
+            let output_drain = await_pipe_output_drain(
+                exec_id,
+                finish_sender,
+                &mut stdout_handle,
+                &mut stderr_handle,
+            )
             .await;
 
             info!(exec_id, exit_code, "grpc: process exited");
-
-            if let Ok(sequence) =
-                send_ordered_exec_event(exec_id, exec_event::Event::ExitCode(exit_code)).await
-            {
-                debug!(exec_id, sequence, "grpc: exit event");
-            }
-
-            {
-                let mut table = exit_table.lock().await;
-                table.remove(exec_id);
-            }
-            remove_exec_order_context(exec_id);
+            finish_exec_stream(&exit_table, exec_id, exit_code, output_drain).await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -860,6 +1909,7 @@ impl AgentServiceImpl {
         &self,
         req: ExecRequest,
         request_id: String,
+        mut request_permit: Option<ExecRequestPermit>,
     ) -> Result<Response<ReceiverStream<Result<ExecEvent, Status>>>, Status> {
         use portable_pty::{CommandBuilder, PtySize, native_pty_system};
         use std::io::Read;
@@ -872,29 +1922,69 @@ impl AgentServiceImpl {
         );
 
         #[cfg(target_os = "linux")]
+        if req.container_target.is_some() {
+            if let Err(rejection) = validate_claimed_container_exec(&req, &request_id, "PTY") {
+                return Ok(rejection);
+            }
+        }
+        #[cfg(target_os = "linux")]
         let server_admission = if let Some(target) = req.container_target.as_ref() {
-            Some(acquire_shared_container_admission(&target.container_id).await?)
+            match acquire_shared_container_admission(&target.container_id).await {
+                Ok(admission) => Some(admission),
+                Err(error) => {
+                    return Ok(definite_exec_rejection(
+                        &request_id,
+                        format!("container PTY exec admission rejected before spawn: {error}"),
+                    ));
+                }
+            }
         } else {
             None
         };
         #[cfg(target_os = "linux")]
         let ready_listener = if req.container_target.is_some() {
-            Some(ContainerReadyListener::bind()?)
+            match ContainerReadyListener::bind() {
+                Ok(listener) => Some(listener),
+                Err(error) => {
+                    return Ok(definite_exec_rejection(
+                        &request_id,
+                        format!("container PTY exec readiness rejected before spawn: {error}"),
+                    ));
+                }
+            }
         } else {
             None
         };
         #[cfg(target_os = "linux")]
-        let ready_endpoint = ready_listener
+        let ready_endpoint = match ready_listener
             .as_ref()
             .map(ContainerReadyListener::endpoint)
-            .transpose()?;
-        let launch = prepare_agent_exec(
+            .transpose()
+        {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                return Ok(definite_exec_rejection(
+                    &request_id,
+                    format!("container PTY exec endpoint rejected before spawn: {error}"),
+                ));
+            }
+        };
+        let launch = match prepare_agent_exec(
             &req,
             #[cfg(target_os = "linux")]
             ready_endpoint,
             #[cfg(not(target_os = "linux"))]
             None,
-        )?;
+        ) {
+            Ok(launch) => launch,
+            Err(error) if req.container_target.is_some() => {
+                return Ok(definite_exec_rejection(
+                    &request_id,
+                    format!("container PTY exec rejected before spawn: {error}"),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         let rows = if req.term_rows == 0 {
             24
         } else {
@@ -907,7 +1997,15 @@ impl AgentServiceImpl {
         };
 
         #[cfg(target_os = "linux")]
-        ensure_devpts_ready()?;
+        if let Err(error) = ensure_devpts_ready() {
+            if req.container_target.is_some() {
+                return Ok(definite_exec_rejection(
+                    &request_id,
+                    format!("container PTY exec devpts rejected before spawn: {error}"),
+                ));
+            }
+            return Err(error);
+        }
 
         let pty_system = native_pty_system();
         info!(
@@ -916,14 +2014,21 @@ impl AgentServiceImpl {
             cols,
             "grpc: opening PTY pair"
         );
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: rows as u16,
-                cols: cols as u16,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| Status::internal(format!("openpty failed: {e}")))?;
+        let pair = match pty_system.openpty(PtySize {
+            rows: rows as u16,
+            cols: cols as u16,
+            pixel_width: 0,
+            pixel_height: 0,
+        }) {
+            Ok(pair) => pair,
+            Err(error) if req.container_target.is_some() => {
+                return Ok(definite_exec_rejection(
+                    &request_id,
+                    format!("container PTY exec openpty rejected before spawn: {error}"),
+                ));
+            }
+            Err(error) => return Err(Status::internal(format!("openpty failed: {error}"))),
+        };
         info!(request_id = %request_id, "grpc: PTY pair opened");
 
         let mut cmd = CommandBuilder::new(&launch.command);
@@ -954,21 +2059,50 @@ impl AgentServiceImpl {
             command = %launch.command,
             "grpc: spawning PTY process"
         );
-        let child = pair.slave.spawn_command(cmd).map_err(|e| {
-            warn!(command = %launch.command, error = %e, "grpc: pty exec spawn failed");
-            Status::internal(format!("failed to spawn PTY process: {e}"))
-        })?;
-        let mut pending_child = PendingPtyChild(Some(child));
+        if let Some(permit) = request_permit.as_mut() {
+            if permit.authorize_start().is_err() {
+                return Ok(definite_exec_rejection(
+                    &request_id,
+                    "container PTY exec was fenced before spawn authorization".to_string(),
+                ));
+            }
+        }
+        let child = match pair.slave.spawn_command(cmd) {
+            Ok(child) => child,
+            Err(error) => {
+                warn!(command = %launch.command, %error, "grpc: pty exec spawn failed");
+                return Ok(definite_exec_rejection(
+                    &request_id,
+                    format!("PTY exec rejected before spawn: {error}"),
+                ));
+            }
+        };
+        let mut pending_child = PendingPtyChild::new(child, request_permit.take());
         info!(request_id = %request_id, "grpc: PTY process spawned");
 
         // Drop slave — only the child uses it.
         drop(pair.slave);
 
-        let spawned_pid = pending_child.child_mut()?.process_id().unwrap_or(0);
+        let spawned_pid = match pending_child.child_mut() {
+            Ok(child) => child.process_id().unwrap_or(0),
+            Err(rejection) => {
+                return reject_pending_pty(pending_child, &request_id, rejection).await;
+            }
+        };
         if spawned_pid == 0 {
-            return Err(Status::internal("spawned PTY exec has no process ID"));
+            return reject_pending_pty(
+                pending_child,
+                &request_id,
+                Status::internal("spawned PTY exec has no process ID"),
+            )
+            .await;
         }
-        let exec_id = allocate_logical_exec_id()?;
+        let exec_id = match allocate_logical_exec_id() {
+            Ok(exec_id) => exec_id,
+            Err(rejection) => {
+                return reject_pending_pty(pending_child, &request_id, rejection).await;
+            }
+        };
         info!(
             request_id = %request_id, exec_id, spawned_pid, command = %launch.command,
             arg_count = launch.args.len(), rows, cols, container_targeted = launch.container_targeted,
@@ -978,27 +2112,39 @@ impl AgentServiceImpl {
         #[cfg(target_os = "linux")]
         let (ready_generation, process_identity) = if let Some(listener) = ready_listener {
             let Some(target) = req.container_target.as_ref() else {
-                return Err(Status::internal("ready listener lost container target"));
+                return reject_pending_pty(
+                    pending_child,
+                    &request_id,
+                    Status::internal("ready listener lost container target"),
+                )
+                .await;
             };
-            let spawned_process =
-                SpawnedProcessIdentity::capture(spawned_pid).map_err(|error| {
-                    Status::failed_precondition(format!(
+            let spawned_process = match SpawnedProcessIdentity::capture(spawned_pid) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    let rejection = Status::failed_precondition(format!(
                         "cannot capture spawned PTY container exec identity: {error}"
-                    ))
-                })?;
+                    ));
+                    return reject_pending_pty(pending_child, &request_id, rejection).await;
+                }
+            };
             let container_id = target.container_id.clone();
             let wait = tokio::spawn(async move {
                 let result = listener.wait(&spawned_process, &container_id).await;
                 drop(server_admission);
                 (result, spawned_process)
             });
-            let (result, spawned_process) = wait
-                .await
-                .map_err(|error| Status::internal(format!("exec-ready task failed: {error}")))?;
+            let (result, spawned_process) = match wait.await {
+                Ok(result) => result,
+                Err(error) => {
+                    let rejection = Status::internal(format!("exec-ready task failed: {error}"));
+                    return reject_pending_pty(pending_child, &request_id, rejection).await;
+                }
+            };
             match result {
                 Ok(generation) => (Some(generation), spawned_process.into_process_identity()),
                 Err(error) => {
-                    return Err(error);
+                    return reject_pending_pty(pending_child, &request_id, error).await;
                 }
             }
         } else {
@@ -1022,25 +2168,38 @@ impl AgentServiceImpl {
         );
         #[cfg(not(target_os = "linux"))]
         let first_event = exec_event::Event::Stdout(Vec::new());
-        info!(exec_id, "grpc: queueing initial PTY exec event");
-        tx.send(Ok(ExecEvent {
-            event: Some(first_event),
-            sequence: 1,
-            request_id: request_id.clone(),
-            exec_id,
-        }))
-        .await
-        .map_err(|_| Status::cancelled("exec stream closed before PTY readiness"))?;
 
         // Get reader (cloned handle) and writer from the master.
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| Status::internal(format!("failed to clone PTY reader: {e}")))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| Status::internal(format!("failed to take PTY writer: {e}")))?;
+        let mut reader = match pair.master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                let rejection = Status::internal(format!("failed to clone PTY reader: {error}"));
+                return reject_pending_pty(pending_child, &request_id, rejection).await;
+            }
+        };
+        let writer = match pair.master.take_writer() {
+            Ok(writer) => writer,
+            Err(error) => {
+                let rejection = Status::internal(format!("failed to take PTY writer: {error}"));
+                return reject_pending_pty(pending_child, &request_id, rejection).await;
+            }
+        };
+        #[cfg(unix)]
+        let reader_poll_fd = match pair.master.as_raw_fd() {
+            Some(fd) => Some(fd),
+            None => {
+                return reject_pending_pty(
+                    pending_child,
+                    &request_id,
+                    Status::failed_precondition(
+                        "PTY master has no pollable descriptor for cancellable output",
+                    ),
+                )
+                .await;
+            }
+        };
+        #[cfg(not(unix))]
+        let reader_poll_fd = None;
         let master_handle = Arc::new(StdMutex::new(PtyMasterHandle {
             writer,
             master: pair.master,
@@ -1051,10 +2210,20 @@ impl AgentServiceImpl {
         // is synchronous until the watcher has been spawned.
         {
             let mut table = self.state.process_table.lock().await;
-            let child = pending_child.take()?;
+            let (child, mut retained_permit) = match pending_child.take() {
+                Ok(owned) => owned,
+                Err(rejection) => {
+                    return Err(Status::internal(format!(
+                        "PTY exec rejected before registration with missing cleanup authority: {rejection}"
+                    )));
+                }
+            };
             // portable-pty Child isn't tokio-compatible, so we wrap it in the
             // process table as a waitable entry below instead.
-            table.insert_pty(exec_id, child, process_identity);
+            let _ = table.insert_pty(exec_id, child, process_identity, launch.container_targeted);
+            if let Some(permit) = retained_permit.take_for_publish() {
+                permit.publish(exec_id);
+            }
         }
         {
             let mut handles = pty_handles().lock().unwrap_or_else(|p| p.into_inner());
@@ -1062,18 +2231,63 @@ impl AgentServiceImpl {
         }
         register_exec_order_context(
             exec_id,
-            ExecOrderContext::with_initial_sequence(tx.clone(), request_id, 1),
+            ExecOrderContext::with_initial_sequence(tx.clone(), request_id.clone(), 1),
         );
+        monitor_exec_stream_loss(self.state.process_table.clone(), exec_id);
+        info!(exec_id, "grpc: queueing initial PTY exec event");
+        let _ = tx
+            .send(Ok(ExecEvent {
+                event: Some(first_event),
+                sequence: 1,
+                request_id: request_id.clone(),
+                exec_id,
+            }))
+            .await;
+        let finish_sender = tx.clone();
 
         // Spawn blocking reader task. portable-pty gives us a synchronous Read,
         // so we read in a blocking thread and forward chunks as exec events.
         let reader_exec_id = exec_id;
-        let (reader_done_tx, mut reader_done_rx) = tokio::sync::oneshot::channel::<()>();
-        let pty_reader_handle = tokio::task::spawn_blocking(move || {
+        let reader_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_cancel_task = reader_cancel.clone();
+        let (reader_done_tx, reader_done_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut pty_reader_handle = tokio::task::spawn_blocking(move || -> OutputReaderResult {
             let mut buf = vec![0u8; 65536];
-            loop {
+            let result = loop {
+                if reader_cancel_task.load(Ordering::Acquire) {
+                    break Err("PTY reader cancelled after receiver close".into());
+                }
+                if let Some(fd) = reader_poll_fd {
+                    let mut descriptor = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                        revents: 0,
+                    };
+                    // SAFETY: descriptor points to one initialized pollfd and
+                    // remains valid for the duration of this call.
+                    let poll_result = unsafe {
+                        libc::poll(
+                            &raw mut descriptor,
+                            1,
+                            PTY_READER_POLL_INTERVAL.as_millis() as libc::c_int,
+                        )
+                    };
+                    if poll_result == 0 {
+                        continue;
+                    }
+                    if poll_result < 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        break Err(format!("PTY poll failed: {error}"));
+                    }
+                    if descriptor.revents & libc::POLLNVAL != 0 {
+                        break Err("PTY poll reported an invalid descriptor".into());
+                    }
+                }
                 match reader.read(&mut buf) {
-                    Ok(0) => break,
+                    Ok(0) => break Ok(()),
                     Ok(n) => {
                         let data = buf[..n].to_vec();
                         let rt = tokio::runtime::Handle::current();
@@ -1089,86 +2303,91 @@ impl AgentServiceImpl {
                                     "grpc: pty stdout chunk"
                                 );
                             }
-                            Err(_) => break,
+                            Err(_) => {
+                                break Err("exec stream closed while sending PTY output".into());
+                            }
                         }
                     }
                     Err(e) => {
                         // EIO is expected when the slave side closes (child exited).
-                        if e.raw_os_error() != Some(libc::EIO) {
-                            warn!(exec_id = reader_exec_id, error = %e, "grpc: pty read error");
+                        if e.raw_os_error() == Some(libc::EIO) {
+                            break Ok(());
                         }
-                        break;
+                        warn!(exec_id = reader_exec_id, error = %e, "grpc: pty read error");
+                        break Err(format!("PTY read failed: {e}"));
                     }
                 }
-            }
+            };
             let _ = reader_done_tx.send(());
+            result
+        });
+
+        let reader_cleanup_table = self.state.process_table.clone();
+        tokio::spawn(async move {
+            if reader_done_rx.await.is_ok() {
+                spawn_exec_cleanup(reader_cleanup_table, exec_id);
+            }
         });
 
         // Spawn exit watcher for the PTY session.
         let exit_table = self.state.process_table.clone();
         tokio::spawn(async move {
-            let child = {
+            let Some(mut child) = ({
                 let mut table = exit_table.lock().await;
                 table.take_pty(exec_id)
+            }) else {
+                warn!(
+                    exec_id,
+                    "grpc: PTY wait handle missing; retaining cleanup authority"
+                );
+                spawn_exec_cleanup(exit_table.clone(), exec_id);
+                return;
             };
 
-            let mut wait_handle = child.map(|mut child| {
-                tokio::task::spawn_blocking(move || match child.wait() {
-                    Ok(status) => status.exit_code() as i32,
-                    Err(_) => -1,
+            let mut cleanup_started = false;
+            let exit_code = loop {
+                let attempt = tokio::task::spawn_blocking(move || match child.wait() {
+                    Ok(status) => Ok(status.exit_code() as i32),
+                    Err(error) => Err((child, error.to_string())),
                 })
-            });
-
-            let exit_code = if let Some(wait_handle) = wait_handle.as_mut() {
-                tokio::select! {
-                    result = &mut *wait_handle => {
-                        result.unwrap_or(-1)
-                    }
-                    _ = &mut reader_done_rx => {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(2),
-                            &mut *wait_handle,
-                        )
-                        .await
-                        {
-                            Ok(result) => result.unwrap_or(-1),
-                            Err(_) => {
-                                warn!(
-                                    exec_id,
-                                    "grpc: pty reader closed but wait() did not resolve; forcing exit event"
-                                );
-                                wait_handle.abort();
-                                -1
-                            }
+                .await;
+                match attempt {
+                    Ok(Ok(exit_code)) => break exit_code,
+                    Ok(Err((returned_child, error))) => {
+                        child = returned_child;
+                        warn!(exec_id, %error, "grpc: PTY wait failed; killing and retrying");
+                        if !cleanup_started {
+                            cleanup_started = true;
+                            spawn_exec_cleanup(exit_table.clone(), exec_id);
                         }
+                        tokio::time::sleep(EXEC_CANCEL_DRIVER_RETRY).await;
+                    }
+                    Err(error) => {
+                        // A panicked blocking waiter has lost the only portable
+                        // wait handle. Never manufacture a reaped receipt.
+                        warn!(exec_id, %error, "grpc: PTY wait task failed without a reap receipt");
+                        spawn_exec_cleanup(exit_table.clone(), exec_id);
+                        return;
                     }
                 }
-            } else {
-                -1
             };
 
-            // Brief window for remaining PTY output.
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), pty_reader_handle)
-                .await;
+            let output_drain = await_pty_output_drain(
+                exec_id,
+                finish_sender,
+                reader_cancel,
+                &mut pty_reader_handle,
+            )
+            .await;
 
             info!(exec_id, exit_code, "grpc: pty process exited");
 
-            if let Ok(sequence) =
-                send_ordered_exec_event(exec_id, exec_event::Event::ExitCode(exit_code)).await
-            {
-                debug!(exec_id, sequence, "grpc: pty exit event");
-            }
-
             // Clean up: remove from process table, PTY handles, and order context.
-            {
-                let mut table = exit_table.lock().await;
-                table.remove(exec_id);
-            }
             {
                 let mut handles = pty_handles().lock().unwrap_or_else(|p| p.into_inner());
                 handles.remove(&exec_id);
             }
-            remove_exec_order_context(exec_id);
+            finish_exec_stream(&exit_table, exec_id, exit_code, output_drain).await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -1221,6 +2440,21 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         }))
     }
 
+    async fn allocate_exec_request(
+        &self,
+        request: Request<AllocateExecRequestRequest>,
+    ) -> Result<Response<AllocateExecRequestResponse>, Status> {
+        let request = request.into_inner();
+        validate_allocate_exec_transport_metadata(request.metadata.as_ref())?;
+        let registry = self.state.process_table.lock().await.request_registry();
+        let exec_request_id = registry.allocate_request_id().map_err(|_| {
+            Status::resource_exhausted("container exec request ticket space exhausted")
+        })?;
+        Ok(Response::new(AllocateExecRequestResponse {
+            exec_request_id,
+        }))
+    }
+
     type ExecStream = ReceiverStream<Result<ExecEvent, Status>>;
 
     type EnsureDockerStream = ReceiverStream<Result<DockerEnsureEvent, Status>>;
@@ -1238,10 +2472,32 @@ impl agent_service_server::AgentService for AgentServiceImpl {
             "grpc: exec request routing"
         );
 
-        if req.allocate_pty {
-            self.exec_pty(req, request_id).await
+        let request_permit = if req.container_target.is_some() {
+            validate_container_exec_request_id(&request_id)?;
+            let registry = self.state.process_table.lock().await.request_registry();
+            match registry.claim(&request_id) {
+                Ok(permit) => Some(permit),
+                Err(ExecRequestClaimError::Active) => {
+                    return Err(Status::already_exists(format!(
+                        "container exec request `{request_id}` is already active"
+                    )));
+                }
+                Err(ExecRequestClaimError::DefiniteRejection) => {
+                    return Ok(definite_exec_rejection(
+                        &request_id,
+                        "container exec request ticket is invalid, stale, retired, or already completed"
+                            .to_string(),
+                    ));
+                }
+            }
         } else {
-            self.exec_pipe(req, request_id).await
+            None
+        };
+
+        if req.allocate_pty {
+            self.exec_pty(req, request_id, request_permit).await
+        } else {
+            self.exec_pipe(req, request_id, request_permit).await
         }
     }
 
@@ -1328,17 +2584,21 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         &self,
         request: Request<StdinWriteRequest>,
     ) -> Result<Response<StdinWriteResponse>, Status> {
-        use tokio::io::AsyncWriteExt;
-
         let req = request.into_inner();
-        if let Some(sequence) = mark_ordered_control(req.exec_id, "stdin_write").await {
-            debug!(
-                exec_id = req.exec_id,
-                sequence,
-                bytes = req.data.len(),
-                "grpc: stdin write ordered"
-            );
+        if req.data.len() > MAX_STDIN_WRITE_BYTES {
+            return Err(Status::resource_exhausted(format!(
+                "stdin write exceeds {MAX_STDIN_WRITE_BYTES} bytes"
+            )));
         }
+        let control = begin_ordered_control(req.exec_id, "stdin_write")
+            .await
+            .ok_or_else(|| Status::not_found(format!("process {} not found", req.exec_id)))?;
+        debug!(
+            exec_id = req.exec_id,
+            sequence = control.sequence,
+            bytes = req.data.len(),
+            "grpc: stdin write ordered"
+        );
 
         // For PTY sessions, write to the master PTY writer.
         let pty_handle = {
@@ -1347,34 +2607,38 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         };
         if let Some(handle) = pty_handle {
             let data = req.data.clone();
-            tokio::task::spawn_blocking(move || -> Result<(), Status> {
+            let write = tokio::task::spawn_blocking(move || -> Result<(), Status> {
                 use std::io::Write;
                 let mut guard = handle.lock().unwrap_or_else(|p| p.into_inner());
                 guard
                     .writer
                     .write_all(&data)
                     .map_err(|e| Status::internal(format!("pty write failed: {e}")))
-            })
-            .await
-            .map_err(|error| Status::internal(format!("pty write task failed: {error}")))??;
+            });
+            match tokio::time::timeout(STDIN_WRITE_TIMEOUT, write).await {
+                Ok(Ok(result)) => result?,
+                Ok(Err(error)) => {
+                    return Err(Status::internal(format!("pty write task failed: {error}")));
+                }
+                Err(_) => {
+                    // The blocking writer may still own its Arc after this RPC
+                    // returns. Retire the public handle and start durable
+                    // cancellation so no additional writer tasks can queue.
+                    pty_handles()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&req.exec_id);
+                    spawn_exec_cleanup(self.state.process_table.clone(), req.exec_id);
+                    return Err(Status::deadline_exceeded(format!(
+                        "PTY stdin write exceeded {} ms",
+                        STDIN_WRITE_TIMEOUT.as_millis()
+                    )));
+                }
+            }
             return Ok(Response::new(StdinWriteResponse {}));
         }
 
-        let mut table = self.state.process_table.lock().await;
-
-        let entry = table
-            .get_mut(req.exec_id)
-            .ok_or_else(|| Status::not_found(format!("process {} not found", req.exec_id)))?;
-
-        let stdin = entry
-            .stdin
-            .as_mut()
-            .ok_or_else(|| Status::failed_precondition("stdin already closed"))?;
-
-        stdin
-            .write_all(&req.data)
-            .await
-            .map_err(|e| Status::internal(format!("stdin write failed: {e}")))?;
+        write_pipe_stdin(&self.state.process_table, req.exec_id, &req.data).await?;
 
         Ok(Response::new(StdinWriteResponse {}))
     }
@@ -1384,19 +2648,24 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         request: Request<StdinCloseRequest>,
     ) -> Result<Response<StdinCloseResponse>, Status> {
         let req = request.into_inner();
-        if let Some(sequence) = mark_ordered_control(req.exec_id, "stdin_close").await {
-            debug!(exec_id = req.exec_id, sequence, "grpc: stdin close ordered");
-        }
+        let control = begin_ordered_control(req.exec_id, "stdin_close")
+            .await
+            .ok_or_else(|| Status::not_found(format!("process {} not found", req.exec_id)))?;
+        debug!(
+            exec_id = req.exec_id,
+            sequence = control.sequence,
+            "grpc: stdin close ordered"
+        );
         let mut table = self.state.process_table.lock().await;
 
         if let Some(entry) = table.get_mut(req.exec_id) {
             entry.stdin = None;
             info!(exec_id = req.exec_id, "grpc: stdin closed");
         } else {
-            warn!(
-                exec_id = req.exec_id,
-                "grpc: stdin close: process not found"
-            );
+            return Err(Status::not_found(format!(
+                "process {} not found",
+                req.exec_id
+            )));
         }
 
         Ok(Response::new(StdinCloseResponse {}))
@@ -1407,14 +2676,16 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         request: Request<SignalRequest>,
     ) -> Result<Response<SignalResponse>, Status> {
         let req = request.into_inner();
-        if let Some(sequence) = mark_ordered_control(req.exec_id, "signal").await {
-            debug!(
-                exec_id = req.exec_id,
-                sequence,
-                signal = req.signal,
-                "grpc: signal ordered"
-            );
-        }
+        validate_exec_signal(req.signal)?;
+        let control = begin_ordered_control(req.exec_id, "signal")
+            .await
+            .ok_or_else(|| Status::not_found(format!("process {} not found", req.exec_id)))?;
+        debug!(
+            exec_id = req.exec_id,
+            sequence = control.sequence,
+            signal = req.signal,
+            "grpc: signal ordered"
+        );
         let table = self.state.process_table.lock().await;
 
         match table.signal(req.exec_id, req.signal) {
@@ -1431,10 +2702,93 @@ impl agent_service_server::AgentService for AgentServiceImpl {
                     req.exec_id
                 )));
             }
-            None => warn!(exec_id = req.exec_id, "grpc: signal: process not found"),
+            None => {
+                return Err(Status::not_found(format!(
+                    "process {} not found",
+                    req.exec_id
+                )));
+            }
         }
 
         Ok(Response::new(SignalResponse {}))
+    }
+
+    async fn cancel_exec(
+        &self,
+        request: Request<CancelExecRequest>,
+    ) -> Result<Response<CancelExecResponse>, Status> {
+        let req = request.into_inner();
+        // Cancellation never waits behind stdin or another control future.
+        // ProcessTable atomically starts or joins the one durable driver.
+        let sequence = mark_nonblocking_control(req.exec_id, "cancel_exec");
+        debug!(
+            exec_id = req.exec_id,
+            sequence, "grpc: cancellation ordered"
+        );
+        let outcome = cancel_active_exec(&self.state.process_table, req.exec_id).await?;
+        Ok(Response::new(CancelExecResponse {
+            exit_code: outcome.exit_code,
+            forced: outcome.forced,
+        }))
+    }
+
+    async fn reconcile_exec(
+        &self,
+        request: Request<ReconcileExecRequest>,
+    ) -> Result<Response<ReconcileExecResponse>, Status> {
+        use reconcile_exec_response::Outcome;
+
+        let request = request.into_inner();
+        if request.exec_request_id.is_empty() {
+            return Err(Status::invalid_argument("exec_request_id is required"));
+        }
+        validate_container_exec_request_id(&request.exec_request_id)?;
+        validate_reconcile_transport_metadata(request.metadata.as_ref())?;
+        let registry = self.state.process_table.lock().await.request_registry();
+        loop {
+            match registry.reconcile(&request.exec_request_id) {
+                ExecRequestReconcile::FencedNeverStarted => {
+                    return Ok(Response::new(ReconcileExecResponse {
+                        outcome: Outcome::FencedNeverStarted as i32,
+                        exec_request_id: request.exec_request_id,
+                        exec_id: 0,
+                        exit_code: 0,
+                        forced: false,
+                    }));
+                }
+                ExecRequestReconcile::Starting => {
+                    tokio::time::sleep(EXEC_CANCEL_DRIVER_RETRY).await;
+                }
+                ExecRequestReconcile::Published(exec_id) => {
+                    let outcome = cancel_active_exec(&self.state.process_table, exec_id).await?;
+                    return Ok(Response::new(ReconcileExecResponse {
+                        outcome: Outcome::TerminalReaped as i32,
+                        exec_request_id: request.exec_request_id,
+                        exec_id,
+                        exit_code: outcome.exit_code,
+                        forced: outcome.forced,
+                    }));
+                }
+                ExecRequestReconcile::Terminal(exec_id, receipt) => {
+                    return Ok(Response::new(ReconcileExecResponse {
+                        outcome: Outcome::TerminalReaped as i32,
+                        exec_request_id: request.exec_request_id,
+                        exec_id,
+                        exit_code: receipt.exit_code,
+                        forced: receipt.forced,
+                    }));
+                }
+                ExecRequestReconcile::StaleUnknown => {
+                    return Ok(Response::new(ReconcileExecResponse {
+                        outcome: Outcome::StaleUnknown as i32,
+                        exec_request_id: request.exec_request_id,
+                        exec_id: 0,
+                        exit_code: 0,
+                        forced: false,
+                    }));
+                }
+            }
+        }
     }
 
     type PortForwardStream = ReceiverStream<Result<PortForwardFrame, Status>>;
@@ -1534,6 +2888,18 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         use portable_pty::PtySize;
 
         let req = request.into_inner();
+        let control = begin_ordered_control(req.exec_id, "resize_exec_pty")
+            .await
+            .ok_or_else(|| Status::not_found(format!("process {} not found", req.exec_id)))?;
+        if req.rows == 0
+            || req.cols == 0
+            || req.rows > u32::from(u16::MAX)
+            || req.cols > u32::from(u16::MAX)
+        {
+            return Err(Status::invalid_argument(
+                "PTY rows and columns must be in 1..=65535",
+            ));
+        }
         let handle = {
             let handles = pty_handles().lock().unwrap_or_else(|p| p.into_inner());
             handles.get(&req.exec_id).cloned()
@@ -1559,6 +2925,7 @@ impl agent_service_server::AgentService for AgentServiceImpl {
 
         info!(
             exec_id = req.exec_id,
+            sequence = control.sequence,
             rows = req.rows,
             cols = req.cols,
             "grpc: pty resized"
@@ -1719,51 +3086,11 @@ impl oci_service_server::OciService for OciServiceImpl {
 
     async fn exec(
         &self,
-        request: Request<OciExecRequest>,
+        _request: Request<OciExecRequest>,
     ) -> Result<Response<OciExecResponse>, Status> {
-        let req = request.into_inner();
-        // Unary compatibility has no early-ready response. Retain shared guest
-        // admission for its complete bounded lifetime, including cancellation.
-        let _admission = acquire_shared_container_admission(&req.container_id).await?;
-        let request_id = request_id_from_metadata(req.metadata.as_ref(), "oci-exec");
-        info!(
-            request_id = %request_id,
-            container_id = %req.container_id,
-            command = %req.command,
-            "oci: exec"
-        );
-
-        let spec = prepare_oci_exec(&req)?;
-        let trampoline = spec.trampoline;
-        info!(args = ?trampoline.args, "oci: exec via verified container trampoline");
-
-        let mut cmd = tokio::process::Command::new(&trampoline.program);
-        cmd.args(&trampoline.args);
-
-        cmd.env_clear();
-        cmd.envs(spec.environment);
-        cmd.kill_on_drop(true);
-
-        let output = match tokio::time::timeout(YOUKI_EXEC_TIMEOUT, cmd.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => {
-                return Err(Status::internal(format!(
-                    "failed to execute container command: {e}"
-                )));
-            }
-            Err(_) => {
-                return Err(Status::internal(format!(
-                    "oci exec timed out after {}s",
-                    YOUKI_EXEC_TIMEOUT.as_secs()
-                )));
-            }
-        };
-
-        Ok(Response::new(OciExecResponse {
-            exit_code: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        }))
+        Err(Status::unimplemented(
+            "OciService.Exec is retired; collect the supervised AgentService.Exec stream",
+        ))
     }
 
     async fn kill(
@@ -1923,10 +3250,6 @@ fn ensure_youki_user_namespace_procfs(uid_map_path: &Path) -> Result<(), String>
 /// Timeout for youki lifecycle commands (create, start, kill, delete).
 #[cfg(target_os = "linux")]
 const YOUKI_LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Timeout for youki exec commands.
-#[cfg(target_os = "linux")]
-const YOUKI_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Ensure the youki state directory exists.
 #[cfg(target_os = "linux")]
@@ -2189,7 +3512,9 @@ impl oci_service_server::OciService for OciServiceImpl {
         &self,
         _request: Request<OciExecRequest>,
     ) -> Result<Response<OciExecResponse>, Status> {
-        Err(Status::unimplemented("OCI lifecycle requires Linux guest"))
+        Err(Status::unimplemented(
+            "OciService.Exec is retired; collect the supervised AgentService.Exec stream",
+        ))
     }
 
     async fn kill(
@@ -2331,6 +3656,437 @@ mod tests {
         NEXT_EXEC_ID.fetch_add(1, Ordering::Relaxed)
     }
 
+    #[derive(Debug)]
+    struct PendingPipeTestState {
+        polls: std::sync::atomic::AtomicUsize,
+        kills: std::sync::atomic::AtomicUsize,
+        errors_remaining: std::sync::atomic::AtomicUsize,
+        allow_reap: std::sync::atomic::AtomicBool,
+        reaped: std::sync::atomic::AtomicBool,
+    }
+
+    #[derive(Debug)]
+    struct PendingPipeTestChild {
+        state: Arc<PendingPipeTestState>,
+    }
+
+    impl PendingPipeProcess for PendingPipeTestChild {
+        fn process_id(&self) -> Option<u32> {
+            Some(42_423)
+        }
+
+        fn start_kill(&mut self) -> std::io::Result<()> {
+            self.state
+                .kills
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn try_wait_reaped(&mut self) -> std::io::Result<bool> {
+            self.state
+                .polls
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            if self
+                .state
+                .errors_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Err(std::io::Error::other("injected pipe wait failure"));
+            }
+            if !self
+                .state
+                .allow_reap
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(std::io::Error::other("persistent pipe wait failure"));
+            }
+            self.state
+                .reaped
+                .store(true, std::sync::atomic::Ordering::Release);
+            Ok(true)
+        }
+    }
+
+    fn pending_pipe_test_child(
+        errors: usize,
+        allow_reap: bool,
+    ) -> (
+        PendingPipeChild<PendingPipeTestChild>,
+        Arc<PendingPipeTestState>,
+    ) {
+        let state = Arc::new(PendingPipeTestState {
+            polls: std::sync::atomic::AtomicUsize::new(0),
+            kills: std::sync::atomic::AtomicUsize::new(0),
+            errors_remaining: std::sync::atomic::AtomicUsize::new(errors),
+            allow_reap: std::sync::atomic::AtomicBool::new(allow_reap),
+            reaped: std::sync::atomic::AtomicBool::new(false),
+        });
+        (
+            PendingPipeChild::new(PendingPipeTestChild {
+                state: Arc::clone(&state),
+            }),
+            state,
+        )
+    }
+
+    async fn await_pending_pipe_test_reap(state: &PendingPipeTestState) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !state.reaped.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("retained pipe cleanup did not reach terminal reap proof");
+    }
+
+    #[tokio::test]
+    async fn pending_pipe_rejection_retries_wait_errors_before_definite_error() {
+        use tokio_stream::StreamExt as _;
+
+        let (child, state) = pending_pipe_test_child(2, true);
+        let response = reject_pending_pipe_with_timeout(
+            child,
+            "pipe-definite-reject",
+            Status::failed_precondition("injected post-spawn rejection"),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .expect("eventual exact reap proof must permit a definite rejection");
+        assert!(state.reaped.load(std::sync::atomic::Ordering::Acquire));
+        assert!(state.polls.load(std::sync::atomic::Ordering::Acquire) >= 3);
+        let event = response
+            .into_inner()
+            .next()
+            .await
+            .expect("definite rejection stream omitted its event")
+            .expect("definite rejection stream returned a transport status");
+        assert_eq!(event.exec_id, 0);
+        assert!(matches!(
+            event.event,
+            Some(exec_event::Event::Error(detail))
+                if detail.contains("spawned process reaped")
+        ));
+    }
+
+    #[tokio::test]
+    async fn pending_pipe_persistent_wait_error_is_bounded_and_ambiguous() {
+        let (child, state) = pending_pipe_test_child(0, false);
+        let error = reject_pending_pipe_with_timeout(
+            child,
+            "pipe-retained-reject",
+            Status::failed_precondition("injected post-spawn rejection"),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(5),
+        )
+        .await
+        .expect_err("unproven pipe cleanup must not emit a definite Error frame");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains("retained authority"));
+        assert!(!state.reaped.load(std::sync::atomic::Ordering::Acquire));
+        state
+            .allow_reap
+            .store(true, std::sync::atomic::Ordering::Release);
+        await_pending_pipe_test_reap(&state).await;
+    }
+
+    #[tokio::test]
+    async fn pending_pipe_cleanup_keeps_request_starting_until_reap() {
+        let registry = ProcessTable::new().request_registry();
+        let request_id = registry.allocate_request_id().unwrap();
+        let mut permit = registry.claim(&request_id).unwrap();
+        permit.authorize_start().unwrap();
+        let (mut child, state) = pending_pipe_test_child(0, false);
+        child.request_permit = RetainedExecRequestPermit(Some(permit));
+        let error = reject_pending_pipe_with_timeout(
+            child,
+            &request_id,
+            Status::failed_precondition("injected post-spawn rejection"),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(2),
+        )
+        .await
+        .expect_err("unreaped child must remain ambiguous");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        for _ in 0..5 {
+            assert_eq!(
+                registry.reconcile(&request_id),
+                ExecRequestReconcile::Starting
+            );
+            assert!(!state.reaped.load(std::sync::atomic::Ordering::Acquire));
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
+        state
+            .allow_reap
+            .store(true, std::sync::atomic::Ordering::Release);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match registry.reconcile(&request_id) {
+                    ExecRequestReconcile::FencedNeverStarted => {
+                        assert!(state.reaped.load(std::sync::atomic::Ordering::Acquire));
+                        break;
+                    }
+                    ExecRequestReconcile::Starting => {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    state => panic!("unexpected cleanup reconcile state: {state:?}"),
+                }
+            }
+        })
+        .await
+        .expect("pipe cleanup did not fence after reap");
+    }
+
+    #[tokio::test]
+    async fn dropped_pending_pipe_child_retains_cleanup_through_wait_errors() {
+        let (child, state) = pending_pipe_test_child(3, true);
+        drop(child);
+        await_pending_pipe_test_reap(&state).await;
+        assert!(state.polls.load(std::sync::atomic::Ordering::Acquire) >= 4);
+    }
+
+    #[derive(Debug)]
+    struct PendingPtyTestState {
+        polls: std::sync::atomic::AtomicUsize,
+        kills: std::sync::atomic::AtomicUsize,
+        poll_errors: usize,
+        reap_poll: usize,
+        kill_errors: usize,
+        allow_reap: std::sync::atomic::AtomicBool,
+        reaped: std::sync::atomic::AtomicBool,
+    }
+
+    #[derive(Debug)]
+    struct PendingPtyTestChild {
+        state: Arc<PendingPtyTestState>,
+    }
+
+    #[derive(Debug)]
+    struct PendingPtyTestKiller {
+        state: Arc<PendingPtyTestState>,
+    }
+
+    fn pending_pty_test_kill(state: &PendingPtyTestState) -> std::io::Result<()> {
+        let attempt = state
+            .kills
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        if attempt <= state.kill_errors {
+            Err(std::io::Error::other("injected PTY kill failure"))
+        } else {
+            Ok(())
+        }
+    }
+
+    impl portable_pty::ChildKiller for PendingPtyTestKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            pending_pty_test_kill(&self.state)
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(Self {
+                state: Arc::clone(&self.state),
+            })
+        }
+    }
+
+    impl portable_pty::ChildKiller for PendingPtyTestChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            pending_pty_test_kill(&self.state)
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(PendingPtyTestKiller {
+                state: Arc::clone(&self.state),
+            })
+        }
+    }
+
+    impl portable_pty::Child for PendingPtyTestChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            let poll = self
+                .state
+                .polls
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                + 1;
+            if poll <= self.state.poll_errors {
+                return Err(std::io::Error::other("injected PTY wait failure"));
+            }
+            if poll >= self.state.reap_poll
+                && self
+                    .state
+                    .allow_reap
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.state
+                    .reaped
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Ok(Some(portable_pty::ExitStatus::with_exit_code(137)));
+            }
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            loop {
+                if let Some(status) = self.try_wait()? {
+                    return Ok(status);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(42_424)
+        }
+    }
+
+    fn pending_pty_test_child(
+        poll_errors: usize,
+        reap_poll: usize,
+        kill_errors: usize,
+    ) -> (PendingPtyChild, Arc<PendingPtyTestState>) {
+        let state = Arc::new(PendingPtyTestState {
+            polls: std::sync::atomic::AtomicUsize::new(0),
+            kills: std::sync::atomic::AtomicUsize::new(0),
+            poll_errors,
+            reap_poll,
+            kill_errors,
+            allow_reap: std::sync::atomic::AtomicBool::new(true),
+            reaped: std::sync::atomic::AtomicBool::new(false),
+        });
+        (
+            PendingPtyChild::new(
+                Box::new(PendingPtyTestChild {
+                    state: Arc::clone(&state),
+                }),
+                None,
+            ),
+            state,
+        )
+    }
+
+    async fn await_pending_pty_test_reap(state: &PendingPtyTestState) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !state.reaped.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("retained PTY cleanup did not reach terminal reap proof");
+    }
+
+    #[tokio::test]
+    async fn pending_pty_rejection_emits_definite_error_only_after_reap_proof() {
+        use tokio_stream::StreamExt as _;
+
+        let (child, state) = pending_pty_test_child(2, 4, 2);
+        let response = reject_pending_pty_with_timeout(
+            child,
+            "pty-definite-reject",
+            Status::failed_precondition("injected post-spawn rejection"),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .expect("eventual exact reap proof must permit a definite rejection");
+        assert!(state.reaped.load(std::sync::atomic::Ordering::Acquire));
+        let event = response
+            .into_inner()
+            .next()
+            .await
+            .expect("definite rejection stream omitted its event")
+            .expect("definite rejection stream returned a transport status");
+        assert_eq!(event.exec_id, 0);
+        assert!(matches!(
+            event.event,
+            Some(exec_event::Event::Error(detail))
+                if detail.contains("spawned process reaped")
+        ));
+    }
+
+    #[tokio::test]
+    async fn pending_pty_rejection_timeout_is_ambiguous_while_cleanup_retains_owner() {
+        let (child, state) = pending_pty_test_child(2, 6, usize::MAX);
+        let error = reject_pending_pty_with_timeout(
+            child,
+            "pty-retained-reject",
+            Status::failed_precondition("injected post-spawn rejection"),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(5),
+        )
+        .await
+        .expect_err("unproven PTY cleanup must not emit a definite Error frame");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains("retained authority"));
+        assert!(!state.reaped.load(std::sync::atomic::Ordering::Acquire));
+        await_pending_pty_test_reap(&state).await;
+    }
+
+    #[tokio::test]
+    async fn pending_pty_cleanup_keeps_request_starting_until_reap() {
+        let registry = ProcessTable::new().request_registry();
+        let request_id = registry.allocate_request_id().unwrap();
+        let mut permit = registry.claim(&request_id).unwrap();
+        permit.authorize_start().unwrap();
+        let (mut child, state) = pending_pty_test_child(0, 1, usize::MAX);
+        state
+            .allow_reap
+            .store(false, std::sync::atomic::Ordering::Release);
+        child.request_permit = RetainedExecRequestPermit(Some(permit));
+        let error = reject_pending_pty_with_timeout(
+            child,
+            &request_id,
+            Status::failed_precondition("injected post-spawn rejection"),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(2),
+        )
+        .await
+        .expect_err("unreaped PTY child must remain ambiguous");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        for _ in 0..5 {
+            assert_eq!(
+                registry.reconcile(&request_id),
+                ExecRequestReconcile::Starting
+            );
+            assert!(!state.reaped.load(std::sync::atomic::Ordering::Acquire));
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
+        state
+            .allow_reap
+            .store(true, std::sync::atomic::Ordering::Release);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match registry.reconcile(&request_id) {
+                    ExecRequestReconcile::FencedNeverStarted => {
+                        assert!(state.reaped.load(std::sync::atomic::Ordering::Acquire));
+                        break;
+                    }
+                    ExecRequestReconcile::Starting => {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    state => panic!("unexpected PTY cleanup reconcile state: {state:?}"),
+                }
+            }
+        })
+        .await
+        .expect("PTY cleanup did not fence after reap");
+    }
+
+    #[tokio::test]
+    async fn dropped_pending_pty_child_retains_cleanup_until_reaped() {
+        let (child, state) = pending_pty_test_child(1, 4, 1);
+        drop(child);
+        await_pending_pty_test_reap(&state).await;
+        assert!(state.polls.load(std::sync::atomic::Ordering::Acquire) >= 4);
+    }
+
     #[test]
     fn logical_exec_ids_are_monotonic_and_never_wrap() {
         let next = AtomicU64::new(41);
@@ -2340,6 +4096,17 @@ mod tests {
         let exhausted = AtomicU64::new(u64::MAX);
         assert_eq!(allocate_logical_exec_id_from(&exhausted), None);
         assert_eq!(exhausted.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn public_signal_validation_rejects_invalid_boundaries() {
+        assert!(validate_exec_signal(libc::SIGTERM).is_ok());
+        assert!(validate_exec_signal(libc::SIGINT).is_ok());
+        assert!(validate_exec_signal(libc::SIGKILL).is_ok());
+        assert!(validate_exec_signal(0).is_err());
+        assert!(validate_exec_signal(65).is_err());
+        #[cfg(target_os = "linux")]
+        assert!(validate_exec_signal(libc::SIGRTMIN()).is_err());
     }
 
     #[test]
@@ -2460,6 +4227,21 @@ mod tests {
         assert_eq!(agent.spawn_environment, unary.environment);
     }
 
+    #[tokio::test]
+    async fn legacy_oci_exec_is_retired_fail_fast() {
+        use vz_agent_proto::oci_service_server::OciService as _;
+
+        let result = OciServiceImpl
+            .exec(Request::new(OciExecRequest::default()))
+            .await;
+        let error = match result {
+            Ok(_) => panic!("legacy unary OCI exec must not run"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        assert!(error.message().contains("AgentService.Exec"));
+    }
+
     #[test]
     fn every_container_exec_adapter_has_one_exact_environment_and_user_spec() {
         let mut request = exec_request(Some("web"), false);
@@ -2510,6 +4292,202 @@ mod tests {
         assert!(normalized_container_environment(&environment).is_err());
     }
 
+    #[test]
+    fn container_exec_request_ids_require_exact_guest_ticket_shape() {
+        let valid = "exec_req_550e8400-e29b-41d4-a716-446655440000_0000000000000001".to_string();
+        assert_eq!(valid.len(), 62);
+        validate_container_exec_request_id(&valid).unwrap();
+
+        for invalid in [
+            "",
+            "exec_req_00000000-0000-0000-0000-000000000000",
+            "exec_req_00000000-0000-4000-0000-000000000000",
+            "exec_req_550E8400-E29B-41D4-A716-446655440000",
+            "exec_req_550e8400e29b41d4a716446655440000",
+            "wrong_550e8400-e29b-41d4-a716-446655440000",
+            "exec_req_550e8400-e29b-41d4-a716-446655440000_0000000000000000",
+            "exec_req_550e8400-e29b-41d4-a716-446655440000_000000000000000A",
+            "exec_req_550e8400-e29b-41d4-a716-446655440000_000000000000001",
+        ] {
+            assert!(
+                validate_container_exec_request_id(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        let oversized = format!("{valid}x");
+        assert!(validate_container_exec_request_id(&oversized).is_err());
+    }
+
+    #[test]
+    fn allocate_exec_metadata_is_required_and_bounded() {
+        assert!(validate_allocate_exec_transport_metadata(None).is_err());
+        assert!(
+            validate_allocate_exec_transport_metadata(Some(&TransportMetadata {
+                request_id: String::new(),
+                idempotency_key: String::new(),
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_allocate_exec_transport_metadata(Some(&TransportMetadata {
+                request_id: "r".repeat(129),
+                idempotency_key: String::new(),
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_allocate_exec_transport_metadata(Some(&TransportMetadata {
+                request_id: "allocate-control".to_string(),
+                idempotency_key: "k".repeat(257),
+            }))
+            .is_err()
+        );
+        validate_allocate_exec_transport_metadata(Some(&TransportMetadata {
+            request_id: "allocate-control".to_string(),
+            idempotency_key: "k".repeat(256),
+        }))
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn allocate_exec_request_issues_distinct_exact_guest_tickets() {
+        use vz_agent_proto::agent_service_server::AgentService as _;
+
+        let service = AgentServiceImpl::new(SharedState {
+            process_table: Arc::new(Mutex::new(ProcessTable::new())),
+            docker_supervisor: Arc::new(crate::docker::DockerSupervisor::new()),
+        });
+        let request = || {
+            Request::new(AllocateExecRequestRequest {
+                metadata: Some(TransportMetadata {
+                    request_id: "allocate-test".to_string(),
+                    idempotency_key: String::new(),
+                }),
+            })
+        };
+        let first = service
+            .allocate_exec_request(request())
+            .await
+            .expect("first allocation")
+            .into_inner()
+            .exec_request_id;
+        let second = service
+            .allocate_exec_request(request())
+            .await
+            .expect("second allocation")
+            .into_inner()
+            .exec_request_id;
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 62);
+        assert_eq!(second.len(), 62);
+        validate_container_exec_request_id(&first).unwrap();
+        validate_container_exec_request_id(&second).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_claim_maps_active_to_status_and_fenced_to_definite_rejection() {
+        use tokio_stream::StreamExt as _;
+        use vz_agent_proto::agent_service_server::AgentService as _;
+
+        let process_table = Arc::new(Mutex::new(ProcessTable::new()));
+        let service = AgentServiceImpl::new(SharedState {
+            process_table: Arc::clone(&process_table),
+            docker_supervisor: Arc::new(crate::docker::DockerSupervisor::new()),
+        });
+        let registry = process_table.lock().await.request_registry();
+        let active_ticket = registry.allocate_request_id().unwrap();
+        let _active_permit = registry.claim(&active_ticket).unwrap();
+        let exec_request = |request_id: &str| {
+            Request::new(ExecRequest {
+                metadata: Some(TransportMetadata {
+                    request_id: request_id.to_string(),
+                    idempotency_key: String::new(),
+                }),
+                container_target: Some(ContainerExecTarget {
+                    container_id: "claim-test".to_string(),
+                }),
+                ..ExecRequest::default()
+            })
+        };
+
+        let active = service
+            .exec(exec_request(&active_ticket))
+            .await
+            .expect_err("an active ticket must remain transport-ambiguous");
+        assert_eq!(active.code(), tonic::Code::AlreadyExists);
+
+        let fenced_ticket = registry.allocate_request_id().unwrap();
+        drop(registry.claim(&fenced_ticket).unwrap());
+        let response = service
+            .exec(exec_request(&fenced_ticket))
+            .await
+            .expect("a fenced ticket has a definite no-child response");
+        let event = response
+            .into_inner()
+            .next()
+            .await
+            .expect("definite rejection stream omitted its event")
+            .expect("definite rejection stream returned a transport status");
+        assert_eq!(event.sequence, 1);
+        assert_eq!(event.request_id, fenced_ticket);
+        assert_eq!(event.exec_id, 0);
+        assert!(matches!(event.event, Some(exec_event::Event::Error(_))));
+    }
+
+    #[test]
+    fn reconcile_metadata_is_required_and_bounded() {
+        assert!(validate_reconcile_transport_metadata(None).is_err());
+        assert!(
+            validate_reconcile_transport_metadata(Some(&TransportMetadata {
+                request_id: String::new(),
+                idempotency_key: String::new(),
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_reconcile_transport_metadata(Some(&TransportMetadata {
+                request_id: "r".repeat(129),
+                idempotency_key: String::new(),
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_reconcile_transport_metadata(Some(&TransportMetadata {
+                request_id: "reconcile-control".to_string(),
+                idempotency_key: "k".repeat(257),
+            }))
+            .is_err()
+        );
+        validate_reconcile_transport_metadata(Some(&TransportMetadata {
+            request_id: "reconcile-control".to_string(),
+            idempotency_key: "k".repeat(256),
+        }))
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn claimed_invalid_container_environment_is_exact_definite_rejection() {
+        let mut request = exec_request(Some("web"), false);
+        request
+            .env
+            .insert("BAD=KEY".to_string(), "value".to_string());
+        let response = match validate_claimed_container_exec(&request, "claimed-request", "pipe") {
+            Ok(()) => panic!("invalid claimed request must be rejected"),
+            Err(response) => response,
+        };
+        let mut receiver = response.into_inner().into_inner();
+        let event = receiver.recv().await.unwrap().unwrap();
+        assert_eq!(event.exec_id, 0);
+        assert_eq!(event.sequence, 1);
+        assert_eq!(event.request_id, "claimed-request");
+        assert!(matches!(
+            event.event,
+            Some(exec_event::Event::Error(detail))
+                if detail.contains("validation rejected before spawn")
+        ));
+        assert!(receiver.recv().await.is_none());
+    }
+
     #[tokio::test]
     async fn exec_order_sequence_is_monotonic_across_control_ops() {
         let exec_id = test_exec_id();
@@ -2525,10 +4503,12 @@ mod tests {
             Ok(sequence) => sequence,
             Err(()) => panic!("first event should send"),
         };
-        let control = match mark_ordered_control(exec_id, "stdin_close").await {
-            Some(sequence) => sequence,
+        let control = match begin_ordered_control(exec_id, "stdin_close").await {
+            Some(control) => control,
             None => panic!("control op should be ordered"),
         };
+        let control_sequence = control.sequence;
+        drop(control);
         let second_event = match send_ordered_exec_event(
             exec_id,
             exec_event::Event::Stderr(b"b".to_vec()),
@@ -2540,7 +4520,7 @@ mod tests {
         };
 
         assert_eq!(first_event, 1);
-        assert_eq!(control, 2);
+        assert_eq!(control_sequence, 2);
         assert_eq!(second_event, 3);
 
         let first = rx.recv().await;
@@ -2549,9 +4529,10 @@ mod tests {
             Some(Ok(ExecEvent {
                 sequence: 1,
                 request_id,
+                exec_id: observed_exec_id,
                 event: Some(exec_event::Event::Stdout(_)),
                 ..
-            })) if request_id == "req-test"
+            })) if request_id == "req-test" && observed_exec_id == exec_id
         ));
         let second = rx.recv().await;
         assert!(matches!(
@@ -2559,9 +4540,10 @@ mod tests {
             Some(Ok(ExecEvent {
                 sequence: 3,
                 request_id,
+                exec_id: observed_exec_id,
                 event: Some(exec_event::Event::Stderr(_)),
                 ..
-            })) if request_id == "req-test"
+            })) if request_id == "req-test" && observed_exec_id == exec_id
         ));
 
         remove_exec_order_context(exec_id);
@@ -2574,8 +4556,686 @@ mod tests {
 
         let sent = send_ordered_exec_event(exec_id, exec_event::Event::ExitCode(0)).await;
         assert!(sent.is_err());
-        let control = mark_ordered_control(exec_id, "signal").await;
+        let control = begin_ordered_control(exec_id, "signal").await;
         assert!(control.is_none());
+    }
+
+    #[tokio::test]
+    async fn output_backpressure_never_blocks_exec_control() {
+        let exec_id = test_exec_id();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        register_exec_order_context(
+            exec_id,
+            ExecOrderContext::new(sender, "backpressure".to_string()),
+        );
+        assert_eq!(
+            send_ordered_exec_event(exec_id, exec_event::Event::Stdout(vec![1])).await,
+            Ok(1)
+        );
+        let blocked_send = tokio::spawn(async move {
+            send_ordered_exec_event(exec_id, exec_event::Event::Stdout(vec![2])).await
+        });
+        tokio::task::yield_now().await;
+
+        let control = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            begin_ordered_control(exec_id, "signal"),
+        )
+        .await
+        .expect("control must not wait behind full output channel")
+        .expect("registered control context");
+        assert_eq!(control.sequence, 3);
+        drop(control);
+
+        assert_eq!(receiver.recv().await.unwrap().unwrap().sequence, 1);
+        assert_eq!(blocked_send.await.unwrap(), Ok(2));
+        assert_eq!(receiver.recv().await.unwrap().unwrap().sequence, 2);
+        remove_exec_order_context(exec_id);
+    }
+
+    #[tokio::test]
+    async fn large_backpressured_output_is_fully_queued_before_exit() {
+        const CHUNKS_PER_READER: usize = 64;
+        const CHUNK_BYTES: usize = 32 * 1024;
+
+        let exec_id = test_exec_id();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let finish_sender = sender.clone();
+        register_exec_order_context(
+            exec_id,
+            ExecOrderContext::new(sender, "large-output".to_string()),
+        );
+
+        let mut stdout = tokio::spawn(async move {
+            for _ in 0..CHUNKS_PER_READER {
+                send_ordered_exec_event(
+                    exec_id,
+                    exec_event::Event::Stdout(vec![b'o'; CHUNK_BYTES]),
+                )
+                .await
+                .map_err(|_| "stdout stream closed".to_string())?;
+            }
+            Ok(())
+        });
+        let mut stderr = tokio::spawn(async move {
+            for _ in 0..CHUNKS_PER_READER {
+                send_ordered_exec_event(
+                    exec_id,
+                    exec_event::Event::Stderr(vec![b'e'; CHUNK_BYTES]),
+                )
+                .await
+                .map_err(|_| "stderr stream closed".to_string())?;
+            }
+            Ok(())
+        });
+        let finalizer = tokio::spawn(async move {
+            assert_eq!(
+                await_pipe_output_drain(exec_id, finish_sender, &mut stdout, &mut stderr).await,
+                OutputDrain::Drained
+            );
+            send_ordered_exec_event(exec_id, exec_event::Event::ExitCode(0))
+                .await
+                .expect("exit send")
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !finalizer.is_finished(),
+            "a full stream channel must backpressure the output barrier"
+        );
+
+        let mut output_chunks = 0;
+        let mut last_sequence = 0;
+        loop {
+            let event = receiver.recv().await.unwrap().unwrap();
+            assert_eq!(event.sequence, last_sequence + 1);
+            last_sequence = event.sequence;
+            match event.event.unwrap() {
+                exec_event::Event::Stdout(bytes) | exec_event::Event::Stderr(bytes) => {
+                    assert_eq!(bytes.len(), CHUNK_BYTES);
+                    output_chunks += 1;
+                }
+                exec_event::Event::ExitCode(0) => {
+                    assert_eq!(output_chunks, CHUNKS_PER_READER * 2);
+                    break;
+                }
+                other => panic!("unexpected event before terminal exit: {other:?}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(finalizer.await.unwrap(), (CHUNKS_PER_READER * 2 + 1) as u64);
+        remove_exec_order_context(exec_id);
+    }
+
+    #[tokio::test]
+    async fn slow_live_consumer_beyond_old_deadline_retains_pipe_finisher() {
+        let exec_id = test_exec_id();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let finish_sender = sender.clone();
+        register_exec_order_context(
+            exec_id,
+            ExecOrderContext::new(sender, "slow-live".to_string()),
+        );
+        let mut stdout = tokio::spawn(async move {
+            send_ordered_exec_event(exec_id, exec_event::Event::Stdout(vec![1]))
+                .await
+                .map_err(|_| "first output rejected".to_string())?;
+            send_ordered_exec_event(exec_id, exec_event::Event::Stdout(vec![2]))
+                .await
+                .map_err(|_| "second output rejected".to_string())?;
+            Ok(())
+        });
+        let mut stderr = tokio::spawn(async { Ok(()) });
+        let finisher = tokio::spawn(async move {
+            await_pipe_output_drain(exec_id, finish_sender, &mut stdout, &mut stderr).await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(5_100)).await;
+        assert!(
+            !finisher.is_finished(),
+            "a live slow consumer must retain finish authority beyond five seconds"
+        );
+        assert!(matches!(
+            receiver.recv().await.unwrap().unwrap().event,
+            Some(exec_event::Event::Stdout(bytes)) if bytes == [1]
+        ));
+        assert!(matches!(
+            receiver.recv().await.unwrap().unwrap().event,
+            Some(exec_event::Event::Stdout(bytes)) if bytes == [2]
+        ));
+        assert_eq!(finisher.await.unwrap(), OutputDrain::Drained);
+        remove_exec_order_context(exec_id);
+    }
+
+    #[tokio::test]
+    async fn closed_receiver_cancels_pipe_readers_and_releases_finisher() {
+        let exec_id = test_exec_id();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let mut stdout = tokio::spawn(std::future::pending::<OutputReaderResult>());
+        let mut stderr = tokio::spawn(std::future::pending::<OutputReaderResult>());
+        let finisher = tokio::spawn(async move {
+            await_pipe_output_drain(exec_id, sender, &mut stdout, &mut stderr).await
+        });
+
+        drop(receiver);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), finisher)
+                .await
+                .expect("closed receiver must release pipe finisher")
+                .unwrap(),
+            OutputDrain::ReceiverClosed
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_receiver_still_publishes_reaped_terminal_receipt_without_exit() {
+        use std::process::Stdio;
+
+        let exec_id = test_exec_id();
+        let mut command = tokio::process::Command::new("/bin/sleep");
+        command
+            .arg("0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let child = command.spawn().expect("spawn terminal receipt child");
+        let pid = child.id().expect("terminal receipt child PID");
+        #[cfg(target_os = "linux")]
+        let identity = capture_signal_identity(pid);
+        #[cfg(not(target_os = "linux"))]
+        let identity = ProcessIdentity::from_pid(pid);
+        let table = Arc::new(Mutex::new(ProcessTable::new()));
+        table
+            .lock()
+            .await
+            .insert(exec_id, child, None, identity, false);
+        let exit_code = {
+            let mut table = table.lock().await;
+            let status = table
+                .get_mut(exec_id)
+                .unwrap()
+                .child
+                .wait()
+                .await
+                .expect("reap terminal receipt child");
+            crate::process_table::normalized_exit_status(status)
+        };
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        register_exec_order_context(
+            exec_id,
+            ExecOrderContext::new(sender, "closed-terminal".to_string()),
+        );
+        drop(receiver);
+        finish_exec_stream(&table, exec_id, exit_code, OutputDrain::ReceiverClosed).await;
+
+        assert_eq!(
+            table.lock().await.terminal_receipt(exec_id),
+            Some(ExecTerminalReceipt {
+                exit_code: 0,
+                forced: false,
+            })
+        );
+        assert!(lookup_exec_order_context(exec_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn closed_receiver_cancels_pty_reader_and_releases_finisher() {
+        let exec_id = test_exec_id();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let cancel_reader = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_cancel = cancel_reader.clone();
+        let mut reader = tokio::task::spawn_blocking(move || -> OutputReaderResult {
+            while !task_cancel.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err("receiver closed".to_string())
+        });
+        let finisher = tokio::spawn(async move {
+            await_pty_output_drain(exec_id, sender, cancel_reader, &mut reader).await
+        });
+
+        drop(receiver);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), finisher)
+                .await
+                .expect("closed receiver must release PTY finisher")
+                .unwrap(),
+            OutputDrain::ReceiverClosed
+        );
+    }
+
+    #[tokio::test]
+    async fn pty_output_bytes_are_enqueued_before_exit() {
+        const CHUNKS: usize = 32;
+        const BYTES: usize = 4096;
+
+        let exec_id = test_exec_id();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let finish_sender = sender.clone();
+        register_exec_order_context(
+            exec_id,
+            ExecOrderContext::new(sender, "pty-order".to_string()),
+        );
+        let cancel_reader = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut reader = tokio::spawn(async move {
+            for _ in 0..CHUNKS {
+                send_ordered_exec_event(exec_id, exec_event::Event::Stdout(vec![b'p'; BYTES]))
+                    .await
+                    .map_err(|_| "PTY output rejected".to_string())?;
+            }
+            Ok(())
+        });
+        let finalizer = tokio::spawn(async move {
+            assert_eq!(
+                await_pty_output_drain(exec_id, finish_sender, cancel_reader, &mut reader).await,
+                OutputDrain::Drained
+            );
+            send_ordered_exec_event(exec_id, exec_event::Event::ExitCode(0))
+                .await
+                .expect("PTY exit send")
+        });
+
+        let mut bytes = 0;
+        loop {
+            let event = receiver.recv().await.unwrap().unwrap();
+            match event.event.unwrap() {
+                exec_event::Event::Stdout(chunk) => bytes += chunk.len(),
+                exec_event::Event::ExitCode(0) => break,
+                other => panic!("unexpected PTY event: {other:?}"),
+            }
+        }
+        assert_eq!(bytes, CHUNKS * BYTES);
+        assert_eq!(finalizer.await.unwrap(), (CHUNKS + 1) as u64);
+        remove_exec_order_context(exec_id);
+    }
+
+    fn assert_process_absent(pid: u32) {
+        // SAFETY: signal zero only queries whether the exact PID exists.
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "child must be killed and reaped before ownership is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_ready_pipe_rejection_reaps_before_definite_error_frame() {
+        use std::process::Stdio;
+
+        let mut command = tokio::process::Command::new("/bin/sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let child = command.spawn().expect("spawn pending child");
+        let pid = child.id().expect("pending child PID");
+
+        let response = reject_pending_pipe(
+            PendingPipeChild::new(child),
+            "pre-ready-test",
+            Status::failed_precondition("injected readiness failure"),
+        )
+        .await
+        .expect("terminated and reaped child must permit a definite rejection");
+        let mut receiver = response.into_inner().into_inner();
+        let event = receiver.recv().await.unwrap().unwrap();
+        assert_eq!(event.exec_id, 0);
+        assert_eq!(event.sequence, 1);
+        assert_eq!(event.request_id, "pre-ready-test");
+        let Some(exec_event::Event::Error(detail)) = event.event else {
+            panic!("pre-ready rejection must be an Error event");
+        };
+        assert!(detail.contains("rejected before readiness"));
+        assert!(detail.contains("spawned process reaped"));
+        assert_process_absent(pid);
+    }
+
+    #[tokio::test]
+    async fn pending_pipe_drop_reaps_when_handler_is_cancelled() {
+        use std::process::Stdio;
+
+        let mut command = tokio::process::Command::new("/bin/sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let child = command.spawn().expect("spawn pending child");
+        let pid = child.id().expect("pending child PID");
+
+        drop(PendingPipeChild::new(child));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                // SAFETY: signal zero only queries whether the exact PID exists.
+                if unsafe { libc::kill(pid as i32, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("drop cleanup did not reap pending pipe child");
+        assert_process_absent(pid);
+    }
+
+    #[tokio::test]
+    async fn cancellation_ordering_never_waits_behind_stdin_control() {
+        let exec_id = test_exec_id();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        register_exec_order_context(
+            exec_id,
+            ExecOrderContext::new(sender, "stdin-cancel".to_string()),
+        );
+        let stdin_control = begin_ordered_control(exec_id, "stdin_write")
+            .await
+            .expect("stdin control");
+        assert_eq!(stdin_control.sequence, 1);
+        assert_eq!(mark_nonblocking_control(exec_id, "cancel_exec"), Some(2));
+        drop(stdin_control);
+        remove_exec_order_context(exec_id);
+    }
+
+    async fn register_test_process(
+        exec_id: u64,
+        ignore_term: bool,
+        piped_stdin: bool,
+    ) -> (
+        Arc<Mutex<ProcessTable>>,
+        crate::process_table::ExecCompletion,
+    ) {
+        use std::process::Stdio;
+
+        let mut command = tokio::process::Command::new("/bin/sleep");
+        command
+            .arg("30")
+            .stdin(if piped_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        if ignore_term {
+            use std::os::unix::process::CommandExt as _;
+
+            // SAFETY: pre_exec runs in the child and invokes only signal(2).
+            unsafe {
+                command.as_std_mut().pre_exec(|| {
+                    if libc::signal(libc::SIGTERM, libc::SIG_IGN) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let mut child = command.spawn().expect("spawn test process");
+        let pid = child.id().expect("test process pid");
+        let stdin = child.stdin.take();
+        #[cfg(target_os = "linux")]
+        let identity = capture_signal_identity(pid);
+        #[cfg(not(target_os = "linux"))]
+        let identity = ProcessIdentity::from_pid(pid);
+
+        let table = Arc::new(Mutex::new(ProcessTable::new()));
+        let completion = table
+            .lock()
+            .await
+            .insert(exec_id, child, stdin, identity, false);
+        let watcher_table = table.clone();
+        tokio::spawn(async move {
+            let exit_code = loop {
+                let observed = {
+                    let mut table = watcher_table.lock().await;
+                    let entry = table.get_mut(exec_id).expect("registered test process");
+                    entry
+                        .child
+                        .try_wait()
+                        .expect("poll test process")
+                        .map(crate::process_table::normalized_exit_status)
+                };
+                if let Some(exit_code) = observed {
+                    break exit_code;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
+            watcher_table.lock().await.finish(exec_id, exit_code);
+        });
+        (table, completion)
+    }
+
+    async fn wait_for_cancel_start(table: &Arc<Mutex<ProcessTable>>, exec_id: u64) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if table.lock().await.cancellation_deadline(exec_id).is_some() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation driver must start");
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_reap_and_returns_normalized_status() {
+        let exec_id = test_exec_id();
+        let (table, _completion) = register_test_process(exec_id, false, false).await;
+
+        let outcome = cancel_active_exec(&table, exec_id)
+            .await
+            .expect("cancel active process");
+        assert_eq!(outcome.exit_code, 128 + libc::SIGTERM);
+        assert!(!outcome.forced);
+        {
+            let table = table.lock().await;
+            assert!(table.completion(exec_id).is_none());
+            assert_eq!(
+                table.terminal_receipt(exec_id),
+                Some(ExecTerminalReceipt {
+                    exit_code: 128 + libc::SIGTERM,
+                    forced: false,
+                })
+            );
+        }
+        assert_eq!(
+            cancel_active_exec(&table, exec_id)
+                .await
+                .expect("completed cancellation must be idempotent"),
+            outcome
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_escalates_to_kill_for_term_ignoring_process() {
+        let exec_id = test_exec_id();
+        let (table, _completion) = register_test_process(exec_id, true, false).await;
+
+        let outcome = cancel_active_exec(&table, exec_id)
+            .await
+            .expect("force-cancel active process");
+        assert_eq!(outcome.exit_code, 128 + libc::SIGKILL);
+        assert!(outcome.forced);
+        {
+            let table = table.lock().await;
+            assert!(table.completion(exec_id).is_none());
+            assert_eq!(
+                table.terminal_receipt(exec_id),
+                Some(ExecTerminalReceipt {
+                    exit_code: 128 + libc::SIGKILL,
+                    forced: true,
+                })
+            );
+        }
+        assert_eq!(
+            cancel_active_exec(&table, exec_id)
+                .await
+                .expect("forced cancellation receipt must be replayable"),
+            outcome
+        );
+    }
+
+    #[tokio::test]
+    async fn aborted_cancellation_rpc_cannot_abandon_escalation() {
+        let exec_id = test_exec_id();
+        let (table, completion) = register_test_process(exec_id, true, false).await;
+        let caller_table = table.clone();
+        let caller = tokio::spawn(async move {
+            cancel_active_exec_with_grace(
+                &caller_table,
+                exec_id,
+                std::time::Duration::from_millis(150),
+            )
+            .await
+        });
+        wait_for_cancel_start(&table, exec_id).await;
+        caller.abort();
+
+        let receipt = tokio::time::timeout(std::time::Duration::from_secs(2), completion.wait())
+            .await
+            .expect("durable driver must complete after caller abort")
+            .expect("durable driver must publish an exact receipt");
+        assert_eq!(receipt.exit_code, 128 + libc::SIGKILL);
+        assert!(receipt.forced);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cancellation_retries_share_one_fixed_deadline_and_receipt() {
+        let exec_id = test_exec_id();
+        let (table, _completion) = register_test_process(exec_id, true, false).await;
+        let first_table = table.clone();
+        let first = tokio::spawn(async move {
+            cancel_active_exec_with_grace(
+                &first_table,
+                exec_id,
+                std::time::Duration::from_millis(200),
+            )
+            .await
+        });
+        wait_for_cancel_start(&table, exec_id).await;
+        let original_deadline = table
+            .lock()
+            .await
+            .cancellation_deadline(exec_id)
+            .expect("fixed deadline");
+
+        let mut retries = Vec::new();
+        for _ in 0..4 {
+            let retry_table = table.clone();
+            retries.push(tokio::spawn(async move {
+                cancel_active_exec_with_grace(
+                    &retry_table,
+                    exec_id,
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+            }));
+        }
+        assert_eq!(
+            table.lock().await.cancellation_deadline(exec_id),
+            Some(original_deadline)
+        );
+
+        let expected = first.await.unwrap().expect("first cancellation receipt");
+        assert_eq!(expected.exit_code, 128 + libc::SIGKILL);
+        assert!(expected.forced);
+        for retry in retries {
+            assert_eq!(retry.await.unwrap().expect("retry receipt"), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn full_nonreading_stdin_cannot_block_bounded_cancellation() {
+        let exec_id = test_exec_id();
+        let (table, _completion) = register_test_process(exec_id, true, true).await;
+        let writer_table = table.clone();
+        let writer = tokio::spawn(async move {
+            write_pipe_stdin(&writer_table, exec_id, &vec![b'x'; MAX_STDIN_WRITE_BYTES]).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !writer.is_finished(),
+            "non-reading child should fill stdin pipe"
+        );
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            cancel_active_exec_with_grace(&table, exec_id, std::time::Duration::from_millis(150)),
+        )
+        .await
+        .expect("cancellation must not wait behind blocked stdin")
+        .expect("cancellation receipt");
+        assert_eq!(outcome.exit_code, 128 + libc::SIGKILL);
+        assert!(outcome.forced);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), writer)
+            .await
+            .expect("stdin work must be bounded");
+    }
+
+    #[tokio::test]
+    async fn stdin_payload_is_bounded_before_process_lookup() {
+        let table = Arc::new(Mutex::new(ProcessTable::new()));
+        let error = write_pipe_stdin(&table, test_exec_id(), &vec![0; MAX_STDIN_WRITE_BYTES + 1])
+            .await
+            .expect_err("oversized stdin must fail");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn wait_errors_are_retryable_and_never_normalized_as_terminal_receipts() {
+        let error = classify_child_wait(Err(std::io::Error::other("injected wait failure")))
+            .expect_err("wait error must remain an error");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(classify_child_wait(Ok(None)).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn cancellation_rejects_unknown_or_stale_exec_id() {
+        let table = Arc::new(Mutex::new(ProcessTable::new()));
+        let error = cancel_active_exec(&table, test_exec_id())
+            .await
+            .expect_err("unknown cancellation must fail");
+        assert_eq!(error.code(), tonic::Code::NotFound);
+        let table = table.lock().await;
+        let error = terminal_cancel_outcome(&table, test_exec_id())
+            .expect_err("unknown terminal receipt must fail");
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn dropped_stream_cancels_and_reaps_registered_process() {
+        let exec_id = test_exec_id();
+        let (table, completion) = register_test_process(exec_id, false, false).await;
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        register_exec_order_context(
+            exec_id,
+            ExecOrderContext::new(sender, "drop-test".to_string()),
+        );
+        monitor_exec_stream_loss(table.clone(), exec_id);
+        drop(receiver);
+
+        let receipt = tokio::time::timeout(std::time::Duration::from_secs(2), completion.wait())
+            .await
+            .expect("stream-loss cancellation must be bounded")
+            .expect("stream-loss cancellation must publish a reap receipt");
+        assert_eq!(receipt.exit_code, 128 + libc::SIGTERM);
+        assert!(!receipt.forced);
+        assert_eq!(
+            table.lock().await.terminal_receipt(exec_id),
+            Some(ExecTerminalReceipt {
+                exit_code: 128 + libc::SIGTERM,
+                forced: false,
+            })
+        );
+        remove_exec_order_context(exec_id);
     }
 
     #[tokio::test]

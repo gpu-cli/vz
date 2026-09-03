@@ -3846,6 +3846,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "vz",
  "vz-agent-proto",
 ]
@@ -3885,6 +3886,7 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "vz",
  "vz-agent-proto",
  "vz-runtime-contract",

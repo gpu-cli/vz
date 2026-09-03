@@ -2,6 +2,10 @@
 
 use std::env;
 
+use super::exec::{
+    MAX_PENDING_EXEC_CONTROLS, MAX_PENDING_EXEC_STDIN_BYTES, PendingExecQueueError,
+    pending_control_error,
+};
 use super::stack_vm::{
     activation_error_with_rollback, clear_recovery_route_last, commit_stack_cleanup_batch,
     hosts_write_command, publish_recovery_route_first, require_running_pid,
@@ -109,6 +113,71 @@ fn every_container_creation_path_validates_id_before_pull() {
         include_str!("stack_vm.rs"),
         "pub async fn create_container_in_stack(",
     );
+}
+
+#[test]
+fn one_shot_run_resolves_all_fallible_config_before_publishing_created_metadata() {
+    let source = include_str!("mod.rs");
+    let body = source
+        .split_once("async fn run_in_transaction(")
+        .expect("run transaction implementation")
+        .1;
+    let image_config = body
+        .find("parse_image_config_summary_from_store")
+        .expect("image config resolution");
+    let run_config = body
+        .find("resolve_run_config(")
+        .expect("run config resolution");
+    let lifecycle = body
+        .find("resolve_container_lifecycle(")
+        .expect("lifecycle resolution");
+    let first_persist = body
+        .find("self.persist_owned(transaction, container.clone())?")
+        .expect("Created metadata persistence");
+
+    assert!(image_config < first_persist);
+    assert!(run_config < first_persist);
+    assert!(lifecycle < first_persist);
+}
+
+#[test]
+fn public_rootfs_run_transfers_lifecycle_and_arms_cleanup_before_vm_start() {
+    let source = include_str!("run_rootfs.rs");
+    let public = source
+        .split_once("pub async fn run_rootfs(")
+        .expect("public rootfs entrypoint")
+        .1;
+    let owned_marker = public
+        .find("async fn run_rootfs_owned(")
+        .expect("owned rootfs worker");
+    assert!(
+        public[..owned_marker].contains("tokio::spawn(async move"),
+        "the public future must transfer lifecycle ownership before awaiting VM work"
+    );
+
+    let owned = &public[owned_marker..];
+    let validation = owned
+        .find("validate_container_id(&registered_container_id)?")
+        .expect("recovery-route identity validation");
+    let create = owned
+        .find("Arc::new(LinuxVm::create(vm_config).await?)")
+        .expect("Arc-owned VM creation");
+    let cleanup = owned
+        .find("TransientVmCleanupGuard::new(")
+        .expect("transient cleanup guard");
+    let route = owned
+        .find("vm_handles.insert(registered_container_id.clone(), Arc::clone(&vm))")
+        .expect("recoverable VM route");
+    let start = owned.find("vm.start().await").expect("VM start");
+    let forwarding_shutdown = owned
+        .find("port_forwards.shutdown().await")
+        .expect("port-forward shutdown");
+    let stop = owned
+        .rfind("vm_cleanup.stop().await")
+        .expect("terminal VM cleanup");
+
+    assert!(validation < create && create < cleanup && cleanup < route && route < start);
+    assert!(forwarding_shutdown < stop);
 }
 
 #[tokio::test]
@@ -1210,17 +1279,147 @@ fn macos_runtime_container_exec_adapters_never_construct_namespace_argv() {
             "{name} adapter must send container identity and raw argv to the guest"
         );
     }
-    assert!(exec_source.contains("exec_container_stream_ready_with_options"));
-    assert!(exec_source.contains("exec_container_interactive_ready"));
-    assert!(exec_source.contains("vm.oci_exec("));
-    assert!(exec_source.matches("id.to_string(),").count() >= 3);
-    assert!(exec_source.matches("command").count() >= 3);
+    assert!(exec_source.contains("exec_container_stream_ready_classified_for_request"));
+    assert!(exec_source.contains("exec_container_interactive_ready_classified_for_request"));
+    assert!(
+        exec_source
+            .matches("exec_container_streaming_admitted")
+            .count()
+            >= 3,
+        "unary compatibility must share the addressable supervised stream path"
+    );
+    assert!(exec_source.matches("id.to_string(),").count() >= 2);
+    assert!(exec_source.matches("command").count() >= 2);
     assert!(lifecycle_source.contains("exec_container_collect_with_options"));
     assert!(lifecycle_source.contains(
         "                    id,\n                    command,\n                    args,"
     ));
     assert!(stack_source.contains("exec_container_collect_with_options"));
     assert!(stack_source.contains("                    oci_container_id.clone(),\n                    hosts_command,\n                    hosts_args,"));
+}
+
+#[test]
+fn exec_before_guest_rpc_observer_fires_after_control_registration() {
+    let source = include_str!("exec.rs");
+    let registration = source
+        .find(".register_exec_session(")
+        .expect("exec path must register its control session");
+    let observer = source
+        .find("RuntimeLifecycleAdmissionKind::ExecBeforeGuestRpc")
+        .expect("exec path must retain its pre-RPC observer");
+    let first_guest_spawn = source
+        .find("let start_task = tokio::spawn")
+        .expect("exec path must own its readiness task");
+    assert!(registration < observer);
+    assert!(observer < first_guest_spawn);
+    assert_eq!(
+        source
+            .matches("RuntimeLifecycleAdmissionKind::ExecBeforeGuestRpc")
+            .count(),
+        1,
+        "all public adapters must share the registered pre-RPC observation point"
+    );
+}
+
+#[test]
+fn container_exec_dispatch_gate_covers_preflight_and_fast_undispatched_cleanup() {
+    let source = include_str!("exec.rs");
+    let gate_install = source
+        .find(".install_dispatch_gate(dispatch_gate.clone())")
+        .expect("registered session must own the gate before preflight");
+    let observer = source
+        .find("RuntimeLifecycleAdmissionKind::ExecBeforeGuestRpc")
+        .expect("preflight observer");
+    let first_start = source
+        .find("let start_task = tokio::spawn")
+        .expect("owned start task");
+    assert!(gate_install < observer && observer < first_start);
+    assert_eq!(
+        source.matches("start_dispatch_gate,").count(),
+        2,
+        "pipe and PTY starts must use the registered gate"
+    );
+
+    let interrupted = source
+        .split_once("async fn finish_interrupted_exec_start(")
+        .expect("interrupted start cleanup")
+        .1
+        .split_once("fn non_empty(")
+        .expect("interrupted cleanup boundary")
+        .0;
+    let fast_proof = interrupted
+        .find("finish_if_dispatch_prevented().await")
+        .expect("undispatched proof branch");
+    let bounded_wait = interrupted
+        .find("tokio::time::timeout(EXEC_TERMINATION_WAIT")
+        .expect("authorized start cleanup wait");
+    assert!(fast_proof < bounded_wait);
+}
+
+#[test]
+fn ready_exec_cleanup_authority_is_retained_until_terminal_proof() {
+    let source = include_str!("exec.rs");
+    assert_eq!(
+        source.matches("ReadyExecLease::new(").count(),
+        2,
+        "promotion and retained startup cleanup must both construct a ready-owner guard"
+    );
+    assert_eq!(
+        source.matches("StartingExecLease::new(").count(),
+        2,
+        "PTY and pipe startup tasks must be owned before either is awaited"
+    );
+    assert_eq!(
+        source
+            .matches("starting.promote(stream, guest_exec_id)")
+            .count(),
+        3,
+        "all synchronous ready-result paths must atomically promote startup ownership"
+    );
+
+    let registration_drop = source
+        .split("impl Drop for ExecSessionRegistration")
+        .nth(1)
+        .and_then(|source| source.split("type GuestExecStart").next());
+    let Some(registration_drop) = registration_drop else {
+        panic!("missing exec registration Drop implementation");
+    };
+    assert!(registration_drop.contains("loop {"));
+    assert!(registration_drop.contains("session.cancel_running(guest_exec_id)"));
+    assert!(
+        !registration_drop.contains("let _ = tokio::time::timeout"),
+        "registration Drop must not discard cancellation failure or timeout"
+    );
+    assert!(
+        registration_drop.find("session.cancel_running(guest_exec_id)")
+            < registration_drop.find("registry.remove(&execution_id)"),
+        "a running registration may be removed only after cancellation receipt"
+    );
+}
+
+#[test]
+fn ambiguous_exec_start_failure_reconciles_or_retains_lifecycle_authority() {
+    let source = include_str!("exec.rs");
+    let resolution = source
+        .split_once("async fn resolve_exec_start_failure")
+        .expect("classified start failures must have an ownership resolver")
+        .1
+        .split_once("impl Drop for StartingExecLease")
+        .expect("resolver must precede the starting lease Drop")
+        .0;
+
+    assert!(resolution.contains("ContainerExecStartError::Definite"));
+    assert!(resolution.contains("starting.finish_pre_ready().await"));
+    assert!(resolution.contains("ContainerExecStartError::Ambiguous"));
+    assert!(resolution.contains("resolve_unknown_start_failure_bounded"));
+    assert!(source.contains("self.retain_unknown_start_failure(context)"));
+    assert!(source.contains("EXEC_TERMINATION_WAIT"));
+    assert!(source.contains("ExecStartFailureResolution::Reconciled"));
+    assert!(source.contains("ExecStartFailureResolution::Pending"));
+    assert!(source.contains("retain_ambiguous_start_authority("));
+    assert!(source.contains("std::mem::forget(authority)"));
+    assert!(source.contains("reconciliation=PENDING_UNDER_RETAINED_AUTHORITY"));
+    assert!(!source.contains("std::future::pending::<()>().await"));
 }
 
 #[tokio::test]
@@ -1748,6 +1947,75 @@ async fn lifecycle_observer_reports_stop_request_before_writer_admission() {
             stop.await.unwrap().unwrap();
         })
         .await;
+}
+
+#[tokio::test]
+async fn cancelled_create_after_reservation_releases_unpublished_generation() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("cancel-create-after-reservation"),
+        ..RuntimeConfig::default()
+    });
+    let mut observer = runtime.install_lifecycle_observer();
+    let creating_runtime = runtime.clone();
+    let create = tokio::spawn(async move {
+        let mut run = RunConfig {
+            container_id: Some("cancelled-create".to_string()),
+            ..RunConfig::default()
+        };
+        let transaction = creating_runtime
+            .begin_container_create(&mut run, None)
+            .await?;
+        drop(transaction);
+        Ok::<(), OciError>(())
+    });
+
+    let before = observer.recv().await.unwrap();
+    assert_eq!(
+        before.kind(),
+        RuntimeLifecycleAdmissionKind::CreateBeforeReservation
+    );
+    before.resume();
+    let after = observer.recv().await.unwrap();
+    assert_eq!(
+        after.kind(),
+        RuntimeLifecycleAdmissionKind::CreateAfterReservation
+    );
+    assert!(
+        runtime
+            .container_store
+            .current_generation("cancelled-create")
+            .unwrap()
+            .is_some()
+    );
+
+    create.abort();
+    assert!(create.await.unwrap_err().is_cancelled());
+    drop(after);
+    assert_eq!(
+        runtime
+            .container_store
+            .current_generation("cancelled-create")
+            .unwrap(),
+        None
+    );
+
+    let mut retry = RunConfig {
+        container_id: Some("cancelled-create".to_string()),
+        ..RunConfig::default()
+    };
+    let retry_runtime = runtime.clone();
+    let retry_create = tokio::spawn(async move {
+        let transaction = retry_runtime
+            .begin_container_create(&mut retry, None)
+            .await?;
+        drop(transaction);
+        Ok::<(), OciError>(())
+    });
+    let before = observer.recv().await.unwrap();
+    before.resume();
+    let after = observer.recv().await.unwrap();
+    after.resume();
+    retry_create.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -3758,6 +4026,162 @@ fn exec_config_default_is_empty() {
     assert!(cfg.term_rows.is_none());
     assert!(cfg.term_cols.is_none());
     assert!(cfg.timeout.is_none());
+}
+
+#[test]
+fn starting_exec_controls_are_queued_deterministically() {
+    let mut pending = PendingExecControls::default();
+    assert!(pending.queue_stdin(b"first").is_ok());
+    assert!(pending.queue_resize(24, 80).is_ok());
+    assert!(pending.queue_signal(15).is_ok());
+    assert!(pending.queue_resize(36, 110).is_ok());
+    assert!(pending.queue_resize(37, 111).is_ok());
+    assert!(pending.queue_stdin(b"second").is_ok());
+    assert!(pending.queue_signal(2).is_ok());
+    assert!(pending.request_cancel());
+
+    assert_eq!(
+        pending.operations,
+        [PendingExecControl::Cancel],
+        "pre-ready cancellation must preempt queued control work"
+    );
+    assert_eq!(pending.stdin_bytes, 0);
+    assert!(pending.cancel_requested);
+    assert_eq!(
+        pending.queue_signal(9),
+        Err(PendingExecQueueError::Cancelled)
+    );
+    assert_eq!(
+        pending.queue_stdin(b"after-cancel"),
+        Err(PendingExecQueueError::Cancelled)
+    );
+    assert_eq!(
+        pending.queue_resize(50, 120),
+        Err(PendingExecQueueError::Cancelled)
+    );
+    assert!(!pending.request_cancel());
+    assert!(matches!(
+        pending.operations.last(),
+        Some(PendingExecControl::Cancel)
+    ));
+}
+
+#[test]
+fn starting_exec_controls_enforce_operation_and_stdin_bounds() {
+    let mut operations = PendingExecControls::default();
+    for signal in 0..MAX_PENDING_EXEC_CONTROLS {
+        operations.queue_signal((signal % 64 + 1) as i32).unwrap();
+    }
+    assert_eq!(
+        operations.queue_signal(15),
+        Err(PendingExecQueueError::OperationLimit)
+    );
+
+    let mut stdin = PendingExecControls::default();
+    stdin
+        .queue_stdin(&vec![b'x'; MAX_PENDING_EXEC_STDIN_BYTES])
+        .unwrap();
+    assert_eq!(
+        stdin.queue_stdin(b"x"),
+        Err(PendingExecQueueError::StdinByteLimit)
+    );
+}
+
+#[test]
+fn pending_exec_control_limits_map_to_deterministic_oci_errors() {
+    assert!(matches!(
+        pending_control_error(PendingExecQueueError::Cancelled, "queued"),
+        OciError::ExecutionSessionNotFound { execution_id } if execution_id == "queued"
+    ));
+
+    let operation = pending_control_error(PendingExecQueueError::OperationLimit, "queued");
+    let OciError::InvalidConfig(operation) = operation else {
+        panic!("operation limit must map to InvalidConfig");
+    };
+    assert_eq!(
+        operation,
+        format!(
+            "execution session 'queued' exceeded the pending control limit of {MAX_PENDING_EXEC_CONTROLS}"
+        )
+    );
+
+    let stdin = pending_control_error(PendingExecQueueError::StdinByteLimit, "queued");
+    let OciError::InvalidConfig(stdin) = stdin else {
+        panic!("stdin limit must map to InvalidConfig");
+    };
+    assert_eq!(
+        stdin,
+        format!(
+            "execution session 'queued' exceeded the pending stdin limit of {MAX_PENDING_EXEC_STDIN_BYTES} bytes"
+        )
+    );
+}
+
+#[test]
+fn running_cancel_does_not_wait_for_the_host_control_rpc_lock() {
+    let source = include_str!("exec.rs");
+    let write = source
+        .split("async fn write_stdin(&self")
+        .nth(1)
+        .and_then(|source| source.split("async fn resize_pty").next());
+    let Some(write) = write else {
+        panic!("missing ContainerExecSession::write_stdin implementation");
+    };
+    assert!(
+        write.contains("self.control.lock"),
+        "test requires stdin to retain ordered host control serialization"
+    );
+    let cancel = source
+        .split("async fn cancel(&self")
+        .nth(1)
+        .and_then(|source| source.split("async fn wait_start_cancel_requested").next());
+    let Some(cancel) = cancel else {
+        panic!("missing ContainerExecSession::cancel implementation");
+    };
+    assert!(cancel.contains("*cancel_requested = true"));
+    assert!(
+        !cancel.contains("self.control.lock"),
+        "CancelExec must not queue behind a blocked stdin/signal/resize RPC"
+    );
+}
+
+#[tokio::test]
+async fn startup_timeout_keeps_readiness_task_awaitable_for_cleanup() {
+    let dispatch_gate = ContainerExecDispatchGate::new(tokio::time::Instant::now());
+    let mut task = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        41_u32
+    });
+    let outcome = await_exec_start(
+        &mut task,
+        tokio::time::Instant::now(),
+        std::future::pending(),
+        &dispatch_gate,
+    )
+    .await;
+    assert!(matches!(outcome, Err(ExecStartInterruption::TimedOut)));
+    assert!(dispatch_gate.cancel_before_dispatch());
+    assert_eq!(task.await.unwrap(), 41);
+}
+
+#[tokio::test]
+async fn startup_cancel_keeps_readiness_task_awaitable_for_cleanup() {
+    let dispatch_gate =
+        ContainerExecDispatchGate::new(tokio::time::Instant::now() + Duration::from_secs(1));
+    let mut task = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        42_u32
+    });
+    let outcome = await_exec_start(
+        &mut task,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        std::future::ready(()),
+        &dispatch_gate,
+    )
+    .await;
+    assert!(matches!(outcome, Err(ExecStartInterruption::Cancelled)));
+    assert!(dispatch_gate.cancel_before_dispatch());
+    assert_eq!(task.await.unwrap(), 42);
 }
 
 #[test]

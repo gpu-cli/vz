@@ -12,12 +12,14 @@ use std::ffi::{CString, OsString};
 use std::os::unix::ffi::OsStrExt as _;
 #[cfg(target_os = "linux")]
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicI32, Ordering};
 
 #[cfg(any(target_os = "linux", test))]
 use anyhow::Context;
 use anyhow::bail;
 
-pub(crate) const TRAMPOLINE_MARKER: &str = "__vz_container_exec_v3";
+pub(crate) const TRAMPOLINE_MARKER: &str = "__vz_container_exec_v4";
 const SELF_EXE: &str = "/proc/self/exe";
 #[cfg(any(target_os = "linux", test))]
 const MAX_CGROUP_FILE_BYTES: usize = 64 * 1024;
@@ -36,6 +38,15 @@ const MAX_IDENTITY_RECORD_BYTES: usize = 16 * 1024;
 const MAX_IDENTITY_NAME_BYTES: usize = 256;
 #[cfg(any(target_os = "linux", test))]
 const MAX_SUPPLEMENTARY_GROUPS: usize = 1024;
+#[cfg(target_os = "linux")]
+const DESCENDANT_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Child process group currently owned by this single-use trampoline.
+#[cfg(target_os = "linux")]
+static SUPERVISED_PROCESS_GROUP: AtomicI32 = AtomicI32::new(0);
+/// Private control signal which means "kill the complete supervised group".
+#[cfg(target_os = "linux")]
+static FORCE_CANCEL_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 /// A command which starts the hidden, same-binary trampoline.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +59,8 @@ pub(crate) struct TrampolineCommand {
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrampolineInvocation {
+    expected_parent_pid: u32,
+    expected_parent_start_time: u64,
     container_id: String,
     command: String,
     args: Vec<String>,
@@ -143,6 +156,8 @@ enum ChildSetupStage {
     UserIdentity = 16,
     IdentityVerify = 17,
     Execve = 18,
+    DeathSentinel = 19,
+    SupervisorReady = 20,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -167,6 +182,8 @@ impl ChildSetupStage {
             Self::UserIdentity => "user identity selection",
             Self::IdentityVerify => "execution identity verification",
             Self::Execve => "command execve",
+            Self::DeathSentinel => "death sentinel launch",
+            Self::SupervisorReady => "supervisor readiness gate",
         }
     }
 
@@ -190,9 +207,16 @@ impl ChildSetupStage {
             16 => Self::UserIdentity,
             17 => Self::IdentityVerify,
             18 => Self::Execve,
+            19 => Self::DeathSentinel,
+            20 => Self::SupervisorReady,
             _ => return None,
         })
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn setup_failure_requires_group_termination(stage: ChildSetupStage) -> bool {
+    stage == ChildSetupStage::DeathSentinel
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -206,6 +230,8 @@ struct ChildSetupError {
 #[derive(Clone, Copy)]
 struct ChildLaunchFds {
     setup_error: libc::c_int,
+    launch_gate_reader: libc::c_int,
+    launch_gate_writer: libc::c_int,
     launcher_pidfd: libc::c_int,
     target_pidfd: libc::c_int,
     cgroup_procs: libc::c_int,
@@ -286,8 +312,11 @@ pub(crate) fn prepare_trampoline_with_ready_socket(
         Some(_) => bail!("container exec ready socket and challenge cannot be empty"),
         None => ("n".to_string(), "n".to_string()),
     };
-    let mut trampoline_args = Vec::with_capacity(args.len() + 8);
+    let (expected_parent_pid, expected_parent_start_time) = expected_agent_parent_identity()?;
+    let mut trampoline_args = Vec::with_capacity(args.len() + 10);
     trampoline_args.push(TRAMPOLINE_MARKER.to_string());
+    trampoline_args.push(expected_parent_pid.to_string());
+    trampoline_args.push(expected_parent_start_time.to_string());
     trampoline_args.push(container_id.to_string());
     trampoline_args.push(encoded_cwd);
     trampoline_args.push(encoded_user);
@@ -313,6 +342,10 @@ pub(crate) fn is_trampoline_request(args: &[OsString]) -> bool {
 #[cfg(target_os = "linux")]
 pub(crate) fn run_trampoline(args: Vec<OsString>) -> anyhow::Result<()> {
     let invocation = parse_trampoline_args(&args)?;
+    arm_outer_parent_death(
+        invocation.expected_parent_pid,
+        invocation.expected_parent_start_time,
+    )?;
     let admission = ContainerAdmissionGuard::shared(&invocation.container_id)?;
     let mut ops = RealLauncherOps {
         admission: Some(admission),
@@ -332,9 +365,16 @@ fn parse_trampoline_args(args: &[OsString]) -> anyhow::Result<TrampolineInvocati
     if !is_trampoline_request(args) {
         bail!("container exec trampoline marker is missing");
     }
-    let container_id = required_utf8_arg(args, 1, "container id")?;
+    let expected_parent_pid = required_utf8_arg(args, 1, "expected parent PID")?
+        .parse::<u32>()
+        .context("container exec expected parent PID is invalid")?;
+    let expected_parent_start_time = required_utf8_arg(args, 2, "expected parent start time")?
+        .parse::<u64>()
+        .context("container exec expected parent start time is invalid")?;
+    validate_expected_parent_identity(expected_parent_pid, expected_parent_start_time)?;
+    let container_id = required_utf8_arg(args, 3, "container id")?;
     validate_container_id(&container_id)?;
-    let encoded_cwd = required_utf8_arg(args, 2, "working directory")?;
+    let encoded_cwd = required_utf8_arg(args, 4, "working directory")?;
     let working_dir = if encoded_cwd == "n" {
         None
     } else if let Some(value) = encoded_cwd.strip_prefix('s') {
@@ -342,7 +382,7 @@ fn parse_trampoline_args(args: &[OsString]) -> anyhow::Result<TrampolineInvocati
     } else {
         bail!("container exec trampoline working directory encoding is invalid");
     };
-    let encoded_user = required_utf8_arg(args, 3, "user")?;
+    let encoded_user = required_utf8_arg(args, 5, "user")?;
     let user = if encoded_user == "n" {
         None
     } else if let Some(value) = encoded_user
@@ -353,12 +393,12 @@ fn parse_trampoline_args(args: &[OsString]) -> anyhow::Result<TrampolineInvocati
     } else {
         bail!("container exec trampoline user encoding is invalid");
     };
-    let retain_shell_environment = match required_utf8_arg(args, 4, "SHELL policy")?.as_str() {
+    let retain_shell_environment = match required_utf8_arg(args, 6, "SHELL policy")?.as_str() {
         "s" => true,
         "n" => false,
         _ => bail!("container exec trampoline SHELL policy encoding is invalid"),
     };
-    let encoded_ready_socket = required_utf8_arg(args, 5, "ready socket")?;
+    let encoded_ready_socket = required_utf8_arg(args, 7, "ready socket")?;
     let ready_socket = if encoded_ready_socket == "n" {
         None
     } else if let Some(value) = encoded_ready_socket.strip_prefix('s') {
@@ -367,7 +407,7 @@ fn parse_trampoline_args(args: &[OsString]) -> anyhow::Result<TrampolineInvocati
     } else {
         bail!("container exec trampoline ready socket encoding is invalid");
     };
-    let encoded_ready_challenge = required_utf8_arg(args, 6, "ready challenge")?;
+    let encoded_ready_challenge = required_utf8_arg(args, 8, "ready challenge")?;
     let ready_challenge = if encoded_ready_challenge == "n" {
         None
     } else if let Some(value) = encoded_ready_challenge.strip_prefix('s') {
@@ -379,11 +419,11 @@ fn parse_trampoline_args(args: &[OsString]) -> anyhow::Result<TrampolineInvocati
     if ready_socket.is_some() != ready_challenge.is_some() {
         bail!("container exec ready socket and challenge must be supplied together");
     }
-    let command = required_utf8_arg(args, 7, "command")?;
+    let command = required_utf8_arg(args, 9, "command")?;
     if command.is_empty() {
         bail!("container exec command cannot be empty");
     }
-    let command_args = args[8..]
+    let command_args = args[10..]
         .iter()
         .map(|arg| {
             arg.to_str()
@@ -393,6 +433,8 @@ fn parse_trampoline_args(args: &[OsString]) -> anyhow::Result<TrampolineInvocati
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     Ok(TrampolineInvocation {
+        expected_parent_pid,
+        expected_parent_start_time,
         container_id,
         command,
         args: command_args,
@@ -402,6 +444,50 @@ fn parse_trampoline_args(args: &[OsString]) -> anyhow::Result<TrampolineInvocati
         ready_socket,
         ready_challenge,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn expected_agent_parent_identity() -> anyhow::Result<(u32, u64)> {
+    let pid = std::process::id();
+    Ok((pid, read_process_start_time(pid)?))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn expected_agent_parent_identity() -> anyhow::Result<(u32, u64)> {
+    Ok((std::process::id(), 1))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_expected_parent_identity(pid: u32, start_time: u64) -> anyhow::Result<()> {
+    if pid == 0 || start_time == 0 {
+        bail!("container exec expected parent identity must be nonzero");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn arm_outer_parent_death(expected_pid: u32, expected_start_time: u64) -> anyhow::Result<()> {
+    validate_expected_parent_identity(expected_pid, expected_start_time)?;
+    let observed_parent = unsafe { libc::getppid() };
+    if observed_parent <= 0 || observed_parent as u32 != expected_pid {
+        bail!("container exec agent parent changed before trampoline entry");
+    }
+    let parent_pidfd = open_pidfd(expected_pid)?;
+    if read_process_start_time(expected_pid)? != expected_start_time {
+        bail!("container exec agent parent PID was reused before trampoline entry");
+    }
+    // SAFETY: prctl receives scalar arguments and arms this outer trampoline.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("cannot arm container exec trampoline parent death");
+    }
+    ensure_pid_alive(&parent_pidfd)?;
+    if unsafe { libc::getppid() } as u32 != expected_pid
+        || read_process_start_time(expected_pid)? != expected_start_time
+    {
+        bail!("container exec agent parent changed while arming parent death");
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -665,6 +751,9 @@ impl LauncherOps for RealLauncherOps {
         // after joining a descendant PID namespace.
         let launcher_pidfd = open_pidfd(std::process::id())?;
         let (setup_reader, setup_writer) = setup_error_pipe()?;
+        let (launch_gate_reader, launch_gate_writer) = setup_error_pipe()?;
+        enable_child_subreaper()?;
+        install_supervisor_signal_handlers()?;
 
         // This is the final path/identity check after every allocation and
         // immediately before PID namespace entry and fork.
@@ -672,6 +761,8 @@ impl LauncherOps for RealLauncherOps {
 
         let child_fds = ChildLaunchFds {
             setup_error: setup_writer.as_raw_fd(),
+            launch_gate_reader: launch_gate_reader.as_raw_fd(),
+            launch_gate_writer: launch_gate_writer.as_raw_fd(),
             launcher_pidfd: launcher_pidfd.as_raw_fd(),
             target_pidfd: pinned.pid_fd.as_raw_fd(),
             cgroup_procs: pinned.cgroup_procs.as_raw_fd(),
@@ -701,12 +792,63 @@ impl LauncherOps for RealLauncherOps {
             unsafe { libc::close(setup_reader.as_raw_fd()) };
             child_exec(child_fds, &expected_cgroup, &mut payload);
         }
+        drop(launch_gate_reader);
+
+        // Bind the child to its own process group while forwarded signals are
+        // still blocked. This closes the signal-before-registration race: a
+        // pending signal cannot be delivered until the group is addressable.
+        if let Err(error) = bind_supervised_process_group(child) {
+            // SAFETY: child is the exact direct child just returned by fork.
+            unsafe { libc::kill(child, libc::SIGKILL) };
+            let _ = wait_for_child(child);
+            return Err(error);
+        }
+        if let Err(error) =
+            launch_death_sentinel(child, setup_writer.as_raw_fd(), launcher_pidfd.as_raw_fd())
+        {
+            // SAFETY: child is the exact group leader established above.
+            unsafe { libc::kill(-child, libc::SIGKILL) };
+            let _ = wait_for_child(child);
+            let _ = terminate_and_reap_descendants(child);
+            return Err(error);
+        }
+        if let Err(error) = assign_foreground_process_group(child) {
+            // SAFETY: child is the exact group leader established above.
+            unsafe { libc::kill(-child, libc::SIGKILL) };
+            let _ = wait_for_child(child);
+            let _ = terminate_and_reap_descendants(child);
+            return Err(error);
+        }
+        SUPERVISED_PROCESS_GROUP.store(child, Ordering::Release);
+        write_all_raw(launch_gate_writer.as_raw_fd(), b"R")
+            .map_err(std::io::Error::from_raw_os_error)
+            .context("cannot release container exec supervisor gate")?;
+        drop(launch_gate_writer);
+        unblock_supervisor_signals()?;
 
         drop(setup_writer);
         let setup_error = read_setup_error(&setup_reader);
         let setup_error = setup_error?;
         if let Some(error) = setup_error {
+            // The sentinel acknowledges only after its parent-death policy is
+            // armed, but descriptor cleanup immediately after that ack can
+            // still fail. The command gate is open by then, so fail closed by
+            // terminating the registered group before waiting for its leader.
+            if setup_failure_requires_group_termination(error.stage) {
+                // SAFETY: child remains the exact process-group leader bound
+                // above; ESRCH merely means the group already terminated.
+                let result = unsafe { libc::kill(-child, libc::SIGKILL) };
+                if result != 0 {
+                    let kill_error = std::io::Error::last_os_error();
+                    if kill_error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(kill_error).context(
+                            "cannot terminate container exec after death sentinel failure",
+                        );
+                    }
+                }
+            }
             let status = wait_for_child(child)?;
+            terminate_and_reap_descendants(child)?;
             if error.stage == ChildSetupStage::Execve {
                 let failure = anyhow::anyhow!(
                     "container exec child failed at {}: {}",
@@ -743,6 +885,7 @@ impl LauncherOps for RealLauncherOps {
                 wait_for_child(child)?
             }
         };
+        terminate_and_reap_descendants(child)?;
         mirror_wait_status(status)
     }
 }
@@ -1630,6 +1773,47 @@ fn child_exec(fds: ChildLaunchFds, expected_cgroup: &[u8], payload: &mut ExecPay
         child_setup_fail(fds.setup_error, ChildSetupStage::ParentRace, libc::ESRCH);
     }
 
+    // The requested command and all ordinary descendants begin in a process
+    // group owned by the outer trampoline. The parent also performs this bind
+    // before unblocking forwarded signals, making either scheduling order safe.
+    if unsafe { libc::setpgid(0, 0) } != 0 {
+        let errno = current_errno();
+        if errno != libc::EACCES {
+            child_setup_fail(fds.setup_error, ChildSetupStage::SignalState, errno);
+        }
+    }
+
+    // Drop the inherited writer first so outer-supervisor death becomes EOF,
+    // then wait for the one-byte release sent only after the death sentinel
+    // and process-group identity are fully installed.
+    unsafe { libc::close(fds.launch_gate_writer) };
+    let mut release = 0_u8;
+    loop {
+        let read = unsafe {
+            libc::read(
+                fds.launch_gate_reader,
+                (&raw mut release).cast::<libc::c_void>(),
+                1,
+            )
+        };
+        if read == 1 && release == b'R' {
+            break;
+        }
+        if read < 0 && current_errno() == libc::EINTR {
+            continue;
+        }
+        child_setup_fail(
+            fds.setup_error,
+            ChildSetupStage::SupervisorReady,
+            if read == 0 {
+                libc::EPIPE
+            } else {
+                current_errno()
+            },
+        );
+    }
+    unsafe { libc::close(fds.launch_gate_reader) };
+
     // Writing "0" moves only this child into the exact pinned target cgroup.
     // The supervisor remains outside, avoiding an unnecessary pids.max slot.
     if let Err(errno) = write_all_raw(fds.cgroup_procs, b"0") {
@@ -1700,6 +1884,18 @@ fn child_exec(fds: ChildLaunchFds, expected_cgroup: &[u8], payload: &mut ExecPay
     // SAFETY: the signal set is initialized before use and affects only this
     // post-fork child.
     unsafe {
+        for signal in supervised_signals()
+            .into_iter()
+            .chain(std::iter::once(libc::SIGRTMIN()))
+        {
+            if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
+                child_setup_fail(
+                    fds.setup_error,
+                    ChildSetupStage::SignalState,
+                    current_errno(),
+                );
+            }
+        }
         if libc::signal(libc::SIGPIPE, libc::SIG_DFL) == libc::SIG_ERR {
             child_setup_fail(
                 fds.setup_error,
@@ -1763,6 +1959,581 @@ fn child_exec(fds: ChildLaunchFds, expected_cgroup: &[u8], payload: &mut ExecPay
             libc::ENOENT
         },
     );
+}
+
+/// Start a descriptor-free sibling sentinel in the exec process group. If the
+/// outer trampoline itself is SIGKILLed, the sentinel's PDEATHSIG handler kills
+/// the complete command group. Keeping it as the command's sibling means it is
+/// invisible to the requested program's waitpid(2) and SIGCHLD behavior.
+#[cfg(target_os = "linux")]
+fn launch_death_sentinel(
+    process_group: libc::pid_t,
+    setup_error_fd: libc::c_int,
+    launcher_pidfd: libc::c_int,
+) -> anyhow::Result<()> {
+    let (gate_reader, gate_writer) = setup_error_pipe()?;
+    let (ready_reader, ready_writer) = setup_error_pipe()?;
+    use std::os::fd::AsRawFd as _;
+
+    // SAFETY: the trampoline is single-threaded and has prepared all state.
+    let sentinel = unsafe { libc::fork() };
+    if sentinel < 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot fork exec death sentinel");
+    }
+    if sentinel != 0 {
+        drop(gate_reader);
+        drop(ready_writer);
+        // Close the same process-group registration race from the parent.
+        // SAFETY: sentinel is the exact child returned above.
+        if unsafe { libc::setpgid(sentinel, process_group) } != 0 {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: this is a read-only check for the exact child.
+            if unsafe { libc::getpgid(sentinel) } != process_group {
+                // SAFETY: sentinel is our exact direct child.
+                unsafe { libc::kill(sentinel, libc::SIGKILL) };
+                let _ = wait_for_child(sentinel);
+                return Err(error).context("cannot bind exec death sentinel process group");
+            }
+        }
+        write_all_raw(gate_writer.as_raw_fd(), b"R")
+            .map_err(std::io::Error::from_raw_os_error)
+            .context("cannot release exec death sentinel gate")?;
+        drop(gate_writer);
+        if !read_one_byte_gate(ready_reader.as_raw_fd(), b'R') {
+            // SAFETY: sentinel is the exact child created above.
+            unsafe { libc::kill(sentinel, libc::SIGKILL) };
+            let _ = wait_for_child(sentinel);
+            bail!("exec death sentinel failed before readiness acknowledgement");
+        }
+        return Ok(());
+    }
+
+    unsafe { libc::close(ready_reader.as_raw_fd()) };
+    // Only the parent names namespace-relative process-group IDs. The sentinel
+    // waits until that parent has confirmed setpgid using its own PID view.
+    unsafe { libc::close(gate_writer.as_raw_fd()) };
+    if !read_one_byte_gate(gate_reader.as_raw_fd(), b'R') {
+        child_setup_fail(setup_error_fd, ChildSetupStage::DeathSentinel, libc::EPIPE);
+    }
+    unsafe { libc::close(gate_reader.as_raw_fd()) };
+
+    // The sentinel ignores public forwarded signals; the command receives
+    // them directly because both remain in the exact same process group.
+    for signal in supervised_signals() {
+        // SAFETY: signal disposition changes affect only the sentinel.
+        if unsafe { libc::signal(signal, libc::SIG_IGN) } == libc::SIG_ERR {
+            child_setup_fail(
+                setup_error_fd,
+                ChildSetupStage::DeathSentinel,
+                current_errno(),
+            );
+        }
+    }
+
+    // SAFETY: the action is initialized and the handler only calls kill(2).
+    let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    action.sa_sigaction = sentinel_parent_died as *const () as usize;
+    action.sa_flags = libc::SA_RESTART;
+    if unsafe { libc::sigemptyset(&raw mut action.sa_mask) } != 0
+        || unsafe {
+            libc::sigaction(
+                libc::SIGRTMIN(),
+                &raw const action,
+                std::ptr::null_mut(),
+            )
+        } != 0
+        // SAFETY: prctl receives scalar arguments only.
+        || unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGRTMIN()) } != 0
+    {
+        child_setup_fail(
+            setup_error_fd,
+            ChildSetupStage::DeathSentinel,
+            current_errno(),
+        );
+    }
+
+    // The outer trampoline blocks controls across both forks to make process
+    // group registration race-free. The sentinel must explicitly unblock its
+    // private PDEATHSIG after installing the handler.
+    let mut empty = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    if unsafe { libc::sigemptyset(&raw mut empty) } != 0
+        || unsafe { libc::sigprocmask(libc::SIG_SETMASK, &raw const empty, std::ptr::null_mut()) }
+            != 0
+    {
+        child_setup_fail(
+            setup_error_fd,
+            ChildSetupStage::DeathSentinel,
+            current_errno(),
+        );
+    }
+
+    // Close the PR_SET_PDEATHSIG race using the namespace-invariant pidfd; the
+    // sentinel never compares a PID originating in the outer namespace.
+    if !pidfd_is_alive_raw(launcher_pidfd) {
+        sentinel_parent_died(libc::SIGRTMIN());
+    }
+
+    // Acknowledge only after the parent-bound group, ignored public controls,
+    // PDEATHSIG handler, unblocked mask, and exact parent pidfd are all valid.
+    if write_all_raw(ready_writer.as_raw_fd(), b"R").is_err() {
+        sentinel_parent_died(libc::SIGRTMIN());
+    }
+    unsafe { libc::close(ready_writer.as_raw_fd()) };
+
+    // Close the standard streams as well as the setup writer and pidfd,
+    // otherwise this sentinel would keep pipe/PTY transports and the ready
+    // handshake open. Parent death after the check is covered by PDEATHSIG.
+    // SAFETY: close_range has no pointer arguments.
+    if unsafe { libc::syscall(libc::SYS_close_range, 0_u32, u32::MAX, 0_u32) } != 0 {
+        child_setup_fail(
+            setup_error_fd,
+            ChildSetupStage::DeathSentinel,
+            current_errno(),
+        );
+    }
+    loop {
+        // SAFETY: pause blocks this descriptor-free sentinel until parent death.
+        unsafe { libc::pause() };
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_one_byte_gate(fd: libc::c_int, expected: u8) -> bool {
+    let mut value = 0_u8;
+    loop {
+        // SAFETY: value is writable and fd names the one-byte synchronization pipe.
+        let read = unsafe { libc::read(fd, (&raw mut value).cast::<libc::c_void>(), 1) };
+        if read == 1 {
+            return gate_byte_matches(read, value, expected);
+        }
+        if read < 0 && current_errno() == libc::EINTR {
+            continue;
+        }
+        return false;
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn gate_byte_matches(read: isize, observed: u8, expected: u8) -> bool {
+    read == 1 && observed == expected
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn absent_controlling_tty_errno(errno: libc::c_int) -> bool {
+    matches!(errno, libc::ENOTTY | libc::EBADF)
+}
+
+#[cfg(target_os = "linux")]
+fn assign_foreground_process_group(process_group: libc::pid_t) -> anyhow::Result<Option<i32>> {
+    for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        // tcgetpgrp succeeds only for the controlling terminal of this session.
+        // SAFETY: fd is merely queried and no pointer arguments are involved.
+        let foreground = unsafe { libc::tcgetpgrp(fd) };
+        if foreground >= 0 {
+            // Signals are still blocked in the trampoline, so tcsetpgrp cannot
+            // suspend it with SIGTTOU between group bind and command release.
+            // SAFETY: process_group was established for the exact child above.
+            if unsafe { libc::tcsetpgrp(fd, process_group) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("cannot assign container exec foreground process group");
+            }
+            return Ok(Some(fd));
+        }
+        let error = std::io::Error::last_os_error();
+        if !error
+            .raw_os_error()
+            .is_some_and(absent_controlling_tty_errno)
+        {
+            return Err(error).context("cannot inspect container exec controlling terminal");
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+extern "C" fn sentinel_parent_died(_signal: libc::c_int) {
+    // SAFETY: zero targets this sentinel's exact exec-owned process group and
+    // kill(2) is async-signal-safe. SIGKILL includes the sentinel itself.
+    unsafe {
+        libc::kill(0, libc::SIGKILL);
+        libc::_exit(128 + libc::SIGKILL);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn supervised_signals() -> [libc::c_int; 28] {
+    [
+        libc::SIGHUP,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGILL,
+        libc::SIGTRAP,
+        libc::SIGABRT,
+        libc::SIGBUS,
+        libc::SIGFPE,
+        libc::SIGSEGV,
+        libc::SIGTERM,
+        libc::SIGUSR1,
+        libc::SIGUSR2,
+        libc::SIGPIPE,
+        libc::SIGALRM,
+        libc::SIGCONT,
+        libc::SIGTSTP,
+        libc::SIGTTIN,
+        libc::SIGTTOU,
+        libc::SIGWINCH,
+        libc::SIGURG,
+        libc::SIGXCPU,
+        libc::SIGXFSZ,
+        libc::SIGVTALRM,
+        libc::SIGPROF,
+        libc::SIGIO,
+        libc::SIGPWR,
+        libc::SIGSYS,
+        libc::SIGCHLD,
+    ]
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn supports_forwarded_signal(signal: libc::c_int) -> bool {
+    signal == libc::SIGKILL || supervised_signals().contains(&signal)
+}
+
+#[cfg(target_os = "linux")]
+extern "C" fn forward_supervisor_signal(signal: libc::c_int) {
+    let group = SUPERVISED_PROCESS_GROUP.load(Ordering::Acquire);
+    if group <= 0 {
+        return;
+    }
+    let forwarded = forwarded_signal(signal, FORCE_CANCEL_SIGNAL.load(Ordering::Relaxed));
+    // SAFETY: negative `group` targets only the process group established by
+    // this trampoline; kill(2) is async-signal-safe.
+    unsafe {
+        libc::kill(-group, forwarded);
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn forwarded_signal(signal: libc::c_int, force_cancel_signal: libc::c_int) -> libc::c_int {
+    if signal == force_cancel_signal {
+        libc::SIGKILL
+    } else {
+        signal
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn supervisor_signal_set() -> anyhow::Result<libc::sigset_t> {
+    // SAFETY: the signal set is initialized before use.
+    let mut set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    if unsafe { libc::sigemptyset(&raw mut set) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot initialize signal set");
+    }
+    for signal in supervised_signals()
+        .into_iter()
+        .chain(std::iter::once(libc::SIGRTMIN()))
+    {
+        if unsafe { libc::sigaddset(&raw mut set, signal) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("cannot populate signal set");
+        }
+    }
+    Ok(set)
+}
+
+#[cfg(target_os = "linux")]
+fn install_supervisor_signal_handlers() -> anyhow::Result<()> {
+    let set = supervisor_signal_set()?;
+    // SAFETY: trampoline dispatch occurs before Tokio and is single-threaded.
+    if unsafe { libc::sigprocmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot block supervisor signals");
+    }
+    FORCE_CANCEL_SIGNAL.store(libc::SIGRTMIN(), Ordering::Relaxed);
+    for signal in supervised_signals()
+        .into_iter()
+        .chain(std::iter::once(libc::SIGRTMIN()))
+    {
+        // SAFETY: sigaction is fully initialized; handler uses only atomics and
+        // async-signal-safe kill(2).
+        let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        action.sa_sigaction = forward_supervisor_signal as *const () as usize;
+        action.sa_flags = libc::SA_RESTART;
+        if unsafe { libc::sigemptyset(&raw mut action.sa_mask) } != 0
+            || unsafe { libc::sigaction(signal, &raw const action, std::ptr::null_mut()) } != 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("cannot install supervisor signal handler for {signal}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn unblock_supervisor_signals() -> anyhow::Result<()> {
+    let set = supervisor_signal_set()?;
+    // SAFETY: set is initialized and this remains the single trampoline thread.
+    if unsafe { libc::sigprocmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot unblock supervisor signals");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn bind_supervised_process_group(child: libc::pid_t) -> anyhow::Result<()> {
+    // SAFETY: child is our exact direct child. The same call is made in the
+    // child; success by either side establishes the identical group.
+    if unsafe { libc::setpgid(child, child) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    // SAFETY: getpgid is a read-only identity check for the direct child.
+    if unsafe { libc::getpgid(child) } == child {
+        return Ok(());
+    }
+    Err(error).context("cannot bind container exec process group")
+}
+
+#[cfg(target_os = "linux")]
+fn enable_child_subreaper() -> anyhow::Result<()> {
+    // SAFETY: prctl receives scalar arguments and affects only this dedicated
+    // single-use trampoline process.
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("cannot make container exec trampoline a child subreaper");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_and_reap_descendants(group: libc::pid_t) -> anyhow::Result<()> {
+    // The requested leader has already been reaped. Kill every ordinary
+    // descendant which retained the exec-owned process group, then drain all
+    // descendants adopted because this trampoline is a subreaper.
+    // SAFETY: negative group targets the exact group established after fork.
+    let result = unsafe { libc::kill(-group, libc::SIGKILL) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).context("cannot terminate container exec descendants");
+        }
+    }
+
+    SUPERVISED_PROCESS_GROUP.store(0, Ordering::Release);
+    let deadline = std::time::Instant::now() + DESCENDANT_REAP_TIMEOUT;
+    loop {
+        kill_adopted_descendants()?;
+        let mut status = 0;
+        // SAFETY: -1 selects any adopted child and status is writable.
+        let reaped = unsafe { libc::waitpid(-1, &raw mut status, libc::WNOHANG) };
+        if reaped > 0 {
+            continue;
+        }
+        if reaped < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                return Ok(());
+            }
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("cannot reap container exec descendants");
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("timed out reaping container exec descendants");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn kill_adopted_descendants() -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    // `setns(CLONE_NEWPID)` changes the namespace used for subsequent
+    // children without changing this trampoline's cached/user-space PID.
+    // Resolve both the child list and supervisor identity through the current
+    // procfs mount so all numeric IDs below belong to the same PID view.
+    let supervisor = read_proc_view_supervisor_pid()?;
+    for pid in read_proc_view_child_pids(supervisor)? {
+        let pid_fd = match open_pidfd(pid) {
+            Ok(pid_fd) => pid_fd,
+            Err(error) if error_has_errno(&error, libc::ESRCH) => continue,
+            Err(error) => return Err(error).context("cannot pin adopted exec descendant"),
+        };
+        let parent = match read_proc_parent_pid(pid) {
+            Ok(parent) => parent,
+            Err(error)
+                if error_has_errno(&error, libc::ENOENT)
+                    || error_has_errno(&error, libc::ESRCH) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if parent != supervisor {
+            bail!("adopted exec descendant changed parent before cancellation");
+        }
+        // SAFETY: pid_fd pins the child identity and ordinary signal delivery
+        // uses null siginfo.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pid_fd.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error).context("cannot kill adopted exec descendant");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn error_has_errno(error: &anyhow::Error, errno: libc::c_int) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.raw_os_error() == Some(errno))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_view_supervisor_pid() -> anyhow::Result<u32> {
+    // `/proc/thread-self` is optional on older or minimal kernels. Enumerating
+    // `/proc/self/task` uses the procfs mount's PID view and is available on
+    // every procfs implementation that exposes per-task children. The
+    // trampoline is deliberately single-threaded, so ambiguity fails closed.
+    let mut tasks = std::fs::read_dir("/proc/self/task")
+        .context("cannot enumerate exec supervisor procfs tasks")?
+        .map(|entry| entry.context("cannot enumerate exec supervisor task"))
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| *pid != 0)
+        .collect::<Vec<_>>();
+    tasks.sort_unstable();
+    tasks.dedup();
+    if tasks.len() != 1 {
+        bail!(
+            "exec supervisor procfs task identity is ambiguous ({} tasks)",
+            tasks.len()
+        );
+    }
+    Ok(tasks[0])
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_view_child_pids(supervisor: u32) -> anyhow::Result<Vec<u32>> {
+    let children_path = format!("/proc/self/task/{supervisor}/children");
+    match std::fs::read_to_string(&children_path) {
+        Ok(children) => parse_proc_children(&children),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Some kernels omit the per-task children file. A bounded procfs
+            // status scan is slower but retains the same exact PPid identity.
+            scan_proc_children_by_parent(supervisor)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("cannot inspect adopted exec descendants at {children_path}")),
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_children(children: &str) -> anyhow::Result<Vec<u32>> {
+    if children.len() > MAX_CGROUP_FILE_BYTES {
+        bail!("adopted exec descendant list exceeds {MAX_CGROUP_FILE_BYTES} bytes");
+    }
+    let mut pids = Vec::new();
+    for field in children.split_whitespace() {
+        let pid = field
+            .parse::<u32>()
+            .context("adopted exec descendant PID is invalid")?;
+        if pid == 0 {
+            bail!("adopted exec descendant PID is zero");
+        }
+        pids.push(pid);
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
+}
+
+#[cfg(target_os = "linux")]
+fn scan_proc_children_by_parent(supervisor: u32) -> anyhow::Result<Vec<u32>> {
+    let mut children = Vec::new();
+    let mut inspected = 0_usize;
+    for entry in std::fs::read_dir("/proc").context("cannot scan procfs for exec descendants")? {
+        let entry = entry.context("cannot enumerate procfs entry for exec descendants")?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .filter(|pid| *pid != 0)
+        else {
+            continue;
+        };
+        inspected += 1;
+        if inspected > MAX_CGROUP_FILE_BYTES {
+            bail!("procfs descendant scan exceeded {MAX_CGROUP_FILE_BYTES} processes");
+        }
+        match read_proc_parent_pid(pid) {
+            Ok(parent) if parent == supervisor => children.push(pid),
+            Ok(_) => {}
+            Err(error)
+                if error_has_errno(&error, libc::ENOENT)
+                    || error_has_errno(&error, libc::ESRCH) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    children.sort_unstable();
+    children.dedup();
+    Ok(children)
+}
+
+#[cfg(test)]
+fn parse_proc_status_id(status: &str, field: &str) -> anyhow::Result<u32> {
+    let value = parse_proc_status_u32(status, field)?;
+    if value == 0 {
+        bail!("process status {field} is zero");
+    }
+    Ok(value)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_status_u32(status: &str, field: &str) -> anyhow::Result<u32> {
+    let prefix = format!("{field}:");
+    let mut values = status.lines().filter_map(|line| line.strip_prefix(&prefix));
+    let value = values
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("process status omitted {field}"))?;
+    if values.next().is_some() {
+        bail!("process status repeated {field}");
+    }
+    let value = value
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("process status {field} is invalid"))?;
+    Ok(value)
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_parent_pid(pid: u32) -> anyhow::Result<u32> {
+    let path = format!("/proc/{pid}/status");
+    let status = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot inspect adopted exec descendant at {path}"))?;
+    if status.len() > MAX_CGROUP_FILE_BYTES {
+        bail!("adopted exec descendant status exceeds {MAX_CGROUP_FILE_BYTES} bytes");
+    }
+    // PPid 0 is legitimate for procfs-visible namespace roots and kernel
+    // processes. Callers compare the value with the nonzero supervisor PID,
+    // so such unrelated entries are safely ignored while reparenting still
+    // fails the later exact-parent check.
+    parse_proc_status_u32(&status, "PPid")
+        .context("adopted exec descendant status has invalid parent identity")
 }
 
 #[cfg(target_os = "linux")]
@@ -2170,25 +2941,9 @@ fn mirror_wait_status(status: libc::c_int) -> anyhow::Result<()> {
         child_exit(libc::WEXITSTATUS(status));
     }
     if libc::WIFSIGNALED(status) {
-        mirror_signal(libc::WTERMSIG(status));
+        child_exit(128 + libc::WTERMSIG(status));
     }
     bail!("container exec child returned an unrecognized wait status {status}")
-}
-
-#[cfg(target_os = "linux")]
-fn mirror_signal(signo: libc::c_int) -> ! {
-    // Restore and unblock the terminating signal before delivering it to this
-    // trampoline, so its caller observes the same wait status as the child.
-    // SAFETY: all operations use initialized values and the current PID.
-    unsafe {
-        libc::signal(signo, libc::SIG_DFL);
-        let mut signals: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&raw mut signals);
-        libc::sigaddset(&raw mut signals, signo);
-        libc::sigprocmask(libc::SIG_UNBLOCK, &raw const signals, std::ptr::null_mut());
-        libc::kill(libc::getpid(), signo);
-        libc::_exit(128 + signo);
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2384,6 +3139,35 @@ mod tests {
     }
 
     #[test]
+    fn proc_status_ids_use_exact_nonzero_view_fields() {
+        let status = "Name:\ttrampoline\nPid:\t37\nPPid:\t12\nTracerPid:\t0\n";
+        assert_eq!(parse_proc_status_id(status, "Pid").unwrap(), 37);
+        assert_eq!(parse_proc_status_id(status, "PPid").unwrap(), 12);
+
+        assert!(parse_proc_status_id("PPid:\t12\n", "Pid").is_err());
+        assert!(parse_proc_status_id("Pid:\t0\n", "Pid").is_err());
+        assert!(parse_proc_status_id("Pid:\tinvalid\n", "Pid").is_err());
+        assert!(parse_proc_status_id("Pid:\t1\nPid:\t2\n", "Pid").is_err());
+        assert_eq!(parse_proc_status_u32("PPid:\t0\n", "PPid").unwrap(), 0);
+        assert!(parse_proc_status_u32("PPid:\tinvalid\n", "PPid").is_err());
+    }
+
+    #[test]
+    fn proc_children_parser_is_bounded_nonzero_and_deduplicated() {
+        assert_eq!(parse_proc_children("41 7 41\n").unwrap(), vec![7, 41]);
+        assert!(parse_proc_children("0\n").is_err());
+        assert!(parse_proc_children("not-a-pid\n").is_err());
+        assert!(parse_proc_children(&"1 ".repeat(MAX_CGROUP_FILE_BYTES)).is_err());
+    }
+
+    #[test]
+    fn trampoline_parent_identity_requires_complete_nonzero_generation() {
+        assert!(validate_expected_parent_identity(42, 99).is_ok());
+        assert!(validate_expected_parent_identity(0, 99).is_err());
+        assert!(validate_expected_parent_identity(42, 0).is_err());
+    }
+
+    #[test]
     fn trampoline_round_trip_preserves_direct_argv_and_cwd() {
         let original_args = vec![
             "a b".to_string(),
@@ -2429,7 +3213,7 @@ mod tests {
         )
         .unwrap();
         let mut malformed = command.args.clone();
-        malformed[6] = "n".to_string();
+        malformed[8] = "n".to_string();
         assert!(
             parse_trampoline_args(
                 &malformed
@@ -2457,6 +3241,8 @@ mod tests {
     #[test]
     fn direct_exec_payload_preserves_raw_argv() {
         let invocation = TrampolineInvocation {
+            expected_parent_pid: 1,
+            expected_parent_start_time: 1,
             container_id: "web".to_string(),
             command: "/bin/printf".to_string(),
             args: vec!["%s".to_string(), "$HOME;literal".to_string()],
@@ -2537,6 +3323,47 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_preserves_public_signals_and_reserves_force_cancel() {
+        let private_cancel = 63;
+        for signal in [
+            libc::SIGHUP,
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGTERM,
+            libc::SIGWINCH,
+        ] {
+            assert_eq!(forwarded_signal(signal, private_cancel), signal);
+        }
+        assert_eq!(
+            forwarded_signal(private_cancel, private_cancel),
+            libc::SIGKILL
+        );
+    }
+
+    #[test]
+    fn supervisor_gates_require_exact_release_and_only_skip_non_ttys() {
+        assert!(gate_byte_matches(1, b'R', b'R'));
+        assert!(!gate_byte_matches(0, b'R', b'R'));
+        assert!(!gate_byte_matches(1, b'X', b'R'));
+        assert!(absent_controlling_tty_errno(libc::ENOTTY));
+        assert!(absent_controlling_tty_errno(libc::EBADF));
+        assert!(!absent_controlling_tty_errno(libc::EPERM));
+    }
+
+    #[test]
+    fn post_ack_sentinel_failure_terminates_group_before_wait() {
+        assert!(setup_failure_requires_group_termination(
+            ChildSetupStage::DeathSentinel
+        ));
+        assert!(!setup_failure_requires_group_termination(
+            ChildSetupStage::Execve
+        ));
+        assert!(!setup_failure_requires_group_termination(
+            ChildSetupStage::CgroupAttach
+        ));
+    }
+
+    #[test]
     fn setup_error_record_round_trips_stage_and_errno() {
         let error = ChildSetupError {
             stage: ChildSetupStage::CgroupAttach,
@@ -2550,6 +3377,16 @@ mod tests {
             errno: libc::ENOENT,
         };
         assert_eq!(decode_setup_error(encode_setup_error(execve)), Some(execve));
+        for stage in [
+            ChildSetupStage::DeathSentinel,
+            ChildSetupStage::SupervisorReady,
+        ] {
+            let error = ChildSetupError {
+                stage,
+                errno: libc::EPIPE,
+            };
+            assert_eq!(decode_setup_error(encode_setup_error(error)), Some(error));
+        }
     }
 
     #[test]
@@ -2743,6 +3580,8 @@ mod tests {
 
     fn invocation() -> TrampolineInvocation {
         TrampolineInvocation {
+            expected_parent_pid: 1,
+            expected_parent_start_time: 1,
             container_id: "web".to_string(),
             command: "/bin/true".to_string(),
             args: Vec::new(),

@@ -4,18 +4,379 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 use tokio::time::Instant;
-use tracing::debug;
-use vz::Vm;
+use tracing::{debug, warn};
 use vz::protocol::{ExecEvent, ExecOutput, NetworkServiceConfig, OciContainerState};
+use vz::{Vm, VmState};
 use vz_agent_proto::SystemInfoResponse;
 use vz_agent_proto::{DockerEnsureEvent, docker_ensure_event};
 
-use crate::grpc_client::{GrpcAgentClient, GrpcExecStream, GrpcPortForwardStream};
+use crate::grpc_client::{
+    ContainerExecDispatchGate, ContainerExecStartError, GrpcAgentClient, GrpcExecStream,
+    GrpcPortForwardStream,
+};
 use crate::{ExecOptions, LinuxError, LinuxVmConfig, OciExecOptions};
 
 const AGENT_POLL_INITIAL: Duration = Duration::from_millis(50);
 const AGENT_POLL_MAX: Duration = Duration::from_secs(1);
 const AGENT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+const CONTAINER_EXEC_CLEANUP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+const CONTAINER_EXEC_CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(1);
+const CONTAINER_EXEC_REQUEST_ALLOCATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+type OwnedContainerExecStart = Result<
+    (
+        GrpcAgentClient,
+        GrpcExecStream,
+        u64,
+        vz_agent_proto::ContainerGeneration,
+    ),
+    ContainerExecStartError,
+>;
+
+struct StartingOwnedContainerExec {
+    task: Option<tokio::task::JoinHandle<OwnedContainerExecStart>>,
+    vm: Arc<Vm>,
+    request_id: String,
+    dispatch_gate: ContainerExecDispatchGate,
+    armed: bool,
+}
+
+impl StartingOwnedContainerExec {
+    fn new(
+        task: tokio::task::JoinHandle<OwnedContainerExecStart>,
+        vm: Arc<Vm>,
+        request_id: String,
+        dispatch_gate: ContainerExecDispatchGate,
+    ) -> Self {
+        Self {
+            task: Some(task),
+            vm,
+            request_id,
+            dispatch_gate,
+            armed: true,
+        }
+    }
+
+    fn task_mut(&mut self) -> &mut tokio::task::JoinHandle<OwnedContainerExecStart> {
+        match self.task.as_mut() {
+            Some(task) => task,
+            None => unreachable!("armed container exec startup must retain its task"),
+        }
+    }
+
+    fn promote(
+        &mut self,
+        client: GrpcAgentClient,
+        stream: GrpcExecStream,
+        exec_id: u64,
+    ) -> ReadyOwnedContainerExec {
+        self.armed = false;
+        self.task.take();
+        ReadyOwnedContainerExec::new(Arc::clone(&self.vm), client, stream, exec_id)
+    }
+
+    fn finish_without_ready(&mut self) {
+        self.armed = false;
+        self.task.take();
+    }
+
+    async fn cancel_after_start(&mut self) -> Result<(), LinuxError> {
+        if self.dispatch_gate.cancel_before_dispatch() {
+            if let Some(task) = self.task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            self.finish_without_ready();
+            return Ok(());
+        }
+        match self.task_mut().await {
+            Ok(Ok((client, stream, exec_id, _generation))) => {
+                let mut ready = self.promote(client, stream, exec_id);
+                ready.cancel_and_reap().await;
+                Ok(())
+            }
+            Ok(Err(ContainerExecStartError::Definite(_startup_error))) => {
+                self.finish_without_ready();
+                Ok(())
+            }
+            Ok(Err(ContainerExecStartError::Ambiguous(error))) => {
+                let reconciliation = tokio::time::timeout(
+                    CONTAINER_EXEC_CLEANUP_ATTEMPT_TIMEOUT,
+                    self.reconcile_ambiguous_start_failure(
+                        "container exec startup cleanup received an ambiguous start failure",
+                    ),
+                )
+                .await;
+                match reconciliation {
+                    Ok(outcome) => Err(LinuxError::Protocol(format!(
+                        "{error}; reconciliation={outcome}"
+                    ))),
+                    Err(_) => {
+                        self.retain_cleanup(
+                            "container exec ambiguous startup reconciliation remains pending",
+                        );
+                        Err(LinuxError::Protocol(format!(
+                            "{error}; reconciliation=PENDING_UNDER_RETAINED_AUTHORITY"
+                        )))
+                    }
+                }
+            }
+            Err(join_error) => {
+                let reconciliation = tokio::time::timeout(
+                    CONTAINER_EXEC_CLEANUP_ATTEMPT_TIMEOUT,
+                    self.reconcile_ambiguous_start_failure(
+                        "container exec startup cleanup task failed ambiguously",
+                    ),
+                )
+                .await;
+                match reconciliation {
+                    Ok(outcome) => Err(LinuxError::Protocol(format!(
+                        "container exec startup task failed: {join_error}; reconciliation={outcome}"
+                    ))),
+                    Err(_) => {
+                        self.retain_cleanup(
+                            "failed container exec startup reconciliation remains pending",
+                        );
+                        Err(LinuxError::Protocol(format!(
+                            "container exec startup task failed: {join_error}; reconciliation=PENDING_UNDER_RETAINED_AUTHORITY"
+                        )))
+                    }
+                }
+            }
+        }
+    }
+
+    async fn reconcile_ambiguous_start_failure(&mut self, context: &'static str) -> &'static str {
+        self.task.take();
+        let outcome = reconcile_exec_request_until_proven(
+            Arc::clone(&self.vm),
+            self.request_id.clone(),
+            context,
+        )
+        .await;
+        self.armed = false;
+        outcome
+    }
+
+    fn retain_cleanup(&mut self, context: &'static str) {
+        if !self.armed {
+            return;
+        }
+        let dispatch_prevented = self.dispatch_gate.cancel_before_dispatch();
+        self.armed = false;
+        let Some(task) = self.task.take() else {
+            retain_request_reconciliation(Arc::clone(&self.vm), self.request_id.clone(), context);
+            return;
+        };
+        let vm = Arc::clone(&self.vm);
+        let request_id = self.request_id.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                %context,
+                "container exec startup cleanup lost its Tokio runtime; retaining authority"
+            );
+            // The task owns the in-flight start and retains its output after
+            // completion. Keep an explicit VM owner as well: leaking both is
+            // the only fail-closed option when no executor can drive cleanup.
+            std::mem::forget(task);
+            std::mem::forget(vm);
+            return;
+        };
+        runtime.spawn(async move {
+            if dispatch_prevented {
+                task.abort();
+                let _ = task.await;
+                return;
+            }
+            match task.await {
+                Ok(Ok((client, stream, exec_id, _generation))) => {
+                    let mut ready = ReadyOwnedContainerExec::new(vm, client, stream, exec_id);
+                    ready.cancel_and_reap().await;
+                }
+                Ok(Err(ContainerExecStartError::Definite(_))) => {}
+                Ok(Err(ContainerExecStartError::Ambiguous(_))) | Err(_) => {
+                    reconcile_exec_request_until_proven(vm, request_id, context).await;
+                }
+            }
+        });
+    }
+}
+
+async fn reconcile_exec_request_until_proven(
+    vm: Arc<Vm>,
+    request_id: String,
+    context: &str,
+) -> &'static str {
+    use vz_agent_proto::reconcile_exec_response::Outcome;
+
+    loop {
+        if let Some(outcome) = terminal_vm_reconciliation_outcome(vm.state()) {
+            debug!(%request_id, %context, outcome, "terminal VM state proves container exec absence");
+            return outcome;
+        }
+        let result = async {
+            let mut client = GrpcAgentClient::connect_default(Arc::clone(&vm)).await?;
+            client.ping().await?;
+            client.reconcile_exec_request(request_id.clone()).await
+        }
+        .await;
+        match result {
+            Ok(response)
+                if response.outcome == Outcome::FencedNeverStarted as i32
+                    || response.outcome == Outcome::TerminalReaped as i32 =>
+            {
+                debug!(%request_id, %context, outcome = response.outcome, "container exec request reconciled");
+                return if response.outcome == Outcome::FencedNeverStarted as i32 {
+                    "FENCED_NEVER_STARTED"
+                } else {
+                    "TERMINAL_REAPED"
+                };
+            }
+            Ok(response) => {
+                warn!(%request_id, %context, outcome = response.outcome, "container exec reconciliation remains unproven")
+            }
+            Err(error) => {
+                warn!(%request_id, %context, %error, "container exec reconciliation failed; retrying")
+            }
+        }
+        tokio::time::sleep(CONTAINER_EXEC_CLEANUP_RETRY_DELAY).await;
+    }
+}
+
+fn terminal_vm_reconciliation_outcome(state: VmState) -> Option<&'static str> {
+    match state {
+        VmState::Stopped => Some("VM_TERMINAL_STOPPED"),
+        VmState::Error(_) => Some("VM_TERMINAL_ERROR"),
+        _ => None,
+    }
+}
+
+fn retain_request_reconciliation(vm: Arc<Vm>, request_id: String, context: &'static str) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        warn!(%request_id, %context, "container exec reconciliation lost its Tokio runtime; retaining authority");
+        std::mem::forget(vm);
+        return;
+    };
+    runtime.spawn(async move {
+        let _ = reconcile_exec_request_until_proven(vm, request_id, context).await;
+    });
+}
+
+impl Drop for StartingOwnedContainerExec {
+    fn drop(&mut self) {
+        self.retain_cleanup("container exec owner dropped during startup");
+    }
+}
+
+struct ReadyOwnedContainerExec {
+    vm: Arc<Vm>,
+    client: Option<GrpcAgentClient>,
+    stream: Option<GrpcExecStream>,
+    exec_id: u64,
+    armed: bool,
+}
+
+impl ReadyOwnedContainerExec {
+    fn new(vm: Arc<Vm>, client: GrpcAgentClient, stream: GrpcExecStream, exec_id: u64) -> Self {
+        Self {
+            vm,
+            client: Some(client),
+            stream: Some(stream),
+            exec_id,
+            armed: true,
+        }
+    }
+
+    fn stream_mut(&mut self) -> &mut GrpcExecStream {
+        match self.stream.as_mut() {
+            Some(stream) => stream,
+            None => unreachable!("armed container exec must retain its stream"),
+        }
+    }
+
+    fn complete(&mut self) {
+        self.armed = false;
+        self.stream.take();
+        self.client.take();
+    }
+
+    async fn cancel_and_reap(&mut self) {
+        loop {
+            let attempt = {
+                let client = match self.client.as_mut() {
+                    Some(client) => client,
+                    None => unreachable!("armed container exec must retain its control client"),
+                };
+                tokio::time::timeout(
+                    CONTAINER_EXEC_CLEANUP_ATTEMPT_TIMEOUT,
+                    client.cancel_exec(self.exec_id),
+                )
+                .await
+            };
+            match attempt {
+                Ok(Ok(_receipt)) => {
+                    self.complete();
+                    return;
+                }
+                Ok(Err(error)) => warn!(
+                    exec_id = self.exec_id,
+                    %error,
+                    "container exec cancellation failed; retaining authority and retrying"
+                ),
+                Err(_) => warn!(
+                    exec_id = self.exec_id,
+                    timeout_secs = CONTAINER_EXEC_CLEANUP_ATTEMPT_TIMEOUT.as_secs_f64(),
+                    "container exec cancellation timed out; retaining authority and retrying"
+                ),
+            }
+
+            match GrpcAgentClient::connect_default(Arc::clone(&self.vm)).await {
+                Ok(client) => self.client = Some(client),
+                Err(error) => warn!(
+                    exec_id = self.exec_id,
+                    %error,
+                    "container exec cleanup reconnect failed; retaining authority and retrying"
+                ),
+            }
+            tokio::time::sleep(CONTAINER_EXEC_CLEANUP_RETRY_DELAY).await;
+        }
+    }
+
+    fn retain_cleanup(&mut self, context: &'static str) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let (Some(client), Some(stream)) = (self.client.take(), self.stream.take()) else {
+            return;
+        };
+        let vm = Arc::clone(&self.vm);
+        let exec_id = self.exec_id;
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                exec_id,
+                %context,
+                "container exec cleanup lost its Tokio runtime; retaining authority"
+            );
+            // Preserve the control channel, stream, and VM rather than
+            // signalling successful cleanup by dropping their last owners.
+            std::mem::forget(client);
+            std::mem::forget(stream);
+            std::mem::forget(vm);
+            return;
+        };
+        runtime.spawn(async move {
+            let mut ready = ReadyOwnedContainerExec::new(vm, client, stream, exec_id);
+            ready.cancel_and_reap().await;
+        });
+    }
+}
+
+impl Drop for ReadyOwnedContainerExec {
+    fn drop(&mut self) {
+        self.retain_cleanup("container exec owner dropped before terminal proof");
+    }
+}
 
 fn exec_control_debug_enabled() -> bool {
     std::env::var("VZ_LINUX_EXEC_CONTROL_DEBUG")
@@ -114,7 +475,30 @@ impl LinuxVm {
         let mut grpc = self.grpc.lock().await;
         *grpc = None;
         drop(grpc);
-        self.wait_for_agent(agent_ready_timeout).await
+        self.wait_for_agent(agent_ready_timeout).await?;
+
+        // VM save-state restores the guest's dentry/inode caches while
+        // VirtioFS reconnects to a live host-side directory. Evict those
+        // restored caches before container mount namespaces are reused so
+        // overlay lowerdirs are resolved against the reconnected share.
+        let cache_evict = self
+            .exec_collect(
+                "/bin/busybox".to_string(),
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "echo 2 > /proc/sys/vm/drop_caches".to_string(),
+                ],
+                Duration::from_secs(5),
+            )
+            .await?;
+        if cache_evict.exit_code != 0 {
+            return Err(LinuxError::Protocol(format!(
+                "restored guest cache eviction failed with exit {}: {}{}",
+                cache_evict.exit_code, cache_evict.stdout, cache_evict.stderr
+            )));
+        }
+        Ok(())
     }
 
     /// Start the VM and wait until guest agent is reachable.
@@ -321,40 +705,60 @@ impl LinuxVm {
         client.exec_stream(command, args, options).await
     }
 
-    /// Run a raw command inside a running OCI container and return its stream.
-    pub async fn exec_container_stream_with_options(
-        &self,
-        container_id: String,
-        command: String,
-        args: Vec<String>,
-        options: ExecOptions,
-    ) -> Result<GrpcExecStream, LinuxError> {
-        self.ensure_grpc().await?;
-        let mut grpc = self.grpc.lock().await;
-        let client = grpc
-            .as_mut()
-            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
-        client
-            .exec_container_stream(container_id, command, args, options)
-            .await
+    /// Allocate the request identity that must remain paired with a classified
+    /// container exec start until it is ready or reconciled.
+    pub async fn prepare_container_exec_request(&self) -> Result<String, LinuxError> {
+        tokio::time::timeout(CONTAINER_EXEC_REQUEST_ALLOCATION_TIMEOUT, async {
+            self.ensure_grpc().await?;
+            let mut grpc = self.grpc.lock().await;
+            let client = grpc
+                .as_mut()
+                .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
+            client.prepare_container_exec_request().await
+        })
+        .await
+        .map_err(|_| {
+            LinuxError::Protocol(format!(
+                "exec request allocation timed out after {:.3}s before dispatch",
+                CONTAINER_EXEC_REQUEST_ALLOCATION_TIMEOUT.as_secs_f64()
+            ))
+        })?
     }
 
-    /// Start a container pipe exec after the guest proves the exact generation
-    /// is pinned and the inner command successfully crossed execve.
-    pub async fn exec_container_stream_ready_with_options(
+    /// Start a pipe exec using a request identity retained by the caller.
+    /// Ambiguous errors and dropped futures require reconciliation of this
+    /// exact ID before releasing VM or lifecycle authority.
+    pub async fn exec_container_stream_ready_classified_for_request(
         &self,
+        dispatch_gate: ContainerExecDispatchGate,
+        request_id: String,
         container_id: String,
         command: String,
         args: Vec<String>,
         options: ExecOptions,
-    ) -> Result<(GrpcExecStream, vz_agent_proto::ContainerGeneration), LinuxError> {
-        self.ensure_grpc().await?;
-        let mut grpc = self.grpc.lock().await;
-        let client = grpc
-            .as_mut()
-            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
+    ) -> Result<(GrpcExecStream, u64, vz_agent_proto::ContainerGeneration), ContainerExecStartError>
+    {
+        let mut client = GrpcAgentClient::connect_default(Arc::clone(&self.vm))
+            .await
+            .map_err(ContainerExecStartError::Definite)?;
         client
-            .exec_container_stream_ready(container_id, command, args, options)
+            .ping()
+            .await
+            .map_err(ContainerExecStartError::Definite)?;
+        let info = client
+            .system_info()
+            .await
+            .map_err(ContainerExecStartError::Definite)?;
+        validate_guest_system_info(&info).map_err(ContainerExecStartError::Definite)?;
+        client
+            .exec_container_stream_ready_for_request(
+                dispatch_gate,
+                request_id,
+                container_id,
+                command,
+                args,
+                options,
+            )
             .await
     }
 
@@ -367,19 +771,169 @@ impl LinuxVm {
         timeout: Duration,
         options: ExecOptions,
     ) -> Result<ExecOutput, LinuxError> {
-        tokio::time::timeout(timeout, async {
-            let stream = self
-                .exec_container_stream_with_options(container_id, command, args, options)
+        let deadline = Instant::now() + timeout;
+        let dispatch_gate = ContainerExecDispatchGate::new(deadline);
+        let request_id = tokio::time::timeout_at(deadline, self.prepare_container_exec_request())
+            .await
+            .map_err(|_| {
+                LinuxError::Protocol(format!(
+                    "container exec timed out after {:.3}s before request allocation completed",
+                    timeout.as_secs_f64()
+                ))
+            })??;
+        let start_request_id = request_id.clone();
+        let start_vm = Arc::clone(&self.vm);
+        let cleanup_vm = Arc::clone(&self.vm);
+        let start_dispatch_gate = dispatch_gate.clone();
+        let start_task = tokio::spawn(async move {
+            let mut client = GrpcAgentClient::connect_default(start_vm)
+                .await
+                .map_err(ContainerExecStartError::Definite)?;
+            client
+                .ping()
+                .await
+                .map_err(ContainerExecStartError::Definite)?;
+            let info = client
+                .system_info()
+                .await
+                .map_err(ContainerExecStartError::Definite)?;
+            validate_guest_system_info(&info).map_err(ContainerExecStartError::Definite)?;
+            let (stream, exec_id, generation) = client
+                .exec_container_stream_ready_for_request(
+                    start_dispatch_gate,
+                    start_request_id,
+                    container_id,
+                    command,
+                    args,
+                    options,
+                )
                 .await?;
-            Ok::<ExecOutput, LinuxError>(stream.collect().await)
+            Ok((client, stream, exec_id, generation))
+        });
+        let mut starting =
+            StartingOwnedContainerExec::new(start_task, cleanup_vm, request_id, dispatch_gate);
+
+        let start_result = tokio::time::timeout_at(deadline, starting.task_mut()).await;
+        let mut ready = match start_result {
+            Ok(Ok(Ok((client, stream, exec_id, _generation)))) => {
+                starting.promote(client, stream, exec_id)
+            }
+            Ok(Ok(Err(ContainerExecStartError::Definite(error)))) => {
+                starting.finish_without_ready();
+                return Err(error);
+            }
+            Ok(Ok(Err(ContainerExecStartError::Ambiguous(error)))) => {
+                let reconciliation = tokio::time::timeout(
+                    CONTAINER_EXEC_CLEANUP_ATTEMPT_TIMEOUT,
+                    starting.reconcile_ambiguous_start_failure(
+                        "container exec startup returned an ambiguous failure",
+                    ),
+                )
+                .await;
+                return match reconciliation {
+                    Ok(outcome) => Err(LinuxError::Protocol(format!(
+                        "{error}; reconciliation={outcome}"
+                    ))),
+                    Err(_) => {
+                        starting.retain_cleanup(
+                            "container exec ambiguous startup reconciliation remains pending",
+                        );
+                        Err(LinuxError::Protocol(format!(
+                            "{error}; reconciliation=PENDING_UNDER_RETAINED_AUTHORITY"
+                        )))
+                    }
+                };
+            }
+            Ok(Err(join_error)) => {
+                let reconciliation = tokio::time::timeout(
+                    CONTAINER_EXEC_CLEANUP_ATTEMPT_TIMEOUT,
+                    starting.reconcile_ambiguous_start_failure(
+                        "container exec startup task failed ambiguously",
+                    ),
+                )
+                .await;
+                return match reconciliation {
+                    Ok(outcome) => Err(LinuxError::Protocol(format!(
+                        "container exec startup task failed: {join_error}; reconciliation={outcome}"
+                    ))),
+                    Err(_) => {
+                        starting.retain_cleanup(
+                            "failed container exec startup reconciliation remains pending",
+                        );
+                        Err(LinuxError::Protocol(format!(
+                            "container exec startup task failed: {join_error}; reconciliation=PENDING_UNDER_RETAINED_AUTHORITY"
+                        )))
+                    }
+                };
+            }
+            Err(_) => {
+                let cleanup = tokio::time::timeout(
+                    CONTAINER_EXEC_CLEANUP_ATTEMPT_TIMEOUT,
+                    starting.cancel_after_start(),
+                )
+                .await;
+                let context = format!(
+                    "container exec timed out after {:.3}s during startup",
+                    timeout.as_secs_f64()
+                );
+                return match cleanup {
+                    Ok(Ok(())) => Err(LinuxError::Protocol(context)),
+                    Ok(Err(error)) => Err(LinuxError::Protocol(format!(
+                        "{context}; cleanup failed: {error}"
+                    ))),
+                    Err(_) => {
+                        starting.retain_cleanup(
+                            "container exec startup timeout cleanup remains pending",
+                        );
+                        Err(LinuxError::Protocol(format!(
+                            "{context}; cleanup proof remains pending under retained authority"
+                        )))
+                    }
+                };
+            }
+        };
+
+        let collected = tokio::time::timeout_at(deadline, async {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            loop {
+                match ready.stream_mut().next_checked().await? {
+                    Some(ExecEvent::Stdout(data)) => stdout.extend_from_slice(&data),
+                    Some(ExecEvent::Stderr(data)) => stderr.extend_from_slice(&data),
+                    Some(ExecEvent::Exit(exit_code)) => {
+                        return Ok(ExecOutput {
+                            exit_code,
+                            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                        });
+                    }
+                    None => {
+                        return Err(LinuxError::Protocol(
+                            "container exec stream ended without an exit receipt".to_string(),
+                        ));
+                    }
+                }
+            }
         })
-        .await
-        .map_err(|_| {
-            LinuxError::Protocol(format!(
-                "container exec timed out after {:.3}s",
-                timeout.as_secs_f64()
-            ))
-        })?
+        .await;
+
+        match collected {
+            Ok(Ok(output)) => {
+                ready.complete();
+                Ok(output)
+            }
+            Ok(Err(error)) => {
+                ready.cancel_and_reap().await;
+                Err(error)
+            }
+            Err(_) => {
+                ready.cancel_and_reap().await;
+                Err(LinuxError::Protocol(format!(
+                    "container exec timed out after {:.3}s",
+                    timeout.as_secs_f64()
+                )))
+            }
+        }
     }
 
     /// Run a command on the guest, collect output via streaming, with a timeout.
@@ -562,20 +1116,20 @@ impl LinuxVm {
         state_result
     }
 
-    /// Execute through the OCI service's bounded unary compatibility RPC.
+    /// Legacy OCI unary exec is retired; synchronous callers must collect the
+    /// supervised container exec stream instead.
+    #[deprecated(note = "use exec_container_stream_ready_with_options and collect the stream")]
     pub async fn oci_exec(
         &self,
-        id: String,
-        command: String,
-        args: Vec<String>,
-        options: OciExecOptions,
+        _id: String,
+        _command: String,
+        _args: Vec<String>,
+        _options: OciExecOptions,
     ) -> Result<ExecOutput, LinuxError> {
-        self.ensure_grpc().await?;
-        let mut grpc = self.grpc.lock().await;
-        let client = grpc
-            .as_mut()
-            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
-        client.oci_exec(id, command, args, options).await
+        Err(LinuxError::Protocol(
+            "legacy OciService.Exec is retired; use supervised AgentService.Exec stream collection"
+                .to_string(),
+        ))
     }
 
     /// Signal a running container in the guest OCI runtime.
@@ -678,38 +1232,14 @@ impl LinuxVm {
         interactive_result
     }
 
-    /// Execute a raw command inside a running OCI container with a PTY.
-    pub async fn exec_container_interactive(
+    /// Start a PTY exec using a request identity retained by the caller.
+    /// Ambiguous errors and dropped futures require reconciliation of this
+    /// exact ID before releasing VM or lifecycle authority.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn exec_container_interactive_ready_classified_for_request(
         &self,
-        container_id: String,
-        command: &str,
-        args: &[&str],
-        options: ExecOptions,
-        rows: u32,
-        cols: u32,
-    ) -> Result<(crate::grpc_client::GrpcExecStream, u64), LinuxError> {
-        let mut client =
-            GrpcAgentClient::connect(Arc::clone(&self.vm), vz::protocol::AGENT_PORT).await?;
-        client.ping().await?;
-        let info = client.system_info().await?;
-        validate_guest_system_info(&info)?;
-        let args_owned = args.iter().map(|arg| (*arg).to_string()).collect();
-        client
-            .exec_container_stream_interactive(
-                container_id,
-                command.to_string(),
-                args_owned,
-                options,
-                rows,
-                cols,
-            )
-            .await
-    }
-
-    /// Start a container PTY exec and return the control ID plus exact pinned
-    /// guest generation.
-    pub async fn exec_container_interactive_ready(
-        &self,
+        dispatch_gate: ContainerExecDispatchGate,
+        request_id: String,
         container_id: String,
         command: &str,
         args: &[&str],
@@ -722,16 +1252,25 @@ impl LinuxVm {
             u64,
             vz_agent_proto::ContainerGeneration,
         ),
-        LinuxError,
+        ContainerExecStartError,
     > {
-        let mut client =
-            GrpcAgentClient::connect(Arc::clone(&self.vm), vz::protocol::AGENT_PORT).await?;
-        client.ping().await?;
-        let info = client.system_info().await?;
-        validate_guest_system_info(&info)?;
+        let mut client = GrpcAgentClient::connect(Arc::clone(&self.vm), vz::protocol::AGENT_PORT)
+            .await
+            .map_err(ContainerExecStartError::Definite)?;
+        client
+            .ping()
+            .await
+            .map_err(ContainerExecStartError::Definite)?;
+        let info = client
+            .system_info()
+            .await
+            .map_err(ContainerExecStartError::Definite)?;
+        validate_guest_system_info(&info).map_err(ContainerExecStartError::Definite)?;
         let args_owned = args.iter().map(|arg| (*arg).to_string()).collect();
         client
-            .exec_container_stream_interactive_ready(
+            .exec_container_stream_interactive_ready_for_request(
+                dispatch_gate,
+                request_id,
                 container_id,
                 command.to_string(),
                 args_owned,
@@ -788,6 +1327,33 @@ impl LinuxVm {
             .as_mut()
             .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
         client.signal(exec_id, signal).await
+    }
+
+    /// Cancel an exec and wait until the guest confirms it is terminal and reaped.
+    pub async fn cancel_exec(
+        &self,
+        exec_id: u64,
+    ) -> Result<vz_agent_proto::CancelExecResponse, LinuxError> {
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
+        client.cancel_exec(exec_id).await
+    }
+
+    /// Reconnect and obtain exact guest proof for an ambiguously dispatched
+    /// container exec request. Callers must retain lifecycle authority until
+    /// this returns a terminal proof outcome (rather than `STALE_UNKNOWN`).
+    pub async fn reconcile_exec_request(
+        &self,
+        request_id: String,
+    ) -> Result<vz_agent_proto::ReconcileExecResponse, LinuxError> {
+        let mut client = GrpcAgentClient::connect_default(Arc::clone(&self.vm)).await?;
+        client.ping().await?;
+        let info = client.system_info().await?;
+        validate_guest_system_info(&info)?;
+        client.reconcile_exec_request(request_id).await
     }
 
     /// Resize the PTY window for a running interactive exec session.
@@ -860,5 +1426,125 @@ mod tests {
             error,
             LinuxError::GuestProtocolRevisionMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn container_collector_uses_addressable_checked_exec_path() {
+        let source = include_str!("vm.rs");
+        let collector = source
+            .split_once("pub async fn exec_container_collect_with_options")
+            .unwrap()
+            .1
+            .split_once("/// Run a command on the guest")
+            .unwrap()
+            .0;
+
+        assert!(collector.contains("exec_container_stream_ready"));
+        assert!(collector.contains("next_checked"));
+        assert!(collector.contains("cancel_and_reap"));
+        assert!(collector.contains("CONTAINER_EXEC_CLEANUP_ATTEMPT_TIMEOUT"));
+        assert!(collector.contains("starting.cancel_after_start()"));
+        assert!(collector.contains("starting.retain_cleanup("));
+        assert!(collector.contains("ContainerExecStartError::Definite"));
+        assert!(collector.contains("ContainerExecStartError::Ambiguous"));
+        assert!(collector.contains("reconcile_ambiguous_start_failure("));
+        assert!(collector.contains("reconciliation=PENDING_UNDER_RETAINED_AUTHORITY"));
+        assert!(collector.contains("exec_container_stream_ready_for_request"));
+        assert!(!collector.contains(".collect().await"));
+        assert!(!collector.contains("ExecEvent::Exit(-1)"));
+    }
+
+    #[test]
+    fn container_exec_drop_guards_fail_closed_without_a_runtime() {
+        let source = include_str!("vm.rs");
+        let ownership = source
+            .split_once("fn exec_control_debug_enabled")
+            .unwrap()
+            .0;
+
+        assert!(ownership.matches("Handle::try_current()").count() >= 3);
+        assert!(ownership.matches("std::mem::forget").count() >= 5);
+        assert!(ownership.contains("container exec startup cleanup lost its Tokio runtime"));
+        assert!(ownership.contains("container exec cleanup lost its Tokio runtime"));
+    }
+
+    #[test]
+    fn terminal_vm_state_is_exact_reconciliation_fallback_proof() {
+        assert_eq!(
+            terminal_vm_reconciliation_outcome(VmState::Stopped),
+            Some("VM_TERMINAL_STOPPED")
+        );
+        assert_eq!(
+            terminal_vm_reconciliation_outcome(VmState::Error("failed".to_string())),
+            Some("VM_TERMINAL_ERROR")
+        );
+        for state in [
+            VmState::Starting,
+            VmState::Running,
+            VmState::Pausing,
+            VmState::Paused,
+            VmState::Resuming,
+            VmState::Stopping,
+            VmState::Saving,
+            VmState::Restoring,
+        ] {
+            assert_eq!(terminal_vm_reconciliation_outcome(state), None);
+        }
+    }
+
+    #[test]
+    fn classified_pipe_start_uses_dedicated_client_without_control_mutex() {
+        let source = include_str!("vm.rs");
+        let method = source
+            .split_once("pub async fn exec_container_stream_ready_classified_for_request")
+            .unwrap()
+            .1
+            .split_once("/// Run and collect a raw command")
+            .unwrap()
+            .0;
+        assert!(method.contains("GrpcAgentClient::connect_default"));
+        assert!(method.contains(".ping()"));
+        assert!(!method.contains("self.grpc.lock()"));
+    }
+
+    #[test]
+    fn public_container_exec_surface_preserves_request_identity_or_owns_cleanup() {
+        let vm = include_str!("vm.rs").split_once("#[cfg(test)]").unwrap().0;
+        let client = include_str!("grpc_client.rs")
+            .split_once("#[cfg(test)]")
+            .unwrap()
+            .0;
+
+        for removed in [
+            "pub async fn exec_container_stream_with_options(",
+            "pub async fn exec_container_stream_ready_with_options(",
+            "pub async fn exec_container_stream_ready_classified_with_options(",
+            "pub async fn exec_container_interactive(",
+            "pub async fn exec_container_interactive_ready(",
+            "pub async fn exec_container_interactive_ready_classified(",
+        ] {
+            assert!(!vm.contains(removed), "lossy VM API remains: {removed}");
+        }
+        for removed in [
+            "pub async fn exec_container_stream(",
+            "pub async fn exec_container_stream_ready(",
+            "pub async fn exec_container_stream_interactive(",
+            "pub async fn exec_container_stream_interactive_ready(",
+        ] {
+            assert!(
+                !client.contains(removed),
+                "lossy client API remains: {removed}"
+            );
+        }
+
+        assert!(vm.contains("pub async fn exec_container_collect_with_options("));
+        assert!(vm.contains("pub async fn exec_container_stream_ready_classified_for_request("));
+        assert!(
+            vm.contains("pub async fn exec_container_interactive_ready_classified_for_request(")
+        );
+        assert!(client.contains("pub async fn exec_container_stream_ready_for_request("));
+        assert!(
+            client.contains("pub async fn exec_container_stream_interactive_ready_for_request(")
+        );
     }
 }

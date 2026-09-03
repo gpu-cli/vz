@@ -23,9 +23,14 @@ service AgentService {
   // Query guest resource usage stats.
   rpc ResourceStats(ResourceStatsRequest) returns (ResourceStatsResponse);
 
+  // Allocate a guest-incarnation-bound, monotonically ordered request ticket
+  // for one container-targeted Exec. Allocation retains no execution state.
+  rpc AllocateExecRequest(AllocateExecRequestRequest) returns (AllocateExecRequestResponse);
+
   // Execute a command in the guest. Returns a stream of stdout/stderr
   // chunks followed by an exit code.
   rpc Exec(ExecRequest) returns (stream ExecEvent);
+
 
   // Write data to a running exec's stdin.
   rpc StdinWrite(StdinWriteRequest) returns (StdinWriteResponse);
@@ -35,6 +40,13 @@ service AgentService {
 
   // Send a signal to a running exec.
   rpc Signal(SignalRequest) returns (SignalResponse);
+
+  // Cancel a running exec, escalating from TERM to KILL and returning only
+  // after the guest has observed and reaped the supervised process.
+  rpc CancelExec(CancelExecRequest) returns (CancelExecResponse);
+
+  // Fence or reap an exec whose stream failed before the host learned exec_id.
+  rpc ReconcileExec(ReconcileExecRequest) returns (ReconcileExecResponse);
 
   // Resize the PTY window for a running exec session.
   rpc ResizeExecPty(ResizeExecPtyRequest) returns (ResizeExecPtyResponse);
@@ -119,6 +131,15 @@ message TransportMetadata {
 }
 
 // ─── Exec ───────────────────────────────────────────────────────
+
+message AllocateExecRequestRequest {
+  TransportMetadata metadata = 1;
+}
+
+message AllocateExecRequestResponse {
+  // Single-use ticket accepted only by this guest-agent incarnation.
+  string exec_request_id = 1;
+}
 
 message ExecRequest {
   string command = 1;
@@ -208,6 +229,40 @@ message SignalRequest {
   TransportMetadata metadata = 3;
 }
 message SignalResponse {}
+
+message CancelExecRequest {
+  uint64 exec_id = 1;
+  TransportMetadata metadata = 2;
+}
+message CancelExecResponse {
+  // Normalized shell-compatible exit status (128 + signal for signaled exits).
+  int32 exit_code = 1;
+  // True when cancellation had to escalate from TERM to KILL.
+  bool forced = 2;
+}
+
+message ReconcileExecRequest {
+  // Exact request_id from the original authenticated ExecRequest metadata.
+  string exec_request_id = 1;
+  TransportMetadata metadata = 2;
+}
+
+message ReconcileExecResponse {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    // The request was atomically fenced before it could spawn.
+    FENCED_NEVER_STARTED = 1;
+    // The exact published exec was forced terminal and reaped.
+    TERMINAL_REAPED = 2;
+    // The bounded receipt was evicted, so exact terminal proof is unavailable.
+    STALE_UNKNOWN = 3;
+  }
+  Outcome outcome = 1;
+  string exec_request_id = 2;
+  uint64 exec_id = 3;
+  int32 exit_code = 4;
+  bool forced = 5;
+}
 
 // ─── PTY Resize ─────────────────────────────────────────────
 
