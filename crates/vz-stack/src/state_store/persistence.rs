@@ -2283,10 +2283,14 @@ impl StateStore {
 
     /// Get the current schema version from control metadata.
     ///
-    /// Returns `1` if no schema version has been recorded.
+    /// Missing or malformed schema metadata is rejected rather than guessed.
     pub fn schema_version(&self) -> Result<u32, StackError> {
-        self.get_control_metadata("schema_version")
-            .map(|v| v.and_then(|s| s.parse().ok()).unwrap_or(1))
+        let value = self
+            .get_control_metadata("schema_version")?
+            .ok_or_else(|| StackError::InvalidSpec("missing state schema version".to_string()))?;
+        value.parse().map_err(|_| {
+            StackError::InvalidSpec(format!("malformed state schema version `{value}`"))
+        })
     }
 
     /// Set the schema version in control metadata.

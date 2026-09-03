@@ -20,6 +20,343 @@ pub struct ErrorDetail {
     #[prost(string, tag = "3")]
     pub request_id: ::prost::alloc::string::String,
 }
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct HostSpec {
+    #[prost(enumeration = "OperatingSystem", tag = "1")]
+    pub os: i32,
+    #[prost(enumeration = "Architecture", tag = "2")]
+    pub arch: i32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TargetSpec {
+    #[prost(enumeration = "OperatingSystem", tag = "1")]
+    pub os: i32,
+    #[prost(enumeration = "Architecture", tag = "2")]
+    pub arch: i32,
+    #[prost(string, tag = "3")]
+    pub image: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "4")]
+    pub version: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "5")]
+    pub channel: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "6")]
+    pub digest: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UnsupportedMachineCapability {
+    #[prost(enumeration = "MachineCapability", tag = "1")]
+    pub capability: i32,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// Used for both requested and negotiated capability sets. Requested sets
+/// normally contain only capabilities. Negotiated sets may additionally retain
+/// a structured reason for every unsupported request.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CapabilitySet {
+    #[prost(enumeration = "MachineCapability", repeated, tag = "1")]
+    pub capabilities: ::prost::alloc::vec::Vec<i32>,
+    #[prost(message, repeated, tag = "2")]
+    pub unsupported: ::prost::alloc::vec::Vec<UnsupportedMachineCapability>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct MachineResources {
+    #[prost(uint32, optional, tag = "1")]
+    pub cpus: ::core::option::Option<u32>,
+    #[prost(uint64, optional, tag = "2")]
+    pub memory_mb: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "3")]
+    pub disk_bytes: ::core::option::Option<u64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkspaceProjection {
+    #[prost(string, tag = "1")]
+    pub binding: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub target_path: ::prost::alloc::string::String,
+    #[prost(enumeration = "WorkspaceProjectionMode", tag = "3")]
+    pub mode: i32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineSpec {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub target: ::core::option::Option<TargetSpec>,
+    #[prost(message, optional, tag = "4")]
+    pub resources: ::core::option::Option<MachineResources>,
+    #[prost(message, optional, tag = "5")]
+    pub requested_capabilities: ::core::option::Option<CapabilitySet>,
+    #[prost(message, optional, tag = "6")]
+    pub workspace: ::core::option::Option<WorkspaceProjection>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NetworkSpec {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(enumeration = "NetworkKind", tag = "3")]
+    pub kind: i32,
+    #[prost(string, optional, tag = "4")]
+    pub cidr: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EndpointSpec {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub machine: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub network: ::prost::alloc::string::String,
+    #[prost(enumeration = "EndpointProtocol", tag = "5")]
+    pub protocol: i32,
+    #[prost(uint32, tag = "6")]
+    pub port: u32,
+    #[prost(string, optional, tag = "7")]
+    pub hostname: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EnvironmentSpec {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(message, repeated, tag = "2")]
+    pub machines: ::prost::alloc::vec::Vec<MachineSpec>,
+    #[prost(message, repeated, tag = "3")]
+    pub networks: ::prost::alloc::vec::Vec<NetworkSpec>,
+    #[prost(message, repeated, tag = "4")]
+    pub endpoints: ::prost::alloc::vec::Vec<EndpointSpec>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProjectDefinition {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub project_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub environment: ::core::option::Option<EnvironmentSpec>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkspaceBinding {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub binding_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub project_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub workspace_key: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "6")]
+    pub path_hint: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, tag = "7")]
+    pub name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineIncarnation {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub incarnation_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "4")]
+    pub generation: u64,
+    #[prost(uint64, tag = "5")]
+    pub created_at: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineInstance {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "5")]
+    pub target: ::core::option::Option<TargetSpec>,
+    #[prost(message, optional, tag = "6")]
+    pub resources: ::core::option::Option<MachineResources>,
+    #[prost(message, optional, tag = "7")]
+    pub requested_capabilities: ::core::option::Option<CapabilitySet>,
+    #[prost(message, optional, tag = "8")]
+    pub negotiated_capabilities: ::core::option::Option<CapabilitySet>,
+    #[prost(enumeration = "MachineBackend", optional, tag = "9")]
+    pub backend: ::core::option::Option<i32>,
+    /// Carries MachineBackend::Other(String) without weakening the enum contract.
+    #[prost(string, optional, tag = "10")]
+    pub other_backend: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "11")]
+    pub incarnation: ::core::option::Option<MachineIncarnation>,
+    #[prost(enumeration = "MachineState", tag = "12")]
+    pub state: i32,
+    #[prost(string, optional, tag = "13")]
+    pub legacy_sandbox_id: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NetworkInstance {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub network_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EndpointInstance {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub endpoint_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub network_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OwnershipRecord {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(enumeration = "OwnedResourceKind", tag = "2")]
+    pub resource_kind: i32,
+    /// Carries OwnedResourceKind::Other(String) without weakening the enum contract.
+    #[prost(string, optional, tag = "3")]
+    pub other_resource_kind: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, tag = "4")]
+    pub resource_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "6")]
+    pub machine_id: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LegacyMigrationProvenance {
+    #[prost(string, tag = "1")]
+    pub source_version: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub legacy_sandbox_id: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "3")]
+    pub unresolved_resources: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EnvironmentInstance {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub project_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub definition_digest: ::prost::alloc::string::String,
+    #[prost(enumeration = "EnvironmentState", tag = "6")]
+    pub state: i32,
+    #[prost(message, repeated, tag = "7")]
+    pub bindings: ::prost::alloc::vec::Vec<WorkspaceBinding>,
+    #[prost(message, repeated, tag = "8")]
+    pub machines: ::prost::alloc::vec::Vec<MachineInstance>,
+    #[prost(message, repeated, tag = "9")]
+    pub networks: ::prost::alloc::vec::Vec<NetworkInstance>,
+    #[prost(message, repeated, tag = "10")]
+    pub endpoints: ::prost::alloc::vec::Vec<EndpointInstance>,
+    #[prost(message, repeated, tag = "11")]
+    pub ownership: ::prost::alloc::vec::Vec<OwnershipRecord>,
+    #[prost(message, optional, tag = "12")]
+    pub legacy_migration: ::core::option::Option<LegacyMigrationProvenance>,
+    #[prost(uint64, tag = "13")]
+    pub created_at: u64,
+    #[prost(uint64, tag = "14")]
+    pub updated_at: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProjectState {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(message, optional, tag = "2")]
+    pub definition: ::core::option::Option<ProjectDefinition>,
+    #[prost(message, repeated, tag = "3")]
+    pub environments: ::prost::alloc::vec::Vec<EnvironmentInstance>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyCandidate {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyNotFoundDetail {
+    #[prost(string, tag = "1")]
+    pub kind: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub selector: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyAmbiguityDetail {
+    #[prost(string, tag = "1")]
+    pub kind: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub selector: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "3")]
+    pub candidates: ::prost::alloc::vec::Vec<TopologyCandidate>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyUnsupportedTargetDetail {
+    #[prost(enumeration = "OperatingSystem", tag = "1")]
+    pub host_os: i32,
+    #[prost(enumeration = "Architecture", tag = "2")]
+    pub host_arch: i32,
+    #[prost(enumeration = "OperatingSystem", tag = "3")]
+    pub target_os: i32,
+    #[prost(enumeration = "Architecture", tag = "4")]
+    pub target_arch: i32,
+    #[prost(enumeration = "MachineCapability", repeated, tag = "5")]
+    pub requested_capabilities: ::prost::alloc::vec::Vec<i32>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyMissingCapabilityDetail {
+    #[prost(string, tag = "1")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "MachineCapability", tag = "2")]
+    pub capability: i32,
+}
+/// Structured detail suitable for an ErrorDetail companion. Do not require
+/// clients to parse ambiguity or unsupported-target information from prose.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyErrorDetail {
+    #[prost(oneof = "topology_error_detail::Detail", tags = "1, 2, 3, 4")]
+    pub detail: ::core::option::Option<topology_error_detail::Detail>,
+}
+/// Nested message and enum types in `TopologyErrorDetail`.
+pub mod topology_error_detail {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Detail {
+        #[prost(message, tag = "1")]
+        NotFound(super::TopologyNotFoundDetail),
+        #[prost(message, tag = "2")]
+        Ambiguous(super::TopologyAmbiguityDetail),
+        #[prost(message, tag = "3")]
+        UnsupportedTarget(super::TopologyUnsupportedTargetDetail),
+        #[prost(message, tag = "4")]
+        MissingCapability(super::TopologyMissingCapabilityDetail),
+    }
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateSandboxRequest {
     #[prost(message, optional, tag = "1")]
@@ -1907,6 +2244,405 @@ pub struct GetCapabilitiesResponse {
     pub request_id: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "2")]
     pub capabilities: ::prost::alloc::vec::Vec<Capability>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum OperatingSystem {
+    Unspecified = 0,
+    Linux = 1,
+    Macos = 2,
+    Windows = 3,
+}
+impl OperatingSystem {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "OPERATING_SYSTEM_UNSPECIFIED",
+            Self::Linux => "OPERATING_SYSTEM_LINUX",
+            Self::Macos => "OPERATING_SYSTEM_MACOS",
+            Self::Windows => "OPERATING_SYSTEM_WINDOWS",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "OPERATING_SYSTEM_UNSPECIFIED" => Some(Self::Unspecified),
+            "OPERATING_SYSTEM_LINUX" => Some(Self::Linux),
+            "OPERATING_SYSTEM_MACOS" => Some(Self::Macos),
+            "OPERATING_SYSTEM_WINDOWS" => Some(Self::Windows),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Architecture {
+    Unspecified = 0,
+    Aarch64 = 1,
+    X8664 = 2,
+}
+impl Architecture {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ARCHITECTURE_UNSPECIFIED",
+            Self::Aarch64 => "ARCHITECTURE_AARCH64",
+            Self::X8664 => "ARCHITECTURE_X86_64",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ARCHITECTURE_UNSPECIFIED" => Some(Self::Unspecified),
+            "ARCHITECTURE_AARCH64" => Some(Self::Aarch64),
+            "ARCHITECTURE_X86_64" => Some(Self::X8664),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MachineCapability {
+    Unspecified = 0,
+    PosixExec = 1,
+    PosixPty = 2,
+    Signals = 3,
+    Files = 4,
+    Ports = 5,
+    DockerEngine = 6,
+    Compose = 7,
+    Buildx = 8,
+    Snapshot = 9,
+    Suspend = 10,
+    Checkpoint = 11,
+    Gui = 12,
+    WindowsConsole = 13,
+}
+impl MachineCapability {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MACHINE_CAPABILITY_UNSPECIFIED",
+            Self::PosixExec => "MACHINE_CAPABILITY_POSIX_EXEC",
+            Self::PosixPty => "MACHINE_CAPABILITY_POSIX_PTY",
+            Self::Signals => "MACHINE_CAPABILITY_SIGNALS",
+            Self::Files => "MACHINE_CAPABILITY_FILES",
+            Self::Ports => "MACHINE_CAPABILITY_PORTS",
+            Self::DockerEngine => "MACHINE_CAPABILITY_DOCKER_ENGINE",
+            Self::Compose => "MACHINE_CAPABILITY_COMPOSE",
+            Self::Buildx => "MACHINE_CAPABILITY_BUILDX",
+            Self::Snapshot => "MACHINE_CAPABILITY_SNAPSHOT",
+            Self::Suspend => "MACHINE_CAPABILITY_SUSPEND",
+            Self::Checkpoint => "MACHINE_CAPABILITY_CHECKPOINT",
+            Self::Gui => "MACHINE_CAPABILITY_GUI",
+            Self::WindowsConsole => "MACHINE_CAPABILITY_WINDOWS_CONSOLE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MACHINE_CAPABILITY_UNSPECIFIED" => Some(Self::Unspecified),
+            "MACHINE_CAPABILITY_POSIX_EXEC" => Some(Self::PosixExec),
+            "MACHINE_CAPABILITY_POSIX_PTY" => Some(Self::PosixPty),
+            "MACHINE_CAPABILITY_SIGNALS" => Some(Self::Signals),
+            "MACHINE_CAPABILITY_FILES" => Some(Self::Files),
+            "MACHINE_CAPABILITY_PORTS" => Some(Self::Ports),
+            "MACHINE_CAPABILITY_DOCKER_ENGINE" => Some(Self::DockerEngine),
+            "MACHINE_CAPABILITY_COMPOSE" => Some(Self::Compose),
+            "MACHINE_CAPABILITY_BUILDX" => Some(Self::Buildx),
+            "MACHINE_CAPABILITY_SNAPSHOT" => Some(Self::Snapshot),
+            "MACHINE_CAPABILITY_SUSPEND" => Some(Self::Suspend),
+            "MACHINE_CAPABILITY_CHECKPOINT" => Some(Self::Checkpoint),
+            "MACHINE_CAPABILITY_GUI" => Some(Self::Gui),
+            "MACHINE_CAPABILITY_WINDOWS_CONSOLE" => Some(Self::WindowsConsole),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum WorkspaceProjectionMode {
+    Unspecified = 0,
+    ReadWrite = 1,
+    ReadOnly = 2,
+    Snapshot = 3,
+}
+impl WorkspaceProjectionMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "WORKSPACE_PROJECTION_MODE_UNSPECIFIED",
+            Self::ReadWrite => "WORKSPACE_PROJECTION_MODE_READ_WRITE",
+            Self::ReadOnly => "WORKSPACE_PROJECTION_MODE_READ_ONLY",
+            Self::Snapshot => "WORKSPACE_PROJECTION_MODE_SNAPSHOT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "WORKSPACE_PROJECTION_MODE_UNSPECIFIED" => Some(Self::Unspecified),
+            "WORKSPACE_PROJECTION_MODE_READ_WRITE" => Some(Self::ReadWrite),
+            "WORKSPACE_PROJECTION_MODE_READ_ONLY" => Some(Self::ReadOnly),
+            "WORKSPACE_PROJECTION_MODE_SNAPSHOT" => Some(Self::Snapshot),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum NetworkKind {
+    Unspecified = 0,
+    Private = 1,
+    SimulatedPublic = 2,
+}
+impl NetworkKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "NETWORK_KIND_UNSPECIFIED",
+            Self::Private => "NETWORK_KIND_PRIVATE",
+            Self::SimulatedPublic => "NETWORK_KIND_SIMULATED_PUBLIC",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "NETWORK_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "NETWORK_KIND_PRIVATE" => Some(Self::Private),
+            "NETWORK_KIND_SIMULATED_PUBLIC" => Some(Self::SimulatedPublic),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum EndpointProtocol {
+    Unspecified = 0,
+    Tcp = 1,
+    Udp = 2,
+    Http = 3,
+    Https = 4,
+}
+impl EndpointProtocol {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ENDPOINT_PROTOCOL_UNSPECIFIED",
+            Self::Tcp => "ENDPOINT_PROTOCOL_TCP",
+            Self::Udp => "ENDPOINT_PROTOCOL_UDP",
+            Self::Http => "ENDPOINT_PROTOCOL_HTTP",
+            Self::Https => "ENDPOINT_PROTOCOL_HTTPS",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ENDPOINT_PROTOCOL_UNSPECIFIED" => Some(Self::Unspecified),
+            "ENDPOINT_PROTOCOL_TCP" => Some(Self::Tcp),
+            "ENDPOINT_PROTOCOL_UDP" => Some(Self::Udp),
+            "ENDPOINT_PROTOCOL_HTTP" => Some(Self::Http),
+            "ENDPOINT_PROTOCOL_HTTPS" => Some(Self::Https),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum EnvironmentState {
+    Unspecified = 0,
+    Creating = 1,
+    Reconciling = 2,
+    Ready = 3,
+    Stopped = 4,
+    Deleting = 5,
+    Deleted = 6,
+    Failed = 7,
+}
+impl EnvironmentState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ENVIRONMENT_STATE_UNSPECIFIED",
+            Self::Creating => "ENVIRONMENT_STATE_CREATING",
+            Self::Reconciling => "ENVIRONMENT_STATE_RECONCILING",
+            Self::Ready => "ENVIRONMENT_STATE_READY",
+            Self::Stopped => "ENVIRONMENT_STATE_STOPPED",
+            Self::Deleting => "ENVIRONMENT_STATE_DELETING",
+            Self::Deleted => "ENVIRONMENT_STATE_DELETED",
+            Self::Failed => "ENVIRONMENT_STATE_FAILED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ENVIRONMENT_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "ENVIRONMENT_STATE_CREATING" => Some(Self::Creating),
+            "ENVIRONMENT_STATE_RECONCILING" => Some(Self::Reconciling),
+            "ENVIRONMENT_STATE_READY" => Some(Self::Ready),
+            "ENVIRONMENT_STATE_STOPPED" => Some(Self::Stopped),
+            "ENVIRONMENT_STATE_DELETING" => Some(Self::Deleting),
+            "ENVIRONMENT_STATE_DELETED" => Some(Self::Deleted),
+            "ENVIRONMENT_STATE_FAILED" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MachineState {
+    Unspecified = 0,
+    Creating = 1,
+    Ready = 2,
+    Stopped = 3,
+    Failed = 4,
+}
+impl MachineState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MACHINE_STATE_UNSPECIFIED",
+            Self::Creating => "MACHINE_STATE_CREATING",
+            Self::Ready => "MACHINE_STATE_READY",
+            Self::Stopped => "MACHINE_STATE_STOPPED",
+            Self::Failed => "MACHINE_STATE_FAILED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MACHINE_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "MACHINE_STATE_CREATING" => Some(Self::Creating),
+            "MACHINE_STATE_READY" => Some(Self::Ready),
+            "MACHINE_STATE_STOPPED" => Some(Self::Stopped),
+            "MACHINE_STATE_FAILED" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MachineBackend {
+    Unspecified = 0,
+    MacosVirtualizationLinux = 1,
+    MacosNative = 2,
+    LinuxNative = 3,
+    WindowsLinux = 4,
+    WindowsNative = 5,
+    Other = 6,
+}
+impl MachineBackend {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MACHINE_BACKEND_UNSPECIFIED",
+            Self::MacosVirtualizationLinux => {
+                "MACHINE_BACKEND_MACOS_VIRTUALIZATION_LINUX"
+            }
+            Self::MacosNative => "MACHINE_BACKEND_MACOS_NATIVE",
+            Self::LinuxNative => "MACHINE_BACKEND_LINUX_NATIVE",
+            Self::WindowsLinux => "MACHINE_BACKEND_WINDOWS_LINUX",
+            Self::WindowsNative => "MACHINE_BACKEND_WINDOWS_NATIVE",
+            Self::Other => "MACHINE_BACKEND_OTHER",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MACHINE_BACKEND_UNSPECIFIED" => Some(Self::Unspecified),
+            "MACHINE_BACKEND_MACOS_VIRTUALIZATION_LINUX" => {
+                Some(Self::MacosVirtualizationLinux)
+            }
+            "MACHINE_BACKEND_MACOS_NATIVE" => Some(Self::MacosNative),
+            "MACHINE_BACKEND_LINUX_NATIVE" => Some(Self::LinuxNative),
+            "MACHINE_BACKEND_WINDOWS_LINUX" => Some(Self::WindowsLinux),
+            "MACHINE_BACKEND_WINDOWS_NATIVE" => Some(Self::WindowsNative),
+            "MACHINE_BACKEND_OTHER" => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum OwnedResourceKind {
+    Unspecified = 0,
+    Machine = 1,
+    Incarnation = 2,
+    Disk = 3,
+    Socket = 4,
+    DockerContext = 5,
+    Network = 6,
+    Endpoint = 7,
+    Credential = 8,
+    Fault = 9,
+    LegacySandbox = 10,
+    Other = 11,
+}
+impl OwnedResourceKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "OWNED_RESOURCE_KIND_UNSPECIFIED",
+            Self::Machine => "OWNED_RESOURCE_KIND_MACHINE",
+            Self::Incarnation => "OWNED_RESOURCE_KIND_INCARNATION",
+            Self::Disk => "OWNED_RESOURCE_KIND_DISK",
+            Self::Socket => "OWNED_RESOURCE_KIND_SOCKET",
+            Self::DockerContext => "OWNED_RESOURCE_KIND_DOCKER_CONTEXT",
+            Self::Network => "OWNED_RESOURCE_KIND_NETWORK",
+            Self::Endpoint => "OWNED_RESOURCE_KIND_ENDPOINT",
+            Self::Credential => "OWNED_RESOURCE_KIND_CREDENTIAL",
+            Self::Fault => "OWNED_RESOURCE_KIND_FAULT",
+            Self::LegacySandbox => "OWNED_RESOURCE_KIND_LEGACY_SANDBOX",
+            Self::Other => "OWNED_RESOURCE_KIND_OTHER",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "OWNED_RESOURCE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "OWNED_RESOURCE_KIND_MACHINE" => Some(Self::Machine),
+            "OWNED_RESOURCE_KIND_INCARNATION" => Some(Self::Incarnation),
+            "OWNED_RESOURCE_KIND_DISK" => Some(Self::Disk),
+            "OWNED_RESOURCE_KIND_SOCKET" => Some(Self::Socket),
+            "OWNED_RESOURCE_KIND_DOCKER_CONTEXT" => Some(Self::DockerContext),
+            "OWNED_RESOURCE_KIND_NETWORK" => Some(Self::Network),
+            "OWNED_RESOURCE_KIND_ENDPOINT" => Some(Self::Endpoint),
+            "OWNED_RESOURCE_KIND_CREDENTIAL" => Some(Self::Credential),
+            "OWNED_RESOURCE_KIND_FAULT" => Some(Self::Fault),
+            "OWNED_RESOURCE_KIND_LEGACY_SANDBOX" => Some(Self::LegacySandbox),
+            "OWNED_RESOURCE_KIND_OTHER" => Some(Self::Other),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

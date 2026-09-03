@@ -21,6 +21,7 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true }
 criterion = { workspace = true }
+sha2 = { workspace = true }
 
 [[bench]]
 name = "state_store_bench"

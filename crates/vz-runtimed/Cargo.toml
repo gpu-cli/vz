@@ -39,6 +39,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 hyper-util = { workspace = true, features = ["tokio"] }
+rusqlite = { version = "0.34", features = ["bundled"] }
 tempfile = { workspace = true }
 
 [lints]

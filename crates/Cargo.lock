@@ -4004,6 +4004,7 @@ dependencies = [
 name = "vz-runtime-translate"
 version = "0.1.0"
 dependencies = [
+ "prost",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -4020,6 +4021,7 @@ dependencies = [
  "fs2",
  "hyper-util",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
@@ -4082,6 +4084,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

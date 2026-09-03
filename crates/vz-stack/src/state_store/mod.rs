@@ -594,6 +594,51 @@ impl StateStore {
     }
 
     fn init_schema(&self) -> Result<(), StackError> {
+        let object_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get(0),
+        )?;
+        if object_count == 0 {
+            return self.with_immediate_transaction(|store| {
+                store.create_legacy_schema()?;
+                store.create_topology_schema()?;
+                store.set_schema_version(topology::STORE_SCHEMA_VERSION)?;
+                Ok(())
+            });
+        }
+
+        let metadata_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'control_metadata'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !metadata_exists {
+            return Err(StackError::InvalidSpec(
+                "non-empty state database has no control_metadata table".to_string(),
+            ));
+        }
+        let version = self.schema_version()?;
+        match version {
+            1 => self.migrate_legacy_v1_to_v2(),
+            topology::STORE_SCHEMA_VERSION => self.validate_topology_schema(),
+            future if future > topology::STORE_SCHEMA_VERSION => {
+                Err(StackError::InvalidSpec(format!(
+                    "state schema version {future} is newer than supported version {}",
+                    topology::STORE_SCHEMA_VERSION
+                )))
+            }
+            unsupported => Err(StackError::InvalidSpec(format!(
+                "unsupported state schema version {unsupported}"
+            ))),
+        }
+    }
+
+    fn create_legacy_schema(&self) -> Result<(), StackError> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS desired_state (
                 id INTEGER PRIMARY KEY,
@@ -1343,6 +1388,7 @@ impl StateStore {
 
 mod drift;
 mod persistence;
+mod topology;
 
 #[cfg(test)]
 mod tests;

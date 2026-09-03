@@ -27,7 +27,7 @@ pub(crate) use execution_sessions::{ExecutionSessionRegistry, ExecutionSessionRe
 pub use grpc::{RuntimedServerError, serve_runtime_uds_with_shutdown};
 use placement_scheduler::{BackendPlacementCandidate, PlacementScheduler, PlacementSnapshot};
 
-const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 1;
+const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 2;
 const LEGACY_SANDBOX_BASE_IMAGE_REF: &str = "debian:bookworm";
 const SANDBOX_DEFAULT_BASE_IMAGE_ENV: &str = "VZ_SANDBOX_DEFAULT_BASE_IMAGE";
 const SANDBOX_DEFAULT_MAIN_CONTAINER_ENV: &str = "VZ_SANDBOX_DEFAULT_MAIN_CONTAINER";
@@ -1516,6 +1516,55 @@ mod tests {
     }
 
     #[test]
+    fn daemon_start_migrates_v0_3_20_developer_state_and_reopens_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = RuntimedConfig {
+            state_store_path: tmp.path().join("state").join("stack-state.db"),
+            runtime_data_dir: tmp.path().join("runtime"),
+            socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+        };
+        std::fs::create_dir_all(cfg.state_store_path.parent().expect("state parent"))
+            .expect("create state directory");
+        let connection =
+            rusqlite::Connection::open(&cfg.state_store_path).expect("open legacy database");
+        connection
+            .execute_batch(include_str!(
+                "../../vz-stack/tests/fixtures/v0.3.20-state.sql"
+            ))
+            .expect("install exact v0.3.20 fixture");
+        drop(connection);
+
+        let daemon = RuntimeDaemon::start(cfg.clone()).expect("daemon should migrate v0.3.20");
+        daemon
+            .with_state_store(|store| {
+                assert_eq!(store.schema_version()?, MAX_SUPPORTED_SCHEMA_VERSION);
+                let projects = store.list_project_states()?;
+                assert_eq!(projects.len(), 1);
+                assert_eq!(projects[0].environments.len(), 1);
+                assert_eq!(projects[0].environments[0].machines.len(), 1);
+                assert_eq!(
+                    projects[0].environments[0]
+                        .legacy_migration
+                        .as_ref()
+                        .map(|provenance| provenance.legacy_sandbox_id.as_str()),
+                    Some("vz-run-shop-a1b2c3d4e5f6")
+                );
+                Ok(())
+            })
+            .expect("migrated topology should be readable");
+        drop(daemon);
+
+        let reopened = RuntimeDaemon::start(cfg).expect("daemon should reopen migrated state");
+        reopened
+            .with_state_store(|store| {
+                assert_eq!(store.schema_version()?, MAX_SUPPORTED_SCHEMA_VERSION);
+                assert_eq!(store.list_project_states()?.len(), 1);
+                Ok(())
+            })
+            .expect("reopened topology should remain readable");
+    }
+
+    #[test]
     fn daemon_start_rejects_unsupported_schema_version() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = RuntimedConfig {
@@ -1535,12 +1584,11 @@ mod tests {
         let result = RuntimeDaemon::start(cfg.clone());
         assert!(matches!(
             result,
-            Err(RuntimedError::UnsupportedSchemaVersion {
-                found,
-                max_supported,
+            Err(RuntimedError::OpenStateStore {
+                source: StackError::InvalidSpec(message),
                 ..
-            }) if found == MAX_SUPPORTED_SCHEMA_VERSION + 1
-                && max_supported == MAX_SUPPORTED_SCHEMA_VERSION
+            }) if message.contains("newer than supported version")
+                && message.contains(&(MAX_SUPPORTED_SCHEMA_VERSION + 1).to_string())
         ));
     }
 

@@ -14,5 +14,8 @@ thiserror = { workspace = true }
 vz-runtime-contract = { workspace = true }
 vz-runtime-proto = { workspace = true }
 
+[dev-dependencies]
+prost = { workspace = true }
+
 [lints]
 workspace = true

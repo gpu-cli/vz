@@ -20,6 +20,7 @@ mod shared_vm;
 mod space_cache;
 mod space_cache_trust;
 mod stack;
+mod topology;
 mod workload;
 
 pub use self::build::*;
@@ -34,6 +35,7 @@ pub use self::shared_vm::*;
 pub use self::space_cache::*;
 pub use self::space_cache_trust::*;
 pub use self::stack::*;
+pub use self::topology::*;
 pub use self::workload::*;
 
 /// Contract invariants that must hold consistently for runtime data.

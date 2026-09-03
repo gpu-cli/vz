@@ -14,11 +14,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vz_runtime_contract::{
-    Build, BuildSpec, BuildState, Checkpoint, CheckpointClass, CheckpointState, Container,
-    ContainerSpec, ContainerState, Event, EventScope, Execution, ExecutionSpec, ExecutionState,
-    Lease, LeaseState, MachineError, MachineErrorCode, RequestMetadata, RuntimeCapabilities,
-    SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER, Sandbox, SandboxBackend,
-    SandboxSpec, SandboxState,
+    Architecture, Build, BuildSpec, BuildState, CapabilitySet, Checkpoint, CheckpointClass,
+    CheckpointState, Container, ContainerSpec, ContainerState, EndpointId, EndpointInstance,
+    EndpointProtocol, EndpointSpec, EnvironmentId, EnvironmentInstance, EnvironmentSpec,
+    EnvironmentState, Event, EventScope, Execution, ExecutionSpec, ExecutionState, HostSpec, Lease,
+    LeaseState, LegacyMigrationProvenance, MachineBackend, MachineCapability, MachineError,
+    MachineErrorCode, MachineId, MachineIncarnation, MachineIncarnationId, MachineInstance,
+    MachineResources, MachineSpec, MachineState, NetworkId, NetworkInstance, NetworkKind,
+    NetworkSpec, OperatingSystem, OwnedResourceKind, OwnershipRecord, ProjectDefinition, ProjectId,
+    ProjectState, RequestMetadata, RuntimeCapabilities, SANDBOX_LABEL_BASE_IMAGE_REF,
+    SANDBOX_LABEL_MAIN_CONTAINER, Sandbox, SandboxBackend, SandboxSpec, SandboxState, TargetSpec,
+    TopologyCandidate, TopologyResolutionError, TopologyValidationError, WorkspaceBinding,
+    WorkspaceBindingId, WorkspaceProjection, WorkspaceProjectionMode,
 };
 use vz_runtime_proto::runtime_v2;
 
@@ -38,6 +45,1189 @@ pub enum TranslationError {
         field: &'static str,
         details: String,
     },
+    #[error("missing required message field `{field}`")]
+    MissingRequiredField { field: &'static str },
+    #[error("decoded topology violates its canonical contract: {0}")]
+    InvalidTopology(#[from] TopologyValidationError),
+}
+
+/// Convert a complete project topology aggregate to its lossless wire form.
+pub fn project_state_to_proto(state: &ProjectState) -> runtime_v2::ProjectState {
+    runtime_v2::ProjectState {
+        schema_version: state.schema_version,
+        definition: Some(project_definition_to_proto(&state.definition)),
+        environments: state
+            .environments
+            .iter()
+            .map(environment_instance_to_proto)
+            .collect(),
+    }
+}
+
+/// Decode and canonically validate a complete project topology aggregate.
+pub fn project_state_from_proto(
+    state: &runtime_v2::ProjectState,
+) -> Result<ProjectState, TranslationError> {
+    let decoded = ProjectState {
+        schema_version: state.schema_version,
+        definition: project_definition_from_proto(required(
+            state.definition.as_ref(),
+            "project_state.definition",
+        )?)?,
+        environments: state
+            .environments
+            .iter()
+            .map(environment_instance_from_proto)
+            .collect::<Result<_, _>>()?,
+    };
+    decoded.validate()?;
+    Ok(decoded)
+}
+
+/// Convert a project definition to its wire representation.
+pub fn project_definition_to_proto(
+    definition: &ProjectDefinition,
+) -> runtime_v2::ProjectDefinition {
+    runtime_v2::ProjectDefinition {
+        schema_version: definition.schema_version,
+        project_id: definition.project_id.to_string(),
+        name: definition.name.clone(),
+        environment: Some(environment_spec_to_proto(&definition.environment)),
+    }
+}
+
+/// Decode a project definition, including its validated project identifier.
+pub fn project_definition_from_proto(
+    definition: &runtime_v2::ProjectDefinition,
+) -> Result<ProjectDefinition, TranslationError> {
+    Ok(ProjectDefinition {
+        schema_version: definition.schema_version,
+        project_id: ProjectId::new(definition.project_id.clone())?,
+        name: definition.name.clone(),
+        environment: environment_spec_from_proto(required(
+            definition.environment.as_ref(),
+            "project_definition.environment",
+        )?)?,
+    })
+}
+
+/// Convert an Environment desired topology to wire form.
+pub fn environment_spec_to_proto(spec: &EnvironmentSpec) -> runtime_v2::EnvironmentSpec {
+    runtime_v2::EnvironmentSpec {
+        schema_version: spec.schema_version,
+        machines: spec.machines.iter().map(machine_spec_to_proto).collect(),
+        networks: spec.networks.iter().map(network_spec_to_proto).collect(),
+        endpoints: spec.endpoints.iter().map(endpoint_spec_to_proto).collect(),
+    }
+}
+
+/// Decode an Environment desired topology.
+pub fn environment_spec_from_proto(
+    spec: &runtime_v2::EnvironmentSpec,
+) -> Result<EnvironmentSpec, TranslationError> {
+    Ok(EnvironmentSpec {
+        schema_version: spec.schema_version,
+        machines: spec
+            .machines
+            .iter()
+            .map(machine_spec_from_proto)
+            .collect::<Result<_, _>>()?,
+        networks: spec
+            .networks
+            .iter()
+            .map(network_spec_from_proto)
+            .collect::<Result<_, _>>()?,
+        endpoints: spec
+            .endpoints
+            .iter()
+            .map(endpoint_spec_from_proto)
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+/// Convert one desired Machine to wire form.
+pub fn machine_spec_to_proto(spec: &MachineSpec) -> runtime_v2::MachineSpec {
+    runtime_v2::MachineSpec {
+        schema_version: spec.schema_version,
+        name: spec.name.clone(),
+        target: Some(target_spec_to_proto(&spec.target)),
+        resources: Some(machine_resources_to_proto(&spec.resources)),
+        requested_capabilities: Some(capability_set_to_proto(&spec.requested_capabilities)),
+        workspace: spec.workspace.as_ref().map(workspace_projection_to_proto),
+    }
+}
+
+/// Decode one desired Machine and all required nested records.
+pub fn machine_spec_from_proto(
+    spec: &runtime_v2::MachineSpec,
+) -> Result<MachineSpec, TranslationError> {
+    Ok(MachineSpec {
+        schema_version: spec.schema_version,
+        name: spec.name.clone(),
+        target: target_spec_from_proto(required(spec.target.as_ref(), "machine_spec.target")?)?,
+        resources: machine_resources_from_proto(required(
+            spec.resources.as_ref(),
+            "machine_spec.resources",
+        )?)?,
+        requested_capabilities: capability_set_from_proto(required(
+            spec.requested_capabilities.as_ref(),
+            "machine_spec.requested_capabilities",
+        )?)?,
+        workspace: spec
+            .workspace
+            .as_ref()
+            .map(workspace_projection_from_proto)
+            .transpose()?,
+    })
+}
+
+/// Convert a host tuple to wire form.
+pub fn host_spec_to_proto(host: HostSpec) -> runtime_v2::HostSpec {
+    runtime_v2::HostSpec {
+        os: operating_system_to_proto(host.os) as i32,
+        arch: architecture_to_proto(host.arch) as i32,
+    }
+}
+
+/// Decode a host tuple, rejecting unknown and unspecified values.
+pub fn host_spec_from_proto(host: &runtime_v2::HostSpec) -> Result<HostSpec, TranslationError> {
+    Ok(HostSpec {
+        os: operating_system_from_proto(host.os, "host_spec.os")?,
+        arch: architecture_from_proto(host.arch, "host_spec.arch")?,
+    })
+}
+
+/// Convert a Machine target to wire form.
+pub fn target_spec_to_proto(target: &TargetSpec) -> runtime_v2::TargetSpec {
+    runtime_v2::TargetSpec {
+        os: operating_system_to_proto(target.os) as i32,
+        arch: architecture_to_proto(target.arch) as i32,
+        image: target.image.clone(),
+        version: target.version.clone(),
+        channel: target.channel.clone(),
+        digest: target.digest.clone(),
+    }
+}
+
+/// Decode a Machine target, rejecting unknown and unspecified platform values.
+pub fn target_spec_from_proto(
+    target: &runtime_v2::TargetSpec,
+) -> Result<TargetSpec, TranslationError> {
+    Ok(TargetSpec {
+        os: operating_system_from_proto(target.os, "target_spec.os")?,
+        arch: architecture_from_proto(target.arch, "target_spec.arch")?,
+        image: target.image.clone(),
+        version: target.version.clone(),
+        channel: target.channel.clone(),
+        digest: target.digest.clone(),
+    })
+}
+
+/// Convert a deterministically ordered capability set to wire form.
+pub fn capability_set_to_proto(set: &CapabilitySet) -> runtime_v2::CapabilitySet {
+    runtime_v2::CapabilitySet {
+        capabilities: set
+            .capabilities
+            .iter()
+            .copied()
+            .map(|capability| machine_capability_to_proto(capability) as i32)
+            .collect(),
+        unsupported: set
+            .unsupported
+            .iter()
+            .map(
+                |(capability, reason)| runtime_v2::UnsupportedMachineCapability {
+                    capability: machine_capability_to_proto(*capability) as i32,
+                    reason: reason.clone(),
+                },
+            )
+            .collect(),
+    }
+}
+
+/// Decode a capability set without losing unsupported-capability reasons.
+pub fn capability_set_from_proto(
+    set: &runtime_v2::CapabilitySet,
+) -> Result<CapabilitySet, TranslationError> {
+    let mut capabilities = BTreeSet::new();
+    for raw in &set.capabilities {
+        let capability = machine_capability_from_proto(*raw, "capability_set.capabilities")?;
+        if !capabilities.insert(capability) {
+            return Err(TranslationError::DuplicateCapability {
+                name: machine_capability_name(capability).to_string(),
+            });
+        }
+    }
+
+    let mut unsupported = BTreeMap::new();
+    for entry in &set.unsupported {
+        let capability = machine_capability_from_proto(
+            entry.capability,
+            "capability_set.unsupported.capability",
+        )?;
+        if unsupported
+            .insert(capability, entry.reason.clone())
+            .is_some()
+        {
+            return Err(TranslationError::DuplicateCapability {
+                name: machine_capability_name(capability).to_string(),
+            });
+        }
+    }
+
+    Ok(CapabilitySet {
+        capabilities,
+        unsupported,
+    })
+}
+
+/// Convert optional Machine resources to their exact wire representation.
+pub fn machine_resources_to_proto(resources: &MachineResources) -> runtime_v2::MachineResources {
+    runtime_v2::MachineResources {
+        cpus: resources.cpus.map(u32::from),
+        memory_mb: resources.memory_mb,
+        disk_bytes: resources.disk_bytes,
+    }
+}
+
+/// Decode Machine resources, rejecting CPU values outside the domain width.
+pub fn machine_resources_from_proto(
+    resources: &runtime_v2::MachineResources,
+) -> Result<MachineResources, TranslationError> {
+    Ok(MachineResources {
+        cpus: resources
+            .cpus
+            .map(|cpus| {
+                u8::try_from(cpus).map_err(|_| TranslationError::InvalidValue {
+                    field: "machine_resources.cpus",
+                    value: cpus.to_string(),
+                })
+            })
+            .transpose()?,
+        memory_mb: resources.memory_mb,
+        disk_bytes: resources.disk_bytes,
+    })
+}
+
+/// Convert a workspace projection to wire form.
+pub fn workspace_projection_to_proto(
+    projection: &WorkspaceProjection,
+) -> runtime_v2::WorkspaceProjection {
+    runtime_v2::WorkspaceProjection {
+        binding: projection.binding.clone(),
+        target_path: projection.target_path.clone(),
+        mode: workspace_projection_mode_to_proto(projection.mode) as i32,
+    }
+}
+
+/// Decode a workspace projection.
+pub fn workspace_projection_from_proto(
+    projection: &runtime_v2::WorkspaceProjection,
+) -> Result<WorkspaceProjection, TranslationError> {
+    Ok(WorkspaceProjection {
+        binding: projection.binding.clone(),
+        target_path: projection.target_path.clone(),
+        mode: workspace_projection_mode_from_proto(projection.mode)?,
+    })
+}
+
+/// Convert a desired network to wire form.
+pub fn network_spec_to_proto(spec: &NetworkSpec) -> runtime_v2::NetworkSpec {
+    runtime_v2::NetworkSpec {
+        schema_version: spec.schema_version,
+        name: spec.name.clone(),
+        kind: network_kind_to_proto(spec.kind) as i32,
+        cidr: spec.cidr.clone(),
+    }
+}
+
+/// Decode a desired network.
+pub fn network_spec_from_proto(
+    spec: &runtime_v2::NetworkSpec,
+) -> Result<NetworkSpec, TranslationError> {
+    Ok(NetworkSpec {
+        schema_version: spec.schema_version,
+        name: spec.name.clone(),
+        kind: network_kind_from_proto(spec.kind)?,
+        cidr: spec.cidr.clone(),
+    })
+}
+
+/// Convert a desired endpoint to wire form.
+pub fn endpoint_spec_to_proto(spec: &EndpointSpec) -> runtime_v2::EndpointSpec {
+    runtime_v2::EndpointSpec {
+        schema_version: spec.schema_version,
+        name: spec.name.clone(),
+        machine: spec.machine.clone(),
+        network: spec.network.clone(),
+        protocol: endpoint_protocol_to_proto(spec.protocol) as i32,
+        port: u32::from(spec.port),
+        hostname: spec.hostname.clone(),
+    }
+}
+
+/// Decode a desired endpoint, rejecting ports outside the domain width.
+pub fn endpoint_spec_from_proto(
+    spec: &runtime_v2::EndpointSpec,
+) -> Result<EndpointSpec, TranslationError> {
+    Ok(EndpointSpec {
+        schema_version: spec.schema_version,
+        name: spec.name.clone(),
+        machine: spec.machine.clone(),
+        network: spec.network.clone(),
+        protocol: endpoint_protocol_from_proto(spec.protocol)?,
+        port: u16::try_from(spec.port).map_err(|_| TranslationError::InvalidValue {
+            field: "endpoint_spec.port",
+            value: spec.port.to_string(),
+        })?,
+        hostname: spec.hostname.clone(),
+    })
+}
+
+/// Convert a workspace binding to wire form.
+pub fn workspace_binding_to_proto(binding: &WorkspaceBinding) -> runtime_v2::WorkspaceBinding {
+    runtime_v2::WorkspaceBinding {
+        schema_version: binding.schema_version,
+        binding_id: binding.binding_id.to_string(),
+        project_id: binding.project_id.to_string(),
+        environment_id: binding.environment_id.to_string(),
+        name: binding.name.clone(),
+        workspace_key: binding.workspace_key.clone(),
+        path_hint: binding.path_hint.clone(),
+    }
+}
+
+/// Decode a workspace binding and validate every typed identifier.
+pub fn workspace_binding_from_proto(
+    binding: &runtime_v2::WorkspaceBinding,
+) -> Result<WorkspaceBinding, TranslationError> {
+    Ok(WorkspaceBinding {
+        schema_version: binding.schema_version,
+        binding_id: WorkspaceBindingId::new(binding.binding_id.clone())?,
+        project_id: ProjectId::new(binding.project_id.clone())?,
+        environment_id: EnvironmentId::new(binding.environment_id.clone())?,
+        name: binding.name.clone(),
+        workspace_key: binding.workspace_key.clone(),
+        path_hint: binding.path_hint.clone(),
+    })
+}
+
+/// Convert a Machine incarnation to wire form.
+pub fn machine_incarnation_to_proto(
+    incarnation: &MachineIncarnation,
+) -> runtime_v2::MachineIncarnation {
+    runtime_v2::MachineIncarnation {
+        schema_version: incarnation.schema_version,
+        incarnation_id: incarnation.incarnation_id.to_string(),
+        machine_id: incarnation.machine_id.to_string(),
+        generation: incarnation.generation,
+        created_at: incarnation.created_at,
+    }
+}
+
+/// Decode a Machine incarnation and validate its typed identifiers.
+pub fn machine_incarnation_from_proto(
+    incarnation: &runtime_v2::MachineIncarnation,
+) -> Result<MachineIncarnation, TranslationError> {
+    Ok(MachineIncarnation {
+        schema_version: incarnation.schema_version,
+        incarnation_id: MachineIncarnationId::new(incarnation.incarnation_id.clone())?,
+        machine_id: MachineId::new(incarnation.machine_id.clone())?,
+        generation: incarnation.generation,
+        created_at: incarnation.created_at,
+    })
+}
+
+/// Convert a persisted Machine to wire form.
+pub fn machine_instance_to_proto(machine: &MachineInstance) -> runtime_v2::MachineInstance {
+    let (backend, other_backend) = machine_backend_to_proto(machine.backend.as_ref());
+    runtime_v2::MachineInstance {
+        schema_version: machine.schema_version,
+        machine_id: machine.machine_id.to_string(),
+        environment_id: machine.environment_id.to_string(),
+        name: machine.name.clone(),
+        target: Some(target_spec_to_proto(&machine.target)),
+        resources: Some(machine_resources_to_proto(&machine.resources)),
+        requested_capabilities: Some(capability_set_to_proto(&machine.requested_capabilities)),
+        negotiated_capabilities: Some(capability_set_to_proto(&machine.negotiated_capabilities)),
+        backend,
+        other_backend,
+        incarnation: machine
+            .incarnation
+            .as_ref()
+            .map(machine_incarnation_to_proto),
+        state: machine_state_to_proto(machine.state) as i32,
+        legacy_sandbox_id: machine.legacy_sandbox_id.clone(),
+    }
+}
+
+/// Decode a persisted Machine and reject malformed companion fields.
+pub fn machine_instance_from_proto(
+    machine: &runtime_v2::MachineInstance,
+) -> Result<MachineInstance, TranslationError> {
+    Ok(MachineInstance {
+        schema_version: machine.schema_version,
+        machine_id: MachineId::new(machine.machine_id.clone())?,
+        environment_id: EnvironmentId::new(machine.environment_id.clone())?,
+        name: machine.name.clone(),
+        target: target_spec_from_proto(required(
+            machine.target.as_ref(),
+            "machine_instance.target",
+        )?)?,
+        resources: machine_resources_from_proto(required(
+            machine.resources.as_ref(),
+            "machine_instance.resources",
+        )?)?,
+        requested_capabilities: capability_set_from_proto(required(
+            machine.requested_capabilities.as_ref(),
+            "machine_instance.requested_capabilities",
+        )?)?,
+        negotiated_capabilities: capability_set_from_proto(required(
+            machine.negotiated_capabilities.as_ref(),
+            "machine_instance.negotiated_capabilities",
+        )?)?,
+        backend: machine_backend_from_proto(machine.backend, machine.other_backend.as_deref())?,
+        incarnation: machine
+            .incarnation
+            .as_ref()
+            .map(machine_incarnation_from_proto)
+            .transpose()?,
+        state: machine_state_from_proto(machine.state)?,
+        legacy_sandbox_id: machine.legacy_sandbox_id.clone(),
+    })
+}
+
+/// Convert a persisted network identity to wire form.
+pub fn network_instance_to_proto(network: &NetworkInstance) -> runtime_v2::NetworkInstance {
+    runtime_v2::NetworkInstance {
+        schema_version: network.schema_version,
+        network_id: network.network_id.to_string(),
+        environment_id: network.environment_id.to_string(),
+        name: network.name.clone(),
+    }
+}
+
+/// Decode a persisted network identity.
+pub fn network_instance_from_proto(
+    network: &runtime_v2::NetworkInstance,
+) -> Result<NetworkInstance, TranslationError> {
+    Ok(NetworkInstance {
+        schema_version: network.schema_version,
+        network_id: NetworkId::new(network.network_id.clone())?,
+        environment_id: EnvironmentId::new(network.environment_id.clone())?,
+        name: network.name.clone(),
+    })
+}
+
+/// Convert a persisted endpoint identity to wire form.
+pub fn endpoint_instance_to_proto(endpoint: &EndpointInstance) -> runtime_v2::EndpointInstance {
+    runtime_v2::EndpointInstance {
+        schema_version: endpoint.schema_version,
+        endpoint_id: endpoint.endpoint_id.to_string(),
+        environment_id: endpoint.environment_id.to_string(),
+        machine_id: endpoint.machine_id.to_string(),
+        network_id: endpoint.network_id.to_string(),
+        name: endpoint.name.clone(),
+    }
+}
+
+/// Decode a persisted endpoint identity.
+pub fn endpoint_instance_from_proto(
+    endpoint: &runtime_v2::EndpointInstance,
+) -> Result<EndpointInstance, TranslationError> {
+    Ok(EndpointInstance {
+        schema_version: endpoint.schema_version,
+        endpoint_id: EndpointId::new(endpoint.endpoint_id.clone())?,
+        environment_id: EnvironmentId::new(endpoint.environment_id.clone())?,
+        machine_id: MachineId::new(endpoint.machine_id.clone())?,
+        network_id: NetworkId::new(endpoint.network_id.clone())?,
+        name: endpoint.name.clone(),
+    })
+}
+
+/// Convert one aggregate ownership edge to wire form.
+pub fn ownership_record_to_proto(record: &OwnershipRecord) -> runtime_v2::OwnershipRecord {
+    let (resource_kind, other_resource_kind) = owned_resource_kind_to_proto(&record.resource_kind);
+    runtime_v2::OwnershipRecord {
+        schema_version: record.schema_version,
+        resource_kind: resource_kind as i32,
+        other_resource_kind,
+        resource_id: record.resource_id.clone(),
+        environment_id: record.environment_id.to_string(),
+        machine_id: record.machine_id.as_ref().map(ToString::to_string),
+    }
+}
+
+/// Decode one aggregate ownership edge and validate companion fields and IDs.
+pub fn ownership_record_from_proto(
+    record: &runtime_v2::OwnershipRecord,
+) -> Result<OwnershipRecord, TranslationError> {
+    Ok(OwnershipRecord {
+        schema_version: record.schema_version,
+        resource_kind: owned_resource_kind_from_proto(
+            record.resource_kind,
+            record.other_resource_kind.as_deref(),
+        )?,
+        resource_id: record.resource_id.clone(),
+        environment_id: EnvironmentId::new(record.environment_id.clone())?,
+        machine_id: record
+            .machine_id
+            .as_ref()
+            .map(|id| MachineId::new(id.clone()))
+            .transpose()?,
+    })
+}
+
+/// Convert legacy migration provenance to wire form.
+pub fn legacy_migration_provenance_to_proto(
+    provenance: &LegacyMigrationProvenance,
+) -> runtime_v2::LegacyMigrationProvenance {
+    runtime_v2::LegacyMigrationProvenance {
+        source_version: provenance.source_version.clone(),
+        legacy_sandbox_id: provenance.legacy_sandbox_id.clone(),
+        unresolved_resources: provenance.unresolved_resources.clone(),
+    }
+}
+
+/// Decode legacy migration provenance.
+pub fn legacy_migration_provenance_from_proto(
+    provenance: &runtime_v2::LegacyMigrationProvenance,
+) -> LegacyMigrationProvenance {
+    LegacyMigrationProvenance {
+        source_version: provenance.source_version.clone(),
+        legacy_sandbox_id: provenance.legacy_sandbox_id.clone(),
+        unresolved_resources: provenance.unresolved_resources.clone(),
+    }
+}
+
+/// Convert a persisted Environment aggregate to wire form.
+pub fn environment_instance_to_proto(
+    environment: &EnvironmentInstance,
+) -> runtime_v2::EnvironmentInstance {
+    runtime_v2::EnvironmentInstance {
+        schema_version: environment.schema_version,
+        environment_id: environment.environment_id.to_string(),
+        project_id: environment.project_id.to_string(),
+        name: environment.name.clone(),
+        definition_digest: environment.definition_digest.clone(),
+        state: environment_state_to_proto(environment.state) as i32,
+        bindings: environment
+            .bindings
+            .iter()
+            .map(workspace_binding_to_proto)
+            .collect(),
+        machines: environment
+            .machines
+            .iter()
+            .map(machine_instance_to_proto)
+            .collect(),
+        networks: environment
+            .networks
+            .iter()
+            .map(network_instance_to_proto)
+            .collect(),
+        endpoints: environment
+            .endpoints
+            .iter()
+            .map(endpoint_instance_to_proto)
+            .collect(),
+        ownership: environment
+            .ownership
+            .iter()
+            .map(ownership_record_to_proto)
+            .collect(),
+        legacy_migration: environment
+            .legacy_migration
+            .as_ref()
+            .map(legacy_migration_provenance_to_proto),
+        created_at: environment.created_at,
+        updated_at: environment.updated_at,
+    }
+}
+
+/// Decode a persisted Environment aggregate.
+pub fn environment_instance_from_proto(
+    environment: &runtime_v2::EnvironmentInstance,
+) -> Result<EnvironmentInstance, TranslationError> {
+    Ok(EnvironmentInstance {
+        schema_version: environment.schema_version,
+        environment_id: EnvironmentId::new(environment.environment_id.clone())?,
+        project_id: ProjectId::new(environment.project_id.clone())?,
+        name: environment.name.clone(),
+        definition_digest: environment.definition_digest.clone(),
+        state: environment_state_from_proto(environment.state)?,
+        bindings: environment
+            .bindings
+            .iter()
+            .map(workspace_binding_from_proto)
+            .collect::<Result<_, _>>()?,
+        machines: environment
+            .machines
+            .iter()
+            .map(machine_instance_from_proto)
+            .collect::<Result<_, _>>()?,
+        networks: environment
+            .networks
+            .iter()
+            .map(network_instance_from_proto)
+            .collect::<Result<_, _>>()?,
+        endpoints: environment
+            .endpoints
+            .iter()
+            .map(endpoint_instance_from_proto)
+            .collect::<Result<_, _>>()?,
+        ownership: environment
+            .ownership
+            .iter()
+            .map(ownership_record_from_proto)
+            .collect::<Result<_, _>>()?,
+        legacy_migration: environment
+            .legacy_migration
+            .as_ref()
+            .map(legacy_migration_provenance_from_proto),
+        created_at: environment.created_at,
+        updated_at: environment.updated_at,
+    })
+}
+
+/// Convert a structured topology resolution failure to wire detail.
+pub fn topology_resolution_error_to_proto(
+    error: &TopologyResolutionError,
+) -> runtime_v2::TopologyErrorDetail {
+    use runtime_v2::topology_error_detail::Detail;
+
+    let detail = match error {
+        TopologyResolutionError::NotFound { kind, selector } => {
+            Detail::NotFound(runtime_v2::TopologyNotFoundDetail {
+                kind: kind.clone(),
+                selector: selector.clone(),
+            })
+        }
+        TopologyResolutionError::Ambiguous {
+            kind,
+            selector,
+            candidates,
+        } => Detail::Ambiguous(runtime_v2::TopologyAmbiguityDetail {
+            kind: kind.clone(),
+            selector: selector.clone(),
+            candidates: candidates
+                .iter()
+                .map(|candidate| runtime_v2::TopologyCandidate {
+                    id: candidate.id.clone(),
+                    name: candidate.name.clone(),
+                })
+                .collect(),
+        }),
+    };
+    runtime_v2::TopologyErrorDetail {
+        detail: Some(detail),
+    }
+}
+
+/// Decode a structured topology resolution failure.
+pub fn topology_resolution_error_from_proto(
+    error: &runtime_v2::TopologyErrorDetail,
+) -> Result<TopologyResolutionError, TranslationError> {
+    use runtime_v2::topology_error_detail::Detail;
+
+    match required(error.detail.as_ref(), "topology_error_detail.detail")? {
+        Detail::NotFound(detail) => Ok(TopologyResolutionError::NotFound {
+            kind: detail.kind.clone(),
+            selector: detail.selector.clone(),
+        }),
+        Detail::Ambiguous(detail) => Ok(TopologyResolutionError::ambiguous(
+            detail.kind.clone(),
+            detail.selector.clone(),
+            detail.candidates.iter().map(|candidate| TopologyCandidate {
+                id: candidate.id.clone(),
+                name: candidate.name.clone(),
+            }),
+        )),
+        Detail::UnsupportedTarget(_) | Detail::MissingCapability(_) => {
+            Err(TranslationError::InvalidValue {
+                field: "topology_error_detail.detail",
+                value: "validation_error".to_string(),
+            })
+        }
+    }
+}
+
+/// Convert a topology validation failure when the wire schema can represent it.
+pub fn topology_validation_error_to_proto(
+    error: &TopologyValidationError,
+) -> Option<runtime_v2::TopologyErrorDetail> {
+    use runtime_v2::topology_error_detail::Detail;
+
+    let detail = match error {
+        TopologyValidationError::UnsupportedTarget {
+            host_os,
+            host_arch,
+            target_os,
+            target_arch,
+            requested_capabilities,
+        } => Detail::UnsupportedTarget(runtime_v2::TopologyUnsupportedTargetDetail {
+            host_os: operating_system_to_proto(*host_os) as i32,
+            host_arch: architecture_to_proto(*host_arch) as i32,
+            target_os: operating_system_to_proto(*target_os) as i32,
+            target_arch: architecture_to_proto(*target_arch) as i32,
+            requested_capabilities: requested_capabilities
+                .iter()
+                .copied()
+                .map(|capability| machine_capability_to_proto(capability) as i32)
+                .collect(),
+        }),
+        TopologyValidationError::MissingCapability {
+            machine_id,
+            capability,
+        } => Detail::MissingCapability(runtime_v2::TopologyMissingCapabilityDetail {
+            machine_id: machine_id.clone(),
+            capability: machine_capability_to_proto(*capability) as i32,
+        }),
+        _ => return None,
+    };
+    Some(runtime_v2::TopologyErrorDetail {
+        detail: Some(detail),
+    })
+}
+
+/// Decode a representable topology validation failure.
+pub fn topology_validation_error_from_proto(
+    error: &runtime_v2::TopologyErrorDetail,
+) -> Result<TopologyValidationError, TranslationError> {
+    use runtime_v2::topology_error_detail::Detail;
+
+    match required(error.detail.as_ref(), "topology_error_detail.detail")? {
+        Detail::UnsupportedTarget(detail) => {
+            let requested_capabilities = decode_capability_list(
+                &detail.requested_capabilities,
+                "topology_unsupported_target.requested_capabilities",
+            )?;
+            Ok(TopologyValidationError::UnsupportedTarget {
+                host_os: operating_system_from_proto(
+                    detail.host_os,
+                    "topology_unsupported_target.host_os",
+                )?,
+                host_arch: architecture_from_proto(
+                    detail.host_arch,
+                    "topology_unsupported_target.host_arch",
+                )?,
+                target_os: operating_system_from_proto(
+                    detail.target_os,
+                    "topology_unsupported_target.target_os",
+                )?,
+                target_arch: architecture_from_proto(
+                    detail.target_arch,
+                    "topology_unsupported_target.target_arch",
+                )?,
+                requested_capabilities,
+            })
+        }
+        Detail::MissingCapability(detail) => {
+            let machine_id = MachineId::new(detail.machine_id.clone())?;
+            Ok(TopologyValidationError::MissingCapability {
+                machine_id: machine_id.to_string(),
+                capability: machine_capability_from_proto(
+                    detail.capability,
+                    "topology_missing_capability.capability",
+                )?,
+            })
+        }
+        Detail::NotFound(_) | Detail::Ambiguous(_) => Err(TranslationError::InvalidValue {
+            field: "topology_error_detail.detail",
+            value: "resolution_error".to_string(),
+        }),
+    }
+}
+
+fn required<'a, T>(value: Option<&'a T>, field: &'static str) -> Result<&'a T, TranslationError> {
+    value.ok_or(TranslationError::MissingRequiredField { field })
+}
+
+fn invalid_enum(field: &'static str, value: i32) -> TranslationError {
+    TranslationError::InvalidEnumValue {
+        field,
+        value: value.to_string(),
+    }
+}
+
+fn operating_system_to_proto(value: OperatingSystem) -> runtime_v2::OperatingSystem {
+    match value {
+        OperatingSystem::Linux => runtime_v2::OperatingSystem::Linux,
+        OperatingSystem::Macos => runtime_v2::OperatingSystem::Macos,
+        OperatingSystem::Windows => runtime_v2::OperatingSystem::Windows,
+    }
+}
+
+fn operating_system_from_proto(
+    raw: i32,
+    field: &'static str,
+) -> Result<OperatingSystem, TranslationError> {
+    match runtime_v2::OperatingSystem::try_from(raw).map_err(|_| invalid_enum(field, raw))? {
+        runtime_v2::OperatingSystem::Linux => Ok(OperatingSystem::Linux),
+        runtime_v2::OperatingSystem::Macos => Ok(OperatingSystem::Macos),
+        runtime_v2::OperatingSystem::Windows => Ok(OperatingSystem::Windows),
+        runtime_v2::OperatingSystem::Unspecified => Err(invalid_enum(field, raw)),
+    }
+}
+
+fn architecture_to_proto(value: Architecture) -> runtime_v2::Architecture {
+    match value {
+        Architecture::Aarch64 => runtime_v2::Architecture::Aarch64,
+        Architecture::X86_64 => runtime_v2::Architecture::X8664,
+    }
+}
+
+fn architecture_from_proto(
+    raw: i32,
+    field: &'static str,
+) -> Result<Architecture, TranslationError> {
+    match runtime_v2::Architecture::try_from(raw).map_err(|_| invalid_enum(field, raw))? {
+        runtime_v2::Architecture::Aarch64 => Ok(Architecture::Aarch64),
+        runtime_v2::Architecture::X8664 => Ok(Architecture::X86_64),
+        runtime_v2::Architecture::Unspecified => Err(invalid_enum(field, raw)),
+    }
+}
+
+fn machine_capability_to_proto(value: MachineCapability) -> runtime_v2::MachineCapability {
+    match value {
+        MachineCapability::PosixExec => runtime_v2::MachineCapability::PosixExec,
+        MachineCapability::PosixPty => runtime_v2::MachineCapability::PosixPty,
+        MachineCapability::Signals => runtime_v2::MachineCapability::Signals,
+        MachineCapability::Files => runtime_v2::MachineCapability::Files,
+        MachineCapability::Ports => runtime_v2::MachineCapability::Ports,
+        MachineCapability::DockerEngine => runtime_v2::MachineCapability::DockerEngine,
+        MachineCapability::Compose => runtime_v2::MachineCapability::Compose,
+        MachineCapability::Buildx => runtime_v2::MachineCapability::Buildx,
+        MachineCapability::Snapshot => runtime_v2::MachineCapability::Snapshot,
+        MachineCapability::Suspend => runtime_v2::MachineCapability::Suspend,
+        MachineCapability::Checkpoint => runtime_v2::MachineCapability::Checkpoint,
+        MachineCapability::Gui => runtime_v2::MachineCapability::Gui,
+        MachineCapability::WindowsConsole => runtime_v2::MachineCapability::WindowsConsole,
+    }
+}
+
+fn machine_capability_from_proto(
+    raw: i32,
+    field: &'static str,
+) -> Result<MachineCapability, TranslationError> {
+    match runtime_v2::MachineCapability::try_from(raw).map_err(|_| invalid_enum(field, raw))? {
+        runtime_v2::MachineCapability::PosixExec => Ok(MachineCapability::PosixExec),
+        runtime_v2::MachineCapability::PosixPty => Ok(MachineCapability::PosixPty),
+        runtime_v2::MachineCapability::Signals => Ok(MachineCapability::Signals),
+        runtime_v2::MachineCapability::Files => Ok(MachineCapability::Files),
+        runtime_v2::MachineCapability::Ports => Ok(MachineCapability::Ports),
+        runtime_v2::MachineCapability::DockerEngine => Ok(MachineCapability::DockerEngine),
+        runtime_v2::MachineCapability::Compose => Ok(MachineCapability::Compose),
+        runtime_v2::MachineCapability::Buildx => Ok(MachineCapability::Buildx),
+        runtime_v2::MachineCapability::Snapshot => Ok(MachineCapability::Snapshot),
+        runtime_v2::MachineCapability::Suspend => Ok(MachineCapability::Suspend),
+        runtime_v2::MachineCapability::Checkpoint => Ok(MachineCapability::Checkpoint),
+        runtime_v2::MachineCapability::Gui => Ok(MachineCapability::Gui),
+        runtime_v2::MachineCapability::WindowsConsole => Ok(MachineCapability::WindowsConsole),
+        runtime_v2::MachineCapability::Unspecified => Err(invalid_enum(field, raw)),
+    }
+}
+
+fn machine_capability_name(value: MachineCapability) -> &'static str {
+    match value {
+        MachineCapability::PosixExec => "posix_exec",
+        MachineCapability::PosixPty => "posix_pty",
+        MachineCapability::Signals => "signals",
+        MachineCapability::Files => "files",
+        MachineCapability::Ports => "ports",
+        MachineCapability::DockerEngine => "docker_engine",
+        MachineCapability::Compose => "compose",
+        MachineCapability::Buildx => "buildx",
+        MachineCapability::Snapshot => "snapshot",
+        MachineCapability::Suspend => "suspend",
+        MachineCapability::Checkpoint => "checkpoint",
+        MachineCapability::Gui => "gui",
+        MachineCapability::WindowsConsole => "windows_console",
+    }
+}
+
+fn decode_capability_list(
+    raw: &[i32],
+    field: &'static str,
+) -> Result<Vec<MachineCapability>, TranslationError> {
+    let mut seen = BTreeSet::new();
+    let mut decoded = Vec::with_capacity(raw.len());
+    for value in raw {
+        let capability = machine_capability_from_proto(*value, field)?;
+        if !seen.insert(capability) {
+            return Err(TranslationError::DuplicateCapability {
+                name: machine_capability_name(capability).to_string(),
+            });
+        }
+        decoded.push(capability);
+    }
+    Ok(decoded)
+}
+
+fn workspace_projection_mode_to_proto(
+    value: WorkspaceProjectionMode,
+) -> runtime_v2::WorkspaceProjectionMode {
+    match value {
+        WorkspaceProjectionMode::ReadWrite => runtime_v2::WorkspaceProjectionMode::ReadWrite,
+        WorkspaceProjectionMode::ReadOnly => runtime_v2::WorkspaceProjectionMode::ReadOnly,
+        WorkspaceProjectionMode::Snapshot => runtime_v2::WorkspaceProjectionMode::Snapshot,
+    }
+}
+
+fn workspace_projection_mode_from_proto(
+    raw: i32,
+) -> Result<WorkspaceProjectionMode, TranslationError> {
+    let field = "workspace_projection.mode";
+    match runtime_v2::WorkspaceProjectionMode::try_from(raw)
+        .map_err(|_| invalid_enum(field, raw))?
+    {
+        runtime_v2::WorkspaceProjectionMode::ReadWrite => Ok(WorkspaceProjectionMode::ReadWrite),
+        runtime_v2::WorkspaceProjectionMode::ReadOnly => Ok(WorkspaceProjectionMode::ReadOnly),
+        runtime_v2::WorkspaceProjectionMode::Snapshot => Ok(WorkspaceProjectionMode::Snapshot),
+        runtime_v2::WorkspaceProjectionMode::Unspecified => Err(invalid_enum(field, raw)),
+    }
+}
+
+fn network_kind_to_proto(value: NetworkKind) -> runtime_v2::NetworkKind {
+    match value {
+        NetworkKind::Private => runtime_v2::NetworkKind::Private,
+        NetworkKind::SimulatedPublic => runtime_v2::NetworkKind::SimulatedPublic,
+    }
+}
+
+fn network_kind_from_proto(raw: i32) -> Result<NetworkKind, TranslationError> {
+    let field = "network_spec.kind";
+    match runtime_v2::NetworkKind::try_from(raw).map_err(|_| invalid_enum(field, raw))? {
+        runtime_v2::NetworkKind::Private => Ok(NetworkKind::Private),
+        runtime_v2::NetworkKind::SimulatedPublic => Ok(NetworkKind::SimulatedPublic),
+        runtime_v2::NetworkKind::Unspecified => Err(invalid_enum(field, raw)),
+    }
+}
+
+fn endpoint_protocol_to_proto(value: EndpointProtocol) -> runtime_v2::EndpointProtocol {
+    match value {
+        EndpointProtocol::Tcp => runtime_v2::EndpointProtocol::Tcp,
+        EndpointProtocol::Udp => runtime_v2::EndpointProtocol::Udp,
+        EndpointProtocol::Http => runtime_v2::EndpointProtocol::Http,
+        EndpointProtocol::Https => runtime_v2::EndpointProtocol::Https,
+    }
+}
+
+fn endpoint_protocol_from_proto(raw: i32) -> Result<EndpointProtocol, TranslationError> {
+    let field = "endpoint_spec.protocol";
+    match runtime_v2::EndpointProtocol::try_from(raw).map_err(|_| invalid_enum(field, raw))? {
+        runtime_v2::EndpointProtocol::Tcp => Ok(EndpointProtocol::Tcp),
+        runtime_v2::EndpointProtocol::Udp => Ok(EndpointProtocol::Udp),
+        runtime_v2::EndpointProtocol::Http => Ok(EndpointProtocol::Http),
+        runtime_v2::EndpointProtocol::Https => Ok(EndpointProtocol::Https),
+        runtime_v2::EndpointProtocol::Unspecified => Err(invalid_enum(field, raw)),
+    }
+}
+
+fn environment_state_to_proto(value: EnvironmentState) -> runtime_v2::EnvironmentState {
+    match value {
+        EnvironmentState::Creating => runtime_v2::EnvironmentState::Creating,
+        EnvironmentState::Reconciling => runtime_v2::EnvironmentState::Reconciling,
+        EnvironmentState::Ready => runtime_v2::EnvironmentState::Ready,
+        EnvironmentState::Stopped => runtime_v2::EnvironmentState::Stopped,
+        EnvironmentState::Deleting => runtime_v2::EnvironmentState::Deleting,
+        EnvironmentState::Deleted => runtime_v2::EnvironmentState::Deleted,
+        EnvironmentState::Failed => runtime_v2::EnvironmentState::Failed,
+    }
+}
+
+fn environment_state_from_proto(raw: i32) -> Result<EnvironmentState, TranslationError> {
+    let field = "environment_instance.state";
+    match runtime_v2::EnvironmentState::try_from(raw).map_err(|_| invalid_enum(field, raw))? {
+        runtime_v2::EnvironmentState::Creating => Ok(EnvironmentState::Creating),
+        runtime_v2::EnvironmentState::Reconciling => Ok(EnvironmentState::Reconciling),
+        runtime_v2::EnvironmentState::Ready => Ok(EnvironmentState::Ready),
+        runtime_v2::EnvironmentState::Stopped => Ok(EnvironmentState::Stopped),
+        runtime_v2::EnvironmentState::Deleting => Ok(EnvironmentState::Deleting),
+        runtime_v2::EnvironmentState::Deleted => Ok(EnvironmentState::Deleted),
+        runtime_v2::EnvironmentState::Failed => Ok(EnvironmentState::Failed),
+        runtime_v2::EnvironmentState::Unspecified => Err(invalid_enum(field, raw)),
+    }
+}
+
+fn machine_state_to_proto(value: MachineState) -> runtime_v2::MachineState {
+    match value {
+        MachineState::Creating => runtime_v2::MachineState::Creating,
+        MachineState::Ready => runtime_v2::MachineState::Ready,
+        MachineState::Stopped => runtime_v2::MachineState::Stopped,
+        MachineState::Failed => runtime_v2::MachineState::Failed,
+    }
+}
+
+fn machine_state_from_proto(raw: i32) -> Result<MachineState, TranslationError> {
+    let field = "machine_instance.state";
+    match runtime_v2::MachineState::try_from(raw).map_err(|_| invalid_enum(field, raw))? {
+        runtime_v2::MachineState::Creating => Ok(MachineState::Creating),
+        runtime_v2::MachineState::Ready => Ok(MachineState::Ready),
+        runtime_v2::MachineState::Stopped => Ok(MachineState::Stopped),
+        runtime_v2::MachineState::Failed => Ok(MachineState::Failed),
+        runtime_v2::MachineState::Unspecified => Err(invalid_enum(field, raw)),
+    }
+}
+
+fn machine_backend_to_proto(value: Option<&MachineBackend>) -> (Option<i32>, Option<String>) {
+    match value {
+        None => (None, None),
+        Some(MachineBackend::MacosVirtualizationLinux) => (
+            Some(runtime_v2::MachineBackend::MacosVirtualizationLinux as i32),
+            None,
+        ),
+        Some(MachineBackend::MacosNative) => {
+            (Some(runtime_v2::MachineBackend::MacosNative as i32), None)
+        }
+        Some(MachineBackend::LinuxNative) => {
+            (Some(runtime_v2::MachineBackend::LinuxNative as i32), None)
+        }
+        Some(MachineBackend::WindowsLinux) => {
+            (Some(runtime_v2::MachineBackend::WindowsLinux as i32), None)
+        }
+        Some(MachineBackend::WindowsNative) => {
+            (Some(runtime_v2::MachineBackend::WindowsNative as i32), None)
+        }
+        Some(MachineBackend::Other(value)) => (
+            Some(runtime_v2::MachineBackend::Other as i32),
+            Some(value.clone()),
+        ),
+    }
+}
+
+fn machine_backend_from_proto(
+    raw: Option<i32>,
+    other: Option<&str>,
+) -> Result<Option<MachineBackend>, TranslationError> {
+    let field = "machine_instance.backend";
+    let Some(raw) = raw else {
+        if let Some(other) = other {
+            return Err(inconsistent_other(field, other));
+        }
+        return Ok(None);
+    };
+    match runtime_v2::MachineBackend::try_from(raw).map_err(|_| invalid_enum(field, raw))? {
+        runtime_v2::MachineBackend::Unspecified => Err(invalid_enum(field, raw)),
+        runtime_v2::MachineBackend::MacosVirtualizationLinux => {
+            reject_other(field, other)?;
+            Ok(Some(MachineBackend::MacosVirtualizationLinux))
+        }
+        runtime_v2::MachineBackend::MacosNative => {
+            reject_other(field, other)?;
+            Ok(Some(MachineBackend::MacosNative))
+        }
+        runtime_v2::MachineBackend::LinuxNative => {
+            reject_other(field, other)?;
+            Ok(Some(MachineBackend::LinuxNative))
+        }
+        runtime_v2::MachineBackend::WindowsLinux => {
+            reject_other(field, other)?;
+            Ok(Some(MachineBackend::WindowsLinux))
+        }
+        runtime_v2::MachineBackend::WindowsNative => {
+            reject_other(field, other)?;
+            Ok(Some(MachineBackend::WindowsNative))
+        }
+        runtime_v2::MachineBackend::Other => {
+            Ok(Some(MachineBackend::Other(require_other(field, other)?)))
+        }
+    }
+}
+
+fn owned_resource_kind_to_proto(
+    value: &OwnedResourceKind,
+) -> (runtime_v2::OwnedResourceKind, Option<String>) {
+    match value {
+        OwnedResourceKind::Machine => (runtime_v2::OwnedResourceKind::Machine, None),
+        OwnedResourceKind::Incarnation => (runtime_v2::OwnedResourceKind::Incarnation, None),
+        OwnedResourceKind::Disk => (runtime_v2::OwnedResourceKind::Disk, None),
+        OwnedResourceKind::Socket => (runtime_v2::OwnedResourceKind::Socket, None),
+        OwnedResourceKind::DockerContext => (runtime_v2::OwnedResourceKind::DockerContext, None),
+        OwnedResourceKind::Network => (runtime_v2::OwnedResourceKind::Network, None),
+        OwnedResourceKind::Endpoint => (runtime_v2::OwnedResourceKind::Endpoint, None),
+        OwnedResourceKind::Credential => (runtime_v2::OwnedResourceKind::Credential, None),
+        OwnedResourceKind::Fault => (runtime_v2::OwnedResourceKind::Fault, None),
+        OwnedResourceKind::LegacySandbox => (runtime_v2::OwnedResourceKind::LegacySandbox, None),
+        OwnedResourceKind::Other(value) => {
+            (runtime_v2::OwnedResourceKind::Other, Some(value.clone()))
+        }
+    }
+}
+
+fn owned_resource_kind_from_proto(
+    raw: i32,
+    other: Option<&str>,
+) -> Result<OwnedResourceKind, TranslationError> {
+    let field = "ownership_record.resource_kind";
+    match runtime_v2::OwnedResourceKind::try_from(raw).map_err(|_| invalid_enum(field, raw))? {
+        runtime_v2::OwnedResourceKind::Unspecified => Err(invalid_enum(field, raw)),
+        runtime_v2::OwnedResourceKind::Machine => {
+            reject_other(field, other)?;
+            Ok(OwnedResourceKind::Machine)
+        }
+        runtime_v2::OwnedResourceKind::Incarnation => {
+            reject_other(field, other)?;
+            Ok(OwnedResourceKind::Incarnation)
+        }
+        runtime_v2::OwnedResourceKind::Disk => {
+            reject_other(field, other)?;
+            Ok(OwnedResourceKind::Disk)
+        }
+        runtime_v2::OwnedResourceKind::Socket => {
+            reject_other(field, other)?;
+            Ok(OwnedResourceKind::Socket)
+        }
+        runtime_v2::OwnedResourceKind::DockerContext => {
+            reject_other(field, other)?;
+            Ok(OwnedResourceKind::DockerContext)
+        }
+        runtime_v2::OwnedResourceKind::Network => {
+            reject_other(field, other)?;
+            Ok(OwnedResourceKind::Network)
+        }
+        runtime_v2::OwnedResourceKind::Endpoint => {
+            reject_other(field, other)?;
+            Ok(OwnedResourceKind::Endpoint)
+        }
+        runtime_v2::OwnedResourceKind::Credential => {
+            reject_other(field, other)?;
+            Ok(OwnedResourceKind::Credential)
+        }
+        runtime_v2::OwnedResourceKind::Fault => {
+            reject_other(field, other)?;
+            Ok(OwnedResourceKind::Fault)
+        }
+        runtime_v2::OwnedResourceKind::LegacySandbox => {
+            reject_other(field, other)?;
+            Ok(OwnedResourceKind::LegacySandbox)
+        }
+        runtime_v2::OwnedResourceKind::Other => {
+            Ok(OwnedResourceKind::Other(require_other(field, other)?))
+        }
+    }
+}
+
+fn reject_other(field: &'static str, other: Option<&str>) -> Result<(), TranslationError> {
+    match other {
+        None => Ok(()),
+        Some(value) => Err(inconsistent_other(field, value)),
+    }
+}
+
+fn require_other(field: &'static str, other: Option<&str>) -> Result<String, TranslationError> {
+    match other.map(str::trim) {
+        Some(value) if !value.is_empty() => Ok(value.to_string()),
+        Some(value) => Err(inconsistent_other(field, value)),
+        None => Err(inconsistent_other(field, "<missing>")),
+    }
+}
+
+fn inconsistent_other(field: &'static str, value: &str) -> TranslationError {
+    TranslationError::InvalidValue {
+        field,
+        value: format!("inconsistent Other companion `{value}`"),
+    }
 }
 
 /// Convert domain request metadata into wire metadata.
@@ -728,7 +1918,583 @@ fn hash_to_btree_map(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
+    use prost::Message;
+
+    const V: u32 = vz_runtime_contract::TOPOLOGY_SCHEMA_VERSION;
+
+    fn project_id(value: &str) -> ProjectId {
+        ProjectId::new(value).expect("valid project ID")
+    }
+
+    fn environment_id(value: &str) -> EnvironmentId {
+        EnvironmentId::new(value).expect("valid environment ID")
+    }
+
+    fn machine_id(value: &str) -> MachineId {
+        MachineId::new(value).expect("valid machine ID")
+    }
+
+    fn network_id(value: &str) -> NetworkId {
+        NetworkId::new(value).expect("valid network ID")
+    }
+
+    fn endpoint_id(value: &str) -> EndpointId {
+        EndpointId::new(value).expect("valid endpoint ID")
+    }
+
+    fn requested_linux_capabilities() -> CapabilitySet {
+        CapabilitySet::new([
+            MachineCapability::PosixExec,
+            MachineCapability::PosixPty,
+            MachineCapability::Signals,
+            MachineCapability::Files,
+            MachineCapability::Ports,
+            MachineCapability::DockerEngine,
+            MachineCapability::Compose,
+            MachineCapability::Buildx,
+            MachineCapability::Checkpoint,
+        ])
+    }
+
+    fn negotiated_linux_capabilities() -> CapabilitySet {
+        let mut set = CapabilitySet::new([
+            MachineCapability::PosixExec,
+            MachineCapability::PosixPty,
+            MachineCapability::Signals,
+            MachineCapability::Files,
+            MachineCapability::Ports,
+            MachineCapability::DockerEngine,
+            MachineCapability::Compose,
+            MachineCapability::Buildx,
+        ]);
+        set.unsupported.insert(
+            MachineCapability::Checkpoint,
+            "kernel profile does not expose checkpoint restore".to_string(),
+        );
+        set
+    }
+
+    fn macos_capabilities() -> CapabilitySet {
+        CapabilitySet::new([
+            MachineCapability::PosixExec,
+            MachineCapability::PosixPty,
+            MachineCapability::Signals,
+            MachineCapability::Files,
+            MachineCapability::Ports,
+            MachineCapability::Snapshot,
+            MachineCapability::Suspend,
+            MachineCapability::Gui,
+        ])
+    }
+
+    fn target(os: OperatingSystem, image: &str) -> TargetSpec {
+        TargetSpec {
+            os,
+            arch: Architecture::Aarch64,
+            image: image.to_string(),
+            version: Some("15.6.1".to_string()),
+            channel: Some("stable".to_string()),
+            digest: Some(format!("sha256:{image}")),
+        }
+    }
+
+    fn machine_spec(name: &str, os: OperatingSystem) -> MachineSpec {
+        let (requested_capabilities, workspace) = match os {
+            OperatingSystem::Linux => (
+                requested_linux_capabilities(),
+                Some(WorkspaceProjection {
+                    binding: "source".to_string(),
+                    target_path: "/workspace".to_string(),
+                    mode: WorkspaceProjectionMode::ReadWrite,
+                }),
+            ),
+            OperatingSystem::Macos => (
+                macos_capabilities(),
+                Some(WorkspaceProjection {
+                    binding: "source".to_string(),
+                    target_path: "/Users/vz/workspace".to_string(),
+                    mode: WorkspaceProjectionMode::Snapshot,
+                }),
+            ),
+            OperatingSystem::Windows => (CapabilitySet::default(), None),
+        };
+        MachineSpec {
+            schema_version: V,
+            name: name.to_string(),
+            target: target(os, name),
+            resources: MachineResources {
+                cpus: Some(12),
+                memory_mb: Some(65_536),
+                disk_bytes: Some(536_870_912_000),
+            },
+            requested_capabilities,
+            workspace,
+        }
+    }
+
+    fn project_definition() -> ProjectDefinition {
+        ProjectDefinition {
+            schema_version: V,
+            project_id: project_id("prj-roundtrip"),
+            name: "roundtrip".to_string(),
+            environment: EnvironmentSpec {
+                schema_version: V,
+                machines: vec![
+                    machine_spec("linux", OperatingSystem::Linux),
+                    machine_spec("macos", OperatingSystem::Macos),
+                ],
+                networks: vec![
+                    NetworkSpec {
+                        schema_version: V,
+                        name: "private".to_string(),
+                        kind: NetworkKind::Private,
+                        cidr: Some("10.44.0.0/24".to_string()),
+                    },
+                    NetworkSpec {
+                        schema_version: V,
+                        name: "public-like".to_string(),
+                        kind: NetworkKind::SimulatedPublic,
+                        cidr: Some("198.18.44.0/24".to_string()),
+                    },
+                ],
+                endpoints: vec![EndpointSpec {
+                    schema_version: V,
+                    name: "web".to_string(),
+                    machine: "linux".to_string(),
+                    network: "public-like".to_string(),
+                    protocol: EndpointProtocol::Https,
+                    port: 8443,
+                    hostname: Some("web.test".to_string()),
+                }],
+            },
+        }
+    }
+
+    fn environment(suffix: &str, path_hint: &str) -> EnvironmentInstance {
+        let definition = project_definition();
+        let definition_digest = definition.digest().expect("definition digest");
+        let linux_spec = &definition.environment.machines[0];
+        let macos_spec = &definition.environment.machines[1];
+        let project_id = definition.project_id.clone();
+        let environment_id = environment_id(&format!("env-{suffix}"));
+        let linux_id = machine_id(&format!("mac-{suffix}-linux"));
+        let macos_id = machine_id(&format!("mac-{suffix}-macos"));
+        let public_network_id = network_id(&format!("net-{suffix}-public"));
+        let private_network_id = network_id(&format!("net-{suffix}-private"));
+        EnvironmentInstance {
+            schema_version: V,
+            environment_id: environment_id.clone(),
+            project_id: project_id.clone(),
+            name: suffix.to_string(),
+            definition_digest,
+            state: EnvironmentState::Ready,
+            bindings: vec![WorkspaceBinding {
+                schema_version: V,
+                binding_id: WorkspaceBindingId::new(format!("wsp-{suffix}"))
+                    .expect("valid binding ID"),
+                project_id,
+                environment_id: environment_id.clone(),
+                name: "source".to_string(),
+                workspace_key: "shared-worktree-key".to_string(),
+                path_hint: Some(path_hint.to_string()),
+            }],
+            machines: vec![
+                MachineInstance {
+                    schema_version: V,
+                    machine_id: linux_id.clone(),
+                    environment_id: environment_id.clone(),
+                    name: "linux".to_string(),
+                    target: linux_spec.target.clone(),
+                    resources: MachineResources {
+                        cpus: Some(16),
+                        memory_mb: Some(131_072),
+                        disk_bytes: Some(1_099_511_627_776),
+                    },
+                    requested_capabilities: linux_spec.requested_capabilities.clone(),
+                    negotiated_capabilities: negotiated_linux_capabilities(),
+                    backend: Some(MachineBackend::MacosVirtualizationLinux),
+                    incarnation: Some(MachineIncarnation {
+                        schema_version: V,
+                        incarnation_id: MachineIncarnationId::new(format!("inc-{suffix}-linux"))
+                            .expect("valid incarnation ID"),
+                        machine_id: linux_id.clone(),
+                        generation: 7,
+                        created_at: 1_725_000_001,
+                    }),
+                    state: MachineState::Ready,
+                    legacy_sandbox_id: Some(format!("legacy-{suffix}")),
+                },
+                MachineInstance {
+                    schema_version: V,
+                    machine_id: macos_id.clone(),
+                    environment_id: environment_id.clone(),
+                    name: "macos".to_string(),
+                    target: macos_spec.target.clone(),
+                    resources: MachineResources {
+                        cpus: Some(8),
+                        memory_mb: Some(65_536),
+                        disk_bytes: Some(536_870_912_000),
+                    },
+                    requested_capabilities: macos_spec.requested_capabilities.clone(),
+                    negotiated_capabilities: macos_capabilities(),
+                    backend: Some(MachineBackend::MacosNative),
+                    incarnation: Some(MachineIncarnation {
+                        schema_version: V,
+                        incarnation_id: MachineIncarnationId::new(format!("inc-{suffix}-macos"))
+                            .expect("valid incarnation ID"),
+                        machine_id: macos_id,
+                        generation: 3,
+                        created_at: 1_725_000_002,
+                    }),
+                    state: MachineState::Stopped,
+                    legacy_sandbox_id: None,
+                },
+            ],
+            networks: vec![
+                NetworkInstance {
+                    schema_version: V,
+                    network_id: private_network_id,
+                    environment_id: environment_id.clone(),
+                    name: "private".to_string(),
+                },
+                NetworkInstance {
+                    schema_version: V,
+                    network_id: public_network_id.clone(),
+                    environment_id: environment_id.clone(),
+                    name: "public-like".to_string(),
+                },
+            ],
+            endpoints: vec![EndpointInstance {
+                schema_version: V,
+                endpoint_id: endpoint_id(&format!("ep-{suffix}-web")),
+                environment_id: environment_id.clone(),
+                machine_id: linux_id.clone(),
+                network_id: public_network_id.clone(),
+                name: "web".to_string(),
+            }],
+            ownership: vec![
+                OwnershipRecord {
+                    schema_version: V,
+                    resource_kind: OwnedResourceKind::Disk,
+                    resource_id: format!("disk-{suffix}-linux"),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(linux_id),
+                },
+                OwnershipRecord {
+                    schema_version: V,
+                    resource_kind: OwnedResourceKind::Network,
+                    resource_id: public_network_id.to_string(),
+                    environment_id: environment_id.clone(),
+                    machine_id: None,
+                },
+                OwnershipRecord {
+                    schema_version: V,
+                    resource_kind: OwnedResourceKind::Other("audit_bundle".to_string()),
+                    resource_id: format!("audit-{suffix}"),
+                    environment_id,
+                    machine_id: None,
+                },
+            ],
+            legacy_migration: Some(LegacyMigrationProvenance {
+                source_version: "0.3.20".to_string(),
+                legacy_sandbox_id: format!("legacy-{suffix}"),
+                unresolved_resources: vec!["external-cache:old".to_string()],
+            }),
+            created_at: 1_725_000_000,
+            updated_at: 1_725_000_999,
+        }
+    }
+
+    fn topology_fixture() -> ProjectState {
+        ProjectState {
+            schema_version: V,
+            definition: project_definition(),
+            environments: vec![
+                environment("alpha", "/Users/alice/project"),
+                environment("beta", "/Volumes/worktrees/project"),
+            ],
+        }
+    }
+
+    #[test]
+    fn topology_project_state_round_trips_through_protobuf_bytes() {
+        let domain = topology_fixture();
+        domain.validate().expect("fixture is canonically valid");
+
+        let wire = project_state_to_proto(&domain);
+        let bytes = wire.encode_to_vec();
+        let decoded_wire =
+            runtime_v2::ProjectState::decode(bytes.as_slice()).expect("protobuf bytes decode");
+        let decoded = project_state_from_proto(&decoded_wire).expect("topology decode");
+
+        assert_eq!(decoded, domain);
+        assert_eq!(decoded.environments.len(), 2);
+        let definition_digest = decoded.definition.digest().expect("definition digest");
+        assert!(
+            decoded
+                .environments
+                .iter()
+                .all(|environment| environment.definition_digest == definition_digest)
+        );
+        assert_eq!(decoded.environments[0].bindings[0].name, "source");
+        assert_eq!(
+            decoded.environments[0].bindings[0].workspace_key,
+            decoded.environments[1].bindings[0].workspace_key
+        );
+        assert_eq!(
+            decoded.environments[0].machines[0].target,
+            decoded.definition.environment.machines[0].target
+        );
+        assert_eq!(
+            decoded.environments[0].machines[1].target,
+            decoded.definition.environment.machines[1].target
+        );
+        let negotiated = &decoded.environments[0].machines[0].negotiated_capabilities;
+        for capability in [
+            MachineCapability::DockerEngine,
+            MachineCapability::Compose,
+            MachineCapability::Buildx,
+        ] {
+            assert!(negotiated.contains(capability));
+        }
+        assert_eq!(
+            negotiated.unsupported.get(&MachineCapability::Checkpoint),
+            Some(&"kernel profile does not expose checkpoint restore".to_string())
+        );
+    }
+
+    #[test]
+    fn topology_decode_rejects_missing_required_messages() {
+        let mut wire = project_state_to_proto(&topology_fixture());
+        wire.definition = None;
+        assert_eq!(
+            project_state_from_proto(&wire),
+            Err(TranslationError::MissingRequiredField {
+                field: "project_state.definition"
+            })
+        );
+
+        let mut machine =
+            machine_instance_to_proto(&topology_fixture().environments[0].machines[0]);
+        machine.target = None;
+        assert_eq!(
+            machine_instance_from_proto(&machine),
+            Err(TranslationError::MissingRequiredField {
+                field: "machine_instance.target"
+            })
+        );
+    }
+
+    #[test]
+    fn topology_decode_rejects_unspecified_and_unknown_enums() {
+        let mut target = target_spec_to_proto(&target(OperatingSystem::Linux, "linux"));
+        target.os = runtime_v2::OperatingSystem::Unspecified as i32;
+        assert!(matches!(
+            target_spec_from_proto(&target),
+            Err(TranslationError::InvalidEnumValue {
+                field: "target_spec.os",
+                ..
+            })
+        ));
+        target.os = 9_999;
+        assert!(matches!(
+            target_spec_from_proto(&target),
+            Err(TranslationError::InvalidEnumValue {
+                field: "target_spec.os",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn topology_decode_rejects_malformed_typed_ids() {
+        let mut wire = project_definition_to_proto(&project_definition());
+        wire.project_id = "../../project".to_string();
+        assert!(matches!(
+            project_definition_from_proto(&wire),
+            Err(TranslationError::InvalidTopology(
+                TopologyValidationError::InvalidIdentifier { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn topology_decode_rejects_inconsistent_other_companions() {
+        let domain = topology_fixture();
+        let mut machine = machine_instance_to_proto(&domain.environments[0].machines[0]);
+        machine.other_backend = Some("custom".to_string());
+        assert!(matches!(
+            machine_instance_from_proto(&machine),
+            Err(TranslationError::InvalidValue {
+                field: "machine_instance.backend",
+                ..
+            })
+        ));
+
+        machine.backend = Some(runtime_v2::MachineBackend::Other as i32);
+        machine.other_backend = None;
+        assert!(matches!(
+            machine_instance_from_proto(&machine),
+            Err(TranslationError::InvalidValue {
+                field: "machine_instance.backend",
+                ..
+            })
+        ));
+
+        let mut ownership = ownership_record_to_proto(&domain.environments[0].ownership[0]);
+        ownership.other_resource_kind = Some("custom".to_string());
+        assert!(matches!(
+            ownership_record_from_proto(&ownership),
+            Err(TranslationError::InvalidValue {
+                field: "ownership_record.resource_kind",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn topology_other_variants_round_trip_with_exact_companions() {
+        let mut machine = topology_fixture().environments[0].machines[0].clone();
+        machine.backend = Some(MachineBackend::Other("remote_lab_backend".to_string()));
+        let wire = machine_instance_to_proto(&machine);
+        let decoded = machine_instance_from_proto(&wire).expect("custom backend decode");
+        assert_eq!(decoded, machine);
+
+        let ownership = topology_fixture().environments[0].ownership[2].clone();
+        let wire = ownership_record_to_proto(&ownership);
+        let decoded = ownership_record_from_proto(&wire).expect("custom ownership kind decode");
+        assert_eq!(decoded, ownership);
+    }
+
+    #[test]
+    fn topology_decode_rejects_duplicate_and_unknown_capabilities() {
+        let duplicate = runtime_v2::CapabilitySet {
+            capabilities: vec![
+                runtime_v2::MachineCapability::Files as i32,
+                runtime_v2::MachineCapability::Files as i32,
+            ],
+            unsupported: Vec::new(),
+        };
+        assert_eq!(
+            capability_set_from_proto(&duplicate),
+            Err(TranslationError::DuplicateCapability {
+                name: "files".to_string()
+            })
+        );
+
+        let unknown = runtime_v2::CapabilitySet {
+            capabilities: vec![8_888],
+            unsupported: Vec::new(),
+        };
+        assert!(matches!(
+            capability_set_from_proto(&unknown),
+            Err(TranslationError::InvalidEnumValue {
+                field: "capability_set.capabilities",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn topology_decode_rejects_endpoint_port_above_u16() {
+        let mut endpoint = endpoint_spec_to_proto(&project_definition().environment.endpoints[0]);
+        endpoint.port = u32::from(u16::MAX) + 1;
+        assert_eq!(
+            endpoint_spec_from_proto(&endpoint),
+            Err(TranslationError::InvalidValue {
+                field: "endpoint_spec.port",
+                value: "65536".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn topology_decode_rejects_aggregate_that_fails_canonical_validation() {
+        let mut wire = project_state_to_proto(&topology_fixture());
+        wire.environments[1].environment_id = wire.environments[0].environment_id.clone();
+        let error = project_state_from_proto(&wire).expect_err("invalid aggregate ownership");
+        assert!(matches!(
+            error,
+            TranslationError::InvalidTopology(TopologyValidationError::OwnershipMismatch {
+                kind,
+                ..
+            }) if kind == "machine.environment"
+        ));
+    }
+
+    #[test]
+    fn topology_decode_rejects_definition_digest_or_target_drift() {
+        let mut digest_drift = project_state_to_proto(&topology_fixture());
+        digest_drift.environments[0].definition_digest = "sha256:stale".to_string();
+        assert!(matches!(
+            project_state_from_proto(&digest_drift),
+            Err(TranslationError::InvalidTopology(
+                TopologyValidationError::DefinitionDigestMismatch { .. }
+            ))
+        ));
+
+        let mut target_drift = project_state_to_proto(&topology_fixture());
+        let target = target_drift.environments[0].machines[0]
+            .target
+            .as_mut()
+            .expect("required fixture target");
+        target.image = "different-image".to_string();
+        assert!(matches!(
+            project_state_from_proto(&target_drift),
+            Err(TranslationError::InvalidTopology(
+                TopologyValidationError::DefinitionTopologyMismatch { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn topology_resolution_errors_round_trip_and_restore_candidate_order() {
+        let error = TopologyResolutionError::ambiguous(
+            "environment",
+            "dev",
+            [
+                TopologyCandidate {
+                    id: "env-z".to_string(),
+                    name: "zeta".to_string(),
+                },
+                TopologyCandidate {
+                    id: "env-a".to_string(),
+                    name: "alpha".to_string(),
+                },
+            ],
+        );
+        let mut wire = topology_resolution_error_to_proto(&error);
+        if let Some(runtime_v2::topology_error_detail::Detail::Ambiguous(detail)) =
+            wire.detail.as_mut()
+        {
+            detail.candidates.reverse();
+        }
+        let decoded = topology_resolution_error_from_proto(&wire).expect("resolution error");
+        assert_eq!(decoded, error);
+    }
+
+    #[test]
+    fn representable_topology_validation_errors_round_trip() {
+        let error = TopologyValidationError::UnsupportedTarget {
+            host_os: OperatingSystem::Macos,
+            host_arch: Architecture::Aarch64,
+            target_os: OperatingSystem::Windows,
+            target_arch: Architecture::X86_64,
+            requested_capabilities: vec![MachineCapability::WindowsConsole, MachineCapability::Gui],
+        };
+        let wire = topology_validation_error_to_proto(&error).expect("representable error");
+        let decoded = topology_validation_error_from_proto(&wire).expect("validation error");
+        assert_eq!(decoded, error);
+
+        let unrepresentable = TopologyValidationError::InvalidName {
+            kind: "machine".to_string(),
+            value: "".to_string(),
+        };
+        assert!(topology_validation_error_to_proto(&unrepresentable).is_none());
+    }
 
     fn sample_request_metadata() -> RequestMetadata {
         RequestMetadata::new(Some(" req-1 ".to_string()), Some(" idem-1 ".to_string()))

@@ -2,7 +2,199 @@
 
 use super::*;
 use crate::spec::{NetworkSpec, ServiceKind, ServiceSpec, VolumeSpec};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use vz_runtime_contract::types::{
+    Architecture, CapabilitySet, EndpointId, EndpointInstance, EndpointProtocol,
+    EndpointSpec as TopologyEndpointSpec, EnvironmentId, EnvironmentInstance, EnvironmentSpec,
+    EnvironmentState, MachineCapability, MachineId, MachineInstance, MachineResources, MachineSpec,
+    MachineState, NetworkId, NetworkInstance, NetworkKind, NetworkSpec as TopologyNetworkSpec,
+    OperatingSystem, OwnedResourceKind, OwnershipRecord, ProjectDefinition, ProjectId,
+    ProjectState, TOPOLOGY_SCHEMA_VERSION, TargetSpec, WorkspaceBinding, WorkspaceBindingId,
+    WorkspaceProjection, WorkspaceProjectionMode,
+};
+
+const V0_3_20_FIXTURE: &str = include_str!("../../tests/fixtures/v0.3.20-state.sql");
+const V0_3_20_AMBIGUOUS_FIXTURE: &str = include_str!("../../tests/fixtures/v0.3.20-ambiguous.sql");
+const V0_3_20_MALFORMED_FIXTURE: &str = include_str!("../../tests/fixtures/v0.3.20-malformed.sql");
+const V0_3_20_FIXTURE_SHA256: &str =
+    "51b7f3cbe9d7e1ad1219e819d862fdb4c832d6ece32842267d87fefb8b2f5529";
+const V0_3_20_AMBIGUOUS_FIXTURE_SHA256: &str =
+    "e2e1f97ca643a4d73921fe8cb0fd594e5e991bba14ee7af961129f580e0205a3";
+const V0_3_20_MALFORMED_FIXTURE_SHA256: &str =
+    "e99a5c6bd2a82c9ef2389ffe12fc00cd637a4f341def67e37e741e7b0b27db38";
+
+fn fixture_sha256(fixture: &str) -> String {
+    format!("{:x}", Sha256::digest(fixture.as_bytes()))
+}
+
+fn seed_v0_3_20_fixture(path: &Path, extension: Option<&str>) {
+    let conn = Connection::open(path).expect("open legacy fixture database");
+    conn.execute_batch(V0_3_20_FIXTURE)
+        .expect("seed exact v0.3.20 state fixture");
+    if let Some(extension) = extension {
+        conn.execute_batch(extension)
+            .expect("apply legacy negative fixture extension");
+    }
+}
+
+fn legacy_non_developer_rows(
+    path: &Path,
+) -> Vec<(String, String, String, String, String, String, i64, i64)> {
+    let conn = Connection::open(path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT sandbox_id, stack_name, state, backend, spec_json, labels_json,
+                    created_at, updated_at
+             FROM sandbox_state
+             WHERE sandbox_id != 'vz-run-shop-a1b2c3d4e5f6'
+             ORDER BY sandbox_id",
+        )
+        .unwrap();
+    stmt.query_map([], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+        ))
+    })
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+fn topology_project_state(
+    project_id: &str,
+    environment_names: &[&str],
+    path_hint: &str,
+) -> ProjectState {
+    let project_id = ProjectId::new(project_id).unwrap();
+    let target = TargetSpec {
+        os: OperatingSystem::Linux,
+        arch: Architecture::Aarch64,
+        image: "ubuntu:24.04".to_string(),
+        version: Some("24.04".to_string()),
+        channel: Some("stable".to_string()),
+        digest: Some("sha256:pinned-linux".to_string()),
+    };
+    let linux_capabilities = CapabilitySet::new([
+        MachineCapability::DockerEngine,
+        MachineCapability::Compose,
+        MachineCapability::Buildx,
+    ]);
+    let machine_spec = MachineSpec {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        name: "linux".to_string(),
+        target: target.clone(),
+        resources: MachineResources::default(),
+        requested_capabilities: linux_capabilities.clone(),
+        workspace: Some(WorkspaceProjection {
+            binding: "workspace".to_string(),
+            target_path: "/workspace".to_string(),
+            mode: WorkspaceProjectionMode::ReadWrite,
+        }),
+    };
+    let definition = ProjectDefinition {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        project_id: project_id.clone(),
+        name: "shop".to_string(),
+        environment: EnvironmentSpec {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            machines: vec![machine_spec],
+            networks: vec![TopologyNetworkSpec {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                name: "private".to_string(),
+                kind: NetworkKind::Private,
+                cidr: Some("10.20.0.0/24".to_string()),
+            }],
+            endpoints: vec![TopologyEndpointSpec {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                name: "web".to_string(),
+                machine: "linux".to_string(),
+                network: "private".to_string(),
+                protocol: EndpointProtocol::Https,
+                port: 443,
+                hostname: Some("web.shop.test".to_string()),
+            }],
+        },
+    };
+    let definition_digest = definition.digest().unwrap();
+    let environments = environment_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let environment_id = EnvironmentId::new(format!("env_{name}")).unwrap();
+            let machine_id = MachineId::new(format!("mac_{name}")).unwrap();
+            let network_id = NetworkId::new(format!("net_{name}")).unwrap();
+            let endpoint_id = EndpointId::new(format!("end_{name}")).unwrap();
+            EnvironmentInstance {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                environment_id: environment_id.clone(),
+                project_id: project_id.clone(),
+                name: (*name).to_string(),
+                definition_digest: definition_digest.clone(),
+                state: EnvironmentState::Ready,
+                bindings: vec![WorkspaceBinding {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    binding_id: WorkspaceBindingId::new(format!("wsp_{name}")).unwrap(),
+                    project_id: project_id.clone(),
+                    environment_id: environment_id.clone(),
+                    name: "workspace".to_string(),
+                    workspace_key: "same-worktree-key".to_string(),
+                    path_hint: Some(path_hint.to_string()),
+                }],
+                machines: vec![MachineInstance {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    machine_id: machine_id.clone(),
+                    environment_id: environment_id.clone(),
+                    name: "linux".to_string(),
+                    target: target.clone(),
+                    resources: MachineResources::default(),
+                    requested_capabilities: linux_capabilities.clone(),
+                    negotiated_capabilities: linux_capabilities.clone(),
+                    backend: None,
+                    incarnation: None,
+                    state: MachineState::Ready,
+                    legacy_sandbox_id: None,
+                }],
+                networks: vec![NetworkInstance {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    network_id: network_id.clone(),
+                    environment_id: environment_id.clone(),
+                    name: "private".to_string(),
+                }],
+                endpoints: vec![EndpointInstance {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    endpoint_id,
+                    environment_id: environment_id.clone(),
+                    machine_id: machine_id.clone(),
+                    network_id,
+                    name: "web".to_string(),
+                }],
+                ownership: vec![OwnershipRecord {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    resource_kind: OwnedResourceKind::Machine,
+                    resource_id: machine_id.to_string(),
+                    environment_id,
+                    machine_id: Some(machine_id),
+                }],
+                legacy_migration: None,
+                created_at: 100 + index as u64,
+                updated_at: 200 + index as u64,
+            }
+        })
+        .collect();
+    ProjectState {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        definition,
+        environments,
+    }
+}
 
 fn sample_spec() -> StackSpec {
     StackSpec {
@@ -2590,10 +2782,10 @@ fn phase2_control_metadata_crud() {
 }
 
 #[test]
-fn phase2_schema_version_defaults_to_1() {
+fn phase2_schema_version_defaults_to_2() {
     let store = StateStore::in_memory().unwrap();
     let version = store.schema_version().unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 }
 
 #[test]
@@ -3957,21 +4149,518 @@ fn regression_observed_state_20_services_under_200ms() {
 
 // ── Migration compatibility tests (vz-4g0) ──
 
-/// Verify that the `control_metadata` table stores a detectable schema version
-/// on first init, and that it can be read back as the expected v1 value.
 #[test]
-fn migration_v1_schema_detectable() {
+fn v0_3_20_fixture_content_and_checksums_are_stable() {
+    assert_eq!(fixture_sha256(V0_3_20_FIXTURE), V0_3_20_FIXTURE_SHA256);
+    assert_eq!(
+        fixture_sha256(V0_3_20_AMBIGUOUS_FIXTURE),
+        V0_3_20_AMBIGUOUS_FIXTURE_SHA256
+    );
+    assert_eq!(
+        fixture_sha256(V0_3_20_MALFORMED_FIXTURE),
+        V0_3_20_MALFORMED_FIXTURE_SHA256
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("v0.3.20.db");
+    seed_v0_3_20_fixture(&db_path, None);
+    let conn = Connection::open(&db_path).unwrap();
+
+    let version: String = conn
+        .query_row(
+            "SELECT value FROM control_metadata WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, "1");
+
+    let sandbox_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sandbox_state", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(sandbox_count, 3);
+
+    let developer_labels: String = conn
+        .query_row(
+            "SELECT labels_json FROM sandbox_state WHERE sandbox_id = 'vz-run-shop-a1b2c3d4e5f6'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let developer_labels: serde_json::Value = serde_json::from_str(&developer_labels).unwrap();
+    assert_eq!(
+        developer_labels["vz.run.workspace"].as_str(),
+        Some("/workspace")
+    );
+    assert!(
+        developer_labels.get("project_dir").is_none(),
+        "v0.3.20 vz run did not persist the host workspace source"
+    );
+
+    let hardened_labels: String = conn
+        .query_row(
+            "SELECT labels_json FROM sandbox_state WHERE sandbox_id = 'sbx-hardened-001'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let hardened_labels: serde_json::Value = serde_json::from_str(&hardened_labels).unwrap();
+    assert_eq!(hardened_labels["vz.space.mode"].as_str(), Some("required"));
+
+    let dependent_rows: i64 = conn
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM container_state WHERE sandbox_id = 'vz-run-shop-a1b2c3d4e5f6') +
+                (SELECT COUNT(*) FROM checkpoint_state WHERE sandbox_id = 'vz-run-shop-a1b2c3d4e5f6') +
+                (SELECT COUNT(*) FROM receipt_state WHERE entity_id = 'vz-run-shop-a1b2c3d4e5f6') +
+                (SELECT COUNT(*) FROM events WHERE stack_name = 'vz-run-shop-a1b2c3d4e5f6')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dependent_rows, 4);
+}
+
+#[test]
+fn v0_3_20_negative_fixture_extensions_are_distinct_and_loadable() {
+    for (name, extension, expected_id) in [
+        (
+            "ambiguous",
+            V0_3_20_AMBIGUOUS_FIXTURE,
+            "vz-run-ambiguous-deadbeef0001",
+        ),
+        (
+            "malformed",
+            V0_3_20_MALFORMED_FIXTURE,
+            "vz-run-malformed-deadbeef0002",
+        ),
+    ] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join(format!("v0.3.20-{name}.db"));
+        seed_v0_3_20_fixture(&db_path, Some(extension));
+        let conn = Connection::open(db_path).unwrap();
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sandbox_state WHERE sandbox_id = ?1",
+                params![expected_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1);
+    }
+}
+
+#[test]
+fn topology_complete_aggregate_round_trips_after_database_relocation() {
+    let first_dir = tempfile::tempdir().unwrap();
+    let second_dir = tempfile::tempdir().unwrap();
+    let first_path = first_dir.path().join("state.db");
+    let relocated_path = second_dir.path().join("renamed-state.db");
+    let expected =
+        topology_project_state("prj_shop", &["agent-a", "agent-b"], "/old/checkout/path");
+
+    {
+        let store = StateStore::open(&first_path).unwrap();
+        store.save_project_state(&expected).unwrap();
+        assert_eq!(store.list_project_states().unwrap(), vec![expected.clone()]);
+        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM environment_instances", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM workspace_bindings WHERE name = 'workspace'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+        assert!(
+            store
+                .conn
+                .execute("UPDATE workspace_bindings SET name = ''", [])
+                .is_err(),
+            "the normalized binding name CHECK must reject blank names"
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM machine_instances", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM environment_networks", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM environment_endpoints", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2
+        );
+    }
+
+    std::fs::copy(&first_path, &relocated_path).unwrap();
+    let reopened = StateStore::open(&relocated_path).unwrap();
+    let actual = reopened.load_project_state("prj_shop").unwrap().unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(actual.environments.len(), 2);
+    assert!(
+        actual
+            .environments
+            .iter()
+            .all(|environment| environment.machines[0].name == "linux")
+    );
+    assert!(
+        actual
+            .environments
+            .iter()
+            .all(|environment| { environment.bindings[0].workspace_key == "same-worktree-key" })
+    );
+}
+
+#[test]
+fn topology_save_is_all_or_nothing_on_cross_environment_id_collision() {
+    let store = StateStore::in_memory_with_pragmas(StateStorePragmas::daemon_defaults()).unwrap();
+    let baseline = topology_project_state("prj_baseline", &["stable"], "/checkout");
+    store.save_project_state(&baseline).unwrap();
+
+    let mut conflicting =
+        topology_project_state("prj_conflict", &["agent-a", "agent-b"], "/checkout");
+    let duplicate_machine_id = conflicting.environments[0].machines[0].machine_id.clone();
+    let second = &mut conflicting.environments[1];
+    second.machines[0].machine_id = duplicate_machine_id.clone();
+    second.endpoints[0].machine_id = duplicate_machine_id.clone();
+    second.ownership[0].resource_id = duplicate_machine_id.to_string();
+    second.ownership[0].machine_id = Some(duplicate_machine_id);
+    conflicting.validate().unwrap();
+
+    assert!(store.save_project_state(&conflicting).is_err());
+    assert!(store.load_project_state("prj_conflict").unwrap().is_none());
+    assert_eq!(
+        store.load_project_state("prj_baseline").unwrap(),
+        Some(baseline)
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM environment_instances", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn v0_3_20_developer_migration_is_atomic_idempotent_and_preserves_legacy_rows() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("legacy.db");
+    seed_v0_3_20_fixture(&db_path, None);
+    let untouched_legacy_rows = legacy_non_developer_rows(&db_path);
+
+    let migrated = {
+        let store = StateStore::open(&db_path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 2);
+        let projects = store.list_project_states().unwrap();
+        assert_eq!(projects.len(), 1);
+        let project = projects.into_iter().next().unwrap();
+        let environment = &project.environments[0];
+        assert_eq!(environment.created_at, 1_779_100_100);
+        assert_eq!(environment.updated_at, 1_779_100_200);
+        assert_eq!(
+            environment.machines[0].legacy_sandbox_id.as_deref(),
+            Some("vz-run-shop-a1b2c3d4e5f6")
+        );
+        assert_eq!(environment.bindings[0].path_hint, None);
+        assert_eq!(environment.bindings[0].name, "workspace");
+        assert_eq!(
+            project.definition.environment.machines[0]
+                .workspace
+                .as_ref()
+                .unwrap()
+                .binding,
+            environment.bindings[0].name
+        );
+        assert_eq!(
+            environment.definition_digest,
+            project.definition.digest().unwrap()
+        );
+        let machine = &environment.machines[0];
+        assert_eq!(machine.target.version, None);
+        assert_eq!(machine.target.digest, None);
+        for capability in [
+            MachineCapability::DockerEngine,
+            MachineCapability::Compose,
+            MachineCapability::Buildx,
+        ] {
+            assert!(machine.requested_capabilities.contains(capability));
+            assert!(machine.negotiated_capabilities.contains(capability));
+        }
+        let provenance = environment.legacy_migration.as_ref().unwrap();
+        assert_eq!(provenance.source_version, "v0.3.20");
+        assert_eq!(
+            provenance.unresolved_resources,
+            [
+                "host_mount_sources",
+                "persistent_disk_path",
+                "published_ports",
+                "target_image_digest"
+            ]
+        );
+        assert_eq!(store.list_sandboxes().unwrap().len(), 3);
+        assert_eq!(
+            store
+                .load_sandbox("sbx-hardened-001")
+                .unwrap()
+                .unwrap()
+                .labels["vz.space.mode"],
+            "required"
+        );
+        project
+    };
+
+    let reopened = StateStore::open(&db_path).unwrap();
+    assert_eq!(reopened.list_project_states().unwrap(), vec![migrated]);
+    assert_eq!(reopened.list_sandboxes().unwrap().len(), 3);
+    assert_eq!(legacy_non_developer_rows(&db_path), untouched_legacy_rows);
+    let dependent_rows: i64 = reopened
+        .conn
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM container_state WHERE sandbox_id = 'vz-run-shop-a1b2c3d4e5f6') +
+                (SELECT COUNT(*) FROM checkpoint_state WHERE sandbox_id = 'vz-run-shop-a1b2c3d4e5f6') +
+                (SELECT COUNT(*) FROM receipt_state WHERE entity_id = 'vz-run-shop-a1b2c3d4e5f6') +
+                (SELECT COUNT(*) FROM events WHERE stack_name = 'vz-run-shop-a1b2c3d4e5f6')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dependent_rows, 4);
+}
+
+#[test]
+fn v0_3_20_migration_identity_uses_persisted_key_not_path_hint() {
+    let migrate_with_path = |path_hint: &str| {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("legacy.db");
+        seed_v0_3_20_fixture(&db_path, None);
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let labels: String = conn
+                .query_row(
+                    "SELECT labels_json FROM sandbox_state
+                     WHERE sandbox_id = 'vz-run-shop-a1b2c3d4e5f6'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut labels: serde_json::Value = serde_json::from_str(&labels).unwrap();
+            labels["project_dir"] = serde_json::Value::String(path_hint.to_string());
+            conn.execute(
+                "UPDATE sandbox_state SET labels_json = ?1
+                 WHERE sandbox_id = 'vz-run-shop-a1b2c3d4e5f6'",
+                params![serde_json::to_string(&labels).unwrap()],
+            )
+            .unwrap();
+        }
+        StateStore::open(&db_path)
+            .unwrap()
+            .list_project_states()
+            .unwrap()
+            .remove(0)
+    };
+
+    let old_path = migrate_with_path("/old/worktrees/shop");
+    let new_path = migrate_with_path("/relocated/worktrees/shop");
+    assert_eq!(
+        old_path.definition.project_id,
+        new_path.definition.project_id
+    );
+    assert_eq!(
+        old_path.environments[0].environment_id,
+        new_path.environments[0].environment_id
+    );
+    assert_eq!(
+        old_path.environments[0].machines[0].machine_id,
+        new_path.environments[0].machines[0].machine_id
+    );
+    assert_ne!(
+        old_path.environments[0].bindings[0].path_hint,
+        new_path.environments[0].bindings[0].path_hint
+    );
+}
+
+#[test]
+fn v0_3_20_ambiguous_and_malformed_state_fail_before_schema_mutation() {
+    for (name, extension, message) in [
+        (
+            "ambiguous",
+            V0_3_20_AMBIGUOUS_FIXTURE,
+            "both Developer and Hardened markers",
+        ),
+        (
+            "malformed",
+            V0_3_20_MALFORMED_FIXTURE,
+            "serialization error",
+        ),
+    ] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join(format!("{name}.db"));
+        seed_v0_3_20_fixture(&db_path, Some(extension));
+        let error = StateStore::open(&db_path)
+            .err()
+            .expect("legacy migration must fail")
+            .to_string();
+        assert!(error.contains(message), "unexpected error: {error}");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM control_metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "1");
+        let topology_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'project_definitions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(topology_tables, 0);
+    }
+}
+
+#[test]
+fn future_and_incomplete_v2_schemas_are_rejected_without_repair() {
+    let future_dir = tempfile::tempdir().unwrap();
+    let future_path = future_dir.path().join("future.db");
+    seed_v0_3_20_fixture(&future_path, None);
+    {
+        let conn = Connection::open(&future_path).unwrap();
+        conn.execute(
+            "UPDATE control_metadata SET value = '99' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+    }
+    let error = StateStore::open(&future_path)
+        .err()
+        .expect("future schema must fail")
+        .to_string();
+    assert!(error.contains("newer than supported"));
+    let conn = Connection::open(&future_path).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'project_definitions'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+
+    let incomplete_dir = tempfile::tempdir().unwrap();
+    let incomplete_path = incomplete_dir.path().join("incomplete.db");
+    {
+        let store = StateStore::open(&incomplete_path).unwrap();
+        store
+            .conn
+            .execute("DROP TABLE environment_endpoints", [])
+            .unwrap();
+    }
+    let error = StateStore::open(&incomplete_path)
+        .err()
+        .expect("incomplete v2 schema must fail")
+        .to_string();
+    assert!(error.contains("missing required table `environment_endpoints`"));
+    let conn = Connection::open(&incomplete_path).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'environment_endpoints'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn missing_and_malformed_schema_versions_are_rejected_before_mutation() {
+    for (name, mutation, expected) in [
+        (
+            "missing",
+            "DELETE FROM control_metadata WHERE key = 'schema_version'",
+            "missing state schema version",
+        ),
+        (
+            "malformed",
+            "UPDATE control_metadata SET value = 'v1-ish' WHERE key = 'schema_version'",
+            "malformed state schema version",
+        ),
+    ] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join(format!("{name}.db"));
+        seed_v0_3_20_fixture(&db_path, None);
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(mutation, [])
+            .unwrap();
+
+        let error = StateStore::open(&db_path).err().unwrap().to_string();
+        assert!(error.contains(expected), "unexpected error: {error}");
+        let conn = Connection::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'project_definitions'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+}
+
+/// Verify that fresh state stores advertise the current v2 schema.
+#[test]
+fn migration_v2_schema_detectable() {
     let store = StateStore::in_memory().unwrap();
 
-    // Schema version must be present and equal to "1" after initial init.
+    // Schema version must be present and equal to "2" after initial init.
     let version_str = store
         .get_control_metadata("schema_version")
         .unwrap()
         .expect("schema_version should be set on first init");
-    assert_eq!(version_str, "1");
+    assert_eq!(version_str, "2");
 
     // The typed accessor must agree.
-    assert_eq!(store.schema_version().unwrap(), 1);
+    assert_eq!(store.schema_version().unwrap(), 2);
 
     // created_at must also be set.
     assert!(
@@ -4029,7 +4718,7 @@ fn migration_old_data_readable_after_schema_update() {
 
     // Schema version must not have been overwritten by re-init
     // (INSERT OR IGNORE preserves original value).
-    assert_eq!(store.schema_version().unwrap(), 1);
+    assert_eq!(store.schema_version().unwrap(), 2);
 }
 
 /// Verify that all existing queries continue to work correctly after new
@@ -4108,7 +4797,7 @@ fn migration_new_tables_dont_break_old_queries() {
     assert_eq!(loaded.checkpoint_id, "ckpt-1");
 
     // Schema version still intact.
-    assert_eq!(store.schema_version().unwrap(), 1);
+    assert_eq!(store.schema_version().unwrap(), 2);
 }
 
 /// Serialize and deserialize a checkpoint through the state store,

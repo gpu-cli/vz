@@ -36,6 +36,317 @@ message ErrorDetail {
   string request_id = 3;
 }
 
+// ── Developer Environment topology contract ──────────────────────
+//
+// These messages are the versioned wire representation of the portable
+// Project -> Environment -> Machine aggregate. Lifecycle RPCs are added by a
+// later slice; this section intentionally defines data and structured errors
+// only. Existing Sandbox messages remain the low-level runtime primitive.
+
+enum OperatingSystem {
+  OPERATING_SYSTEM_UNSPECIFIED = 0;
+  OPERATING_SYSTEM_LINUX = 1;
+  OPERATING_SYSTEM_MACOS = 2;
+  OPERATING_SYSTEM_WINDOWS = 3;
+}
+
+enum Architecture {
+  ARCHITECTURE_UNSPECIFIED = 0;
+  ARCHITECTURE_AARCH64 = 1;
+  ARCHITECTURE_X86_64 = 2;
+}
+
+message HostSpec {
+  OperatingSystem os = 1;
+  Architecture arch = 2;
+}
+
+message TargetSpec {
+  OperatingSystem os = 1;
+  Architecture arch = 2;
+  string image = 3;
+  optional string version = 4;
+  optional string channel = 5;
+  optional string digest = 6;
+}
+
+enum MachineCapability {
+  MACHINE_CAPABILITY_UNSPECIFIED = 0;
+  MACHINE_CAPABILITY_POSIX_EXEC = 1;
+  MACHINE_CAPABILITY_POSIX_PTY = 2;
+  MACHINE_CAPABILITY_SIGNALS = 3;
+  MACHINE_CAPABILITY_FILES = 4;
+  MACHINE_CAPABILITY_PORTS = 5;
+  MACHINE_CAPABILITY_DOCKER_ENGINE = 6;
+  MACHINE_CAPABILITY_COMPOSE = 7;
+  MACHINE_CAPABILITY_BUILDX = 8;
+  MACHINE_CAPABILITY_SNAPSHOT = 9;
+  MACHINE_CAPABILITY_SUSPEND = 10;
+  MACHINE_CAPABILITY_CHECKPOINT = 11;
+  MACHINE_CAPABILITY_GUI = 12;
+  MACHINE_CAPABILITY_WINDOWS_CONSOLE = 13;
+}
+
+message UnsupportedMachineCapability {
+  MachineCapability capability = 1;
+  string reason = 2;
+}
+
+// Used for both requested and negotiated capability sets. Requested sets
+// normally contain only capabilities. Negotiated sets may additionally retain
+// a structured reason for every unsupported request.
+message CapabilitySet {
+  repeated MachineCapability capabilities = 1;
+  repeated UnsupportedMachineCapability unsupported = 2;
+}
+
+message MachineResources {
+  optional uint32 cpus = 1;
+  optional uint64 memory_mb = 2;
+  optional uint64 disk_bytes = 3;
+}
+
+enum WorkspaceProjectionMode {
+  WORKSPACE_PROJECTION_MODE_UNSPECIFIED = 0;
+  WORKSPACE_PROJECTION_MODE_READ_WRITE = 1;
+  WORKSPACE_PROJECTION_MODE_READ_ONLY = 2;
+  WORKSPACE_PROJECTION_MODE_SNAPSHOT = 3;
+}
+
+message WorkspaceProjection {
+  string binding = 1;
+  string target_path = 2;
+  WorkspaceProjectionMode mode = 3;
+}
+
+message MachineSpec {
+  uint32 schema_version = 1;
+  string name = 2;
+  TargetSpec target = 3;
+  MachineResources resources = 4;
+  CapabilitySet requested_capabilities = 5;
+  optional WorkspaceProjection workspace = 6;
+}
+
+enum NetworkKind {
+  NETWORK_KIND_UNSPECIFIED = 0;
+  NETWORK_KIND_PRIVATE = 1;
+  NETWORK_KIND_SIMULATED_PUBLIC = 2;
+}
+
+message NetworkSpec {
+  uint32 schema_version = 1;
+  string name = 2;
+  NetworkKind kind = 3;
+  optional string cidr = 4;
+}
+
+enum EndpointProtocol {
+  ENDPOINT_PROTOCOL_UNSPECIFIED = 0;
+  ENDPOINT_PROTOCOL_TCP = 1;
+  ENDPOINT_PROTOCOL_UDP = 2;
+  ENDPOINT_PROTOCOL_HTTP = 3;
+  ENDPOINT_PROTOCOL_HTTPS = 4;
+}
+
+message EndpointSpec {
+  uint32 schema_version = 1;
+  string name = 2;
+  string machine = 3;
+  string network = 4;
+  EndpointProtocol protocol = 5;
+  uint32 port = 6;
+  optional string hostname = 7;
+}
+
+message EnvironmentSpec {
+  uint32 schema_version = 1;
+  repeated MachineSpec machines = 2;
+  repeated NetworkSpec networks = 3;
+  repeated EndpointSpec endpoints = 4;
+}
+
+message ProjectDefinition {
+  uint32 schema_version = 1;
+  string project_id = 2;
+  string name = 3;
+  EnvironmentSpec environment = 4;
+}
+
+message WorkspaceBinding {
+  uint32 schema_version = 1;
+  string binding_id = 2;
+  string project_id = 3;
+  string environment_id = 4;
+  string workspace_key = 5;
+  optional string path_hint = 6;
+  string name = 7;
+}
+
+enum EnvironmentState {
+  ENVIRONMENT_STATE_UNSPECIFIED = 0;
+  ENVIRONMENT_STATE_CREATING = 1;
+  ENVIRONMENT_STATE_RECONCILING = 2;
+  ENVIRONMENT_STATE_READY = 3;
+  ENVIRONMENT_STATE_STOPPED = 4;
+  ENVIRONMENT_STATE_DELETING = 5;
+  ENVIRONMENT_STATE_DELETED = 6;
+  ENVIRONMENT_STATE_FAILED = 7;
+}
+
+enum MachineState {
+  MACHINE_STATE_UNSPECIFIED = 0;
+  MACHINE_STATE_CREATING = 1;
+  MACHINE_STATE_READY = 2;
+  MACHINE_STATE_STOPPED = 3;
+  MACHINE_STATE_FAILED = 4;
+}
+
+enum MachineBackend {
+  MACHINE_BACKEND_UNSPECIFIED = 0;
+  MACHINE_BACKEND_MACOS_VIRTUALIZATION_LINUX = 1;
+  MACHINE_BACKEND_MACOS_NATIVE = 2;
+  MACHINE_BACKEND_LINUX_NATIVE = 3;
+  MACHINE_BACKEND_WINDOWS_LINUX = 4;
+  MACHINE_BACKEND_WINDOWS_NATIVE = 5;
+  MACHINE_BACKEND_OTHER = 6;
+}
+
+message MachineIncarnation {
+  uint32 schema_version = 1;
+  string incarnation_id = 2;
+  string machine_id = 3;
+  uint64 generation = 4;
+  uint64 created_at = 5;
+}
+
+message MachineInstance {
+  uint32 schema_version = 1;
+  string machine_id = 2;
+  string environment_id = 3;
+  string name = 4;
+  TargetSpec target = 5;
+  MachineResources resources = 6;
+  CapabilitySet requested_capabilities = 7;
+  CapabilitySet negotiated_capabilities = 8;
+  optional MachineBackend backend = 9;
+  // Carries MachineBackend::Other(String) without weakening the enum contract.
+  optional string other_backend = 10;
+  optional MachineIncarnation incarnation = 11;
+  MachineState state = 12;
+  optional string legacy_sandbox_id = 13;
+}
+
+message NetworkInstance {
+  uint32 schema_version = 1;
+  string network_id = 2;
+  string environment_id = 3;
+  string name = 4;
+}
+
+message EndpointInstance {
+  uint32 schema_version = 1;
+  string endpoint_id = 2;
+  string environment_id = 3;
+  string machine_id = 4;
+  string network_id = 5;
+  string name = 6;
+}
+
+enum OwnedResourceKind {
+  OWNED_RESOURCE_KIND_UNSPECIFIED = 0;
+  OWNED_RESOURCE_KIND_MACHINE = 1;
+  OWNED_RESOURCE_KIND_INCARNATION = 2;
+  OWNED_RESOURCE_KIND_DISK = 3;
+  OWNED_RESOURCE_KIND_SOCKET = 4;
+  OWNED_RESOURCE_KIND_DOCKER_CONTEXT = 5;
+  OWNED_RESOURCE_KIND_NETWORK = 6;
+  OWNED_RESOURCE_KIND_ENDPOINT = 7;
+  OWNED_RESOURCE_KIND_CREDENTIAL = 8;
+  OWNED_RESOURCE_KIND_FAULT = 9;
+  OWNED_RESOURCE_KIND_LEGACY_SANDBOX = 10;
+  OWNED_RESOURCE_KIND_OTHER = 11;
+}
+
+message OwnershipRecord {
+  uint32 schema_version = 1;
+  OwnedResourceKind resource_kind = 2;
+  // Carries OwnedResourceKind::Other(String) without weakening the enum contract.
+  optional string other_resource_kind = 3;
+  string resource_id = 4;
+  string environment_id = 5;
+  optional string machine_id = 6;
+}
+
+message LegacyMigrationProvenance {
+  string source_version = 1;
+  string legacy_sandbox_id = 2;
+  repeated string unresolved_resources = 3;
+}
+
+message EnvironmentInstance {
+  uint32 schema_version = 1;
+  string environment_id = 2;
+  string project_id = 3;
+  string name = 4;
+  string definition_digest = 5;
+  EnvironmentState state = 6;
+  repeated WorkspaceBinding bindings = 7;
+  repeated MachineInstance machines = 8;
+  repeated NetworkInstance networks = 9;
+  repeated EndpointInstance endpoints = 10;
+  repeated OwnershipRecord ownership = 11;
+  optional LegacyMigrationProvenance legacy_migration = 12;
+  uint64 created_at = 13;
+  uint64 updated_at = 14;
+}
+
+message ProjectState {
+  uint32 schema_version = 1;
+  ProjectDefinition definition = 2;
+  repeated EnvironmentInstance environments = 3;
+}
+
+message TopologyCandidate {
+  string id = 1;
+  string name = 2;
+}
+
+message TopologyNotFoundDetail {
+  string kind = 1;
+  string selector = 2;
+}
+
+message TopologyAmbiguityDetail {
+  string kind = 1;
+  string selector = 2;
+  repeated TopologyCandidate candidates = 3;
+}
+
+message TopologyUnsupportedTargetDetail {
+  OperatingSystem host_os = 1;
+  Architecture host_arch = 2;
+  OperatingSystem target_os = 3;
+  Architecture target_arch = 4;
+  repeated MachineCapability requested_capabilities = 5;
+}
+
+message TopologyMissingCapabilityDetail {
+  string machine_id = 1;
+  MachineCapability capability = 2;
+}
+
+// Structured detail suitable for an ErrorDetail companion. Do not require
+// clients to parse ambiguity or unsupported-target information from prose.
+message TopologyErrorDetail {
+  oneof detail {
+    TopologyNotFoundDetail not_found = 1;
+    TopologyAmbiguityDetail ambiguous = 2;
+    TopologyUnsupportedTargetDetail unsupported_target = 3;
+    TopologyMissingCapabilityDetail missing_capability = 4;
+  }
+}
+
 // ── 1. SandboxService ──────────────────────────────────────────────
 
 service SandboxService {
