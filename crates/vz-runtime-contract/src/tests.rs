@@ -1107,6 +1107,14 @@ fn sandbox_and_lease_state_invariants() {
         updated_at: 0,
         labels: BTreeMap::new(),
     };
+    sandbox.ensure_lifecycle_consistency().unwrap();
+    sandbox.created_at = 2;
+    sandbox.updated_at = 1;
+    assert!(matches!(
+        sandbox.ensure_lifecycle_consistency(),
+        Err(ContractInvariantError::SandboxLifecycleInconsistency { .. })
+    ));
+    sandbox.updated_at = 2;
 
     assert!(matches!(
         sandbox.ensure_can_open_lease(),
@@ -1198,6 +1206,43 @@ fn container_and_execution_state_invariants() {
     assert!(matches!(
         execution.transition_to(ExecutionState::Running),
         Err(ContractInvariantError::ExecutionStateTransition { .. })
+    ));
+}
+
+#[test]
+fn container_lifecycle_metadata_matches_persisted_state() {
+    let mut container = Container {
+        container_id: "c-lifecycle".to_string(),
+        sandbox_id: "s-1".to_string(),
+        image_digest: "sha256:abc".to_string(),
+        container_spec: ContainerSpec::default(),
+        state: ContainerState::Created,
+        created_at: 10,
+        started_at: None,
+        ended_at: None,
+    };
+    container.ensure_lifecycle_consistency().unwrap();
+
+    container.state = ContainerState::Running;
+    container.started_at = Some(11);
+    container.ensure_lifecycle_consistency().unwrap();
+
+    container.state = ContainerState::Exited;
+    container.ended_at = Some(12);
+    container.ensure_lifecycle_consistency().unwrap();
+
+    container.started_at = Some(13);
+    assert!(matches!(
+        container.ensure_lifecycle_consistency(),
+        Err(ContractInvariantError::LifecycleInconsistency { .. })
+    ));
+
+    container.state = ContainerState::Created;
+    container.started_at = None;
+    container.ended_at = Some(12);
+    assert!(matches!(
+        container.ensure_lifecycle_consistency(),
+        Err(ContractInvariantError::LifecycleInconsistency { .. })
     ));
 }
 

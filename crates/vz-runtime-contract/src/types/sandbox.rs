@@ -131,6 +131,17 @@ pub struct Sandbox {
 }
 
 impl Sandbox {
+    /// Validate persisted lifecycle timestamps.
+    pub fn ensure_lifecycle_consistency(&self) -> Result<(), ContractInvariantError> {
+        if self.updated_at < self.created_at {
+            return Err(ContractInvariantError::SandboxLifecycleInconsistency {
+                sandbox_id: self.sandbox_id.clone(),
+                details: "update time cannot precede creation time".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Validate that the sandbox currently permits opening a new lease.
     pub fn ensure_can_open_lease(&self) -> Result<(), ContractInvariantError> {
         if self.state != SandboxState::Ready {

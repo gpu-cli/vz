@@ -17,9 +17,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::info;
 use vz_runtime_contract::{
-    BuildState, ExecutionState, MachineError, MachineErrorCode, PolicyDecision, RequestMetadata,
-    RuntimeCapabilities, RuntimeError, RuntimeOperation, RuntimePolicyHook, SandboxState,
-    WorkspaceRuntimeManager, enforce_runtime_policy_hook,
+    Build, BuildState, Execution, ExecutionState, MachineError, MachineErrorCode, PolicyDecision,
+    RequestMetadata, RuntimeCapabilities, RuntimeError, RuntimeOperation, RuntimePolicyHook,
+    Sandbox, SandboxState, WorkspaceRuntimeManager, enforce_runtime_policy_hook,
 };
 use vz_stack::{Receipt, StackError, StackEvent, StateStore, StateStorePragmas};
 
@@ -216,16 +216,26 @@ impl RuntimeDaemon {
                 }
             })?;
         let migrate_legacy_checkpoint_artifacts = load_legacy_checkpoint_migration_mode_enabled()?;
+        // Parse every fallible startup-policy input before opening the state store:
+        // opening may migrate a legacy database, which is a durable mutation.
+        let sandbox_startup_policy = load_sandbox_startup_policy()?;
+        if !legacy_checkpoint_artifacts.is_empty() && !migrate_legacy_checkpoint_artifacts {
+            return Err(RuntimedError::LegacyCheckpointArtifactsIncompatible {
+                runtime_data_dir: config.runtime_data_dir.clone(),
+                migration_env: LEGACY_CHECKPOINT_MIGRATION_ENV,
+                paths: legacy_checkpoint_artifacts,
+            });
+        }
 
         let startup_lock = StartupLock::acquire(startup_lock_path(&config.state_store_path))?;
-        let state_store = StateStore::open_with_pragmas(
-            &config.state_store_path,
-            StateStorePragmas::daemon_defaults(),
-        )
-        .map_err(|source| RuntimedError::OpenStateStore {
-            path: config.state_store_path.clone(),
-            source,
-        })?;
+        let mut prevalidation_pragmas = StateStorePragmas::daemon_defaults();
+        prevalidation_pragmas.journal_mode_wal = false;
+        let state_store =
+            StateStore::open_with_pragmas(&config.state_store_path, prevalidation_pragmas)
+                .map_err(|source| RuntimedError::OpenStateStore {
+                    path: config.state_store_path.clone(),
+                    source,
+                })?;
         let schema_version =
             state_store
                 .schema_version()
@@ -251,56 +261,57 @@ impl RuntimeDaemon {
                 source,
             }
         })?;
-        if !legacy_checkpoint_artifacts.is_empty() {
-            if migrate_legacy_checkpoint_artifacts {
-                let report = migrate_legacy_checkpoint_artifacts_to_archive(
-                    &config.runtime_data_dir,
-                    &legacy_checkpoint_artifacts,
-                )
-                .map_err(|source| {
-                    RuntimedError::MigrateLegacyCheckpointArtifacts {
-                        runtime_data_dir: config.runtime_data_dir.clone(),
-                        source,
-                    }
-                })?;
-                persist_legacy_checkpoint_migration_audit(&state_store, &report).map_err(
-                    |source| RuntimedError::RecordLegacyCheckpointMigration {
-                        path: config.state_store_path.clone(),
-                        source,
-                    },
-                )?;
-            } else {
-                return Err(RuntimedError::LegacyCheckpointArtifactsIncompatible {
-                    runtime_data_dir: config.runtime_data_dir.clone(),
-                    migration_env: LEGACY_CHECKPOINT_MIGRATION_ENV,
-                    paths: legacy_checkpoint_artifacts,
-                });
-            }
-        }
-        let reconciled_execution_count =
-            reconcile_orphaned_executions(&state_store).map_err(|source| {
-                RuntimedError::ReconcileExecutionState {
+        let recovery_state =
+            load_and_validate_persisted_recovery_state(&state_store).map_err(|source| {
+                RuntimedError::ValidatePersistedRecoveryState {
                     path: config.state_store_path.clone(),
                     source,
                 }
             })?;
-        let reconciled_build_count = reconcile_orphaned_builds(&state_store).map_err(|source| {
-            RuntimedError::ReconcileBuildState {
+        state_store.enable_wal_journal_mode().map_err(|source| {
+            RuntimedError::ConfigureStateStore {
                 path: config.state_store_path.clone(),
                 source,
             }
         })?;
-        let reconciled_sandbox_count =
-            reconcile_orphaned_sandboxes(&state_store).map_err(|source| {
-                RuntimedError::ReconcileSandboxState {
+        if !legacy_checkpoint_artifacts.is_empty() {
+            let report = migrate_legacy_checkpoint_artifacts_to_archive(
+                &config.runtime_data_dir,
+                &legacy_checkpoint_artifacts,
+            )
+            .map_err(|source| RuntimedError::MigrateLegacyCheckpointArtifacts {
+                runtime_data_dir: config.runtime_data_dir.clone(),
+                source,
+            })?;
+            persist_legacy_checkpoint_migration_audit(&state_store, &report).map_err(|source| {
+                RuntimedError::RecordLegacyCheckpointMigration {
                     path: config.state_store_path.clone(),
                     source,
                 }
             })?;
+        }
+        let reconciled_execution_count =
+            reconcile_orphaned_executions(&state_store, recovery_state.executions).map_err(
+                |source| RuntimedError::ReconcileExecutionState {
+                    path: config.state_store_path.clone(),
+                    source,
+                },
+            )?;
+        let reconciled_build_count = reconcile_orphaned_builds(&state_store, recovery_state.builds)
+            .map_err(|source| RuntimedError::ReconcileBuildState {
+                path: config.state_store_path.clone(),
+                source,
+            })?;
+        let reconciled_sandbox_count =
+            reconcile_orphaned_sandboxes(&state_store, recovery_state.sandboxes).map_err(
+                |source| RuntimedError::ReconcileSandboxState {
+                    path: config.state_store_path.clone(),
+                    source,
+                },
+            )?;
 
         let manager = build_runtime_manager(&config.runtime_data_dir);
         let placement_scheduler = PlacementScheduler::default();
-        let sandbox_startup_policy = load_sandbox_startup_policy()?;
         placement_scheduler
             .refresh(&state_store, current_unix_secs())
             .map_err(|source| RuntimedError::RefreshPlacementSnapshot {
@@ -763,9 +774,57 @@ fn load_sandbox_startup_policy() -> Result<SandboxStartupPolicy, RuntimedError> 
     })
 }
 
-fn reconcile_orphaned_executions(state_store: &StateStore) -> Result<u64, StackError> {
+struct PersistedRecoveryState {
+    executions: Vec<Execution>,
+    builds: Vec<Build>,
+    sandboxes: Vec<Sandbox>,
+}
+
+fn load_and_validate_persisted_recovery_state(
+    state_store: &StateStore,
+) -> Result<PersistedRecoveryState, StackError> {
+    // Materialize every recovery/placement input before validating or mutating
+    // any one domain. A corrupt later-domain row must not permit an earlier
+    // reconciliation transaction to commit.
+    let executions = state_store.list_executions()?;
+    let builds = state_store.list_builds()?;
+    let sandboxes = state_store.list_sandboxes()?;
+    let containers = state_store.list_containers()?;
+
+    for execution in &executions {
+        execution
+            .ensure_lifecycle_consistency()
+            .map_err(|error| StackError::InvalidSpec(error.to_string()))?;
+    }
+    for build in &builds {
+        build
+            .ensure_lifecycle_consistency()
+            .map_err(|error| StackError::InvalidSpec(error.to_string()))?;
+    }
+    for container in &containers {
+        container
+            .ensure_lifecycle_consistency()
+            .map_err(|error| StackError::InvalidSpec(error.to_string()))?;
+    }
+    for sandbox in &sandboxes {
+        sandbox
+            .ensure_lifecycle_consistency()
+            .map_err(|error| StackError::InvalidSpec(error.to_string()))?;
+    }
+
+    Ok(PersistedRecoveryState {
+        executions,
+        builds,
+        sandboxes,
+    })
+}
+
+fn reconcile_orphaned_executions(
+    state_store: &StateStore,
+    executions: Vec<Execution>,
+) -> Result<u64, StackError> {
     let mut reconciled = 0;
-    for mut execution in state_store.list_executions()? {
+    for mut execution in executions {
         if !matches!(
             execution.state,
             ExecutionState::Queued | ExecutionState::Running
@@ -809,9 +868,12 @@ struct BuildRestartReconcileReceiptMetadata<'a> {
     reason: &'a str,
 }
 
-fn reconcile_orphaned_builds(state_store: &StateStore) -> Result<u64, StackError> {
+fn reconcile_orphaned_builds(
+    state_store: &StateStore,
+    builds: Vec<Build>,
+) -> Result<u64, StackError> {
     let mut reconciled: u64 = 0;
-    for mut build in state_store.list_builds()? {
+    for mut build in builds {
         if !matches!(build.state, BuildState::Queued | BuildState::Running) {
             continue;
         }
@@ -882,9 +944,12 @@ fn reconcile_orphaned_builds(state_store: &StateStore) -> Result<u64, StackError
 /// take their already-handled "sandbox is in a terminal state" branches.
 /// The eligibility filter mirrors `reconcile_orphaned_executions` —
 /// terminal states are skipped.
-fn reconcile_orphaned_sandboxes(state_store: &StateStore) -> Result<u64, StackError> {
+fn reconcile_orphaned_sandboxes(
+    state_store: &StateStore,
+    sandboxes: Vec<Sandbox>,
+) -> Result<u64, StackError> {
     let mut reconciled: u64 = 0;
-    for mut sandbox in state_store.list_sandboxes()? {
+    for mut sandbox in sandboxes {
         if sandbox.state.is_terminal() {
             continue;
         }
@@ -1068,6 +1133,12 @@ pub enum RuntimedError {
         #[source]
         source: StackError,
     },
+    #[error("failed to configure validated daemon state store at {path}: {source}")]
+    ConfigureStateStore {
+        path: PathBuf,
+        #[source]
+        source: StackError,
+    },
     #[error("failed to read schema version from {path}: {source}")]
     ReadSchemaVersion {
         path: PathBuf,
@@ -1076,6 +1147,12 @@ pub enum RuntimedError {
     },
     #[error("failed to validate persisted topology state from {path}: {source}")]
     ValidateTopologyState {
+        path: PathBuf,
+        #[source]
+        source: StackError,
+    },
+    #[error("failed to validate persisted recovery state from {path}: {source}")]
+    ValidatePersistedRecoveryState {
         path: PathBuf,
         #[source]
         source: StackError,
@@ -1125,8 +1202,9 @@ mod tests {
 
     use super::*;
     use vz_runtime_contract::{
-        Build, BuildSpec, BuildState, Execution, ExecutionSpec, ExecutionState, MachineProfile,
-        Sandbox, SandboxBackend, SandboxSpec, SandboxState,
+        Build, BuildSpec, BuildState, Container, ContainerSpec, ContainerState, Execution,
+        ExecutionSpec, ExecutionState, MachineProfile, Sandbox, SandboxBackend, SandboxSpec,
+        SandboxState,
     };
 
     fn queued_execution(execution_id: &str) -> Execution {
@@ -1145,6 +1223,105 @@ mod tests {
             started_at: None,
             ended_at: None,
         }
+    }
+
+    fn queued_build(build_id: &str) -> Build {
+        Build {
+            build_id: build_id.to_string(),
+            sandbox_id: "sbx-startup-validation".to_string(),
+            build_spec: BuildSpec {
+                context: ".".to_string(),
+                dockerfile: Some("Dockerfile".to_string()),
+                target: None,
+                args: BTreeMap::new(),
+                cache_from: Vec::new(),
+                image_tag: None,
+                secrets: Vec::new(),
+                no_cache: false,
+                push: false,
+                output_oci_tar_dest: None,
+            },
+            state: BuildState::Queued,
+            result_digest: None,
+            started_at: 1,
+            ended_at: None,
+        }
+    }
+
+    fn ready_sandbox(sandbox_id: &str) -> Sandbox {
+        Sandbox {
+            sandbox_id: sandbox_id.to_string(),
+            backend: SandboxBackend::MacosVz,
+            spec: SandboxSpec::default(),
+            state: SandboxState::Ready,
+            created_at: 1,
+            updated_at: 1,
+            labels: BTreeMap::new(),
+        }
+    }
+
+    fn created_container(container_id: &str) -> Container {
+        Container {
+            container_id: container_id.to_string(),
+            sandbox_id: "sbx-startup-validation".to_string(),
+            image_digest: "sha256:startup-validation".to_string(),
+            container_spec: ContainerSpec::default(),
+            state: ContainerState::Created,
+            created_at: 1,
+            started_at: None,
+            ended_at: None,
+        }
+    }
+
+    fn startup_validation_config(root: &Path) -> RuntimedConfig {
+        RuntimedConfig {
+            state_store_path: root.join("state").join("stack-state.db"),
+            runtime_data_dir: root.join("runtime"),
+            socket_path: root.join("runtime").join("runtimed.sock"),
+        }
+    }
+
+    fn assert_recovery_side_effects_absent(
+        state_store_path: &Path,
+        execution_id: &str,
+        build_id: Option<&str>,
+    ) {
+        let connection = rusqlite::Connection::open(state_store_path).expect("reopen database");
+        let execution_state: String = connection
+            .query_row(
+                "SELECT state FROM execution_state WHERE execution_id = ?1",
+                [execution_id],
+                |row| row.get(0),
+            )
+            .expect("queued execution state remains readable");
+        assert_eq!(execution_state, "\"queued\"");
+
+        if let Some(build_id) = build_id {
+            let build_state: String = connection
+                .query_row(
+                    "SELECT state FROM build_state WHERE build_id = ?1",
+                    [build_id],
+                    |row| row.get(0),
+                )
+                .expect("queued build state remains readable");
+            assert_eq!(build_state, "\"queued\"");
+        }
+
+        let event_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .expect("count recovery events");
+        assert_eq!(event_count, 0, "startup failure must not emit events");
+        let receipt_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM receipt_state", [], |row| row.get(0))
+            .expect("count recovery receipts");
+        assert_eq!(receipt_count, 0, "startup failure must not emit receipts");
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("read journal mode");
+        assert_eq!(
+            journal_mode, "delete",
+            "recovery validation failure must precede the durable WAL switch"
+        );
     }
 
     #[test]
@@ -1192,6 +1369,16 @@ mod tests {
             .join("sbx-legacy")
             .join("fs");
         std::fs::create_dir_all(&legacy_root).expect("create legacy checkpoint root");
+        std::fs::create_dir_all(cfg.state_store_path.parent().expect("state parent"))
+            .expect("create state directory");
+        let connection =
+            rusqlite::Connection::open(&cfg.state_store_path).expect("open legacy database");
+        connection
+            .execute_batch(include_str!(
+                "../../vz-stack/tests/fixtures/v0.3.20-state.sql"
+            ))
+            .expect("install exact v0.3.20 fixture");
+        drop(connection);
 
         let error = match RuntimeDaemon::start(cfg.clone()) {
             Ok(_) => panic!("daemon should reject legacy layout"),
@@ -1208,6 +1395,25 @@ mod tests {
             }
             other => panic!("unexpected start error: {other}"),
         }
+        let connection =
+            rusqlite::Connection::open(&cfg.state_store_path).expect("reopen legacy database");
+        let schema_version: String = connection
+            .query_row(
+                "SELECT value FROM control_metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read untouched legacy schema marker");
+        assert_eq!(schema_version, "1");
+        let topology_tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'project_definitions'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query topology tables");
+        assert_eq!(topology_tables, 0);
     }
 
     #[test]
@@ -1671,12 +1877,28 @@ mod tests {
             .expect("insert malformed topology JSON");
         drop(connection);
 
+        let journal_mode = || {
+            rusqlite::Connection::open(&cfg.state_store_path)
+                .expect("open database for journal mode")
+                .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .expect("read journal mode")
+        };
+        assert_eq!(journal_mode(), "delete");
+
         let result = RuntimeDaemon::start(cfg.clone());
         assert!(matches!(
             result,
-            Err(RuntimedError::ValidateTopologyState { source, .. })
-                if source.to_string().contains("serialization error")
+            Err(RuntimedError::ValidateTopologyState {
+                source: StackError::InvalidSpec(message),
+                ..
+            }) if message.contains("project_definitions")
+                && message.contains("definition_json")
         ));
+        assert_eq!(
+            journal_mode(),
+            "delete",
+            "aggregate validation failure must precede the durable WAL switch"
+        );
 
         let reopened = StateStore::open(&cfg.state_store_path).expect("reopen state store");
         let execution = reopened
@@ -1686,6 +1908,263 @@ mod tests {
         assert_eq!(execution.state, ExecutionState::Queued);
         assert_eq!(execution.started_at, None);
         assert_eq!(execution.ended_at, None);
+    }
+
+    #[test]
+    fn daemon_rejects_topology_projection_drift_before_wal_or_recovery_mutation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = startup_validation_config(tmp.path());
+        std::fs::create_dir_all(cfg.state_store_path.parent().expect("state parent"))
+            .expect("create state directory");
+        let connection =
+            rusqlite::Connection::open(&cfg.state_store_path).expect("open legacy database");
+        connection
+            .execute_batch(include_str!(
+                "../../vz-stack/tests/fixtures/v0.3.20-state.sql"
+            ))
+            .expect("install exact v0.3.20 fixture");
+        drop(connection);
+        let store = StateStore::open(&cfg.state_store_path).expect("migrate fixture to v2");
+        store
+            .save_execution(&queued_execution("exec-before-projection-drift"))
+            .expect("save queued execution");
+        drop(store);
+        let connection = rusqlite::Connection::open(&cfg.state_store_path).expect("open database");
+        connection
+            .execute_batch(
+                "UPDATE project_definitions SET name = 'drifted-name';
+                 DELETE FROM events;
+                 DELETE FROM receipt_state;",
+            )
+            .expect("inject normalized projection drift");
+        drop(connection);
+
+        let result = RuntimeDaemon::start(cfg.clone());
+        assert!(matches!(
+            result,
+            Err(RuntimedError::ValidateTopologyState {
+                source: StackError::InvalidSpec(message),
+                ..
+            }) if message.contains("project_definitions") && message.contains("field=name")
+        ));
+        assert_recovery_side_effects_absent(
+            &cfg.state_store_path,
+            "exec-before-projection-drift",
+            None,
+        );
+    }
+
+    #[test]
+    fn daemon_rejects_malformed_build_before_recovery_mutation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = startup_validation_config(tmp.path());
+        std::fs::create_dir_all(cfg.state_store_path.parent().expect("state parent"))
+            .expect("create state directory");
+        let store = StateStore::open(&cfg.state_store_path).expect("state store");
+        store
+            .save_execution(&queued_execution("exec-before-malformed-build"))
+            .expect("save queued execution");
+        store
+            .save_build(&queued_build("build-malformed"))
+            .expect("save queued build");
+        drop(store);
+
+        let connection = rusqlite::Connection::open(&cfg.state_store_path).expect("open database");
+        connection
+            .execute(
+                "UPDATE build_state SET spec_json = '{not-json' WHERE build_id = 'build-malformed'",
+                [],
+            )
+            .expect("corrupt build JSON");
+        drop(connection);
+
+        let result = RuntimeDaemon::start(cfg.clone());
+        assert!(matches!(
+            result,
+            Err(RuntimedError::ValidatePersistedRecoveryState { source, .. })
+                if source.to_string().contains("serialization error")
+        ));
+        assert_recovery_side_effects_absent(
+            &cfg.state_store_path,
+            "exec-before-malformed-build",
+            Some("build-malformed"),
+        );
+    }
+
+    #[test]
+    fn daemon_rejects_malformed_sandbox_before_recovery_mutation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = startup_validation_config(tmp.path());
+        std::fs::create_dir_all(cfg.state_store_path.parent().expect("state parent"))
+            .expect("create state directory");
+        let store = StateStore::open(&cfg.state_store_path).expect("state store");
+        store
+            .save_execution(&queued_execution("exec-before-malformed-sandbox"))
+            .expect("save queued execution");
+        store
+            .save_build(&queued_build("build-before-malformed-sandbox"))
+            .expect("save queued build");
+        store
+            .save_sandbox(&ready_sandbox("sbx-malformed"))
+            .expect("save sandbox");
+        drop(store);
+
+        let connection = rusqlite::Connection::open(&cfg.state_store_path).expect("open database");
+        connection
+            .execute(
+                "UPDATE sandbox_state SET state = 'not-json' WHERE sandbox_id = 'sbx-malformed'",
+                [],
+            )
+            .expect("corrupt sandbox state");
+        drop(connection);
+
+        let result = RuntimeDaemon::start(cfg.clone());
+        assert!(matches!(
+            result,
+            Err(RuntimedError::ValidatePersistedRecoveryState { source, .. })
+                if source.to_string().contains("serialization error")
+        ));
+        assert_recovery_side_effects_absent(
+            &cfg.state_store_path,
+            "exec-before-malformed-sandbox",
+            Some("build-before-malformed-sandbox"),
+        );
+    }
+
+    #[test]
+    fn daemon_rejects_malformed_container_before_recovery_mutation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = startup_validation_config(tmp.path());
+        std::fs::create_dir_all(cfg.state_store_path.parent().expect("state parent"))
+            .expect("create state directory");
+        let store = StateStore::open(&cfg.state_store_path).expect("state store");
+        store
+            .save_execution(&queued_execution("exec-before-malformed-container"))
+            .expect("save queued execution");
+        store
+            .save_build(&queued_build("build-before-malformed-container"))
+            .expect("save queued build");
+        store
+            .save_sandbox(&ready_sandbox("sbx-startup-validation"))
+            .expect("save sandbox");
+        store
+            .save_container(&created_container("ctr-malformed"))
+            .expect("save container");
+        drop(store);
+
+        let connection = rusqlite::Connection::open(&cfg.state_store_path).expect("open database");
+        connection
+            .execute(
+                "UPDATE container_state SET state = 'not-json' WHERE container_id = 'ctr-malformed'",
+                [],
+            )
+            .expect("corrupt container state");
+        drop(connection);
+
+        let result = RuntimeDaemon::start(cfg.clone());
+        assert!(matches!(
+            result,
+            Err(RuntimedError::ValidatePersistedRecoveryState { source, .. })
+                if source.to_string().contains("serialization error")
+        ));
+        assert_recovery_side_effects_absent(
+            &cfg.state_store_path,
+            "exec-before-malformed-container",
+            Some("build-before-malformed-container"),
+        );
+    }
+
+    #[test]
+    fn daemon_rejects_inconsistent_recovery_lifecycle_before_mutation() {
+        for invalid_domain in ["execution", "build", "sandbox"] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let cfg = startup_validation_config(tmp.path());
+            std::fs::create_dir_all(cfg.state_store_path.parent().expect("state parent"))
+                .expect("create state directory");
+            let store = StateStore::open(&cfg.state_store_path).expect("state store");
+            store
+                .save_execution(&queued_execution("exec-valid-sentinel"))
+                .expect("save queued sentinel execution");
+            store
+                .save_build(&queued_build("build-valid-sentinel"))
+                .expect("save queued sentinel build");
+            match invalid_domain {
+                "execution" => {
+                    let mut execution = queued_execution("exec-inconsistent");
+                    execution.started_at = Some(1);
+                    store
+                        .save_execution(&execution)
+                        .expect("save inconsistent execution");
+                }
+                "build" => {
+                    let mut build = queued_build("build-inconsistent");
+                    build.state = BuildState::Succeeded;
+                    store.save_build(&build).expect("save inconsistent build");
+                }
+                "sandbox" => {
+                    let mut sandbox = ready_sandbox("sbx-inconsistent");
+                    sandbox.created_at = 2;
+                    sandbox.updated_at = 1;
+                    store
+                        .save_sandbox(&sandbox)
+                        .expect("save inconsistent sandbox");
+                }
+                _ => unreachable!(),
+            }
+            drop(store);
+
+            let result = RuntimeDaemon::start(cfg.clone());
+            assert!(matches!(
+                result,
+                Err(RuntimedError::ValidatePersistedRecoveryState {
+                    source: StackError::InvalidSpec(_),
+                    ..
+                })
+            ));
+            assert_recovery_side_effects_absent(
+                &cfg.state_store_path,
+                "exec-valid-sentinel",
+                Some("build-valid-sentinel"),
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_rejects_inconsistent_container_before_recovery_mutation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = startup_validation_config(tmp.path());
+        std::fs::create_dir_all(cfg.state_store_path.parent().expect("state parent"))
+            .expect("create state directory");
+        let store = StateStore::open(&cfg.state_store_path).expect("state store");
+        store
+            .save_execution(&queued_execution("exec-before-inconsistent-container"))
+            .expect("save queued execution");
+        store
+            .save_build(&queued_build("build-before-inconsistent-container"))
+            .expect("save queued build");
+        store
+            .save_sandbox(&ready_sandbox("sbx-startup-validation"))
+            .expect("save sandbox");
+        let mut container = created_container("ctr-inconsistent");
+        container.started_at = Some(0);
+        store
+            .save_container(&container)
+            .expect("save inconsistent container");
+        drop(store);
+
+        let result = RuntimeDaemon::start(cfg.clone());
+        assert!(matches!(
+            result,
+            Err(RuntimedError::ValidatePersistedRecoveryState {
+                source: StackError::InvalidSpec(message),
+                ..
+            }) if message.contains("start time cannot precede creation time")
+        ));
+        assert_recovery_side_effects_absent(
+            &cfg.state_store_path,
+            "exec-before-inconsistent-container",
+            Some("build-before-inconsistent-container"),
+        );
     }
 
     #[test]
@@ -1716,7 +2195,7 @@ mod tests {
             Err(RuntimedError::OpenStateStore {
                 source: StackError::InvalidSpec(message),
                 ..
-            }) if message.contains("topology shape mismatch")
+            }) if message.contains("state schema v2 shape mismatch")
                 && message.contains("index:idx_environment_project")
         ));
 

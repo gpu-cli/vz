@@ -553,6 +553,13 @@ pub enum LegacyMigrationError {
     NotDeveloper { sandbox_id: String },
     #[error("legacy Sandbox `{sandbox_id}` has both Developer and Hardened markers")]
     AmbiguousClassification { sandbox_id: String },
+    #[error(
+        "legacy Developer Sandbox `{sandbox_id}` backend `{backend:?}` has no authoritative v0.3.20 target architecture"
+    )]
+    UnresolvedTargetArchitecture {
+        sandbox_id: String,
+        backend: SandboxBackend,
+    },
     #[error(transparent)]
     InvalidTopology(#[from] TopologyValidationError),
     #[error("failed to serialize migrated definition: {details}")]
@@ -1146,6 +1153,20 @@ pub fn migrate_legacy_developer_sandbox(
         });
     }
 
+    // The official v0.3.20 macOS release was Apple-Silicon-only, so its
+    // Virtualization.framework backend is authoritative evidence for a Linux
+    // aarch64 target. Legacy Linux/custom records did not persist architecture;
+    // never invent one from the host that happens to open the relocated DB.
+    let backend = match &sandbox.backend {
+        SandboxBackend::MacosVz => MachineBackend::MacosVirtualizationLinux,
+        SandboxBackend::LinuxFirecracker | SandboxBackend::Other(_) => {
+            return Err(LegacyMigrationError::UnresolvedTargetArchitecture {
+                sandbox_id: sandbox.sandbox_id.clone(),
+                backend: sandbox.backend.clone(),
+            });
+        }
+    };
+
     let project_id = ProjectId::new(legacy_id("prj", &sandbox.sandbox_id))?;
     let environment_id = EnvironmentId::new(legacy_id("env", &sandbox.sandbox_id))?;
     let machine_id = MachineId::new(legacy_id("mac", &sandbox.sandbox_id))?;
@@ -1173,11 +1194,6 @@ pub fn migrate_legacy_developer_sandbox(
         MachineCapability::Compose,
         MachineCapability::Buildx,
     ]);
-    let backend = match &sandbox.backend {
-        SandboxBackend::MacosVz => MachineBackend::MacosVirtualizationLinux,
-        SandboxBackend::LinuxFirecracker => MachineBackend::LinuxNative,
-        SandboxBackend::Other(value) => MachineBackend::Other(value.clone()),
-    };
     let (environment_state, machine_state) = legacy_state(sandbox.state);
     let machine_spec = MachineSpec {
         schema_version: TOPOLOGY_SCHEMA_VERSION,
@@ -1808,6 +1824,33 @@ mod tests {
                 .unresolved_resources
                 .contains(&"target_image_digest".to_string())
         );
+    }
+
+    #[test]
+    fn legacy_developer_target_architecture_requires_authoritative_backend_provenance() {
+        let macos = migrate_legacy_developer_sandbox(&legacy_sandbox("/shop")).unwrap();
+        let machine = &macos.environments[0].machines[0];
+        assert_eq!(machine.target.os, OperatingSystem::Linux);
+        assert_eq!(machine.target.arch, Architecture::Aarch64);
+        assert_eq!(
+            machine.backend,
+            Some(MachineBackend::MacosVirtualizationLinux)
+        );
+
+        for backend in [
+            SandboxBackend::LinuxFirecracker,
+            SandboxBackend::Other("custom".to_string()),
+        ] {
+            let mut legacy = legacy_sandbox("/shop");
+            legacy.backend = backend.clone();
+            assert!(matches!(
+                migrate_legacy_developer_sandbox(&legacy),
+                Err(LegacyMigrationError::UnresolvedTargetArchitecture {
+                    sandbox_id,
+                    backend: unresolved,
+                }) if sandbox_id == legacy.sandbox_id && unresolved == backend
+            ));
+        }
     }
 
     #[test]

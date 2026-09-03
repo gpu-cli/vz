@@ -513,8 +513,9 @@ impl StateStore {
             conn,
             event_sender: None,
         };
-        store.apply_pragmas(pragmas)?;
+        store.apply_connection_pragmas(pragmas)?;
         store.init_schema()?;
+        store.apply_journal_mode(pragmas)?;
         Ok(store)
     }
 
@@ -530,8 +531,9 @@ impl StateStore {
             conn,
             event_sender: None,
         };
-        store.apply_pragmas(pragmas)?;
+        store.apply_connection_pragmas(pragmas)?;
         store.init_schema()?;
+        store.apply_journal_mode(pragmas)?;
         Ok(store)
     }
 
@@ -544,16 +546,26 @@ impl StateStore {
         self.event_sender = Some(sender);
     }
 
-    fn apply_pragmas(&self, pragmas: StateStorePragmas) -> Result<(), StackError> {
-        if pragmas.journal_mode_wal {
-            self.conn.pragma_update(None, "journal_mode", "WAL")?;
-        }
+    fn apply_connection_pragmas(&self, pragmas: StateStorePragmas) -> Result<(), StackError> {
         if let Some(timeout_ms) = pragmas.busy_timeout_ms {
             self.conn.busy_timeout(Duration::from_millis(timeout_ms))?;
         }
         if pragmas.foreign_keys {
             self.conn.pragma_update(None, "foreign_keys", "ON")?;
         }
+        Ok(())
+    }
+
+    fn apply_journal_mode(&self, pragmas: StateStorePragmas) -> Result<(), StackError> {
+        if pragmas.journal_mode_wal {
+            self.enable_wal_journal_mode()?;
+        }
+        Ok(())
+    }
+
+    /// Durably switch the database to WAL after caller-specific validation completes.
+    pub fn enable_wal_journal_mode(&self) -> Result<(), StackError> {
+        self.conn.pragma_update(None, "journal_mode", "WAL")?;
         Ok(())
     }
 
@@ -602,7 +614,7 @@ impl StateStore {
     fn init_schema(&self) -> Result<(), StackError> {
         let object_count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master
-             WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'",
+             WHERE name NOT LIKE 'sqlite_%'",
             [],
             |row| row.get(0),
         )?;
@@ -610,6 +622,7 @@ impl StateStore {
             return self.with_immediate_transaction(|store| {
                 store.create_legacy_schema()?;
                 store.create_topology_schema()?;
+                store.validate_v2_schema()?;
                 store.set_schema_version(topology::STORE_SCHEMA_VERSION)?;
                 Ok(())
             });
@@ -631,7 +644,7 @@ impl StateStore {
         let version = self.schema_version()?;
         match version {
             1 => self.migrate_legacy_v1_to_v2(),
-            topology::STORE_SCHEMA_VERSION => self.validate_topology_schema(),
+            topology::STORE_SCHEMA_VERSION => self.validate_v2_schema(),
             future if future > topology::STORE_SCHEMA_VERSION => {
                 Err(StackError::InvalidSpec(format!(
                     "state schema version {future} is newer than supported version {}",

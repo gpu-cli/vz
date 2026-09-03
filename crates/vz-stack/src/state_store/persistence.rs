@@ -1,5 +1,24 @@
 use super::*;
 
+fn persisted_u64(entity: &str, id: &str, field: &str, value: i64) -> Result<u64, StackError> {
+    u64::try_from(value).map_err(|_| {
+        StackError::InvalidSpec(format!(
+            "persisted {entity} `{id}` has negative `{field}` timestamp {value}"
+        ))
+    })
+}
+
+fn persisted_optional_u64(
+    entity: &str,
+    id: &str,
+    field: &str,
+    value: Option<i64>,
+) -> Result<Option<u64>, StackError> {
+    value
+        .map(|value| persisted_u64(entity, id, field, value))
+        .transpose()
+}
+
 impl StateStore {
     // ── Sandbox persistence ──
 
@@ -107,14 +126,16 @@ impl StateStore {
             let spec: SandboxSpec = serde_json::from_str(&spec_str)?;
             let labels: std::collections::BTreeMap<String, String> =
                 serde_json::from_str(&labels_str)?;
+            let created_at = persisted_u64("sandbox", &sandbox_id, "created_at", created_at)?;
+            let updated_at = persisted_u64("sandbox", &sandbox_id, "updated_at", updated_at)?;
 
             sandboxes.push(Sandbox {
                 sandbox_id,
                 backend,
                 spec,
                 state,
-                created_at: created_at as u64,
-                updated_at: updated_at as u64,
+                created_at,
+                updated_at,
                 labels,
             });
         }
@@ -145,14 +166,16 @@ impl StateStore {
         let backend: SandboxBackend = serde_json::from_str(&backend_str)?;
         let spec: SandboxSpec = serde_json::from_str(&spec_str)?;
         let labels: std::collections::BTreeMap<String, String> = serde_json::from_str(&labels_str)?;
+        let created_at = persisted_u64("sandbox", &sandbox_id, "created_at", created_at)?;
+        let updated_at = persisted_u64("sandbox", &sandbox_id, "updated_at", updated_at)?;
 
         Ok(Sandbox {
             sandbox_id,
             backend,
             spec,
             state,
-            created_at: created_at as u64,
-            updated_at: updated_at as u64,
+            created_at,
+            updated_at,
             labels,
         })
     }
@@ -835,6 +858,10 @@ impl StateStore {
                 row_result?;
             let exec_spec: ExecutionSpec = serde_json::from_str(&spec_str)?;
             let state: ExecutionState = serde_json::from_str(&state_str)?;
+            let started_at =
+                persisted_optional_u64("execution", &execution_id, "started_at", started_at)?;
+            let ended_at =
+                persisted_optional_u64("execution", &execution_id, "ended_at", ended_at)?;
 
             executions.push(Execution {
                 execution_id,
@@ -842,8 +869,8 @@ impl StateStore {
                 exec_spec,
                 state,
                 exit_code,
-                started_at: started_at.map(|v| v as u64),
-                ended_at: ended_at.map(|v| v as u64),
+                started_at,
+                ended_at,
             });
         }
         Ok(executions)
@@ -876,6 +903,10 @@ impl StateStore {
                 row_result?;
             let exec_spec: ExecutionSpec = serde_json::from_str(&spec_str)?;
             let state: ExecutionState = serde_json::from_str(&state_str)?;
+            let started_at =
+                persisted_optional_u64("execution", &execution_id, "started_at", started_at)?;
+            let ended_at =
+                persisted_optional_u64("execution", &execution_id, "ended_at", ended_at)?;
 
             executions.push(Execution {
                 execution_id,
@@ -883,8 +914,8 @@ impl StateStore {
                 exec_spec,
                 state,
                 exit_code,
-                started_at: started_at.map(|v| v as u64),
-                ended_at: ended_at.map(|v| v as u64),
+                started_at,
+                ended_at,
             });
         }
         Ok(executions)
@@ -911,6 +942,9 @@ impl StateStore {
 
         let exec_spec: ExecutionSpec = serde_json::from_str(&spec_str)?;
         let state: ExecutionState = serde_json::from_str(&state_str)?;
+        let started_at =
+            persisted_optional_u64("execution", &execution_id, "started_at", started_at)?;
+        let ended_at = persisted_optional_u64("execution", &execution_id, "ended_at", ended_at)?;
 
         Ok(Execution {
             execution_id,
@@ -918,8 +952,8 @@ impl StateStore {
             exec_spec,
             state,
             exit_code,
-            started_at: started_at.map(|v| v as u64),
-            ended_at: ended_at.map(|v| v as u64),
+            started_at,
+            ended_at,
         })
     }
 
@@ -1616,6 +1650,11 @@ impl StateStore {
             ) = row_result?;
             let container_spec: ContainerSpec = serde_json::from_str(&spec_str)?;
             let state: ContainerState = serde_json::from_str(&state_str)?;
+            let created_at = persisted_u64("container", &container_id, "created_at", created_at)?;
+            let started_at =
+                persisted_optional_u64("container", &container_id, "started_at", started_at)?;
+            let ended_at =
+                persisted_optional_u64("container", &container_id, "ended_at", ended_at)?;
 
             containers.push(Container {
                 container_id,
@@ -1623,9 +1662,9 @@ impl StateStore {
                 image_digest,
                 container_spec,
                 state,
-                created_at: created_at as u64,
-                started_at: started_at.map(|v| v as u64),
-                ended_at: ended_at.map(|v| v as u64),
+                created_at,
+                started_at,
+                ended_at,
             });
         }
         Ok(containers)
@@ -1653,6 +1692,10 @@ impl StateStore {
 
         let container_spec: ContainerSpec = serde_json::from_str(&spec_str)?;
         let state: ContainerState = serde_json::from_str(&state_str)?;
+        let created_at = persisted_u64("container", &container_id, "created_at", created_at)?;
+        let started_at =
+            persisted_optional_u64("container", &container_id, "started_at", started_at)?;
+        let ended_at = persisted_optional_u64("container", &container_id, "ended_at", ended_at)?;
 
         Ok(Container {
             container_id,
@@ -1660,9 +1703,9 @@ impl StateStore {
             image_digest,
             container_spec,
             state,
-            created_at: created_at as u64,
-            started_at: started_at.map(|v| v as u64),
-            ended_at: ended_at.map(|v| v as u64),
+            created_at,
+            started_at,
+            ended_at,
         })
     }
 
@@ -2165,6 +2208,8 @@ impl StateStore {
                 row_result?;
             let build_spec: BuildSpec = serde_json::from_str(&spec_str)?;
             let state: BuildState = serde_json::from_str(&state_str)?;
+            let started_at = persisted_u64("build", &build_id, "started_at", started_at)?;
+            let ended_at = persisted_optional_u64("build", &build_id, "ended_at", ended_at)?;
 
             builds.push(Build {
                 build_id,
@@ -2172,8 +2217,8 @@ impl StateStore {
                 build_spec,
                 state,
                 result_digest,
-                started_at: started_at as u64,
-                ended_at: ended_at.map(|v| v as u64),
+                started_at,
+                ended_at,
             });
         }
         Ok(builds)
@@ -2203,6 +2248,8 @@ impl StateStore {
                 row_result?;
             let build_spec: BuildSpec = serde_json::from_str(&spec_str)?;
             let state: BuildState = serde_json::from_str(&state_str)?;
+            let started_at = persisted_u64("build", &build_id, "started_at", started_at)?;
+            let ended_at = persisted_optional_u64("build", &build_id, "ended_at", ended_at)?;
 
             builds.push(Build {
                 build_id,
@@ -2210,8 +2257,8 @@ impl StateStore {
                 build_spec,
                 state,
                 result_digest,
-                started_at: started_at as u64,
-                ended_at: ended_at.map(|v| v as u64),
+                started_at,
+                ended_at,
             });
         }
         Ok(builds)
@@ -2238,6 +2285,8 @@ impl StateStore {
 
         let build_spec: BuildSpec = serde_json::from_str(&spec_str)?;
         let state: BuildState = serde_json::from_str(&state_str)?;
+        let started_at = persisted_u64("build", &build_id, "started_at", started_at)?;
+        let ended_at = persisted_optional_u64("build", &build_id, "ended_at", ended_at)?;
 
         Ok(Build {
             build_id,
@@ -2245,8 +2294,8 @@ impl StateStore {
             build_spec,
             state,
             result_digest,
-            started_at: started_at as u64,
-            ended_at: ended_at.map(|v| v as u64),
+            started_at,
+            ended_at,
         })
     }
 

@@ -57,6 +57,8 @@ pub enum ContractInvariantError {
         from: SandboxState,
         to: SandboxState,
     },
+    /// Sandbox timestamps are inconsistent with the persisted lifecycle record.
+    SandboxLifecycleInconsistency { sandbox_id: String, details: String },
     /// Lease state transition was invalid.
     LeaseStateTransition {
         lease_id: String,
@@ -151,6 +153,14 @@ impl fmt::Display for ContractInvariantError {
                 f,
                 "Invalid sandbox state transition for {} from {:?} to {:?}",
                 sandbox_id, from, to
+            ),
+            ContractInvariantError::SandboxLifecycleInconsistency {
+                sandbox_id,
+                details,
+            } => write!(
+                f,
+                "Sandbox lifecycle invariant violated for {}: {}",
+                sandbox_id, details
             ),
             ContractInvariantError::LeaseStateTransition { lease_id, from, to } => write!(
                 f,

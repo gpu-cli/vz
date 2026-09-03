@@ -4590,6 +4590,174 @@ fn topology_save_is_all_or_nothing_on_cross_environment_id_collision() {
 }
 
 #[test]
+fn persisted_topology_rejects_normalized_column_json_drift_without_mutation() {
+    for (case, mutation, table, field) in [
+        (
+            "project",
+            "UPDATE project_definitions SET name = 'drifted-project'",
+            "project_definitions",
+            "name",
+        ),
+        (
+            "project-created-at",
+            "UPDATE project_definitions SET created_at = 99",
+            "project_definitions",
+            "created_at",
+        ),
+        (
+            "project-updated-at",
+            "UPDATE project_definitions SET updated_at = 201",
+            "project_definitions",
+            "updated_at",
+        ),
+        (
+            "environment",
+            r#"UPDATE environment_instances SET state = '"stopped"'"#,
+            "environment_instances",
+            "state",
+        ),
+        (
+            "binding",
+            "UPDATE workspace_bindings SET path_hint = '/drifted/checkout'",
+            "workspace_bindings",
+            "path_hint",
+        ),
+        (
+            "machine",
+            r#"UPDATE machine_instances SET state = '"stopped"'"#,
+            "machine_instances",
+            "state",
+        ),
+        (
+            "network",
+            "UPDATE environment_networks SET name = 'drifted-network'",
+            "environment_networks",
+            "name",
+        ),
+        (
+            "endpoint",
+            "UPDATE environment_endpoints SET name = 'drifted-endpoint'",
+            "environment_endpoints",
+            "name",
+        ),
+        (
+            "ownership",
+            r#"UPDATE topology_ownership SET resource_kind = '"disk"'"#,
+            "topology_ownership",
+            "resource_kind",
+        ),
+    ] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join(format!("projection-{case}.db"));
+        let store = StateStore::open(&db_path).unwrap();
+        let state = topology_project_state("prj_projection_drift", &["agent"], "/checkout");
+        store.save_project_state(&state).unwrap();
+        store.conn.execute(mutation, []).unwrap();
+
+        let bytes_before = std::fs::read(&db_path).unwrap();
+        let error = store
+            .load_project_state("prj_projection_drift")
+            .expect_err("normalized SQL drift must fail closed")
+            .to_string();
+        let bytes_after = std::fs::read(&db_path).unwrap();
+
+        assert!(
+            error.contains("persisted topology projection mismatch"),
+            "unexpected error for {case}: {error}"
+        );
+        assert!(
+            error.contains(&format!("table={table}")),
+            "missing table for {case}: {error}"
+        );
+        assert!(
+            error.contains(&format!("field={field}")),
+            "missing field for {case}: {error}"
+        );
+        assert_eq!(
+            bytes_after, bytes_before,
+            "failed projection read mutated the database for {case}"
+        );
+    }
+}
+
+#[test]
+fn persisted_topology_parent_child_comparison_is_stable_identity_ordered() {
+    let store = StateStore::in_memory().unwrap();
+    let mut state = topology_project_state("prj_child_order", &["agent"], "/checkout");
+    let environment = &mut state.environments[0];
+    environment.bindings.push(WorkspaceBinding {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        binding_id: WorkspaceBindingId::new("wsp_000").unwrap(),
+        project_id: state.definition.project_id.clone(),
+        environment_id: environment.environment_id.clone(),
+        name: "secondary".to_string(),
+        workspace_key: "secondary-worktree-key".to_string(),
+        path_hint: Some("/secondary".to_string()),
+    });
+    state.validate().unwrap();
+    store.save_project_state(&state).unwrap();
+
+    let loaded = store
+        .load_project_state("prj_child_order")
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.environments[0].bindings.len(), 2);
+    assert_eq!(
+        loaded.environments[0].bindings[0].binding_id.as_str(),
+        "wsp_000"
+    );
+    assert_eq!(
+        loaded.environments[0].bindings[1].binding_id.as_str(),
+        "wsp_agent"
+    );
+}
+
+#[test]
+fn persisted_topology_rejects_self_consistent_child_that_diverges_from_parent_snapshot() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("parent-child-drift.db");
+    let store = StateStore::open(&db_path).unwrap();
+    let state = topology_project_state("prj_parent_child_drift", &["agent"], "/checkout");
+    store.save_project_state(&state).unwrap();
+
+    let machine_json: String = store
+        .conn
+        .query_row(
+            "SELECT instance_json FROM machine_instances WHERE machine_id = 'mac_agent'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut machine: MachineInstance = serde_json::from_str(&machine_json).unwrap();
+    machine.state = MachineState::Stopped;
+    store
+        .conn
+        .execute(
+            "UPDATE machine_instances SET state = ?1, instance_json = ?2
+             WHERE machine_id = 'mac_agent'",
+            params![
+                serde_json::to_string(&machine.state).unwrap(),
+                serde_json::to_string(&machine).unwrap()
+            ],
+        )
+        .unwrap();
+
+    let bytes_before = std::fs::read(&db_path).unwrap();
+    let error = store
+        .load_project_state("prj_parent_child_drift")
+        .expect_err("parent and normalized child snapshots must agree")
+        .to_string();
+    let bytes_after = std::fs::read(&db_path).unwrap();
+    assert!(error.contains("table=environment_instances"));
+    assert!(error.contains("key=env_agent"));
+    assert!(error.contains("field=machines"));
+    assert_eq!(
+        bytes_after, bytes_before,
+        "failed read must not mutate state"
+    );
+}
+
+#[test]
 fn v0_3_20_developer_migration_is_atomic_idempotent_and_preserves_legacy_rows() {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("legacy.db");
@@ -4874,6 +5042,54 @@ fn v0_3_20_ambiguous_and_malformed_state_fail_before_schema_mutation() {
 }
 
 #[test]
+fn daemon_pragmas_do_not_change_journal_mode_before_legacy_validation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("ambiguous-daemon-open.db");
+    seed_v0_3_20_fixture(&db_path, Some(V0_3_20_AMBIGUOUS_FIXTURE));
+    let journal_mode = |path: &Path| {
+        Connection::open(path)
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .unwrap()
+    };
+    assert_eq!(journal_mode(&db_path), "delete");
+
+    let error = StateStore::open_with_pragmas(&db_path, StateStorePragmas::daemon_defaults())
+        .err()
+        .expect("ambiguous legacy data must fail daemon-style open")
+        .to_string();
+    assert!(error.contains("both Developer and Hardened markers"));
+
+    assert_eq!(
+        journal_mode(&db_path),
+        "delete",
+        "failed validation must not durably switch the legacy DB to WAL"
+    );
+    let connection = Connection::open(&db_path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT value FROM control_metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'project_definitions'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn future_and_incomplete_v2_schemas_are_rejected_without_repair() {
     let future_dir = tempfile::tempdir().unwrap();
     let future_path = future_dir.path().join("future.db");
@@ -4915,7 +5131,7 @@ fn future_and_incomplete_v2_schemas_are_rejected_without_repair() {
         .err()
         .expect("incomplete v2 schema must fail")
         .to_string();
-    assert!(error.contains("topology shape mismatch"));
+    assert!(error.contains("state schema v2 shape mismatch"));
     assert!(error.contains("table:environment_endpoints"));
     let conn = Connection::open(&incomplete_path).unwrap();
     assert_eq!(
@@ -4944,7 +5160,7 @@ fn malformed_v2_columns_constraints_and_foreign_key_data_are_rejected() {
             .unwrap();
     }
     let error = StateStore::open(&column_path).err().unwrap().to_string();
-    assert!(error.contains("topology shape mismatch"));
+    assert!(error.contains("state schema v2 shape mismatch"));
     assert!(error.contains("table:project_definitions"));
 
     let constraint_dir = tempfile::tempdir().unwrap();
@@ -4968,7 +5184,7 @@ fn malformed_v2_columns_constraints_and_foreign_key_data_are_rejected() {
         .err()
         .unwrap()
         .to_string();
-    assert!(error.contains("topology shape mismatch"));
+    assert!(error.contains("state schema v2 shape mismatch"));
     assert!(error.contains("table:project_definitions"));
 
     let foreign_key_dir = tempfile::tempdir().unwrap();
@@ -5000,6 +5216,374 @@ fn malformed_v2_columns_constraints_and_foreign_key_data_are_rejected() {
     assert!(error.contains("foreign-key violation"));
     assert!(error.contains("table=environment_instances"));
     assert!(error.contains("parent=project_definitions"));
+}
+
+#[test]
+fn v2_open_rejects_noncanonical_legacy_schema_objects_without_repair() {
+    for (name, mutation, expected, verification_sql) in [
+        (
+            "missing-table",
+            "DROP TABLE execution_state",
+            "table:execution_state",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'execution_state'",
+        ),
+        (
+            "malformed-table",
+            "ALTER TABLE checkpoint_state ADD COLUMN unexpected TEXT",
+            "table:checkpoint_state",
+            "SELECT COUNT(*) FROM pragma_table_info('checkpoint_state') WHERE name = 'unexpected'",
+        ),
+        (
+            "missing-index",
+            "DROP INDEX idx_build_sandbox",
+            "index:idx_build_sandbox",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_build_sandbox'",
+        ),
+        (
+            "unexpected-trigger",
+            "CREATE TRIGGER injected_metadata_trigger
+             AFTER UPDATE ON control_metadata
+             BEGIN
+                 DELETE FROM build_state;
+             END",
+            "trigger:injected_metadata_trigger",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'injected_metadata_trigger'",
+        ),
+    ] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join(format!("{name}.db"));
+        {
+            let store = StateStore::open(&db_path).unwrap();
+            store.conn.execute_batch(mutation).unwrap();
+        }
+
+        let error = StateStore::open(&db_path)
+            .err()
+            .expect("noncanonical v2 schema must fail")
+            .to_string();
+        assert!(
+            error.contains("state schema v2 shape mismatch"),
+            "unexpected error for {name}: {error}"
+        );
+        assert!(
+            error.contains(expected),
+            "missing object diagnostic for {name}: {error}"
+        );
+
+        let connection = Connection::open(&db_path).unwrap();
+        let observed: i64 = connection
+            .query_row(verification_sql, [], |row| row.get(0))
+            .unwrap();
+        let expected_count = i64::from(name == "malformed-table" || name == "unexpected-trigger");
+        assert_eq!(
+            observed, expected_count,
+            "failed v2 open repaired the {name} mutation"
+        );
+    }
+}
+
+#[test]
+fn v0_3_20_migration_rejects_noncanonical_schema_before_mutation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("noncanonical-v0.3.20.db");
+    seed_v0_3_20_fixture(&db_path, None);
+    Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "ALTER TABLE checkpoint_state ADD COLUMN unexpected TEXT",
+            [],
+        )
+        .unwrap();
+
+    let error = StateStore::open(&db_path)
+        .err()
+        .expect("noncanonical v0.3.20 schema must not migrate")
+        .to_string();
+    assert!(error.contains("state schema v1 shape mismatch"));
+    assert!(error.contains("table:checkpoint_state"));
+
+    let connection = Connection::open(&db_path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT value FROM control_metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE name IN (
+                     'project_definitions', 'environment_instances', 'workspace_bindings',
+                     'machine_instances', 'environment_networks', 'environment_endpoints',
+                     'topology_ownership'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+        "schema fingerprint failure must occur before topology mutation"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('checkpoint_state')
+                 WHERE name = 'unexpected'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "failed migration must not repair the legacy schema"
+    );
+}
+
+#[test]
+fn v0_3_20_migration_rejects_missing_legacy_index_before_mutation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("missing-index-v0.3.20.db");
+    seed_v0_3_20_fixture(&db_path, None);
+    Connection::open(&db_path)
+        .unwrap()
+        .execute("DROP INDEX idx_execution_container", [])
+        .unwrap();
+
+    let error = StateStore::open(&db_path)
+        .err()
+        .expect("v0.3.20 with a missing index must not migrate")
+        .to_string();
+    assert!(error.contains("state schema v1 shape mismatch"));
+    assert!(error.contains("index:idx_execution_container"));
+
+    let connection = Connection::open(&db_path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT value FROM control_metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'project_definitions'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn legacy_migration_rechecks_schema_version_inside_transaction() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("changed-version-v0.3.20.db");
+    seed_v0_3_20_fixture(&db_path, None);
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute(
+            "UPDATE control_metadata SET value = '3' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+    let store = StateStore {
+        conn: connection,
+        event_sender: None,
+    };
+
+    let error = store
+        .migrate_legacy_v1_to_v2()
+        .expect_err("migration must recheck its source version under the write reservation")
+        .to_string();
+    assert!(error.contains("requires state schema version 1, found 3"));
+    drop(store);
+
+    let connection = Connection::open(&db_path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT value FROM control_metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "3"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'project_definitions'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn v0_3_20_migration_validates_all_recovery_rows_before_mutation() {
+    for (name, mutation, expected) in [
+        (
+            "malformed-execution",
+            "INSERT INTO execution_state
+                (execution_id, container_id, spec_json, state, exit_code, started_at, ended_at,
+                 created_at, updated_at)
+             VALUES ('exec-corrupt', 'ctr-legacy-workspace', '{not-json', '\"queued\"',
+                     NULL, NULL, NULL, 1, 1)",
+            "serialization error",
+        ),
+        (
+            "malformed-build",
+            "INSERT INTO build_state
+                (build_id, sandbox_id, spec_json, state, result_digest, started_at, ended_at,
+                 created_at, updated_at)
+             VALUES ('build-corrupt', 'vz-run-shop-a1b2c3d4e5f6', '{not-json', '\"queued\"',
+                     NULL, 1, NULL, 1, 1)",
+            "serialization error",
+        ),
+        (
+            "inconsistent-execution",
+            "INSERT INTO execution_state
+                (execution_id, container_id, spec_json, state, exit_code, started_at, ended_at,
+                 created_at, updated_at)
+             VALUES ('exec-inconsistent', 'ctr-legacy-workspace',
+                     '{\"cmd\":[],\"args\":[],\"env_override\":{},\"pty\":false,\"timeout_secs\":null}',
+                     '\"queued\"', NULL, 1, NULL, 1, 1)",
+            "queued executions cannot include start/end/exit metadata",
+        ),
+        (
+            "inconsistent-container",
+            "UPDATE container_state SET state = '\"created\"'
+             WHERE container_id = 'ctr-legacy-workspace'",
+            "created containers cannot include start/end metadata",
+        ),
+        (
+            "negative-execution-timestamp",
+            "INSERT INTO execution_state
+                (execution_id, container_id, spec_json, state, exit_code, started_at, ended_at,
+                 created_at, updated_at)
+             VALUES ('exec-negative', 'ctr-legacy-workspace',
+                     '{\"cmd\":[],\"args\":[],\"env_override\":{},\"pty\":false,\"timeout_secs\":null}',
+                     '\"running\"', NULL, -1, NULL, 1, 1)",
+            "persisted execution `exec-negative` has negative `started_at` timestamp -1",
+        ),
+        (
+            "negative-container-timestamp",
+            "UPDATE container_state SET started_at = -1
+             WHERE container_id = 'ctr-legacy-workspace'",
+            "persisted container `ctr-legacy-workspace` has negative `started_at` timestamp -1",
+        ),
+        (
+            "negative-build-timestamp",
+            "INSERT INTO build_state
+                (build_id, sandbox_id, spec_json, state, result_digest, started_at, ended_at,
+                 created_at, updated_at)
+             VALUES ('build-negative', 'vz-run-shop-a1b2c3d4e5f6',
+                     '{\"context\":\".\",\"dockerfile\":\"Dockerfile\",\"target\":null,\"args\":{},\"cache_from\":[],\"image_tag\":null,\"secrets\":[],\"no_cache\":false,\"push\":false,\"output_oci_tar_dest\":null}',
+                     '\"running\"', NULL, -1, NULL, 1, 1)",
+            "persisted build `build-negative` has negative `started_at` timestamp -1",
+        ),
+        (
+            "inconsistent-sandbox-timestamp",
+            "UPDATE sandbox_state SET updated_at = created_at - 1
+             WHERE sandbox_id = 'vz-run-shop-a1b2c3d4e5f6'",
+            "update time cannot precede creation time",
+        ),
+    ] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join(format!("{name}.db"));
+        seed_v0_3_20_fixture(&db_path, None);
+        Connection::open(&db_path)
+            .unwrap()
+            .execute_batch(mutation)
+            .unwrap();
+
+        let error = StateStore::open(&db_path)
+            .err()
+            .expect("invalid recovery state must block migration")
+            .to_string();
+        assert!(error.contains(expected), "unexpected error for {name}: {error}");
+
+        let connection = Connection::open(&db_path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM control_metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'project_definitions'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "invalid recovery state must fail before topology creation"
+        );
+    }
+}
+
+#[test]
+fn v0_3_20_migration_rejects_developer_backend_without_architecture_provenance() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("unresolved-target.db");
+    seed_v0_3_20_fixture(&db_path, None);
+    Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "UPDATE sandbox_state SET backend = '\"linux_firecracker\"'
+             WHERE sandbox_id = 'vz-run-shop-a1b2c3d4e5f6'",
+            [],
+        )
+        .unwrap();
+
+    let error = StateStore::open(&db_path)
+        .err()
+        .expect("unresolved legacy architecture must block migration")
+        .to_string();
+    assert!(error.contains("no authoritative v0.3.20 target architecture"));
+
+    let connection = Connection::open(&db_path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT value FROM control_metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'project_definitions'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
 }
 
 #[test]

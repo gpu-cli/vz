@@ -111,6 +111,56 @@ pub struct Container {
 }
 
 impl Container {
+    fn lifecycle_error(&self, details: impl Into<String>) -> ContractInvariantError {
+        ContractInvariantError::LifecycleInconsistency {
+            container_id: self.container_id.clone(),
+            details: details.into(),
+        }
+    }
+
+    /// Validate lifecycle timestamps against the persisted container state.
+    pub fn ensure_lifecycle_consistency(&self) -> Result<(), ContractInvariantError> {
+        if self
+            .started_at
+            .is_some_and(|started_at| started_at < self.created_at)
+        {
+            return Err(self.lifecycle_error("start time cannot precede creation time"));
+        }
+        if self
+            .ended_at
+            .is_some_and(|ended_at| ended_at < self.created_at)
+        {
+            return Err(self.lifecycle_error("end time cannot precede creation time"));
+        }
+        if let (Some(started_at), Some(ended_at)) = (self.started_at, self.ended_at)
+            && ended_at < started_at
+        {
+            return Err(self.lifecycle_error("end time cannot precede start time"));
+        }
+
+        let invalid_details = match self.state {
+            ContainerState::Created if self.started_at.is_some() || self.ended_at.is_some() => {
+                Some("created containers cannot include start/end metadata")
+            }
+            ContainerState::Starting | ContainerState::Running | ContainerState::Stopping
+                if self.started_at.is_none() || self.ended_at.is_some() =>
+            {
+                Some("active containers require a start time and no end time")
+            }
+            ContainerState::Exited if self.started_at.is_none() || self.ended_at.is_none() => {
+                Some("exited containers require start and end times")
+            }
+            ContainerState::Failed | ContainerState::Removed if self.ended_at.is_none() => {
+                Some("terminal containers require an end time")
+            }
+            _ => None,
+        };
+        if let Some(details) = invalid_details {
+            return Err(self.lifecycle_error(details));
+        }
+        Ok(())
+    }
+
     /// Validate that an exec operation can run in this container.
     pub fn ensure_can_exec(&self) -> Result<(), ContractInvariantError> {
         if self.state != ContainerState::Running {
