@@ -1,5 +1,9 @@
 # 05 — CLI Build Command
 
+> **SUPERSEDED FOR 0.4:** there is no public `vz build` command. Builds use the
+> native Docker/buildx clients against a Machine context; this file is retained
+> as implementation history.
+
 ## Depends On
 
 - 04 (host build client — BuildClient with full protocol support)

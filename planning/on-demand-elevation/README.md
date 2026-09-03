@@ -1,5 +1,9 @@
 # On-Demand Privilege Elevation for Provisioning
 
+> **0.4 interpretation:** privileged backend provisioning belongs to an
+> authorized Admin API/installer. It does not preserve public `vz init` or
+> direct-VM lifecycle paths.
+
 ## Context
 
 `vz` can already create macOS images from Apple-sourced restore media, and it can provision users/agents/SPICE into those images. The current friction is privilege handling:

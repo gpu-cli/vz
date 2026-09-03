@@ -51,13 +51,13 @@ Linux namespaces/cgroups or VM backends, and the future Windows virtualization
 backend can implement one environment lifecycle without pretending their kernels
 or capabilities are identical.
 
-## Docker is part of every Linux Machine
+## Docker is part of every Developer-profile Linux Machine
 
 Full Docker compatibility is not an optional facade. It is an implicit
 capability of every Linux Developer Machine. Creating or starting one makes its
 Docker service available as part of Machine readiness.
 
-Every Linux Machine owns its own Docker Engine, containerd, image and volume
+Every Developer-profile Linux Machine owns its own Docker Engine, containerd, image and volume
 stores, networks, BuildKit cache, persistent data, proxy endpoint, and Docker
 context. The host's unmodified `docker`, Compose, and buildx clients select that
 specific Environment/Machine. There is no Environment-global or global
@@ -92,7 +92,7 @@ daemon into the coordination boundary.
 
 ## Architecture boundary
 
-On macOS, each Linux Machine—including its Docker daemon—uses its selected Linux
+On macOS, each Developer-profile Linux Machine—including its Docker daemon—uses its selected Linux
 backend, while each native macOS Machine uses a macOS VM. They may participate
 in one Environment through its declared network fabric.
 On Linux, the native backend uses Linux isolation primitives and may offer VM
@@ -116,7 +116,7 @@ a Linux VM or that nothing executes natively on any host.
 ### DEV
 
 - A Project/Environment/Machine topology identity and lifecycle.
-- Implicit, per-Linux-Machine Docker, driven end to end by the local Mac's
+- Implicit, per-Developer-Linux-Machine Docker, driven end to end by the local Mac's
   Docker/Compose/buildx clients.
 - Private/public-like topology networking, per-Machine endpoints, persistence,
   isolation, recovery, and comprehensive real-VM evidence.
@@ -138,7 +138,7 @@ a Linux VM or that nothing executes natively on any host.
 - Say sandbox, container, VM, process, youki, Docker, or BuildKit when explaining
   a security boundary, backend, protocol, or current compatibility command.
 - Say Linux is the universal Machine target, not that vz is Linux-only.
-- Say Docker is implicit for Linux Machines, not a global socket or optional
+- Say Docker is implicit for Developer-profile Linux Machines, not a global socket or optional
   facade.
 - State the host and target when describing a capability.
 - Tag capabilities **ACTIVE**, **DEV**, or **PLANNED** and require real

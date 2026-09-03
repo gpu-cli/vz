@@ -1,8 +1,12 @@
 # OCI Runtime — Planning Overview
 
+> **0.4 interpretation:** OCI is a Linux Machine implementation primitive.
+> Docker state and endpoints are per Developer-profile Linux Machine—not global
+> and not merely per Environment—and public OCI lifecycle commands are legacy.
+
 > Historical component plan. The current product contract is
 > `docs/developer-environments.md`: Linux is the universal target, Docker is
-> implicit and private per Linux Developer Environment, and native macOS and
+> implicit and private per Developer-profile Linux Machine, and native macOS and
 > Windows targets use target-native semantics. Where this document differs, the
 > current contract wins.
 

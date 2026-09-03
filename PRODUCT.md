@@ -54,7 +54,7 @@ principle of the Developer Environment product.
 
 ## Docker contract
 
-Docker is implicit for Linux Developer Machines. Every Linux Machine has its own
+Docker is implicit for Linux Developer Machines. Every Developer-profile Linux Machine has its own
 Docker Engine, state, BuildKit cache, networks, endpoint, and Docker context.
 There is no Environment-global or global vz Docker socket. The unmodified host
 Docker CLI addresses one exact Environment/Machine and never falls back to
@@ -83,7 +83,7 @@ backend into a full-product parity claim.
 
 Humans and agents select an Environment explicitly or through an unambiguous
 project/worktree association, then select a default or named Machine. A worktree
-may have multiple Environments. Every Linux Machine starts with Docker readiness
+may have multiple Environments. Every Developer-profile Linux Machine starts with Docker readiness
 and a Machine-specific context. Environment instances may repeat Machine names,
 ports, DNS aliases, and CIDRs without sharing identity or mutable state.
 
@@ -103,13 +103,15 @@ presented as already shipped.
    Linux-on-Windows.
 5. Parallel by construction: identity and all mutable resources are scoped per
    environment.
-6. Docker belongs to each Linux Machine, not to an Environment-global daemon or
+6. Docker belongs to each Developer-profile Linux Machine, not to an Environment-global daemon or
    optional compatibility tier.
 7. Network realism without exposure: declared private paths and a local
    simulated-public DNS/TLS/ingress/NAT edge; cross-Environment access is
    explicit and least-privilege.
-8. Explicit host effects: mounts, ports, credentials, and policy are declared and
-   inspectable.
+8. Explicit host effects: mounts, ports, credentials, and policy are declared
+   and inspectable. Host imports are authenticated, exact loopback-service
+   grants and remain independent from Internet egress; no shared gateway alias
+   is an authority boundary.
 9. Measured and status-tagged claims: commands and end-to-end evidence precede
    parity claims.
 

@@ -1,5 +1,10 @@
 # BuildKit Integration — `docker build` for vz
 
+> **0.4 interpretation:** BuildKit is a private capability of each
+> Developer-profile Linux Machine. Global/dedicated service language and public
+> `vz build` examples below are legacy; see
+> [`../developer-environments/03-implicit-docker.md`](../developer-environments/03-implicit-docker.md).
+
 ## Vision
 
 Enable `vz build .` to build OCI images from Dockerfiles, powered by BuildKit running inside a lightweight Linux guest VM. Users get full `docker build` compatibility (multi-stage, cache mounts, secrets, etc.) without Docker Desktop.

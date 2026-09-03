@@ -1,5 +1,9 @@
 # Linux VM Init: Daemon/Proto Roadmap
 
+> **0.4 interpretation:** backend/Admin API roadmap only. It does not preserve a
+> public `vz vm` family or define the Developer Environment lifecycle; see
+> [`developer-environments.md`](developer-environments.md).
+
 This document defines how `vz vm linux init` evolves from host-local descriptor provisioning to daemon-owned lifecycle management.
 
 ## Current State

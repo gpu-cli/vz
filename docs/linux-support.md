@@ -111,7 +111,7 @@ supported fallback.
 | Resource limits (memory) | VM-level memory | cgroup v2 `memory.max` (planned) |
 
 The end-state is one Environment topology model despite different host backends.
-Every Linux Machine owns its target state and, once Docker compatibility lands,
+Every Developer-profile Linux Machine owns its target state and, once Docker compatibility lands,
 its own Docker Engine, containerd, BuildKit cache, image store, volumes,
 networks, endpoint, and context. No host uses an Environment-global or global
 `vz` daemon, and a Machine never falls back to a sibling, another Environment,

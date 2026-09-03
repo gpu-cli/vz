@@ -1,5 +1,9 @@
 # e2b vs `vz`: capability gap analysis
 
+> **Historical comparison:** product conclusions and CLI examples here predate
+> the 0.4 multi-Environment/multi-Machine mission. Use
+> [`developer-environments.md`](developer-environments.md) for current scope.
+
 Date: **2026-02-26**  
 Scope: public `e2b` platform features vs local `vz` capabilities.
 
@@ -144,4 +148,3 @@ If you want an e2b-like service, start with:
 - file/session access APIs
 
 Then backfill runtime internals without changing existing container/VM execution quality.
-

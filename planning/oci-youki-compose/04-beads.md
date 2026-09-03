@@ -1,5 +1,9 @@
 # 04 - Bead Breakdown
 
+> **Historical delivery breakdown:** the completed mechanisms are inputs to
+> per-Machine Docker, but public `vz stack` scope and unconditional host aliases
+> are superseded by the 0.4 Developer Environment contract.
+
 ## Execution Strategy
 
 Order beads by dependency so each delivers a testable increment.

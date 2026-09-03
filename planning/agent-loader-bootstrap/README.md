@@ -1,5 +1,9 @@
 # Agent Loader Bootstrap Plan
 
+> **0.4 interpretation:** loader/provisioning mechanism only. Direct `vz vm`
+> examples are legacy; normal agents select an Environment and Machine through
+> the five-verb CLI or typed API.
+
 ## Why this plan exists
 
 Current VM bootstrap bundles include the full `vz-guest-agent` binary. That forces frequent patch/delta regeneration whenever the agent changes.

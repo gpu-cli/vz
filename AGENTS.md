@@ -24,12 +24,15 @@ bd dolt push          # Push issue DB to the beads remote
   contain Linux and native macOS Machines. Linux is the universal Machine target:
   Linux-on-macOS now, Linux-on-Linux next, and Linux-on-Windows later; native
   Windows-on-Windows follows Linux-on-Windows.
-- Docker is implicit, private, and scoped to each Linux Machine. There is no
+- Docker is implicit, private, and scoped to each Developer-profile Linux Machine. There is no
   Environment-wide/global vz Docker socket or fallback daemon. Native macOS and
   native Windows Machines do not implicitly provide Docker.
 - Machines communicate through declared private or Environment-local
   public-like paths. Separate Environments are default-deny; cross-Environment
   access requires an explicit directional service grant.
+- Host imports are exact authenticated Environment/Machine grants to a declared
+  host-loopback service and are independent from external egress. A hardcoded
+  NAT gateway alias or wildcard/LAN listener is never authorization.
 - The 0.4 public lifecycle CLI is `vz up`, `vz exec`, `vz status`, `vz stop`,
   and `vz delete`; richer topology operations belong to typed APIs.
 - Linux-target OCI execution is youki-only. The public locked-down profile is **Hardened** and remains a secondary, restricted mode.
@@ -84,7 +87,11 @@ This beads DB is remote-backed (Dolt). When bd refuses writes with a schema-migr
 - Completion requires real end-to-end verification on the relevant
   host×Machine-target backend and, for topology work, the aggregate Environment
   gate in `planning/developer-environments/GOAL-0.4.0.md`.
-- On macOS hosts, Linux-target verification should run inside a local `vz`-managed Linux VM first (via the `vz vm ...` flows), not an arbitrary external SSH host.
+- On macOS hosts, Linux-target verification must run inside a local `vz`-managed
+  Linux Machine, not an arbitrary external SSH host. Until the five-verb surface
+  lands, focused backend harnesses may invoke the current `vz vm ...` mechanism;
+  0.4 release evidence must use the installed public CLI/API and prove `vz vm`
+  is no longer executable.
 - Do not use ad-hoc external SSH Linux hosts for release-gate evidence collection.
 - If the applicable host×Machine-target end-to-end gate has not run and passed,
   keep the bead/task open.

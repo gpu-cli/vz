@@ -26,7 +26,8 @@ ProjectDefinition
 └── EnvironmentInstance[]
     ├── MachineInstance[]
     ├── Network[] and declared service paths
-    ├── Endpoint[] and environment-local public-like ingress
+    ├── Endpoint[], HostImport[], HostExport[], and EgressPolicy[]
+    │   └── environment-local public-like ingress
     └── Volume[], SecretBinding[], Fault[], Execution[], and Receipt[]
 ```
 
@@ -78,6 +79,20 @@ selector, then an unambiguous project/worktree binding and declared default
 Machine. Ambiguity fails closed and lists candidates. vz has no mutable global
 current Environment.
 
+For 0.4, the nearest checked-in `vz.json` is the versioned ProjectDefinition.
+`vz up --environment <name>` creates or reconciles that project-unique named
+instance and, on success, always creates or refreshes the current worktree
+binding after ownership validation. Without a selector, the
+sole instance already bound to this worktree is selected and multiple bound
+instances are ambiguous. `default` is created only when the Project has no
+Environment; a new unbound worktree never silently adopts or creates beside an
+existing instance. Missing, invalid, or ambiguous definitions fail before
+mutation. Project identity is stored in the definition and never derived from
+the checkout path; authoring uses
+`schemas/vz-project-definition-v1.schema.json`,
+`examples/developer-environment/vz.json`, or the typed authoring API rather than
+a second `vz init` lifecycle.
+
 An Environment exclusively owns its Machines, disks, shares, credentials,
 networks, DNS view, ingress, NAT state, ports, faults, events, and endpoints.
 Every resource key includes `environment_id`; Machine-owned resources also
@@ -97,6 +112,12 @@ architecture, image/version, and requested capabilities. It also has resources,
 filesystem state, network attachments, lifecycle, negotiated capabilities, and
 a replaceable incarnation. Rebuild may change the incarnation without changing
 the logical Machine identity or declared endpoints.
+
+Every new 0.4 MachineSpec explicitly selects `Developer` or `Hardened`.
+Developer is the normal capability-rich profile. Hardened is a restricted Linux
+Machine profile, does not inherit Docker, and rejects unsupported native-target
+combinations. Legacy migration assigns the profile from provenance and never
+silently converts a Hardened/generic record into Developer.
 
 Every supported Machine provides target-native execution, streaming stdin and
 stdout/stderr, PTY where supported, cancellation, exit status, inspectable
@@ -153,8 +174,22 @@ communicate only through declared service paths:
   local and isolated;
 - real Internet egress is separately controlled as offline, allowed, or
   domain/CIDR allowlisted;
-- host imports and exports are explicit capabilities; exports default to
-  collision-safe loopback listeners and never expose the LAN by accident.
+- host imports and exports are separate explicit capabilities; exports default
+  to collision-safe loopback listeners and never expose the LAN by accident.
+
+A host import authorizes one Environment/Machine to reach one stored host
+loopback protocol/port through an authenticated private relay. It does not use
+general Internet egress, require a wildcard/LAN host listener, expose arbitrary
+host destinations, or grant another Machine access. Compatibility DNS names
+such as `host.docker.internal` or `host.vz.internal` exist only where an import
+is declared and resolve to an Environment-local relay—not an unconditional
+shared Apple NAT gateway address.
+
+External egress is independently deny-first and audited. Enabling it does not
+authorize host imports, LAN access, control-plane access, or cross-Environment
+traffic. Offline Machines may still use their exact declared imports. Domain
+allowlists require mediated DNS and expiring resolved-address policy; a static
+resolver or `/etc/hosts` entry is not enforcement.
 
 Deterministic latency, jitter, loss, bandwidth, reset, DNS failure, and
 partition controls are scoped to a declared path, seeded, bounded by TTL, and
@@ -182,8 +217,9 @@ vz delete [--environment <name-or-id>]
 `up`, `stop`, and `delete` operate on the complete topology. `exec` targets the
 declared default/only Machine or requires `--machine`; it can reconcile that
 Machine and its dependencies. `status` reports topology, identities, targets,
-capabilities, health, endpoints, and a Docker context for each Linux Machine.
-Bare `vz` is read-only help or status and never creates resources.
+capabilities, health, endpoints, and a Docker context for each Developer-profile
+Linux Machine; Hardened Machines omit Docker contexts. Bare `vz` prints static
+top-level help, exits zero, and does not inspect or create resources.
 
 There is no canonical `vz dev` namespace and no public or hidden `run`, `shell`,
 `list`, `logs`, `restart`, `docker`, `stack`, `network`, `machine`, or `vm`

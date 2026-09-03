@@ -16,8 +16,8 @@ The target model is deliberately asymmetric:
   Linux and Windows hosts.
 - **Native targets follow the host.** Native macOS Machines run on macOS;
   native Windows Machines are planned for Windows.
-- **Docker belongs to each Linux Machine.** The complete Docker-compatible
-  workflow is in progress. Every Linux Machine will implicitly own its private
+- **Docker belongs to each Developer-profile Linux Machine.** The complete Docker-compatible
+  workflow is in progress. Every Developer-profile Linux Machine will implicitly own its private
   Docker Engine, containerd, BuildKit cache, image and volume state, networks,
   endpoint, and Docker context. There is no Environment-global or global `vz`
   Docker daemon and no Docker capability implied for native macOS/Windows
@@ -31,7 +31,7 @@ The target model is deliberately asymmetric:
 
 Today, `vz` ships Linux VM/OCI/BuildKit primitives and native macOS VM automation
 on Apple Silicon. Their convergence into the complete Developer Environment
-contract—including topology and private per-Linux-Machine Docker—is in
+contract—including topology and private per-Developer-Linux-Machine Docker—is in
 development. Additional
 host/Machine-target combinations below are roadmap work, not shipped functionality.
 
@@ -179,6 +179,12 @@ Host-facing port publishing is explicit opt-in via Compose host bindings
 
 #### Reaching macOS host services from inside a container
 
+> **Legacy 0.3 behavior—not the 0.4 contract.** The unconditional alias and
+> wildcard-listener guidance below describe the currently shipped stack
+> mechanism. 0.4 replaces it with an explicit Environment/Machine-owned import
+> to one host-loopback protocol/port over a private authenticated relay. Host
+> imports remain independent from Internet egress and do not expose the LAN.
+
 Every stack-managed container resolves the hostname **`host.vz.internal`**
 to the macOS host's NAT gateway IP (`192.168.64.1`). This is the Docker
 Desktop equivalent of `host.docker.internal` and is injected automatically
@@ -186,16 +192,16 @@ into each container's `/etc/hosts`.
 
 ```bash
 # Inside a sandboxed container:
-curl http://host.vz.internal:18080/   # reaches the host service
+curl http://host.vz.internal:18080/   # intended path; currently times out
 ```
 
-**Caveat — bind to `0.0.0.0`, not `127.0.0.1`:** services on the macOS host
-that listen only on `127.0.0.1` are **not** reachable via the NAT gateway
-IP. macOS's TCP stack does not route inbound NAT traffic to its own
-loopback. Bind your host service to `0.0.0.0` (or to `192.168.64.1`
-explicitly) so the guest can reach it. The address itself is hardcoded
-because Virtualization.framework provides no API to query Apple's NAT
-gateway — see `vz_runtime_contract::HOST_INTERNAL_GATEWAY_IPV4`.
+**Historical caveat:** the v0.3 design cannot reach services listening only on
+`127.0.0.1`; it expected a service on `0.0.0.0` or `192.168.64.1`. That can
+expose the service to the physical LAN and is not recommended as a security
+boundary. The address is hardcoded because Virtualization.framework provides no
+API to query Apple's NAT gateway—see
+`vz_runtime_contract::HOST_INTERNAL_GATEWAY_IPV4`. The 0.4 declared relay removes
+both assumptions.
 
 **Known limitation — netns reachability is pending.** Today
 `host.vz.internal` always resolves to `192.168.64.1` inside the container

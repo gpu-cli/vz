@@ -1,5 +1,9 @@
 # 06 — Cache Management
 
+> **0.4 interpretation:** cache operations belong to a typed Machine/Admin API
+> and exact per-Machine BuildKit ownership. Any public `vz build` spelling below
+> is legacy.
+
 ## Depends On
 
 - 02 (guest BuildKit service — persistent ext4 cache disk)

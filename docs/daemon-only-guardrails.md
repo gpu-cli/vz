@@ -1,5 +1,10 @@
 # Daemon-Only Guardrails
 
+> **0.4 interpretation:** internal control-plane guardrails. Sandbox/VM nouns and
+> legacy commands below are mechanisms, not the product API. The canonical
+> Project/Environment/Machine contract is
+> [`developer-environments.md`](developer-environments.md).
+
 This project enforces daemon ownership (`vz-runtimed`) for runtime mutations.
 
 ## Runtime Path Conventions

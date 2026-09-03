@@ -1,5 +1,9 @@
 # 05 — Manual Linux Stack Harness
 
+> **Historical backend harness:** it cannot certify 0.4 and any runc or public
+> `vz stack` allowance is superseded. Linux Developer Machines require youki-only
+> evidence through the canonical release gate.
+
 ## Goal
 
 Provide a repeatable host-side runbook for validating `vz stack` on Linux-native hosts across the compose dimensions that are most likely to fail in real environments.

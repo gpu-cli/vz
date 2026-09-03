@@ -13,6 +13,10 @@ ownership and correct stop/delete semantics.
 - Add versioned `ProjectDefinition`, `WorkspaceBinding`, `EnvironmentInstance`,
   `MachineSpec`, `MachineInstance`, `MachineIncarnation`, `Network`, `Endpoint`,
   and ownership records.
+- Require an explicit `Developer` or `Hardened` Machine profile in new 0.4
+  definitions. Developer is capability-rich; Hardened is restricted and valid
+  only for supported Linux targets. Migration assigns the profile from legacy
+  provenance rather than defaulting ambiguous records.
 - Put immutable `TargetSpec` (`os`, `arch`, image/version/channel), requested
   requirements, backend, and negotiated capabilities on each Machine.
 - Persist and return project/environment/machine IDs through manager, gRPC,
@@ -24,7 +28,8 @@ ownership and correct stop/delete semantics.
 
 - Select a Machine backend from `(host OS, Machine target OS, architecture)` and
   fail explicitly for unsupported tuples.
-- Select the Developer kernel/profile for Linux Machines at the backend boundary.
+- Select the declared Developer/Hardened kernel profile for Linux Machines at
+  the backend boundary; reject invalid target/profile combinations.
 - Select pinned native image metadata and TargetAdapter for macOS/Windows Machines.
 - Retain Container as a deprecated internal alias for Hardened during migration.
 - Fail closed on artifact/profile mismatches.

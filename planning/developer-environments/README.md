@@ -31,7 +31,7 @@ sockets, and networks themselves.
   boundary. A project and a worktree may each have multiple named instances.
 - `MachineInstance` is a target-native compute member. Its target specification,
   backend, lifecycle, filesystem, and capabilities are explicit.
-- Each Linux Machine implicitly owns a private Docker Engine, containerd,
+- Each Developer-profile Linux Machine implicitly owns a private Docker Engine, containerd,
   BuildKit, images, volumes, networks, endpoint, and managed context. Docker is
   never Environment-global.
 - Native macOS and Windows Machines expose native capabilities and never acquire
@@ -56,7 +56,7 @@ Topology product contract and 0.4 definition of done
 Project / Environment / Machine identity and aggregate lifecycle
        /                 |                   |                 \
       v                  v                   v                  v
-five-verb CLI    per-Linux-Machine Docker   native macOS   topology network
+five-verb CLI    per-Developer-Linux Docker native macOS   topology network
       |                  |                   |          and isolation
       |                  v                   |                 |
       +-------- Machine Engine Adapter ------+-----------------+
@@ -91,7 +91,7 @@ gates. Later host work reuses the exact Machine and topology scenario IDs.
   single worktree can create more than one without identity aliasing.
 - An Environment can contain multiple Linux Machines and mixed Linux/native
   macOS Machines with independent target-qualified capabilities.
-- Every Linux Machine exposes a distinct managed Docker context to the Mac's
+- Every Developer-profile Linux Machine exposes a distinct managed Docker context to the Mac's
   unmodified Docker/Compose/buildx clients and cannot observe another Machine's
   Docker API or state.
 - Declared private paths work; undeclared paths fail. A simulated-public path
@@ -126,11 +126,12 @@ in `vz-356`.
 - `00-product-contract.md` — language, profiles, compatibility, and audit
 - `01-environment-lifecycle.md` — aggregate and Machine identity/lifecycle
 - `02-developer-cli.md` — five-verb CLI and deterministic selectors
+- `legacy-cli-removal.md` — exhaustive 0.3 surface retirement and migration map
 - `03-implicit-docker.md` — private Docker per Linux Machine
 - `03-native-macos.md` — native macOS Machines in heterogeneous topologies
 - `04-isolation-storage-network.md` — storage, network fabric, simulated public
   edge, faults, peering, and isolation
-- `05-host-docker-bridge.md` — per-Linux-Machine endpoints and contexts
+- `05-host-docker-bridge.md` — per-Developer-Linux-Machine endpoints and contexts
 - `06-local-mac-validation.md` — release-built Linux/Docker Mac gate
 - `06-macos-target-validation.md` — release-built native macOS Machine gate
 - `07-migration-launch.md` — schema/CLI migration, public surfaces, and Mac GA

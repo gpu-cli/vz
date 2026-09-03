@@ -12,7 +12,7 @@ host-root Docker dependency.
 
 - Map each Machine plus the Environment aggregate onto the rootless
   outer-sandbox design.
-- Provide per-Linux-Machine Docker, persistent state, contexts, workspace
+- Provide per-Developer-Linux-Machine Docker, persistent state, contexts, workspace
   projections, topology networks, public-like edge, faults, peering, status,
   lifecycle, and youki-only behavior.
 - Use host-neutral contract types; do not introduce a second Linux-only product model.

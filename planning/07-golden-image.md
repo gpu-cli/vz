@@ -1,5 +1,9 @@
 # 07 — IPSW to Bootable macOS VM
 
+> **0.4 interpretation:** native macOS Machine image/backend plan. Direct VM CLI
+> workflows are legacy; the capability is selected through an Environment's
+> Machine target.
+
 ## What's a Golden Image
 
 A pre-configured macOS disk image with dev tools installed, ready to clone or snapshot.

@@ -1,4 +1,4 @@
-# Per-Linux-Machine Engine Endpoint Adapter and Docker contexts
+# Per-Developer-Linux-Machine Engine Endpoint Adapter and Docker contexts
 
 Depends on: Minimal five-verb Developer Environment CLI; implicit Docker per
 Linux Machine; multi-environment isolation and topology networking
@@ -25,7 +25,7 @@ hosts follow through host-specific endpoint adapters.
 
 ## Step 2: Managed Docker contexts
 
-- Automatically create/repair one stable context per Linux Machine during
+- Automatically create/repair one stable context per Developer-profile Linux Machine during
   Environment reconciliation.
 - Record ownership metadata so Machine rebuild preserves logical selection and
   Environment delete removes only its managed contexts.
@@ -35,7 +35,7 @@ hosts follow through host-specific endpoint adapters.
 ## Step 3: Docker CLI compatibility
 
 Support normal host `docker`, `docker compose`, and `docker buildx` clients for
-Linux Machines, including API negotiation, streaming progress, attach/exec TTY,
+Developer-profile Linux Machines, including API negotiation, streaming progress, attach/exec TTY,
 events, stats, and concurrent requests. No acceptance test may substitute an
 internal Rust API. Non-Docker Machines expose no Engine endpoint.
 

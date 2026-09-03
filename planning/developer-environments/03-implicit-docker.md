@@ -1,11 +1,11 @@
-# Implicit private Docker service for each Linux Machine
+# Implicit private Docker service for each Developer-profile Linux Machine
 
 Depends on: First-class Environment topology, Machine identity, and durable lifecycle
 
 ## Purpose
 
 Finish the Docker-in-guest wave as a Machine-owned default capability of every
-Linux target rather than an Environment-wide daemon, universal capability, or
+Developer-profile Linux target rather than an Environment-wide daemon, universal capability, or
 optional global facade.
 
 ## Step 1: Re-scope existing Docker foundations
@@ -31,7 +31,7 @@ optional global facade.
 
 ## Step 4: Scope services per Linux Machine
 
-Every Linux Machine gets independent daemon/containerd processes, sockets, state
+Every Developer-profile Linux Machine gets independent daemon/containerd processes, sockets, state
 directories, BuildKit cache, volumes, networks, event streams, configuration,
 credentials, endpoint, and context. Two Linux Machines in one Environment must
 not collapse onto a shared engine even if lower-level infrastructure is pooled.

@@ -7,12 +7,14 @@ ProjectDefinition (versioned desired topology)
 └── EnvironmentInstance (isolation, ownership, lifecycle, and evidence root)
     ├── WorkspaceBinding[]
     ├── MachineInstance[]
+    │   ├── MachineProfile { Developer | Hardened }
     │   ├── TargetSpec { os, arch, image/version, requirements }
     │   ├── HostBackend + TargetAdapter + CapabilitySet
     │   ├── MachineIncarnation and target-native persistent state
-    │   └── Linux only: private Docker/containerd/BuildKit + youki
+    │   └── Developer Linux: private Docker/containerd/BuildKit; all Linux: youki
     ├── Network[] + NIC attachments + declared service paths
-    ├── Endpoint[] + DNS/ingress/TLS/NAT/firewall/egress
+    ├── Endpoint[] + HostImport[] + HostExport[]
+    │   └── DNS/ingress/TLS/NAT/firewall/EgressPolicy[]
     └── Volume[], SecretBinding[], Fault[], Execution[], Receipt[]
 ```
 
@@ -33,9 +35,9 @@ Machine. Neither is a peer product journey.
   Environment without making the native path a persistent identity.
 - `EnvironmentInstance`: immutable ID, human name, definition digest,
   parameters, ownership graph, aggregate state, and zero or more bindings.
-- `MachineInstance`: immutable ID and stable name within an Environment, target
-  specification, resources, capabilities, attachments, logical state, and a
-  replaceable incarnation.
+- `MachineInstance`: immutable ID and stable name within an Environment,
+  explicit Developer/Hardened profile, target specification, resources,
+  capabilities, attachments, logical state, and a replaceable incarnation.
 
 Canonical resource identity is `(project_id, environment_id, machine_id)` where
 applicable. Names and paths are selectors. Every persisted child resource
@@ -76,7 +78,10 @@ aggregate reports degraded/failed state without identity substitution.
 ## Machine backends and capabilities
 
 The daemon selects a Machine backend from `(host OS, Machine target OS,
-architecture, requested capabilities)`. Unsupported tuples fail explicitly.
+architecture, profile, requested capabilities)`. Unsupported tuples fail
+explicitly. Developer is the primary capability-rich profile. Hardened is a
+restricted Linux profile with no implicit Docker; native/Hardened combinations
+are unsupported in 0.4.
 
 - `HostBackend`: compute isolation, disks, native shares, host networking, and
   target transport for one Machine.
@@ -98,7 +103,7 @@ configuration.
 
 ## Linux Machine Docker boundary
 
-Each Linux Machine reconciles an independent private Docker Engine, containerd,
+Each Developer-profile Linux Machine reconciles an independent private Docker Engine, containerd,
 BuildKit state, image/volume stores, networks, credentials, endpoint, and Docker
 context. Even Machines in the same Environment cannot share a daemon implicitly.
 Shared registries/caches must be declared topology resources.
@@ -106,7 +111,7 @@ Shared registries/caches must be declared topology resources.
 The Engine Endpoint Adapter authorizes and routes each request by
 `(environment_id, machine_id)`, preserves Docker streaming/hijacking semantics,
 and performs only narrowly authorized host-path translation. `vz status`
-returns a context for every Linux Machine. Normal use is:
+returns a context for every Developer-profile Linux Machine. Normal use is:
 
 ```bash
 docker --context <context-from-vz-status> ps
@@ -132,8 +137,33 @@ Machines attach to declared networks and service paths:
   and force DNS, ingress, TLS, firewall, and NAT behavior through an
   Environment-local edge;
 - external egress is independently offline, enabled, or allowlisted;
-- host imports/exports are explicit, loopback-only by default, and
-  collision-safe; physical LAN publication is a separate high-friction policy.
+- host imports and exports are separate explicit resources; imports authorize
+  one guest-to-host protocol/port and exports authorize one host-to-guest
+  endpoint;
+- exports bind collision-safe host loopback listeners by default; physical LAN
+  publication is a separate high-friction policy.
+
+A `HostImport` never piggybacks on general Internet egress and never asks a host
+service to bind a wildcard or LAN address. The host side stores the exact
+loopback destination and validates the owning Environment, Machine, Network,
+import ID, protocol, and port before dialing it. The guest receives only an
+exact Machine/network-scoped relay address and guest-side port for the declared
+import; a DNS alias is materialized only when that import declares one. No other
+Machine or attachment receives the address or alias. A reverse-vsock or
+equivalent authenticated Machine transport may implement this
+contract, but the guest cannot choose an arbitrary host destination. There is
+no unconditional `host.vz.internal`, shared NAT-gateway address, or host route
+to a nested guest CIDR in the portable design.
+
+External egress is a distinct Environment-owned firewall/NAT policy. It is
+installed deny-first for exact owned source networks, blocks host, LAN,
+link-local, multicast, control-plane, and sibling-Environment ranges unless a
+separate capability allows them, and applies source NAT only after policy
+acceptance. Domain allowlists use mediated DNS and expiring resolved-address
+sets rather than an unenforced resolver configuration. Setup commits policy
+before forwarding is enabled; rollback and deletion remove only exact
+inventoried owner resources and restore forwarding only after the final
+vz-owned policy is gone.
 
 Per-Environment authoritative DNS allows aliases such as `api.shop.test` to
 resolve differently in simultaneous instances. Managed TLS uses

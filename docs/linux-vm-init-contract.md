@@ -1,5 +1,9 @@
 # Linux VM Init Contract
 
+> **0.4 interpretation:** backend provisioning contract only. Any `vz vm` or
+> single-VM product workflow here is legacy; Developer Environment lifecycle is
+> defined by [`developer-environments.md`](developer-environments.md).
+
 This document defines the command contract for the Linux guest image pipeline.
 
 ## Commands

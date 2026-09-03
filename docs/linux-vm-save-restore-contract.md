@@ -1,5 +1,9 @@
 # Linux VM Save/Restore Contract
 
+> **0.4 interpretation:** Machine-backend capability contract. Public lifecycle
+> is the Environment model in [`developer-environments.md`](developer-environments.md);
+> direct VM commands in this document are legacy diagnostics.
+
 This document defines how `vz vm linux` save/restore semantics map to daemon checkpoint primitives.
 
 ## Scope

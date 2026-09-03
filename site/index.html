@@ -372,7 +372,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         <li><span class="tick">▪</span><span><b>Environment first.</b> Each isolated project instance owns a topology of target-native Machines</span></li>
         <li><span class="tick">▪</span><span><b>Linux everywhere.</b> Linux-on-macOS now; Linux-on-Linux next; Linux-on-Windows later</span></li>
         <li><span class="tick">▪</span><span><b>Native where it matters.</b> macOS-on-macOS now; Windows-on-Windows follows Linux-on-Windows</span></li>
-        <li><span class="tick">▪</span><span><b>Docker is implicit for Linux.</b> Each Linux Machine owns a private Engine, context, state, and cache</span></li>
+        <li><span class="tick">▪</span><span><b>Docker is implicit for Linux development.</b> Each Developer-profile Linux Machine owns a private Engine, context, state, and cache</span></li>
         <li><span class="tick">▪</span><span><b>Parallel on both axes.</b> Many isolated Environments per project; many cooperating Machines per Environment</span></li>
         <li><span class="tick">▪</span><span><b>Public-like, still local.</b> Declared DNS, TLS, ingress, NAT, firewall, and network faults without accidental exposure</span></li>
         <li><span class="tick">▪</span><span><b>Honest capabilities.</b> Host×Machine-target support is ACTIVE, DEV, or PLANNED</span></li>
@@ -384,7 +384,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       <div class="desc">
         <p class="lede"><strong>vz</strong> creates reproducible, parallel Developer Environments on local hardware. A project defines a topology that can be instantiated many times; each isolated Environment contains one or more target-native Machines plus its storage, networks, endpoints, policies, and lifecycle.</p>
         <p><span class="none-em">Linux is the universal Machine target.</span> Linux and native macOS Machines can coexist in one Environment on macOS; Linux moves next to Linux hosts and later Windows, with native Windows last.</p>
-        <p>Every Linux Machine includes private Docker readiness: its own Engine, containerd, BuildKit cache, images, volumes, networks, endpoint, and managed context. There is no Environment-wide/global socket and no fallback to Docker Desktop, a sibling Machine, or another Environment.</p>
+        <p>Every Developer-profile Linux Machine includes private Docker readiness: its own Engine, containerd, BuildKit cache, images, volumes, networks, endpoint, and managed context. There is no Environment-wide/global socket and no fallback to Docker Desktop, a sibling Machine, or another Environment.</p>
         <p>Current runtime and VM mechanisms are real; the five-verb <code>vz up/exec/status/stop/delete</code> lifecycle, topology fabric, and full host-Docker-CLI parity remain in development.</p>
         <p class="foot">Status vocabulary: <span class="tag tag-active">ACTIVE</span> shipped in v0.3.20 · <span class="tag tag-dev">DEV</span> in development · <span class="tag tag-planned">PLANNED</span> committed roadmap, subject to change.</p>
       </div>
@@ -426,7 +426,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
           <rect x="92" y="262" width="406" height="58" fill="none" stroke="#a33327" stroke-width="1.2" stroke-dasharray="5 4"/>
           <text x="108" y="286" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#a33327">MANAGED DOCKER CONTEXT</text>
-          <text x="108" y="305" font-family="IBM Plex Mono" font-size="10.5" fill="#a33327">one private endpoint per Linux Machine · DEV</text>
+          <text x="108" y="305" font-family="IBM Plex Mono" font-size="10.5" fill="#a33327">one endpoint per Developer Linux Machine · DEV</text>
 
           <rect x="92" y="340" width="406" height="120" fill="none" stroke="#1f1c18" stroke-width="1.2"/>
           <text x="108" y="364" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#1f1c18">STATE</text>
@@ -499,7 +499,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         </thead>
         <tbody>
           <tr><td>Linux-on-macOS cold boot to first command</td><td>–</td><td class="t-mono">~3<sup class="fn">2</sup></td><td>–</td><td class="t-dim">s, repository-stated typical; warm reuse follows</td></tr>
-          <tr><td>Mutable Docker owners per Linux Machine</td><td>1</td><td class="t-mono">1</td><td class="t-mono">1</td><td class="t-dim">Engine, state, cache, network, endpoint, context</td></tr>
+          <tr><td>Docker owners per Developer Linux Machine</td><td>1</td><td class="t-mono">1</td><td class="t-mono">1</td><td class="t-dim">Engine, state, cache, network, endpoint, context</td></tr>
           <tr><td>Host bytes visible to an environment</td><td>–</td><td class="t-mono">declared shares only</td><td class="t-mono">policy bounded</td><td class="t-dim">target-specific share backend</td></tr>
           <tr><td>Concurrent macOS guest VMs</td><td>1</td><td class="t-mono">–</td><td class="t-mono">2</td><td class="t-dim">kernel-enforced; Linux guest VMs not so limited</td></tr>
           <tr><td>Memory / CPUs per environment</td><td class="t-mono">–</td><td class="t-mono">8 / 4</td><td class="t-mono">host RAM − reserve</td><td class="t-dim">GiB / cores, configurable per definition</td></tr>
@@ -620,10 +620,11 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         <div class="clause-h"><span class="cno">5.2</span>Machine targets &amp; topology</div>
         <div class="clause-b">
           <p>On macOS, Linux and native macOS Machines can form one Environment through declared private or simulated-public paths. Linux OCI execution uses pinned <b>youki</b>; the same Linux Machine contract moves next to Linux and Windows hosts.</p>
-          <pre class="cmdline"><span class="cmt"># bring a whole environment up, stream its logs, tear it down</span>
-vz stack up -f compose.yaml -n demo
-vz stack logs demo --service web --follow
-vz stack down demo --volumes</pre>
+          <pre class="cmdline"><span class="cmt"># 0.4 Developer Environment lifecycle (DEV)</span>
+vz up --environment demo
+vz status --environment demo --json
+vz exec --environment demo --machine api -- make test
+vz stop --environment demo</pre>
           <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> youki in-guest · <span class="tag tag-active">ACTIVE</span> deterministic stacks · <span class="tag tag-dev">DEV</span> stack egress (netns MASQUERADE)</div>
         </div>
       </article>
@@ -631,7 +632,7 @@ vz stack down demo --volumes</pre>
       <article class="clause">
         <div class="clause-h"><span class="cno">5.3</span>Docker compatibility belongs to Linux</div>
         <div class="clause-b">
-          <p>Every Linux Machine owns a private dockerd, containerd, BuildKit cache, images, volumes, networks, endpoint, and context. The host Docker CLI selects that exact Environment/Machine. No Environment-wide/global socket, default-context mutation, fallback, or cross-routing is allowed.</p>
+          <p>Every Developer-profile Linux Machine owns a private dockerd, containerd, BuildKit cache, images, volumes, networks, endpoint, and context. The host Docker CLI selects that exact Environment/Machine. No Environment-wide/global socket, default-context mutation, fallback, or cross-routing is allowed.</p>
           <pre class="cmdline"><span class="cmt"># use the Machine context reported by vz status</span>
 docker --context vz-agent-a-api ps
 docker --context vz-agent-a-api compose up
@@ -741,7 +742,7 @@ docker --context vz-agent-a-api build -t app .</pre>
           <tr><td class="t-mono">Windows</td><td>Windows</td><td><span class="tag tag-planned">PLANNED</span> native Windows target after Linux-on-Windows</td></tr>
         </tbody>
         <tfoot>
-          <tr><td colspan="3">Docker is implicit only for Linux Machines. Each owns a private Engine, containerd, BuildKit cache, images, volumes, networks, endpoint, and context. Native macOS and Windows Machines do not silently start Linux.</td></tr>
+          <tr><td colspan="3">Docker is implicit only for Developer-profile Linux Machines. Each owns a private Engine, containerd, BuildKit cache, images, volumes, networks, endpoint, and context. Hardened Linux Machines omit Docker; native macOS/Windows Machines do not receive a hidden Linux sidecar or Docker service.</td></tr>
         </tfoot>
       </table>
     </div>
@@ -787,14 +788,14 @@ docker --context vz-agent-a-api build -t app .</pre>
           </tr>
           <tr>
             <td class="t-mono">vz-agent-skill</td>
-            <td>Claude plugin + skill: agents drive the shipped vz run workflow</td>
+            <td>Claude plugin + skill for the shipped 0.3 legacy run workflow</td>
             <td class="t-mono">.claude-plugin/ (in repo)</td>
             <td><span class="tag tag-active">ACTIVE</span></td>
           </tr>
         </tbody>
       </table>
     </div>
-    <p class="order-note"><b>First command after install:</b> <code>cd your-project &amp;&amp; vz init &amp;&amp; vz run echo "hello from Linux"</code>. vz.json is generated per project (Rust / Node / Python / Go auto-detected), and the first run boots the VM, pulls the base image, and caches setup by hash.<sup class="fn">2</sup></p>
+    <p class="order-note"><b>0.4 Developer workflow (DEV):</b> check in a schema-valid <code>vz.json</code>, then run <code>cd your-project &amp;&amp; vz up</code>. The first unqualified use creates the <code>default</code> Environment; named parallel instances use <code>vz up --environment &lt;name&gt;</code>. The shipped 0.3 <code>vz init/vz run</code> workflow is documented as legacy in the repository README.<sup class="fn">2</sup></p>
   </section>
 
   <hr class="rule">
@@ -817,7 +818,7 @@ docker --context vz-agent-a-api build -t app .</pre>
           </tr>
           <tr>
             <td class="t-mono">F.1</td><td class="t-dim">in dev</td><td><span class="tag tag-dev">DEV</span></td>
-            <td>Project/Environment/Machine identity; five-verb lifecycle; mixed targets; per-Linux-Machine Docker; isolated private and public-like topology networking</td>
+            <td>Project/Environment/Machine identity; five-verb lifecycle; mixed targets; per-Developer-Linux-Machine Docker; isolated private and public-like topology networking</td>
           </tr>
           <tr>
             <td class="t-mono">F.2</td><td class="t-dim">planned</td><td><span class="tag tag-planned">PLANNED</span></td>
@@ -839,7 +840,7 @@ docker --context vz-agent-a-api build -t app .</pre>
     <ol>
       <li>The current Linux-on-macOS backend uses a Linux VM on Apple Virtualization.framework; native macOS environments use macOS VMs. macOS 14+ (Sonoma) is required for VM state save/restore.</li>
       <li>Boot and reuse behavior as stated in the vz repository documentation (v0.3.20): ~3 s typical cold boot to first command; setup cached by hash; warm reuse instant. Subject to the project's measured-claims policy; no independent benchmark is claimed here.</li>
-      <li>For Linux-on-macOS, Linux workloads—including each Linux Machine's future private dockerd—execute in that Machine's backend. Declared host clients and bridges remain visible parts of the contract.</li>
+      <li>For Linux-on-macOS, Linux workloads—including each Developer-profile Linux Machine's future private dockerd—execute in that Machine's backend. Hardened Machines do not gain implicit Docker. Declared host clients and bridges remain visible parts of the contract.</li>
       <li>The typed API register in §4 is proposed. The shipped 0.3 skill uses legacy command names; 0.4 replaces them with the five-verb surface while convergence is DEV.</li>
       <li>Guest kernel 6.12.85 currently builds <code>developer</code> and legacy <code>container</code> profiles; the public restricted profile becomes <code>Hardened</code>.</li>
     </ol>

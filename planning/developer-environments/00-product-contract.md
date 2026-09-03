@@ -20,7 +20,7 @@ Make the new mission explicit and remove contradictory product language before i
 - Rename the public locked-down Container profile to Hardened, preserving compatibility aliases internally and on disk.
 - Define host OS and Machine target OS as separate explicit dimensions; an
   Environment may contain heterogeneous Machine targets.
-- State that Docker is implicit and private for each Linux Machine, while macOS
+- State that Docker is implicit and private for each Developer-profile Linux Machine, while macOS
   and Windows Machines expose native target capabilities.
 - Define the ordered matrix: Linux-on-macOS and macOS-on-macOS now; Linux-on-Linux next; Linux-on-Windows then; Windows-on-Windows finally.
 
@@ -28,7 +28,7 @@ Make the new mission explicit and remove contradictory product language before i
 
 - One Environment identity owns a topology of Machines plus all aggregate state,
   networks, endpoints, credentials, policies, faults, and evidence. Machine
-  identity owns target-native state and capabilities; every Linux Machine owns
+  identity owns target-native state and capabilities; every Developer-profile Linux Machine owns
   an independent Docker stack and context.
 - Project membership grants no connectivity. Machines use declared paths;
   separate Environments are default-deny and can interact only through explicit,

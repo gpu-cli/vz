@@ -1,5 +1,9 @@
 # Linux VM Base/Validate/Patch Parity Matrix
 
+> **0.4 interpretation:** pinned Machine-artifact/Admin API contract. It does
+> not retain `vz vm` as a public product family; see
+> [`developer-environments.md`](developer-environments.md).
+
 This document maps `vz vm mac` base/validate/patch surfaces to Linux support status and required follow-up work.
 
 ## Scope

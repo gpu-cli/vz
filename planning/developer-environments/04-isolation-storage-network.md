@@ -11,8 +11,8 @@ reproducible while the entire topology remains local and isolated.
 ## Step 1: Storage and workspace ownership
 
 - Give each Machine independent target image, writable disk, service state, home,
-  caches, and identity. Linux Machines additionally own independent Docker,
-  BuildKit, image, and volume state.
+  caches, and identity. Developer-profile Linux Machines additionally own
+  independent Docker, BuildKit, image, and volume state.
 - Make Environment volumes explicit. A volume normally has one Machine owner;
   multi-Machine use declares a sharing protocol and consistency contract. Never
   silently multi-attach writable block storage.
@@ -34,6 +34,9 @@ reproducible while the entire topology remains local and isolated.
 - Define target-neutral TCP/UDP/IPv4/IPv6, internal DNS, host import/export,
   egress, and published-endpoint behavior. Keep gateway implementation details
   out of portable configuration.
+- Persist stable Environment, Machine, Network, and endpoint ownership in the
+  resolved network plan. Resource names, truncated display names, bridge
+  prefixes, and guest CIDRs are never sufficient cleanup or authorization keys.
 
 ## Step 3: Public-like local edge
 
@@ -45,11 +48,23 @@ reproducible while the entire topology remains local and isolated.
   publication. Host exports are explicit, collision-safe, and loopback-only by
   default. Physical LAN or real public exposure requires separate explicit
   policy.
-- Make guest-to-host imports explicit and protocol/port scoped. Linux Docker
-  supports conventional `host.docker.internal` behavior plus documented
-  `host.vz.internal` compatibility only when the import is authorized.
+- Make guest-to-host imports explicit and protocol/port scoped. A host import
+  stores an exact host-loopback destination, authenticates the owning
+  Environment/Machine/import over a private relay transport, and exposes the
+  exact relay address, guest-side port, network attachment, and optional alias
+  only to that owning Machine. The guest never supplies an arbitrary host destination. `host.docker.internal` or
+  `host.vz.internal` may resolve only for a declared import; neither name maps
+  unconditionally to a shared Apple NAT gateway.
+- Keep host imports independent from external egress. The Environment owns and
+  atomically reconciles the ruleset, while policy attachment and source matching
+  are explicit per Machine/network. An offline Machine can
+  use an authorized host import without receiving Internet, LAN, or arbitrary
+  host access, and enabling egress never authorizes a host import.
 - Control external egress as offline, allowed/audited, or domain/CIDR
-  allowlisted. External DNS obeys that policy and can be recorded/pinned.
+  allowlisted using an Environment-owned deny-first firewall/NAT ruleset.
+  Domain policy uses mediated DNS plus TTL-bound address sets. Host, LAN,
+  link-local, multicast, control-plane, and sibling-Environment ranges stay
+  denied unless a distinct explicit capability permits them.
 
 ## Step 4: Deterministic faults and peering
 
@@ -69,14 +84,29 @@ Controlled OOM, disk-full, service failure, Machine stop, Environment stop, and
 delete must not corrupt or interrupt siblings outside the selected ownership
 scope.
 
+Network setup is transactional. It installs owner-scoped deny rules before
+enabling forwarding and rolls back in reverse order after any partial failure.
+Stop, delete, and recovery first revoke import/peer authorization, close relay
+sessions, remove exact owned policy and NAT state, then remove exact inventoried
+links/namespaces. Cleanup failures remain visible and retryable; prefix scans or
+cross-Environment rule deletion are forbidden.
+
 ## Validation
 
 - Run two worktrees plus multiple named Environments from one worktree with
   repeated names, ports, DNS aliases, and overlapping CIDRs.
 - Run client -> simulated-public edge -> API -> private database; prove the
   client cannot reach the database and traffic crossed DNS/TLS/ingress/NAT.
-- Prove split DNS, host import/export, egress/offline/allowlist behavior,
-  deterministic faults and recovery, explicit peering and revocation.
+- Prove a service bound only to host `127.0.0.1` works through one declared
+  import while the undeclared port, wrong protocol, wrong Machine, sibling
+  Environment, host LAN, and arbitrary host destinations fail. Prove no host
+  wildcard/LAN listener exists during the test.
+- Prove split DNS, loopback-only exports, independent
+  offline/allowed/CIDR/domain egress behavior, deterministic faults and
+  recovery, explicit peering and revocation.
+- In one Environment, run two Machines with different egress attachments and
+  prove allowed traffic from one does not change the other's offline/allowlist
+  behavior or either Machine's host-import authority.
 - Prove same-target and mixed Linux/macOS Machine topology, per-Machine Docker
   isolation, stop/up persistence, crash reconstruction, delete safety, and empty
   post-run leak inventory on the real Mac.

@@ -1,4 +1,13 @@
-# `host.vz.internal` — Sandbox-to-Host DNS Alias
+# Historical 0.3 design: unconditional `host.vz.internal` alias
+
+> **SUPERSEDED FOR 0.4.** This document records the shipped v0.3 mechanism and
+> its known failure. It is not the Developer Environment network contract.
+> 0.4 removes unconditional alias injection and the requirement to bind a host
+> service to `0.0.0.0`. A host import must authorize one
+> Environment/Machine/protocol/port and relay to an exact host-loopback service
+> over an authenticated private transport. General egress/MASQUERADE does not
+> grant a host import. See
+> [`../developer-environments/04-isolation-storage-network.md`](../developer-environments/04-isolation-storage-network.md).
 
 Inject a stable hostname into every stack-managed container that resolves to the macOS host, so workloads can call host-side services without knowing the underlying NAT layout. This is the Docker Desktop equivalent of `host.docker.internal`.
 
@@ -62,8 +71,15 @@ Two things are needed to close this:
 
 This is filed as a separate bead so it can be sequenced independently of the DNS-injection work. The injection is still useful on its own — it gives `vz stack`-managed containers a stable, documented hostname for the host, and the reachability fix becomes purely a guest-side patch.
 
-## Future work (tracked separately)
+## Historical follow-up status
 
-- **vz-0ml** `network: stack-network MASQUERADE for container→host reachability` — the netns reachability gap above. Required to actually make `curl host.vz.internal` work from a stack-managed container.
-- **vz-662** `network: revive gvproxy as the production network backend` — would replace hardcoded `192.168.64.1` with a real DNS server, add LAN-bind for inbound forwarding, and add UDP port forwarding. Heavier rewrite.
-- `network: 127.0.0.1-on-host reachability for host.vz.internal` — userspace proxy bound on `192.168.64.1` that fans out to `127.0.0.1` host-side. Only worth doing if a concrete user demand surfaces. Not yet filed.
+- **vz-0ml** now owns Environment egress policy and forwarding/NAT, not
+  authorization for an unconditional host alias.
+- **vz-ufk** replaces this design with authorized Environment-local host
+  imports. It must remove the wildcard-listener and shared-gateway assumptions
+  before closing.
+- **vz-662** records an earlier gvproxy alternative. Any reusable transport must
+  still satisfy the explicit import/export contract; LAN binding is not a 0.4
+  default or an authorization mechanism.
+- Host-loopback reachability is now part of **vz-ufk**, not a separate optional
+  alias proxy.

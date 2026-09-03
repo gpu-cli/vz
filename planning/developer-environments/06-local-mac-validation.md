@@ -1,7 +1,8 @@
 # Linux-on-macOS Docker validation
 
 Depends on: Minimal five-verb Developer Environment CLI; implicit Docker per
-Linux Machine; multi-environment topology isolation; per-Linux-Machine Engine
+Developer-profile Linux Machine; multi-environment topology isolation;
+per-Developer-Linux-Machine Engine
 Endpoint Adapter and contexts
 
 ## Purpose

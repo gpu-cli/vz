@@ -18,7 +18,7 @@ Evaluate supported Windows versions and Linux isolation choices including WSL2 a
   Environment identity on raw path spelling or case.
 - Translate authorized native `C:\...` bind sources through the Engine Endpoint Adapter/Share Backend; a byte-only proxy to a Linux daemon is insufficient.
 - Implement filesystem sharing, networking, published ports, host reachability, persistent disks, lifecycle reconciliation, installation/upgrades, and a Docker-context endpoint such as a private named pipe or other authenticated local transport supported by the selected backend.
-- Preserve aggregate ownership, per-Linux-Machine Docker, isolated topology,
+- Preserve aggregate ownership, per-Developer-Linux-Machine Docker, isolated topology,
   fail-closed routing, and youki-only execution. Native Windows Machines are a
   subsequent phase.
 

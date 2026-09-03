@@ -4,7 +4,13 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## What is vz
 
-Container runtime with dual backends: macOS (Virtualization.framework VMs) and Linux-native (direct OCI runtime execution).
+vz is a local-first system for reproducible, parallel Developer Environment
+topologies. A project/worktree may have multiple isolated Environments and each
+Environment may contain multiple target-native Machines. Linux is the universal
+Machine target; native macOS Machines complement it on macOS. VMs, containers,
+sandboxes, and Linux-native OCI are backend mechanisms, not peer products. The
+canonical contract is `docs/developer-environments.md` and the 0.4 completion
+gate is `planning/developer-environments/GOAL-0.4.0.md`.
 
 **Core crates:**
 1. **vz** — Safe async Rust API wrapping `objc2-virtualization` (auto-generated bindings). All unsafe is internal; public API is 100% safe Rust.
@@ -90,7 +96,7 @@ rm -rf linux/src/linux-6.12.85 && cd linux && make docker-build
 |-------|---------|
 | `vz` | Safe async Rust API — Vm, VmConfig, VirtioFs, Vsock, SaveState. Wraps `objc2-virtualization` directly. |
 | `vz-sandbox` | High-level sandbox — SandboxPool, SandboxSession, typed Channel, guest agent binary |
-| `vz-cli` | CLI binary — `vz init`, `vz run`, `vz exec`, `vz save/restore` |
+| `vz-cli` | CLI binary — current 0.3 mechanisms are migrating to the five-verb 0.4 Environment lifecycle |
 | `vz-runtime-contract` | Backend-neutral `RuntimeBackend` trait + shared types (RunConfig, ExecConfig, etc.) |
 | `vz-linux-native` | Linux-native container backend — OCI bundle gen, container lifecycle, ns/cgroup/network |
 | `vz-linux` | Linux VM guest-side runtime (OCI dispatch, protocol, guest agent interface) |
@@ -103,7 +109,7 @@ rm -rf linux/src/linux-6.12.85 && cd linux && make docker-build
   several isolated instances, and each instance may contain several Machines
 - **Machine owns target OS** — Linux is universal across hosts; Linux and native
   macOS Machines can coexist in one Environment on macOS
-- **Docker is implicit per Linux Machine** — private Engine/state/context, no
+- **Docker is implicit per Developer-profile Linux Machine** — private Engine/state/context, no
   Environment-wide/global socket or fallback; native Machines do not inherit it
 - **Declared topology only** — private and simulated-public paths are explicit;
   cross-Environment access is default-deny and service-scoped

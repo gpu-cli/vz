@@ -31,7 +31,7 @@ All surfaces provide structured output, stable exit codes, versioned errors, str
 3. **Files, workspaces, and endpoints.** Scope file operations and projections
    to Environment/Machine identity; expose ports/services through declared
    private or simulated-public paths without backend transport leakage.
-4. **Target services.** Resolve capabilities by Machine. Every Linux Machine has
+4. **Target services.** Resolve capabilities by Machine. Every Developer-profile Linux Machine has
    its own Docker endpoint/context; it is never Environment-global and never
    falls back to another Machine or daemon.
 5. **Brokered credentials.** Assign per-environment broker identities and provider capabilities with an audit feed of every use. Credentials are usable according to policy but are not copied into the target as ambient secrets.

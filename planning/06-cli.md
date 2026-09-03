@@ -1,5 +1,9 @@
 # 06 — vz-cli Commands & UX
 
+> **SUPERSEDED FOR 0.4:** this pre-topology CLI is retained as implementation
+> history. The only public lifecycle verbs are defined in
+> [`developer-environments/02-developer-cli.md`](developer-environments/02-developer-cli.md).
+
 ## Purpose
 
 Standalone CLI for managing macOS VMs without writing Rust. Built with clap 4.

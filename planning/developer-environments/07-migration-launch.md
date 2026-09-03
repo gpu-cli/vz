@@ -12,7 +12,12 @@ native-macOS, and aggregate topology gates pass.
 ## Step 1: Migrate CLI and configuration
 
 - Introduce `vz up/exec/status/stop/delete`; remove legacy execution paths and
-  return actionable migration errors rather than public or hidden aliases.
+  return actionable migration errors rather than public or hidden aliases. Use
+  [`legacy-cli-removal.md`](legacy-cli-removal.md) as the exhaustive command,
+  nested-path, root-flag, and retained-spelling test inventory.
+- Retain `vz.json` as the checked-in ProjectDefinition, publish its schema, and
+  migrate legacy config deterministically. Missing/invalid discovery fails
+  before mutation; `vz up` owns default/named instance creation.
 - Migrate legacy single-Machine records and configuration into explicit Project,
   Environment, Machine, and topology records without data loss.
 - Rename public Container profile references to Hardened with a time-bounded compatibility alias.
@@ -43,7 +48,8 @@ Run migration/release rehearsals, upgrade/rollback tests, artifact verification,
 
 - Repository-wide terminology/link/search audit.
 - Clean install and upgrade from the previous supported release, including
-  deterministic single-Machine-to-topology migration.
+  deterministic single-Machine-to-topology migration and semantic preservation
+  of legacy Hardened/generic records.
 - Existing scripts receive clear compatibility behavior.
 - Site claims match evidence and ACTIVE/DEV/PLANNED status.
 - Beads graph has no stale duplicates or contradictory profile/socket descriptions.
