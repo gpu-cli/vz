@@ -321,6 +321,24 @@ pub struct TopologyAmbiguityDetail {
     pub candidates: ::prost::alloc::vec::Vec<TopologyCandidate>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologySelectionRequiredDetail {
+    #[prost(string, tag = "1")]
+    pub kind: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub selector: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "3")]
+    pub candidates: ::prost::alloc::vec::Vec<TopologyCandidate>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyInvalidSelectorDetail {
+    #[prost(string, tag = "1")]
+    pub kind: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub selector: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TopologyUnsupportedTargetDetail {
     #[prost(enumeration = "OperatingSystem", tag = "1")]
     pub host_os: i32,
@@ -367,7 +385,7 @@ pub struct TopologyContradictoryCapabilityDetail {
 /// clients to parse ambiguity or unsupported-target information from prose.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TopologyErrorDetail {
-    #[prost(oneof = "topology_error_detail::Detail", tags = "1, 2, 3, 4, 5, 6, 7")]
+    #[prost(oneof = "topology_error_detail::Detail", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
     pub detail: ::core::option::Option<topology_error_detail::Detail>,
 }
 /// Nested message and enum types in `TopologyErrorDetail`.
@@ -388,6 +406,10 @@ pub mod topology_error_detail {
         InvalidCapabilityDeclaration(super::TopologyInvalidCapabilityDeclarationDetail),
         #[prost(message, tag = "7")]
         ContradictoryCapability(super::TopologyContradictoryCapabilityDetail),
+        #[prost(message, tag = "8")]
+        SelectionRequired(super::TopologySelectionRequiredDetail),
+        #[prost(message, tag = "9")]
+        InvalidSelector(super::TopologyInvalidSelectorDetail),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]

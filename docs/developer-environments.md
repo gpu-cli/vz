@@ -32,10 +32,10 @@ ProjectDefinition
 ```
 
 A worktree is a workspace binding and convenient default selector, not an
-Environment identity and not a one-instance limit. One worktree may own several
-Environments; one Environment may contain several Machines. A sandbox, VM,
-container, process boundary, or native OS facility implements a Machine or a
-capability behind this contract and is not a competing product concept.
+Environment identity and not a one-instance limit. One worktree may bind
+several Environments; one Environment may contain several Machines. A sandbox,
+VM, container, process boundary, or native OS facility implements a Machine or
+a capability behind this contract and is not a competing product concept.
 
 Target OS belongs to a Machine and is independent of the host OS. An Environment
 may be heterogeneous. On macOS it may contain Linux Machines and native macOS
@@ -72,12 +72,28 @@ Canonical identity has three independent levels:
 project_id / environment_id / machine_id
 ```
 
-Each level has an immutable internal ID. Human names, worktree bindings, and
-configuration paths are selectors, not storage or ownership keys. Selection
-uses an explicit Environment/Machine ID or name first, then a process-scoped
-selector, then an unambiguous project/worktree binding and declared default
-Machine. Ambiguity fails closed and lists candidates. vz has no mutable global
-current Environment.
+Each level has an immutable internal ID. Human names and worktree bindings are
+selectors, not storage or ownership keys; configuration paths are discovery or
+diagnostic data only.
+
+Environment selection has strict precedence: an explicit Environment ID/name,
+then the process-scoped `VZ_ENVIRONMENT_ID`, then the unambiguous binding for the
+current workspace token. `VZ_ENVIRONMENT_ID` accepts an immutable Environment
+ID only. A present explicit or process selector that is invalid or stale fails
+at that level and never falls through to workspace selection. Within the
+selected Environment, Machine selection uses an explicit Machine ID/name, then
+the process-scoped `VZ_MACHINE_ID`, then the declared default or sole Machine.
+`VZ_MACHINE_ID` accepts an immutable Machine ID only and is ownership-checked
+against that Environment; a present invalid, stale, or foreign value fails
+without falling through. Ambiguity fails closed and lists candidates. vz has no
+mutable global current Environment.
+
+The workspace binding key is a random opaque token persisted at
+`<resolved-per-worktree-git-dir>/vz/workspace-id`. It survives moving the
+worktree, while every new worktree or clone gets a new token. The raw checkout
+path and an optional refreshable `path_hint` are non-authorizing diagnostics:
+neither is identity, proof of a binding, nor a basis for selecting or adopting
+an Environment.
 
 For 0.4, the nearest checked-in `vz.json` is the versioned ProjectDefinition.
 `vz up --environment <name>` creates or reconciles that project-unique named

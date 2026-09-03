@@ -28,6 +28,7 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 base64 = { workspace = true }
 uuid = { workspace = true }
+tempfile = { workspace = true }
 libc = { workspace = true }
 ctrlc = { workspace = true }
 ratatui = { workspace = true }
@@ -58,7 +59,6 @@ zstd = "0.13"
 vz-linux-native = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 axum = "0.8"
 portable-pty = { workspace = true }
 vz-api = { workspace = true }

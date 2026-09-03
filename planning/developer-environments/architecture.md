@@ -31,8 +31,9 @@ Machine. Neither is a peer product journey.
 
 - `ProjectDefinition`: versioned machines, networks, services, endpoints,
   workspace projections, volumes, policies, and reproducible inputs.
-- `WorkspaceBinding`: associates a checkout/worktree with a project and an
-  Environment without making the native path a persistent identity.
+- `WorkspaceBinding`: associates an opaque workspace token with a project and
+  an Environment. The token is created once in the resolved per-worktree Git
+  metadata directory; the native checkout path is not persistent identity.
 - `EnvironmentInstance`: immutable ID, human name, definition digest,
   parameters, ownership graph, aggregate state, and zero or more bindings.
 - `MachineInstance`: immutable ID and stable name within an Environment,
@@ -40,15 +41,30 @@ Machine. Neither is a peer product journey.
   capabilities, attachments, logical state, and a replaceable incarnation.
 
 Canonical resource identity is `(project_id, environment_id, machine_id)` where
-applicable. Names and paths are selectors. Every persisted child resource
-includes `environment_id`; Machine-owned resources also include `machine_id`.
-Identifiers used in paths, sockets, contexts, networks, and routes are bounded
-and collision checked.
+applicable. Names and workspace bindings are selectors; paths are discovery or
+diagnostic data only. Every persisted child resource includes `environment_id`;
+Machine-owned resources also include `machine_id`. Identifiers used in paths,
+sockets, contexts, networks, and routes are bounded and collision checked.
 
-Selection order is explicit ID/name, process-scoped selector, unambiguous
-workspace binding, then a declared default or sole Machine. Ambiguity fails with
-candidates. No mutable global current-Environment symlink or Docker selector is
-permitted.
+Environment selection has strict precedence: an explicit ID/name, then the
+process-scoped `VZ_ENVIRONMENT_ID`, then the unambiguous binding for the current
+workspace token. `VZ_ENVIRONMENT_ID` accepts an immutable Environment ID only.
+A selector that is present but invalid or stale fails at that level; resolution
+never falls through to a lower-precedence selector. Within the selected
+Environment, Machine selection uses an explicit ID/name, then the process-scoped
+`VZ_MACHINE_ID`, then the declared default or sole Machine. `VZ_MACHINE_ID`
+accepts an immutable Machine ID only and is ownership-checked against that
+Environment; a present invalid, stale, or foreign Machine ID fails without
+falling through. Ambiguity fails with candidates. No mutable global
+current-Environment symlink or Docker selector is permitted.
+
+The workspace token is random and opaque, is stored at
+`<resolved-per-worktree-git-dir>/vz/workspace-id` rather than under the checkout
+root, and is the only authorizing key for workspace binding lookup. It survives
+a worktree move; a newly created worktree or clone receives a new token. A raw
+checkout path or persisted `path_hint` may be recorded and refreshed for
+diagnostics, but is never identity, proof of a binding, or authority to select or adopt an
+Environment.
 
 ## Reconciliation and lifecycle
 

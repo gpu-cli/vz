@@ -28,7 +28,7 @@ pub use compose::{
     expand_variables, parse_compose, parse_compose_with_dir, parse_env_file_content,
 };
 pub use convert::service_to_run_config;
-pub use error::StackError;
+pub use error::{OwnedResourceCollisionError, StackError};
 pub use events::{
     EventRecord, FnStackEventSink, StackEvent, StackEventSink, StackEventSinkError,
     emit_event_to_sink,
@@ -58,10 +58,10 @@ pub use spec::{
 };
 pub use state_store::{
     AllocatorSnapshot, CheckpointGcReport, CheckpointRetentionPolicy, CheckpointRetentionState,
-    DriftFinding, DriftSeverity, IDEMPOTENCY_TTL_SECS, IdempotencyRecord, ImageRecord, Receipt,
-    ReceiptGcReport, ReceiptRetentionPolicy, ReceiptRetentionState, ReconcileAuditEntry,
-    ReconcileSession, ReconcileSessionStatus, RetentionGcReason, ServiceObservedState,
-    ServicePhase, StateStore, StateStorePragmas,
+    DriftFinding, DriftSeverity, EnvironmentUpReservation, IDEMPOTENCY_TTL_SECS, IdempotencyRecord,
+    ImageRecord, Receipt, ReceiptGcReport, ReceiptRetentionPolicy, ReceiptRetentionState,
+    ReconcileAuditEntry, ReconcileSession, ReconcileSessionStatus, RetentionGcReason,
+    ServiceObservedState, ServicePhase, StateStore, StateStorePragmas,
 };
 pub use volume::{
     ResolvedMount, ResolvedMountKind, SkippedMount, VolumeManager, mounts_changed,

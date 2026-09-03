@@ -632,6 +632,14 @@ mod tests {
                 &[("kind", 1), ("selector", 2), ("candidates", 3)],
             ),
             (
+                "TopologySelectionRequiredDetail",
+                &[("kind", 1), ("selector", 2), ("candidates", 3)],
+            ),
+            (
+                "TopologyInvalidSelectorDetail",
+                &[("kind", 1), ("selector", 2), ("reason", 3)],
+            ),
+            (
                 "TopologyUnsupportedTargetDetail",
                 &[
                     ("host_os", 1),
@@ -667,6 +675,8 @@ mod tests {
                     ("invalid_machine_profile", 5),
                     ("invalid_capability_declaration", 6),
                     ("contradictory_capability", 7),
+                    ("selection_required", 8),
+                    ("invalid_selector", 9),
                 ],
             ),
         ] {
@@ -1026,6 +1036,23 @@ mod tests {
                 selector: "missing".into(),
             })),
         };
+        let selection_required = TopologyErrorDetail {
+            detail: Some(Detail::SelectionRequired(TopologySelectionRequiredDetail {
+                kind: "environment".into(),
+                selector: "workspace binding".into(),
+                candidates: vec![TopologyCandidate {
+                    id: "env_agent".into(),
+                    name: "agent".into(),
+                }],
+            })),
+        };
+        let invalid_selector = TopologyErrorDetail {
+            detail: Some(Detail::InvalidSelector(TopologyInvalidSelectorDetail {
+                kind: "environment".into(),
+                selector: " ".into(),
+                reason: "name must not be blank".into(),
+            })),
+        };
         let missing_capability = TopologyErrorDetail {
             detail: Some(Detail::MissingCapability(TopologyMissingCapabilityDetail {
                 machine_id: "mac_native".into(),
@@ -1062,6 +1089,8 @@ mod tests {
             ambiguous,
             unsupported,
             not_found,
+            selection_required,
+            invalid_selector,
             missing_capability,
             invalid_profile,
             invalid_capability,

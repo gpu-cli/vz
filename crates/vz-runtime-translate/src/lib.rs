@@ -723,6 +723,30 @@ pub fn topology_resolution_error_to_proto(
                 })
                 .collect(),
         }),
+        TopologyResolutionError::SelectionRequired {
+            kind,
+            selector,
+            candidates,
+        } => Detail::SelectionRequired(runtime_v2::TopologySelectionRequiredDetail {
+            kind: kind.clone(),
+            selector: selector.clone(),
+            candidates: candidates
+                .iter()
+                .map(|candidate| runtime_v2::TopologyCandidate {
+                    id: candidate.id.clone(),
+                    name: candidate.name.clone(),
+                })
+                .collect(),
+        }),
+        TopologyResolutionError::InvalidSelector {
+            kind,
+            selector,
+            reason,
+        } => Detail::InvalidSelector(runtime_v2::TopologyInvalidSelectorDetail {
+            kind: kind.clone(),
+            selector: selector.clone(),
+            reason: reason.clone(),
+        }),
     };
     runtime_v2::TopologyErrorDetail {
         detail: Some(detail),
@@ -748,6 +772,19 @@ pub fn topology_resolution_error_from_proto(
                 name: candidate.name.clone(),
             }),
         )),
+        Detail::SelectionRequired(detail) => Ok(TopologyResolutionError::selection_required(
+            detail.kind.clone(),
+            detail.selector.clone(),
+            detail.candidates.iter().map(|candidate| TopologyCandidate {
+                id: candidate.id.clone(),
+                name: candidate.name.clone(),
+            }),
+        )),
+        Detail::InvalidSelector(detail) => Ok(TopologyResolutionError::InvalidSelector {
+            kind: detail.kind.clone(),
+            selector: detail.selector.clone(),
+            reason: detail.reason.clone(),
+        }),
         Detail::UnsupportedTarget(_)
         | Detail::MissingCapability(_)
         | Detail::InvalidMachineProfile(_)
@@ -888,7 +925,10 @@ pub fn topology_validation_error_from_proto(
                 )?,
             })
         }
-        Detail::NotFound(_) | Detail::Ambiguous(_) => Err(TranslationError::InvalidValue {
+        Detail::NotFound(_)
+        | Detail::Ambiguous(_)
+        | Detail::SelectionRequired(_)
+        | Detail::InvalidSelector(_) => Err(TranslationError::InvalidValue {
             field: "topology_error_detail.detail",
             value: "resolution_error".to_string(),
         }),
@@ -2721,6 +2761,33 @@ mod tests {
         }
         let decoded = topology_resolution_error_from_proto(&wire).expect("resolution error");
         assert_eq!(decoded, error);
+
+        let selection_required = TopologyResolutionError::selection_required(
+            "environment",
+            "workspace:worktree-new",
+            [
+                TopologyCandidate {
+                    id: "env-z".to_string(),
+                    name: "zeta".to_string(),
+                },
+                TopologyCandidate {
+                    id: "env-a".to_string(),
+                    name: "alpha".to_string(),
+                },
+            ],
+        );
+        let wire = topology_resolution_error_to_proto(&selection_required);
+        let decoded = topology_resolution_error_from_proto(&wire).expect("selection required");
+        assert_eq!(decoded, selection_required);
+
+        let invalid_selector = TopologyResolutionError::InvalidSelector {
+            kind: "environment".to_string(),
+            selector: " ".to_string(),
+            reason: "name must not be blank".to_string(),
+        };
+        let wire = topology_resolution_error_to_proto(&invalid_selector);
+        let decoded = topology_resolution_error_from_proto(&wire).expect("invalid selector");
+        assert_eq!(decoded, invalid_selector);
     }
 
     #[test]

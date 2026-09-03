@@ -1408,6 +1408,7 @@ impl StateStore {
 mod drift;
 mod persistence;
 mod topology;
+pub use topology::EnvironmentUpReservation;
 
 #[cfg(test)]
 mod tests;

@@ -32,11 +32,20 @@ vz delete [--environment <name-or-id>]
 
 ## Step 2: Resolve identity without global state
 
-Selection order is explicit immutable ID/name, process-scoped Environment and
-Machine selectors, unambiguous project/worktree binding, then a declared default
-or sole Machine. A worktree may resolve more than one named Environment;
-ambiguity fails with a bounded candidate list. There is no mutable global current
-Environment, Machine, socket, or Docker context.
+Environment selection uses strict, non-fallback precedence: an explicit
+`--environment` immutable ID/name, then `VZ_ENVIRONMENT_ID`, then the current
+workspace binding. `VZ_ENVIRONMENT_ID` is process-scoped and accepts an
+immutable Environment ID only. If an explicit or process selector is present
+but invalid or stale, the command fails at that level instead of consulting a
+workspace binding. A worktree may bind more than one named Environment;
+ambiguity fails with a bounded candidate list.
+
+Within the selected Environment, Machine selection uses explicit `--machine`
+ID/name, then the process-scoped `VZ_MACHINE_ID`, then the declared default or
+sole Machine. `VZ_MACHINE_ID` accepts an immutable Machine ID only and is
+ownership-checked against the selected Environment. A present invalid, stale,
+or foreign value fails at the process tier without falling through. There is no
+mutable global current Environment, Machine, socket, or Docker context.
 
 ## Step 3: Discover definitions and create instances deterministically
 
@@ -46,8 +55,15 @@ bootstrap fixture is `examples/developer-environment/vz.json`. Commands search f
 working directory toward the filesystem root and select the nearest `vz.json`;
 multiple candidates at the same selection level or an invalid definition fail
 before mutation. The file carries a stable `project_id`, so moving or cloning a
-worktree does not change project identity. Host paths may appear only in
-workspace bindings, never as derived persistent IDs.
+worktree does not change project identity.
+
+Each checkout/worktree gets a random opaque workspace token, persisted at
+`<resolved-per-worktree-git-dir>/vz/workspace-id`. Moving that worktree
+preserves its token and bindings; creating another worktree or clone creates a
+new token. The token, not the native path, is the workspace binding key. A raw
+path or stored `path_hint` is optional, refreshable diagnostic context only: it
+cannot authorize lookup, establish identity, or cause selection or adoption of an
+Environment.
 
 `vz up --environment <name>` creates that project-unique named Environment
 instance when absent and otherwise reconciles it to the discovered definition
@@ -92,9 +108,17 @@ the exact project, Environment, Machine, incarnation, and topology digest.
   help exposes no legacy product command family.
 - Project, worktree, explicit instance, multiple instances per worktree,
   default/ambiguous Machine, stopped, missing, and unsupported target cases.
+- Explicit, process, and workspace precedence tests prove that a present stale
+  selector fails without falling through; `VZ_ENVIRONMENT_ID` accepts IDs but
+  not names. `VZ_MACHINE_ID` accepts only an ID owned by the selected
+  Environment and likewise fails without fallback when present but invalid,
+  stale, or foreign.
 - Nearest-definition discovery, missing/invalid/ambiguous definitions, first
   `default` creation, explicit named instance creation, sole selection, and
   multi-instance ambiguity all pass without path-derived identity.
+- Worktree relocation preserves the opaque workspace token and binding; a new
+  clone/worktree gets a different token, and matching `path_hint` values never
+  select or adopt an Environment.
 - Bare `vz` exactly matches the zero-exit help snapshot and performs no reads
   beyond static help generation; old verbs reject with migration guidance.
 - A clean directory proves missing-definition failure and zero mutation, then

@@ -4,14 +4,17 @@ use super::*;
 use crate::spec::{NetworkSpec, ServiceKind, ServiceSpec, VolumeSpec};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use vz_runtime_contract::MachineErrorCode;
 use vz_runtime_contract::types::{
     Architecture, CapabilitySet, EndpointId, EndpointInstance, EndpointProtocol,
-    EndpointSpec as TopologyEndpointSpec, EnvironmentId, EnvironmentInstance, EnvironmentSpec,
+    EndpointSpec as TopologyEndpointSpec, EnvironmentId, EnvironmentInstance,
+    EnvironmentSelectionContext, EnvironmentSelectionSource, EnvironmentSelector, EnvironmentSpec,
     EnvironmentState, MachineCapability, MachineId, MachineInstance, MachineProfile,
     MachineResources, MachineSpec, MachineState, NetworkId, NetworkInstance, NetworkKind,
     NetworkSpec as TopologyNetworkSpec, OperatingSystem, OwnedResourceKind, OwnershipRecord,
-    ProjectDefinition, ProjectId, ProjectState, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
-    WorkspaceBinding, WorkspaceBindingId, WorkspaceProjection, WorkspaceProjectionMode,
+    ProjectDefinition, ProjectId, ProjectState, ResourceOwner, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
+    TopologyResolutionError, WorkspaceBinding, WorkspaceBindingId, WorkspaceProjection,
+    WorkspaceProjectionMode,
 };
 
 const V0_3_20_FIXTURE: &str = include_str!("../../tests/fixtures/v0.3.20-state.sql");
@@ -5976,4 +5979,652 @@ fn daemon_pragmas_busy_timeout_waits_through_write_lock_contention() {
             .unwrap()
             .is_some()
     );
+}
+
+#[test]
+fn workspace_binding_refresh_preserves_identity_and_resources_across_relocation() {
+    let store = StateStore::in_memory().unwrap();
+    let original = topology_project_state("prj_relocated", &["agent"], "/old/checkout");
+    let original_environment = &original.environments[0];
+    let original_binding_id = original_environment.bindings[0].binding_id.clone();
+    let original_machines = original_environment.machines.clone();
+    let original_ownership = original_environment.ownership.clone();
+    store.save_project_state(&original).unwrap();
+
+    let mut requested = original_environment.bindings[0].clone();
+    requested.binding_id = WorkspaceBindingId::generate();
+    requested.path_hint = Some("/new/location/checkout".to_string());
+    let refreshed = store.refresh_workspace_binding(&requested, 300).unwrap();
+
+    assert_eq!(refreshed.binding_id, original_binding_id);
+    assert_eq!(refreshed.workspace_key, "same-worktree-key");
+    assert_eq!(refreshed.path_hint, requested.path_hint);
+    let actual = store.load_project_state("prj_relocated").unwrap().unwrap();
+    let actual_environment = &actual.environments[0];
+    assert_eq!(actual_environment.bindings, vec![refreshed]);
+    assert_eq!(actual_environment.machines, original_machines);
+    assert_eq!(actual_environment.ownership, original_ownership);
+    assert_eq!(
+        actual_environment.created_at,
+        original_environment.created_at
+    );
+    assert_eq!(actual_environment.updated_at, 300);
+}
+
+#[test]
+fn creating_environment_can_reserve_declared_workspace_before_reconciliation() {
+    let store = StateStore::in_memory().unwrap();
+    let definition = topology_project_state("prj_pre_reconcile", &["fixture"], "/x").definition;
+    let created = store
+        .resolve_or_reserve_environment_for_up(
+            &definition,
+            &EnvironmentSelectionContext {
+                explicit: Some(EnvironmentSelector::Name("agent".to_string())),
+                ..EnvironmentSelectionContext::default()
+            },
+            100,
+        )
+        .unwrap();
+    let environment = match created {
+        EnvironmentUpReservation::Created { environment } => environment,
+        EnvironmentUpReservation::Existing { .. } => panic!("expected a new Environment"),
+    };
+    assert_eq!(environment.state, EnvironmentState::Creating);
+    assert!(environment.bindings.is_empty());
+
+    let requested = WorkspaceBinding {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        binding_id: WorkspaceBindingId::generate(),
+        project_id: definition.project_id.clone(),
+        environment_id: environment.environment_id.clone(),
+        name: "workspace".to_string(),
+        workspace_key: "opaque-worktree-token".to_string(),
+        path_hint: Some("/diagnostic/checkout".to_string()),
+    };
+    assert_eq!(
+        store
+            .reserve_workspace_binding_for_environment(&requested, 200)
+            .unwrap(),
+        requested
+    );
+    assert_eq!(
+        store
+            .reserve_workspace_binding_for_environment(&requested, 999)
+            .unwrap(),
+        requested
+    );
+
+    let persisted = store
+        .load_project_state(definition.project_id.as_str())
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.environments[0].state, EnvironmentState::Creating);
+    assert_eq!(persisted.environments[0].bindings, vec![requested]);
+    assert_eq!(persisted.environments[0].updated_at, 200);
+}
+
+#[test]
+fn workspace_binding_refresh_rejects_non_ready_environment_without_writes() {
+    let store = StateStore::in_memory().unwrap();
+    let mut original = topology_project_state("prj_stopped", &["agent"], "/checkout");
+    original.environments[0].state = EnvironmentState::Stopped;
+    store.save_project_state(&original).unwrap();
+    let mut requested = original.environments[0].bindings[0].clone();
+    requested.path_hint = Some("/moved".to_string());
+
+    let error = store
+        .refresh_workspace_binding(&requested, 300)
+        .expect_err("stopped Environment must reject binding refresh");
+    assert!(error.to_string().contains("must be ready"));
+    assert_eq!(
+        store.load_project_state("prj_stopped").unwrap(),
+        Some(original)
+    );
+}
+
+#[test]
+fn owned_resource_reservation_is_idempotent_and_foreign_collision_rolls_back() {
+    let store = StateStore::in_memory().unwrap();
+    let original = topology_project_state("prj_resources", &["agent-a", "agent-b"], "/checkout");
+    store.save_project_state(&original).unwrap();
+    let first_environment = &original.environments[0];
+    let first_machine = &first_environment.machines[0];
+    let reservation = OwnershipRecord {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        resource_kind: OwnedResourceKind::Disk,
+        resource_id: "vzr1-shared-looking-key".to_string(),
+        environment_id: first_environment.environment_id.clone(),
+        machine_id: Some(first_machine.machine_id.clone()),
+    };
+
+    assert_eq!(
+        store.reserve_owned_resource(&reservation, 300).unwrap(),
+        reservation
+    );
+    assert_eq!(
+        store.reserve_owned_resource(&reservation, 999).unwrap(),
+        reservation
+    );
+    let after_idempotent = store.load_project_state("prj_resources").unwrap().unwrap();
+    assert_eq!(after_idempotent.environments[0].updated_at, 300);
+    assert_eq!(
+        after_idempotent.environments[0]
+            .ownership
+            .iter()
+            .filter(|record| record.resource_id == reservation.resource_id)
+            .count(),
+        1
+    );
+
+    let second_environment = &after_idempotent.environments[1];
+    let foreign = OwnershipRecord {
+        environment_id: second_environment.environment_id.clone(),
+        machine_id: Some(second_environment.machines[0].machine_id.clone()),
+        ..reservation.clone()
+    };
+    let error = store
+        .reserve_owned_resource(&foreign, 500)
+        .expect_err("foreign owner must not adopt a reserved resource");
+    assert!(matches!(error, StackError::OwnedResourceCollision(_)));
+    assert_eq!(
+        store.load_project_state("prj_resources").unwrap(),
+        Some(after_idempotent)
+    );
+}
+
+#[test]
+fn owned_resource_reservation_rejects_normalized_json_owner_drift_without_adoption() {
+    let store = StateStore::in_memory().unwrap();
+    let original = topology_project_state(
+        "prj_resource_projection",
+        &["owner", "foreign"],
+        "/checkout",
+    );
+    store.save_project_state(&original).unwrap();
+    let owner = &original.environments[0];
+    let foreign = &original.environments[1];
+    let reserved = OwnershipRecord {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        resource_kind: OwnedResourceKind::Disk,
+        resource_id: "vzr1-projection-drift".to_string(),
+        environment_id: owner.environment_id.clone(),
+        machine_id: Some(owner.machines[0].machine_id.clone()),
+    };
+    store.reserve_owned_resource(&reserved, 300).unwrap();
+
+    let corrupted_json_owner = OwnershipRecord {
+        environment_id: foreign.environment_id.clone(),
+        machine_id: Some(foreign.machines[0].machine_id.clone()),
+        ..reserved.clone()
+    };
+    store
+        .conn
+        .execute(
+            "UPDATE topology_ownership SET record_json = ?1
+             WHERE resource_kind = ?2 AND resource_id = ?3",
+            params![
+                serde_json::to_string(&corrupted_json_owner).unwrap(),
+                serde_json::to_string(&reserved.resource_kind).unwrap(),
+                reserved.resource_id,
+            ],
+        )
+        .unwrap();
+    let row_before: (String, String, String, Option<String>, i64, String) = store
+        .conn
+        .query_row(
+            "SELECT resource_kind, resource_id, environment_id, machine_id,
+                    schema_version, record_json
+             FROM topology_ownership
+             WHERE resource_kind = ?1 AND resource_id = ?2",
+            params![
+                serde_json::to_string(&reserved.resource_kind).unwrap(),
+                reserved.resource_id,
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+
+    let error = store
+        .reserve_owned_resource(&corrupted_json_owner, 999)
+        .expect_err("JSON owner drift must not be accepted as an idempotent reservation");
+    assert!(
+        error
+            .to_string()
+            .contains("persisted topology projection mismatch")
+    );
+    assert!(error.to_string().contains("field=environment_id"));
+    let row_after: (String, String, String, Option<String>, i64, String) = store
+        .conn
+        .query_row(
+            "SELECT resource_kind, resource_id, environment_id, machine_id,
+                    schema_version, record_json
+             FROM topology_ownership
+             WHERE resource_kind = ?1 AND resource_id = ?2",
+            params![
+                serde_json::to_string(&reserved.resource_kind).unwrap(),
+                reserved.resource_id,
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row_after, row_before);
+    assert_eq!(row_after.2, owner.environment_id.as_str());
+    assert_eq!(
+        row_after.3.as_deref(),
+        Some(owner.machines[0].machine_id.as_str())
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT updated_at FROM environment_instances WHERE environment_id = ?1",
+                params![owner.environment_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        300
+    );
+}
+
+#[test]
+fn store_environment_resolution_uses_shared_explicit_process_workspace_precedence() {
+    let store = StateStore::in_memory().unwrap();
+    let mut state = topology_project_state(
+        "prj_selection",
+        &["explicit", "process", "workspace"],
+        "/checkout",
+    );
+    for (index, environment) in state.environments.iter_mut().enumerate() {
+        environment.bindings[0].workspace_key = format!("workspace-{index}");
+    }
+    store.save_project_state(&state).unwrap();
+
+    let context = EnvironmentSelectionContext {
+        explicit: Some(EnvironmentSelector::Id(
+            state.environments[0].environment_id.clone(),
+        )),
+        process_environment_id: Some(state.environments[1].environment_id.clone()),
+        workspace_key: Some("workspace-2".to_string()),
+    };
+    let explicit = store
+        .resolve_environment("prj_selection", &context)
+        .unwrap();
+    assert_eq!(explicit.project_id, state.definition.project_id);
+    assert_eq!(explicit.name, "explicit");
+    assert_eq!(explicit.source, EnvironmentSelectionSource::Explicit);
+
+    let process = store
+        .resolve_environment(
+            "prj_selection",
+            &EnvironmentSelectionContext {
+                explicit: None,
+                ..context.clone()
+            },
+        )
+        .unwrap();
+    assert_eq!(process.name, "process");
+    assert_eq!(process.source, EnvironmentSelectionSource::Process);
+
+    let workspace = store
+        .resolve_environment(
+            "prj_selection",
+            &EnvironmentSelectionContext {
+                explicit: None,
+                process_environment_id: None,
+                ..context
+            },
+        )
+        .unwrap();
+    assert_eq!(workspace.name, "workspace");
+    assert_eq!(workspace.source, EnvironmentSelectionSource::Workspace);
+}
+
+#[test]
+fn store_environment_resolution_reports_id_name_collision_without_writes() {
+    let store = StateStore::in_memory().unwrap();
+    let mut state = topology_project_state("prj_selector_collision", &["first", "second"], "/x");
+    let colliding = state.environments[0].environment_id.to_string();
+    state.environments[1].name = colliding.clone();
+    store.save_project_state(&state).unwrap();
+
+    let error = store
+        .resolve_environment(
+            "prj_selector_collision",
+            &EnvironmentSelectionContext {
+                explicit: Some(EnvironmentSelector::NameOrId(colliding)),
+                ..EnvironmentSelectionContext::default()
+            },
+        )
+        .expect_err("cross-namespace ID/name collision must be ambiguous");
+    assert!(matches!(
+        error,
+        StackError::TopologyResolution(error)
+            if matches!(error.as_ref(), TopologyResolutionError::Ambiguous { candidates, .. } if candidates.len() == 2)
+    ));
+    assert_eq!(
+        store.load_project_state("prj_selector_collision").unwrap(),
+        Some(state)
+    );
+}
+
+#[test]
+fn same_path_with_new_workspace_key_does_not_adopt_or_write() {
+    let store = StateStore::in_memory().unwrap();
+    let state = topology_project_state("prj_no_adoption", &["agent"], "/same/path");
+    store.save_project_state(&state).unwrap();
+
+    let error = store
+        .resolve_environment(
+            "prj_no_adoption",
+            &EnvironmentSelectionContext {
+                workspace_key: Some("new-opaque-worktree-key".to_string()),
+                ..EnvironmentSelectionContext::default()
+            },
+        )
+        .expect_err("an unbound key must not adopt by matching path_hint");
+    assert!(matches!(
+        error,
+        StackError::TopologyResolution(error)
+            if matches!(error.as_ref(), TopologyResolutionError::SelectionRequired { candidates, .. } if candidates.len() == 1)
+    ));
+    assert_eq!(
+        store.load_project_state("prj_no_adoption").unwrap(),
+        Some(state)
+    );
+}
+
+fn race_environment_up_reservations(
+    db_path: &Path,
+    definition: ProjectDefinition,
+    names: [&str; 2],
+) -> [EnvironmentUpReservation; 2] {
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let handles: Vec<_> = names
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let db_path = db_path.to_path_buf();
+            let definition = definition.clone();
+            let barrier = barrier.clone();
+            let name = name.to_string();
+            std::thread::spawn(move || {
+                let store =
+                    StateStore::open_with_pragmas(&db_path, StateStorePragmas::daemon_defaults())
+                        .unwrap();
+                barrier.wait();
+                store
+                    .resolve_or_reserve_environment_for_up(
+                        &definition,
+                        &EnvironmentSelectionContext {
+                            explicit: Some(EnvironmentSelector::Name(name)),
+                            ..EnvironmentSelectionContext::default()
+                        },
+                        1_000 + index as u64,
+                    )
+                    .unwrap()
+            })
+        })
+        .collect();
+    barrier.wait();
+    let mut results = handles.into_iter().map(|handle| handle.join().unwrap());
+    [results.next().unwrap(), results.next().unwrap()]
+}
+
+#[test]
+fn concurrent_same_name_up_reservations_converge_on_one_immutable_id() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("same-name.db");
+    let definition = topology_project_state("prj_same_name", &["fixture"], "/x").definition;
+    StateStore::open_with_pragmas(&db_path, StateStorePragmas::daemon_defaults()).unwrap();
+
+    let results =
+        race_environment_up_reservations(&db_path, definition.clone(), ["parallel", "parallel"]);
+    let ids: Vec<_> = results
+        .iter()
+        .map(|reservation| match reservation {
+            EnvironmentUpReservation::Existing { environment, .. }
+            | EnvironmentUpReservation::Created { environment } => {
+                environment.environment_id.clone()
+            }
+        })
+        .collect();
+    assert_eq!(ids[0], ids[1]);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|reservation| matches!(reservation, EnvironmentUpReservation::Created { .. }))
+            .count(),
+        1
+    );
+    let final_state = StateStore::open(&db_path)
+        .unwrap()
+        .load_project_state(definition.project_id.as_str())
+        .unwrap()
+        .unwrap();
+    assert_eq!(final_state.environments.len(), 1);
+    assert_eq!(final_state.environments[0].name, "parallel");
+}
+
+#[test]
+fn concurrent_different_name_up_reservations_preserve_both_siblings() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("different-name.db");
+    let definition = topology_project_state("prj_different_names", &["fixture"], "/x").definition;
+    StateStore::open_with_pragmas(&db_path, StateStorePragmas::daemon_defaults()).unwrap();
+
+    let results =
+        race_environment_up_reservations(&db_path, definition.clone(), ["agent-a", "agent-b"]);
+    assert!(
+        results
+            .iter()
+            .all(|result| matches!(result, EnvironmentUpReservation::Created { .. }))
+    );
+    let final_state = StateStore::open(&db_path)
+        .unwrap()
+        .load_project_state(definition.project_id.as_str())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        final_state
+            .environments
+            .iter()
+            .map(|environment| environment.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["agent-a", "agent-b"])
+    );
+}
+
+#[test]
+fn stale_aggregate_save_cannot_erase_concurrent_sibling_or_owned_resource() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("stale-aggregate.db");
+    let initial = topology_project_state("prj_stale", &["existing"], "/x");
+    let first =
+        StateStore::open_with_pragmas(&db_path, StateStorePragmas::daemon_defaults()).unwrap();
+    first.save_project_state(&initial).unwrap();
+    let stale = first.load_project_state("prj_stale").unwrap().unwrap();
+
+    let second =
+        StateStore::open_with_pragmas(&db_path, StateStorePragmas::daemon_defaults()).unwrap();
+    let created = second
+        .resolve_or_reserve_environment_for_up(
+            &initial.definition,
+            &EnvironmentSelectionContext {
+                explicit: Some(EnvironmentSelector::Name("sibling".to_string())),
+                ..EnvironmentSelectionContext::default()
+            },
+            300,
+        )
+        .unwrap();
+    assert!(matches!(created, EnvironmentUpReservation::Created { .. }));
+    let resource = OwnershipRecord {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        resource_kind: OwnedResourceKind::Disk,
+        resource_id: "vzr1-concurrent-disk".to_string(),
+        environment_id: initial.environments[0].environment_id.clone(),
+        machine_id: Some(initial.environments[0].machines[0].machine_id.clone()),
+    };
+    second.reserve_owned_resource(&resource, 400).unwrap();
+
+    let error = first
+        .save_project_state(&stale)
+        .expect_err("bootstrap save must reject replacement of an existing Project");
+    assert_eq!(error.machine_code(), MachineErrorCode::StateConflict);
+    let final_state = first.load_project_state("prj_stale").unwrap().unwrap();
+    assert_eq!(final_state.environments.len(), 2);
+    assert!(
+        final_state
+            .environments
+            .iter()
+            .any(|environment| environment.name == "sibling")
+    );
+    assert!(
+        final_state
+            .environments
+            .iter()
+            .flat_map(|environment| &environment.ownership)
+            .any(|record| record == &resource)
+    );
+}
+
+#[test]
+fn up_reservation_rejects_definition_drift_before_mutation() {
+    let store = StateStore::in_memory().unwrap();
+    let state = topology_project_state("prj_drift_up", &["existing"], "/x");
+    store.save_project_state(&state).unwrap();
+    let mut drifted = state.definition.clone();
+    drifted.name = "different-project-name".to_string();
+
+    let error = store
+        .resolve_or_reserve_environment_for_up(
+            &drifted,
+            &EnvironmentSelectionContext {
+                explicit: Some(EnvironmentSelector::Name("new".to_string())),
+                ..EnvironmentSelectionContext::default()
+            },
+            500,
+        )
+        .expect_err("definition drift must reject before creating an Environment");
+    assert!(error.to_string().contains("project definition drift"));
+    assert_eq!(
+        store.load_project_state("prj_drift_up").unwrap(),
+        Some(state)
+    );
+}
+
+#[test]
+fn two_worktree_three_environment_layout_resolves_and_persists_distinct_owned_resources() {
+    let store = StateStore::in_memory().unwrap();
+    let mut state = topology_project_state(
+        "prj_acceptance_layout",
+        &["agent-a", "agent-b", "integration"],
+        "/diagnostic/path",
+    );
+    state.environments[0].bindings[0].workspace_key = "worktree-token-a".to_string();
+    state.environments[1].bindings[0].workspace_key = "worktree-token-a".to_string();
+    state.environments[2].bindings[0].workspace_key = "worktree-token-b".to_string();
+    assert!(
+        state
+            .environments
+            .iter()
+            .all(|environment| environment.machines[0].name == "linux")
+    );
+    store.save_project_state(&state).unwrap();
+
+    let ambiguity = store
+        .resolve_environment(
+            "prj_acceptance_layout",
+            &EnvironmentSelectionContext {
+                workspace_key: Some("worktree-token-a".to_string()),
+                ..EnvironmentSelectionContext::default()
+            },
+        )
+        .expect_err("one worktree bound to two named Environments must be ambiguous");
+    assert!(matches!(
+        ambiguity,
+        StackError::TopologyResolution(error)
+            if matches!(error.as_ref(), TopologyResolutionError::Ambiguous { candidates, .. }
+                if candidates.iter().map(|candidate| candidate.name.as_str()).collect::<std::collections::BTreeSet<_>>()
+                    == std::collections::BTreeSet::from(["agent-a", "agent-b"]))
+    ));
+    let selected = store
+        .resolve_environment(
+            "prj_acceptance_layout",
+            &EnvironmentSelectionContext {
+                workspace_key: Some("worktree-token-b".to_string()),
+                ..EnvironmentSelectionContext::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(selected.name, "integration");
+
+    let resource_kinds = [
+        OwnedResourceKind::Disk,
+        OwnedResourceKind::Socket,
+        OwnedResourceKind::DockerContext,
+        OwnedResourceKind::Endpoint,
+        OwnedResourceKind::Other("state".to_string()),
+    ];
+    let mut expected_ids = std::collections::BTreeSet::new();
+    for environment in &state.environments {
+        let machine_id = environment.machines[0].machine_id.clone();
+        let owner = ResourceOwner {
+            project_id: state.definition.project_id.clone(),
+            environment_id: environment.environment_id.clone(),
+            machine_id: Some(machine_id.clone()),
+        };
+        for kind in &resource_kinds {
+            let resource_id = owner
+                .bounded_resource_name(kind, "linux-primary", 96)
+                .unwrap();
+            assert!(expected_ids.insert(resource_id.clone()));
+            store
+                .reserve_owned_resource(
+                    &OwnershipRecord {
+                        schema_version: TOPOLOGY_SCHEMA_VERSION,
+                        resource_kind: kind.clone(),
+                        resource_id,
+                        environment_id: environment.environment_id.clone(),
+                        machine_id: Some(machine_id.clone()),
+                    },
+                    300,
+                )
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        expected_ids.len(),
+        state.environments.len() * resource_kinds.len()
+    );
+
+    let persisted = store
+        .load_project_state("prj_acceptance_layout")
+        .unwrap()
+        .unwrap();
+    let persisted_ids: std::collections::BTreeSet<_> = persisted
+        .environments
+        .iter()
+        .flat_map(|environment| &environment.ownership)
+        .filter(|record| resource_kinds.contains(&record.resource_kind))
+        .map(|record| record.resource_id.clone())
+        .collect();
+    assert_eq!(persisted_ids, expected_ids);
 }

@@ -2,15 +2,29 @@ use std::collections::BTreeMap;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use vz_runtime_contract::types::{
-    EndpointInstance, EnvironmentInstance, LegacyMigrationError, MachineInstance, NetworkInstance,
-    OwnershipRecord, ProjectDefinition, ProjectState, TOPOLOGY_SCHEMA_VERSION, WorkspaceBinding,
-    migrate_legacy_developer_sandbox,
+    EndpointInstance, EnvironmentInstance, EnvironmentSelection, EnvironmentSelectionContext,
+    EnvironmentState, EnvironmentUpDecision, LegacyMigrationError, MachineInstance,
+    NetworkInstance, OwnershipRecord, ProjectDefinition, ProjectState, TOPOLOGY_SCHEMA_VERSION,
+    TopologyResolutionError, WorkspaceBinding, migrate_legacy_developer_sandbox,
 };
 
 use super::StateStore;
 use crate::StackError;
+use crate::error::OwnedResourceCollisionError;
 
 pub(super) const STORE_SCHEMA_VERSION: u32 = 2;
+
+/// Result of atomically selecting or reserving an Environment for `up`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvironmentUpReservation {
+    Existing {
+        selection: EnvironmentSelection,
+        environment: EnvironmentInstance,
+    },
+    Created {
+        environment: EnvironmentInstance,
+    },
+}
 
 pub(super) const TOPOLOGY_SCHEMA_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS project_definitions (
@@ -324,12 +338,30 @@ impl StateStore {
         Ok(())
     }
 
-    /// Persist one complete Project aggregate atomically.
+    /// Bootstrap one complete Project aggregate atomically.
+    ///
+    /// Existing projects must be changed through the narrow locked mutation APIs.
+    /// Rejecting replacement here prevents a caller holding a stale aggregate from
+    /// erasing a concurrently-created Environment or reserved owned resource.
     pub fn save_project_state(&self, state: &ProjectState) -> Result<(), StackError> {
         state
             .validate()
             .map_err(|error| StackError::InvalidSpec(error.to_string()))?;
-        self.with_immediate_transaction(|store| store.save_project_state_in_transaction(state))
+        self.with_immediate_transaction(|store| {
+            if store
+                .load_project_state(state.definition.project_id.as_str())?
+                .is_some()
+            {
+                return Err(StackError::Machine {
+                    code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                    message: format!(
+                        "project `{}` already exists; use a locked topology mutation API",
+                        state.definition.project_id
+                    ),
+                });
+            }
+            store.save_project_state_in_transaction(state)
+        })
     }
 
     pub(super) fn save_project_state_in_transaction(
@@ -606,6 +638,357 @@ impl StateStore {
                 })
             })
             .collect()
+    }
+
+    /// Resolve one existing Environment in a project without mutating state.
+    pub fn resolve_environment(
+        &self,
+        project_id: &str,
+        context: &EnvironmentSelectionContext,
+    ) -> Result<EnvironmentSelection, StackError> {
+        let project = self.load_project_state(project_id)?.ok_or_else(|| {
+            TopologyResolutionError::NotFound {
+                kind: "project".to_string(),
+                selector: project_id.to_string(),
+            }
+        })?;
+        project.resolve_environment(context).map_err(Into::into)
+    }
+
+    /// Atomically select an existing Environment or reserve a fresh immutable instance.
+    ///
+    /// The project is re-read only after `BEGIN IMMEDIATE`, so concurrent creators of
+    /// one name converge and creators of different names retain both sibling instances.
+    pub fn resolve_or_reserve_environment_for_up(
+        &self,
+        definition: &ProjectDefinition,
+        context: &EnvironmentSelectionContext,
+        now: u64,
+    ) -> Result<EnvironmentUpReservation, StackError> {
+        definition
+            .validate()
+            .map_err(|error| StackError::InvalidSpec(error.to_string()))?;
+        self.with_immediate_transaction(|store| {
+            let mut project = match store.load_project_state(definition.project_id.as_str())? {
+                Some(project) => {
+                    if project.definition != *definition {
+                        return Err(StackError::InvalidSpec(format!(
+                            "project definition drift for `{}`; persisted digest={}, requested digest={}",
+                            definition.project_id,
+                            project.definition.digest().map_err(|error| StackError::InvalidSpec(error.to_string()))?,
+                            definition.digest().map_err(|error| StackError::InvalidSpec(error.to_string()))?,
+                        )));
+                    }
+                    project
+                }
+                None => ProjectState {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    definition: definition.clone(),
+                    environments: Vec::new(),
+                },
+            };
+
+            match project.resolve_environment_for_up(context)? {
+                EnvironmentUpDecision::Existing { selection } => {
+                    let environment = project
+                        .environments
+                        .iter()
+                        .find(|environment| environment.environment_id == selection.environment_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            StackError::InvalidSpec(format!(
+                                "selected Environment `{}` disappeared from its locked project aggregate",
+                                selection.environment_id
+                            ))
+                        })?;
+                    Ok(EnvironmentUpReservation::Existing {
+                        selection,
+                        environment,
+                    })
+                }
+                EnvironmentUpDecision::Create { name } => {
+                    let environment = definition
+                        .instantiate_environment(name, now)
+                        .map_err(|error| StackError::InvalidSpec(error.to_string()))?;
+                    project.environments.push(environment.clone());
+                    project
+                        .validate()
+                        .map_err(|error| StackError::InvalidSpec(error.to_string()))?;
+                    store.save_project_state_in_transaction(&project)?;
+                    Ok(EnvironmentUpReservation::Created { environment })
+                }
+            }
+        })
+    }
+
+    /// Reserve a declared workspace slot while an Environment is still Creating.
+    ///
+    /// This is the pre-reconciliation half of workspace setup: it validates the
+    /// exact Project/Environment owner and declared symbolic slot, then persists
+    /// the binding while holding an immediate transaction. Repeating the exact
+    /// reservation is idempotent and does not advance the Environment timestamp.
+    pub fn reserve_workspace_binding_for_environment(
+        &self,
+        requested: &WorkspaceBinding,
+        now: u64,
+    ) -> Result<WorkspaceBinding, StackError> {
+        self.with_immediate_transaction(|store| {
+            let mut project = store
+                .load_project_state(requested.project_id.as_str())?
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(format!(
+                        "project `{}` not found while reserving workspace binding",
+                        requested.project_id
+                    ))
+                })?;
+            let slot_is_declared = project.definition.environment.machines.iter().any(|machine| {
+                machine
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|workspace| workspace.binding == requested.name)
+            });
+            if !slot_is_declared {
+                return Err(StackError::InvalidSpec(format!(
+                    "workspace binding slot `{}` is not declared by project `{}`",
+                    requested.name, requested.project_id
+                )));
+            }
+            let environment = project
+                .environments
+                .iter_mut()
+                .find(|environment| environment.environment_id == requested.environment_id)
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(format!(
+                        "Environment `{}` is not owned by project `{}`",
+                        requested.environment_id, requested.project_id
+                    ))
+                })?;
+            if environment.state != EnvironmentState::Creating {
+                return Err(StackError::InvalidSpec(format!(
+                    "Environment `{}` must be creating while reserving its workspace binding",
+                    requested.environment_id
+                )));
+            }
+            if let Some(existing) = environment.bindings.iter().find(|binding| {
+                binding.name == requested.name || binding.workspace_key == requested.workspace_key
+            }) {
+                if existing == requested {
+                    return Ok(existing.clone());
+                }
+                return Err(StackError::Machine {
+                    code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                    message: format!(
+                        "workspace binding slot `{}` or key `{}` is already reserved in Environment `{}`",
+                        requested.name, requested.workspace_key, requested.environment_id
+                    ),
+                });
+            }
+
+            environment.bindings.push(requested.clone());
+            environment.updated_at = environment.updated_at.max(now);
+            project
+                .validate()
+                .map_err(|error| StackError::InvalidSpec(error.to_string()))?;
+            store.save_project_state_in_transaction(&project)?;
+            Ok(requested.clone())
+        })
+    }
+
+    /// Refresh one workspace slot only after its exact owning Environment is Ready.
+    ///
+    /// `path_hint` is diagnostic: it may change without changing the binding identity.
+    /// Existing Machine/resource identities are preserved by re-reading and writing the
+    /// latest aggregate while holding an immediate transaction.
+    pub fn refresh_workspace_binding(
+        &self,
+        requested: &WorkspaceBinding,
+        now: u64,
+    ) -> Result<WorkspaceBinding, StackError> {
+        self.with_immediate_transaction(|store| {
+            let mut project = store
+                .load_project_state(requested.project_id.as_str())?
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(format!(
+                        "project `{}` not found while refreshing workspace binding",
+                        requested.project_id
+                    ))
+                })?;
+            let environment = project
+                .environments
+                .iter_mut()
+                .find(|environment| environment.environment_id == requested.environment_id)
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(format!(
+                        "Environment `{}` is not owned by project `{}`",
+                        requested.environment_id, requested.project_id
+                    ))
+                })?;
+            if environment.state != EnvironmentState::Ready {
+                return Err(StackError::InvalidSpec(format!(
+                    "Environment `{}` must be ready before refreshing a workspace binding",
+                    requested.environment_id
+                )));
+            }
+
+            let refreshed = if let Some(existing) = environment
+                .bindings
+                .iter_mut()
+                .find(|binding| binding.name == requested.name)
+            {
+                // The symbolic slot owns the immutable binding identity. A successful
+                // reconcile may move that slot to a new opaque workspace key and may
+                // refresh its diagnostic path without replacing any other resource.
+                existing.workspace_key = requested.workspace_key.clone();
+                existing.path_hint = requested.path_hint.clone();
+                existing.clone()
+            } else {
+                if let Some(existing) = environment
+                    .bindings
+                    .iter()
+                    .find(|binding| binding.workspace_key == requested.workspace_key)
+                {
+                    return Err(StackError::InvalidSpec(format!(
+                        "workspace key `{}` is already bound to slot `{}` in Environment `{}`",
+                        requested.workspace_key, existing.name, requested.environment_id
+                    )));
+                }
+                environment.bindings.push(requested.clone());
+                requested.clone()
+            };
+            environment.updated_at = environment.updated_at.max(now);
+            project
+                .validate()
+                .map_err(|error| StackError::InvalidSpec(error.to_string()))?;
+            store.save_project_state_in_transaction(&project)?;
+            Ok(refreshed)
+        })
+    }
+
+    /// Atomically reserve a physical/runtime resource for its exact topology owner.
+    ///
+    /// Repeating the exact reservation is idempotent. A reservation held by any
+    /// different Environment or Machine fails before the aggregate is changed.
+    pub fn reserve_owned_resource(
+        &self,
+        requested: &OwnershipRecord,
+        now: u64,
+    ) -> Result<OwnershipRecord, StackError> {
+        self.with_immediate_transaction(|store| {
+            let encoded_kind = serde_json::to_string(&requested.resource_kind)?;
+            let existing: Option<(String, String, String, Option<String>, i64, String)> = store
+                .conn
+                .query_row(
+                    "SELECT resource_kind, resource_id, environment_id, machine_id,
+                            schema_version, record_json
+                     FROM topology_ownership
+                     WHERE resource_kind = ?1 AND resource_id = ?2",
+                    params![encoded_kind, requested.resource_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((
+                resource_kind,
+                resource_id,
+                sql_environment_id,
+                machine_id,
+                schema_version,
+                json,
+            )) = existing
+            {
+                let table = "topology_ownership";
+                let key = format!("{resource_kind}:{resource_id}");
+                let existing: OwnershipRecord =
+                    parse_persisted_json(table, &key, "record_json", &json)?;
+                require_projection(
+                    resource_kind == serde_json::to_string(&existing.resource_kind)?,
+                    table,
+                    &key,
+                    "resource_kind",
+                )?;
+                require_projection(
+                    resource_id == existing.resource_id,
+                    table,
+                    &key,
+                    "resource_id",
+                )?;
+                require_projection(
+                    sql_environment_id == existing.environment_id.as_str(),
+                    table,
+                    &key,
+                    "environment_id",
+                )?;
+                require_projection(
+                    machine_id.as_deref() == existing.machine_id.as_ref().map(|id| id.as_str()),
+                    table,
+                    &key,
+                    "machine_id",
+                )?;
+                require_projection(
+                    schema_version == i64::from(existing.schema_version),
+                    table,
+                    &key,
+                    "schema_version",
+                )?;
+                if existing == *requested {
+                    return Ok(existing);
+                }
+                return Err(StackError::OwnedResourceCollision(Box::new(
+                    OwnedResourceCollisionError {
+                        resource_kind: encoded_kind,
+                        resource_id: requested.resource_id.clone(),
+                        existing_environment_id: existing.environment_id.to_string(),
+                        existing_machine_id: existing.machine_id.map(|id| id.to_string()),
+                    },
+                )));
+            }
+
+            let project_id: Option<String> = store
+                .conn
+                .query_row(
+                    "SELECT project_id FROM environment_instances WHERE environment_id = ?1",
+                    params![requested.environment_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let project_id = project_id.ok_or_else(|| {
+                StackError::InvalidSpec(format!(
+                    "Environment `{}` not found while reserving resource `{}`",
+                    requested.environment_id, requested.resource_id
+                ))
+            })?;
+            let mut project = store.load_project_state(&project_id)?.ok_or_else(|| {
+                StackError::InvalidSpec(format!(
+                    "project `{project_id}` disappeared while reserving resource `{}`",
+                    requested.resource_id
+                ))
+            })?;
+            let environment = project
+                .environments
+                .iter_mut()
+                .find(|environment| environment.environment_id == requested.environment_id)
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(format!(
+                        "Environment `{}` is not owned by project `{project_id}`",
+                        requested.environment_id
+                    ))
+                })?;
+            environment.ownership.push(requested.clone());
+            environment.updated_at = environment.updated_at.max(now);
+            project
+                .validate()
+                .map_err(|error| StackError::InvalidSpec(error.to_string()))?;
+            store.save_project_state_in_transaction(&project)?;
+            Ok(requested.clone())
+        })
     }
 
     fn load_environments_for_project(

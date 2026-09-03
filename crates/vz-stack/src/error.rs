@@ -2,7 +2,20 @@ use std::collections::BTreeMap;
 
 use vz_runtime_contract::{
     MachineError, MachineErrorCode, MachineErrorEnvelope, RequestMetadata, RuntimeError,
+    TopologyResolutionError,
 };
+
+/// Owner recorded for a physical/runtime resource key that could not be reserved.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "owned resource collision: kind={resource_kind}; resource_id={resource_id}; existing_environment_id={existing_environment_id}; existing_machine_id={existing_machine_id:?}"
+)]
+pub struct OwnedResourceCollisionError {
+    pub resource_kind: String,
+    pub resource_id: String,
+    pub existing_environment_id: String,
+    pub existing_machine_id: Option<String>,
+}
 
 /// Errors produced by `vz-stack` operations.
 #[derive(Debug, thiserror::Error)]
@@ -18,6 +31,14 @@ pub enum StackError {
     /// Invalid stack specification.
     #[error("invalid stack spec: {0}")]
     InvalidSpec(String),
+
+    /// A Developer Environment selector did not resolve uniquely.
+    #[error(transparent)]
+    TopologyResolution(Box<TopologyResolutionError>),
+
+    /// A physical/runtime resource key is already reserved by another owner.
+    #[error(transparent)]
+    OwnedResourceCollision(Box<OwnedResourceCollisionError>),
 
     /// Network backend operation failed.
     #[error("network error: {0}")]
@@ -71,6 +92,17 @@ impl StackError {
             StackError::Store(_) | StackError::Serialization(_) | StackError::VolumeIo(_) => {
                 MachineErrorCode::InternalError
             }
+            StackError::TopologyResolution(error) => match error.as_ref() {
+                TopologyResolutionError::NotFound { .. } => MachineErrorCode::NotFound,
+                TopologyResolutionError::Ambiguous { .. }
+                | TopologyResolutionError::SelectionRequired { .. } => {
+                    MachineErrorCode::StateConflict
+                }
+                TopologyResolutionError::InvalidSelector { .. } => {
+                    MachineErrorCode::ValidationError
+                }
+            },
+            StackError::OwnedResourceCollision(_) => MachineErrorCode::StateConflict,
             StackError::InvalidSpec(_)
             | StackError::ComposeParse(_)
             | StackError::ComposeValidation(_) => MachineErrorCode::ValidationError,
@@ -107,6 +139,20 @@ impl StackError {
             | StackError::ComposeValidation(message) => {
                 details.insert("reason".to_string(), message.clone());
             }
+            StackError::TopologyResolution(error) => {
+                details.insert("reason".to_string(), error.to_string());
+            }
+            StackError::OwnedResourceCollision(error) => {
+                details.insert("resource_kind".to_string(), error.resource_kind.clone());
+                details.insert("resource_id".to_string(), error.resource_id.clone());
+                details.insert(
+                    "existing_environment_id".to_string(),
+                    error.existing_environment_id.clone(),
+                );
+                if let Some(machine_id) = &error.existing_machine_id {
+                    details.insert("existing_machine_id".to_string(), machine_id.clone());
+                }
+            }
             StackError::ComposeUnsupportedFeature { feature, reason } => {
                 details.insert("feature".to_string(), feature.clone());
                 details.insert("reason".to_string(), reason.clone());
@@ -134,6 +180,12 @@ impl StackError {
     /// Convert a stack error into the shared transport error envelope.
     pub fn to_machine_error_envelope(&self, metadata: &RequestMetadata) -> MachineErrorEnvelope {
         MachineErrorEnvelope::new(self.to_machine_error(metadata))
+    }
+}
+
+impl From<TopologyResolutionError> for StackError {
+    fn from(error: TopologyResolutionError) -> Self {
+        Self::TopologyResolution(Box::new(error))
     }
 }
 
@@ -196,5 +248,45 @@ mod tests {
         assert!(message.starts_with("unsupported_operation:"));
         assert!(message.contains("surface=compose"));
         assert!(message.contains("feature=services.web.networks.frontend.aliases"));
+    }
+
+    #[test]
+    fn topology_resolution_and_resource_conflicts_use_state_aware_machine_codes() {
+        assert_eq!(
+            StackError::from(TopologyResolutionError::NotFound {
+                kind: "environment".to_string(),
+                selector: "env_missing".to_string(),
+            })
+            .machine_code(),
+            MachineErrorCode::NotFound
+        );
+        assert_eq!(
+            StackError::from(TopologyResolutionError::selection_required(
+                "environment",
+                "workspace",
+                [],
+            ))
+            .machine_code(),
+            MachineErrorCode::StateConflict
+        );
+        assert_eq!(
+            StackError::from(TopologyResolutionError::InvalidSelector {
+                kind: "environment".to_string(),
+                selector: "".to_string(),
+                reason: "selector is blank".to_string(),
+            })
+            .machine_code(),
+            MachineErrorCode::ValidationError
+        );
+        assert_eq!(
+            StackError::OwnedResourceCollision(Box::new(OwnedResourceCollisionError {
+                resource_kind: "disk".to_string(),
+                resource_id: "disk-1".to_string(),
+                existing_environment_id: "env_owner".to_string(),
+                existing_machine_id: None,
+            }))
+            .machine_code(),
+            MachineErrorCode::StateConflict
+        );
     }
 }

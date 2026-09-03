@@ -331,6 +331,18 @@ message TopologyAmbiguityDetail {
   repeated TopologyCandidate candidates = 3;
 }
 
+message TopologySelectionRequiredDetail {
+  string kind = 1;
+  string selector = 2;
+  repeated TopologyCandidate candidates = 3;
+}
+
+message TopologyInvalidSelectorDetail {
+  string kind = 1;
+  string selector = 2;
+  string reason = 3;
+}
+
 message TopologyUnsupportedTargetDetail {
   OperatingSystem host_os = 1;
   Architecture host_arch = 2;
@@ -371,6 +383,8 @@ message TopologyErrorDetail {
     TopologyInvalidMachineProfileDetail invalid_machine_profile = 5;
     TopologyInvalidCapabilityDeclarationDetail invalid_capability_declaration = 6;
     TopologyContradictoryCapabilityDetail contradictory_capability = 7;
+    TopologySelectionRequiredDetail selection_required = 8;
+    TopologyInvalidSelectorDetail invalid_selector = 9;
   }
 }
 

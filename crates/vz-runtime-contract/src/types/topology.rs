@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use uuid::Uuid;
 
 use super::{
     SANDBOX_LABEL_PROJECT_DIR, SANDBOX_LABEL_SPACE_MODE, SANDBOX_SPACE_MODE_REQUIRED, Sandbox,
@@ -15,9 +16,13 @@ pub const TOPOLOGY_SCHEMA_VERSION: u32 = 1;
 const MAX_ID_LENGTH: usize = 128;
 const MAX_NAME_LENGTH: usize = 128;
 const LEGACY_DEVELOPER_MARKER: &str = "vz.run.workspace";
+/// Maximum number of candidates returned by a topology selection error.
+pub const MAX_TOPOLOGY_SELECTION_CANDIDATES: usize = 20;
+const RESOURCE_NAME_VERSION_PREFIX: &str = "vzr1";
+const RESOURCE_NAME_DIGEST_HEX_LENGTH: usize = 32;
 
 macro_rules! topology_id {
-    ($name:ident, $label:literal) => {
+    ($name:ident, $label:literal, $prefix:literal) => {
         #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
         #[serde(transparent)]
         pub struct $name(String);
@@ -28,6 +33,11 @@ macro_rules! topology_id {
                 let value = value.into();
                 validate_identifier($label, &value)?;
                 Ok(Self(value))
+            }
+
+            /// Generate a fresh opaque identity with a stable, type-specific prefix.
+            pub fn generate() -> Self {
+                Self(format!("{}{}", $prefix, Uuid::new_v4().simple()))
             }
 
             /// Borrow the stable wire representation.
@@ -64,13 +74,13 @@ macro_rules! topology_id {
     };
 }
 
-topology_id!(ProjectId, "project_id");
-topology_id!(EnvironmentId, "environment_id");
-topology_id!(MachineId, "machine_id");
-topology_id!(MachineIncarnationId, "machine_incarnation_id");
-topology_id!(WorkspaceBindingId, "workspace_binding_id");
-topology_id!(NetworkId, "network_id");
-topology_id!(EndpointId, "endpoint_id");
+topology_id!(ProjectId, "project_id", "prj_");
+topology_id!(EnvironmentId, "environment_id", "env_");
+topology_id!(MachineId, "machine_id", "mch_");
+topology_id!(MachineIncarnationId, "machine_incarnation_id", "inc_");
+topology_id!(WorkspaceBindingId, "workspace_binding_id", "wsp_");
+topology_id!(NetworkId, "network_id", "net_");
+topology_id!(EndpointId, "endpoint_id", "end_");
 
 /// Host or Machine operating system.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -274,7 +284,11 @@ pub struct ProjectDefinition {
     pub environment: EnvironmentSpec,
 }
 
-/// A path-independent workspace association. `path_hint` is a relocatable selector only.
+/// A path-independent workspace association.
+///
+/// `workspace_key` is the authoritative opaque worktree token. `path_hint` is
+/// non-authorizing diagnostic metadata and must never be used to adopt an
+/// Environment or derive persistent identity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceBinding {
     pub schema_version: u32,
@@ -373,7 +387,7 @@ pub struct EndpointInstance {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum OwnedResourceKind {
     Machine,
@@ -398,6 +412,83 @@ pub struct OwnershipRecord {
     pub environment_id: EnvironmentId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<MachineId>,
+}
+
+/// Stable ownership tuple for a physical resource.
+///
+/// Host paths and human names are intentionally absent so relocation cannot
+/// change a resource name or cause cross-Environment adoption.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceOwner {
+    pub project_id: ProjectId,
+    pub environment_id: EnvironmentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<MachineId>,
+}
+
+impl ResourceOwner {
+    /// Build a deterministic, bounded physical name for an owned resource.
+    ///
+    /// Callers must still collision-check this name in the physical backend
+    /// namespace before mutation. A matching name may be reused only when the
+    /// persisted owner tuple and logical identity are identical.
+    pub fn bounded_resource_name(
+        &self,
+        resource_kind: &OwnedResourceKind,
+        logical_identity: &str,
+        max_bytes: usize,
+    ) -> Result<String, TopologyValidationError> {
+        if logical_identity.trim().is_empty() {
+            return Err(TopologyValidationError::InvalidIdentifier {
+                kind: "resource.logical_identity".to_string(),
+                value: logical_identity.to_string(),
+                reason: "must not be empty".to_string(),
+            });
+        }
+
+        let minimum = RESOURCE_NAME_VERSION_PREFIX.len() + 1 + RESOURCE_NAME_DIGEST_HEX_LENGTH;
+        if max_bytes < minimum {
+            return Err(TopologyValidationError::InvalidIdentifier {
+                kind: "resource.max_name_bytes".to_string(),
+                value: max_bytes.to_string(),
+                reason: format!("must be at least {minimum}"),
+            });
+        }
+
+        let kind = resource_kind_identity(resource_kind);
+        let machine_id = self
+            .machine_id
+            .as_ref()
+            .map(MachineId::as_str)
+            .unwrap_or("");
+        let mut hasher = Sha256::new();
+        hasher.update(b"vz.resource-name.v1\0");
+        for field in [
+            self.project_id.as_str(),
+            self.environment_id.as_str(),
+            machine_id,
+            kind.as_str(),
+            logical_identity,
+        ] {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
+        let digest = format!("{:x}", hasher.finalize());
+        let digest = &digest[..RESOURCE_NAME_DIGEST_HEX_LENGTH];
+        let readable = resource_name_slug(&format!("{kind}-{logical_identity}"));
+        let readable_budget = max_bytes - minimum;
+        if readable_budget == 0 {
+            return Ok(format!("{RESOURCE_NAME_VERSION_PREFIX}-{digest}"));
+        }
+        let readable = &readable[..readable.len().min(readable_budget.saturating_sub(1))];
+        if readable.is_empty() {
+            Ok(format!("{RESOURCE_NAME_VERSION_PREFIX}-{digest}"))
+        } else {
+            Ok(format!(
+                "{RESOURCE_NAME_VERSION_PREFIX}-{readable}-{digest}"
+            ))
+        }
+    }
 }
 
 /// Provenance retained when a v0.3.20 Sandbox becomes a Developer Environment.
@@ -442,6 +533,54 @@ pub struct ProjectState {
     pub environments: Vec<EnvironmentInstance>,
 }
 
+/// An explicit Environment selector. `NameOrId` exists for the single CLI
+/// spelling and deliberately checks both namespaces rather than guessing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum EnvironmentSelector {
+    Id(EnvironmentId),
+    Name(String),
+    NameOrId(String),
+}
+
+/// All process-local inputs used to select one Environment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentSelectionContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explicit: Option<EnvironmentSelector>,
+    /// Immutable ID received from the process-scoped `VZ_ENVIRONMENT_ID` selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_environment_id: Option<EnvironmentId>,
+    /// Opaque token read from the resolved worktree's private Git metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentSelectionSource {
+    Explicit,
+    Process,
+    Workspace,
+}
+
+/// Stable result of selecting an existing Environment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentSelection {
+    pub project_id: ProjectId,
+    pub environment_id: EnvironmentId,
+    pub name: String,
+    pub source: EnvironmentSelectionSource,
+}
+
+/// Read-only decision made before `up` starts any reconciliation or binding mutation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum EnvironmentUpDecision {
+    Existing { selection: EnvironmentSelection },
+    Create { name: String },
+}
+
 /// A structured resolution candidate; callers render these without parsing prose.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TopologyCandidate {
@@ -452,10 +591,22 @@ pub struct TopologyCandidate {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Error)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum TopologyResolutionError {
+    #[error("invalid {kind} selector `{selector}`: {reason}")]
+    InvalidSelector {
+        kind: String,
+        selector: String,
+        reason: String,
+    },
     #[error("no {kind} matched selector `{selector}`")]
     NotFound { kind: String, selector: String },
     #[error("selector `{selector}` matched multiple {kind} candidates")]
     Ambiguous {
+        kind: String,
+        selector: String,
+        candidates: Vec<TopologyCandidate>,
+    },
+    #[error("select a {kind} explicitly; {selector} does not identify an existing binding")]
+    SelectionRequired {
         kind: String,
         selector: String,
         candidates: Vec<TopologyCandidate>,
@@ -468,14 +619,35 @@ impl TopologyResolutionError {
         selector: impl Into<String>,
         candidates: impl IntoIterator<Item = TopologyCandidate>,
     ) -> Self {
-        let mut candidates: Vec<_> = candidates.into_iter().collect();
-        candidates.sort();
+        let candidates = bounded_candidates(candidates);
         Self::Ambiguous {
             kind: kind.into(),
             selector: selector.into(),
             candidates,
         }
     }
+
+    pub fn selection_required(
+        kind: impl Into<String>,
+        selector: impl Into<String>,
+        candidates: impl IntoIterator<Item = TopologyCandidate>,
+    ) -> Self {
+        Self::SelectionRequired {
+            kind: kind.into(),
+            selector: selector.into(),
+            candidates: bounded_candidates(candidates),
+        }
+    }
+}
+
+fn bounded_candidates(
+    candidates: impl IntoIterator<Item = TopologyCandidate>,
+) -> Vec<TopologyCandidate> {
+    let mut candidates: Vec<_> = candidates.into_iter().collect();
+    candidates.sort();
+    candidates.dedup();
+    candidates.truncate(MAX_TOPOLOGY_SELECTION_CANDIDATES);
+    candidates
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Error)]
@@ -605,6 +777,122 @@ impl ProjectDefinition {
         })?;
         Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
     }
+
+    /// Materialize a fresh, unbound Environment identity from this definition.
+    ///
+    /// Runtime negotiation and workspace authorization happen during later
+    /// reconciliation. This constructor never derives identity from a path or
+    /// human selector.
+    pub fn instantiate_environment(
+        &self,
+        name: impl Into<String>,
+        now: u64,
+    ) -> Result<EnvironmentInstance, TopologyValidationError> {
+        self.validate()?;
+        let name = name.into();
+        validate_name("environment", &name)?;
+        let environment_id = EnvironmentId::generate();
+
+        let machines: Vec<_> = self
+            .environment
+            .machines
+            .iter()
+            .map(|machine| MachineInstance {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                machine_id: MachineId::generate(),
+                environment_id: environment_id.clone(),
+                name: machine.name.clone(),
+                profile: machine.profile,
+                target: machine.target.clone(),
+                resources: machine.resources.clone(),
+                requested_capabilities: machine.requested_capabilities.clone(),
+                negotiated_capabilities: CapabilitySet::default(),
+                backend: None,
+                incarnation: None,
+                state: MachineState::Creating,
+                legacy_sandbox_id: None,
+            })
+            .collect();
+        let machine_ids: BTreeMap<_, _> = machines
+            .iter()
+            .map(|machine| (machine.name.as_str(), machine.machine_id.clone()))
+            .collect();
+
+        let networks: Vec<_> = self
+            .environment
+            .networks
+            .iter()
+            .map(|network| NetworkInstance {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                network_id: NetworkId::generate(),
+                environment_id: environment_id.clone(),
+                name: network.name.clone(),
+            })
+            .collect();
+        let network_ids: BTreeMap<_, _> = networks
+            .iter()
+            .map(|network| (network.name.as_str(), network.network_id.clone()))
+            .collect();
+
+        let endpoints: Vec<_> = self
+            .environment
+            .endpoints
+            .iter()
+            .map(|endpoint| EndpointInstance {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                endpoint_id: EndpointId::generate(),
+                environment_id: environment_id.clone(),
+                machine_id: machine_ids[endpoint.machine.as_str()].clone(),
+                network_id: network_ids[endpoint.network.as_str()].clone(),
+                name: endpoint.name.clone(),
+            })
+            .collect();
+
+        let mut ownership: Vec<_> = machines
+            .iter()
+            .map(|machine| OwnershipRecord {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                resource_kind: OwnedResourceKind::Machine,
+                resource_id: machine.machine_id.to_string(),
+                environment_id: environment_id.clone(),
+                machine_id: Some(machine.machine_id.clone()),
+            })
+            .collect();
+        ownership.extend(networks.iter().map(|network| OwnershipRecord {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            resource_kind: OwnedResourceKind::Network,
+            resource_id: network.network_id.to_string(),
+            environment_id: environment_id.clone(),
+            machine_id: None,
+        }));
+        ownership.extend(endpoints.iter().map(|endpoint| OwnershipRecord {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            resource_kind: OwnedResourceKind::Endpoint,
+            resource_id: endpoint.endpoint_id.to_string(),
+            environment_id: environment_id.clone(),
+            machine_id: Some(endpoint.machine_id.clone()),
+        }));
+
+        let environment = EnvironmentInstance {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            environment_id,
+            project_id: self.project_id.clone(),
+            name,
+            definition_digest: self.digest()?,
+            state: EnvironmentState::Creating,
+            bindings: Vec::new(),
+            machines,
+            networks,
+            endpoints,
+            ownership,
+            legacy_migration: None,
+            created_at: now,
+            updated_at: now,
+        };
+        environment.validate()?;
+        validate_definition_instance(&self.environment, &environment)?;
+        Ok(environment)
+    }
 }
 
 impl EnvironmentSpec {
@@ -708,6 +996,264 @@ impl ProjectState {
             }
         }
         Ok(())
+    }
+
+    /// Resolve one existing Environment without mutating bindings or topology.
+    pub fn resolve_environment(
+        &self,
+        context: &EnvironmentSelectionContext,
+    ) -> Result<EnvironmentSelection, TopologyResolutionError> {
+        if let Some(selector) = &context.explicit {
+            return self
+                .resolve_explicit_environment(selector)?
+                .map(|environment| {
+                    environment_selection(environment, EnvironmentSelectionSource::Explicit)
+                })
+                .ok_or_else(|| TopologyResolutionError::NotFound {
+                    kind: "environment".to_string(),
+                    selector: environment_selector_value(selector).to_string(),
+                });
+        }
+
+        if let Some(environment_id) = &context.process_environment_id {
+            environment_id.validate().map_err(|error| {
+                TopologyResolutionError::InvalidSelector {
+                    kind: "environment".to_string(),
+                    selector: environment_id.to_string(),
+                    reason: error.to_string(),
+                }
+            })?;
+            return self
+                .environments
+                .iter()
+                .find(|environment| {
+                    environment.project_id == self.definition.project_id
+                        && environment.environment_id == *environment_id
+                })
+                .map(|environment| {
+                    environment_selection(environment, EnvironmentSelectionSource::Process)
+                })
+                .ok_or_else(|| TopologyResolutionError::NotFound {
+                    kind: "environment".to_string(),
+                    selector: environment_id.to_string(),
+                });
+        }
+
+        if let Some(workspace_key) = context.workspace_key.as_deref() {
+            validate_name("workspace_key", workspace_key).map_err(|error| {
+                TopologyResolutionError::InvalidSelector {
+                    kind: "workspace".to_string(),
+                    selector: "workspace binding".to_string(),
+                    reason: error.to_string(),
+                }
+            })?;
+            let bound: Vec<_> = self
+                .environments
+                .iter()
+                .filter(|environment| {
+                    environment.project_id == self.definition.project_id
+                        && environment.bindings.iter().any(|binding| {
+                            binding.project_id == self.definition.project_id
+                                && binding.workspace_key == workspace_key
+                        })
+                })
+                .collect();
+            match bound.as_slice() {
+                [environment] => {
+                    return Ok(environment_selection(
+                        environment,
+                        EnvironmentSelectionSource::Workspace,
+                    ));
+                }
+                [] => {}
+                _ => {
+                    return Err(TopologyResolutionError::ambiguous(
+                        "environment",
+                        "workspace binding",
+                        bound.into_iter().map(environment_candidate),
+                    ));
+                }
+            }
+        }
+
+        Err(TopologyResolutionError::selection_required(
+            "environment",
+            "workspace binding",
+            self.environments
+                .iter()
+                .filter(|environment| environment.project_id == self.definition.project_id)
+                .map(environment_candidate),
+        ))
+    }
+
+    /// Decide whether `up` selects an existing Environment or may create one.
+    ///
+    /// Only a missing explicit name (including a non-colliding `NameOrId`) or
+    /// the empty-project `default` rule can create. A stale explicit/process ID
+    /// never falls through to another tier or to creation.
+    pub fn resolve_environment_for_up(
+        &self,
+        context: &EnvironmentSelectionContext,
+    ) -> Result<EnvironmentUpDecision, TopologyResolutionError> {
+        if let Some(selector) = &context.explicit {
+            if let Some(environment) = self.resolve_explicit_environment(selector)? {
+                return Ok(EnvironmentUpDecision::Existing {
+                    selection: environment_selection(
+                        environment,
+                        EnvironmentSelectionSource::Explicit,
+                    ),
+                });
+            }
+            return match selector {
+                EnvironmentSelector::Name(name) => {
+                    validate_name("environment", name).map_err(|error| {
+                        TopologyResolutionError::InvalidSelector {
+                            kind: "environment".to_string(),
+                            selector: name.clone(),
+                            reason: error.to_string(),
+                        }
+                    })?;
+                    Ok(EnvironmentUpDecision::Create { name: name.clone() })
+                }
+                EnvironmentSelector::NameOrId(value) => {
+                    validate_name("environment", value).map_err(|error| {
+                        TopologyResolutionError::InvalidSelector {
+                            kind: "environment".to_string(),
+                            selector: value.clone(),
+                            reason: error.to_string(),
+                        }
+                    })?;
+                    if is_generated_environment_id(value) {
+                        Err(TopologyResolutionError::NotFound {
+                            kind: "environment".to_string(),
+                            selector: value.clone(),
+                        })
+                    } else {
+                        Ok(EnvironmentUpDecision::Create {
+                            name: value.clone(),
+                        })
+                    }
+                }
+                EnvironmentSelector::Id(environment_id) => Err(TopologyResolutionError::NotFound {
+                    kind: "environment".to_string(),
+                    selector: environment_id.to_string(),
+                }),
+            };
+        }
+
+        if context.process_environment_id.is_some() {
+            return self
+                .resolve_environment(context)
+                .map(|selection| EnvironmentUpDecision::Existing { selection });
+        }
+
+        match self.resolve_environment(context) {
+            Ok(selection) => Ok(EnvironmentUpDecision::Existing { selection }),
+            Err(TopologyResolutionError::SelectionRequired { .. })
+                if self.environments.is_empty() =>
+            {
+                Ok(EnvironmentUpDecision::Create {
+                    name: "default".to_string(),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn resolve_explicit_environment(
+        &self,
+        selector: &EnvironmentSelector,
+    ) -> Result<Option<&EnvironmentInstance>, TopologyResolutionError> {
+        match selector {
+            EnvironmentSelector::Id(environment_id) => environment_id
+                .validate()
+                .map_err(|error| TopologyResolutionError::InvalidSelector {
+                    kind: "environment".to_string(),
+                    selector: environment_id.to_string(),
+                    reason: error.to_string(),
+                })
+                .map(|()| {
+                    self.environments.iter().find(|environment| {
+                        environment.project_id == self.definition.project_id
+                            && environment.environment_id == *environment_id
+                    })
+                }),
+            EnvironmentSelector::Name(name) => {
+                validate_name("environment", name).map_err(|error| {
+                    TopologyResolutionError::InvalidSelector {
+                        kind: "environment".to_string(),
+                        selector: name.clone(),
+                        reason: error.to_string(),
+                    }
+                })?;
+                Ok(self.environments.iter().find(|environment| {
+                    environment.project_id == self.definition.project_id
+                        && environment.name == *name
+                }))
+            }
+            EnvironmentSelector::NameOrId(value) => {
+                validate_name("environment", value).map_err(|error| {
+                    TopologyResolutionError::InvalidSelector {
+                        kind: "environment".to_string(),
+                        selector: value.clone(),
+                        reason: error.to_string(),
+                    }
+                })?;
+                let matches: Vec<_> = self
+                    .environments
+                    .iter()
+                    .filter(|environment| {
+                        environment.project_id == self.definition.project_id
+                            && (environment.environment_id.as_str() == value
+                                || environment.name == *value)
+                    })
+                    .collect();
+                match matches.as_slice() {
+                    [] => Ok(None),
+                    [environment] => Ok(Some(environment)),
+                    _ => Err(TopologyResolutionError::ambiguous(
+                        "environment",
+                        value,
+                        matches.into_iter().map(environment_candidate),
+                    )),
+                }
+            }
+        }
+    }
+}
+
+fn is_generated_environment_id(value: &str) -> bool {
+    value.strip_prefix("env_").is_some_and(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn environment_selector_value(selector: &EnvironmentSelector) -> &str {
+    match selector {
+        EnvironmentSelector::Id(id) => id.as_str(),
+        EnvironmentSelector::Name(name) | EnvironmentSelector::NameOrId(name) => name,
+    }
+}
+
+fn environment_candidate(environment: &EnvironmentInstance) -> TopologyCandidate {
+    TopologyCandidate {
+        id: environment.environment_id.to_string(),
+        name: environment.name.clone(),
+    }
+}
+
+fn environment_selection(
+    environment: &EnvironmentInstance,
+    source: EnvironmentSelectionSource,
+) -> EnvironmentSelection {
+    EnvironmentSelection {
+        project_id: environment.project_id.clone(),
+        environment_id: environment.environment_id.clone(),
+        name: environment.name.clone(),
+        source,
     }
 }
 
@@ -825,6 +1371,7 @@ impl EnvironmentInstance {
                 });
             }
         }
+        let mut ownership_keys = BTreeSet::new();
         for record in &self.ownership {
             validate_schema(record.schema_version)?;
             if record.environment_id != self.environment_id {
@@ -848,6 +1395,16 @@ impl EnvironmentInstance {
                     value: record.resource_id.clone(),
                 });
             }
+            if !ownership_keys.insert((&record.resource_kind, record.resource_id.as_str())) {
+                return Err(TopologyValidationError::Duplicate {
+                    kind: "ownership_resource".to_string(),
+                    value: format!(
+                        "{}:{}",
+                        resource_kind_identity(&record.resource_kind),
+                        record.resource_id
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -861,12 +1418,17 @@ impl MachineInstance {
         validate_name("machine", &self.name)?;
         validate_target(&self.target)?;
         validate_requested_capabilities(&self.name, &self.requested_capabilities)?;
+        // Creation can fail before capability negotiation completes. Persist that
+        // failure record so reconciliation can diagnose or resume it; operational
+        // Ready/Stopped Machines still require a complete negotiation result.
+        let negotiation_complete =
+            matches!(self.state, MachineState::Ready | MachineState::Stopped);
         validate_machine_profile(
             self.machine_id.as_str(),
             self.profile,
             &self.target,
             &self.requested_capabilities,
-            Some(&self.negotiated_capabilities),
+            negotiation_complete.then_some(&self.negotiated_capabilities),
         )?;
         if let Some(incarnation) = &self.incarnation {
             validate_schema(incarnation.schema_version)?;
@@ -907,11 +1469,12 @@ impl MachineInstance {
                 });
             }
         }
-        if let Some(capability) = self
-            .requested_capabilities
-            .unaccounted_by(&self.negotiated_capabilities)
-            .into_iter()
-            .next()
+        if negotiation_complete
+            && let Some(capability) = self
+                .requested_capabilities
+                .unaccounted_by(&self.negotiated_capabilities)
+                .into_iter()
+                .next()
         {
             return Err(TopologyValidationError::MissingCapability {
                 machine_id: self.machine_id.to_string(),
@@ -968,7 +1531,14 @@ fn validate_definition_instance(
                 format!("Machine `{}` requested capabilities differ", desired.name),
             );
         }
-        if let Some(workspace) = &desired.workspace
+        // A failed Environment may be the durable result of creation failing
+        // before its workspace slot was reserved. All states reached after
+        // successful creation keep the binding requirement, including Stopped
+        // and Deleting, so lifecycle operations cannot shed selector authority.
+        if !matches!(
+            environment.state,
+            EnvironmentState::Creating | EnvironmentState::Failed
+        ) && let Some(workspace) = &desired.workspace
             && !binding_names.contains(workspace.binding.as_str())
         {
             return definition_topology_mismatch(
@@ -1330,6 +1900,7 @@ fn resource_kind_requires_machine(kind: &OwnedResourceKind) -> bool {
             | OwnedResourceKind::Disk
             | OwnedResourceKind::Socket
             | OwnedResourceKind::DockerContext
+            | OwnedResourceKind::Endpoint
             | OwnedResourceKind::LegacySandbox
     )
 }
@@ -1360,6 +1931,40 @@ fn validate_identifier(kind: &str, value: &str) -> Result<(), TopologyValidation
         });
     }
     Ok(())
+}
+
+fn resource_kind_identity(kind: &OwnedResourceKind) -> String {
+    match kind {
+        OwnedResourceKind::Machine => "machine".to_string(),
+        OwnedResourceKind::Incarnation => "incarnation".to_string(),
+        OwnedResourceKind::Disk => "disk".to_string(),
+        OwnedResourceKind::Socket => "socket".to_string(),
+        OwnedResourceKind::DockerContext => "docker_context".to_string(),
+        OwnedResourceKind::Network => "network".to_string(),
+        OwnedResourceKind::Endpoint => "endpoint".to_string(),
+        OwnedResourceKind::Credential => "credential".to_string(),
+        OwnedResourceKind::Fault => "fault".to_string(),
+        OwnedResourceKind::LegacySandbox => "legacy_sandbox".to_string(),
+        OwnedResourceKind::Other(value) => format!("other:{value}"),
+    }
+}
+
+fn resource_name_slug(value: &str) -> String {
+    let mut slug = String::with_capacity(value.len());
+    let mut previous_was_dash = false;
+    for byte in value.bytes() {
+        let mapped = if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.') {
+            byte as char
+        } else {
+            '-'
+        };
+        if mapped == '-' && previous_was_dash {
+            continue;
+        }
+        previous_was_dash = mapped == '-';
+        slug.push(mapped);
+    }
+    slug.trim_matches('-').to_string()
 }
 
 fn validate_name(kind: &str, value: &str) -> Result<(), TopologyValidationError> {
@@ -2015,5 +2620,534 @@ mod tests {
             state.environments[0].bindings[0].workspace_key,
             state.environments[1].bindings[0].workspace_key
         );
+    }
+
+    fn unbound_project_state(names: &[&str]) -> ProjectState {
+        let definition = project_definition();
+        let environments = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                definition
+                    .instantiate_environment(*name, 1_000 + index as u64)
+                    .unwrap()
+            })
+            .collect();
+        ProjectState {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            definition,
+            environments,
+        }
+    }
+
+    fn bind(environment: &mut EnvironmentInstance, workspace_key: &str) {
+        environment.bindings.push(WorkspaceBinding {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            binding_id: WorkspaceBindingId::generate(),
+            project_id: environment.project_id.clone(),
+            environment_id: environment.environment_id.clone(),
+            name: "source".to_string(),
+            workspace_key: workspace_key.to_string(),
+            path_hint: Some("/diagnostic/only".to_string()),
+        });
+    }
+
+    #[test]
+    fn generated_topology_ids_are_fresh_valid_and_type_prefixed() {
+        macro_rules! assert_generated {
+            ($type:ty, $prefix:literal) => {{
+                let first = <$type>::generate();
+                let second = <$type>::generate();
+                assert!(first.as_str().starts_with($prefix));
+                assert_ne!(first, second);
+                first.validate().unwrap();
+                second.validate().unwrap();
+            }};
+        }
+
+        assert_generated!(ProjectId, "prj_");
+        assert_generated!(EnvironmentId, "env_");
+        assert_generated!(MachineId, "mch_");
+        assert_generated!(MachineIncarnationId, "inc_");
+        assert_generated!(WorkspaceBindingId, "wsp_");
+        assert_generated!(NetworkId, "net_");
+        assert_generated!(EndpointId, "end_");
+    }
+
+    #[test]
+    fn instantiate_environment_creates_fresh_unbound_topology() {
+        let definition = project_definition();
+        let first = definition.instantiate_environment("agent", 42).unwrap();
+        let second = definition.instantiate_environment("agent-2", 42).unwrap();
+
+        assert_ne!(first.environment_id, second.environment_id);
+        assert!(first.bindings.is_empty());
+        assert_eq!(
+            first.ownership.len(),
+            first.machines.len() + first.networks.len() + first.endpoints.len()
+        );
+        assert_eq!(first.state, EnvironmentState::Creating);
+        assert_eq!(first.created_at, 42);
+        assert_eq!(first.updated_at, 42);
+        assert!(first.machines.iter().all(|machine| {
+            machine.state == MachineState::Creating
+                && machine.backend.is_none()
+                && machine.incarnation.is_none()
+                && machine.negotiated_capabilities == CapabilitySet::default()
+        }));
+        let endpoint = &first.endpoints[0];
+        assert_eq!(
+            first
+                .machines
+                .iter()
+                .find(|machine| machine.machine_id == endpoint.machine_id)
+                .unwrap()
+                .name,
+            "api"
+        );
+        first.validate().unwrap();
+        ProjectState {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            definition,
+            environments: vec![first],
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn creating_allows_pending_negotiation_and_binding_but_ready_is_strict() {
+        let definition = project_definition();
+        let mut environment = definition.instantiate_environment("agent", 42).unwrap();
+        environment.validate().unwrap();
+
+        environment.state = EnvironmentState::Ready;
+        for machine in &mut environment.machines {
+            machine.state = MachineState::Ready;
+        }
+        assert!(matches!(
+            environment.validate(),
+            Err(TopologyValidationError::MissingCapability { .. })
+        ));
+
+        for machine in &mut environment.machines {
+            machine.negotiated_capabilities = machine.requested_capabilities.clone();
+        }
+        environment.validate().unwrap();
+        assert!(matches!(
+            ProjectState {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                definition,
+                environments: vec![environment],
+            }
+            .validate(),
+            Err(TopologyValidationError::DefinitionTopologyMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn partial_creation_failure_persists_but_post_creation_states_remain_strict() {
+        let definition = project_definition();
+        let creating = definition.instantiate_environment("agent", 42).unwrap();
+
+        let mut failed = creating.clone();
+        failed.state = EnvironmentState::Failed;
+        for machine in &mut failed.machines {
+            machine.state = MachineState::Failed;
+        }
+        ProjectState {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            definition: definition.clone(),
+            environments: vec![failed],
+        }
+        .validate()
+        .expect("a partial Creating -> Failed snapshot must remain persistable");
+
+        let mut stopped = creating.clone();
+        stopped.state = EnvironmentState::Stopped;
+        for machine in &mut stopped.machines {
+            machine.state = MachineState::Stopped;
+        }
+        assert!(matches!(
+            stopped.validate(),
+            Err(TopologyValidationError::MissingCapability { .. })
+        ));
+
+        for machine in &mut stopped.machines {
+            machine.negotiated_capabilities = machine.requested_capabilities.clone();
+        }
+        for state in [EnvironmentState::Stopped, EnvironmentState::Deleting] {
+            let mut environment = stopped.clone();
+            environment.state = state;
+            assert!(matches!(
+                ProjectState {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    definition: definition.clone(),
+                    environments: vec![environment],
+                }
+                .validate(),
+                Err(TopologyValidationError::DefinitionTopologyMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn environment_selection_uses_strict_explicit_process_workspace_precedence() {
+        let mut state = unbound_project_state(&["explicit", "process", "workspace"]);
+        bind(&mut state.environments[2], "worktree-token");
+        let context = EnvironmentSelectionContext {
+            explicit: Some(EnvironmentSelector::Name("explicit".to_string())),
+            process_environment_id: Some(state.environments[1].environment_id.clone()),
+            workspace_key: Some("worktree-token".to_string()),
+        };
+
+        let selection = state.resolve_environment(&context).unwrap();
+        assert_eq!(selection.name, "explicit");
+        assert_eq!(selection.source, EnvironmentSelectionSource::Explicit);
+
+        let selection = state
+            .resolve_environment(&EnvironmentSelectionContext {
+                explicit: None,
+                ..context.clone()
+            })
+            .unwrap();
+        assert_eq!(selection.name, "process");
+        assert_eq!(selection.source, EnvironmentSelectionSource::Process);
+
+        let selection = state
+            .resolve_environment(&EnvironmentSelectionContext {
+                explicit: None,
+                process_environment_id: None,
+                ..context
+            })
+            .unwrap();
+        assert_eq!(selection.name, "workspace");
+        assert_eq!(selection.source, EnvironmentSelectionSource::Workspace);
+    }
+
+    #[test]
+    fn stale_explicit_and_process_selectors_never_fall_through() {
+        let mut state = unbound_project_state(&["bound"]);
+        bind(&mut state.environments[0], "worktree-token");
+
+        for context in [
+            EnvironmentSelectionContext {
+                explicit: Some(EnvironmentSelector::Id(
+                    EnvironmentId::new("env_missing").unwrap(),
+                )),
+                process_environment_id: None,
+                workspace_key: Some("worktree-token".to_string()),
+            },
+            EnvironmentSelectionContext {
+                explicit: None,
+                process_environment_id: Some(EnvironmentId::new("env_missing").unwrap()),
+                workspace_key: Some("worktree-token".to_string()),
+            },
+        ] {
+            assert!(matches!(
+                state.resolve_environment(&context),
+                Err(TopologyResolutionError::NotFound { .. })
+            ));
+            assert!(matches!(
+                state.resolve_environment_for_up(&context),
+                Err(TopologyResolutionError::NotFound { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_present_selectors_fail_validation_without_fallthrough() {
+        let mut state = unbound_project_state(&["bound"]);
+        bind(&mut state.environments[0], "worktree-token");
+        let invalid_id: EnvironmentId = serde_json::from_str("\"invalid/id\"").unwrap();
+
+        for context in [
+            EnvironmentSelectionContext {
+                explicit: Some(EnvironmentSelector::Id(invalid_id.clone())),
+                process_environment_id: None,
+                workspace_key: Some("worktree-token".to_string()),
+            },
+            EnvironmentSelectionContext {
+                explicit: None,
+                process_environment_id: Some(invalid_id),
+                workspace_key: Some("worktree-token".to_string()),
+            },
+            EnvironmentSelectionContext {
+                explicit: Some(EnvironmentSelector::Name("   ".to_string())),
+                process_environment_id: None,
+                workspace_key: Some("worktree-token".to_string()),
+            },
+            EnvironmentSelectionContext {
+                explicit: Some(EnvironmentSelector::NameOrId("".to_string())),
+                process_environment_id: None,
+                workspace_key: Some("worktree-token".to_string()),
+            },
+        ] {
+            assert!(matches!(
+                state.resolve_environment(&context),
+                Err(TopologyResolutionError::InvalidSelector { .. })
+            ));
+            assert!(matches!(
+                state.resolve_environment_for_up(&context),
+                Err(TopologyResolutionError::InvalidSelector { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn missing_generated_id_in_name_or_id_never_creates() {
+        let state = unbound_project_state(&[]);
+        let missing = EnvironmentId::generate().to_string();
+        let context = EnvironmentSelectionContext {
+            explicit: Some(EnvironmentSelector::NameOrId(missing.clone())),
+            ..EnvironmentSelectionContext::default()
+        };
+
+        assert!(matches!(
+            state.resolve_environment(&context),
+            Err(TopologyResolutionError::NotFound { selector, .. }) if selector == missing
+        ));
+        assert!(matches!(
+            state.resolve_environment_for_up(&context),
+            Err(TopologyResolutionError::NotFound { selector, .. }) if selector == missing
+        ));
+
+        let uppercase_lookalike = format!("env_{}", "A".repeat(32));
+        assert_eq!(
+            state
+                .resolve_environment_for_up(&EnvironmentSelectionContext {
+                    explicit: Some(EnvironmentSelector::NameOrId(uppercase_lookalike.clone())),
+                    ..EnvironmentSelectionContext::default()
+                })
+                .unwrap(),
+            EnvironmentUpDecision::Create {
+                name: uppercase_lookalike
+            }
+        );
+    }
+
+    #[test]
+    fn name_or_id_collision_is_ambiguous_instead_of_guessing() {
+        let mut state = unbound_project_state(&["first", "second"]);
+        let colliding = state.environments[0].environment_id.to_string();
+        state.environments[1].name = colliding.clone();
+        let error = state
+            .resolve_environment(&EnvironmentSelectionContext {
+                explicit: Some(EnvironmentSelector::NameOrId(colliding)),
+                ..EnvironmentSelectionContext::default()
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            TopologyResolutionError::Ambiguous { candidates, .. } if candidates.len() == 2
+        ));
+    }
+
+    #[test]
+    fn selection_contract_round_trips_as_structured_json() {
+        let context = EnvironmentSelectionContext {
+            explicit: Some(EnvironmentSelector::NameOrId("agent".to_string())),
+            process_environment_id: Some(EnvironmentId::new("env_process").unwrap()),
+            workspace_key: Some("opaque-worktree-token".to_string()),
+        };
+        let decoded: EnvironmentSelectionContext =
+            serde_json::from_value(serde_json::to_value(&context).unwrap()).unwrap();
+        assert_eq!(decoded, context);
+
+        let error = TopologyResolutionError::selection_required(
+            "environment",
+            "workspace binding",
+            [TopologyCandidate {
+                id: "env_agent".to_string(),
+                name: "agent".to_string(),
+            }],
+        );
+        let decoded: TopologyResolutionError =
+            serde_json::from_value(serde_json::to_value(&error).unwrap()).unwrap();
+        assert_eq!(decoded, error);
+    }
+
+    #[test]
+    fn workspace_ambiguity_is_sorted_bounded_and_path_independent() {
+        let names: Vec<_> = (0..(MAX_TOPOLOGY_SELECTION_CANDIDATES + 5))
+            .map(|index| format!("agent-{index:02}"))
+            .collect();
+        let refs: Vec<_> = names.iter().map(String::as_str).collect();
+        let mut state = unbound_project_state(&refs);
+        for (index, environment) in state.environments.iter_mut().enumerate() {
+            bind(environment, "shared-token");
+            environment.bindings[0].path_hint = Some(format!("/different/path/{index}"));
+        }
+        let error = state
+            .resolve_environment(&EnvironmentSelectionContext {
+                workspace_key: Some("shared-token".to_string()),
+                ..EnvironmentSelectionContext::default()
+            })
+            .unwrap_err();
+        let TopologyResolutionError::Ambiguous { candidates, .. } = error else {
+            panic!("expected ambiguity");
+        };
+        assert_eq!(candidates.len(), MAX_TOPOLOGY_SELECTION_CANDIDATES);
+        assert!(candidates.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn up_creation_rules_are_fail_closed() {
+        let empty = unbound_project_state(&[]);
+        assert_eq!(
+            empty
+                .resolve_environment_for_up(&EnvironmentSelectionContext::default())
+                .unwrap(),
+            EnvironmentUpDecision::Create {
+                name: "default".to_string()
+            }
+        );
+
+        let existing = unbound_project_state(&["agent"]);
+        let no_selector = existing
+            .resolve_environment_for_up(&EnvironmentSelectionContext::default())
+            .unwrap_err();
+        assert!(matches!(
+            no_selector,
+            TopologyResolutionError::SelectionRequired { candidates, .. }
+                if candidates.len() == 1
+        ));
+
+        assert_eq!(
+            existing
+                .resolve_environment_for_up(&EnvironmentSelectionContext {
+                    explicit: Some(EnvironmentSelector::Name("new-agent".to_string())),
+                    ..EnvironmentSelectionContext::default()
+                })
+                .unwrap(),
+            EnvironmentUpDecision::Create {
+                name: "new-agent".to_string()
+            }
+        );
+        assert_eq!(
+            existing
+                .resolve_environment_for_up(&EnvironmentSelectionContext {
+                    explicit: Some(EnvironmentSelector::NameOrId("new-agent-2".to_string())),
+                    ..EnvironmentSelectionContext::default()
+                })
+                .unwrap(),
+            EnvironmentUpDecision::Create {
+                name: "new-agent-2".to_string()
+            }
+        );
+        assert!(matches!(
+            existing.resolve_environment_for_up(&EnvironmentSelectionContext {
+                explicit: Some(EnvironmentSelector::Id(
+                    EnvironmentId::new("env_missing").unwrap()
+                )),
+                ..EnvironmentSelectionContext::default()
+            }),
+            Err(TopologyResolutionError::NotFound { .. })
+        ));
+        assert!(matches!(
+            existing.resolve_environment_for_up(&EnvironmentSelectionContext {
+                explicit: Some(EnvironmentSelector::Name("   ".to_string())),
+                ..EnvironmentSelectionContext::default()
+            }),
+            Err(TopologyResolutionError::InvalidSelector { .. })
+        ));
+        assert!(matches!(
+            empty.resolve_environment_for_up(&EnvironmentSelectionContext {
+                workspace_key: Some(String::new()),
+                ..EnvironmentSelectionContext::default()
+            }),
+            Err(TopologyResolutionError::InvalidSelector { .. })
+        ));
+    }
+
+    #[test]
+    fn resource_names_are_bounded_deterministic_and_owner_scoped() {
+        let owner = ResourceOwner {
+            project_id: ProjectId::new("prj_shop").unwrap(),
+            environment_id: EnvironmentId::new("env_agent").unwrap(),
+            machine_id: Some(MachineId::new("mch_linux").unwrap()),
+        };
+        let first = owner
+            .bounded_resource_name(&OwnedResourceKind::Socket, "docker/socket", 64)
+            .unwrap();
+        assert_eq!(
+            first,
+            owner
+                .bounded_resource_name(&OwnedResourceKind::Socket, "docker/socket", 64)
+                .unwrap()
+        );
+        assert!(first.is_ascii());
+        assert!(first.len() <= 64);
+        assert_ne!(
+            first,
+            ResourceOwner {
+                environment_id: EnvironmentId::new("env_sibling").unwrap(),
+                ..owner.clone()
+            }
+            .bounded_resource_name(&OwnedResourceKind::Socket, "docker/socket", 64)
+            .unwrap()
+        );
+        assert_ne!(
+            first,
+            owner
+                .bounded_resource_name(&OwnedResourceKind::Disk, "docker/socket", 64)
+                .unwrap()
+        );
+        assert_ne!(
+            first,
+            owner
+                .bounded_resource_name(&OwnedResourceKind::Socket, "docker/other", 64)
+                .unwrap()
+        );
+        assert_ne!(
+            first,
+            ResourceOwner {
+                project_id: ProjectId::new("prj_other").unwrap(),
+                ..owner.clone()
+            }
+            .bounded_resource_name(&OwnedResourceKind::Socket, "docker/socket", 64)
+            .unwrap()
+        );
+        assert_ne!(
+            first,
+            ResourceOwner {
+                machine_id: None,
+                ..owner.clone()
+            }
+            .bounded_resource_name(&OwnedResourceKind::Socket, "docker/socket", 64)
+            .unwrap()
+        );
+        let minimum = RESOURCE_NAME_VERSION_PREFIX.len() + 1 + RESOURCE_NAME_DIGEST_HEX_LENGTH;
+        assert_eq!(
+            owner
+                .bounded_resource_name(&OwnedResourceKind::Socket, &"x".repeat(1_000), minimum)
+                .unwrap()
+                .len(),
+            minimum
+        );
+        assert!(
+            owner
+                .bounded_resource_name(&OwnedResourceKind::Socket, "socket", minimum - 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn duplicate_ownership_keys_are_rejected() {
+        let definition = project_definition();
+        let mut environment = definition.instantiate_environment("agent", 42).unwrap();
+        let record = OwnershipRecord {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            resource_kind: OwnedResourceKind::Network,
+            resource_id: "shared-logical-id".to_string(),
+            environment_id: environment.environment_id.clone(),
+            machine_id: None,
+        };
+        environment.ownership = vec![record.clone(), record];
+        assert!(matches!(
+            environment.validate(),
+            Err(TopologyValidationError::Duplicate { kind, .. })
+                if kind == "ownership_resource"
+        ));
     }
 }
