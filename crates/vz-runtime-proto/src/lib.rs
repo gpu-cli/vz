@@ -264,6 +264,13 @@ mod tests {
         let _ = ReceiptPayload::default();
         let _ = StackServiceStatus::default();
         let _ = StackServiceLog::default();
+        let _ = EnvironmentLifecycleOperation::default();
+        let _ = MachineLifecycleStep::default();
+        let _ = MachineLifecycleStepAcknowledgement::default();
+        let _ = OwnershipCleanupStep::default();
+        let _ = OwnershipCleanupStepAcknowledgement::default();
+        let _ = EnvironmentTombstone::default();
+        let _ = TopologyLifecycleErrorDetail::default();
 
         // Verify list responses.
         let _ = ListSandboxesResponse::default();
@@ -590,6 +597,84 @@ mod tests {
                     ("machine_id", 6),
                 ],
             ),
+            ("LifecycleStepSucceeded", &[]),
+            ("LifecycleStepFailed", &[("reason", 1)]),
+            ("LifecycleStepResult", &[("succeeded", 1), ("failed", 2)]),
+            (
+                "MachineLifecycleStep",
+                &[
+                    ("machine_id", 1),
+                    ("initial_state", 2),
+                    ("target_state", 3),
+                    ("status", 4),
+                    ("failure_reason", 5),
+                    ("expected_incarnation", 6),
+                    ("resulting_incarnation", 7),
+                ],
+            ),
+            (
+                "MachineLifecycleStepAcknowledgement",
+                &[
+                    ("operation_id", 1),
+                    ("generation", 2),
+                    ("machine_id", 3),
+                    ("initial_state", 4),
+                    ("target_state", 5),
+                    ("result", 6),
+                    ("expected_incarnation", 7),
+                    ("resulting_incarnation", 8),
+                ],
+            ),
+            (
+                "OwnershipCleanupStep",
+                &[("ownership", 1), ("status", 2), ("failure_reason", 3)],
+            ),
+            (
+                "OwnershipCleanupStepAcknowledgement",
+                &[
+                    ("operation_id", 1),
+                    ("generation", 2),
+                    ("ownership", 3),
+                    ("result", 4),
+                ],
+            ),
+            (
+                "EnvironmentLifecycleOperation",
+                &[
+                    ("schema_version", 1),
+                    ("operation_id", 2),
+                    ("project_id", 3),
+                    ("environment_id", 4),
+                    ("kind", 5),
+                    ("generation", 6),
+                    ("request_id", 7),
+                    ("idempotency_key", 8),
+                    ("request_hash", 9),
+                    ("definition_digest", 10),
+                    ("initial_state", 11),
+                    ("requested_target", 12),
+                    ("status", 13),
+                    ("machine_steps", 14),
+                    ("cleanup_steps", 15),
+                    ("created_at", 16),
+                    ("updated_at", 17),
+                    ("completed_at", 18),
+                ],
+            ),
+            (
+                "EnvironmentTombstone",
+                &[
+                    ("schema_version", 1),
+                    ("project_id", 2),
+                    ("environment_id", 3),
+                    ("name", 4),
+                    ("definition_digest", 5),
+                    ("delete_operation_id", 6),
+                    ("lifecycle_generation", 7),
+                    ("ownership_digest", 8),
+                    ("deleted_at", 9),
+                ],
+            ),
             (
                 "LegacyMigrationProvenance",
                 &[
@@ -615,6 +700,8 @@ mod tests {
                     ("legacy_migration", 12),
                     ("created_at", 13),
                     ("updated_at", 14),
+                    ("lifecycle_generation", 15),
+                    ("active_operation_id", 16),
                 ],
             ),
             (
@@ -666,6 +753,14 @@ mod tests {
                 &[("machine_id", 1), ("capability", 2)],
             ),
             (
+                "TopologyInvalidLifecycleStateDetail",
+                &[("environment_id", 1), ("reason", 2)],
+            ),
+            (
+                "TopologyInvalidMachineIncarnationDetail",
+                &[("machine_id", 1), ("reason", 2)],
+            ),
+            (
                 "TopologyErrorDetail",
                 &[
                     ("not_found", 1),
@@ -677,6 +772,74 @@ mod tests {
                     ("contradictory_capability", 7),
                     ("selection_required", 8),
                     ("invalid_selector", 9),
+                    ("invalid_lifecycle_state", 10),
+                    ("invalid_machine_incarnation", 11),
+                ],
+            ),
+            (
+                "TopologyLifecycleInvalidTransitionDetail",
+                &[("environment_id", 1), ("operation", 2), ("state", 3)],
+            ),
+            (
+                "TopologyLifecycleOperationConflictDetail",
+                &[("environment_id", 1), ("active_operation_id", 2)],
+            ),
+            (
+                "TopologyLifecycleGenerationMismatchDetail",
+                &[("operation_id", 1), ("expected", 2), ("found", 3)],
+            ),
+            (
+                "TopologyLifecycleOperationMismatchDetail",
+                &[("environment_id", 1), ("expected", 2), ("found", 3)],
+            ),
+            (
+                "TopologyLifecycleMachineStepNotFoundDetail",
+                &[("operation_id", 1), ("machine_id", 2)],
+            ),
+            (
+                "TopologyLifecycleMachineStepMismatchDetail",
+                &[("machine_id", 1)],
+            ),
+            (
+                "TopologyLifecycleOwnershipStepMismatchDetail",
+                &[
+                    ("operation_id", 1),
+                    ("resource_kind", 2),
+                    ("resource_id", 3),
+                ],
+            ),
+            (
+                "TopologyLifecycleOperationIncompleteDetail",
+                &[("operation_id", 1)],
+            ),
+            (
+                "TopologyLifecycleOperationFailedDetail",
+                &[("operation_id", 1)],
+            ),
+            (
+                "TopologyLifecycleDeleteRequiredDetail",
+                &[("operation_id", 1)],
+            ),
+            (
+                "TopologyLifecycleDeletedEnvironmentIsNotLiveDetail",
+                &[("environment_id", 1)],
+            ),
+            ("TopologyLifecycleInvalidOperationDetail", &[("reason", 1)]),
+            (
+                "TopologyLifecycleErrorDetail",
+                &[
+                    ("invalid_transition", 1),
+                    ("operation_conflict", 2),
+                    ("generation_mismatch", 3),
+                    ("operation_mismatch", 4),
+                    ("machine_step_not_found", 5),
+                    ("machine_step_mismatch", 6),
+                    ("ownership_step_mismatch", 7),
+                    ("operation_incomplete", 8),
+                    ("operation_failed", 9),
+                    ("delete_required", 10),
+                    ("deleted_environment_is_not_live", 11),
+                    ("invalid_operation", 12),
                 ],
             ),
         ] {
@@ -771,6 +934,38 @@ mod tests {
                     ("ENVIRONMENT_STATE_DELETING", 5),
                     ("ENVIRONMENT_STATE_DELETED", 6),
                     ("ENVIRONMENT_STATE_FAILED", 7),
+                    ("ENVIRONMENT_STATE_DEGRADED", 8),
+                ],
+            ),
+            (
+                "EnvironmentLifecycleKind",
+                &[
+                    ("ENVIRONMENT_LIFECYCLE_KIND_UNSPECIFIED", 0),
+                    ("ENVIRONMENT_LIFECYCLE_KIND_UP", 1),
+                    ("ENVIRONMENT_LIFECYCLE_KIND_STOP", 2),
+                    ("ENVIRONMENT_LIFECYCLE_KIND_DELETE", 3),
+                ],
+            ),
+            (
+                "EnvironmentLifecycleStatus",
+                &[
+                    ("ENVIRONMENT_LIFECYCLE_STATUS_UNSPECIFIED", 0),
+                    ("ENVIRONMENT_LIFECYCLE_STATUS_PLANNED", 1),
+                    ("ENVIRONMENT_LIFECYCLE_STATUS_RUNNING", 2),
+                    ("ENVIRONMENT_LIFECYCLE_STATUS_BLOCKED", 3),
+                    ("ENVIRONMENT_LIFECYCLE_STATUS_SUCCEEDED", 4),
+                    ("ENVIRONMENT_LIFECYCLE_STATUS_FAILED", 5),
+                    ("ENVIRONMENT_LIFECYCLE_STATUS_SUPERSEDED", 6),
+                ],
+            ),
+            (
+                "LifecycleStepStatus",
+                &[
+                    ("LIFECYCLE_STEP_STATUS_UNSPECIFIED", 0),
+                    ("LIFECYCLE_STEP_STATUS_PENDING", 1),
+                    ("LIFECYCLE_STEP_STATUS_RUNNING", 2),
+                    ("LIFECYCLE_STEP_STATUS_SUCCEEDED", 3),
+                    ("LIFECYCLE_STEP_STATUS_FAILED", 4),
                 ],
             ),
             (
@@ -979,6 +1174,8 @@ mod tests {
             }),
             created_at: 1_700_000_000,
             updated_at: 1_700_000_100,
+            lifecycle_generation: 9,
+            active_operation_id: Some("lop_reconcile_9".into()),
         };
         let state = ProjectState {
             schema_version: 1,
@@ -998,6 +1195,90 @@ mod tests {
                 .reason,
             "not available on a Linux Machine"
         );
+    }
+
+    #[test]
+    fn runtime_v2_lifecycle_records_preserve_presence_and_oneofs() {
+        use crate::runtime_v2::lifecycle_step_result::Result as StepResult;
+        use crate::runtime_v2::*;
+
+        let incarnation = MachineIncarnation {
+            schema_version: 1,
+            incarnation_id: "inc_api_8".into(),
+            machine_id: "mch_api".into(),
+            generation: 8,
+            created_at: 1_700_000_200,
+        };
+        let operation = EnvironmentLifecycleOperation {
+            schema_version: 1,
+            operation_id: "lop_up_8".into(),
+            project_id: "prj_demo".into(),
+            environment_id: "env_agent_a".into(),
+            kind: EnvironmentLifecycleKind::Up as i32,
+            generation: 8,
+            request_id: "req-up-8".into(),
+            idempotency_key: "idem-up-8".into(),
+            request_hash: "sha256:request".into(),
+            definition_digest: "sha256:definition".into(),
+            initial_state: EnvironmentState::Stopped as i32,
+            requested_target: EnvironmentState::Ready as i32,
+            status: EnvironmentLifecycleStatus::Running as i32,
+            machine_steps: vec![MachineLifecycleStep {
+                machine_id: "mch_api".into(),
+                initial_state: MachineState::Stopped as i32,
+                target_state: Some(MachineState::Ready as i32),
+                expected_incarnation: Some(incarnation.clone()),
+                resulting_incarnation: None,
+                status: LifecycleStepStatus::Pending as i32,
+                failure_reason: None,
+            }],
+            cleanup_steps: vec![OwnershipCleanupStep {
+                ownership: Some(OwnershipRecord {
+                    schema_version: 1,
+                    resource_kind: OwnedResourceKind::Disk as i32,
+                    other_resource_kind: None,
+                    resource_id: "disk_api".into(),
+                    environment_id: "env_agent_a".into(),
+                    machine_id: Some("mch_api".into()),
+                }),
+                status: LifecycleStepStatus::Failed as i32,
+                failure_reason: Some("busy".into()),
+            }],
+            created_at: 1_700_000_100,
+            updated_at: 1_700_000_200,
+            completed_at: None,
+        };
+        let acknowledgement = MachineLifecycleStepAcknowledgement {
+            operation_id: operation.operation_id.clone(),
+            generation: operation.generation,
+            machine_id: "mch_api".into(),
+            initial_state: MachineState::Stopped as i32,
+            target_state: Some(MachineState::Ready as i32),
+            expected_incarnation: Some(incarnation.clone()),
+            resulting_incarnation: Some(MachineIncarnation {
+                incarnation_id: "inc_api_9".into(),
+                generation: 9,
+                ..incarnation
+            }),
+            result: Some(LifecycleStepResult {
+                result: Some(StepResult::Succeeded(LifecycleStepSucceeded::default())),
+            }),
+        };
+
+        let encoded = operation.encode_to_vec();
+        let decoded = EnvironmentLifecycleOperation::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded, operation);
+        assert!(decoded.completed_at.is_none());
+        assert!(decoded.machine_steps[0].target_state.is_some());
+        assert!(decoded.machine_steps[0].resulting_incarnation.is_none());
+
+        let encoded = acknowledgement.encode_to_vec();
+        let decoded = MachineLifecycleStepAcknowledgement::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded, acknowledgement);
+        assert!(matches!(
+            decoded.result.and_then(|result| result.result),
+            Some(StepResult::Succeeded(_))
+        ));
     }
 
     #[test]

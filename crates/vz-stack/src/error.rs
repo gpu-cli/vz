@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use vz_runtime_contract::{
     MachineError, MachineErrorCode, MachineErrorEnvelope, RequestMetadata, RuntimeError,
-    TopologyResolutionError,
+    TopologyLifecycleError, TopologyResolutionError,
 };
 
 /// Owner recorded for a physical/runtime resource key that could not be reserved.
@@ -35,6 +35,10 @@ pub enum StackError {
     /// A Developer Environment selector did not resolve uniquely.
     #[error(transparent)]
     TopologyResolution(Box<TopologyResolutionError>),
+
+    /// A durable Developer Environment lifecycle operation was rejected.
+    #[error(transparent)]
+    TopologyLifecycle(Box<TopologyLifecycleError>),
 
     /// A physical/runtime resource key is already reserved by another owner.
     #[error(transparent)]
@@ -102,6 +106,24 @@ impl StackError {
                     MachineErrorCode::ValidationError
                 }
             },
+            StackError::TopologyLifecycle(error) => match error.as_ref() {
+                TopologyLifecycleError::MachineStepNotFound { .. } => MachineErrorCode::NotFound,
+                TopologyLifecycleError::InvalidOperation { .. } => {
+                    MachineErrorCode::ValidationError
+                }
+                TopologyLifecycleError::InvalidTransition { .. }
+                | TopologyLifecycleError::OperationConflict { .. }
+                | TopologyLifecycleError::GenerationMismatch { .. }
+                | TopologyLifecycleError::OperationMismatch { .. }
+                | TopologyLifecycleError::MachineStepMismatch { .. }
+                | TopologyLifecycleError::OwnershipStepMismatch { .. }
+                | TopologyLifecycleError::OperationIncomplete { .. }
+                | TopologyLifecycleError::OperationFailed { .. }
+                | TopologyLifecycleError::DeleteRequired { .. }
+                | TopologyLifecycleError::DeletedEnvironmentIsNotLive { .. } => {
+                    MachineErrorCode::StateConflict
+                }
+            },
             StackError::OwnedResourceCollision(_) => MachineErrorCode::StateConflict,
             StackError::InvalidSpec(_)
             | StackError::ComposeParse(_)
@@ -140,6 +162,9 @@ impl StackError {
                 details.insert("reason".to_string(), message.clone());
             }
             StackError::TopologyResolution(error) => {
+                details.insert("reason".to_string(), error.to_string());
+            }
+            StackError::TopologyLifecycle(error) => {
                 details.insert("reason".to_string(), error.to_string());
             }
             StackError::OwnedResourceCollision(error) => {
@@ -189,6 +214,12 @@ impl From<TopologyResolutionError> for StackError {
     }
 }
 
+impl From<TopologyLifecycleError> for StackError {
+    fn from(error: TopologyLifecycleError) -> Self {
+        Self::TopologyLifecycle(Box::new(error))
+    }
+}
+
 impl From<RuntimeError> for StackError {
     fn from(error: RuntimeError) -> Self {
         StackError::Machine {
@@ -214,6 +245,27 @@ mod tests {
             MachineErrorCode::UnsupportedOperation
         );
         assert!(matches!(stack_error, StackError::Machine { .. }));
+    }
+
+    #[test]
+    fn topology_lifecycle_errors_preserve_stable_machine_codes() {
+        let conflict = StackError::from(TopologyLifecycleError::GenerationMismatch {
+            operation_id: "lop_example".to_string(),
+            expected: 4,
+            found: 3,
+        });
+        assert_eq!(conflict.machine_code(), MachineErrorCode::StateConflict);
+
+        let not_found = StackError::from(TopologyLifecycleError::MachineStepNotFound {
+            operation_id: "lop_example".to_string(),
+            machine_id: "mch_missing".to_string(),
+        });
+        assert_eq!(not_found.machine_code(), MachineErrorCode::NotFound);
+
+        let invalid = StackError::from(TopologyLifecycleError::InvalidOperation {
+            reason: "empty request hash".to_string(),
+        });
+        assert_eq!(invalid.machine_code(), MachineErrorCode::ValidationError);
     }
 
     #[test]

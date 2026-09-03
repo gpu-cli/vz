@@ -44,7 +44,9 @@ Options:
                                 runtime-port-forwarding, runtime-shared-vm-net, stack-real-services,
                                 stack-control-socket, stack-port-forwarding,
                                 stack-container-ownership,
-                                stack-snapshot-restore, buildkit-roundtrip,
+                                stack-snapshot-restore,
+                                environment-lifecycle-journal-linux-vm,
+                                buildkit-roundtrip,
                                 sandbox-usecases, all-usecases
                               note: when set, suite selection is derived from scenarios
   --output-dir <path>         Artifacts/log root (default: .artifacts/sandbox-vm-e2e)
@@ -142,7 +144,7 @@ expand_scenario_token() {
         case "$part" in
             "")
                 ;;
-            runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-supervision|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net|stack-real-services|stack-control-socket|stack-port-forwarding|stack-container-ownership|stack-snapshot-restore|stack-user-journey-checkpoint|buildkit-roundtrip)
+            runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-supervision|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net|stack-real-services|stack-control-socket|stack-port-forwarding|stack-container-ownership|stack-snapshot-restore|stack-user-journey-checkpoint|environment-lifecycle-journal-linux-vm|buildkit-roundtrip)
                 append_unique_scenario "$part"
                 ;;
             sandbox-usecases)
@@ -157,6 +159,7 @@ expand_scenario_token() {
                 append_unique_scenario "stack-port-forwarding"
                 append_unique_scenario "stack-container-ownership"
                 append_unique_scenario "stack-snapshot-restore"
+                append_unique_scenario "environment-lifecycle-journal-linux-vm"
                 ;;
             all-usecases)
                 append_unique_scenario "runtime-smoke"
@@ -172,6 +175,7 @@ expand_scenario_token() {
                 append_unique_scenario "stack-port-forwarding"
                 append_unique_scenario "stack-container-ownership"
                 append_unique_scenario "stack-snapshot-restore"
+                append_unique_scenario "environment-lifecycle-journal-linux-vm"
                 append_unique_scenario "buildkit-roundtrip"
                 ;;
             *)
@@ -186,7 +190,7 @@ scenario_suite() {
         runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-supervision|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net)
             echo "runtime"
             ;;
-        stack-real-services|stack-control-socket|stack-port-forwarding|stack-container-ownership|stack-snapshot-restore)
+        stack-real-services|stack-control-socket|stack-port-forwarding|stack-container-ownership|stack-snapshot-restore|environment-lifecycle-journal-linux-vm)
             echo "stack"
             ;;
         stack-user-journey-checkpoint)
@@ -244,6 +248,9 @@ scenario_test_filter() {
             ;;
         stack-user-journey-checkpoint)
             echo "complex_stack_snapshot_restore_rewinds_shared_vm_state"
+            ;;
+        environment-lifecycle-journal-linux-vm)
+            echo "environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_cross_environment_damage"
             ;;
         buildkit-roundtrip)
             echo "buildkit_builds_dockerfile_and_run_uses_built_image"
@@ -448,6 +455,8 @@ STACK_TEARDOWN_EVIDENCE="$RUN_DIR/stack-port-forwarding-teardown.json"
 STACK_TEARDOWN_SHA256="$RUN_DIR/stack-port-forwarding-teardown.json.sha256"
 STACK_CONTAINER_OWNERSHIP_EVIDENCE="$RUN_DIR/stack-container-ownership.json"
 STACK_CONTAINER_OWNERSHIP_SHA256="$RUN_DIR/stack-container-ownership.json.sha256"
+ENVIRONMENT_LIFECYCLE_EVIDENCE="$RUN_DIR/environment-lifecycle-journal-linux-vm.json"
+ENVIRONMENT_LIFECYCLE_SHA256="$RUN_DIR/environment-lifecycle-journal-linux-vm.json.sha256"
 EXEC_SUPERVISION_EVIDENCE="$RUN_DIR/runtime-exec-supervision.json"
 EXEC_SUPERVISION_SHA256="$RUN_DIR/runtime-exec-supervision.json.sha256"
 
@@ -1623,6 +1632,160 @@ validate_stack_container_ownership_evidence() {
     ' "$evidence_file" >/dev/null
 }
 
+validate_environment_lifecycle_evidence() {
+    local evidence_file="$1"
+
+    jq -e '
+        def exact_keys($keys): (keys | sort) == ($keys | sort);
+        def nonempty: type == "string" and length > 0;
+        def sha256: type == "string" and test("^sha256:[0-9a-f]{64}$");
+        def hex_sha256: type == "string" and test("^[0-9a-f]{64}$");
+        def bounded_key: type == "string" and startswith("vzr1-") and length <= 64;
+
+        (type == "object") and
+        (exact_keys([
+            "backend_invocations", "boot_ids", "controls", "final", "host_target",
+            "ids", "operations", "phases", "reopen", "scenario", "schema_version",
+            "sentinels", "sibling_isolation", "stop_replay"
+        ])) and
+        (.schema_version == 1) and
+        (.scenario == "environment-lifecycle-journal-linux-vm") and
+
+        (.host_target | exact_keys([
+            "backend", "host_arch", "host_os", "machine_arch", "machine_os", "profile"
+        ])) and
+        (.host_target == {
+            "host_os": "macos", "host_arch": "aarch64", "machine_os": "linux",
+            "machine_arch": "aarch64", "profile": "developer",
+            "backend": "macos_virtualization_linux"
+        }) and
+
+        (.ids | exact_keys(["project_id", "sibling", "target"])) and
+        (.ids.project_id == "prj_lifecycle_mac_e2e") and
+        (all([.ids.target, .ids.sibling][];
+            exact_keys([
+                "backend_key", "disk_resource_id", "environment_id", "incarnation_id",
+                "machine_id"
+            ]) and
+            (.environment_id | test("^env_")) and
+            (.machine_id | test("^mch_")) and
+            (.incarnation_id | test("^inc_")) and
+            (.backend_key | bounded_key) and
+            (.disk_resource_id | bounded_key)
+        )) and
+        (.ids.target.environment_id != .ids.sibling.environment_id) and
+        (.ids.target.machine_id != .ids.sibling.machine_id) and
+        (.ids.target.incarnation_id != .ids.sibling.incarnation_id) and
+        (.ids.target.backend_key != .ids.sibling.backend_key) and
+        (.ids.target.disk_resource_id != .ids.sibling.disk_resource_id) and
+
+        ((.operations | type) == "array") and
+        ((.operations | length) == 6) and
+        ((.operations | map(.operation_id) | unique | length) == 6) and
+        ((.operations | map(.request_id) | unique | length) == 6) and
+        ((.operations | map(.idempotency_key) | unique | length) == 6) and
+        (all(.operations[];
+            exact_keys([
+                "definition_digest", "generation", "idempotency_key", "kind", "label",
+                "operation_id", "plan_digest", "request_hash", "request_id", "status"
+            ]) and
+            (.operation_id | test("^lop_[A-Za-z0-9._:-]+$")) and
+            (.generation | type == "number" and . > 0 and . == floor) and
+            (.request_id | nonempty) and
+            (.idempotency_key | nonempty) and
+            (.request_hash | sha256) and
+            (.definition_digest | sha256) and
+            (.plan_digest | sha256) and
+            (.status == "succeeded")
+        )) and
+        ((.operations | map([.label, .kind, .generation])) == [
+            ["target_initial_up", "up", 1],
+            ["sibling_initial_up", "up", 1],
+            ["target_stop", "stop", 2],
+            ["target_up_after_reopen", "up", 3],
+            ["target_delete", "delete", 4],
+            ["sibling_delete", "delete", 2]
+        ]) and
+
+        ((.phases | type) == "array") and
+        ((.phases | map(.name)) == [
+            "initial_up", "persistent_sentinels", "target_stop", "exact_stop_replay",
+            "store_only_reopen", "target_up_after_reopen", "target_delete_reopen",
+            "target_delete", "sibling_delete", "final_cleanup"
+        ]) and
+        (all(.phases[]; exact_keys(["name", "passed"]) and .passed == true)) and
+
+        (.backend_invocations | exact_keys([
+            "boot", "disk_already_absent", "disk_remove_attempts", "disk_removed",
+            "shutdown", "stop_replay"
+        ])) and
+        (.backend_invocations == {
+            "boot": 3, "shutdown": 3, "disk_remove_attempts": 3,
+            "disk_removed": 2, "disk_already_absent": 1, "stop_replay": 0
+        }) and
+
+        (.stop_replay | exact_keys([
+            "backend_invocations", "pending_steps", "same_generation", "same_operation",
+            "same_plan_digest"
+        ])) and
+        (.stop_replay == {
+            "same_operation": true, "same_generation": true, "same_plan_digest": true,
+            "pending_steps": 0, "backend_invocations": 0
+        }) and
+
+        (.boot_ids | exact_keys([
+            "sibling_after_target_delete", "sibling_initial", "target_after_reopen",
+            "target_initial"
+        ])) and
+        (all(.boot_ids[]; nonempty)) and
+        (.boot_ids.target_initial != .boot_ids.target_after_reopen) and
+        (.boot_ids.sibling_initial == .boot_ids.sibling_after_target_delete) and
+
+        (.sentinels | exact_keys([
+            "sibling_persisted", "sibling_sha256", "target_persisted", "target_sha256"
+        ])) and
+        (.sentinels.target_sha256 | hex_sha256) and
+        (.sentinels.sibling_sha256 | hex_sha256) and
+        (.sentinels.target_persisted == true) and
+        (.sentinels.sibling_persisted == true) and
+
+        (.reopen | exact_keys([
+            "delete_operation_byte_equal", "delete_plan_digest_equal", "disk_step_pending",
+            "runtime_kept_alive", "runtime_reattachment_claimed", "store_only"
+        ])) and
+        (.reopen.store_only == true) and
+        (.reopen.runtime_kept_alive == true) and
+        (.reopen.runtime_reattachment_claimed == false) and
+        (.reopen.delete_operation_byte_equal == true) and
+        (.reopen.delete_plan_digest_equal == true) and
+        (.reopen.disk_step_pending == true) and
+
+        (.sibling_isolation | exact_keys([
+            "aggregate_bytes_equal_after_delete", "aggregate_bytes_equal_after_restart",
+            "aggregate_bytes_equal_after_stop", "live_after_target_delete",
+            "live_after_target_restart", "live_during_target_stop",
+            "ownership_bytes_equal_after_delete", "ownership_bytes_equal_after_restart",
+            "ownership_bytes_equal_after_stop"
+        ])) and
+        (all(.sibling_isolation[]; . == true)) and
+
+        (.final | exact_keys([
+            "disk_count", "environment_rows", "operation_count", "ownership_rows",
+            "runtime_active_lifecycles", "runtime_exec_sessions", "runtime_stack_vms",
+            "runtime_vm_handles", "tombstone_count"
+        ])) and
+        (.final == {
+            "tombstone_count": 2, "operation_count": 6, "environment_rows": 0,
+            "ownership_rows": 0, "disk_count": 0, "runtime_vm_handles": 0,
+            "runtime_stack_vms": 0, "runtime_active_lifecycles": 0,
+            "runtime_exec_sessions": 0
+        }) and
+
+        (.controls | exact_keys(["fallbacks", "invocations", "retries"])) and
+        (.controls == {"invocations": 1, "retries": 0, "fallbacks": 0})
+    ' "$evidence_file" >/dev/null
+}
+
 write_and_validate_container_id_ownership_checksum() {
     local evidence_file="$1"
     local checksum_file="$2"
@@ -1657,6 +1820,17 @@ write_and_validate_stack_teardown_checksum() {
 }
 
 write_and_validate_stack_container_ownership_checksum() {
+    local evidence_file="$1"
+    local checksum_file="$2"
+    local evidence_name
+    evidence_name="$(basename "$evidence_file")"
+    local digest
+    digest="$(shasum -a 256 "$evidence_file" | cut -d' ' -f1)"
+    printf '%s  %s\n' "$digest" "$evidence_name" > "$checksum_file"
+    (cd "$(dirname "$evidence_file")" && shasum -a 256 -c "$(basename "$checksum_file")") >/dev/null
+}
+
+write_and_validate_environment_lifecycle_checksum() {
     local evidence_file="$1"
     local checksum_file="$2"
     local evidence_name
@@ -1713,6 +1887,11 @@ run_and_log() {
             rm -f "$STACK_CONTAINER_OWNERSHIP_EVIDENCE"
             rm -f "$STACK_CONTAINER_OWNERSHIP_SHA256"
             cmd_env+=("VZ_STACK_CONTAINER_OWNERSHIP_EVIDENCE=$STACK_CONTAINER_OWNERSHIP_EVIDENCE")
+        fi
+        if [[ "$label" == "stack" || "$label" == "environment-lifecycle-journal-linux-vm" ]]; then
+            rm -f "$ENVIRONMENT_LIFECYCLE_EVIDENCE"
+            rm -f "$ENVIRONMENT_LIFECYCLE_SHA256"
+            cmd_env+=("VZ_ENVIRONMENT_LIFECYCLE_EVIDENCE=$ENVIRONMENT_LIFECYCLE_EVIDENCE")
         fi
     fi
 
@@ -1778,9 +1957,9 @@ run_and_log() {
     if [[ $status -eq 0 && "$PROFILE" == "release" \
         && "$suite" == "stack" && "$label" == "stack" ]] \
         && ! grep -Fqx \
-            "test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished" \
+            "test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished" \
             <(sed -E 's/; finished in .*/; finished/' "$log_file"); then
-        echo "complete stack suite did not report exactly 21/21 real-VM tests with zero ignored failures" >&2
+        echo "complete stack suite did not report exactly 22/22 real-VM tests with zero ignored failures" >&2
         return 99
     fi
 
@@ -1843,6 +2022,21 @@ run_and_log() {
             return 98
         fi
         STACK_CONTAINER_OWNERSHIP_EVIDENCE_VALIDATED=true
+    fi
+
+    if [[ $status -eq 0 ]] && [[ "$suite" == "stack" ]] \
+        && [[ "$label" == "stack" || "$label" == "environment-lifecycle-journal-linux-vm" ]]; then
+        if [[ ! -f "$ENVIRONMENT_LIFECYCLE_EVIDENCE" ]] \
+            || ! validate_environment_lifecycle_evidence "$ENVIRONMENT_LIFECYCLE_EVIDENCE"; then
+            echo "Environment lifecycle evidence is missing, malformed, or violates the journal contract" >&2
+            return 104
+        fi
+        if ! write_and_validate_environment_lifecycle_checksum \
+            "$ENVIRONMENT_LIFECYCLE_EVIDENCE" "$ENVIRONMENT_LIFECYCLE_SHA256"; then
+            echo "Environment lifecycle evidence checksum creation or verification failed" >&2
+            return 105
+        fi
+        ENVIRONMENT_LIFECYCLE_EVIDENCE_VALIDATED=true
     fi
 
     if [[ $status -eq 0 ]] && [[ "$suite" == "buildkit" ]]; then
@@ -1914,6 +2108,8 @@ echo "==> output directory: $RUN_DIR"
     echo "buildkit_artifact_verification=$BUILDKIT_ARTIFACT_VERIFICATION_EVIDENCE"
     echo "buildkit_artifact_evidence_checksums=$BUILDKIT_ARTIFACT_EVIDENCE_CHECKSUMS"
     echo "buildkit_builder_output_checksums=$BUILDKIT_BUILDER_OUTPUT_CHECKSUMS"
+    echo "environment_lifecycle_evidence=$ENVIRONMENT_LIFECYCLE_EVIDENCE"
+    echo "environment_lifecycle_checksum=$ENVIRONMENT_LIFECYCLE_SHA256"
 } > "$RUN_DIR/run-info.txt"
 
 echo "==> building host binaries required for local VM flows"
@@ -1942,6 +2138,8 @@ STACK_TEARDOWN_EVIDENCE_VALIDATED=false
 STACK_TEARDOWN_EVIDENCE_REQUIRED=false
 STACK_CONTAINER_OWNERSHIP_EVIDENCE_VALIDATED=false
 STACK_CONTAINER_OWNERSHIP_EVIDENCE_REQUIRED=false
+ENVIRONMENT_LIFECYCLE_EVIDENCE_VALIDATED=false
+ENVIRONMENT_LIFECYCLE_EVIDENCE_REQUIRED=false
 
 for suite in "${RESOLVED_SUITES[@]}"; do
     package="$(suite_package "$suite")" || err "unknown suite '$suite'"
@@ -1953,6 +2151,10 @@ for suite in "${RESOLVED_SUITES[@]}"; do
     if [[ "$suite" == "stack" ]] && { [[ ${#RESOLVED_SCENARIOS[@]} -eq 0 ]] \
         || [[ " ${RESOLVED_SCENARIOS[*]} " == *" stack-container-ownership "* ]]; }; then
         STACK_CONTAINER_OWNERSHIP_EVIDENCE_REQUIRED=true
+    fi
+    if [[ "$suite" == "stack" ]] && { [[ ${#RESOLVED_SCENARIOS[@]} -eq 0 ]] \
+        || [[ " ${RESOLVED_SCENARIOS[*]} " == *" environment-lifecycle-journal-linux-vm "* ]]; }; then
+        ENVIRONMENT_LIFECYCLE_EVIDENCE_REQUIRED=true
     fi
 
     echo "==> building [$suite] ($package::$test_name)"
@@ -2046,6 +2248,12 @@ if [[ "$STACK_CONTAINER_OWNERSHIP_EVIDENCE_REQUIRED" == "true" \
     FAILED+=("stack-container-ownership-evidence:97")
 fi
 
+if [[ "$ENVIRONMENT_LIFECYCLE_EVIDENCE_REQUIRED" == "true" \
+    && "$ENVIRONMENT_LIFECYCLE_EVIDENCE_VALIDATED" != "true" ]]; then
+    echo "==> required Environment lifecycle evidence was not validated" >&2
+    FAILED+=("environment-lifecycle-evidence:104")
+fi
+
 if [[ "$BUILDKIT_RELEASE_GATE_QUALIFIED" == "pending" ]]; then
     if [[ "$BUILDKIT_EVIDENCE_VALIDATED" == "true" && ${#FAILED[@]} -eq 0 ]]; then
         BUILDKIT_RELEASE_GATE_QUALIFIED="true"
@@ -2107,6 +2315,15 @@ action_summary="$RUN_DIR/summary.txt"
         echo "stack_container_ownership=none"
         echo "stack_container_ownership_sha256=none"
     fi
+    if [[ "$ENVIRONMENT_LIFECYCLE_EVIDENCE_VALIDATED" == "true" ]]; then
+        echo "environment_lifecycle=$ENVIRONMENT_LIFECYCLE_EVIDENCE"
+        echo "environment_lifecycle_sha256=$ENVIRONMENT_LIFECYCLE_SHA256"
+    else
+        echo "environment_lifecycle=none"
+        echo "environment_lifecycle_sha256=none"
+    fi
+    echo "environment_lifecycle_required=$ENVIRONMENT_LIFECYCLE_EVIDENCE_REQUIRED"
+    echo "environment_lifecycle_validated=$ENVIRONMENT_LIFECYCLE_EVIDENCE_VALIDATED"
 } > "$action_summary"
 
 if [[ ${#FAILED[@]} -gt 0 ]]; then

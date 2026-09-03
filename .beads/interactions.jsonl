@@ -65,3 +65,4 @@
 {"id":"int-77df04172579400584f78941d1bf6956","kind":"field_change","created_at":"2026-09-03T20:32:37.436691Z","actor":"James Lal","issue_id":"vz-mzs.2.1","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
 {"id":"int-35c1f178d36c6875e0e61429df727415","kind":"field_change","created_at":"2026-09-03T20:43:03.691829Z","actor":"James Lal","issue_id":"vz-mzs.2.4","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
 {"id":"int-1e91c99a598e600343292a9759c69423","kind":"field_change","created_at":"2026-09-03T21:29:57.334102Z","actor":"James Lal","issue_id":"vz-mzs.2.4","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
+{"id":"int-c5eeb16fe9fb5ea567cea4376876cf0b","kind":"field_change","created_at":"2026-09-03T21:32:33.830051Z","actor":"James Lal","issue_id":"vz-mzs.2.2","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}

@@ -21,15 +21,23 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use vz_oci_macos::{
     MacosRuntimeBackend, Runtime, RuntimeConfig, RuntimeLifecycleAdmissionKind,
     RuntimeLifecycleDiagnostics,
 };
 use vz_runtime_contract::{
-    Container, ContainerCreateReceipt, ContainerGenerationOwnership, ContainerState,
-    ContractInvariantError, ExecConfig, GenerationCleanupOutcome, Lease, LeaseState,
-    MachineErrorCode, NetworkServiceConfig, OwnedCreateError, PortMapping, RunConfig,
-    RuntimeBackend, Sandbox, SandboxBackend, SandboxSpec, SandboxState,
+    Architecture, CapabilitySet, Container, ContainerCreateReceipt, ContainerGenerationOwnership,
+    ContainerState, ContractInvariantError, EnvironmentId, EnvironmentInstance,
+    EnvironmentLifecycleKind, EnvironmentLifecycleOperation, EnvironmentLifecycleStatus,
+    EnvironmentSpec, EnvironmentState, ExecConfig, GenerationCleanupOutcome, Lease, LeaseState,
+    LifecycleStepResult, LifecycleStepStatus, MachineBackend, MachineCapability, MachineErrorCode,
+    MachineId, MachineIncarnation, MachineIncarnationId, MachineInstance,
+    MachineLifecycleStepAcknowledgement, MachineProfile, MachineResources, MachineSpec,
+    MachineState, NetworkServiceConfig, OperatingSystem, OwnedCreateError, OwnedResourceKind,
+    OwnershipCleanupStepAcknowledgement, OwnershipRecord, PortMapping, ProjectDefinition,
+    ProjectId, ProjectState, ResourceOwner, RunConfig, RuntimeBackend, Sandbox, SandboxBackend,
+    SandboxSpec, SandboxState, StackResourceHint, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
 };
 use vz_stack::{
     Action, ContainerRuntime, ImagePolicy, OrchestrationConfig, ServicePhase, StackError,
@@ -288,6 +296,174 @@ fn write_stack_container_ownership_evidence(evidence: &serde_json::Value) {
     .expect("stack container-ownership evidence should be writable");
     std::fs::rename(&temporary, &path)
         .expect("stack container-ownership evidence should publish atomically");
+}
+
+#[allow(clippy::expect_used)]
+fn write_environment_lifecycle_evidence(evidence: &serde_json::Value) {
+    let Some(path) =
+        std::env::var_os("VZ_ENVIRONMENT_LIFECYCLE_EVIDENCE").map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(evidence)
+            .expect("Environment lifecycle evidence should serialize"),
+    )
+    .expect("Environment lifecycle evidence should be writable");
+    std::fs::rename(&temporary, &path)
+        .expect("Environment lifecycle evidence should publish atomically");
+}
+
+#[allow(clippy::expect_used)]
+fn environment_lifecycle_plan_digest(operation: &EnvironmentLifecycleOperation) -> String {
+    let machine_steps = operation
+        .machine_steps
+        .iter()
+        .map(|step| {
+            serde_json::json!({
+                "machine_id": step.machine_id,
+                "initial_state": step.initial_state,
+                "target_state": step.target_state,
+                "expected_incarnation": step.expected_incarnation,
+            })
+        })
+        .collect::<Vec<_>>();
+    let cleanup_ownership = operation
+        .cleanup_steps
+        .iter()
+        .map(|step| &step.ownership)
+        .collect::<Vec<_>>();
+    let plan = serde_json::json!({
+        "kind": operation.kind,
+        "generation": operation.generation,
+        "definition_digest": operation.definition_digest,
+        "machine_steps": machine_steps,
+        "cleanup_ownership": cleanup_ownership,
+    });
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&plan).expect("lifecycle plan should serialize"))
+    )
+}
+
+fn environment_lifecycle_sha256(value: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn environment_lifecycle_operation_evidence(
+    label: &str,
+    operation: &EnvironmentLifecycleOperation,
+) -> serde_json::Value {
+    serde_json::json!({
+        "label": label,
+        "kind": match operation.kind {
+            EnvironmentLifecycleKind::Up => "up",
+            EnvironmentLifecycleKind::Stop => "stop",
+            EnvironmentLifecycleKind::Delete => "delete",
+        },
+        "operation_id": operation.operation_id,
+        "generation": operation.generation,
+        "request_id": operation.request_id,
+        "idempotency_key": operation.idempotency_key,
+        "request_hash": operation.request_hash,
+        "definition_digest": operation.definition_digest,
+        "plan_digest": environment_lifecycle_plan_digest(operation),
+        "status": match operation.status {
+            EnvironmentLifecycleStatus::Succeeded => "succeeded",
+            EnvironmentLifecycleStatus::Failed => "failed",
+            EnvironmentLifecycleStatus::Superseded => "superseded",
+            EnvironmentLifecycleStatus::Planned => "planned",
+            EnvironmentLifecycleStatus::Running => "running",
+            EnvironmentLifecycleStatus::Blocked => "blocked",
+        },
+    })
+}
+
+#[allow(clippy::expect_used)]
+fn environment_lifecycle_machine_ack(
+    operation: &EnvironmentLifecycleOperation,
+    resulting_incarnation: Option<MachineIncarnation>,
+) -> MachineLifecycleStepAcknowledgement {
+    let step = operation
+        .machine_steps
+        .first()
+        .expect("single-Machine lifecycle plan should have one step");
+    MachineLifecycleStepAcknowledgement {
+        operation_id: operation.operation_id.clone(),
+        generation: operation.generation,
+        machine_id: step.machine_id.clone(),
+        initial_state: step.initial_state,
+        target_state: step.target_state,
+        expected_incarnation: step.expected_incarnation.clone(),
+        resulting_incarnation,
+        result: LifecycleStepResult::Succeeded,
+    }
+}
+
+#[allow(clippy::expect_used)]
+fn environment_lifecycle_environment(
+    store: &StateStore,
+    project_id: &ProjectId,
+    environment_id: &EnvironmentId,
+) -> EnvironmentInstance {
+    store
+        .load_project_state(project_id.as_str())
+        .expect("project state should load")
+        .expect("project state should exist")
+        .environments
+        .into_iter()
+        .find(|environment| environment.environment_id == *environment_id)
+        .unwrap_or_else(|| panic!("Environment `{environment_id}` should exist"))
+}
+
+#[allow(clippy::expect_used)]
+fn environment_lifecycle_guest_exec(
+    runtime: &OciContainerRuntime,
+    backend_key: &str,
+    script: &str,
+) -> String {
+    let (exit_code, stdout, stderr) = runtime
+        .exec_in_shared_vm(
+            backend_key,
+            "/bin/busybox",
+            vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+            Duration::from_secs(30),
+        )
+        .expect("shared-VM lifecycle probe should execute");
+    assert_eq!(
+        exit_code, 0,
+        "shared-VM lifecycle probe failed: stdout={stdout}, stderr={stderr}"
+    );
+    stdout.trim().to_string()
+}
+
+struct EnvironmentLifecyclePhysicalCleanup {
+    runtime: OciContainerRuntime,
+    backend_keys: Vec<String>,
+    disk_paths: Vec<std::path::PathBuf>,
+}
+
+#[allow(clippy::print_stderr)]
+impl Drop for EnvironmentLifecyclePhysicalCleanup {
+    fn drop(&mut self) {
+        for backend_key in &self.backend_keys {
+            if self.runtime.has_sandbox(backend_key) {
+                let _ = self.runtime.shutdown_sandbox(backend_key);
+            }
+        }
+        for disk_path in &self.disk_paths {
+            match std::fs::remove_file(disk_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => eprintln!(
+                    "best-effort Environment lifecycle disk cleanup failed for {}: {error}",
+                    disk_path.display()
+                ),
+            }
+        }
+    }
 }
 
 fn ownership_json(ownership: &ContainerGenerationOwnership) -> serde_json::Value {
@@ -4217,4 +4393,916 @@ networks:
         .runtime()
         .shutdown_sandbox("multinet-e2e")
         .expect("multinet-e2e shared VM shutdown should succeed");
+}
+
+/// Prove a durable Environment journal fences real VM stop/up/delete work,
+/// survives store reopen, preserves the selected Machine incarnation and disk,
+/// and never mutates a sibling Environment in the same Project.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+#[allow(clippy::expect_used)]
+async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_cross_environment_damage()
+ {
+    if !require_virtualization_entitlement() {
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,vz_oci_macos=debug,vz_linux=debug,vz_stack=debug")
+        .with_test_writer()
+        .try_init();
+
+    let tmp = tempfile::tempdir().expect("Environment lifecycle tempdir should be created");
+    let db_path = tmp.path().join("environment-lifecycle.db");
+    let target_disk = tmp.path().join("target-machine.img");
+    let sibling_disk = tmp.path().join("sibling-machine.img");
+    for path in [&target_disk, &sibling_disk] {
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .unwrap_or_else(|error| panic!("create sparse disk {}: {error}", path.display()));
+        file.set_len(512 * 1024 * 1024)
+            .unwrap_or_else(|error| panic!("size sparse disk {}: {error}", path.display()));
+    }
+
+    let project_id = ProjectId::new("prj_lifecycle_mac_e2e").unwrap();
+    let target_environment_id = EnvironmentId::new("env_lifecycle_target").unwrap();
+    let sibling_environment_id = EnvironmentId::new("env_lifecycle_sibling").unwrap();
+    let target_machine_id = MachineId::new("mch_lifecycle_target").unwrap();
+    let sibling_machine_id = MachineId::new("mch_lifecycle_sibling").unwrap();
+    let target_incarnation = MachineIncarnation {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        incarnation_id: MachineIncarnationId::new("inc_lifecycle_target_g1").unwrap(),
+        machine_id: target_machine_id.clone(),
+        generation: 1,
+        created_at: 100,
+    };
+    let sibling_incarnation = MachineIncarnation {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        incarnation_id: MachineIncarnationId::new("inc_lifecycle_sibling_g1").unwrap(),
+        machine_id: sibling_machine_id.clone(),
+        generation: 1,
+        created_at: 101,
+    };
+    let target_owner = ResourceOwner {
+        project_id: project_id.clone(),
+        environment_id: target_environment_id.clone(),
+        machine_id: Some(target_machine_id.clone()),
+    };
+    let sibling_owner = ResourceOwner {
+        project_id: project_id.clone(),
+        environment_id: sibling_environment_id.clone(),
+        machine_id: Some(sibling_machine_id.clone()),
+    };
+    let target_backend_key = target_owner
+        .bounded_resource_name(&OwnedResourceKind::Machine, "runtime-vm", 64)
+        .unwrap();
+    let sibling_backend_key = sibling_owner
+        .bounded_resource_name(&OwnedResourceKind::Machine, "runtime-vm", 64)
+        .unwrap();
+    let target_disk_resource = target_owner
+        .bounded_resource_name(&OwnedResourceKind::Disk, "root-disk", 64)
+        .unwrap();
+    let sibling_disk_resource = sibling_owner
+        .bounded_resource_name(&OwnedResourceKind::Disk, "root-disk", 64)
+        .unwrap();
+    assert_ne!(target_backend_key, sibling_backend_key);
+    assert_ne!(target_disk_resource, sibling_disk_resource);
+
+    let target = TargetSpec {
+        os: OperatingSystem::Linux,
+        arch: Architecture::Aarch64,
+        image: "vz-linux-developer-bundle".to_string(),
+        version: Some("0.4.0-e2e".to_string()),
+        channel: Some("local".to_string()),
+        digest: Some("sha256:environment-lifecycle-e2e".to_string()),
+    };
+    let capabilities = CapabilitySet::new([
+        MachineCapability::PosixExec,
+        MachineCapability::PosixPty,
+        MachineCapability::Signals,
+        MachineCapability::Files,
+        MachineCapability::DockerEngine,
+        MachineCapability::Compose,
+        MachineCapability::Buildx,
+    ]);
+    let definition = ProjectDefinition {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        project_id: project_id.clone(),
+        name: "environment-lifecycle-e2e".to_string(),
+        environment: EnvironmentSpec {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            machines: vec![MachineSpec {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                name: "linux".to_string(),
+                profile: MachineProfile::Developer,
+                target: target.clone(),
+                resources: MachineResources {
+                    cpus: Some(2),
+                    memory_mb: Some(1024),
+                    disk_bytes: Some(512 * 1024 * 1024),
+                },
+                requested_capabilities: capabilities.clone(),
+                workspace: None,
+            }],
+            networks: vec![],
+            endpoints: vec![],
+        },
+    };
+    let definition_digest = definition.digest().unwrap();
+    let make_environment = |environment_id: EnvironmentId,
+                            machine_id: MachineId,
+                            incarnation: MachineIncarnation,
+                            name: &str,
+                            disk_resource: String,
+                            created_at: u64| {
+        EnvironmentInstance {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            environment_id: environment_id.clone(),
+            project_id: project_id.clone(),
+            name: name.to_string(),
+            definition_digest: definition_digest.clone(),
+            state: EnvironmentState::Stopped,
+            lifecycle_generation: 0,
+            active_operation_id: None,
+            bindings: vec![],
+            machines: vec![MachineInstance {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                machine_id: machine_id.clone(),
+                environment_id: environment_id.clone(),
+                name: "linux".to_string(),
+                profile: MachineProfile::Developer,
+                target: target.clone(),
+                resources: MachineResources {
+                    cpus: Some(2),
+                    memory_mb: Some(1024),
+                    disk_bytes: Some(512 * 1024 * 1024),
+                },
+                requested_capabilities: capabilities.clone(),
+                negotiated_capabilities: capabilities.clone(),
+                backend: Some(MachineBackend::MacosVirtualizationLinux),
+                incarnation: Some(incarnation.clone()),
+                state: MachineState::Stopped,
+                legacy_sandbox_id: None,
+            }],
+            networks: vec![],
+            endpoints: vec![],
+            ownership: vec![
+                OwnershipRecord {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    resource_kind: OwnedResourceKind::Machine,
+                    resource_id: machine_id.to_string(),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(machine_id.clone()),
+                },
+                OwnershipRecord {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    resource_kind: OwnedResourceKind::Incarnation,
+                    resource_id: incarnation.incarnation_id.to_string(),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(machine_id.clone()),
+                },
+                OwnershipRecord {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    resource_kind: OwnedResourceKind::Disk,
+                    resource_id: disk_resource,
+                    environment_id,
+                    machine_id: Some(machine_id),
+                },
+            ],
+            legacy_migration: None,
+            created_at,
+            updated_at: created_at,
+        }
+    };
+    let initial_state = ProjectState {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        definition,
+        environments: vec![
+            make_environment(
+                target_environment_id.clone(),
+                target_machine_id.clone(),
+                target_incarnation.clone(),
+                "target",
+                target_disk_resource.clone(),
+                200,
+            ),
+            make_environment(
+                sibling_environment_id.clone(),
+                sibling_machine_id.clone(),
+                sibling_incarnation.clone(),
+                "sibling",
+                sibling_disk_resource.clone(),
+                201,
+            ),
+        ],
+    };
+    initial_state
+        .validate()
+        .expect("E2E topology should validate");
+
+    let oci_data = stack_e2e_oci_data_dir();
+    let runtime = OciContainerRuntime::new(&oci_data);
+    let _physical_cleanup = EnvironmentLifecyclePhysicalCleanup {
+        runtime: runtime.clone(),
+        backend_keys: vec![target_backend_key.clone(), sibling_backend_key.clone()],
+        disk_paths: vec![target_disk.clone(), sibling_disk.clone()],
+    };
+    let store = StateStore::open(&db_path).expect("lifecycle StateStore should open");
+    store
+        .save_project_state(&initial_state)
+        .expect("lifecycle Project should bootstrap");
+
+    let mut clock = 1_000_u64;
+    let mut boot_invocations = 0_u64;
+    let mut shutdown_invocations = 0_u64;
+    let mut disk_remove_attempts = 0_u64;
+    let mut disk_removed = 0_u64;
+    let mut disk_already_absent = 0_u64;
+    let mut operations = Vec::new();
+
+    let target_up = store
+        .begin_environment_lifecycle(
+            target_environment_id.as_str(),
+            EnvironmentLifecycleKind::Up,
+            "request-target-up-initial",
+            "idempotency-target-up-initial",
+            &environment_lifecycle_sha256("request-target-up-initial"),
+            clock,
+        )
+        .expect("target Up journal should begin");
+    clock += 1;
+    assert_eq!(target_up.status, EnvironmentLifecycleStatus::Running);
+    assert_eq!(
+        target_up.machine_steps[0].status,
+        LifecycleStepStatus::Pending
+    );
+    boot_invocations += 1;
+    runtime
+        .create_sandbox(
+            &target_backend_key,
+            vec![],
+            StackResourceHint {
+                cpus: Some(2),
+                memory_mb: Some(1024),
+                disk_image_path: Some(target_disk.clone()),
+                ..StackResourceHint::default()
+            },
+        )
+        .expect("target VM should boot");
+    let target_up = store
+        .acknowledge_environment_machine_step(
+            &environment_lifecycle_machine_ack(
+                &target_up,
+                target_up.machine_steps[0].expected_incarnation.clone(),
+            ),
+            clock,
+        )
+        .expect("target Up Machine step should persist");
+    clock += 1;
+    let target_up = store
+        .finish_environment_lifecycle(target_up.operation_id.as_str(), target_up.generation, clock)
+        .expect("target Up should finish");
+    clock += 1;
+    operations.push(environment_lifecycle_operation_evidence(
+        "target_initial_up",
+        &target_up,
+    ));
+
+    let sibling_up = store
+        .begin_environment_lifecycle(
+            sibling_environment_id.as_str(),
+            EnvironmentLifecycleKind::Up,
+            "request-sibling-up-initial",
+            "idempotency-sibling-up-initial",
+            &environment_lifecycle_sha256("request-sibling-up-initial"),
+            clock,
+        )
+        .expect("sibling Up journal should begin");
+    clock += 1;
+    boot_invocations += 1;
+    runtime
+        .create_sandbox(
+            &sibling_backend_key,
+            vec![],
+            StackResourceHint {
+                cpus: Some(2),
+                memory_mb: Some(1024),
+                disk_image_path: Some(sibling_disk.clone()),
+                ..StackResourceHint::default()
+            },
+        )
+        .expect("sibling VM should boot");
+    let sibling_up = store
+        .acknowledge_environment_machine_step(
+            &environment_lifecycle_machine_ack(
+                &sibling_up,
+                sibling_up.machine_steps[0].expected_incarnation.clone(),
+            ),
+            clock,
+        )
+        .expect("sibling Up Machine step should persist");
+    clock += 1;
+    let sibling_up = store
+        .finish_environment_lifecycle(
+            sibling_up.operation_id.as_str(),
+            sibling_up.generation,
+            clock,
+        )
+        .expect("sibling Up should finish");
+    clock += 1;
+    operations.push(environment_lifecycle_operation_evidence(
+        "sibling_initial_up",
+        &sibling_up,
+    ));
+
+    let target_sentinel = "target-environment-lifecycle-sentinel-v1";
+    let sibling_sentinel = "sibling-environment-lifecycle-sentinel-v1";
+    let target_boot_initial = environment_lifecycle_guest_exec(
+        &runtime,
+        &target_backend_key,
+        &format!(
+            "printf '%s' '{target_sentinel}' > /run/vz-oci/volumes/lifecycle-sentinel && sync && cat /proc/sys/kernel/random/boot_id"
+        ),
+    );
+    let sibling_boot_initial = environment_lifecycle_guest_exec(
+        &runtime,
+        &sibling_backend_key,
+        &format!(
+            "printf '%s' '{sibling_sentinel}' > /run/vz-oci/volumes/lifecycle-sentinel && sync && cat /proc/sys/kernel/random/boot_id"
+        ),
+    );
+    assert!(!target_boot_initial.is_empty());
+    assert!(!sibling_boot_initial.is_empty());
+
+    let sibling_snapshot =
+        environment_lifecycle_environment(&store, &project_id, &sibling_environment_id);
+    let sibling_aggregate_bytes = serde_json::to_vec(&sibling_snapshot).unwrap();
+    let sibling_ownership_bytes = serde_json::to_vec(&sibling_snapshot.ownership).unwrap();
+
+    let target_stop = store
+        .begin_environment_lifecycle(
+            target_environment_id.as_str(),
+            EnvironmentLifecycleKind::Stop,
+            "request-target-stop",
+            "idempotency-target-stop",
+            &environment_lifecycle_sha256("request-target-stop"),
+            clock,
+        )
+        .expect("target Stop journal should begin");
+    clock += 1;
+    shutdown_invocations += 1;
+    runtime
+        .shutdown_sandbox(&target_backend_key)
+        .expect("target VM should stop");
+    assert!(!runtime.has_sandbox(&target_backend_key));
+    assert!(runtime.has_sandbox(&sibling_backend_key));
+    let sibling_boot_during_target_stop = environment_lifecycle_guest_exec(
+        &runtime,
+        &sibling_backend_key,
+        "cat /proc/sys/kernel/random/boot_id",
+    );
+    assert_eq!(sibling_boot_during_target_stop, sibling_boot_initial);
+    let target_stop = store
+        .acknowledge_environment_machine_step(
+            &environment_lifecycle_machine_ack(&target_stop, None),
+            clock,
+        )
+        .expect("target Stop Machine step should persist");
+    clock += 1;
+    let target_stop = store
+        .finish_environment_lifecycle(
+            target_stop.operation_id.as_str(),
+            target_stop.generation,
+            clock,
+        )
+        .expect("target Stop should finish");
+    clock += 1;
+    operations.push(environment_lifecycle_operation_evidence(
+        "target_stop",
+        &target_stop,
+    ));
+    let stopped_target =
+        environment_lifecycle_environment(&store, &project_id, &target_environment_id);
+    assert_eq!(stopped_target.state, EnvironmentState::Stopped);
+    assert_eq!(stopped_target.machines[0].state, MachineState::Stopped);
+    assert_eq!(
+        stopped_target.machines[0].incarnation.as_ref(),
+        Some(&target_incarnation)
+    );
+    assert!(target_disk.exists());
+    let sibling_after_target_stop =
+        environment_lifecycle_environment(&store, &project_id, &sibling_environment_id);
+    let sibling_aggregate_bytes_equal_after_stop =
+        serde_json::to_vec(&sibling_after_target_stop).unwrap() == sibling_aggregate_bytes;
+    let sibling_ownership_bytes_equal_after_stop =
+        serde_json::to_vec(&sibling_after_target_stop.ownership).unwrap()
+            == sibling_ownership_bytes;
+    assert!(sibling_aggregate_bytes_equal_after_stop);
+    assert!(sibling_ownership_bytes_equal_after_stop);
+
+    let counts_before_stop_replay = (boot_invocations, shutdown_invocations, disk_remove_attempts);
+    let target_stop_replay = store
+        .begin_environment_lifecycle(
+            target_environment_id.as_str(),
+            EnvironmentLifecycleKind::Stop,
+            "request-target-stop",
+            "idempotency-target-stop",
+            &environment_lifecycle_sha256("request-target-stop"),
+            clock,
+        )
+        .expect("exact Stop replay should return its terminal journal");
+    clock += 1;
+    assert_eq!(target_stop_replay, target_stop);
+    assert_eq!(
+        counts_before_stop_replay,
+        (boot_invocations, shutdown_invocations, disk_remove_attempts)
+    );
+    assert!(
+        target_stop_replay
+            .machine_steps
+            .iter()
+            .all(|step| step.status == LifecycleStepStatus::Succeeded)
+    );
+    let target_stop_replay_pending_steps = target_stop_replay
+        .machine_steps
+        .iter()
+        .filter(|step| {
+            matches!(
+                step.status,
+                LifecycleStepStatus::Pending | LifecycleStepStatus::Running
+            )
+        })
+        .count();
+    assert_eq!(target_stop_replay_pending_steps, 0);
+    assert!(
+        store
+            .load_current_environment_lifecycle(target_environment_id.as_str())
+            .unwrap()
+            .is_none()
+    );
+
+    drop(store);
+    let store = StateStore::open(&db_path).expect("lifecycle StateStore should reopen");
+    assert!(runtime.has_sandbox(&sibling_backend_key));
+    assert!(!runtime.has_sandbox(&target_backend_key));
+    let target_up_after_reopen = store
+        .begin_environment_lifecycle(
+            target_environment_id.as_str(),
+            EnvironmentLifecycleKind::Up,
+            "request-target-up-after-reopen",
+            "idempotency-target-up-after-reopen",
+            &environment_lifecycle_sha256("request-target-up-after-reopen"),
+            clock,
+        )
+        .expect("target Up after StateStore reopen should begin");
+    clock += 1;
+    assert_eq!(
+        target_up_after_reopen.machine_steps[0]
+            .expected_incarnation
+            .as_ref(),
+        Some(&target_incarnation)
+    );
+    boot_invocations += 1;
+    runtime
+        .create_sandbox(
+            &target_backend_key,
+            vec![],
+            StackResourceHint {
+                cpus: Some(2),
+                memory_mb: Some(1024),
+                disk_image_path: Some(target_disk.clone()),
+                ..StackResourceHint::default()
+            },
+        )
+        .expect("target VM should boot from its existing disk");
+    let target_boot_after_reopen = environment_lifecycle_guest_exec(
+        &runtime,
+        &target_backend_key,
+        "cat /proc/sys/kernel/random/boot_id",
+    );
+    assert_ne!(target_boot_after_reopen, target_boot_initial);
+    let target_sentinel_after_reopen = environment_lifecycle_guest_exec(
+        &runtime,
+        &target_backend_key,
+        "cat /run/vz-oci/volumes/lifecycle-sentinel",
+    );
+    assert_eq!(target_sentinel_after_reopen, target_sentinel);
+    let sibling_boot_after_target_restart = environment_lifecycle_guest_exec(
+        &runtime,
+        &sibling_backend_key,
+        "cat /proc/sys/kernel/random/boot_id",
+    );
+    assert_eq!(sibling_boot_after_target_restart, sibling_boot_initial);
+    let target_up_after_reopen = store
+        .acknowledge_environment_machine_step(
+            &environment_lifecycle_machine_ack(
+                &target_up_after_reopen,
+                target_up_after_reopen.machine_steps[0]
+                    .expected_incarnation
+                    .clone(),
+            ),
+            clock,
+        )
+        .expect("reopened target Up Machine step should persist");
+    clock += 1;
+    let target_up_after_reopen = store
+        .finish_environment_lifecycle(
+            target_up_after_reopen.operation_id.as_str(),
+            target_up_after_reopen.generation,
+            clock,
+        )
+        .expect("reopened target Up should finish");
+    clock += 1;
+    operations.push(environment_lifecycle_operation_evidence(
+        "target_up_after_reopen",
+        &target_up_after_reopen,
+    ));
+    let sibling_after_target_restart =
+        environment_lifecycle_environment(&store, &project_id, &sibling_environment_id);
+    let sibling_aggregate_bytes_equal_after_restart =
+        serde_json::to_vec(&sibling_after_target_restart).unwrap() == sibling_aggregate_bytes;
+    let sibling_ownership_bytes_equal_after_restart =
+        serde_json::to_vec(&sibling_after_target_restart.ownership).unwrap()
+            == sibling_ownership_bytes;
+    assert!(sibling_aggregate_bytes_equal_after_restart);
+    assert!(sibling_ownership_bytes_equal_after_restart);
+
+    let target_delete = store
+        .begin_environment_lifecycle(
+            target_environment_id.as_str(),
+            EnvironmentLifecycleKind::Delete,
+            "request-target-delete",
+            "idempotency-target-delete",
+            &environment_lifecycle_sha256("request-target-delete"),
+            clock,
+        )
+        .expect("target Delete journal should begin");
+    let target_delete_planned_digest = environment_lifecycle_plan_digest(&target_delete);
+    clock += 1;
+    shutdown_invocations += 1;
+    runtime
+        .shutdown_sandbox(&target_backend_key)
+        .expect("target VM should shut down for delete");
+    let target_delete = store
+        .acknowledge_environment_machine_step(
+            &environment_lifecycle_machine_ack(&target_delete, None),
+            clock,
+        )
+        .expect("target Delete Machine step should persist");
+    assert_eq!(
+        environment_lifecycle_plan_digest(&target_delete),
+        target_delete_planned_digest
+    );
+    clock += 1;
+    disk_remove_attempts += 1;
+    match std::fs::remove_file(&target_disk) {
+        Ok(()) => disk_removed += 1,
+        Err(error) => panic!("target disk should be removed before acknowledgement: {error}"),
+    }
+    let target_delete_before_reopen = target_delete.clone();
+    let target_delete_before_reopen_bytes =
+        serde_json::to_vec(&target_delete_before_reopen).unwrap();
+    let target_delete_plan_before_reopen =
+        environment_lifecycle_plan_digest(&target_delete_before_reopen);
+    drop(store);
+
+    let store = StateStore::open(&db_path).expect("StateStore should reopen during Delete");
+    let target_delete_after_reopen = store
+        .load_resumable_environment_lifecycle(target_environment_id.as_str())
+        .expect("resumable target Delete should load")
+        .expect("target Delete should remain fenced after reopen");
+    let target_delete_operation_byte_equal = serde_json::to_vec(&target_delete_after_reopen)
+        .unwrap()
+        == target_delete_before_reopen_bytes;
+    let target_delete_plan_after_reopen =
+        environment_lifecycle_plan_digest(&target_delete_after_reopen);
+    let target_disk_step_pending = target_delete_after_reopen.cleanup_steps.iter().any(|step| {
+        step.ownership.resource_kind == OwnedResourceKind::Disk
+            && step.ownership.resource_id == target_disk_resource
+            && step.status == LifecycleStepStatus::Pending
+    });
+    assert!(target_delete_operation_byte_equal);
+    assert_eq!(
+        target_delete_after_reopen.operation_id,
+        target_delete_before_reopen.operation_id
+    );
+    assert_eq!(
+        target_delete_after_reopen.generation,
+        target_delete_before_reopen.generation
+    );
+    assert_eq!(
+        target_delete_plan_after_reopen,
+        target_delete_plan_before_reopen
+    );
+    assert_eq!(
+        target_delete_plan_after_reopen,
+        target_delete_planned_digest
+    );
+    assert!(target_disk_step_pending);
+    disk_remove_attempts += 1;
+    match std::fs::remove_file(&target_disk) {
+        Ok(()) => panic!("target disk must already be absent after StateStore reopen"),
+        Err(error) if error.kind() == ErrorKind::NotFound => disk_already_absent += 1,
+        Err(error) => panic!("idempotent target disk removal failed: {error}"),
+    }
+    let mut target_delete = target_delete_after_reopen;
+    for step in target_delete.cleanup_steps.clone() {
+        target_delete = store
+            .acknowledge_environment_cleanup_step(
+                &OwnershipCleanupStepAcknowledgement {
+                    operation_id: target_delete.operation_id.clone(),
+                    generation: target_delete.generation,
+                    ownership: step.ownership,
+                    result: LifecycleStepResult::Succeeded,
+                },
+                clock,
+            )
+            .expect("target exact ownership cleanup should persist");
+        clock += 1;
+    }
+    let (target_delete, target_tombstone) = store
+        .finish_environment_delete(
+            target_delete.operation_id.as_str(),
+            target_delete.generation,
+            clock,
+        )
+        .expect("target Delete should finish with a tombstone");
+    clock += 1;
+    assert_eq!(target_delete.status, EnvironmentLifecycleStatus::Succeeded);
+    assert_eq!(
+        environment_lifecycle_plan_digest(&target_delete),
+        target_delete_planned_digest
+    );
+    assert_eq!(target_tombstone.environment_id, target_environment_id);
+    operations.push(environment_lifecycle_operation_evidence(
+        "target_delete",
+        &target_delete,
+    ));
+    assert!(
+        store
+            .load_project_state(project_id.as_str())
+            .unwrap()
+            .unwrap()
+            .environments
+            .iter()
+            .all(|environment| environment.environment_id != target_environment_id)
+    );
+    let sibling_after_target_delete =
+        environment_lifecycle_environment(&store, &project_id, &sibling_environment_id);
+    let sibling_aggregate_bytes_equal_after_delete =
+        serde_json::to_vec(&sibling_after_target_delete).unwrap() == sibling_aggregate_bytes;
+    let sibling_ownership_bytes_equal_after_delete =
+        serde_json::to_vec(&sibling_after_target_delete.ownership).unwrap()
+            == sibling_ownership_bytes;
+    assert!(sibling_aggregate_bytes_equal_after_delete);
+    assert!(sibling_ownership_bytes_equal_after_delete);
+    assert!(runtime.has_sandbox(&sibling_backend_key));
+    let sibling_boot_after_target_delete = environment_lifecycle_guest_exec(
+        &runtime,
+        &sibling_backend_key,
+        "cat /proc/sys/kernel/random/boot_id",
+    );
+    let sibling_sentinel_after_target_delete = environment_lifecycle_guest_exec(
+        &runtime,
+        &sibling_backend_key,
+        "cat /run/vz-oci/volumes/lifecycle-sentinel",
+    );
+    assert_eq!(sibling_boot_after_target_delete, sibling_boot_initial);
+    assert_eq!(sibling_sentinel_after_target_delete, sibling_sentinel);
+
+    let sibling_delete = store
+        .begin_environment_lifecycle(
+            sibling_environment_id.as_str(),
+            EnvironmentLifecycleKind::Delete,
+            "request-sibling-delete",
+            "idempotency-sibling-delete",
+            &environment_lifecycle_sha256("request-sibling-delete"),
+            clock,
+        )
+        .expect("sibling Delete journal should begin");
+    clock += 1;
+    shutdown_invocations += 1;
+    runtime
+        .shutdown_sandbox(&sibling_backend_key)
+        .expect("sibling VM should shut down for delete");
+    let mut sibling_delete = store
+        .acknowledge_environment_machine_step(
+            &environment_lifecycle_machine_ack(&sibling_delete, None),
+            clock,
+        )
+        .expect("sibling Delete Machine step should persist");
+    clock += 1;
+    disk_remove_attempts += 1;
+    match std::fs::remove_file(&sibling_disk) {
+        Ok(()) => disk_removed += 1,
+        Err(error) => panic!("sibling disk should be removed: {error}"),
+    }
+    for step in sibling_delete.cleanup_steps.clone() {
+        sibling_delete = store
+            .acknowledge_environment_cleanup_step(
+                &OwnershipCleanupStepAcknowledgement {
+                    operation_id: sibling_delete.operation_id.clone(),
+                    generation: sibling_delete.generation,
+                    ownership: step.ownership,
+                    result: LifecycleStepResult::Succeeded,
+                },
+                clock,
+            )
+            .expect("sibling exact ownership cleanup should persist");
+        clock += 1;
+    }
+    let (sibling_delete, sibling_tombstone) = store
+        .finish_environment_delete(
+            sibling_delete.operation_id.as_str(),
+            sibling_delete.generation,
+            clock,
+        )
+        .expect("sibling Delete should finish with a tombstone");
+    assert_eq!(sibling_tombstone.environment_id, sibling_environment_id);
+    operations.push(environment_lifecycle_operation_evidence(
+        "sibling_delete",
+        &sibling_delete,
+    ));
+
+    drop(store);
+    let store = StateStore::open(&db_path).expect("final lifecycle StateStore should reopen");
+    let final_project = store
+        .load_project_state(project_id.as_str())
+        .expect("final Project should load")
+        .expect("Project definition should remain after Environment deletion");
+    let final_environment_rows = final_project.environments.len();
+    let final_ownership_rows = final_project
+        .environments
+        .iter()
+        .map(|environment| environment.ownership.len())
+        .sum::<usize>();
+    let tombstones = store
+        .list_environment_tombstones(project_id.as_str())
+        .expect("both lifecycle tombstones should list");
+    let lifecycle_operation_ids = [
+        target_up.operation_id.as_str(),
+        sibling_up.operation_id.as_str(),
+        target_stop.operation_id.as_str(),
+        target_up_after_reopen.operation_id.as_str(),
+        target_delete.operation_id.as_str(),
+        sibling_delete.operation_id.as_str(),
+    ];
+    for operation_id in lifecycle_operation_ids {
+        assert!(
+            store
+                .load_environment_lifecycle(operation_id)
+                .expect("final lifecycle journal should load")
+                .is_some(),
+            "expected lifecycle journal `{operation_id}` should remain readable"
+        );
+    }
+    drop(store);
+    let final_connection =
+        rusqlite::Connection::open(&db_path).expect("final lifecycle database should reopen");
+    let (
+        final_operation_rows,
+        final_tombstone_rows,
+        actual_environment_rows,
+        actual_ownership_rows,
+    ): (i64, i64, i64, i64) = final_connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM environment_lifecycle_operations),
+                (SELECT COUNT(*) FROM environment_tombstones),
+                (SELECT COUNT(*) FROM environment_instances),
+                (SELECT COUNT(*) FROM topology_ownership)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("final lifecycle database counts should load");
+    assert_eq!(tombstones.len(), 2);
+    assert_eq!(final_tombstone_rows, 2);
+    assert_eq!(final_operation_rows, 6);
+    assert_eq!(final_environment_rows, 0);
+    assert_eq!(final_ownership_rows, 0);
+    assert_eq!(actual_environment_rows, 0);
+    assert_eq!(actual_ownership_rows, 0);
+    assert!(!target_disk.exists());
+    assert!(!sibling_disk.exists());
+    assert!(!runtime.has_sandbox(&target_backend_key));
+    assert!(!runtime.has_sandbox(&sibling_backend_key));
+    let final_diagnostics = runtime.lifecycle_diagnostics();
+    assert_eq!(final_diagnostics.vm_handles, 0);
+    assert_eq!(final_diagnostics.stack_vms, 0);
+    assert_eq!(final_diagnostics.active_lifecycles, 0);
+    assert_eq!(operations.len(), 6);
+    assert!(
+        operations
+            .iter()
+            .all(|operation| operation["status"] == "succeeded")
+    );
+
+    let target_sentinel_sha256 = format!("{:x}", Sha256::digest(target_sentinel.as_bytes()));
+    let sibling_sentinel_sha256 = format!("{:x}", Sha256::digest(sibling_sentinel.as_bytes()));
+    let evidence = serde_json::json!({
+        "schema_version": 1,
+        "scenario": "environment-lifecycle-journal-linux-vm",
+        "host_target": {
+            "host_os": "macos",
+            "host_arch": "aarch64",
+            "machine_os": "linux",
+            "machine_arch": "aarch64",
+            "profile": "developer",
+            "backend": "macos_virtualization_linux",
+        },
+        "ids": {
+            "project_id": project_id,
+            "target": {
+                "environment_id": target_environment_id,
+                "machine_id": target_machine_id,
+                "incarnation_id": target_incarnation.incarnation_id,
+                "backend_key": target_backend_key,
+                "disk_resource_id": target_disk_resource,
+            },
+            "sibling": {
+                "environment_id": sibling_environment_id,
+                "machine_id": sibling_machine_id,
+                "incarnation_id": sibling_incarnation.incarnation_id,
+                "backend_key": sibling_backend_key,
+                "disk_resource_id": sibling_disk_resource,
+            },
+        },
+        "operations": operations,
+        "phases": [
+            {"name": "initial_up", "passed": true},
+            {"name": "persistent_sentinels", "passed": true},
+            {"name": "target_stop", "passed": true},
+            {"name": "exact_stop_replay", "passed": true},
+            {"name": "store_only_reopen", "passed": true},
+            {"name": "target_up_after_reopen", "passed": true},
+            {"name": "target_delete_reopen", "passed": true},
+            {"name": "target_delete", "passed": true},
+            {"name": "sibling_delete", "passed": true},
+            {"name": "final_cleanup", "passed": true}
+        ],
+        "backend_invocations": {
+            "boot": boot_invocations,
+            "shutdown": shutdown_invocations,
+            "disk_remove_attempts": disk_remove_attempts,
+            "disk_removed": disk_removed,
+            "disk_already_absent": disk_already_absent,
+            "stop_replay": 0,
+        },
+        "stop_replay": {
+            "same_operation": target_stop_replay.operation_id == target_stop.operation_id,
+            "same_generation": target_stop_replay.generation == target_stop.generation,
+            "same_plan_digest": environment_lifecycle_plan_digest(&target_stop_replay) == environment_lifecycle_plan_digest(&target_stop),
+            "pending_steps": target_stop_replay_pending_steps,
+            "backend_invocations": 0,
+        },
+        "boot_ids": {
+            "target_initial": target_boot_initial,
+            "target_after_reopen": target_boot_after_reopen,
+            "sibling_initial": sibling_boot_initial,
+            "sibling_after_target_delete": sibling_boot_after_target_delete,
+        },
+        "sentinels": {
+            "target_sha256": target_sentinel_sha256,
+            "sibling_sha256": sibling_sentinel_sha256,
+            "target_persisted": true,
+            "sibling_persisted": true,
+        },
+        "reopen": {
+            "store_only": true,
+            "runtime_kept_alive": true,
+            "runtime_reattachment_claimed": false,
+            "delete_operation_byte_equal": target_delete_operation_byte_equal,
+            "delete_plan_digest_equal": target_delete_plan_after_reopen == target_delete_plan_before_reopen,
+            "disk_step_pending": target_disk_step_pending,
+        },
+        "sibling_isolation": {
+            "aggregate_bytes_equal_after_stop": sibling_aggregate_bytes_equal_after_stop,
+            "aggregate_bytes_equal_after_restart": sibling_aggregate_bytes_equal_after_restart,
+            "aggregate_bytes_equal_after_delete": sibling_aggregate_bytes_equal_after_delete,
+            "ownership_bytes_equal_after_stop": sibling_ownership_bytes_equal_after_stop,
+            "ownership_bytes_equal_after_restart": sibling_ownership_bytes_equal_after_restart,
+            "ownership_bytes_equal_after_delete": sibling_ownership_bytes_equal_after_delete,
+            "live_during_target_stop": true,
+            "live_after_target_restart": true,
+            "live_after_target_delete": true,
+        },
+        "final": {
+            "tombstone_count": final_tombstone_rows,
+            "operation_count": final_operation_rows,
+            "environment_rows": actual_environment_rows,
+            "ownership_rows": actual_ownership_rows,
+            "disk_count": usize::from(target_disk.exists()) + usize::from(sibling_disk.exists()),
+            "runtime_vm_handles": final_diagnostics.vm_handles,
+            "runtime_stack_vms": final_diagnostics.stack_vms,
+            "runtime_active_lifecycles": final_diagnostics.active_lifecycles,
+            "runtime_exec_sessions": final_diagnostics.exec_sessions,
+        },
+        "controls": {
+            "invocations": 1,
+            "retries": 0,
+            "fallbacks": 0,
+        },
+    });
+    write_environment_lifecycle_evidence(&evidence);
 }

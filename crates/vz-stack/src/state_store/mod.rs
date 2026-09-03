@@ -621,8 +621,8 @@ impl StateStore {
         if object_count == 0 {
             return self.with_immediate_transaction(|store| {
                 store.create_legacy_schema()?;
-                store.create_topology_schema()?;
-                store.validate_v2_schema()?;
+                store.create_topology_schema_v3()?;
+                store.validate_v3_schema()?;
                 store.set_schema_version(topology::STORE_SCHEMA_VERSION)?;
                 Ok(())
             });
@@ -643,8 +643,12 @@ impl StateStore {
         }
         let version = self.schema_version()?;
         match version {
-            1 => self.migrate_legacy_v1_to_v2(),
-            topology::STORE_SCHEMA_VERSION => self.validate_v2_schema(),
+            1 => {
+                self.migrate_legacy_v1_to_v2()?;
+                self.migrate_topology_v2_to_v3()
+            }
+            2 => self.migrate_topology_v2_to_v3(),
+            topology::STORE_SCHEMA_VERSION => self.validate_v3_schema(),
             future if future > topology::STORE_SCHEMA_VERSION => {
                 Err(StackError::InvalidSpec(format!(
                     "state schema version {future} is newer than supported version {}",

@@ -16,17 +16,20 @@ use thiserror::Error;
 use vz_runtime_contract::{
     Architecture, Build, BuildSpec, BuildState, CapabilitySet, Checkpoint, CheckpointClass,
     CheckpointState, Container, ContainerSpec, ContainerState, EndpointId, EndpointInstance,
-    EndpointProtocol, EndpointSpec, EnvironmentId, EnvironmentInstance, EnvironmentSpec,
-    EnvironmentState, Event, EventScope, Execution, ExecutionSpec, ExecutionState, HostSpec, Lease,
-    LeaseState, LegacyMigrationProvenance, MachineBackend, MachineCapability, MachineError,
-    MachineErrorCode, MachineId, MachineIncarnation, MachineIncarnationId, MachineInstance,
-    MachineProfile, MachineResources, MachineSpec, MachineState, NetworkId, NetworkInstance,
-    NetworkKind, NetworkSpec, OperatingSystem, OwnedResourceKind, OwnershipRecord,
+    EndpointProtocol, EndpointSpec, EnvironmentId, EnvironmentInstance, EnvironmentLifecycleKind,
+    EnvironmentLifecycleOperation, EnvironmentLifecycleStatus, EnvironmentSpec, EnvironmentState,
+    EnvironmentTombstone, Event, EventScope, Execution, ExecutionSpec, ExecutionState, HostSpec,
+    Lease, LeaseState, LegacyMigrationProvenance, LifecycleOperationId, LifecycleStepResult,
+    LifecycleStepStatus, MachineBackend, MachineCapability, MachineError, MachineErrorCode,
+    MachineId, MachineIncarnation, MachineIncarnationId, MachineInstance, MachineLifecycleStep,
+    MachineLifecycleStepAcknowledgement, MachineProfile, MachineResources, MachineSpec,
+    MachineState, NetworkId, NetworkInstance, NetworkKind, NetworkSpec, OperatingSystem,
+    OwnedResourceKind, OwnershipCleanupStep, OwnershipCleanupStepAcknowledgement, OwnershipRecord,
     ProjectDefinition, ProjectId, ProjectState, RequestMetadata, RuntimeCapabilities,
     SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER, Sandbox, SandboxBackend,
-    SandboxSpec, SandboxState, TargetSpec, TopologyCandidate, TopologyResolutionError,
-    TopologyValidationError, WorkspaceBinding, WorkspaceBindingId, WorkspaceProjection,
-    WorkspaceProjectionMode,
+    SandboxSpec, SandboxState, TargetSpec, TopologyCandidate, TopologyLifecycleError,
+    TopologyResolutionError, TopologyValidationError, WorkspaceBinding, WorkspaceBindingId,
+    WorkspaceProjection, WorkspaceProjectionMode,
 };
 use vz_runtime_proto::runtime_v2;
 
@@ -50,6 +53,8 @@ pub enum TranslationError {
     MissingRequiredField { field: &'static str },
     #[error("decoded topology violates its canonical contract: {0}")]
     InvalidTopology(#[from] TopologyValidationError),
+    #[error("decoded lifecycle value violates its canonical contract: {0}")]
+    InvalidLifecycle(#[from] TopologyLifecycleError),
 }
 
 /// Convert a complete project topology aggregate to its lossless wire form.
@@ -583,6 +588,320 @@ pub fn ownership_record_from_proto(
     })
 }
 
+/// Convert a lifecycle step result without collapsing success and failure payloads.
+pub fn lifecycle_step_result_to_proto(
+    result: &LifecycleStepResult,
+) -> runtime_v2::LifecycleStepResult {
+    use runtime_v2::lifecycle_step_result::Result;
+
+    let result = match result {
+        LifecycleStepResult::Succeeded => {
+            Result::Succeeded(runtime_v2::LifecycleStepSucceeded::default())
+        }
+        LifecycleStepResult::Failed { reason } => Result::Failed(runtime_v2::LifecycleStepFailed {
+            reason: reason.clone(),
+        }),
+    };
+    runtime_v2::LifecycleStepResult {
+        result: Some(result),
+    }
+}
+
+/// Decode a lifecycle step result, preserving the failed-result reason.
+pub fn lifecycle_step_result_from_proto(
+    result: &runtime_v2::LifecycleStepResult,
+) -> Result<LifecycleStepResult, TranslationError> {
+    use runtime_v2::lifecycle_step_result::Result;
+
+    match required(result.result.as_ref(), "lifecycle_step_result.result")? {
+        Result::Succeeded(_) => Ok(LifecycleStepResult::Succeeded),
+        Result::Failed(failed) => Ok(LifecycleStepResult::Failed {
+            reason: failed.reason.clone(),
+        }),
+    }
+}
+
+/// Convert one deterministic Machine lifecycle step.
+pub fn machine_lifecycle_step_to_proto(
+    step: &MachineLifecycleStep,
+) -> runtime_v2::MachineLifecycleStep {
+    runtime_v2::MachineLifecycleStep {
+        machine_id: step.machine_id.to_string(),
+        initial_state: machine_state_to_proto(step.initial_state) as i32,
+        target_state: step
+            .target_state
+            .map(|state| machine_state_to_proto(state) as i32),
+        status: lifecycle_step_status_to_proto(step.status) as i32,
+        failure_reason: step.failure_reason.clone(),
+        expected_incarnation: step
+            .expected_incarnation
+            .as_ref()
+            .map(machine_incarnation_to_proto),
+        resulting_incarnation: step
+            .resulting_incarnation
+            .as_ref()
+            .map(machine_incarnation_to_proto),
+    }
+}
+
+/// Decode one deterministic Machine lifecycle step.
+pub fn machine_lifecycle_step_from_proto(
+    step: &runtime_v2::MachineLifecycleStep,
+) -> Result<MachineLifecycleStep, TranslationError> {
+    Ok(MachineLifecycleStep {
+        machine_id: MachineId::new(step.machine_id.clone())?,
+        initial_state: machine_state_from_proto_at(
+            step.initial_state,
+            "machine_lifecycle_step.initial_state",
+        )?,
+        target_state: step
+            .target_state
+            .map(|state| machine_state_from_proto_at(state, "machine_lifecycle_step.target_state"))
+            .transpose()?,
+        status: lifecycle_step_status_from_proto(step.status, "machine_lifecycle_step.status")?,
+        failure_reason: step.failure_reason.clone(),
+        expected_incarnation: step
+            .expected_incarnation
+            .as_ref()
+            .map(machine_incarnation_from_proto)
+            .transpose()?,
+        resulting_incarnation: step
+            .resulting_incarnation
+            .as_ref()
+            .map(machine_incarnation_from_proto)
+            .transpose()?,
+    })
+}
+
+/// Convert an exact Machine lifecycle acknowledgement.
+pub fn machine_lifecycle_step_acknowledgement_to_proto(
+    acknowledgement: &MachineLifecycleStepAcknowledgement,
+) -> runtime_v2::MachineLifecycleStepAcknowledgement {
+    runtime_v2::MachineLifecycleStepAcknowledgement {
+        operation_id: acknowledgement.operation_id.to_string(),
+        generation: acknowledgement.generation,
+        machine_id: acknowledgement.machine_id.to_string(),
+        initial_state: machine_state_to_proto(acknowledgement.initial_state) as i32,
+        target_state: acknowledgement
+            .target_state
+            .map(|state| machine_state_to_proto(state) as i32),
+        result: Some(lifecycle_step_result_to_proto(&acknowledgement.result)),
+        expected_incarnation: acknowledgement
+            .expected_incarnation
+            .as_ref()
+            .map(machine_incarnation_to_proto),
+        resulting_incarnation: acknowledgement
+            .resulting_incarnation
+            .as_ref()
+            .map(machine_incarnation_to_proto),
+    }
+}
+
+/// Decode an exact Machine lifecycle acknowledgement.
+pub fn machine_lifecycle_step_acknowledgement_from_proto(
+    acknowledgement: &runtime_v2::MachineLifecycleStepAcknowledgement,
+) -> Result<MachineLifecycleStepAcknowledgement, TranslationError> {
+    Ok(MachineLifecycleStepAcknowledgement {
+        operation_id: LifecycleOperationId::new(acknowledgement.operation_id.clone())?,
+        generation: acknowledgement.generation,
+        machine_id: MachineId::new(acknowledgement.machine_id.clone())?,
+        initial_state: machine_state_from_proto_at(
+            acknowledgement.initial_state,
+            "machine_lifecycle_step_acknowledgement.initial_state",
+        )?,
+        target_state: acknowledgement
+            .target_state
+            .map(|state| {
+                machine_state_from_proto_at(
+                    state,
+                    "machine_lifecycle_step_acknowledgement.target_state",
+                )
+            })
+            .transpose()?,
+        result: lifecycle_step_result_from_proto(required(
+            acknowledgement.result.as_ref(),
+            "machine_lifecycle_step_acknowledgement.result",
+        )?)?,
+        expected_incarnation: acknowledgement
+            .expected_incarnation
+            .as_ref()
+            .map(machine_incarnation_from_proto)
+            .transpose()?,
+        resulting_incarnation: acknowledgement
+            .resulting_incarnation
+            .as_ref()
+            .map(machine_incarnation_from_proto)
+            .transpose()?,
+    })
+}
+
+/// Convert one exact-owner cleanup step.
+pub fn ownership_cleanup_step_to_proto(
+    step: &OwnershipCleanupStep,
+) -> runtime_v2::OwnershipCleanupStep {
+    runtime_v2::OwnershipCleanupStep {
+        ownership: Some(ownership_record_to_proto(&step.ownership)),
+        status: lifecycle_step_status_to_proto(step.status) as i32,
+        failure_reason: step.failure_reason.clone(),
+    }
+}
+
+/// Decode one exact-owner cleanup step.
+pub fn ownership_cleanup_step_from_proto(
+    step: &runtime_v2::OwnershipCleanupStep,
+) -> Result<OwnershipCleanupStep, TranslationError> {
+    Ok(OwnershipCleanupStep {
+        ownership: ownership_record_from_proto(required(
+            step.ownership.as_ref(),
+            "ownership_cleanup_step.ownership",
+        )?)?,
+        status: lifecycle_step_status_from_proto(step.status, "ownership_cleanup_step.status")?,
+        failure_reason: step.failure_reason.clone(),
+    })
+}
+
+/// Convert an exact-owner cleanup acknowledgement.
+pub fn ownership_cleanup_step_acknowledgement_to_proto(
+    acknowledgement: &OwnershipCleanupStepAcknowledgement,
+) -> runtime_v2::OwnershipCleanupStepAcknowledgement {
+    runtime_v2::OwnershipCleanupStepAcknowledgement {
+        operation_id: acknowledgement.operation_id.to_string(),
+        generation: acknowledgement.generation,
+        ownership: Some(ownership_record_to_proto(&acknowledgement.ownership)),
+        result: Some(lifecycle_step_result_to_proto(&acknowledgement.result)),
+    }
+}
+
+/// Decode an exact-owner cleanup acknowledgement.
+pub fn ownership_cleanup_step_acknowledgement_from_proto(
+    acknowledgement: &runtime_v2::OwnershipCleanupStepAcknowledgement,
+) -> Result<OwnershipCleanupStepAcknowledgement, TranslationError> {
+    Ok(OwnershipCleanupStepAcknowledgement {
+        operation_id: LifecycleOperationId::new(acknowledgement.operation_id.clone())?,
+        generation: acknowledgement.generation,
+        ownership: ownership_record_from_proto(required(
+            acknowledgement.ownership.as_ref(),
+            "ownership_cleanup_step_acknowledgement.ownership",
+        )?)?,
+        result: lifecycle_step_result_from_proto(required(
+            acknowledgement.result.as_ref(),
+            "ownership_cleanup_step_acknowledgement.result",
+        )?)?,
+    })
+}
+
+/// Convert a durable Environment lifecycle operation journal.
+pub fn environment_lifecycle_operation_to_proto(
+    operation: &EnvironmentLifecycleOperation,
+) -> runtime_v2::EnvironmentLifecycleOperation {
+    runtime_v2::EnvironmentLifecycleOperation {
+        schema_version: operation.schema_version,
+        operation_id: operation.operation_id.to_string(),
+        project_id: operation.project_id.to_string(),
+        environment_id: operation.environment_id.to_string(),
+        kind: environment_lifecycle_kind_to_proto(operation.kind) as i32,
+        generation: operation.generation,
+        request_id: operation.request_id.clone(),
+        idempotency_key: operation.idempotency_key.clone(),
+        request_hash: operation.request_hash.clone(),
+        definition_digest: operation.definition_digest.clone(),
+        initial_state: environment_state_to_proto(operation.initial_state) as i32,
+        requested_target: environment_state_to_proto(operation.requested_target) as i32,
+        status: environment_lifecycle_status_to_proto(operation.status) as i32,
+        machine_steps: operation
+            .machine_steps
+            .iter()
+            .map(machine_lifecycle_step_to_proto)
+            .collect(),
+        cleanup_steps: operation
+            .cleanup_steps
+            .iter()
+            .map(ownership_cleanup_step_to_proto)
+            .collect(),
+        created_at: operation.created_at,
+        updated_at: operation.updated_at,
+        completed_at: operation.completed_at,
+    }
+}
+
+/// Decode and structurally validate a durable Environment lifecycle operation.
+pub fn environment_lifecycle_operation_from_proto(
+    operation: &runtime_v2::EnvironmentLifecycleOperation,
+) -> Result<EnvironmentLifecycleOperation, TranslationError> {
+    let decoded = EnvironmentLifecycleOperation {
+        schema_version: operation.schema_version,
+        operation_id: LifecycleOperationId::new(operation.operation_id.clone())?,
+        project_id: ProjectId::new(operation.project_id.clone())?,
+        environment_id: EnvironmentId::new(operation.environment_id.clone())?,
+        kind: environment_lifecycle_kind_from_proto(operation.kind)?,
+        generation: operation.generation,
+        request_id: operation.request_id.clone(),
+        idempotency_key: operation.idempotency_key.clone(),
+        request_hash: operation.request_hash.clone(),
+        definition_digest: operation.definition_digest.clone(),
+        initial_state: environment_state_from_proto_at(
+            operation.initial_state,
+            "environment_lifecycle_operation.initial_state",
+        )?,
+        requested_target: environment_state_from_proto_at(
+            operation.requested_target,
+            "environment_lifecycle_operation.requested_target",
+        )?,
+        status: environment_lifecycle_status_from_proto(operation.status)?,
+        machine_steps: operation
+            .machine_steps
+            .iter()
+            .map(machine_lifecycle_step_from_proto)
+            .collect::<Result<_, _>>()?,
+        cleanup_steps: operation
+            .cleanup_steps
+            .iter()
+            .map(ownership_cleanup_step_from_proto)
+            .collect::<Result<_, _>>()?,
+        created_at: operation.created_at,
+        updated_at: operation.updated_at,
+        completed_at: operation.completed_at,
+    };
+    decoded.validate_structure()?;
+    Ok(decoded)
+}
+
+/// Convert a durable Environment deletion tombstone.
+pub fn environment_tombstone_to_proto(
+    tombstone: &EnvironmentTombstone,
+) -> runtime_v2::EnvironmentTombstone {
+    runtime_v2::EnvironmentTombstone {
+        schema_version: tombstone.schema_version,
+        project_id: tombstone.project_id.to_string(),
+        environment_id: tombstone.environment_id.to_string(),
+        name: tombstone.name.clone(),
+        definition_digest: tombstone.definition_digest.clone(),
+        delete_operation_id: tombstone.delete_operation_id.to_string(),
+        lifecycle_generation: tombstone.lifecycle_generation,
+        ownership_digest: tombstone.ownership_digest.clone(),
+        deleted_at: tombstone.deleted_at,
+    }
+}
+
+/// Decode and validate a durable Environment deletion tombstone.
+pub fn environment_tombstone_from_proto(
+    tombstone: &runtime_v2::EnvironmentTombstone,
+) -> Result<EnvironmentTombstone, TranslationError> {
+    let decoded = EnvironmentTombstone {
+        schema_version: tombstone.schema_version,
+        project_id: ProjectId::new(tombstone.project_id.clone())?,
+        environment_id: EnvironmentId::new(tombstone.environment_id.clone())?,
+        name: tombstone.name.clone(),
+        definition_digest: tombstone.definition_digest.clone(),
+        delete_operation_id: LifecycleOperationId::new(tombstone.delete_operation_id.clone())?,
+        lifecycle_generation: tombstone.lifecycle_generation,
+        ownership_digest: tombstone.ownership_digest.clone(),
+        deleted_at: tombstone.deleted_at,
+    };
+    decoded.validate()?;
+    Ok(decoded)
+}
+
 /// Convert legacy migration provenance to wire form.
 pub fn legacy_migration_provenance_to_proto(
     provenance: &LegacyMigrationProvenance,
@@ -647,6 +966,11 @@ pub fn environment_instance_to_proto(
             .map(legacy_migration_provenance_to_proto),
         created_at: environment.created_at,
         updated_at: environment.updated_at,
+        lifecycle_generation: environment.lifecycle_generation,
+        active_operation_id: environment
+            .active_operation_id
+            .as_ref()
+            .map(ToString::to_string),
     }
 }
 
@@ -692,6 +1016,12 @@ pub fn environment_instance_from_proto(
             .map(legacy_migration_provenance_from_proto),
         created_at: environment.created_at,
         updated_at: environment.updated_at,
+        lifecycle_generation: environment.lifecycle_generation,
+        active_operation_id: environment
+            .active_operation_id
+            .as_ref()
+            .map(|id| LifecycleOperationId::new(id.clone()))
+            .transpose()?,
     })
 }
 
@@ -789,7 +1119,9 @@ pub fn topology_resolution_error_from_proto(
         | Detail::MissingCapability(_)
         | Detail::InvalidMachineProfile(_)
         | Detail::InvalidCapabilityDeclaration(_)
-        | Detail::ContradictoryCapability(_) => Err(TranslationError::InvalidValue {
+        | Detail::ContradictoryCapability(_)
+        | Detail::InvalidLifecycleState(_)
+        | Detail::InvalidMachineIncarnation(_) => Err(TranslationError::InvalidValue {
             field: "topology_error_detail.detail",
             value: "validation_error".to_string(),
         }),
@@ -851,6 +1183,19 @@ pub fn topology_validation_error_to_proto(
             machine_id: machine_id.clone(),
             capability: machine_capability_to_proto(*capability) as i32,
         }),
+        TopologyValidationError::InvalidLifecycleState {
+            environment_id,
+            reason,
+        } => Detail::InvalidLifecycleState(runtime_v2::TopologyInvalidLifecycleStateDetail {
+            environment_id: environment_id.clone(),
+            reason: reason.clone(),
+        }),
+        TopologyValidationError::InvalidMachineIncarnation { machine_id, reason } => {
+            Detail::InvalidMachineIncarnation(runtime_v2::TopologyInvalidMachineIncarnationDetail {
+                machine_id: machine_id.clone(),
+                reason: reason.clone(),
+            })
+        }
         _ => return None,
     };
     Some(runtime_v2::TopologyErrorDetail {
@@ -925,12 +1270,190 @@ pub fn topology_validation_error_from_proto(
                 )?,
             })
         }
+        Detail::InvalidLifecycleState(detail) => {
+            Ok(TopologyValidationError::InvalidLifecycleState {
+                environment_id: detail.environment_id.clone(),
+                reason: detail.reason.clone(),
+            })
+        }
+        Detail::InvalidMachineIncarnation(detail) => {
+            Ok(TopologyValidationError::InvalidMachineIncarnation {
+                machine_id: detail.machine_id.clone(),
+                reason: detail.reason.clone(),
+            })
+        }
         Detail::NotFound(_)
         | Detail::Ambiguous(_)
         | Detail::SelectionRequired(_)
         | Detail::InvalidSelector(_) => Err(TranslationError::InvalidValue {
             field: "topology_error_detail.detail",
             value: "resolution_error".to_string(),
+        }),
+    }
+}
+
+/// Convert a structured Environment lifecycle failure to wire detail.
+pub fn topology_lifecycle_error_to_proto(
+    error: &TopologyLifecycleError,
+) -> runtime_v2::TopologyLifecycleErrorDetail {
+    use runtime_v2::topology_lifecycle_error_detail::Detail;
+
+    let detail = match error {
+        TopologyLifecycleError::InvalidTransition {
+            environment_id,
+            operation,
+            state,
+        } => Detail::InvalidTransition(runtime_v2::TopologyLifecycleInvalidTransitionDetail {
+            environment_id: environment_id.clone(),
+            operation: environment_lifecycle_kind_to_proto(*operation) as i32,
+            state: environment_state_to_proto(*state) as i32,
+        }),
+        TopologyLifecycleError::OperationConflict {
+            environment_id,
+            active_operation_id,
+        } => Detail::OperationConflict(runtime_v2::TopologyLifecycleOperationConflictDetail {
+            environment_id: environment_id.clone(),
+            active_operation_id: active_operation_id.clone(),
+        }),
+        TopologyLifecycleError::GenerationMismatch {
+            operation_id,
+            expected,
+            found,
+        } => Detail::GenerationMismatch(runtime_v2::TopologyLifecycleGenerationMismatchDetail {
+            operation_id: operation_id.clone(),
+            expected: *expected,
+            found: *found,
+        }),
+        TopologyLifecycleError::OperationMismatch {
+            environment_id,
+            expected,
+            found,
+        } => Detail::OperationMismatch(runtime_v2::TopologyLifecycleOperationMismatchDetail {
+            environment_id: environment_id.clone(),
+            expected: expected.clone(),
+            found: found.clone(),
+        }),
+        TopologyLifecycleError::MachineStepNotFound {
+            operation_id,
+            machine_id,
+        } => Detail::MachineStepNotFound(runtime_v2::TopologyLifecycleMachineStepNotFoundDetail {
+            operation_id: operation_id.clone(),
+            machine_id: machine_id.clone(),
+        }),
+        TopologyLifecycleError::MachineStepMismatch { machine_id } => {
+            Detail::MachineStepMismatch(runtime_v2::TopologyLifecycleMachineStepMismatchDetail {
+                machine_id: machine_id.clone(),
+            })
+        }
+        TopologyLifecycleError::OwnershipStepMismatch {
+            operation_id,
+            resource_kind,
+            resource_id,
+        } => Detail::OwnershipStepMismatch(
+            runtime_v2::TopologyLifecycleOwnershipStepMismatchDetail {
+                operation_id: operation_id.clone(),
+                resource_kind: resource_kind.clone(),
+                resource_id: resource_id.clone(),
+            },
+        ),
+        TopologyLifecycleError::OperationIncomplete { operation_id } => {
+            Detail::OperationIncomplete(runtime_v2::TopologyLifecycleOperationIncompleteDetail {
+                operation_id: operation_id.clone(),
+            })
+        }
+        TopologyLifecycleError::OperationFailed { operation_id } => {
+            Detail::OperationFailed(runtime_v2::TopologyLifecycleOperationFailedDetail {
+                operation_id: operation_id.clone(),
+            })
+        }
+        TopologyLifecycleError::DeleteRequired { operation_id } => {
+            Detail::DeleteRequired(runtime_v2::TopologyLifecycleDeleteRequiredDetail {
+                operation_id: operation_id.clone(),
+            })
+        }
+        TopologyLifecycleError::DeletedEnvironmentIsNotLive { environment_id } => {
+            Detail::DeletedEnvironmentIsNotLive(
+                runtime_v2::TopologyLifecycleDeletedEnvironmentIsNotLiveDetail {
+                    environment_id: environment_id.clone(),
+                },
+            )
+        }
+        TopologyLifecycleError::InvalidOperation { reason } => {
+            Detail::InvalidOperation(runtime_v2::TopologyLifecycleInvalidOperationDetail {
+                reason: reason.clone(),
+            })
+        }
+    };
+    runtime_v2::TopologyLifecycleErrorDetail {
+        detail: Some(detail),
+    }
+}
+
+/// Decode a structured Environment lifecycle failure.
+pub fn topology_lifecycle_error_from_proto(
+    error: &runtime_v2::TopologyLifecycleErrorDetail,
+) -> Result<TopologyLifecycleError, TranslationError> {
+    use runtime_v2::topology_lifecycle_error_detail::Detail;
+
+    match required(
+        error.detail.as_ref(),
+        "topology_lifecycle_error_detail.detail",
+    )? {
+        Detail::InvalidTransition(detail) => Ok(TopologyLifecycleError::InvalidTransition {
+            environment_id: detail.environment_id.clone(),
+            operation: environment_lifecycle_kind_from_proto_at(
+                detail.operation,
+                "topology_lifecycle_invalid_transition.operation",
+            )?,
+            state: environment_state_from_proto_at(
+                detail.state,
+                "topology_lifecycle_invalid_transition.state",
+            )?,
+        }),
+        Detail::OperationConflict(detail) => Ok(TopologyLifecycleError::OperationConflict {
+            environment_id: detail.environment_id.clone(),
+            active_operation_id: detail.active_operation_id.clone(),
+        }),
+        Detail::GenerationMismatch(detail) => Ok(TopologyLifecycleError::GenerationMismatch {
+            operation_id: detail.operation_id.clone(),
+            expected: detail.expected,
+            found: detail.found,
+        }),
+        Detail::OperationMismatch(detail) => Ok(TopologyLifecycleError::OperationMismatch {
+            environment_id: detail.environment_id.clone(),
+            expected: detail.expected.clone(),
+            found: detail.found.clone(),
+        }),
+        Detail::MachineStepNotFound(detail) => Ok(TopologyLifecycleError::MachineStepNotFound {
+            operation_id: detail.operation_id.clone(),
+            machine_id: detail.machine_id.clone(),
+        }),
+        Detail::MachineStepMismatch(detail) => Ok(TopologyLifecycleError::MachineStepMismatch {
+            machine_id: detail.machine_id.clone(),
+        }),
+        Detail::OwnershipStepMismatch(detail) => {
+            Ok(TopologyLifecycleError::OwnershipStepMismatch {
+                operation_id: detail.operation_id.clone(),
+                resource_kind: detail.resource_kind.clone(),
+                resource_id: detail.resource_id.clone(),
+            })
+        }
+        Detail::OperationIncomplete(detail) => Ok(TopologyLifecycleError::OperationIncomplete {
+            operation_id: detail.operation_id.clone(),
+        }),
+        Detail::OperationFailed(detail) => Ok(TopologyLifecycleError::OperationFailed {
+            operation_id: detail.operation_id.clone(),
+        }),
+        Detail::DeleteRequired(detail) => Ok(TopologyLifecycleError::DeleteRequired {
+            operation_id: detail.operation_id.clone(),
+        }),
+        Detail::DeletedEnvironmentIsNotLive(detail) => {
+            Ok(TopologyLifecycleError::DeletedEnvironmentIsNotLive {
+                environment_id: detail.environment_id.clone(),
+            })
+        }
+        Detail::InvalidOperation(detail) => Ok(TopologyLifecycleError::InvalidOperation {
+            reason: detail.reason.clone(),
         }),
     }
 }
@@ -1125,6 +1648,7 @@ fn environment_state_to_proto(value: EnvironmentState) -> runtime_v2::Environmen
         EnvironmentState::Creating => runtime_v2::EnvironmentState::Creating,
         EnvironmentState::Reconciling => runtime_v2::EnvironmentState::Reconciling,
         EnvironmentState::Ready => runtime_v2::EnvironmentState::Ready,
+        EnvironmentState::Degraded => runtime_v2::EnvironmentState::Degraded,
         EnvironmentState::Stopped => runtime_v2::EnvironmentState::Stopped,
         EnvironmentState::Deleting => runtime_v2::EnvironmentState::Deleting,
         EnvironmentState::Deleted => runtime_v2::EnvironmentState::Deleted,
@@ -1133,16 +1657,111 @@ fn environment_state_to_proto(value: EnvironmentState) -> runtime_v2::Environmen
 }
 
 fn environment_state_from_proto(raw: i32) -> Result<EnvironmentState, TranslationError> {
-    let field = "environment_instance.state";
+    environment_state_from_proto_at(raw, "environment_instance.state")
+}
+
+fn environment_state_from_proto_at(
+    raw: i32,
+    field: &'static str,
+) -> Result<EnvironmentState, TranslationError> {
     match runtime_v2::EnvironmentState::try_from(raw).map_err(|_| invalid_enum(field, raw))? {
         runtime_v2::EnvironmentState::Creating => Ok(EnvironmentState::Creating),
         runtime_v2::EnvironmentState::Reconciling => Ok(EnvironmentState::Reconciling),
         runtime_v2::EnvironmentState::Ready => Ok(EnvironmentState::Ready),
+        runtime_v2::EnvironmentState::Degraded => Ok(EnvironmentState::Degraded),
         runtime_v2::EnvironmentState::Stopped => Ok(EnvironmentState::Stopped),
         runtime_v2::EnvironmentState::Deleting => Ok(EnvironmentState::Deleting),
         runtime_v2::EnvironmentState::Deleted => Ok(EnvironmentState::Deleted),
         runtime_v2::EnvironmentState::Failed => Ok(EnvironmentState::Failed),
         runtime_v2::EnvironmentState::Unspecified => Err(invalid_enum(field, raw)),
+    }
+}
+
+fn environment_lifecycle_kind_to_proto(
+    value: EnvironmentLifecycleKind,
+) -> runtime_v2::EnvironmentLifecycleKind {
+    match value {
+        EnvironmentLifecycleKind::Up => runtime_v2::EnvironmentLifecycleKind::Up,
+        EnvironmentLifecycleKind::Stop => runtime_v2::EnvironmentLifecycleKind::Stop,
+        EnvironmentLifecycleKind::Delete => runtime_v2::EnvironmentLifecycleKind::Delete,
+    }
+}
+
+fn environment_lifecycle_kind_from_proto(
+    raw: i32,
+) -> Result<EnvironmentLifecycleKind, TranslationError> {
+    environment_lifecycle_kind_from_proto_at(raw, "environment_lifecycle_operation.kind")
+}
+
+fn environment_lifecycle_kind_from_proto_at(
+    raw: i32,
+    field: &'static str,
+) -> Result<EnvironmentLifecycleKind, TranslationError> {
+    match runtime_v2::EnvironmentLifecycleKind::try_from(raw)
+        .map_err(|_| invalid_enum(field, raw))?
+    {
+        runtime_v2::EnvironmentLifecycleKind::Up => Ok(EnvironmentLifecycleKind::Up),
+        runtime_v2::EnvironmentLifecycleKind::Stop => Ok(EnvironmentLifecycleKind::Stop),
+        runtime_v2::EnvironmentLifecycleKind::Delete => Ok(EnvironmentLifecycleKind::Delete),
+        runtime_v2::EnvironmentLifecycleKind::Unspecified => Err(invalid_enum(field, raw)),
+    }
+}
+
+fn environment_lifecycle_status_to_proto(
+    value: EnvironmentLifecycleStatus,
+) -> runtime_v2::EnvironmentLifecycleStatus {
+    match value {
+        EnvironmentLifecycleStatus::Planned => runtime_v2::EnvironmentLifecycleStatus::Planned,
+        EnvironmentLifecycleStatus::Running => runtime_v2::EnvironmentLifecycleStatus::Running,
+        EnvironmentLifecycleStatus::Blocked => runtime_v2::EnvironmentLifecycleStatus::Blocked,
+        EnvironmentLifecycleStatus::Succeeded => runtime_v2::EnvironmentLifecycleStatus::Succeeded,
+        EnvironmentLifecycleStatus::Failed => runtime_v2::EnvironmentLifecycleStatus::Failed,
+        EnvironmentLifecycleStatus::Superseded => {
+            runtime_v2::EnvironmentLifecycleStatus::Superseded
+        }
+    }
+}
+
+fn environment_lifecycle_status_from_proto(
+    raw: i32,
+) -> Result<EnvironmentLifecycleStatus, TranslationError> {
+    let field = "environment_lifecycle_operation.status";
+    match runtime_v2::EnvironmentLifecycleStatus::try_from(raw)
+        .map_err(|_| invalid_enum(field, raw))?
+    {
+        runtime_v2::EnvironmentLifecycleStatus::Planned => Ok(EnvironmentLifecycleStatus::Planned),
+        runtime_v2::EnvironmentLifecycleStatus::Running => Ok(EnvironmentLifecycleStatus::Running),
+        runtime_v2::EnvironmentLifecycleStatus::Blocked => Ok(EnvironmentLifecycleStatus::Blocked),
+        runtime_v2::EnvironmentLifecycleStatus::Succeeded => {
+            Ok(EnvironmentLifecycleStatus::Succeeded)
+        }
+        runtime_v2::EnvironmentLifecycleStatus::Failed => Ok(EnvironmentLifecycleStatus::Failed),
+        runtime_v2::EnvironmentLifecycleStatus::Superseded => {
+            Ok(EnvironmentLifecycleStatus::Superseded)
+        }
+        runtime_v2::EnvironmentLifecycleStatus::Unspecified => Err(invalid_enum(field, raw)),
+    }
+}
+
+fn lifecycle_step_status_to_proto(value: LifecycleStepStatus) -> runtime_v2::LifecycleStepStatus {
+    match value {
+        LifecycleStepStatus::Pending => runtime_v2::LifecycleStepStatus::Pending,
+        LifecycleStepStatus::Running => runtime_v2::LifecycleStepStatus::Running,
+        LifecycleStepStatus::Succeeded => runtime_v2::LifecycleStepStatus::Succeeded,
+        LifecycleStepStatus::Failed => runtime_v2::LifecycleStepStatus::Failed,
+    }
+}
+
+fn lifecycle_step_status_from_proto(
+    raw: i32,
+    field: &'static str,
+) -> Result<LifecycleStepStatus, TranslationError> {
+    match runtime_v2::LifecycleStepStatus::try_from(raw).map_err(|_| invalid_enum(field, raw))? {
+        runtime_v2::LifecycleStepStatus::Pending => Ok(LifecycleStepStatus::Pending),
+        runtime_v2::LifecycleStepStatus::Running => Ok(LifecycleStepStatus::Running),
+        runtime_v2::LifecycleStepStatus::Succeeded => Ok(LifecycleStepStatus::Succeeded),
+        runtime_v2::LifecycleStepStatus::Failed => Ok(LifecycleStepStatus::Failed),
+        runtime_v2::LifecycleStepStatus::Unspecified => Err(invalid_enum(field, raw)),
     }
 }
 
@@ -1156,7 +1775,13 @@ fn machine_state_to_proto(value: MachineState) -> runtime_v2::MachineState {
 }
 
 fn machine_state_from_proto(raw: i32) -> Result<MachineState, TranslationError> {
-    let field = "machine_instance.state";
+    machine_state_from_proto_at(raw, "machine_instance.state")
+}
+
+fn machine_state_from_proto_at(
+    raw: i32,
+    field: &'static str,
+) -> Result<MachineState, TranslationError> {
     match runtime_v2::MachineState::try_from(raw).map_err(|_| invalid_enum(field, raw))? {
         runtime_v2::MachineState::Creating => Ok(MachineState::Creating),
         runtime_v2::MachineState::Ready => Ok(MachineState::Ready),
@@ -2206,6 +2831,8 @@ mod tests {
             name: suffix.to_string(),
             definition_digest,
             state: EnvironmentState::Ready,
+            lifecycle_generation: 0,
+            active_operation_id: None,
             bindings: vec![WorkspaceBinding {
                 schema_version: V,
                 binding_id: WorkspaceBindingId::new(format!("wsp-{suffix}"))
@@ -2262,18 +2889,18 @@ mod tests {
                         schema_version: V,
                         incarnation_id: MachineIncarnationId::new(format!("inc-{suffix}-macos"))
                             .expect("valid incarnation ID"),
-                        machine_id: macos_id,
+                        machine_id: macos_id.clone(),
                         generation: 3,
                         created_at: 1_725_000_002,
                     }),
-                    state: MachineState::Stopped,
+                    state: MachineState::Ready,
                     legacy_sandbox_id: None,
                 },
             ],
             networks: vec![
                 NetworkInstance {
                     schema_version: V,
-                    network_id: private_network_id,
+                    network_id: private_network_id.clone(),
                     environment_id: environment_id.clone(),
                     name: "private".to_string(),
                 },
@@ -2295,10 +2922,45 @@ mod tests {
             ownership: vec![
                 OwnershipRecord {
                     schema_version: V,
+                    resource_kind: OwnedResourceKind::LegacySandbox,
+                    resource_id: format!("legacy-{suffix}"),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(linux_id.clone()),
+                },
+                OwnershipRecord {
+                    schema_version: V,
+                    resource_kind: OwnedResourceKind::Incarnation,
+                    resource_id: format!("inc-{suffix}-linux"),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(linux_id.clone()),
+                },
+                OwnershipRecord {
+                    schema_version: V,
+                    resource_kind: OwnedResourceKind::Machine,
+                    resource_id: macos_id.to_string(),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(macos_id.clone()),
+                },
+                OwnershipRecord {
+                    schema_version: V,
+                    resource_kind: OwnedResourceKind::Incarnation,
+                    resource_id: format!("inc-{suffix}-macos"),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(macos_id),
+                },
+                OwnershipRecord {
+                    schema_version: V,
                     resource_kind: OwnedResourceKind::Disk,
                     resource_id: format!("disk-{suffix}-linux"),
                     environment_id: environment_id.clone(),
-                    machine_id: Some(linux_id),
+                    machine_id: Some(linux_id.clone()),
+                },
+                OwnershipRecord {
+                    schema_version: V,
+                    resource_kind: OwnedResourceKind::Network,
+                    resource_id: private_network_id.to_string(),
+                    environment_id: environment_id.clone(),
+                    machine_id: None,
                 },
                 OwnershipRecord {
                     schema_version: V,
@@ -2309,6 +2971,13 @@ mod tests {
                 },
                 OwnershipRecord {
                     schema_version: V,
+                    resource_kind: OwnedResourceKind::Endpoint,
+                    resource_id: format!("ep-{suffix}-web"),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(linux_id),
+                },
+                OwnershipRecord {
+                    schema_version: V,
                     resource_kind: OwnedResourceKind::Other("audit_bundle".to_string()),
                     resource_id: format!("audit-{suffix}"),
                     environment_id,
@@ -2316,7 +2985,7 @@ mod tests {
                 },
             ],
             legacy_migration: Some(LegacyMigrationProvenance {
-                source_version: "0.3.20".to_string(),
+                source_version: "v0.3.20".to_string(),
                 legacy_sandbox_id: format!("legacy-{suffix}"),
                 unresolved_resources: vec!["external-cache:old".to_string()],
             }),
@@ -2334,6 +3003,423 @@ mod tests {
                 environment("beta", "/Volumes/worktrees/project"),
             ],
         }
+    }
+
+    fn lifecycle_operation_fixture() -> (
+        EnvironmentLifecycleOperation,
+        MachineLifecycleStepAcknowledgement,
+    ) {
+        let mut environment = environment("lifecycle", "/tmp/lifecycle");
+        environment.state = EnvironmentState::Stopped;
+        for machine in &mut environment.machines {
+            machine.state = MachineState::Stopped;
+        }
+        environment.validate().expect("stopped lifecycle fixture");
+
+        let mut operation = EnvironmentLifecycleOperation::plan(
+            &environment,
+            LifecycleOperationId::new("lop_translate_up").expect("operation ID"),
+            EnvironmentLifecycleKind::Up,
+            "req-translate-up",
+            "idem-translate-up",
+            "sha256:translate-up",
+            1_725_001_000,
+        )
+        .expect("plan Up");
+        operation
+            .begin(&mut environment, 1_725_001_001)
+            .expect("begin Up");
+        let step = operation.machine_steps[0].clone();
+        let acknowledgement = MachineLifecycleStepAcknowledgement {
+            operation_id: operation.operation_id.clone(),
+            generation: operation.generation,
+            machine_id: step.machine_id.clone(),
+            initial_state: step.initial_state,
+            target_state: step.target_state,
+            expected_incarnation: step.expected_incarnation.clone(),
+            resulting_incarnation: step.expected_incarnation.clone(),
+            result: LifecycleStepResult::Succeeded,
+        };
+        operation
+            .apply_machine_step_acknowledgement(&mut environment, &acknowledgement, 1_725_001_002)
+            .expect("acknowledge one Machine");
+        operation
+            .validate_structure()
+            .expect("valid running journal");
+        (operation, acknowledgement)
+    }
+
+    #[test]
+    fn lifecycle_operation_acknowledgements_and_tombstone_round_trip_losslessly() {
+        let (operation, acknowledgement) = lifecycle_operation_fixture();
+        let wire = environment_lifecycle_operation_to_proto(&operation);
+        let bytes = wire.encode_to_vec();
+        let decoded_wire = runtime_v2::EnvironmentLifecycleOperation::decode(bytes.as_slice())
+            .expect("operation protobuf decode");
+        let decoded = environment_lifecycle_operation_from_proto(&decoded_wire)
+            .expect("operation translation");
+        assert_eq!(decoded, operation);
+        assert!(decoded.completed_at.is_none());
+        assert!(decoded.machine_steps[0].expected_incarnation.is_some());
+        assert!(decoded.machine_steps[0].resulting_incarnation.is_some());
+        assert!(decoded.machine_steps[1].resulting_incarnation.is_none());
+
+        let wire = machine_lifecycle_step_acknowledgement_to_proto(&acknowledgement);
+        let bytes = wire.encode_to_vec();
+        let decoded_wire =
+            runtime_v2::MachineLifecycleStepAcknowledgement::decode(bytes.as_slice())
+                .expect("Machine acknowledgement protobuf decode");
+        assert_eq!(
+            machine_lifecycle_step_acknowledgement_from_proto(&decoded_wire)
+                .expect("Machine acknowledgement translation"),
+            acknowledgement
+        );
+
+        let delete_environment = environment("delete", "/tmp/delete");
+        let delete_operation = EnvironmentLifecycleOperation::plan(
+            &delete_environment,
+            LifecycleOperationId::new("lop_translate_delete").expect("operation ID"),
+            EnvironmentLifecycleKind::Delete,
+            "req-translate-delete",
+            "idem-translate-delete",
+            "sha256:translate-delete",
+            1_725_002_000,
+        )
+        .expect("plan Delete");
+        assert!(delete_operation.machine_steps[0].target_state.is_none());
+        let cleanup_acknowledgement = OwnershipCleanupStepAcknowledgement {
+            operation_id: delete_operation.operation_id.clone(),
+            generation: delete_operation.generation,
+            ownership: delete_operation.cleanup_steps[0].ownership.clone(),
+            result: LifecycleStepResult::Failed {
+                reason: "backend unavailable".to_string(),
+            },
+        };
+        let wire = ownership_cleanup_step_acknowledgement_to_proto(&cleanup_acknowledgement);
+        let bytes = wire.encode_to_vec();
+        let decoded_wire =
+            runtime_v2::OwnershipCleanupStepAcknowledgement::decode(bytes.as_slice())
+                .expect("cleanup acknowledgement protobuf decode");
+        assert_eq!(
+            ownership_cleanup_step_acknowledgement_from_proto(&decoded_wire)
+                .expect("cleanup acknowledgement translation"),
+            cleanup_acknowledgement
+        );
+
+        let tombstone = EnvironmentTombstone {
+            schema_version: V,
+            project_id: delete_environment.project_id,
+            environment_id: delete_environment.environment_id,
+            name: delete_environment.name,
+            definition_digest: delete_environment.definition_digest,
+            delete_operation_id: delete_operation.operation_id,
+            lifecycle_generation: delete_operation.generation,
+            ownership_digest: "sha256:ownership".to_string(),
+            deleted_at: 1_725_002_100,
+        };
+        let wire = environment_tombstone_to_proto(&tombstone);
+        let bytes = wire.encode_to_vec();
+        let decoded_wire = runtime_v2::EnvironmentTombstone::decode(bytes.as_slice())
+            .expect("tombstone protobuf decode");
+        assert_eq!(
+            environment_tombstone_from_proto(&decoded_wire).expect("tombstone translation"),
+            tombstone
+        );
+        let json = serde_json::to_string(&tombstone).expect("tombstone JSON encode");
+        assert_eq!(
+            serde_json::from_str::<EnvironmentTombstone>(&json).expect("tombstone JSON decode"),
+            tombstone
+        );
+    }
+
+    #[test]
+    fn lifecycle_json_and_superseded_operation_round_trip_losslessly() {
+        let (mut operation, _) = lifecycle_operation_fixture();
+        operation.status = EnvironmentLifecycleStatus::Superseded;
+        operation.updated_at += 1;
+        operation.completed_at = Some(operation.updated_at);
+        operation
+            .validate_structure()
+            .expect("valid superseded journal");
+
+        let json = serde_json::to_string(&operation).expect("lifecycle JSON encode");
+        let json_decoded: EnvironmentLifecycleOperation =
+            serde_json::from_str(&json).expect("lifecycle JSON decode");
+        assert_eq!(json_decoded, operation);
+
+        let wire = environment_lifecycle_operation_to_proto(&operation);
+        assert_eq!(
+            environment_lifecycle_operation_from_proto(&wire)
+                .expect("superseded operation translation"),
+            operation
+        );
+
+        let error = TopologyLifecycleError::InvalidTransition {
+            environment_id: "env_lifecycle".to_string(),
+            operation: EnvironmentLifecycleKind::Stop,
+            state: EnvironmentState::Creating,
+        };
+        let json = serde_json::to_string(&error).expect("lifecycle error JSON encode");
+        let json_decoded: TopologyLifecycleError =
+            serde_json::from_str(&json).expect("lifecycle error JSON decode");
+        assert_eq!(json_decoded, error);
+    }
+
+    #[test]
+    fn environment_lifecycle_fence_fields_preserve_optional_presence() {
+        let mut fenced_environment = environment("fenced", "/tmp/fenced");
+        let mut operation = EnvironmentLifecycleOperation::plan(
+            &fenced_environment,
+            LifecycleOperationId::new("lop_translate_fenced").expect("operation ID"),
+            EnvironmentLifecycleKind::Stop,
+            "req-translate-fenced",
+            "idem-translate-fenced",
+            "sha256:translate-fenced",
+            1_725_003_000,
+        )
+        .expect("plan Stop");
+        operation
+            .begin(&mut fenced_environment, 1_725_003_001)
+            .expect("begin Stop");
+
+        let wire = environment_instance_to_proto(&fenced_environment);
+        assert_eq!(wire.lifecycle_generation, operation.generation);
+        assert_eq!(
+            wire.active_operation_id.as_deref(),
+            Some(operation.operation_id.as_str())
+        );
+        assert_eq!(
+            environment_instance_from_proto(&wire).expect("fenced Environment translation"),
+            fenced_environment
+        );
+
+        let stable = environment("unfenced", "/tmp/unfenced");
+        let wire = environment_instance_to_proto(&stable);
+        assert_eq!(wire.lifecycle_generation, 0);
+        assert!(wire.active_operation_id.is_none());
+        assert_eq!(
+            environment_instance_from_proto(&wire).expect("stable Environment translation"),
+            stable
+        );
+    }
+
+    #[test]
+    fn lifecycle_decode_rejects_invalid_enums_and_presence_combinations() {
+        let (operation, acknowledgement) = lifecycle_operation_fixture();
+
+        let mut wire = environment_lifecycle_operation_to_proto(&operation);
+        wire.kind = runtime_v2::EnvironmentLifecycleKind::Unspecified as i32;
+        assert!(matches!(
+            environment_lifecycle_operation_from_proto(&wire),
+            Err(TranslationError::InvalidEnumValue {
+                field: "environment_lifecycle_operation.kind",
+                ..
+            })
+        ));
+
+        let mut wire = environment_lifecycle_operation_to_proto(&operation);
+        wire.machine_steps[0].status = runtime_v2::LifecycleStepStatus::Unspecified as i32;
+        assert!(matches!(
+            environment_lifecycle_operation_from_proto(&wire),
+            Err(TranslationError::InvalidEnumValue {
+                field: "machine_lifecycle_step.status",
+                ..
+            })
+        ));
+
+        let mut wire = machine_lifecycle_step_acknowledgement_to_proto(&acknowledgement);
+        wire.result = None;
+        assert_eq!(
+            machine_lifecycle_step_acknowledgement_from_proto(&wire),
+            Err(TranslationError::MissingRequiredField {
+                field: "machine_lifecycle_step_acknowledgement.result"
+            })
+        );
+
+        let mut wire = machine_lifecycle_step_acknowledgement_to_proto(&acknowledgement);
+        wire.result.as_mut().expect("result").result = None;
+        assert_eq!(
+            machine_lifecycle_step_acknowledgement_from_proto(&wire),
+            Err(TranslationError::MissingRequiredField {
+                field: "lifecycle_step_result.result"
+            })
+        );
+
+        let mut wire = environment_lifecycle_operation_to_proto(&operation);
+        wire.machine_steps[0].resulting_incarnation = None;
+        assert!(matches!(
+            environment_lifecycle_operation_from_proto(&wire),
+            Err(TranslationError::InvalidLifecycle(
+                TopologyLifecycleError::InvalidOperation { .. }
+            ))
+        ));
+
+        let cleanup = runtime_v2::OwnershipCleanupStepAcknowledgement {
+            operation_id: "lop_missing_ownership".to_string(),
+            result: Some(lifecycle_step_result_to_proto(
+                &LifecycleStepResult::Succeeded,
+            )),
+            ..Default::default()
+        };
+        assert_eq!(
+            ownership_cleanup_step_acknowledgement_from_proto(&cleanup),
+            Err(TranslationError::MissingRequiredField {
+                field: "ownership_cleanup_step_acknowledgement.ownership"
+            })
+        );
+    }
+
+    #[test]
+    fn lifecycle_protobuf_decode_rejects_malformed_and_foreign_cleanup_ownership() {
+        let delete_environment = environment("invalid-cleanup", "/tmp/invalid-cleanup");
+        let delete_operation = EnvironmentLifecycleOperation::plan(
+            &delete_environment,
+            LifecycleOperationId::new("lop_translate_invalid_cleanup").expect("operation ID"),
+            EnvironmentLifecycleKind::Delete,
+            "req-translate-invalid-cleanup",
+            "idem-translate-invalid-cleanup",
+            "sha256:translate-invalid-cleanup",
+            1_725_004_000,
+        )
+        .expect("plan Delete");
+        let wire = environment_lifecycle_operation_to_proto(&delete_operation);
+        let machine_owned_index = wire
+            .cleanup_steps
+            .iter()
+            .position(|step| {
+                step.ownership
+                    .as_ref()
+                    .is_some_and(|ownership| ownership.machine_id.is_some())
+            })
+            .expect("Delete plan should include Machine-owned cleanup");
+        let decode = |wire: runtime_v2::EnvironmentLifecycleOperation| {
+            let bytes = wire.encode_to_vec();
+            let decoded_wire = runtime_v2::EnvironmentLifecycleOperation::decode(bytes.as_slice())
+                .expect("protobuf envelope should decode");
+            environment_lifecycle_operation_from_proto(&decoded_wire)
+        };
+        let assert_invalid_lifecycle = |result| {
+            assert!(matches!(
+                result,
+                Err(TranslationError::InvalidLifecycle(
+                    TopologyLifecycleError::InvalidOperation { .. }
+                ))
+            ));
+        };
+
+        let mut malformed_schema = wire.clone();
+        malformed_schema.cleanup_steps[0]
+            .ownership
+            .as_mut()
+            .expect("cleanup ownership")
+            .schema_version = V + 1;
+        assert_invalid_lifecycle(decode(malformed_schema));
+
+        let mut malformed_resource_id = wire.clone();
+        malformed_resource_id.cleanup_steps[0]
+            .ownership
+            .as_mut()
+            .expect("cleanup ownership")
+            .resource_id = "invalid/resource".to_string();
+        assert_invalid_lifecycle(decode(malformed_resource_id));
+
+        let mut foreign_environment = wire.clone();
+        foreign_environment.cleanup_steps[0]
+            .ownership
+            .as_mut()
+            .expect("cleanup ownership")
+            .environment_id = "env_foreign_cleanup".to_string();
+        assert_invalid_lifecycle(decode(foreign_environment));
+
+        let mut foreign_machine = wire;
+        foreign_machine.cleanup_steps[machine_owned_index]
+            .ownership
+            .as_mut()
+            .expect("cleanup ownership")
+            .machine_id = Some("mch_foreign_cleanup".to_string());
+        assert_invalid_lifecycle(decode(foreign_machine));
+    }
+
+    #[test]
+    fn all_topology_lifecycle_errors_round_trip_through_protobuf() {
+        let errors = [
+            TopologyLifecycleError::InvalidTransition {
+                environment_id: "env_a".to_string(),
+                operation: EnvironmentLifecycleKind::Up,
+                state: EnvironmentState::Degraded,
+            },
+            TopologyLifecycleError::OperationConflict {
+                environment_id: "env_a".to_string(),
+                active_operation_id: "lop_a".to_string(),
+            },
+            TopologyLifecycleError::GenerationMismatch {
+                operation_id: "lop_a".to_string(),
+                expected: 9,
+                found: 8,
+            },
+            TopologyLifecycleError::OperationMismatch {
+                environment_id: "env_a".to_string(),
+                expected: "lop_a".to_string(),
+                found: "lop_b".to_string(),
+            },
+            TopologyLifecycleError::MachineStepNotFound {
+                operation_id: "lop_a".to_string(),
+                machine_id: "mch_a".to_string(),
+            },
+            TopologyLifecycleError::MachineStepMismatch {
+                machine_id: "mch_a".to_string(),
+            },
+            TopologyLifecycleError::OwnershipStepMismatch {
+                operation_id: "lop_a".to_string(),
+                resource_kind: "disk".to_string(),
+                resource_id: "disk_a".to_string(),
+            },
+            TopologyLifecycleError::OperationIncomplete {
+                operation_id: "lop_a".to_string(),
+            },
+            TopologyLifecycleError::OperationFailed {
+                operation_id: "lop_a".to_string(),
+            },
+            TopologyLifecycleError::DeleteRequired {
+                operation_id: "lop_a".to_string(),
+            },
+            TopologyLifecycleError::DeletedEnvironmentIsNotLive {
+                environment_id: "env_a".to_string(),
+            },
+            TopologyLifecycleError::InvalidOperation {
+                reason: "invalid journal".to_string(),
+            },
+        ];
+        for error in errors {
+            let wire = topology_lifecycle_error_to_proto(&error);
+            let bytes = wire.encode_to_vec();
+            let decoded_wire = runtime_v2::TopologyLifecycleErrorDetail::decode(bytes.as_slice())
+                .expect("lifecycle error protobuf decode");
+            assert_eq!(
+                topology_lifecycle_error_from_proto(&decoded_wire)
+                    .expect("lifecycle error translation"),
+                error
+            );
+        }
+
+        let wire = runtime_v2::TopologyLifecycleErrorDetail {
+            detail: Some(
+                runtime_v2::topology_lifecycle_error_detail::Detail::InvalidTransition(
+                    runtime_v2::TopologyLifecycleInvalidTransitionDetail {
+                        environment_id: "env_a".to_string(),
+                        operation: runtime_v2::EnvironmentLifecycleKind::Unspecified as i32,
+                        state: runtime_v2::EnvironmentState::Ready as i32,
+                    },
+                ),
+            ),
+        };
+        assert!(matches!(
+            topology_lifecycle_error_from_proto(&wire),
+            Err(TranslationError::InvalidEnumValue {
+                field: "topology_lifecycle_invalid_transition.operation",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2820,6 +3906,14 @@ mod tests {
             TopologyValidationError::ContradictoryCapability {
                 machine_id: "mac_linux".to_string(),
                 capability: MachineCapability::Buildx,
+            },
+            TopologyValidationError::InvalidLifecycleState {
+                environment_id: "env_agent".to_string(),
+                reason: "stable state retained an active operation".to_string(),
+            },
+            TopologyValidationError::InvalidMachineIncarnation {
+                machine_id: "mch_linux".to_string(),
+                reason: "generation must be positive".to_string(),
             },
         ];
         for error in errors {

@@ -8,13 +8,15 @@ use vz_runtime_contract::MachineErrorCode;
 use vz_runtime_contract::types::{
     Architecture, CapabilitySet, EndpointId, EndpointInstance, EndpointProtocol,
     EndpointSpec as TopologyEndpointSpec, EnvironmentId, EnvironmentInstance,
+    EnvironmentLifecycleKind, EnvironmentLifecycleOperation, EnvironmentLifecycleStatus,
     EnvironmentSelectionContext, EnvironmentSelectionSource, EnvironmentSelector, EnvironmentSpec,
-    EnvironmentState, MachineCapability, MachineId, MachineInstance, MachineProfile,
-    MachineResources, MachineSpec, MachineState, NetworkId, NetworkInstance, NetworkKind,
-    NetworkSpec as TopologyNetworkSpec, OperatingSystem, OwnedResourceKind, OwnershipRecord,
-    ProjectDefinition, ProjectId, ProjectState, ResourceOwner, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
-    TopologyResolutionError, WorkspaceBinding, WorkspaceBindingId, WorkspaceProjection,
-    WorkspaceProjectionMode,
+    EnvironmentState, LifecycleStepResult, LifecycleStepStatus, MachineCapability, MachineId,
+    MachineIncarnation, MachineIncarnationId, MachineInstance, MachineLifecycleStepAcknowledgement,
+    MachineProfile, MachineResources, MachineSpec, MachineState, NetworkId, NetworkInstance,
+    NetworkKind, NetworkSpec as TopologyNetworkSpec, OperatingSystem, OwnedResourceKind,
+    OwnershipCleanupStepAcknowledgement, OwnershipRecord, ProjectDefinition, ProjectId,
+    ProjectState, ResourceOwner, TOPOLOGY_SCHEMA_VERSION, TargetSpec, TopologyResolutionError,
+    WorkspaceBinding, WorkspaceBindingId, WorkspaceProjection, WorkspaceProjectionMode,
 };
 
 const V0_3_20_FIXTURE: &str = include_str!("../../tests/fixtures/v0.3.20-state.sql");
@@ -39,6 +41,76 @@ fn seed_v0_3_20_fixture(path: &Path, extension: Option<&str>) {
         conn.execute_batch(extension)
             .expect("apply legacy negative fixture extension");
     }
+}
+
+fn create_v2_store(path: &Path) -> StateStore {
+    let connection = Connection::open(path).expect("open v2 state database");
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("enable foreign keys for v2 state database");
+    let store = StateStore {
+        conn: connection,
+        event_sender: None,
+    };
+    store
+        .with_immediate_transaction(|store| {
+            store.create_legacy_schema()?;
+            store.create_topology_schema_v2()?;
+            store.validate_v2_schema()?;
+            store.set_schema_version(2)
+        })
+        .expect("create canonical v2 state database");
+    store
+}
+
+fn application_schema_snapshot(connection: &Connection) -> Vec<(String, String, String, String)> {
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name, tbl_name, COALESCE(sql, '')
+             FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%'
+             ORDER BY type, name",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn ownership_snapshot(
+    connection: &Connection,
+) -> Vec<(String, String, String, Option<String>, i64, String)> {
+    let mut statement = connection
+        .prepare(
+            "SELECT resource_kind, resource_id, environment_id, machine_id,
+                    schema_version, record_json
+             FROM topology_ownership
+             ORDER BY resource_kind, resource_id",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
 }
 
 fn legacy_non_developer_rows(
@@ -134,6 +206,7 @@ fn topology_project_state(
         .map(|(index, name)| {
             let environment_id = EnvironmentId::new(format!("env_{name}")).unwrap();
             let machine_id = MachineId::new(format!("mac_{name}")).unwrap();
+            let incarnation_id = MachineIncarnationId::new(format!("inc_{name}")).unwrap();
             let network_id = NetworkId::new(format!("net_{name}")).unwrap();
             let endpoint_id = EndpointId::new(format!("end_{name}")).unwrap();
             EnvironmentInstance {
@@ -143,6 +216,8 @@ fn topology_project_state(
                 name: (*name).to_string(),
                 definition_digest: definition_digest.clone(),
                 state: EnvironmentState::Ready,
+                lifecycle_generation: 0,
+                active_operation_id: None,
                 bindings: vec![WorkspaceBinding {
                     schema_version: TOPOLOGY_SCHEMA_VERSION,
                     binding_id: WorkspaceBindingId::new(format!("wsp_{name}")).unwrap(),
@@ -163,7 +238,13 @@ fn topology_project_state(
                     requested_capabilities: linux_capabilities.clone(),
                     negotiated_capabilities: linux_capabilities.clone(),
                     backend: None,
-                    incarnation: None,
+                    incarnation: Some(MachineIncarnation {
+                        schema_version: TOPOLOGY_SCHEMA_VERSION,
+                        incarnation_id: incarnation_id.clone(),
+                        machine_id: machine_id.clone(),
+                        generation: 1,
+                        created_at: 50,
+                    }),
                     state: MachineState::Ready,
                     legacy_sandbox_id: None,
                 }],
@@ -175,19 +256,42 @@ fn topology_project_state(
                 }],
                 endpoints: vec![EndpointInstance {
                     schema_version: TOPOLOGY_SCHEMA_VERSION,
-                    endpoint_id,
+                    endpoint_id: endpoint_id.clone(),
                     environment_id: environment_id.clone(),
                     machine_id: machine_id.clone(),
-                    network_id,
+                    network_id: network_id.clone(),
                     name: "web".to_string(),
                 }],
-                ownership: vec![OwnershipRecord {
-                    schema_version: TOPOLOGY_SCHEMA_VERSION,
-                    resource_kind: OwnedResourceKind::Machine,
-                    resource_id: machine_id.to_string(),
-                    environment_id,
-                    machine_id: Some(machine_id),
-                }],
+                ownership: vec![
+                    OwnershipRecord {
+                        schema_version: TOPOLOGY_SCHEMA_VERSION,
+                        resource_kind: OwnedResourceKind::Endpoint,
+                        resource_id: endpoint_id.to_string(),
+                        environment_id: environment_id.clone(),
+                        machine_id: Some(machine_id.clone()),
+                    },
+                    OwnershipRecord {
+                        schema_version: TOPOLOGY_SCHEMA_VERSION,
+                        resource_kind: OwnedResourceKind::Incarnation,
+                        resource_id: incarnation_id.to_string(),
+                        environment_id: environment_id.clone(),
+                        machine_id: Some(machine_id.clone()),
+                    },
+                    OwnershipRecord {
+                        schema_version: TOPOLOGY_SCHEMA_VERSION,
+                        resource_kind: OwnedResourceKind::Machine,
+                        resource_id: machine_id.to_string(),
+                        environment_id: environment_id.clone(),
+                        machine_id: Some(machine_id.clone()),
+                    },
+                    OwnershipRecord {
+                        schema_version: TOPOLOGY_SCHEMA_VERSION,
+                        resource_kind: OwnedResourceKind::Network,
+                        resource_id: network_id.to_string(),
+                        environment_id,
+                        machine_id: None,
+                    },
+                ],
                 legacy_migration: None,
                 created_at: 100 + index as u64,
                 updated_at: 200 + index as u64,
@@ -2852,10 +2956,10 @@ fn phase2_control_metadata_crud() {
 }
 
 #[test]
-fn phase2_schema_version_defaults_to_2() {
+fn phase2_schema_version_defaults_to_current() {
     let store = StateStore::in_memory().unwrap();
     let version = store.schema_version().unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 }
 
 #[test]
@@ -3799,13 +3903,13 @@ fn phase2_validation_schema_version_survives_reopen() {
 
     {
         let store = StateStore::open(&db_path).unwrap();
-        store.set_schema_version(2).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 2);
+        store.set_schema_version(3).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 3);
     }
     // Drop store (close connection), reopen
     {
         let store = StateStore::open(&db_path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
     }
 }
 
@@ -4341,7 +4445,7 @@ fn topology_complete_aggregate_round_trips_after_database_relocation() {
         let store = StateStore::open(&first_path).unwrap();
         store.save_project_state(&expected).unwrap();
         assert_eq!(store.list_project_states().unwrap(), vec![expected.clone()]);
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
         let definition_json: String = store
             .conn
             .query_row(
@@ -4570,9 +4674,16 @@ fn topology_save_is_all_or_nothing_on_cross_environment_id_collision() {
     let duplicate_machine_id = conflicting.environments[0].machines[0].machine_id.clone();
     let second = &mut conflicting.environments[1];
     second.machines[0].machine_id = duplicate_machine_id.clone();
+    second.machines[0].incarnation.as_mut().unwrap().machine_id = duplicate_machine_id.clone();
     second.endpoints[0].machine_id = duplicate_machine_id.clone();
-    second.ownership[0].resource_id = duplicate_machine_id.to_string();
-    second.ownership[0].machine_id = Some(duplicate_machine_id);
+    for ownership in &mut second.ownership {
+        if ownership.machine_id.is_some() {
+            ownership.machine_id = Some(duplicate_machine_id.clone());
+        }
+        if ownership.resource_kind == OwnedResourceKind::Machine {
+            ownership.resource_id = duplicate_machine_id.to_string();
+        }
+    }
     conflicting.validate().unwrap();
 
     assert!(store.save_project_state(&conflicting).is_err());
@@ -4761,6 +4872,1595 @@ fn persisted_topology_rejects_self_consistent_child_that_diverges_from_parent_sn
 }
 
 #[test]
+fn v3_schema_has_durable_lifecycle_shape_and_constraints() {
+    let store = StateStore::in_memory().unwrap();
+    assert_eq!(store.schema_version().unwrap(), 3);
+    store.validate_v3_schema().unwrap();
+
+    let object_names = application_schema_snapshot(&store.conn)
+        .into_iter()
+        .map(|(kind, name, _, _)| (kind, name))
+        .collect::<Vec<_>>();
+    for expected in [
+        ("table", "environment_lifecycle_operations"),
+        ("table", "environment_tombstones"),
+        ("index", "idx_environment_active_operation"),
+        ("index", "idx_environment_lifecycle_project"),
+        ("index", "idx_environment_lifecycle_status"),
+        ("index", "idx_environment_lifecycle_one_active"),
+        ("index", "idx_environment_tombstone_project"),
+        ("trigger", "environment_lifecycle_idempotency_key_immutable"),
+        ("trigger", "environment_lifecycle_intent_immutable"),
+    ] {
+        assert!(
+            object_names
+                .iter()
+                .any(|(kind, name)| kind == expected.0 && name == expected.1),
+            "missing canonical schema object {expected:?}"
+        );
+    }
+
+    let lifecycle_foreign_keys: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('environment_lifecycle_operations')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let tombstone_foreign_keys: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('environment_tombstones')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!((lifecycle_foreign_keys, tombstone_foreign_keys), (0, 0));
+
+    let insert_operation = |operation_id: &str,
+                            idempotency_key: &str,
+                            environment_id: &str,
+                            generation: i64,
+                            status: &str| {
+        store.conn.execute(
+            "INSERT INTO environment_lifecycle_operations
+                (operation_id, idempotency_key, request_id, project_id, environment_id,
+                 schema_version, generation, kind, status, request_hash, definition_digest,
+                 initial_state, requested_target, operation_json, created_at, updated_at,
+                 completed_at)
+             VALUES (?1, ?2, 'req_fixture', 'prj_missing', ?3, 1, ?4, 'up', ?5,
+                     'sha256:request', 'sha256:definition', 'stopped', 'ready', '{}', 10, 10,
+                     CASE WHEN ?5 IN ('succeeded', 'failed', 'superseded') THEN 10 ELSE NULL END)",
+            params![
+                operation_id,
+                idempotency_key,
+                environment_id,
+                generation,
+                status
+            ],
+        )
+    };
+
+    insert_operation("lop_done", "idem_done", "env_absent", 1, "succeeded").unwrap();
+    insert_operation("lop_active", "idem_active", "env_absent", 2, "planned").unwrap();
+    assert!(
+        insert_operation("lop_blocked", "idem_blocked", "env_absent", 3, "blocked").is_err(),
+        "only one planned/running/blocked operation may exist per Environment"
+    );
+    assert!(
+        insert_operation(
+            "lop_generation",
+            "idem_generation",
+            "env_absent",
+            2,
+            "failed"
+        )
+        .is_err(),
+        "Environment generations must be unique"
+    );
+    insert_operation(
+        "lop_superseded",
+        "idem_superseded",
+        "env_absent",
+        3,
+        "superseded",
+    )
+    .unwrap();
+    assert!(
+        insert_operation(
+            "lop_idempotency",
+            "idem_active",
+            "env_other",
+            1,
+            "succeeded"
+        )
+        .is_err(),
+        "idempotency keys must be globally unique"
+    );
+    let immutable_error = store
+        .conn
+        .execute(
+            "UPDATE environment_lifecycle_operations
+             SET idempotency_key = 'idem_changed'
+             WHERE operation_id = 'lop_active'",
+            [],
+        )
+        .expect_err("idempotency keys must be immutable")
+        .to_string();
+    assert!(immutable_error.contains("immutable"));
+    let immutable_hash_error = store
+        .conn
+        .execute(
+            "UPDATE environment_lifecycle_operations
+             SET request_hash = 'sha256:changed'
+             WHERE operation_id = 'lop_active'",
+            [],
+        )
+        .expect_err("request hashes and other intent projections must be immutable")
+        .to_string();
+    assert!(immutable_hash_error.contains("immutable"));
+    assert!(
+        store
+            .conn
+            .execute(
+                "UPDATE environment_lifecycle_operations
+                 SET completed_at = 11
+                 WHERE operation_id = 'lop_active'",
+                [],
+            )
+            .is_err(),
+        "active lifecycle rows cannot advertise terminal completion"
+    );
+
+    store
+        .conn
+        .execute(
+            "INSERT INTO environment_tombstones
+                (environment_id, project_id, schema_version, name, definition_digest,
+                 delete_operation_id, lifecycle_generation, ownership_digest, deleted_at,
+                 tombstone_json)
+             VALUES ('env_absent', 'prj_missing', 1, 'gone', 'sha256:definition',
+                     'lop_delete', 4, 'sha256:ownership', 20, '{}')",
+            [],
+        )
+        .unwrap();
+}
+
+#[test]
+fn lifecycle_stop_up_and_stable_target_noops_preserve_identity() {
+    let store = StateStore::in_memory().unwrap();
+    let expected = topology_project_state("prj_lifecycle", &["agent"], "/checkout");
+    let original = expected.environments[0].clone();
+    store.save_project_state(&expected).unwrap();
+
+    let ready_up = store
+        .begin_environment_lifecycle(
+            "env_agent",
+            EnvironmentLifecycleKind::Up,
+            "req-ready-up",
+            "idem-ready-up",
+            "sha256:ready-up",
+            300,
+        )
+        .unwrap();
+    assert_eq!(ready_up.status, EnvironmentLifecycleStatus::Succeeded);
+    assert!(
+        ready_up
+            .machine_steps
+            .iter()
+            .all(|step| step.status == LifecycleStepStatus::Succeeded)
+    );
+
+    let stop = store
+        .begin_environment_lifecycle(
+            "env_agent",
+            EnvironmentLifecycleKind::Stop,
+            "req-stop",
+            "idem-stop",
+            "sha256:stop",
+            301,
+        )
+        .unwrap();
+    assert_eq!(stop.status, EnvironmentLifecycleStatus::Running);
+    let mut stop = stop;
+    for step in stop.machine_steps.clone() {
+        stop = store
+            .acknowledge_environment_machine_step(
+                &MachineLifecycleStepAcknowledgement {
+                    operation_id: stop.operation_id.clone(),
+                    generation: stop.generation,
+                    machine_id: step.machine_id,
+                    initial_state: step.initial_state,
+                    target_state: step.target_state,
+                    expected_incarnation: step.expected_incarnation,
+                    resulting_incarnation: None,
+                    result: LifecycleStepResult::Succeeded,
+                },
+                302,
+            )
+            .unwrap();
+    }
+    assert_eq!(stop.status, EnvironmentLifecycleStatus::Running);
+    let stop = store
+        .finish_environment_lifecycle(stop.operation_id.as_str(), stop.generation, 303)
+        .unwrap();
+    assert_eq!(stop.status, EnvironmentLifecycleStatus::Succeeded);
+
+    let stopped_stop = store
+        .begin_environment_lifecycle(
+            "env_agent",
+            EnvironmentLifecycleKind::Stop,
+            "req-stopped-stop",
+            "idem-stopped-stop",
+            "sha256:stopped-stop",
+            304,
+        )
+        .unwrap();
+    assert_eq!(stopped_stop.status, EnvironmentLifecycleStatus::Succeeded);
+    assert!(
+        stopped_stop
+            .machine_steps
+            .iter()
+            .all(|step| step.status == LifecycleStepStatus::Succeeded)
+    );
+
+    let mut up = store
+        .begin_environment_lifecycle(
+            "env_agent",
+            EnvironmentLifecycleKind::Up,
+            "req-up",
+            "idem-up",
+            "sha256:up",
+            305,
+        )
+        .unwrap();
+    for step in up.machine_steps.clone() {
+        up = store
+            .acknowledge_environment_machine_step(
+                &MachineLifecycleStepAcknowledgement {
+                    operation_id: up.operation_id.clone(),
+                    generation: up.generation,
+                    machine_id: step.machine_id,
+                    initial_state: step.initial_state,
+                    target_state: step.target_state,
+                    expected_incarnation: step.expected_incarnation.clone(),
+                    resulting_incarnation: step.expected_incarnation,
+                    result: LifecycleStepResult::Succeeded,
+                },
+                306,
+            )
+            .unwrap();
+    }
+    store
+        .finish_environment_lifecycle(up.operation_id.as_str(), up.generation, 307)
+        .unwrap();
+
+    let actual = store
+        .load_project_state("prj_lifecycle")
+        .unwrap()
+        .unwrap()
+        .environments
+        .remove(0);
+    assert_eq!(actual.state, EnvironmentState::Ready);
+    assert_eq!(actual.environment_id, original.environment_id);
+    assert_eq!(
+        actual.machines[0].machine_id,
+        original.machines[0].machine_id
+    );
+    assert_eq!(
+        actual.machines[0].incarnation,
+        original.machines[0].incarnation
+    );
+    assert_eq!(actual.definition_digest, original.definition_digest);
+    assert_eq!(actual.ownership, original.ownership);
+}
+
+#[test]
+fn lifecycle_idempotency_and_two_connection_admission_are_atomic() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("lifecycle-admission.db");
+    let first =
+        StateStore::open_with_pragmas(&db_path, StateStorePragmas::daemon_defaults()).unwrap();
+    first
+        .save_project_state(&topology_project_state(
+            "prj_admission",
+            &["first", "second"],
+            "/checkout",
+        ))
+        .unwrap();
+    let second =
+        StateStore::open_with_pragmas(&db_path, StateStorePragmas::daemon_defaults()).unwrap();
+
+    let operation = first
+        .begin_environment_lifecycle(
+            "env_first",
+            EnvironmentLifecycleKind::Stop,
+            "req-admit",
+            "idem-admit",
+            "sha256:admit",
+            400,
+        )
+        .unwrap();
+    let replay = second
+        .begin_environment_lifecycle(
+            "env_first",
+            EnvironmentLifecycleKind::Stop,
+            "req-admit",
+            "idem-admit",
+            "sha256:admit",
+            999,
+        )
+        .unwrap();
+    assert_eq!(replay, operation);
+    let row_count_before: i64 = first
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM environment_lifecycle_operations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    for (environment_id, kind, request_id, request_hash) in [
+        (
+            "env_first",
+            EnvironmentLifecycleKind::Stop,
+            "req-other",
+            "sha256:admit",
+        ),
+        (
+            "env_first",
+            EnvironmentLifecycleKind::Up,
+            "req-admit",
+            "sha256:admit",
+        ),
+        (
+            "env_second",
+            EnvironmentLifecycleKind::Stop,
+            "req-admit",
+            "sha256:admit",
+        ),
+        (
+            "env_first",
+            EnvironmentLifecycleKind::Stop,
+            "req-admit",
+            "sha256:other",
+        ),
+    ] {
+        assert!(
+            second
+                .begin_environment_lifecycle(
+                    environment_id,
+                    kind,
+                    request_id,
+                    "idem-admit",
+                    request_hash,
+                    401,
+                )
+                .is_err()
+        );
+    }
+    assert!(
+        second
+            .begin_environment_lifecycle(
+                "env_first",
+                EnvironmentLifecycleKind::Up,
+                "req-conflict",
+                "idem-conflict",
+                "sha256:conflict",
+                402,
+            )
+            .is_err()
+    );
+    assert_eq!(
+        first
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM environment_lifecycle_operations",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+        row_count_before
+    );
+}
+
+#[test]
+fn lifecycle_simultaneous_two_connection_admission_serializes_exactly() {
+    fn run_pair(
+        db_path: &Path,
+        idempotency_keys: [&'static str; 2],
+    ) -> [Result<EnvironmentLifecycleOperation, StackError>; 2] {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = idempotency_keys.map(|idempotency_key| {
+            let db_path = db_path.to_path_buf();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let store =
+                    StateStore::open_with_pragmas(&db_path, StateStorePragmas::daemon_defaults())
+                        .unwrap();
+                barrier.wait();
+                store.begin_environment_lifecycle(
+                    "env_agent",
+                    EnvironmentLifecycleKind::Stop,
+                    "req-race",
+                    idempotency_key,
+                    "sha256:race",
+                    1_000,
+                )
+            })
+        });
+        handles.map(|handle| handle.join().expect("admission thread must not panic"))
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let conflict_path = temp_dir.path().join("lifecycle-race-conflict.db");
+    let seed = StateStore::open_with_pragmas(&conflict_path, StateStorePragmas::daemon_defaults())
+        .unwrap();
+    seed.save_project_state(&topology_project_state(
+        "prj_race_conflict",
+        &["agent"],
+        "/checkout",
+    ))
+    .unwrap();
+    drop(seed);
+
+    let conflict_results = run_pair(&conflict_path, ["idem-race-a", "idem-race-b"]);
+    assert_eq!(
+        conflict_results
+            .iter()
+            .filter(|result| result.is_ok())
+            .count(),
+        1
+    );
+    assert_eq!(
+        conflict_results
+            .iter()
+            .filter(|result| result.is_err())
+            .count(),
+        1
+    );
+    let accepted = conflict_results
+        .into_iter()
+        .find_map(Result::ok)
+        .expect("one competing request must own the Environment fence");
+    let inspect = StateStore::open(&conflict_path).unwrap();
+    assert_eq!(
+        inspect
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM environment_lifecycle_operations",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    let environment = inspect
+        .load_project_state("prj_race_conflict")
+        .unwrap()
+        .unwrap()
+        .environments
+        .remove(0);
+    assert_eq!(environment.lifecycle_generation, accepted.generation);
+    assert_eq!(
+        environment.active_operation_id.as_ref(),
+        Some(&accepted.operation_id)
+    );
+
+    let replay_path = temp_dir.path().join("lifecycle-race-replay.db");
+    let seed =
+        StateStore::open_with_pragmas(&replay_path, StateStorePragmas::daemon_defaults()).unwrap();
+    seed.save_project_state(&topology_project_state(
+        "prj_race_replay",
+        &["agent"],
+        "/checkout",
+    ))
+    .unwrap();
+    drop(seed);
+
+    let replay_results = run_pair(&replay_path, ["idem-race-shared", "idem-race-shared"]);
+    let [first, second] = replay_results.map(Result::unwrap);
+    assert_eq!(first, second);
+    let inspect = StateStore::open(&replay_path).unwrap();
+    assert_eq!(
+        inspect
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM environment_lifecycle_operations",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    let environment = inspect
+        .load_project_state("prj_race_replay")
+        .unwrap()
+        .unwrap()
+        .environments
+        .remove(0);
+    assert_eq!(environment.lifecycle_generation, first.generation);
+    assert_eq!(
+        environment.active_operation_id.as_ref(),
+        Some(&first.operation_id)
+    );
+}
+
+#[test]
+fn lifecycle_ack_is_fenced_resumable_and_terminal_replay_is_exact() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("lifecycle-resume.db");
+    let store = StateStore::open(&db_path).unwrap();
+    store
+        .save_project_state(&topology_project_state(
+            "prj_resume",
+            &["agent"],
+            "/checkout",
+        ))
+        .unwrap();
+    let operation = store
+        .begin_environment_lifecycle(
+            "env_agent",
+            EnvironmentLifecycleKind::Stop,
+            "req-resume",
+            "idem-resume",
+            "sha256:resume",
+            500,
+        )
+        .unwrap();
+    let step = operation.machine_steps[0].clone();
+    let exact = MachineLifecycleStepAcknowledgement {
+        operation_id: operation.operation_id.clone(),
+        generation: operation.generation,
+        machine_id: step.machine_id.clone(),
+        initial_state: step.initial_state,
+        target_state: step.target_state,
+        expected_incarnation: step.expected_incarnation,
+        resulting_incarnation: None,
+        result: LifecycleStepResult::Succeeded,
+    };
+    let mut stale = exact.clone();
+    stale.generation -= 1;
+    assert!(
+        store
+            .acknowledge_environment_machine_step(&stale, 501)
+            .is_err()
+    );
+    let mut foreign = exact.clone();
+    foreign.machine_id = MachineId::new("mac_foreign").unwrap();
+    assert!(
+        store
+            .acknowledge_environment_machine_step(&foreign, 501)
+            .is_err()
+    );
+    let mut stale_incarnation = exact.clone();
+    stale_incarnation.expected_incarnation = None;
+    assert!(
+        store
+            .acknowledge_environment_machine_step(&stale_incarnation, 501)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .load_current_environment_lifecycle("env_agent")
+            .unwrap(),
+        Some(operation.clone()),
+        "a stale incarnation acknowledgement must roll back without advancing the journal"
+    );
+    let acknowledged = store
+        .acknowledge_environment_machine_step(&exact, 502)
+        .unwrap();
+    assert_eq!(acknowledged.status, EnvironmentLifecycleStatus::Running);
+    drop(store);
+
+    let reopened = StateStore::open(&db_path).unwrap();
+    assert_eq!(
+        reopened
+            .load_resumable_environment_lifecycle("env_agent")
+            .unwrap(),
+        Some(acknowledged.clone())
+    );
+    let finished = reopened
+        .finish_environment_lifecycle(
+            acknowledged.operation_id.as_str(),
+            acknowledged.generation,
+            503,
+        )
+        .unwrap();
+    assert_eq!(finished.status, EnvironmentLifecycleStatus::Succeeded);
+    assert_eq!(
+        reopened
+            .acknowledge_environment_machine_step(&exact, 999)
+            .unwrap(),
+        finished
+    );
+    let mut different = exact;
+    different.result = LifecycleStepResult::Failed {
+        reason: "different".to_string(),
+    };
+    assert!(
+        reopened
+            .acknowledge_environment_machine_step(&different, 999)
+            .is_err()
+    );
+}
+
+#[test]
+fn lifecycle_delete_is_exact_durable_replayable_and_releases_name() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("lifecycle-delete-resume.db");
+    let store = StateStore::open(&db_path).unwrap();
+    let state = topology_project_state("prj_delete", &["target", "sibling"], "/checkout");
+    let old_environment_id = state.environments[0].environment_id.clone();
+    store.save_project_state(&state).unwrap();
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER forbid_sibling_update
+             BEFORE UPDATE ON environment_instances
+             WHEN OLD.environment_id = 'env_sibling'
+             BEGIN SELECT RAISE(ABORT, 'sibling update forbidden'); END;
+             CREATE TRIGGER forbid_sibling_delete
+             BEFORE DELETE ON environment_instances
+             WHEN OLD.environment_id = 'env_sibling'
+             BEGIN SELECT RAISE(ABORT, 'sibling delete forbidden'); END;",
+        )
+        .unwrap();
+    let sibling_before: (String, String) = store
+        .conn
+        .query_row(
+            "SELECT state, instance_json FROM environment_instances
+             WHERE environment_id = 'env_sibling'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    let mut operation = store
+        .begin_environment_lifecycle(
+            old_environment_id.as_str(),
+            EnvironmentLifecycleKind::Delete,
+            "req-delete",
+            "idem-delete",
+            "sha256:delete",
+            600,
+        )
+        .unwrap();
+    for step in operation.machine_steps.clone() {
+        operation = store
+            .acknowledge_environment_machine_step(
+                &MachineLifecycleStepAcknowledgement {
+                    operation_id: operation.operation_id.clone(),
+                    generation: operation.generation,
+                    machine_id: step.machine_id,
+                    initial_state: step.initial_state,
+                    target_state: step.target_state,
+                    expected_incarnation: step.expected_incarnation,
+                    resulting_incarnation: None,
+                    result: LifecycleStepResult::Succeeded,
+                },
+                601,
+            )
+            .unwrap();
+    }
+    store
+        .conn
+        .execute_batch("DROP TRIGGER forbid_sibling_update; DROP TRIGGER forbid_sibling_delete;")
+        .unwrap();
+    drop(store);
+    let store = StateStore::open(&db_path).unwrap();
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER forbid_sibling_update
+             BEFORE UPDATE ON environment_instances
+             WHEN OLD.environment_id = 'env_sibling'
+             BEGIN SELECT RAISE(ABORT, 'sibling update forbidden'); END;
+             CREATE TRIGGER forbid_sibling_delete
+             BEFORE DELETE ON environment_instances
+             WHEN OLD.environment_id = 'env_sibling'
+             BEGIN SELECT RAISE(ABORT, 'sibling delete forbidden'); END;",
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .load_resumable_environment_lifecycle(old_environment_id.as_str())
+            .unwrap(),
+        Some(operation.clone()),
+        "a partially acknowledged delete must resume from its durable journal"
+    );
+    assert!(
+        store
+            .finish_environment_delete(operation.operation_id.as_str(), operation.generation, 602,)
+            .is_err(),
+        "delete cannot finish before exact ownership cleanup succeeds"
+    );
+    let ownership_count_before: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM topology_ownership WHERE environment_id = ?1",
+            params![old_environment_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    for step in operation.cleanup_steps.clone() {
+        operation = store
+            .acknowledge_environment_cleanup_step(
+                &OwnershipCleanupStepAcknowledgement {
+                    operation_id: operation.operation_id.clone(),
+                    generation: operation.generation,
+                    ownership: step.ownership,
+                    result: LifecycleStepResult::Succeeded,
+                },
+                603,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM topology_ownership WHERE environment_id = ?1",
+                params![old_environment_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        ownership_count_before,
+        "cleanup acknowledgements retain ownership evidence until final delete"
+    );
+
+    let (finished, tombstone) = store
+        .finish_environment_delete(operation.operation_id.as_str(), operation.generation, 604)
+        .unwrap();
+    assert_eq!(finished.status, EnvironmentLifecycleStatus::Succeeded);
+    assert_eq!(tombstone.environment_id, old_environment_id);
+    assert!(
+        store
+            .load_project_state("prj_delete")
+            .unwrap()
+            .unwrap()
+            .environments
+            .iter()
+            .all(|environment| environment.environment_id != old_environment_id)
+    );
+    assert_eq!(
+        store
+            .load_environment_lifecycle(finished.operation_id.as_str())
+            .unwrap(),
+        Some(finished.clone())
+    );
+    assert_eq!(
+        store
+            .load_environment_tombstone(old_environment_id.as_str())
+            .unwrap(),
+        Some(tombstone.clone())
+    );
+    assert_eq!(
+        store
+            .finish_environment_delete(finished.operation_id.as_str(), finished.generation, 999)
+            .unwrap(),
+        (finished, tombstone.clone())
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT state, instance_json FROM environment_instances
+                 WHERE environment_id = 'env_sibling'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+        sibling_before
+    );
+    store
+        .conn
+        .execute_batch("DROP TRIGGER forbid_sibling_update; DROP TRIGGER forbid_sibling_delete;")
+        .unwrap();
+
+    let definition = state.definition;
+    let created = store
+        .resolve_or_reserve_environment_for_up(
+            &definition,
+            &EnvironmentSelectionContext {
+                explicit: Some(EnvironmentSelector::Name("target".to_string())),
+                ..EnvironmentSelectionContext::default()
+            },
+            605,
+        )
+        .unwrap();
+    let EnvironmentUpReservation::Created { environment } = created else {
+        panic!("deleted Environment name should be reusable")
+    };
+    assert_ne!(environment.environment_id, old_environment_id);
+
+    let mut corrupted_tombstone = tombstone;
+    corrupted_tombstone.ownership_digest = "sha256:corrupted".to_string();
+    store
+        .conn
+        .execute(
+            "UPDATE environment_tombstones
+             SET ownership_digest = ?1, tombstone_json = ?2
+             WHERE environment_id = ?3",
+            params![
+                corrupted_tombstone.ownership_digest,
+                serde_json::to_string(&corrupted_tombstone).unwrap(),
+                old_environment_id.as_str(),
+            ],
+        )
+        .unwrap();
+    let error = store
+        .load_environment_tombstone(old_environment_id.as_str())
+        .expect_err("tombstone ownership must match the succeeded Delete cleanup plan")
+        .to_string();
+    assert!(error.contains("field=cleanup_ownership_digest"));
+}
+
+#[test]
+fn blocked_delete_reopens_retries_and_replays_exact_steps_after_deletion() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("blocked-delete-retry.db");
+    let store = StateStore::open(&db_path).unwrap();
+    store
+        .save_project_state(&topology_project_state(
+            "prj_blocked_delete",
+            &["agent"],
+            "/checkout",
+        ))
+        .unwrap();
+    let operation = store
+        .begin_environment_lifecycle(
+            "env_agent",
+            EnvironmentLifecycleKind::Delete,
+            "req-blocked-delete",
+            "idem-blocked-delete",
+            "sha256:blocked-delete",
+            650,
+        )
+        .unwrap();
+    let step = operation.machine_steps[0].clone();
+    let failed_ack = MachineLifecycleStepAcknowledgement {
+        operation_id: operation.operation_id.clone(),
+        generation: operation.generation,
+        machine_id: step.machine_id,
+        initial_state: step.initial_state,
+        target_state: step.target_state,
+        expected_incarnation: step.expected_incarnation,
+        resulting_incarnation: None,
+        result: LifecycleStepResult::Failed {
+            reason: "transient backend failure".to_string(),
+        },
+    };
+    let mut blocked = store
+        .acknowledge_environment_machine_step(&failed_ack, 651)
+        .unwrap();
+    let cleanup_acks = blocked
+        .cleanup_steps
+        .iter()
+        .map(|step| OwnershipCleanupStepAcknowledgement {
+            operation_id: blocked.operation_id.clone(),
+            generation: blocked.generation,
+            ownership: step.ownership.clone(),
+            result: LifecycleStepResult::Succeeded,
+        })
+        .collect::<Vec<_>>();
+    for acknowledgement in &cleanup_acks {
+        blocked = store
+            .acknowledge_environment_cleanup_step(acknowledgement, 651)
+            .unwrap();
+    }
+    assert_eq!(blocked.status, EnvironmentLifecycleStatus::Blocked);
+    drop(store);
+
+    let store = StateStore::open(&db_path).unwrap();
+    assert_eq!(
+        store
+            .load_resumable_environment_lifecycle("env_agent")
+            .unwrap(),
+        Some(blocked.clone())
+    );
+    assert_eq!(
+        store
+            .acknowledge_environment_machine_step(&failed_ack, 999)
+            .unwrap(),
+        blocked,
+        "an exact failed-step replay must not advance the journal"
+    );
+    let mut succeeded_ack = failed_ack;
+    succeeded_ack.result = LifecycleStepResult::Succeeded;
+    let retried = store
+        .acknowledge_environment_machine_step(&succeeded_ack, 652)
+        .unwrap();
+    for acknowledgement in &cleanup_acks {
+        assert_eq!(
+            store
+                .acknowledge_environment_cleanup_step(acknowledgement, 999)
+                .unwrap(),
+            retried,
+            "an exact successful cleanup replay must not advance the journal"
+        );
+    }
+    let (finished, _) = store
+        .finish_environment_delete(retried.operation_id.as_str(), retried.generation, 654)
+        .unwrap();
+    drop(store);
+
+    let store = StateStore::open(&db_path).unwrap();
+    assert_eq!(
+        store
+            .acknowledge_environment_machine_step(&succeeded_ack, 999)
+            .unwrap(),
+        finished
+    );
+    for acknowledgement in &cleanup_acks {
+        assert_eq!(
+            store
+                .acknowledge_environment_cleanup_step(acknowledgement, 999)
+                .unwrap(),
+            finished
+        );
+    }
+}
+
+#[test]
+fn delete_supersedes_non_delete_and_resource_reservation_obeys_fence() {
+    let store = StateStore::in_memory().unwrap();
+    let state = topology_project_state("prj_supersede", &["agent"], "/checkout");
+    store.save_project_state(&state).unwrap();
+    let stop = store
+        .begin_environment_lifecycle(
+            "env_agent",
+            EnvironmentLifecycleKind::Stop,
+            "req-stop-before-delete",
+            "idem-stop-before-delete",
+            "sha256:stop-before-delete",
+            700,
+        )
+        .unwrap();
+    let delete = store
+        .begin_environment_lifecycle(
+            "env_agent",
+            EnvironmentLifecycleKind::Delete,
+            "req-delete-after-stop",
+            "idem-delete-after-stop",
+            "sha256:delete-after-stop",
+            701,
+        )
+        .unwrap();
+    assert_eq!(delete.generation, stop.generation + 1);
+    assert_eq!(
+        store
+            .load_environment_lifecycle(stop.operation_id.as_str())
+            .unwrap()
+            .unwrap()
+            .status,
+        EnvironmentLifecycleStatus::Superseded
+    );
+    assert_eq!(
+        store
+            .load_current_environment_lifecycle("env_agent")
+            .unwrap(),
+        Some(delete.clone())
+    );
+    let requested = OwnershipRecord {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        resource_kind: OwnedResourceKind::Disk,
+        resource_id: "vzr1-active-disk".to_string(),
+        environment_id: EnvironmentId::new("env_agent").unwrap(),
+        machine_id: Some(MachineId::new("mac_agent").unwrap()),
+    };
+    assert!(store.reserve_owned_resource(&requested, 702).is_err());
+    assert!(
+        store
+            .conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM topology_ownership WHERE resource_id = 'vzr1-active-disk'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+            == false
+    );
+}
+
+#[test]
+fn successful_up_persists_first_and_replacement_incarnation_ownership_exactly() {
+    let store = StateStore::in_memory().unwrap();
+    let template = topology_project_state("prj_incarnation", &["template"], "/checkout");
+    let definition = template.definition;
+    let mut environment = definition.instantiate_environment("fresh", 800).unwrap();
+    environment.machines[0].negotiated_capabilities =
+        environment.machines[0].requested_capabilities.clone();
+    let environment_id = environment.environment_id.clone();
+    let machine_id = environment.machines[0].machine_id.clone();
+    store
+        .save_project_state(&ProjectState {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            definition,
+            environments: vec![environment],
+        })
+        .unwrap();
+
+    let mut up = store
+        .begin_environment_lifecycle(
+            environment_id.as_str(),
+            EnvironmentLifecycleKind::Up,
+            "req-first-up",
+            "idem-first-up",
+            "sha256:first-up",
+            801,
+        )
+        .unwrap();
+    let step = up.machine_steps[0].clone();
+    assert_eq!(step.expected_incarnation, None);
+    let first_incarnation = MachineIncarnation {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        incarnation_id: MachineIncarnationId::new("inc_first").unwrap(),
+        machine_id: machine_id.clone(),
+        generation: 1,
+        created_at: 802,
+    };
+    up = store
+        .acknowledge_environment_machine_step(
+            &MachineLifecycleStepAcknowledgement {
+                operation_id: up.operation_id.clone(),
+                generation: up.generation,
+                machine_id: machine_id.clone(),
+                initial_state: step.initial_state,
+                target_state: step.target_state,
+                expected_incarnation: None,
+                resulting_incarnation: Some(first_incarnation.clone()),
+                result: LifecycleStepResult::Succeeded,
+            },
+            802,
+        )
+        .unwrap();
+    store
+        .finish_environment_lifecycle(up.operation_id.as_str(), up.generation, 803)
+        .unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM topology_ownership
+                 WHERE resource_kind = '\"incarnation\"' AND resource_id = 'inc_first'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+
+    let mut stop = store
+        .begin_environment_lifecycle(
+            environment_id.as_str(),
+            EnvironmentLifecycleKind::Stop,
+            "req-stop-incarnation",
+            "idem-stop-incarnation",
+            "sha256:stop-incarnation",
+            804,
+        )
+        .unwrap();
+    let step = stop.machine_steps[0].clone();
+    stop = store
+        .acknowledge_environment_machine_step(
+            &MachineLifecycleStepAcknowledgement {
+                operation_id: stop.operation_id.clone(),
+                generation: stop.generation,
+                machine_id: machine_id.clone(),
+                initial_state: step.initial_state,
+                target_state: step.target_state,
+                expected_incarnation: step.expected_incarnation,
+                resulting_incarnation: None,
+                result: LifecycleStepResult::Succeeded,
+            },
+            805,
+        )
+        .unwrap();
+    store
+        .finish_environment_lifecycle(stop.operation_id.as_str(), stop.generation, 806)
+        .unwrap();
+
+    let mut rebuild = store
+        .begin_environment_lifecycle(
+            environment_id.as_str(),
+            EnvironmentLifecycleKind::Up,
+            "req-rebuild",
+            "idem-rebuild",
+            "sha256:rebuild",
+            807,
+        )
+        .unwrap();
+    let step = rebuild.machine_steps[0].clone();
+    let replacement = MachineIncarnation {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        incarnation_id: MachineIncarnationId::new("inc_replacement").unwrap(),
+        machine_id,
+        generation: 2,
+        created_at: 808,
+    };
+    rebuild = store
+        .acknowledge_environment_machine_step(
+            &MachineLifecycleStepAcknowledgement {
+                operation_id: rebuild.operation_id.clone(),
+                generation: rebuild.generation,
+                machine_id: replacement.machine_id.clone(),
+                initial_state: step.initial_state,
+                target_state: step.target_state,
+                expected_incarnation: Some(first_incarnation),
+                resulting_incarnation: Some(replacement.clone()),
+                result: LifecycleStepResult::Succeeded,
+            },
+            808,
+        )
+        .unwrap();
+    store
+        .finish_environment_lifecycle(rebuild.operation_id.as_str(), rebuild.generation, 809)
+        .unwrap();
+    let ids = store
+        .conn
+        .prepare(
+            "SELECT resource_id FROM topology_ownership
+             WHERE resource_kind = '\"incarnation\"' AND environment_id = ?1",
+        )
+        .unwrap()
+        .query_map(params![environment_id.as_str()], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(ids, vec![replacement.incarnation_id.to_string()]);
+}
+
+#[test]
+fn lifecycle_partial_up_auto_acknowledges_only_machine_already_at_target() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("partial-up-degraded.db");
+    let store = StateStore::open(&db_path).unwrap();
+    let mut state = topology_project_state("prj_partial_up", &["agent"], "/checkout");
+    let environment = &mut state.environments[0];
+    let mut second_spec = state.definition.environment.machines[0].clone();
+    second_spec.name = "worker".to_string();
+    state.definition.environment.machines.push(second_spec);
+
+    let mut second_machine = environment.machines[0].clone();
+    second_machine.machine_id = MachineId::new("mac_worker").unwrap();
+    second_machine.name = "worker".to_string();
+    second_machine.state = MachineState::Stopped;
+    let second_incarnation = MachineIncarnation {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        incarnation_id: MachineIncarnationId::new("inc_worker").unwrap(),
+        machine_id: second_machine.machine_id.clone(),
+        generation: 1,
+        created_at: 50,
+    };
+    second_machine.incarnation = Some(second_incarnation.clone());
+    environment.ownership.extend([
+        OwnershipRecord {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            resource_kind: OwnedResourceKind::Incarnation,
+            resource_id: second_incarnation.incarnation_id.to_string(),
+            environment_id: environment.environment_id.clone(),
+            machine_id: Some(second_machine.machine_id.clone()),
+        },
+        OwnershipRecord {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            resource_kind: OwnedResourceKind::Machine,
+            resource_id: second_machine.machine_id.to_string(),
+            environment_id: environment.environment_id.clone(),
+            machine_id: Some(second_machine.machine_id.clone()),
+        },
+    ]);
+    environment.machines.push(second_machine);
+    environment.state = EnvironmentState::Failed;
+    environment.definition_digest = state.definition.digest().unwrap();
+    store.save_project_state(&state).unwrap();
+
+    let operation = store
+        .begin_environment_lifecycle(
+            "env_agent",
+            EnvironmentLifecycleKind::Up,
+            "req-partial-up",
+            "idem-partial-up",
+            "sha256:partial-up",
+            900,
+        )
+        .unwrap();
+    assert_eq!(operation.status, EnvironmentLifecycleStatus::Running);
+    assert_eq!(
+        operation
+            .machine_steps
+            .iter()
+            .filter(|step| step.status == LifecycleStepStatus::Succeeded)
+            .count(),
+        1
+    );
+    assert_eq!(
+        operation
+            .machine_steps
+            .iter()
+            .filter(|step| step.status == LifecycleStepStatus::Pending)
+            .count(),
+        1
+    );
+    let ready_sibling_before: (String, String) = store
+        .conn
+        .query_row(
+            "SELECT state, instance_json FROM machine_instances
+             WHERE machine_id = 'mac_agent'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER forbid_ready_sibling_machine_update
+             BEFORE UPDATE ON machine_instances
+             WHEN OLD.machine_id = 'mac_agent'
+             BEGIN SELECT RAISE(ABORT, 'ready sibling Machine update forbidden'); END;",
+        )
+        .unwrap();
+    let pending = operation
+        .machine_steps
+        .iter()
+        .find(|step| step.status == LifecycleStepStatus::Pending)
+        .unwrap();
+    let acknowledged = store
+        .acknowledge_environment_machine_step(
+            &MachineLifecycleStepAcknowledgement {
+                operation_id: operation.operation_id.clone(),
+                generation: operation.generation,
+                machine_id: pending.machine_id.clone(),
+                initial_state: pending.initial_state,
+                target_state: pending.target_state,
+                expected_incarnation: pending.expected_incarnation.clone(),
+                resulting_incarnation: None,
+                result: LifecycleStepResult::Failed {
+                    reason: "guest failed to start".to_string(),
+                },
+            },
+            901,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT state, instance_json FROM machine_instances
+                 WHERE machine_id = 'mac_agent'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+        ready_sibling_before
+    );
+    store
+        .conn
+        .execute("DROP TRIGGER forbid_ready_sibling_machine_update", [])
+        .unwrap();
+    let finished = store
+        .finish_environment_lifecycle(
+            acknowledged.operation_id.as_str(),
+            acknowledged.generation,
+            902,
+        )
+        .unwrap();
+    assert_eq!(finished.status, EnvironmentLifecycleStatus::Failed);
+    drop(store);
+    let environment = StateStore::open(&db_path)
+        .unwrap()
+        .load_project_state("prj_partial_up")
+        .unwrap()
+        .unwrap()
+        .environments
+        .remove(0);
+    assert_eq!(environment.state, EnvironmentState::Degraded);
+}
+
+#[test]
+fn lifecycle_bulk_and_journal_projection_drift_fail_closed() {
+    let store = StateStore::in_memory().unwrap();
+    store
+        .save_project_state(&topology_project_state(
+            "prj_projection",
+            &["agent"],
+            "/checkout",
+        ))
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE environment_instances SET lifecycle_generation = 99
+             WHERE environment_id = 'env_agent'",
+            [],
+        )
+        .unwrap();
+    let error = store
+        .load_project_state("prj_projection")
+        .expect_err("bulk project load must validate normalized lifecycle generation")
+        .to_string();
+    assert!(error.contains("field=lifecycle_generation"));
+    store
+        .conn
+        .execute(
+            "UPDATE environment_instances SET lifecycle_generation = 0
+             WHERE environment_id = 'env_agent'",
+            [],
+        )
+        .unwrap();
+
+    let operation = store
+        .begin_environment_lifecycle(
+            "env_agent",
+            EnvironmentLifecycleKind::Stop,
+            "req-projection",
+            "idem-projection",
+            "sha256:projection",
+            910,
+        )
+        .unwrap();
+    let operation_json: String = store
+        .conn
+        .query_row(
+            "SELECT operation_json FROM environment_lifecycle_operations
+             WHERE operation_id = ?1",
+            params![operation.operation_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut operation_json: serde_json::Value = serde_json::from_str(&operation_json).unwrap();
+    operation_json["request_hash"] = serde_json::Value::String("sha256:drift".to_string());
+    store
+        .conn
+        .execute(
+            "UPDATE environment_lifecycle_operations SET operation_json = ?1
+             WHERE operation_id = ?2",
+            params![
+                serde_json::to_string(&operation_json).unwrap(),
+                operation.operation_id.as_str()
+            ],
+        )
+        .unwrap();
+    let error = store
+        .load_environment_lifecycle(operation.operation_id.as_str())
+        .expect_err("journal JSON must agree with immutable normalized request hash")
+        .to_string();
+    assert!(error.contains("field=request_hash"));
+}
+
+#[test]
+fn lifecycle_current_load_and_ack_validate_the_attached_aggregate() {
+    let store = StateStore::in_memory().unwrap();
+    store
+        .save_project_state(&topology_project_state(
+            "prj_attachment",
+            &["agent"],
+            "/checkout",
+        ))
+        .unwrap();
+    let operation = store
+        .begin_environment_lifecycle(
+            "env_agent",
+            EnvironmentLifecycleKind::Stop,
+            "req-attachment",
+            "idem-attachment",
+            "sha256:attachment",
+            920,
+        )
+        .unwrap();
+    let step = operation.machine_steps[0].clone();
+    let instance_json: String = store
+        .conn
+        .query_row(
+            "SELECT instance_json FROM environment_instances
+             WHERE environment_id = 'env_agent'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut environment: EnvironmentInstance = serde_json::from_str(&instance_json).unwrap();
+    environment.definition_digest = "sha256:foreign-definition".to_string();
+    store
+        .conn
+        .execute(
+            "UPDATE environment_instances
+             SET definition_digest = ?1, instance_json = ?2
+             WHERE environment_id = 'env_agent'",
+            params![
+                environment.definition_digest,
+                serde_json::to_string(&environment).unwrap(),
+            ],
+        )
+        .unwrap();
+
+    assert!(
+        store
+            .load_current_environment_lifecycle("env_agent")
+            .is_err(),
+        "current-operation lookup must validate the journal attachment"
+    );
+    assert!(
+        store
+            .acknowledge_environment_machine_step(
+                &MachineLifecycleStepAcknowledgement {
+                    operation_id: operation.operation_id,
+                    generation: operation.generation,
+                    machine_id: step.machine_id,
+                    initial_state: step.initial_state,
+                    target_state: step.target_state,
+                    expected_incarnation: step.expected_incarnation,
+                    resulting_incarnation: None,
+                    result: LifecycleStepResult::Succeeded,
+                },
+                921,
+            )
+            .is_err(),
+        "acknowledgement must reject a coherently encoded but foreign aggregate"
+    );
+}
+
+#[test]
+fn stopped_environment_rejects_narrow_resource_reservation_without_mutation() {
+    let store = StateStore::in_memory().unwrap();
+    let mut state = topology_project_state("prj_stopped_reserve", &["agent"], "/checkout");
+    state.environments[0].state = EnvironmentState::Stopped;
+    state.environments[0].machines[0].state = MachineState::Stopped;
+    store.save_project_state(&state).unwrap();
+    let before = ownership_snapshot(&store.conn);
+    let requested = OwnershipRecord {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        resource_kind: OwnedResourceKind::Disk,
+        resource_id: "vzr1-stopped-disk".to_string(),
+        environment_id: EnvironmentId::new("env_agent").unwrap(),
+        machine_id: Some(MachineId::new("mac_agent").unwrap()),
+    };
+    assert!(store.reserve_owned_resource(&requested, 999).is_err());
+    assert_eq!(ownership_snapshot(&store.conn), before);
+}
+
+#[test]
+fn v2_to_v3_migration_preserves_topology_and_restricts_owned_parent_deletion() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("v2-to-v3.db");
+    let store = create_v2_store(&db_path);
+    let expected = topology_project_state("prj_v2_migration", &["agent"], "/checkout");
+    store.save_project_state(&expected).unwrap();
+    let ownership_before = ownership_snapshot(&store.conn);
+    assert!(!ownership_before.is_empty());
+
+    store.migrate_topology_v2_to_v3().unwrap();
+
+    assert_eq!(store.schema_version().unwrap(), 3);
+    assert_eq!(
+        store.load_project_state("prj_v2_migration").unwrap(),
+        Some(expected)
+    );
+    assert_eq!(ownership_snapshot(&store.conn), ownership_before);
+    let lifecycle_rows: i64 = store
+        .conn
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM environment_lifecycle_operations) +
+                (SELECT COUNT(*) FROM environment_tombstones)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lifecycle_rows, 0);
+
+    let mut foreign_keys = store
+        .conn
+        .prepare("PRAGMA foreign_key_list('topology_ownership')")
+        .unwrap();
+    let delete_actions = foreign_keys
+        .query_map([], |row| row.get::<_, String>(6))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(delete_actions, vec!["RESTRICT", "RESTRICT", "RESTRICT"]);
+    assert!(
+        store
+            .conn
+            .execute(
+                "DELETE FROM environment_instances WHERE environment_id = 'env_agent'",
+                [],
+            )
+            .is_err(),
+        "ownership must block Environment deletion until cleanup removes its record"
+    );
+    assert_eq!(ownership_snapshot(&store.conn), ownership_before);
+    let (lifecycle_generation, active_operation_id): (i64, Option<String>) = store
+        .conn
+        .query_row(
+            "SELECT lifecycle_generation, active_operation_id
+             FROM environment_instances WHERE environment_id = 'env_agent'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(lifecycle_generation, 0);
+    assert_eq!(active_operation_id, None);
+}
+
+#[test]
+fn v2_to_v3_failure_rolls_back_schema_rows_and_version_then_retries() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("v2-to-v3-failpoint.db");
+    let store = create_v2_store(&db_path);
+    let expected = topology_project_state("prj_v2_failpoint", &["agent"], "/checkout");
+    store.save_project_state(&expected).unwrap();
+    let schema_before = application_schema_snapshot(&store.conn);
+    let ownership_before = ownership_snapshot(&store.conn);
+
+    let error = store
+        .migrate_topology_v2_to_v3_with_failpoint(
+            topology::TopologyV3MigrationFailpoint::AfterOwnershipRebuild,
+        )
+        .expect_err("injected migration failure must abort the transaction")
+        .to_string();
+    assert!(error.contains("after ownership rebuild"));
+    assert_eq!(store.schema_version().unwrap(), 2);
+    assert_eq!(application_schema_snapshot(&store.conn), schema_before);
+    assert_eq!(ownership_snapshot(&store.conn), ownership_before);
+    drop(store);
+
+    let retried = StateStore::open(&db_path).expect("v2-to-v3 migration retry must succeed");
+    assert_eq!(retried.schema_version().unwrap(), 3);
+    assert_eq!(
+        retried.load_project_state("prj_v2_failpoint").unwrap(),
+        Some(expected)
+    );
+    assert_eq!(ownership_snapshot(&retried.conn), ownership_before);
+}
+
+#[test]
+fn incomplete_v2_schema_is_rejected_before_v3_mutation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("incomplete-v2.db");
+    let store = create_v2_store(&db_path);
+    store
+        .conn
+        .execute("DROP TABLE environment_endpoints", [])
+        .unwrap();
+    drop(store);
+
+    let error = StateStore::open(&db_path)
+        .err()
+        .expect("incomplete v2 schema must fail before migration")
+        .to_string();
+    assert!(error.contains("state schema v2 shape mismatch"));
+    assert!(error.contains("table:environment_endpoints"));
+    let connection = Connection::open(&db_path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT value FROM control_metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "2"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE name IN ('environment_lifecycle_operations', 'environment_tombstones')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn v0_3_20_developer_migration_is_atomic_idempotent_and_preserves_legacy_rows() {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("legacy.db");
@@ -4769,7 +6469,24 @@ fn v0_3_20_developer_migration_is_atomic_idempotent_and_preserves_legacy_rows() 
 
     let migrated = {
         let store = StateStore::open(&db_path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table'
+                       AND name IN (
+                           'environment_lifecycle_operations',
+                           'environment_tombstones'
+                       )",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2,
+            "opening exact v1 state must chain through v2 to the complete v3 schema"
+        );
         let projects = store.list_project_states().unwrap();
         assert_eq!(projects.len(), 1);
         let project = projects.into_iter().next().unwrap();
@@ -4987,7 +6704,7 @@ fn v0_3_20_migration_failure_after_partial_write_rolls_back_and_retries() {
     drop(connection);
 
     let retried = StateStore::open(&db_path).expect("migration retry must succeed");
-    assert_eq!(retried.schema_version().unwrap(), 2);
+    assert_eq!(retried.schema_version().unwrap(), 3);
     let projects = retried.list_project_states().unwrap();
     assert_eq!(projects.len(), 1);
     assert_eq!(
@@ -5093,7 +6810,7 @@ fn daemon_pragmas_do_not_change_journal_mode_before_legacy_validation() {
 }
 
 #[test]
-fn future_and_incomplete_v2_schemas_are_rejected_without_repair() {
+fn future_and_incomplete_v3_schemas_are_rejected_without_repair() {
     let future_dir = tempfile::tempdir().unwrap();
     let future_path = future_dir.path().join("future.db");
     seed_v0_3_20_fixture(&future_path, None);
@@ -5132,9 +6849,9 @@ fn future_and_incomplete_v2_schemas_are_rejected_without_repair() {
     }
     let error = StateStore::open(&incomplete_path)
         .err()
-        .expect("incomplete v2 schema must fail")
+        .expect("incomplete v3 schema must fail")
         .to_string();
-    assert!(error.contains("state schema v2 shape mismatch"));
+    assert!(error.contains("state schema v3 shape mismatch"));
     assert!(error.contains("table:environment_endpoints"));
     let conn = Connection::open(&incomplete_path).unwrap();
     assert_eq!(
@@ -5149,7 +6866,7 @@ fn future_and_incomplete_v2_schemas_are_rejected_without_repair() {
 }
 
 #[test]
-fn malformed_v2_columns_constraints_and_foreign_key_data_are_rejected() {
+fn malformed_current_columns_and_foreign_key_data_are_rejected() {
     let column_dir = tempfile::tempdir().unwrap();
     let column_path = column_dir.path().join("unexpected-column.db");
     {
@@ -5163,7 +6880,7 @@ fn malformed_v2_columns_constraints_and_foreign_key_data_are_rejected() {
             .unwrap();
     }
     let error = StateStore::open(&column_path).err().unwrap().to_string();
-    assert!(error.contains("state schema v2 shape mismatch"));
+    assert!(error.contains("state schema v3 shape mismatch"));
     assert!(error.contains("table:project_definitions"));
 
     let constraint_dir = tempfile::tempdir().unwrap();
@@ -5171,11 +6888,14 @@ fn malformed_v2_columns_constraints_and_foreign_key_data_are_rejected() {
     seed_v0_3_20_fixture(&constraint_path, None);
     {
         let connection = Connection::open(&constraint_path).unwrap();
-        let malformed_ddl = topology::TOPOLOGY_SCHEMA_DDL.replace(
+        let malformed_ddl = topology::TOPOLOGY_SCHEMA_COMMON_DDL.replace(
             "schema_version INTEGER NOT NULL CHECK(schema_version = 1)",
             "schema_version INTEGER NOT NULL",
         );
         connection.execute_batch(&malformed_ddl).unwrap();
+        connection
+            .execute_batch(topology::TOPOLOGY_OWNERSHIP_V2_DDL)
+            .unwrap();
         connection
             .execute(
                 "UPDATE control_metadata SET value = '2' WHERE key = 'schema_version'",
@@ -5222,7 +6942,7 @@ fn malformed_v2_columns_constraints_and_foreign_key_data_are_rejected() {
 }
 
 #[test]
-fn v2_open_rejects_noncanonical_legacy_schema_objects_without_repair() {
+fn v3_open_rejects_noncanonical_legacy_schema_objects_without_repair() {
     for (name, mutation, expected, verification_sql) in [
         (
             "missing-table",
@@ -5262,10 +6982,10 @@ fn v2_open_rejects_noncanonical_legacy_schema_objects_without_repair() {
 
         let error = StateStore::open(&db_path)
             .err()
-            .expect("noncanonical v2 schema must fail")
+            .expect("noncanonical v3 schema must fail")
             .to_string();
         assert!(
-            error.contains("state schema v2 shape mismatch"),
+            error.contains("state schema v3 shape mismatch"),
             "unexpected error for {name}: {error}"
         );
         assert!(
@@ -5280,7 +7000,7 @@ fn v2_open_rejects_noncanonical_legacy_schema_objects_without_repair() {
         let expected_count = i64::from(name == "malformed-table" || name == "unexpected-trigger");
         assert_eq!(
             observed, expected_count,
-            "failed v2 open repaired the {name} mutation"
+            "failed v3 open repaired the {name} mutation"
         );
     }
 }
@@ -5626,20 +7346,20 @@ fn missing_and_malformed_schema_versions_are_rejected_before_mutation() {
     }
 }
 
-/// Verify that fresh state stores advertise the current v2 schema.
+/// Verify that fresh state stores advertise the current v3 schema.
 #[test]
-fn migration_v2_schema_detectable() {
+fn migration_v3_schema_detectable() {
     let store = StateStore::in_memory().unwrap();
 
-    // Schema version must be present and equal to "2" after initial init.
+    // Schema version must be present and equal to "3" after initial init.
     let version_str = store
         .get_control_metadata("schema_version")
         .unwrap()
         .expect("schema_version should be set on first init");
-    assert_eq!(version_str, "2");
+    assert_eq!(version_str, "3");
 
     // The typed accessor must agree.
-    assert_eq!(store.schema_version().unwrap(), 2);
+    assert_eq!(store.schema_version().unwrap(), 3);
 
     // created_at must also be set.
     assert!(
@@ -5698,7 +7418,7 @@ fn migration_old_data_readable_after_schema_update() {
 
     // Schema version must not have been overwritten by re-init
     // (INSERT OR IGNORE preserves original value).
-    assert_eq!(store.schema_version().unwrap(), 2);
+    assert_eq!(store.schema_version().unwrap(), 3);
 }
 
 /// Verify that all existing queries continue to work correctly after new
@@ -5778,7 +7498,7 @@ fn migration_new_tables_dont_break_old_queries() {
     assert_eq!(loaded.checkpoint_id, "ckpt-1");
 
     // Schema version still intact.
-    assert_eq!(store.schema_version().unwrap(), 2);
+    assert_eq!(store.schema_version().unwrap(), 3);
 }
 
 /// Serialize and deserialize a checkpoint through the state store,
@@ -6012,6 +7732,112 @@ fn workspace_binding_refresh_preserves_identity_and_resources_across_relocation(
 }
 
 #[test]
+fn topology_create_and_binding_mutations_never_rewrite_active_sibling_rows() {
+    let store = StateStore::in_memory().unwrap();
+    let state = topology_project_state("prj_narrow_topology", &["active", "ready"], "/checkout");
+    let definition = state.definition.clone();
+    let ready_binding = state.environments[1].bindings[0].clone();
+    store.save_project_state(&state).unwrap();
+    let active = store
+        .begin_environment_lifecycle(
+            "env_active",
+            EnvironmentLifecycleKind::Stop,
+            "req-active-sibling",
+            "idem-active-sibling",
+            "sha256:active-sibling",
+            100,
+        )
+        .unwrap();
+    let active_row_before: (String, String, i64, Option<String>) = store
+        .conn
+        .query_row(
+            "SELECT state, instance_json, lifecycle_generation, active_operation_id
+             FROM environment_instances WHERE environment_id = 'env_active'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER forbid_active_sibling_update
+             BEFORE UPDATE ON environment_instances
+             WHEN OLD.environment_id = 'env_active'
+             BEGIN SELECT RAISE(ABORT, 'active sibling update forbidden'); END;
+             CREATE TRIGGER forbid_active_sibling_delete
+             BEFORE DELETE ON environment_instances
+             WHEN OLD.environment_id = 'env_active'
+             BEGIN SELECT RAISE(ABORT, 'active sibling delete forbidden'); END;
+             CREATE TRIGGER forbid_active_owner_update
+             BEFORE UPDATE ON topology_ownership
+             WHEN OLD.environment_id = 'env_active'
+             BEGIN SELECT RAISE(ABORT, 'active owner update forbidden'); END;
+             CREATE TRIGGER forbid_active_owner_delete
+             BEFORE DELETE ON topology_ownership
+             WHEN OLD.environment_id = 'env_active'
+             BEGIN SELECT RAISE(ABORT, 'active owner delete forbidden'); END;",
+        )
+        .unwrap();
+
+    let EnvironmentUpReservation::Created {
+        environment: created,
+    } = store
+        .resolve_or_reserve_environment_for_up(
+            &definition,
+            &EnvironmentSelectionContext {
+                explicit: Some(EnvironmentSelector::Name("created".to_string())),
+                ..EnvironmentSelectionContext::default()
+            },
+            200,
+        )
+        .unwrap()
+    else {
+        panic!("explicit missing name must create an Environment")
+    };
+    let reserved = WorkspaceBinding {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        binding_id: WorkspaceBindingId::generate(),
+        project_id: definition.project_id.clone(),
+        environment_id: created.environment_id,
+        name: "workspace".to_string(),
+        workspace_key: "narrow-created-workspace".to_string(),
+        path_hint: Some("/created".to_string()),
+    };
+    store
+        .reserve_workspace_binding_for_environment(&reserved, 201)
+        .unwrap();
+
+    let mut refreshed = ready_binding;
+    refreshed.workspace_key = "narrow-ready-workspace".to_string();
+    refreshed.path_hint = Some("/relocated".to_string());
+    store.refresh_workspace_binding(&refreshed, 202).unwrap();
+
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT state, instance_json, lifecycle_generation, active_operation_id
+                 FROM environment_instances WHERE environment_id = 'env_active'",
+                [],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?
+                )),
+            )
+            .unwrap(),
+        active_row_before
+    );
+    assert_eq!(
+        store
+            .load_current_environment_lifecycle("env_active")
+            .unwrap(),
+        Some(active)
+    );
+}
+
+#[test]
 fn creating_environment_can_reserve_declared_workspace_before_reconciliation() {
     let store = StateStore::in_memory().unwrap();
     let definition = topology_project_state("prj_pre_reconcile", &["fixture"], "/x").definition;
@@ -6068,6 +7894,7 @@ fn workspace_binding_refresh_rejects_non_ready_environment_without_writes() {
     let store = StateStore::in_memory().unwrap();
     let mut original = topology_project_state("prj_stopped", &["agent"], "/checkout");
     original.environments[0].state = EnvironmentState::Stopped;
+    original.environments[0].machines[0].state = MachineState::Stopped;
     store.save_project_state(&original).unwrap();
     let mut requested = original.environments[0].bindings[0].clone();
     requested.path_hint = Some("/moved".to_string());
@@ -6580,7 +8407,7 @@ fn two_worktree_three_environment_layout_resolves_and_persists_distinct_owned_re
         OwnedResourceKind::Disk,
         OwnedResourceKind::Socket,
         OwnedResourceKind::DockerContext,
-        OwnedResourceKind::Endpoint,
+        OwnedResourceKind::Credential,
         OwnedResourceKind::Other("state".to_string()),
     ];
     let mut expected_ids = std::collections::BTreeSet::new();

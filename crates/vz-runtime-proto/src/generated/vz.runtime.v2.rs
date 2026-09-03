@@ -248,6 +248,144 @@ pub struct OwnershipRecord {
     #[prost(string, optional, tag = "6")]
     pub machine_id: ::core::option::Option<::prost::alloc::string::String>,
 }
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct LifecycleStepSucceeded {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LifecycleStepFailed {
+    #[prost(string, tag = "1")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LifecycleStepResult {
+    #[prost(oneof = "lifecycle_step_result::Result", tags = "1, 2")]
+    pub result: ::core::option::Option<lifecycle_step_result::Result>,
+}
+/// Nested message and enum types in `LifecycleStepResult`.
+pub mod lifecycle_step_result {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Result {
+        #[prost(message, tag = "1")]
+        Succeeded(super::LifecycleStepSucceeded),
+        #[prost(message, tag = "2")]
+        Failed(super::LifecycleStepFailed),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineLifecycleStep {
+    #[prost(string, tag = "1")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "MachineState", tag = "2")]
+    pub initial_state: i32,
+    #[prost(enumeration = "MachineState", optional, tag = "3")]
+    pub target_state: ::core::option::Option<i32>,
+    #[prost(enumeration = "LifecycleStepStatus", tag = "4")]
+    pub status: i32,
+    #[prost(string, optional, tag = "5")]
+    pub failure_reason: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "6")]
+    pub expected_incarnation: ::core::option::Option<MachineIncarnation>,
+    #[prost(message, optional, tag = "7")]
+    pub resulting_incarnation: ::core::option::Option<MachineIncarnation>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineLifecycleStepAcknowledgement {
+    #[prost(string, tag = "1")]
+    pub operation_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub generation: u64,
+    #[prost(string, tag = "3")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "MachineState", tag = "4")]
+    pub initial_state: i32,
+    #[prost(enumeration = "MachineState", optional, tag = "5")]
+    pub target_state: ::core::option::Option<i32>,
+    #[prost(message, optional, tag = "6")]
+    pub result: ::core::option::Option<LifecycleStepResult>,
+    #[prost(message, optional, tag = "7")]
+    pub expected_incarnation: ::core::option::Option<MachineIncarnation>,
+    #[prost(message, optional, tag = "8")]
+    pub resulting_incarnation: ::core::option::Option<MachineIncarnation>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OwnershipCleanupStep {
+    #[prost(message, optional, tag = "1")]
+    pub ownership: ::core::option::Option<OwnershipRecord>,
+    #[prost(enumeration = "LifecycleStepStatus", tag = "2")]
+    pub status: i32,
+    #[prost(string, optional, tag = "3")]
+    pub failure_reason: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OwnershipCleanupStepAcknowledgement {
+    #[prost(string, tag = "1")]
+    pub operation_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub generation: u64,
+    #[prost(message, optional, tag = "3")]
+    pub ownership: ::core::option::Option<OwnershipRecord>,
+    #[prost(message, optional, tag = "4")]
+    pub result: ::core::option::Option<LifecycleStepResult>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EnvironmentLifecycleOperation {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub operation_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub project_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "EnvironmentLifecycleKind", tag = "5")]
+    pub kind: i32,
+    #[prost(uint64, tag = "6")]
+    pub generation: u64,
+    #[prost(string, tag = "7")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub idempotency_key: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub request_hash: ::prost::alloc::string::String,
+    #[prost(string, tag = "10")]
+    pub definition_digest: ::prost::alloc::string::String,
+    #[prost(enumeration = "EnvironmentState", tag = "11")]
+    pub initial_state: i32,
+    #[prost(enumeration = "EnvironmentState", tag = "12")]
+    pub requested_target: i32,
+    #[prost(enumeration = "EnvironmentLifecycleStatus", tag = "13")]
+    pub status: i32,
+    #[prost(message, repeated, tag = "14")]
+    pub machine_steps: ::prost::alloc::vec::Vec<MachineLifecycleStep>,
+    #[prost(message, repeated, tag = "15")]
+    pub cleanup_steps: ::prost::alloc::vec::Vec<OwnershipCleanupStep>,
+    #[prost(uint64, tag = "16")]
+    pub created_at: u64,
+    #[prost(uint64, tag = "17")]
+    pub updated_at: u64,
+    #[prost(uint64, optional, tag = "18")]
+    pub completed_at: ::core::option::Option<u64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EnvironmentTombstone {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub project_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub definition_digest: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub delete_operation_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "7")]
+    pub lifecycle_generation: u64,
+    #[prost(string, tag = "8")]
+    pub ownership_digest: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "9")]
+    pub deleted_at: u64,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LegacyMigrationProvenance {
     #[prost(string, tag = "1")]
@@ -287,6 +425,10 @@ pub struct EnvironmentInstance {
     pub created_at: u64,
     #[prost(uint64, tag = "14")]
     pub updated_at: u64,
+    #[prost(uint64, tag = "15")]
+    pub lifecycle_generation: u64,
+    #[prost(string, optional, tag = "16")]
+    pub active_operation_id: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProjectState {
@@ -381,11 +523,28 @@ pub struct TopologyContradictoryCapabilityDetail {
     #[prost(enumeration = "MachineCapability", tag = "2")]
     pub capability: i32,
 }
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyInvalidLifecycleStateDetail {
+    #[prost(string, tag = "1")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyInvalidMachineIncarnationDetail {
+    #[prost(string, tag = "1")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
 /// Structured detail suitable for an ErrorDetail companion. Do not require
 /// clients to parse ambiguity or unsupported-target information from prose.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TopologyErrorDetail {
-    #[prost(oneof = "topology_error_detail::Detail", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(
+        oneof = "topology_error_detail::Detail",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+    )]
     pub detail: ::core::option::Option<topology_error_detail::Detail>,
 }
 /// Nested message and enum types in `TopologyErrorDetail`.
@@ -410,6 +569,130 @@ pub mod topology_error_detail {
         SelectionRequired(super::TopologySelectionRequiredDetail),
         #[prost(message, tag = "9")]
         InvalidSelector(super::TopologyInvalidSelectorDetail),
+        #[prost(message, tag = "10")]
+        InvalidLifecycleState(super::TopologyInvalidLifecycleStateDetail),
+        #[prost(message, tag = "11")]
+        InvalidMachineIncarnation(super::TopologyInvalidMachineIncarnationDetail),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyLifecycleInvalidTransitionDetail {
+    #[prost(string, tag = "1")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "EnvironmentLifecycleKind", tag = "2")]
+    pub operation: i32,
+    #[prost(enumeration = "EnvironmentState", tag = "3")]
+    pub state: i32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyLifecycleOperationConflictDetail {
+    #[prost(string, tag = "1")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub active_operation_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyLifecycleGenerationMismatchDetail {
+    #[prost(string, tag = "1")]
+    pub operation_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub expected: u64,
+    #[prost(uint64, tag = "3")]
+    pub found: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyLifecycleOperationMismatchDetail {
+    #[prost(string, tag = "1")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub expected: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub found: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyLifecycleMachineStepNotFoundDetail {
+    #[prost(string, tag = "1")]
+    pub operation_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub machine_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyLifecycleMachineStepMismatchDetail {
+    #[prost(string, tag = "1")]
+    pub machine_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyLifecycleOwnershipStepMismatchDetail {
+    #[prost(string, tag = "1")]
+    pub operation_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub resource_kind: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub resource_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyLifecycleOperationIncompleteDetail {
+    #[prost(string, tag = "1")]
+    pub operation_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyLifecycleOperationFailedDetail {
+    #[prost(string, tag = "1")]
+    pub operation_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyLifecycleDeleteRequiredDetail {
+    #[prost(string, tag = "1")]
+    pub operation_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyLifecycleDeletedEnvironmentIsNotLiveDetail {
+    #[prost(string, tag = "1")]
+    pub environment_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyLifecycleInvalidOperationDetail {
+    #[prost(string, tag = "1")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyLifecycleErrorDetail {
+    #[prost(
+        oneof = "topology_lifecycle_error_detail::Detail",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12"
+    )]
+    pub detail: ::core::option::Option<topology_lifecycle_error_detail::Detail>,
+}
+/// Nested message and enum types in `TopologyLifecycleErrorDetail`.
+pub mod topology_lifecycle_error_detail {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Detail {
+        #[prost(message, tag = "1")]
+        InvalidTransition(super::TopologyLifecycleInvalidTransitionDetail),
+        #[prost(message, tag = "2")]
+        OperationConflict(super::TopologyLifecycleOperationConflictDetail),
+        #[prost(message, tag = "3")]
+        GenerationMismatch(super::TopologyLifecycleGenerationMismatchDetail),
+        #[prost(message, tag = "4")]
+        OperationMismatch(super::TopologyLifecycleOperationMismatchDetail),
+        #[prost(message, tag = "5")]
+        MachineStepNotFound(super::TopologyLifecycleMachineStepNotFoundDetail),
+        #[prost(message, tag = "6")]
+        MachineStepMismatch(super::TopologyLifecycleMachineStepMismatchDetail),
+        #[prost(message, tag = "7")]
+        OwnershipStepMismatch(super::TopologyLifecycleOwnershipStepMismatchDetail),
+        #[prost(message, tag = "8")]
+        OperationIncomplete(super::TopologyLifecycleOperationIncompleteDetail),
+        #[prost(message, tag = "9")]
+        OperationFailed(super::TopologyLifecycleOperationFailedDetail),
+        #[prost(message, tag = "10")]
+        DeleteRequired(super::TopologyLifecycleDeleteRequiredDetail),
+        #[prost(message, tag = "11")]
+        DeletedEnvironmentIsNotLive(
+            super::TopologyLifecycleDeletedEnvironmentIsNotLiveDetail,
+        ),
+        #[prost(message, tag = "12")]
+        InvalidOperation(super::TopologyLifecycleInvalidOperationDetail),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2559,6 +2842,7 @@ pub enum EnvironmentState {
     Deleting = 5,
     Deleted = 6,
     Failed = 7,
+    Degraded = 8,
 }
 impl EnvironmentState {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2575,6 +2859,7 @@ impl EnvironmentState {
             Self::Deleting => "ENVIRONMENT_STATE_DELETING",
             Self::Deleted => "ENVIRONMENT_STATE_DELETED",
             Self::Failed => "ENVIRONMENT_STATE_FAILED",
+            Self::Degraded => "ENVIRONMENT_STATE_DEGRADED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2588,6 +2873,7 @@ impl EnvironmentState {
             "ENVIRONMENT_STATE_DELETING" => Some(Self::Deleting),
             "ENVIRONMENT_STATE_DELETED" => Some(Self::Deleted),
             "ENVIRONMENT_STATE_FAILED" => Some(Self::Failed),
+            "ENVIRONMENT_STATE_DEGRADED" => Some(Self::Degraded),
             _ => None,
         }
     }
@@ -2724,6 +3010,114 @@ impl OwnedResourceKind {
             "OWNED_RESOURCE_KIND_FAULT" => Some(Self::Fault),
             "OWNED_RESOURCE_KIND_LEGACY_SANDBOX" => Some(Self::LegacySandbox),
             "OWNED_RESOURCE_KIND_OTHER" => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum EnvironmentLifecycleKind {
+    Unspecified = 0,
+    Up = 1,
+    Stop = 2,
+    Delete = 3,
+}
+impl EnvironmentLifecycleKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ENVIRONMENT_LIFECYCLE_KIND_UNSPECIFIED",
+            Self::Up => "ENVIRONMENT_LIFECYCLE_KIND_UP",
+            Self::Stop => "ENVIRONMENT_LIFECYCLE_KIND_STOP",
+            Self::Delete => "ENVIRONMENT_LIFECYCLE_KIND_DELETE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ENVIRONMENT_LIFECYCLE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "ENVIRONMENT_LIFECYCLE_KIND_UP" => Some(Self::Up),
+            "ENVIRONMENT_LIFECYCLE_KIND_STOP" => Some(Self::Stop),
+            "ENVIRONMENT_LIFECYCLE_KIND_DELETE" => Some(Self::Delete),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum EnvironmentLifecycleStatus {
+    Unspecified = 0,
+    Planned = 1,
+    Running = 2,
+    Blocked = 3,
+    Succeeded = 4,
+    Failed = 5,
+    Superseded = 6,
+}
+impl EnvironmentLifecycleStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ENVIRONMENT_LIFECYCLE_STATUS_UNSPECIFIED",
+            Self::Planned => "ENVIRONMENT_LIFECYCLE_STATUS_PLANNED",
+            Self::Running => "ENVIRONMENT_LIFECYCLE_STATUS_RUNNING",
+            Self::Blocked => "ENVIRONMENT_LIFECYCLE_STATUS_BLOCKED",
+            Self::Succeeded => "ENVIRONMENT_LIFECYCLE_STATUS_SUCCEEDED",
+            Self::Failed => "ENVIRONMENT_LIFECYCLE_STATUS_FAILED",
+            Self::Superseded => "ENVIRONMENT_LIFECYCLE_STATUS_SUPERSEDED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ENVIRONMENT_LIFECYCLE_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
+            "ENVIRONMENT_LIFECYCLE_STATUS_PLANNED" => Some(Self::Planned),
+            "ENVIRONMENT_LIFECYCLE_STATUS_RUNNING" => Some(Self::Running),
+            "ENVIRONMENT_LIFECYCLE_STATUS_BLOCKED" => Some(Self::Blocked),
+            "ENVIRONMENT_LIFECYCLE_STATUS_SUCCEEDED" => Some(Self::Succeeded),
+            "ENVIRONMENT_LIFECYCLE_STATUS_FAILED" => Some(Self::Failed),
+            "ENVIRONMENT_LIFECYCLE_STATUS_SUPERSEDED" => Some(Self::Superseded),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum LifecycleStepStatus {
+    Unspecified = 0,
+    Pending = 1,
+    Running = 2,
+    Succeeded = 3,
+    Failed = 4,
+}
+impl LifecycleStepStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "LIFECYCLE_STEP_STATUS_UNSPECIFIED",
+            Self::Pending => "LIFECYCLE_STEP_STATUS_PENDING",
+            Self::Running => "LIFECYCLE_STEP_STATUS_RUNNING",
+            Self::Succeeded => "LIFECYCLE_STEP_STATUS_SUCCEEDED",
+            Self::Failed => "LIFECYCLE_STEP_STATUS_FAILED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "LIFECYCLE_STEP_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
+            "LIFECYCLE_STEP_STATUS_PENDING" => Some(Self::Pending),
+            "LIFECYCLE_STEP_STATUS_RUNNING" => Some(Self::Running),
+            "LIFECYCLE_STEP_STATUS_SUCCEEDED" => Some(Self::Succeeded),
+            "LIFECYCLE_STEP_STATUS_FAILED" => Some(Self::Failed),
             _ => None,
         }
     }

@@ -199,6 +199,7 @@ enum EnvironmentState {
   ENVIRONMENT_STATE_DELETING = 5;
   ENVIRONMENT_STATE_DELETED = 6;
   ENVIRONMENT_STATE_FAILED = 7;
+  ENVIRONMENT_STATE_DEGRADED = 8;
 }
 
 enum MachineState {
@@ -286,6 +287,112 @@ message OwnershipRecord {
   optional string machine_id = 6;
 }
 
+enum EnvironmentLifecycleKind {
+  ENVIRONMENT_LIFECYCLE_KIND_UNSPECIFIED = 0;
+  ENVIRONMENT_LIFECYCLE_KIND_UP = 1;
+  ENVIRONMENT_LIFECYCLE_KIND_STOP = 2;
+  ENVIRONMENT_LIFECYCLE_KIND_DELETE = 3;
+}
+
+enum EnvironmentLifecycleStatus {
+  ENVIRONMENT_LIFECYCLE_STATUS_UNSPECIFIED = 0;
+  ENVIRONMENT_LIFECYCLE_STATUS_PLANNED = 1;
+  ENVIRONMENT_LIFECYCLE_STATUS_RUNNING = 2;
+  ENVIRONMENT_LIFECYCLE_STATUS_BLOCKED = 3;
+  ENVIRONMENT_LIFECYCLE_STATUS_SUCCEEDED = 4;
+  ENVIRONMENT_LIFECYCLE_STATUS_FAILED = 5;
+  ENVIRONMENT_LIFECYCLE_STATUS_SUPERSEDED = 6;
+}
+
+enum LifecycleStepStatus {
+  LIFECYCLE_STEP_STATUS_UNSPECIFIED = 0;
+  LIFECYCLE_STEP_STATUS_PENDING = 1;
+  LIFECYCLE_STEP_STATUS_RUNNING = 2;
+  LIFECYCLE_STEP_STATUS_SUCCEEDED = 3;
+  LIFECYCLE_STEP_STATUS_FAILED = 4;
+}
+
+message LifecycleStepSucceeded {
+}
+
+message LifecycleStepFailed {
+  string reason = 1;
+}
+
+message LifecycleStepResult {
+  oneof result {
+    LifecycleStepSucceeded succeeded = 1;
+    LifecycleStepFailed failed = 2;
+  }
+}
+
+message MachineLifecycleStep {
+  string machine_id = 1;
+  MachineState initial_state = 2;
+  optional MachineState target_state = 3;
+  LifecycleStepStatus status = 4;
+  optional string failure_reason = 5;
+  optional MachineIncarnation expected_incarnation = 6;
+  optional MachineIncarnation resulting_incarnation = 7;
+}
+
+message MachineLifecycleStepAcknowledgement {
+  string operation_id = 1;
+  uint64 generation = 2;
+  string machine_id = 3;
+  MachineState initial_state = 4;
+  optional MachineState target_state = 5;
+  LifecycleStepResult result = 6;
+  optional MachineIncarnation expected_incarnation = 7;
+  optional MachineIncarnation resulting_incarnation = 8;
+}
+
+message OwnershipCleanupStep {
+  OwnershipRecord ownership = 1;
+  LifecycleStepStatus status = 2;
+  optional string failure_reason = 3;
+}
+
+message OwnershipCleanupStepAcknowledgement {
+  string operation_id = 1;
+  uint64 generation = 2;
+  OwnershipRecord ownership = 3;
+  LifecycleStepResult result = 4;
+}
+
+message EnvironmentLifecycleOperation {
+  uint32 schema_version = 1;
+  string operation_id = 2;
+  string project_id = 3;
+  string environment_id = 4;
+  EnvironmentLifecycleKind kind = 5;
+  uint64 generation = 6;
+  string request_id = 7;
+  string idempotency_key = 8;
+  string request_hash = 9;
+  string definition_digest = 10;
+  EnvironmentState initial_state = 11;
+  EnvironmentState requested_target = 12;
+  EnvironmentLifecycleStatus status = 13;
+  repeated MachineLifecycleStep machine_steps = 14;
+  repeated OwnershipCleanupStep cleanup_steps = 15;
+  uint64 created_at = 16;
+  uint64 updated_at = 17;
+  optional uint64 completed_at = 18;
+}
+
+message EnvironmentTombstone {
+  uint32 schema_version = 1;
+  string project_id = 2;
+  string environment_id = 3;
+  string name = 4;
+  string definition_digest = 5;
+  string delete_operation_id = 6;
+  uint64 lifecycle_generation = 7;
+  string ownership_digest = 8;
+  uint64 deleted_at = 9;
+}
+
 message LegacyMigrationProvenance {
   string source_version = 1;
   string legacy_sandbox_id = 2;
@@ -307,6 +414,8 @@ message EnvironmentInstance {
   optional LegacyMigrationProvenance legacy_migration = 12;
   uint64 created_at = 13;
   uint64 updated_at = 14;
+  uint64 lifecycle_generation = 15;
+  optional string active_operation_id = 16;
 }
 
 message ProjectState {
@@ -372,6 +481,16 @@ message TopologyContradictoryCapabilityDetail {
   MachineCapability capability = 2;
 }
 
+message TopologyInvalidLifecycleStateDetail {
+  string environment_id = 1;
+  string reason = 2;
+}
+
+message TopologyInvalidMachineIncarnationDetail {
+  string machine_id = 1;
+  string reason = 2;
+}
+
 // Structured detail suitable for an ErrorDetail companion. Do not require
 // clients to parse ambiguity or unsupported-target information from prose.
 message TopologyErrorDetail {
@@ -385,6 +504,83 @@ message TopologyErrorDetail {
     TopologyContradictoryCapabilityDetail contradictory_capability = 7;
     TopologySelectionRequiredDetail selection_required = 8;
     TopologyInvalidSelectorDetail invalid_selector = 9;
+    TopologyInvalidLifecycleStateDetail invalid_lifecycle_state = 10;
+    TopologyInvalidMachineIncarnationDetail invalid_machine_incarnation = 11;
+  }
+}
+
+message TopologyLifecycleInvalidTransitionDetail {
+  string environment_id = 1;
+  EnvironmentLifecycleKind operation = 2;
+  EnvironmentState state = 3;
+}
+
+message TopologyLifecycleOperationConflictDetail {
+  string environment_id = 1;
+  string active_operation_id = 2;
+}
+
+message TopologyLifecycleGenerationMismatchDetail {
+  string operation_id = 1;
+  uint64 expected = 2;
+  uint64 found = 3;
+}
+
+message TopologyLifecycleOperationMismatchDetail {
+  string environment_id = 1;
+  string expected = 2;
+  string found = 3;
+}
+
+message TopologyLifecycleMachineStepNotFoundDetail {
+  string operation_id = 1;
+  string machine_id = 2;
+}
+
+message TopologyLifecycleMachineStepMismatchDetail {
+  string machine_id = 1;
+}
+
+message TopologyLifecycleOwnershipStepMismatchDetail {
+  string operation_id = 1;
+  string resource_kind = 2;
+  string resource_id = 3;
+}
+
+message TopologyLifecycleOperationIncompleteDetail {
+  string operation_id = 1;
+}
+
+message TopologyLifecycleOperationFailedDetail {
+  string operation_id = 1;
+}
+
+message TopologyLifecycleDeleteRequiredDetail {
+  string operation_id = 1;
+}
+
+message TopologyLifecycleDeletedEnvironmentIsNotLiveDetail {
+  string environment_id = 1;
+}
+
+message TopologyLifecycleInvalidOperationDetail {
+  string reason = 1;
+}
+
+message TopologyLifecycleErrorDetail {
+  oneof detail {
+    TopologyLifecycleInvalidTransitionDetail invalid_transition = 1;
+    TopologyLifecycleOperationConflictDetail operation_conflict = 2;
+    TopologyLifecycleGenerationMismatchDetail generation_mismatch = 3;
+    TopologyLifecycleOperationMismatchDetail operation_mismatch = 4;
+    TopologyLifecycleMachineStepNotFoundDetail machine_step_not_found = 5;
+    TopologyLifecycleMachineStepMismatchDetail machine_step_mismatch = 6;
+    TopologyLifecycleOwnershipStepMismatchDetail ownership_step_mismatch = 7;
+    TopologyLifecycleOperationIncompleteDetail operation_incomplete = 8;
+    TopologyLifecycleOperationFailedDetail operation_failed = 9;
+    TopologyLifecycleDeleteRequiredDetail delete_required = 10;
+    TopologyLifecycleDeletedEnvironmentIsNotLiveDetail deleted_environment_is_not_live = 11;
+    TopologyLifecycleInvalidOperationDetail invalid_operation = 12;
   }
 }
 
