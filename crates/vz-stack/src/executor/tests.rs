@@ -154,6 +154,65 @@ fn create_multiple_services() {
 }
 
 #[test]
+fn generated_runtime_ids_are_distinct_across_stacks_with_same_service_name() {
+    let runtime = MockContainerRuntime::new();
+    let mut executor = make_executor(runtime);
+    for stack_name in ["project-a", "project-b"] {
+        let spec = stack(stack_name, vec![svc("db", "postgres:16")]);
+        let result = executor
+            .execute(
+                &spec,
+                &[Action::ServiceCreate {
+                    service_name: "db".to_string(),
+                }],
+            )
+            .unwrap();
+        assert!(result.all_succeeded());
+    }
+
+    let configs = executor.runtime.captured_configs.lock().unwrap();
+    let requested: Vec<&str> = configs
+        .iter()
+        .filter_map(|(_, config)| config.container_id.as_deref())
+        .collect();
+    assert_eq!(requested.len(), 2);
+    assert_ne!(requested[0], requested[1]);
+    assert_eq!(
+        requested[0],
+        super::create::generated_runtime_container_id("project-a", "db", 1)
+    );
+    assert_eq!(
+        requested[1],
+        super::create::generated_runtime_container_id("project-b", "db", 1)
+    );
+}
+
+#[test]
+fn explicit_container_name_is_preserved_as_caller_selected_runtime_id() {
+    let runtime = MockContainerRuntime::new();
+    let mut executor = make_executor(runtime);
+    let mut service = svc("web", "nginx:latest");
+    service.container_name = Some("shared-explicit-name".to_string());
+    let spec = stack("project-a", vec![service]);
+
+    let result = executor
+        .execute(
+            &spec,
+            &[Action::ServiceCreate {
+                service_name: "web".to_string(),
+            }],
+        )
+        .unwrap();
+
+    assert!(result.all_succeeded());
+    let configs = executor.runtime.captured_configs.lock().unwrap();
+    assert_eq!(
+        configs[0].1.container_id.as_deref(),
+        Some("shared-explicit-name")
+    );
+}
+
+#[test]
 fn remove_service() {
     let runtime = MockContainerRuntime::new();
     let mut executor = make_executor(runtime);
@@ -371,7 +430,34 @@ fn create_failure_marks_service_failed() {
     let observed = executor.store().load_observed_state("myapp").unwrap();
     let web = observed.iter().find(|o| o.service_name == "web").unwrap();
     assert_eq!(web.phase, ServicePhase::Failed);
-    assert_eq!(web.container_id.as_deref(), Some("web"));
+    assert_eq!(
+        web.container_id.as_deref(),
+        Some(super::create::generated_runtime_container_id("myapp", "web", 1).as_str())
+    );
+}
+
+#[test]
+fn explicit_container_name_failure_does_not_claim_cleanup_ownership() {
+    let mut runtime = MockContainerRuntime::new();
+    runtime.fail_create = true;
+    let mut executor = make_executor(runtime);
+    let mut service = svc("web", "nginx:latest");
+    service.container_name = Some("foreign-global-id".to_string());
+    let spec = stack("myapp", vec![service]);
+
+    let result = executor
+        .execute(
+            &spec,
+            &[Action::ServiceCreate {
+                service_name: "web".to_string(),
+            }],
+        )
+        .unwrap();
+
+    assert_eq!(result.failed, 1);
+    let observed = executor.store().load_observed_state("myapp").unwrap();
+    assert_eq!(observed[0].phase, ServicePhase::Failed);
+    assert!(observed[0].container_id.is_none());
 }
 
 #[test]

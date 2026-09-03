@@ -49,6 +49,7 @@ use crate::network_holder::{
 
 /// Directory where named network namespaces are stored.
 const NETNS_RUN_DIR: &str = "/var/run/netns";
+const SYS_CLASS_NET: &str = "/sys/class/net";
 
 /// Set up per-service network isolation for a stack.
 ///
@@ -216,8 +217,9 @@ pub fn setup_stack_network(stack_id: &str, services: &[NetworkServiceConfig]) ->
 
 /// Tear down network resources for a stack.
 ///
-/// Removes per-service network namespaces and all bridges created for the
-/// stack (one per network, named `br-<stack_id>-<network_name>`).
+/// Removes per-service network namespaces, their host veth ends, and all
+/// bridges created for the stack (one per network, named
+/// `br-<stack_id>-<network_name>`).
 pub fn teardown_stack_network(stack_id: &str, service_names: &[String]) -> io::Result<()> {
     // Remove network namespaces (deletes veth pairs automatically).
     for name in service_names {
@@ -233,32 +235,60 @@ pub fn teardown_stack_network(stack_id: &str, service_names: &[String]) -> io::R
         }
     }
 
-    // Delete all bridges matching the br-<stack_id>-* pattern.
-    // We enumerate by listing interfaces; alternatively, just try the
-    // well-known prefix. Since bridge names are truncated, list all
-    // interfaces and delete those matching our prefix.
-    let prefix = format!("br-{}-", truncate_name(stack_id, 5));
-    if let Ok(output) = Command::new(IP_BIN)
-        .args(["link", "show", "type", "bridge"])
-        .output()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            // Lines look like: "5: br-mystack-default: <BROADCAST,..."
-            if let Some(name_part) = line.split(':').nth(1) {
-                let bridge = name_part.trim();
-                if bridge.starts_with(&prefix) {
-                    let _ = ip_run(&["link", "del", bridge]);
-                }
-            }
+    // Do not rely on destruction of an unmounted namespace to synchronously
+    // remove veth pairs. Delete only agent-generated host ends for the exact
+    // supplied services (`ve-<truncated-service>-<numeric-index>`).
+    let veths = discover_service_veths(Path::new(SYS_CLASS_NET), service_names)?;
+
+    // BusyBox `ip link show type bridge` is not a reliable enumeration API.
+    // sysfs provides both the complete interface set and an unambiguous
+    // bridge marker at `<interface>/bridge`. Restrict deletion to this stack's
+    // current prefix or exact legacy name, and verify the interface is really
+    // a bridge before invoking `ip link del`.
+    let bridges = discover_stack_bridges(Path::new(SYS_CLASS_NET), stack_id)?;
+    let mut first_error = None;
+    for veth in veths {
+        info!(stack_id = %stack_id, veth = %veth, "deleting stack service veth");
+        if let Err(error) = delete_discovered_link(&veth) {
+            first_error.get_or_insert(error);
         }
     }
-
-    // Fallback: also try the legacy single-bridge name for backwards compat.
-    let legacy_bridge = format!("br-{}", truncate_name(stack_id, 12));
-    let _ = ip_run(&["link", "del", &legacy_bridge]);
+    for bridge in bridges {
+        info!(stack_id = %stack_id, bridge = %bridge, "deleting stack bridge");
+        if let Err(error) = delete_discovered_link(&bridge) {
+            first_error.get_or_insert(error);
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
 
     Ok(())
+}
+
+/// Delete a link discovered in sysfs, tolerating only a confirmed concurrent
+/// disappearance (for example when namespace destruction removes a veth).
+fn delete_discovered_link(name: &str) -> io::Result<()> {
+    let delete_result = ip_run(&["link", "del", name]);
+    let existence_result = Path::new(SYS_CLASS_NET).join(name).try_exists();
+    normalize_link_delete_result(name, delete_result, existence_result)
+}
+
+fn normalize_link_delete_result(
+    name: &str,
+    delete_result: io::Result<()>,
+    existence_result: io::Result<bool>,
+) -> io::Result<()> {
+    match (delete_result, existence_result) {
+        (Ok(()), _) | (Err(_), Ok(false)) => Ok(()),
+        (Err(delete_error), Ok(true)) => Err(delete_error),
+        (Err(delete_error), Err(existence_error)) => Err(io::Error::new(
+            delete_error.kind(),
+            format!(
+                "failed to delete network link `{name}`: {delete_error}; cannot confirm link absence: {existence_error}"
+            ),
+        )),
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -269,6 +299,53 @@ fn truncate_name(name: &str, max_len: usize) -> &str {
     } else {
         name
     }
+}
+
+/// Discover agent-generated host veth ends for the supplied services only.
+fn discover_service_veths(
+    net_class_root: &Path,
+    service_names: &[String],
+) -> io::Result<Vec<String>> {
+    let prefixes = service_names
+        .iter()
+        .map(|name| format!("ve-{}-", truncate_name(name, 9)))
+        .collect::<HashSet<_>>();
+    let mut veths = Vec::new();
+
+    for entry in fs::read_dir(net_class_root)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if prefixes.iter().any(|prefix| {
+            name.strip_prefix(prefix).is_some_and(|index| {
+                !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        }) {
+            veths.push(name);
+        }
+    }
+    veths.sort_unstable();
+    Ok(veths)
+}
+
+/// Discover only real bridge interfaces belonging to one stack.
+fn discover_stack_bridges(net_class_root: &Path, stack_id: &str) -> io::Result<Vec<String>> {
+    let prefix = format!("br-{}-", truncate_name(stack_id, 5));
+    let legacy = format!("br-{}", truncate_name(stack_id, 12));
+    let mut bridges = Vec::new();
+
+    for entry in fs::read_dir(net_class_root)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if (name.starts_with(&prefix) || name == legacy) && entry.path().join("bridge").is_dir() {
+            bridges.push(name);
+        }
+    }
+    bridges.sort_unstable();
+    Ok(bridges)
 }
 
 fn parse_cidr(addr: &str) -> io::Result<(Ipv4Addr, u8)> {
@@ -638,6 +715,121 @@ mod tests {
     #[test]
     fn truncate_name_long() {
         assert_eq!(truncate_name("very-long-stack-name", 12), "very-long-st");
+    }
+
+    #[test]
+    fn bridge_discovery_uses_busybox_independent_sysfs_type_marker() {
+        let net = tempfile::tempdir().unwrap();
+        for name in [
+            "br-id-ow-defau",
+            "br-id-ow-backe",
+            "br-other-defau",
+            "br-id-owner-sta",
+            "ve-web-0",
+        ] {
+            fs::create_dir(net.path().join(name)).unwrap();
+        }
+        for name in ["br-id-ow-defau", "br-id-ow-backe", "br-id-owner-sta"] {
+            fs::create_dir(net.path().join(name).join("bridge")).unwrap();
+        }
+
+        assert_eq!(
+            discover_stack_bridges(net.path(), "id-owner-stack").unwrap(),
+            ["br-id-ow-backe", "br-id-ow-defau", "br-id-owner-sta"]
+        );
+    }
+
+    #[test]
+    fn bridge_discovery_never_selects_prefix_matching_non_bridge() {
+        let net = tempfile::tempdir().unwrap();
+        fs::create_dir(net.path().join("br-id-ow-fake")).unwrap();
+        fs::create_dir_all(net.path().join("br-other-real").join("bridge")).unwrap();
+
+        assert!(
+            discover_stack_bridges(net.path(), "id-owner-stack")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn service_veth_discovery_selects_every_numeric_index_for_supplied_services() {
+        let net = tempfile::tempdir().unwrap();
+        for name in [
+            "ve-owner-0",
+            "ve-owner-12",
+            "ve-owner-x",
+            "ve-owner-",
+            "ve-other-0",
+            "ve-owner-ser-3",
+        ] {
+            fs::create_dir(net.path().join(name)).unwrap();
+        }
+        let services = vec!["owner".to_string(), "owner-service".to_string()];
+
+        assert_eq!(
+            discover_service_veths(net.path(), &services).unwrap(),
+            ["ve-owner-0", "ve-owner-12", "ve-owner-ser-3"]
+        );
+    }
+
+    #[test]
+    fn service_veth_discovery_is_empty_without_exact_service_prefixes() {
+        let net = tempfile::tempdir().unwrap();
+        for name in ["ve-owner-0", "ve-api-old-1", "br-id-ow-defau"] {
+            fs::create_dir(net.path().join(name)).unwrap();
+        }
+
+        assert!(
+            discover_service_veths(net.path(), &["api".to_string()])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(discover_service_veths(net.path(), &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn link_delete_error_is_idempotent_only_after_confirmed_absence() {
+        assert!(
+            normalize_link_delete_result(
+                "ve-owner-0",
+                Err(io::Error::other("cannot find device")),
+                Ok(false),
+            )
+            .is_ok()
+        );
+
+        let still_present = normalize_link_delete_result(
+            "ve-owner-0",
+            Err(io::Error::other("delete failed")),
+            Ok(true),
+        )
+        .unwrap_err();
+        assert!(still_present.to_string().contains("delete failed"));
+
+        let unconfirmed = normalize_link_delete_result(
+            "ve-owner-0",
+            Err(io::Error::other("delete failed")),
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "sysfs denied",
+            )),
+        )
+        .unwrap_err();
+        assert!(
+            unconfirmed
+                .to_string()
+                .contains("cannot confirm link absence")
+        );
+
+        assert!(
+            normalize_link_delete_result(
+                "ve-owner-0",
+                Ok(()),
+                Err(io::Error::other("ignored after successful delete")),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

@@ -1,10 +1,76 @@
 use super::*;
+use sha2::{Digest, Sha256};
+
+const MAX_RUNTIME_CONTAINER_ID_BYTES: usize = 128;
+const GENERATED_ID_DIGEST_HEX_LEN: usize = 32;
+const GENERATED_ID_VERSION_PREFIX: &str = "vzs1";
+
+/// Derive an opaque runtime ID for a stack-managed container.
+///
+/// Service names remain the user-facing identity used by reconciliation,
+/// networking, logs, and exec lookup. Runtime IDs also include the stack
+/// namespace so two developer environments can safely use the same service
+/// names in one daemon. A digest makes the mapping collision-resistant even
+/// when the readable prefix must be sanitized or truncated.
+pub(super) fn generated_runtime_container_id(
+    stack_name: &str,
+    service_name: &str,
+    replica_index: u32,
+) -> String {
+    let replica_name = if replica_index > 1 {
+        format!("{service_name}-{replica_index}")
+    } else {
+        service_name.to_string()
+    };
+    let readable = format!("{}-{}", id_slug(stack_name), id_slug(&replica_name));
+
+    let mut hasher = Sha256::new();
+    for field in [stack_name.as_bytes(), service_name.as_bytes()] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    hasher.update(replica_index.to_le_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    let digest = &digest[..GENERATED_ID_DIGEST_HEX_LEN];
+
+    // `readable` is ASCII after slugging, so byte truncation is safe.
+    let max_readable =
+        MAX_RUNTIME_CONTAINER_ID_BYTES - GENERATED_ID_VERSION_PREFIX.len() - 2 - digest.len();
+    let readable = &readable[..readable.len().min(max_readable)];
+    format!("{GENERATED_ID_VERSION_PREFIX}-{readable}-{digest}")
+}
+
+fn id_slug(value: &str) -> String {
+    let mut slug = String::with_capacity(value.len().max(1));
+    let mut previous_was_dash = false;
+    for byte in value.bytes() {
+        let mapped = if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.') {
+            byte as char
+        } else {
+            '-'
+        };
+        if mapped == '-' && previous_was_dash {
+            continue;
+        }
+        previous_was_dash = mapped == '-';
+        slug.push(mapped);
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "unnamed".to_string()
+    } else {
+        slug.to_string()
+    }
+}
 
 pub(super) struct PreparedCreate {
     pub(super) service_name: String,
     pub(super) replica_index: u32,
     pub(super) image: String,
     pub(super) run_config: vz_runtime_contract::RunConfig,
+    /// Generated IDs are scoped to this stack and may be retained for cleanup
+    /// after a partial create. Explicit IDs require runtime ownership proof.
+    pub(super) retain_failed_create_id: bool,
 }
 
 impl PreparedCreate {
@@ -108,13 +174,19 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         // Convert ServiceSpec → RunConfig.
         let mut run_config = service_to_run_config(svc_spec, &resolved_mounts, &secret_mounts)?;
 
-        // Generate container_id: replica 1 = base name, replica N = "{base}-{N}".
+        // Preserve an explicit Compose `container_name` as a caller-selected,
+        // globally unique ID. Default IDs are stack-namespaced so separate
+        // developer environments may use identical service names safely.
         let replicas = svc_spec.resources.replicas.max(1);
-        let base_name = svc_spec.container_name.as_deref().unwrap_or(service_name);
-        let container_id = if replicas > 1 && replica_index > 1 {
-            format!("{}-{}", base_name, replica_index)
+        let retain_failed_create_id = svc_spec.container_name.is_none();
+        let container_id = if let Some(base_name) = svc_spec.container_name.as_deref() {
+            if replicas > 1 && replica_index > 1 {
+                format!("{base_name}-{replica_index}")
+            } else {
+                base_name.to_string()
+            }
         } else {
-            base_name.to_string()
+            generated_runtime_container_id(&spec.name, service_name, replica_index)
         };
         run_config.container_id = Some(container_id);
 
@@ -185,6 +257,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             replica_index,
             image: svc_spec.image.clone(),
             run_config,
+            retain_failed_create_id,
         })
     }
 
@@ -217,5 +290,34 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
         info!(service = %service_name, "service running");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_ids_are_stable_and_stack_scoped() {
+        let first = generated_runtime_container_id("project-a", "db", 1);
+        assert_eq!(first, generated_runtime_container_id("project-a", "db", 1));
+        assert_ne!(first, generated_runtime_container_id("project-b", "db", 1));
+        assert_ne!(first, generated_runtime_container_id("project-a", "db", 2));
+        assert!(first.starts_with("vzs1-project-a-db-"));
+    }
+
+    #[test]
+    fn generated_ids_obey_runtime_grammar_and_length_bound() {
+        let id = generated_runtime_container_id(
+            &format!("🔥/{}", "project".repeat(40)),
+            &format!("service/{}", "worker".repeat(40)),
+            42,
+        );
+        assert!(id.len() <= MAX_RUNTIME_CONTAINER_ID_BYTES);
+        assert!(id.as_bytes()[0].is_ascii_alphanumeric());
+        assert!(
+            id.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        );
     }
 }

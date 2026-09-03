@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -24,7 +23,202 @@ use tracing::error;
 
 use vz_agent_proto::*;
 
-use crate::process_table::ProcessTable;
+#[cfg(target_os = "linux")]
+use crate::process_table::SpawnedProcessIdentity;
+use crate::process_table::{ProcessIdentity, ProcessTable};
+
+#[cfg(target_os = "linux")]
+const CONTAINER_READY_ROOT: &str = "/run/vz-agent-exec";
+#[cfg(target_os = "linux")]
+const CONTAINER_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[cfg(target_os = "linux")]
+struct ContainerReadyListener {
+    listener: tokio::net::UnixListener,
+    path: PathBuf,
+    challenge: String,
+}
+
+#[cfg(target_os = "linux")]
+impl ContainerReadyListener {
+    fn bind() -> Result<Self, Status> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        std::fs::create_dir_all(CONTAINER_READY_ROOT).map_err(|error| {
+            Status::internal(format!("cannot create exec-ready directory: {error}"))
+        })?;
+        let metadata = std::fs::symlink_metadata(CONTAINER_READY_ROOT).map_err(|error| {
+            Status::internal(format!("cannot inspect exec-ready directory: {error}"))
+        })?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != 0 {
+            return Err(Status::permission_denied(
+                "exec-ready directory is not a root-owned real directory",
+            ));
+        }
+        std::fs::set_permissions(CONTAINER_READY_ROOT, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| {
+                Status::internal(format!("cannot secure exec-ready directory: {error}"))
+            })?;
+        let challenge = random_ready_challenge()?;
+        let path = Path::new(CONTAINER_READY_ROOT).join(format!("{challenge}.sock"));
+        let listener = std::os::unix::net::UnixListener::bind(&path)
+            .map_err(|error| Status::internal(format!("cannot bind exec-ready socket: {error}")))?;
+        listener.set_nonblocking(true).map_err(|error| {
+            Status::internal(format!("cannot configure exec-ready socket: {error}"))
+        })?;
+        let listener = tokio::net::UnixListener::from_std(listener).map_err(|error| {
+            Status::internal(format!("cannot adopt exec-ready socket: {error}"))
+        })?;
+        Ok(Self {
+            listener,
+            path,
+            challenge,
+        })
+    }
+
+    fn challenge(&self) -> &str {
+        &self.challenge
+    }
+
+    fn endpoint(&self) -> Result<(&str, &str), Status> {
+        let path = self
+            .path
+            .to_str()
+            .ok_or_else(|| Status::internal("exec-ready socket path is not UTF-8"))?;
+        Ok((path, self.challenge()))
+    }
+
+    async fn wait(
+        &self,
+        expected_process: &SpawnedProcessIdentity,
+        expected_container_id: &str,
+    ) -> Result<ContainerGeneration, Status> {
+        use tokio::io::AsyncReadExt as _;
+
+        let deadline = tokio::time::Instant::now() + CONTAINER_READY_TIMEOUT;
+        let operation = async {
+            let (stream, _) =
+                self.listener.accept().await.map_err(|error| {
+                    Status::internal(format!("exec-ready accept failed: {error}"))
+                })?;
+            let credentials = stream.peer_cred().map_err(|error| {
+                Status::internal(format!("exec-ready peer credentials failed: {error}"))
+            })?;
+            if credentials.pid() != Some(expected_process.pid() as i32) || credentials.uid() != 0 {
+                return Err(Status::permission_denied(
+                    "container exec readiness came from an unexpected process",
+                ));
+            }
+            expected_process.ensure_same_generation().map_err(|error| {
+                Status::failed_precondition(format!(
+                    "container exec readiness sender changed: {error}"
+                ))
+            })?;
+            let mut bytes = Vec::new();
+            stream
+                .take(4097)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| Status::internal(format!("exec-ready read failed: {error}")))?;
+            let identity = crate::container_exec::decode_ready_identity(
+                &bytes,
+                &self.challenge,
+                expected_process.start_time(),
+            )
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            if identity.container_id != expected_container_id {
+                return Err(Status::failed_precondition(
+                    "container exec readiness named a different target",
+                ));
+            }
+            Ok(container_generation(identity))
+        };
+        enforce_ready_deadline(deadline, operation).await
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+async fn enforce_ready_deadline<T>(
+    deadline: tokio::time::Instant,
+    operation: impl std::future::Future<Output = Result<T, Status>>,
+) -> Result<T, Status> {
+    tokio::time::timeout_at(deadline, operation)
+        .await
+        .map_err(|_| Status::deadline_exceeded("timed out waiting for container exec readiness"))?
+}
+
+#[cfg(target_os = "linux")]
+fn random_ready_challenge() -> Result<String, Status> {
+    let mut bytes = [0_u8; 32];
+    let mut used = 0;
+    while used < bytes.len() {
+        // SAFETY: the remaining byte slice is writable for the requested
+        // length and getrandom does not retain its pointer.
+        let result =
+            unsafe { libc::getrandom(bytes[used..].as_mut_ptr().cast(), bytes.len() - used, 0) };
+        if result > 0 {
+            used += result as usize;
+            continue;
+        }
+        if result == 0 {
+            return Err(Status::internal(
+                "cannot generate exec-ready challenge: getrandom returned zero bytes",
+            ));
+        }
+        if result < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(Status::internal(format!(
+            "cannot generate exec-ready challenge: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(hex_ready_challenge(bytes))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn hex_ready_challenge(bytes: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ContainerReadyListener {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn kernel_object((device, inode): (u64, u64)) -> KernelObjectIdentity {
+    KernelObjectIdentity { device, inode }
+}
+
+#[cfg(target_os = "linux")]
+fn container_generation(
+    identity: crate::container_exec::ContainerReadyIdentity,
+) -> ContainerGeneration {
+    ContainerGeneration {
+        container_id: identity.container_id,
+        init_pid: identity.pid,
+        init_start_time: identity.start_time,
+        cgroup_path: identity.cgroup_path,
+        cgroup: Some(kernel_object(identity.cgroup)),
+        namespaces: Some(ContainerNamespaceIdentity {
+            mount: Some(kernel_object(identity.namespaces[0])),
+            network: Some(kernel_object(identity.namespaces[1])),
+            pid: Some(kernel_object(identity.namespaces[2])),
+            ipc: Some(kernel_object(identity.namespaces[3])),
+            uts: Some(kernel_object(identity.namespaces[4])),
+        }),
+        root: Some(kernel_object(identity.root)),
+    }
+}
 
 // ── PTY handle tracking ─────────────────────────────────────────
 
@@ -33,6 +227,34 @@ use crate::process_table::ProcessTable;
 struct PtyMasterHandle {
     writer: Box<dyn std::io::Write + Send>,
     master: Box<dyn portable_pty::MasterPty + Send>,
+}
+
+/// Owns a just-spawned PTY trampoline until its ready handshake completes.
+/// Cancellation of the gRPC handler must not leave an untracked trampoline
+/// resolving a mutable container ID in the background.
+struct PendingPtyChild(Option<Box<dyn portable_pty::Child + Send>>);
+
+impl PendingPtyChild {
+    fn child_mut(&mut self) -> Result<&mut Box<dyn portable_pty::Child + Send>, Status> {
+        self.0
+            .as_mut()
+            .ok_or_else(|| Status::internal("pending PTY child is missing"))
+    }
+
+    fn take(mut self) -> Result<Box<dyn portable_pty::Child + Send>, Status> {
+        self.0
+            .take()
+            .ok_or_else(|| Status::internal("pending PTY child is missing"))
+    }
+}
+
+impl Drop for PendingPtyChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 static PTY_HANDLES: OnceLock<StdMutex<HashMap<u64, Arc<StdMutex<PtyMasterHandle>>>>> =
@@ -123,14 +345,23 @@ struct ExecOrderContext {
 }
 
 impl ExecOrderContext {
+    #[cfg(test)]
     fn new(
         sender: tokio::sync::mpsc::Sender<Result<ExecEvent, Status>>,
         request_id: String,
     ) -> Self {
+        Self::with_initial_sequence(sender, request_id, 0)
+    }
+
+    fn with_initial_sequence(
+        sender: tokio::sync::mpsc::Sender<Result<ExecEvent, Status>>,
+        request_id: String,
+        initial_sequence: u64,
+    ) -> Self {
         Self {
             sender,
             gate: Arc::new(Mutex::new(())),
-            sequence: Arc::new(AtomicU64::new(0)),
+            sequence: Arc::new(AtomicU64::new(initial_sequence)),
             request_id,
         }
     }
@@ -171,6 +402,28 @@ fn generated_request_id(prefix: &str) -> String {
     format!("{prefix}-{seq:016x}")
 }
 
+fn allocate_logical_exec_id_from(next: &AtomicU64) -> Option<u64> {
+    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        current.checked_add(1)
+    })
+    .ok()
+}
+
+fn allocate_logical_exec_id() -> Result<u64, Status> {
+    static NEXT_EXEC_ID: AtomicU64 = AtomicU64::new(1);
+    allocate_logical_exec_id_from(&NEXT_EXEC_ID)
+        .filter(|exec_id| *exec_id != 0)
+        .ok_or_else(|| Status::resource_exhausted("logical exec ID space exhausted"))
+}
+
+#[cfg(target_os = "linux")]
+fn capture_signal_identity(pid: u32) -> ProcessIdentity {
+    ProcessIdentity::capture_pidfd(pid).unwrap_or_else(|error| {
+        warn!(pid, %error, "grpc: pidfd capture failed; later signals will fail closed");
+        ProcessIdentity::from_pid(pid)
+    })
+}
+
 fn request_id_from_metadata(metadata: Option<&TransportMetadata>, prefix: &str) -> String {
     metadata
         .and_then(|metadata| {
@@ -185,16 +438,6 @@ fn request_id_from_metadata(metadata: Option<&TransportMetadata>, prefix: &str) 
 }
 
 async fn send_ordered_exec_event(exec_id: u64, event: exec_event::Event) -> Result<u64, ()> {
-    send_ordered_exec_event_with_id(exec_id, event, 0).await
-}
-
-/// Send an ordered exec event with an explicit exec_id field in the event.
-/// Used for PTY sessions where the client needs the exec_id for correlation.
-async fn send_ordered_exec_event_with_id(
-    exec_id: u64,
-    event: exec_event::Event,
-    event_exec_id: u64,
-) -> Result<u64, ()> {
     let Some(context) = lookup_exec_order_context(exec_id) else {
         return Err(());
     };
@@ -206,7 +449,7 @@ async fn send_ordered_exec_event_with_id(
             event: Some(event),
             sequence,
             request_id: context.request_id.clone(),
-            exec_id: event_exec_id,
+            exec_id: 0,
         }))
         .await
         .map_err(|_| ())?;
@@ -279,15 +522,17 @@ fn normalized_container_exec(
     working_dir: Option<&str>,
     user: Option<&str>,
     environment: &HashMap<String, String>,
+    ready_handshake: Option<(&str, &str)>,
 ) -> Result<ContainerExecProcessSpec, Status> {
     let environment = normalized_container_environment(environment)?;
-    let trampoline = crate::container_exec::prepare_trampoline(
+    let trampoline = crate::container_exec::prepare_trampoline_with_ready_socket(
         container_id,
         command,
         args,
         working_dir,
         user,
         environment.iter().any(|(key, _)| key == "SHELL"),
+        ready_handshake,
     )
     .map_err(|error| Status::invalid_argument(error.to_string()))?;
     Ok(ContainerExecProcessSpec {
@@ -296,7 +541,10 @@ fn normalized_container_exec(
     })
 }
 
-fn prepare_agent_exec(req: &ExecRequest) -> Result<PreparedAgentExec, Status> {
+fn prepare_agent_exec(
+    req: &ExecRequest,
+    ready_handshake: Option<(&str, &str)>,
+) -> Result<PreparedAgentExec, Status> {
     if let Some(target) = &req.container_target {
         let spec = normalized_container_exec(
             &target.container_id,
@@ -305,6 +553,7 @@ fn prepare_agent_exec(req: &ExecRequest) -> Result<PreparedAgentExec, Status> {
             (!req.working_dir.is_empty()).then_some(req.working_dir.as_str()),
             (!req.user.is_empty()).then_some(req.user.as_str()),
             &req.env,
+            ready_handshake,
         )?;
         return Ok(PreparedAgentExec {
             command: spec.trampoline.program,
@@ -343,6 +592,7 @@ fn prepare_oci_exec(req: &OciExecRequest) -> Result<ContainerExecProcessSpec, St
         (!req.working_dir.is_empty()).then_some(req.working_dir.as_str()),
         (!req.user.is_empty()).then_some(req.user.as_str()),
         &req.env,
+        None,
     )
 }
 
@@ -361,7 +611,30 @@ impl AgentServiceImpl {
     ) -> Result<Response<ReceiverStream<Result<ExecEvent, Status>>>, Status> {
         use tokio::io::AsyncReadExt;
 
-        let launch = prepare_agent_exec(&req)?;
+        #[cfg(target_os = "linux")]
+        let server_admission = if let Some(target) = req.container_target.as_ref() {
+            Some(acquire_shared_container_admission(&target.container_id).await?)
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let ready_listener = if req.container_target.is_some() {
+            Some(ContainerReadyListener::bind()?)
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let ready_endpoint = ready_listener
+            .as_ref()
+            .map(ContainerReadyListener::endpoint)
+            .transpose()?;
+        let launch = prepare_agent_exec(
+            &req,
+            #[cfg(target_os = "linux")]
+            ready_endpoint,
+            #[cfg(not(target_os = "linux"))]
+            None,
+        )?;
         let spawn_result = if let Some(ref username) = launch.spawn_user {
             crate::spawn_as_user(
                 username,
@@ -398,22 +671,82 @@ impl AgentServiceImpl {
             }
         };
 
-        info!(request_id = %request_id, command = %launch.command, args = ?launch.args, container_targeted = launch.container_targeted, "grpc: process spawned");
+        info!(request_id = %request_id, command = %launch.command, arg_count = launch.args.len(), container_targeted = launch.container_targeted, "grpc: process spawned");
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdin = child.stdin.take();
-        let exec_id = child.id().unwrap_or(0) as u64;
-
-        {
-            let mut table = self.state.process_table.lock().await;
-            table.insert(exec_id, child, stdin);
+        let spawned_pid = child.id().unwrap_or(0);
+        if spawned_pid == 0 {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(Status::internal("spawned exec has no process ID"));
         }
+        let exec_id = allocate_logical_exec_id()?;
+
+        #[cfg(target_os = "linux")]
+        let (ready_generation, process_identity) = if let Some(listener) = ready_listener {
+            let Some(target) = req.container_target.as_ref() else {
+                return Err(Status::internal("ready listener lost container target"));
+            };
+            let spawned_process =
+                SpawnedProcessIdentity::capture(spawned_pid).map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "cannot capture spawned container exec identity: {error}"
+                    ))
+                })?;
+            let container_id = target.container_id.clone();
+            let wait = tokio::spawn(async move {
+                let result = listener.wait(&spawned_process, &container_id).await;
+                drop(server_admission);
+                (result, spawned_process)
+            });
+            let (result, spawned_process) = wait
+                .await
+                .map_err(|error| Status::internal(format!("exec-ready task failed: {error}")))?;
+            match result {
+                Ok(generation) => (Some(generation), spawned_process.into_process_identity()),
+                Err(error) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    return Err(error);
+                }
+            }
+        } else {
+            (None, capture_signal_identity(spawned_pid))
+        };
+        #[cfg(not(target_os = "linux"))]
+        let process_identity = ProcessIdentity::from_pid(spawned_pid);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ExecEvent, Status>>(64);
-        register_exec_order_context(exec_id, ExecOrderContext::new(tx.clone(), request_id));
+        #[cfg(target_os = "linux")]
+        let initial_sequence = if let Some(generation) = ready_generation {
+            tx.send(Ok(ExecEvent {
+                event: Some(exec_event::Event::ContainerReady(ContainerExecReady {
+                    generation: Some(generation),
+                })),
+                sequence: 1,
+                request_id: request_id.clone(),
+                exec_id,
+            }))
+            .await
+            .map_err(|_| Status::cancelled("container exec stream closed before readiness"))?;
+            1
+        } else {
+            0
+        };
+        #[cfg(not(target_os = "linux"))]
+        let initial_sequence = 0;
 
         let process_table = self.state.process_table.clone();
+        {
+            let mut table = self.state.process_table.lock().await;
+            table.insert(exec_id, child, stdin, process_identity);
+        }
+        register_exec_order_context(
+            exec_id,
+            ExecOrderContext::with_initial_sequence(tx.clone(), request_id, initial_sequence),
+        );
 
         let stdout_handle = tokio::spawn(async move {
             if let Some(mut stdout) = stdout {
@@ -538,7 +871,30 @@ impl AgentServiceImpl {
             "grpc: pty exec request received"
         );
 
-        let launch = prepare_agent_exec(&req)?;
+        #[cfg(target_os = "linux")]
+        let server_admission = if let Some(target) = req.container_target.as_ref() {
+            Some(acquire_shared_container_admission(&target.container_id).await?)
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let ready_listener = if req.container_target.is_some() {
+            Some(ContainerReadyListener::bind()?)
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let ready_endpoint = ready_listener
+            .as_ref()
+            .map(ContainerReadyListener::endpoint)
+            .transpose()?;
+        let launch = prepare_agent_exec(
+            &req,
+            #[cfg(target_os = "linux")]
+            ready_endpoint,
+            #[cfg(not(target_os = "linux"))]
+            None,
+        )?;
         let rows = if req.term_rows == 0 {
             24
         } else {
@@ -602,17 +958,79 @@ impl AgentServiceImpl {
             warn!(command = %launch.command, error = %e, "grpc: pty exec spawn failed");
             Status::internal(format!("failed to spawn PTY process: {e}"))
         })?;
+        let mut pending_child = PendingPtyChild(Some(child));
         info!(request_id = %request_id, "grpc: PTY process spawned");
 
         // Drop slave — only the child uses it.
         drop(pair.slave);
 
-        let exec_id = child.process_id().unwrap_or(0) as u64;
+        let spawned_pid = pending_child.child_mut()?.process_id().unwrap_or(0);
+        if spawned_pid == 0 {
+            return Err(Status::internal("spawned PTY exec has no process ID"));
+        }
+        let exec_id = allocate_logical_exec_id()?;
         info!(
-            request_id = %request_id, exec_id, command = %launch.command,
-            args = ?launch.args, rows, cols, container_targeted = launch.container_targeted,
+            request_id = %request_id, exec_id, spawned_pid, command = %launch.command,
+            arg_count = launch.args.len(), rows, cols, container_targeted = launch.container_targeted,
             "grpc: pty process spawned"
         );
+
+        #[cfg(target_os = "linux")]
+        let (ready_generation, process_identity) = if let Some(listener) = ready_listener {
+            let Some(target) = req.container_target.as_ref() else {
+                return Err(Status::internal("ready listener lost container target"));
+            };
+            let spawned_process =
+                SpawnedProcessIdentity::capture(spawned_pid).map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "cannot capture spawned PTY container exec identity: {error}"
+                    ))
+                })?;
+            let container_id = target.container_id.clone();
+            let wait = tokio::spawn(async move {
+                let result = listener.wait(&spawned_process, &container_id).await;
+                drop(server_admission);
+                (result, spawned_process)
+            });
+            let (result, spawned_process) = wait
+                .await
+                .map_err(|error| Status::internal(format!("exec-ready task failed: {error}")))?;
+            match result {
+                Ok(generation) => (Some(generation), spawned_process.into_process_identity()),
+                Err(error) => {
+                    return Err(error);
+                }
+            }
+        } else {
+            (None, capture_signal_identity(spawned_pid))
+        };
+        #[cfg(not(target_os = "linux"))]
+        let process_identity = ProcessIdentity::from_pid(spawned_pid);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ExecEvent, Status>>(64);
+        // Container-targeted sessions use a typed generation proof as their
+        // first event. Ordinary guest PTY sessions retain the empty correlation
+        // frame for backwards compatibility.
+        #[cfg(target_os = "linux")]
+        let first_event = ready_generation.map_or_else(
+            || exec_event::Event::Stdout(Vec::new()),
+            |generation| {
+                exec_event::Event::ContainerReady(ContainerExecReady {
+                    generation: Some(generation),
+                })
+            },
+        );
+        #[cfg(not(target_os = "linux"))]
+        let first_event = exec_event::Event::Stdout(Vec::new());
+        info!(exec_id, "grpc: queueing initial PTY exec event");
+        tx.send(Ok(ExecEvent {
+            event: Some(first_event),
+            sequence: 1,
+            request_id: request_id.clone(),
+            exec_id,
+        }))
+        .await
+        .map_err(|_| Status::cancelled("exec stream closed before PTY readiness"))?;
 
         // Get reader (cloned handle) and writer from the master.
         let mut reader = pair
@@ -623,39 +1041,29 @@ impl AgentServiceImpl {
             .master
             .take_writer()
             .map_err(|e| Status::internal(format!("failed to take PTY writer: {e}")))?;
+        let master_handle = Arc::new(StdMutex::new(PtyMasterHandle {
+            writer,
+            master: pair.master,
+        }));
 
-        // Store master + writer for stdin_write and resize operations.
-        {
-            let mut handles = pty_handles().lock().unwrap_or_else(|p| p.into_inner());
-            handles.insert(
-                exec_id,
-                Arc::new(StdMutex::new(PtyMasterHandle {
-                    writer,
-                    master: pair.master,
-                })),
-            );
-        }
-
-        // Insert child into process table (no stdin pipe — we use PTY writer).
+        // Acquire the async table lock while PendingPtyChild still guarantees
+        // cancellation cleanup. After insertion, all remaining registration
+        // is synchronous until the watcher has been spawned.
         {
             let mut table = self.state.process_table.lock().await;
+            let child = pending_child.take()?;
             // portable-pty Child isn't tokio-compatible, so we wrap it in the
             // process table as a waitable entry below instead.
-            table.insert_pty(exec_id, child);
+            table.insert_pty(exec_id, child, process_identity);
         }
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ExecEvent, Status>>(64);
-        register_exec_order_context(exec_id, ExecOrderContext::new(tx.clone(), request_id));
-
-        // Send the first event with exec_id so the client can correlate.
-        info!(exec_id, "grpc: sending initial PTY exec event");
-        if let Err(()) =
-            send_ordered_exec_event_with_id(exec_id, exec_event::Event::Stdout(Vec::new()), exec_id)
-                .await
         {
-            warn!(exec_id, "grpc: failed to send initial pty exec event");
+            let mut handles = pty_handles().lock().unwrap_or_else(|p| p.into_inner());
+            handles.insert(exec_id, master_handle);
         }
-        info!(exec_id, "grpc: initial PTY exec event sent");
+        register_exec_order_context(
+            exec_id,
+            ExecOrderContext::with_initial_sequence(tx.clone(), request_id, 1),
+        );
 
         // Spawn blocking reader task. portable-pty gives us a synchronous Read,
         // so we read in a blocking thread and forward chunks as exec events.
@@ -1009,21 +1417,21 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         }
         let table = self.state.process_table.lock().await;
 
-        if let Some(entry) = table.get(req.exec_id) {
-            if let Some(pid) = entry.pid() {
+        match table.signal(req.exec_id, req.signal) {
+            Some(Ok(())) => {
                 info!(
                     exec_id = req.exec_id,
-                    pid,
                     signal = req.signal,
-                    "grpc: sending signal"
+                    "grpc: signal delivered to spawned process identity"
                 );
-                // SAFETY: kill is a standard POSIX function.
-                unsafe {
-                    libc::kill(pid, req.signal);
-                }
             }
-        } else {
-            warn!(exec_id = req.exec_id, "grpc: signal: process not found");
+            Some(Err(error)) => {
+                return Err(Status::failed_precondition(format!(
+                    "cannot signal exec {}: {error}",
+                    req.exec_id
+                )));
+            }
+            None => warn!(exec_id = req.exec_id, "grpc: signal: process not found"),
         }
 
         Ok(Response::new(SignalResponse {}))
@@ -1176,6 +1584,32 @@ const YOUKI_ROOT: &str = crate::container_exec::YOUKI_ROOT;
 pub struct OciServiceImpl;
 
 #[cfg(target_os = "linux")]
+async fn acquire_exclusive_container_admission(
+    container_id: &str,
+) -> Result<crate::container_exec::ContainerAdmissionGuard, Status> {
+    let container_id = container_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::container_exec::ContainerAdmissionGuard::exclusive(&container_id)
+    })
+    .await
+    .map_err(|error| Status::internal(format!("container admission task failed: {error}")))?
+    .map_err(|error| Status::failed_precondition(error.to_string()))
+}
+
+#[cfg(target_os = "linux")]
+async fn acquire_shared_container_admission(
+    container_id: &str,
+) -> Result<crate::container_exec::ContainerAdmissionGuard, Status> {
+    let container_id = container_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::container_exec::ContainerAdmissionGuard::shared(&container_id)
+    })
+    .await
+    .map_err(|error| Status::internal(format!("container admission task failed: {error}")))?
+    .map_err(|error| Status::failed_precondition(error.to_string()))
+}
+
+#[cfg(target_os = "linux")]
 #[tonic::async_trait]
 impl oci_service_server::OciService for OciServiceImpl {
     async fn create(
@@ -1183,6 +1617,7 @@ impl oci_service_server::OciService for OciServiceImpl {
         request: Request<OciCreateRequest>,
     ) -> Result<Response<OciCreateResponse>, Status> {
         let req = request.into_inner();
+        let _admission = acquire_exclusive_container_admission(&req.container_id).await?;
         let request_id = request_id_from_metadata(req.metadata.as_ref(), "oci-create");
         info!(
             request_id = %request_id,
@@ -1252,6 +1687,7 @@ impl oci_service_server::OciService for OciServiceImpl {
         request: Request<OciStartRequest>,
     ) -> Result<Response<OciStartResponse>, Status> {
         let req = request.into_inner();
+        let _admission = acquire_exclusive_container_admission(&req.container_id).await?;
         let request_id = request_id_from_metadata(req.metadata.as_ref(), "oci-start");
         info!(request_id = %request_id, container_id = %req.container_id, "oci: start");
 
@@ -1264,6 +1700,7 @@ impl oci_service_server::OciService for OciServiceImpl {
         request: Request<OciStateRequest>,
     ) -> Result<Response<OciStateResponse>, Status> {
         let req = request.into_inner();
+        let _admission = acquire_shared_container_admission(&req.container_id).await?;
         let request_id = request_id_from_metadata(req.metadata.as_ref(), "oci-state");
         debug!(request_id = %request_id, container_id = %req.container_id, "oci: state");
 
@@ -1285,6 +1722,9 @@ impl oci_service_server::OciService for OciServiceImpl {
         request: Request<OciExecRequest>,
     ) -> Result<Response<OciExecResponse>, Status> {
         let req = request.into_inner();
+        // Unary compatibility has no early-ready response. Retain shared guest
+        // admission for its complete bounded lifetime, including cancellation.
+        let _admission = acquire_shared_container_admission(&req.container_id).await?;
         let request_id = request_id_from_metadata(req.metadata.as_ref(), "oci-exec");
         info!(
             request_id = %request_id,
@@ -1331,6 +1771,7 @@ impl oci_service_server::OciService for OciServiceImpl {
         request: Request<OciKillRequest>,
     ) -> Result<Response<OciKillResponse>, Status> {
         let req = request.into_inner();
+        let _admission = acquire_exclusive_container_admission(&req.container_id).await?;
         let request_id = request_id_from_metadata(req.metadata.as_ref(), "oci-kill");
         info!(
             request_id = %request_id,
@@ -1348,6 +1789,7 @@ impl oci_service_server::OciService for OciServiceImpl {
         request: Request<OciDeleteRequest>,
     ) -> Result<Response<OciDeleteResponse>, Status> {
         let req = request.into_inner();
+        let _admission = acquire_exclusive_container_admission(&req.container_id).await?;
         let request_id = request_id_from_metadata(req.metadata.as_ref(), "oci-delete");
         info!(
             request_id = %request_id,
@@ -1889,6 +2331,47 @@ mod tests {
         NEXT_EXEC_ID.fetch_add(1, Ordering::Relaxed)
     }
 
+    #[test]
+    fn logical_exec_ids_are_monotonic_and_never_wrap() {
+        let next = AtomicU64::new(41);
+        assert_eq!(allocate_logical_exec_id_from(&next), Some(41));
+        assert_eq!(allocate_logical_exec_id_from(&next), Some(42));
+
+        let exhausted = AtomicU64::new(u64::MAX);
+        assert_eq!(allocate_logical_exec_id_from(&exhausted), None);
+        assert_eq!(exhausted.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn ready_challenge_hex_encoding_is_fixed_width() {
+        let mut bytes = [0_u8; 32];
+        bytes[0] = 0x01;
+        bytes[31] = 0xfe;
+        let encoded = hex_ready_challenge(bytes);
+        assert_eq!(encoded.len(), 64);
+        assert!(encoded.starts_with("01"));
+        assert!(encoded.ends_with("fe"));
+        assert!(encoded.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn one_ready_deadline_bounds_a_connected_stalled_reader() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (mut reader, _stalled_writer) = tokio::io::duplex(8);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(25);
+        let result = enforce_ready_deadline(deadline, async move {
+            let mut bytes = Vec::new();
+            reader
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?;
+            Ok(bytes)
+        })
+        .await;
+        assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
+    }
+
     fn exec_request(container_id: Option<&str>, allocate_pty: bool) -> ExecRequest {
         ExecRequest {
             command: "/bin/printf".to_string(),
@@ -1910,7 +2393,7 @@ mod tests {
 
     #[test]
     fn ordinary_guest_exec_remains_direct_and_does_not_select_trampoline() {
-        let prepared = prepare_agent_exec(&exec_request(None, false)).unwrap();
+        let prepared = prepare_agent_exec(&exec_request(None, false), None).unwrap();
         assert!(!prepared.container_targeted);
         assert_eq!(prepared.command, "/bin/printf");
         assert_eq!(prepared.args, ["%s", "$HOME;not-a-shell"]);
@@ -1927,8 +2410,12 @@ mod tests {
 
     #[test]
     fn pipe_and_pty_container_requests_route_through_one_trampoline() {
-        let pipe = prepare_agent_exec(&exec_request(Some("web"), false)).unwrap();
-        let pty = prepare_agent_exec(&exec_request(Some("web"), true)).unwrap();
+        let ready_handshake = Some((
+            "/run/vz-agent-exec/test.sock",
+            "abababababababababababababababababababababababababababababababab",
+        ));
+        let pipe = prepare_agent_exec(&exec_request(Some("web"), false), ready_handshake).unwrap();
+        let pty = prepare_agent_exec(&exec_request(Some("web"), true), ready_handshake).unwrap();
         assert!(pipe.container_targeted);
         assert_eq!(pipe, pty);
         assert_eq!(pipe.command, "/proc/self/exe");
@@ -1954,7 +2441,7 @@ mod tests {
 
     #[test]
     fn unary_oci_exec_uses_the_same_trampoline_and_preserves_argv() {
-        let agent = prepare_agent_exec(&exec_request(Some("web"), false)).unwrap();
+        let agent = prepare_agent_exec(&exec_request(Some("web"), false), None).unwrap();
         let unary = prepare_oci_exec(&OciExecRequest {
             container_id: "web".to_string(),
             command: "/bin/printf".to_string(),
@@ -1982,9 +2469,9 @@ mod tests {
             .insert("PATH".to_string(), "/custom/bin".to_string());
         request.env.insert("Z_LAST".to_string(), "last".to_string());
 
-        let pipe = prepare_agent_exec(&request).unwrap();
+        let pipe = prepare_agent_exec(&request, None).unwrap();
         request.allocate_pty = true;
-        let pty = prepare_agent_exec(&request).unwrap();
+        let pty = prepare_agent_exec(&request, None).unwrap();
         let unary = prepare_oci_exec(&OciExecRequest {
             container_id: "web".to_string(),
             command: request.command,
@@ -2089,6 +2576,32 @@ mod tests {
         assert!(sent.is_err());
         let control = mark_ordered_control(exec_id, "signal").await;
         assert!(control.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_order_cleanup_cannot_remove_a_new_logical_exec_context() {
+        let old_exec_id = test_exec_id();
+        let new_exec_id = test_exec_id();
+        let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
+        let (new_tx, mut new_rx) = tokio::sync::mpsc::channel(1);
+        register_exec_order_context(
+            old_exec_id,
+            ExecOrderContext::new(old_tx, "old".to_string()),
+        );
+        register_exec_order_context(
+            new_exec_id,
+            ExecOrderContext::new(new_tx, "new".to_string()),
+        );
+
+        remove_exec_order_context(old_exec_id);
+        assert!(
+            send_ordered_exec_event(new_exec_id, exec_event::Event::ExitCode(0))
+                .await
+                .is_ok()
+        );
+        let event = new_rx.recv().await.unwrap().unwrap();
+        assert_eq!(event.request_id, "new");
+        remove_exec_order_context(new_exec_id);
     }
 
     #[test]

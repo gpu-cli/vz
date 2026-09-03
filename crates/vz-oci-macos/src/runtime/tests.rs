@@ -1,11 +1,11 @@
 #![allow(clippy::unwrap_used)]
 
 use std::env;
-use std::io;
 
 use super::stack_vm::{
-    activation_error_with_rollback, hosts_write_command, require_running_pid,
-    require_successful_hosts_write,
+    activation_error_with_rollback, clear_recovery_route_last, commit_stack_cleanup_batch,
+    hosts_write_command, publish_recovery_route_first, require_running_pid,
+    require_successful_hosts_write, shutdown_container_cleanup_transition,
 };
 use super::*;
 use vz_linux::KernelVersion;
@@ -173,6 +173,469 @@ fn hosts_write_passes_user_data_as_an_opaque_positional_argument() {
 }
 
 #[test]
+fn guest_overlay_teardown_is_verified_ordered_and_uses_opaque_id() {
+    let container_id = "stable-name;touch /tmp/not-executed";
+    let (command, args) = super::bundle::guest_overlay_teardown_command(container_id);
+
+    assert_eq!(command, "/bin/busybox");
+    assert_eq!(args[0], "sh");
+    assert_eq!(args[1], "-c");
+    assert_eq!(args[3], "vz-overlay-teardown");
+    assert_eq!(args[4], container_id);
+    assert!(!args[2].contains(container_id));
+    let merged_unmount = args[2].find("umount \"$merged\"").unwrap();
+    let base_unmount = args[2].find("umount \"$base\"").unwrap();
+    let remove = args[2].find("rm -rf \"$base\"").unwrap();
+    let verify = args[2].find("test ! -e \"$base\"").unwrap();
+    assert!(merged_unmount < base_unmount);
+    assert!(base_unmount < remove);
+    assert!(remove < verify);
+}
+
+#[test]
+fn partial_overlay_setup_failure_aggregates_cleanup_failure() {
+    let setup = OciError::InvalidConfig("mount overlay failed".to_string());
+    let cleanup = OciError::InvalidConfig("unmount tmpfs failed".to_string());
+    let error = super::bundle::overlay_setup_error_with_cleanup(setup, Err(cleanup));
+    let message = error.to_string();
+    assert!(message.contains("mount overlay failed"));
+    assert!(message.contains("partial-overlay cleanup also failed"));
+    assert!(message.contains("unmount tmpfs failed"));
+}
+
+#[tokio::test]
+async fn overlay_cleanup_pending_marker_is_generation_scoped() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("overlay-cleanup-pending"),
+        ..RuntimeConfig::default()
+    });
+    let first = ContainerGeneration(7);
+    let replacement = ContainerGeneration(8);
+
+    runtime.mark_overlay_cleanup_pending("stable-name", first);
+    assert!(runtime.overlay_cleanup_is_pending("stable-name", first));
+    assert!(!runtime.overlay_cleanup_is_pending("stable-name", replacement));
+    assert_eq!(
+        runtime
+            .lifecycle_diagnostics()
+            .await
+            .unwrap()
+            .overlay_cleanup_pending,
+        1
+    );
+    runtime.clear_overlay_cleanup_pending("stable-name");
+    assert!(!runtime.overlay_cleanup_is_pending("stable-name", first));
+}
+
+#[tokio::test]
+async fn route_first_publication_and_route_last_clear_survive_cancellation() {
+    let routes = Arc::new(Mutex::new(HashMap::<String, String>::new()));
+    let handles = Arc::new(Mutex::new(HashMap::<String, String>::new()));
+    let (published, published_rx) = oneshot::channel();
+    let task_routes = Arc::clone(&routes);
+    let task_handles = Arc::clone(&handles);
+    let publish = tokio::spawn(async move {
+        publish_recovery_route_first(
+            &task_routes,
+            &task_handles,
+            "stack",
+            "container",
+            &"vm".to_string(),
+            async move {
+                let _ = published.send(());
+                std::future::pending::<()>().await;
+            },
+        )
+        .await;
+    });
+    published_rx.await.unwrap();
+    publish.abort();
+    let _ = publish.await;
+    assert_eq!(
+        routes.lock().await.get("container").map(String::as_str),
+        Some("stack")
+    );
+    assert!(!handles.lock().await.contains_key("container"));
+
+    let (overlay_starting, overlay_starting_rx) = oneshot::channel();
+    let task_routes = Arc::clone(&routes);
+    let task_handles = Arc::clone(&handles);
+    let overlay_setup = tokio::spawn(async move {
+        publish_recovery_route_first(
+            &task_routes,
+            &task_handles,
+            "stack",
+            "container",
+            &"vm".to_string(),
+            std::future::ready(()),
+        )
+        .await;
+        let _ = overlay_starting.send(());
+        std::future::pending::<()>().await;
+    });
+    overlay_starting_rx.await.unwrap();
+    overlay_setup.abort();
+    let _ = overlay_setup.await;
+    assert_eq!(
+        handles.lock().await.get("container").map(String::as_str),
+        Some("vm")
+    );
+    assert_eq!(
+        routes.lock().await.get("container").map(String::as_str),
+        Some("stack")
+    );
+    let (handle_cleared, handle_cleared_rx) = oneshot::channel();
+    let task_routes = Arc::clone(&routes);
+    let task_handles = Arc::clone(&handles);
+    let clear = tokio::spawn(async move {
+        clear_recovery_route_last(&task_routes, &task_handles, "container", async move {
+            let _ = handle_cleared.send(());
+            std::future::pending::<()>().await;
+        })
+        .await;
+    });
+    handle_cleared_rx.await.unwrap();
+    clear.abort();
+    let _ = clear.await;
+    assert!(!handles.lock().await.contains_key("container"));
+    assert!(routes.lock().await.contains_key("container"));
+
+    clear_recovery_route_last(&routes, &handles, "container", std::future::ready(())).await;
+    assert!(!routes.lock().await.contains_key("container"));
+}
+
+#[tokio::test]
+async fn cleanup_failures_retain_recovery_state_and_successful_retry_clears_it() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("shutdown-overlay-transition"),
+        ..RuntimeConfig::default()
+    });
+    let lease = runtime
+        .container_store
+        .try_acquire_container_write_lease("stable-name")
+        .unwrap();
+    let generation = runtime
+        .container_store
+        .reserve_generation_with_write_lease("stable-name", &lease)
+        .unwrap();
+    runtime
+        .container_store
+        .upsert_if_generation(
+            ContainerInfo {
+                id: "stable-name".to_string(),
+                image: "alpine:latest".to_string(),
+                image_id: "sha256:first".to_string(),
+                status: ContainerStatus::Running,
+                created_unix_secs: 1,
+                started_unix_secs: Some(2),
+                stopped_unix_secs: None,
+                rootfs_path: None,
+                host_pid: Some(process::id()),
+            },
+            generation,
+        )
+        .unwrap();
+
+    let routes = Mutex::new(HashMap::<String, String>::new());
+    let handles = Mutex::new(HashMap::<String, String>::new());
+    publish_recovery_route_first(
+        &routes,
+        &handles,
+        "stack",
+        "stable-name",
+        &"vm".to_string(),
+        std::future::ready(()),
+    )
+    .await;
+
+    let delete_count = std::sync::atomic::AtomicUsize::new(0);
+    let overlay_count = std::sync::atomic::AtomicUsize::new(0);
+
+    let delete_failure = shutdown_container_cleanup_transition(
+        &runtime,
+        "stable-name",
+        generation,
+        || async {
+            delete_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(OciError::InvalidConfig(
+                "injected delete failure".to_string(),
+            ))
+        },
+        || async {
+            overlay_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(delete_failure.to_string().contains("OCI delete failed"));
+    assert_eq!(delete_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(overlay_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(routes.lock().await.contains_key("stable-name"));
+    assert!(handles.lock().await.contains_key("stable-name"));
+    assert!(!runtime.overlay_cleanup_is_pending("stable-name", generation));
+    assert!(matches!(
+        runtime
+            .container_store
+            .find("stable-name")
+            .unwrap()
+            .unwrap()
+            .status,
+        ContainerStatus::Running
+    ));
+
+    let overlay_failure = shutdown_container_cleanup_transition(
+        &runtime,
+        "stable-name",
+        generation,
+        || async {
+            delete_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+        || async {
+            overlay_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(OciError::InvalidConfig(
+                "injected overlay failure".to_string(),
+            ))
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        overlay_failure
+            .to_string()
+            .contains("overlay teardown failed")
+    );
+    assert_eq!(delete_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(overlay_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let persisted = runtime
+        .container_store
+        .find("stable-name")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        persisted.status,
+        ContainerStatus::Stopped { exit_code: 0 }
+    ));
+    assert_eq!(persisted.host_pid, None);
+    assert!(runtime.overlay_cleanup_is_pending("stable-name", generation));
+    assert!(routes.lock().await.contains_key("stable-name"));
+    assert!(handles.lock().await.contains_key("stable-name"));
+
+    shutdown_container_cleanup_transition(
+        &runtime,
+        "stable-name",
+        generation,
+        || async {
+            delete_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+        || async {
+            overlay_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        delete_count.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "retry must skip OCI delete after the durable pending marker"
+    );
+    assert_eq!(overlay_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(runtime.overlay_cleanup_is_pending("stable-name", generation));
+    assert!(routes.lock().await.contains_key("stable-name"));
+    assert!(handles.lock().await.contains_key("stable-name"));
+    commit_stack_cleanup_batch(&runtime, &routes, &handles, &["stable-name".to_string()]).await;
+    assert!(!runtime.overlay_cleanup_is_pending("stable-name", generation));
+    assert!(!routes.lock().await.contains_key("stable-name"));
+    assert!(!handles.lock().await.contains_key("stable-name"));
+}
+
+#[tokio::test]
+async fn stack_cleanup_batch_retains_earlier_success_until_later_failure_is_retried() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("shutdown-overlay-multi-container"),
+        ..RuntimeConfig::default()
+    });
+    let mut leases = Vec::new();
+    let mut generations = HashMap::new();
+    for (index, container_id) in ["container-a", "container-b"].into_iter().enumerate() {
+        let lease = runtime
+            .container_store
+            .try_acquire_container_write_lease(container_id)
+            .unwrap();
+        let generation = runtime
+            .container_store
+            .reserve_generation_with_write_lease(container_id, &lease)
+            .unwrap();
+        runtime
+            .container_store
+            .upsert_if_generation(
+                ContainerInfo {
+                    id: container_id.to_string(),
+                    image: "alpine:latest".to_string(),
+                    image_id: format!("sha256:{index}"),
+                    status: ContainerStatus::Running,
+                    created_unix_secs: 1,
+                    started_unix_secs: Some(2),
+                    stopped_unix_secs: None,
+                    rootfs_path: None,
+                    host_pid: Some(process::id()),
+                },
+                generation,
+            )
+            .unwrap();
+        runtime.active_lifecycle.lock().await.insert(
+            container_id.to_string(),
+            ActiveContainerLifecycle {
+                class: ContainerLifecycleClass::Service,
+                auto_remove: false,
+            },
+        );
+        runtime.setup_restored_containers.lock().await.insert(
+            container_id.to_string(),
+            SetupRestoreIdentity {
+                generation,
+                commit_ref: format!("commit-{index}"),
+            },
+        );
+        generations.insert(container_id, generation);
+        leases.push(lease);
+    }
+
+    let routes = Mutex::new(HashMap::<String, String>::new());
+    let handles = Mutex::new(HashMap::<String, String>::new());
+    for container_id in ["container-a", "container-b"] {
+        publish_recovery_route_first(
+            &routes,
+            &handles,
+            "stack",
+            container_id,
+            &format!("vm-{container_id}"),
+            std::future::ready(()),
+        )
+        .await;
+    }
+
+    let delete_a = std::sync::atomic::AtomicUsize::new(0);
+    let delete_b = std::sync::atomic::AtomicUsize::new(0);
+    let overlay_a = std::sync::atomic::AtomicUsize::new(0);
+    let overlay_b = std::sync::atomic::AtomicUsize::new(0);
+    let generation_a = generations["container-a"];
+    let generation_b = generations["container-b"];
+
+    shutdown_container_cleanup_transition(
+        &runtime,
+        "container-a",
+        generation_a,
+        || async {
+            delete_a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+        || async {
+            overlay_a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    let failure = shutdown_container_cleanup_transition(
+        &runtime,
+        "container-b",
+        generation_b,
+        || async {
+            delete_b.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+        || async {
+            overlay_b.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(OciError::InvalidConfig(
+                "injected container-b overlay failure".to_string(),
+            ))
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(failure.to_string().contains("overlay teardown failed"));
+
+    for container_id in ["container-a", "container-b"] {
+        assert!(routes.lock().await.contains_key(container_id));
+        assert!(handles.lock().await.contains_key(container_id));
+        assert!(runtime.overlay_cleanup_is_pending(container_id, generations[container_id]));
+    }
+    let retained = runtime.lifecycle_diagnostics().await.unwrap();
+    assert_eq!(retained.active_lifecycles, 2);
+    assert_eq!(retained.setup_restore_entries, 2);
+    assert_eq!(retained.overlay_cleanup_pending, 2);
+
+    shutdown_container_cleanup_transition(
+        &runtime,
+        "container-a",
+        generation_a,
+        || async {
+            delete_a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+        || async {
+            overlay_a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    shutdown_container_cleanup_transition(
+        &runtime,
+        "container-b",
+        generation_b,
+        || async {
+            delete_b.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+        || async {
+            overlay_b.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(delete_a.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(delete_b.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(overlay_a.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(overlay_b.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    commit_stack_cleanup_batch(
+        &runtime,
+        &routes,
+        &handles,
+        &["container-a".to_string(), "container-b".to_string()],
+    )
+    .await;
+    assert!(routes.lock().await.is_empty());
+    assert!(handles.lock().await.is_empty());
+    let cleared = runtime.lifecycle_diagnostics().await.unwrap();
+    assert_eq!(cleared.vm_handles, 0);
+    assert_eq!(cleared.container_routes, 0);
+    assert_eq!(cleared.exec_bindings, 0);
+    assert_eq!(cleared.active_lifecycles, 0);
+    assert_eq!(cleared.exec_sessions, 0);
+    assert_eq!(cleared.setup_restore_entries, 0);
+    assert_eq!(cleared.overlay_cleanup_pending, 0);
+    for container_id in ["container-a", "container-b"] {
+        assert!(matches!(
+            runtime
+                .container_store
+                .find(container_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            ContainerStatus::Stopped { exit_code: 0 }
+        ));
+    }
+    drop(leases);
+}
+
+#[test]
 fn macos_runtime_container_exec_adapters_never_construct_namespace_argv() {
     let exec_source = include_str!("exec.rs");
     let lifecycle_source = include_str!("oci_lifecycle.rs");
@@ -188,8 +651,8 @@ fn macos_runtime_container_exec_adapters_never_construct_namespace_argv() {
             "{name} adapter must send container identity and raw argv to the guest"
         );
     }
-    assert!(exec_source.contains("exec_container_stream_with_options"));
-    assert!(exec_source.contains("exec_container_interactive"));
+    assert!(exec_source.contains("exec_container_stream_ready_with_options"));
+    assert!(exec_source.contains("exec_container_interactive_ready"));
     assert!(exec_source.contains("vm.oci_exec("));
     assert!(exec_source.matches("id.to_string(),").count() >= 3);
     assert!(exec_source.matches("command").count() >= 3);
@@ -291,6 +754,509 @@ async fn activation_guard_proves_the_same_stack_lock_is_held() {
     assert!(same_stack.try_lock().is_ok());
 }
 
+#[tokio::test]
+async fn caller_selected_id_is_serialized_and_duplicate_is_rejected() {
+    let data_dir = unique_temp_dir("container-generation-lock");
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: data_dir.clone(),
+        ..RuntimeConfig::default()
+    });
+    let mut first_run = RunConfig {
+        container_id: Some("fixed-id".to_string()),
+        ..RunConfig::default()
+    };
+    let first = runtime
+        .begin_container_create(&mut first_run, None)
+        .await
+        .unwrap();
+    runtime
+        .persist_owned(
+            &first,
+            ContainerInfo {
+                id: "fixed-id".to_string(),
+                image: "alpine:latest".to_string(),
+                image_id: "sha256:first".to_string(),
+                status: ContainerStatus::Created,
+                created_unix_secs: 1,
+                started_unix_secs: None,
+                stopped_unix_secs: None,
+                rootfs_path: None,
+                host_pid: None,
+            },
+        )
+        .unwrap();
+
+    let waiter_runtime = Runtime::new(RuntimeConfig {
+        data_dir,
+        ..RuntimeConfig::default()
+    });
+    let duplicate = tokio::time::timeout(std::time::Duration::from_millis(100), async move {
+        let mut run = RunConfig {
+            container_id: Some("fixed-id".to_string()),
+            ..RunConfig::default()
+        };
+        waiter_runtime.begin_container_create(&mut run, None).await
+    })
+    .await
+    .expect("duplicate create admission must fail without waiting for the owner");
+    let error = match duplicate {
+        Ok(_) => panic!("duplicate generation unexpectedly reserved"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        OciError::ContainerAlreadyExists { ref id } if id == "fixed-id"
+    ));
+
+    drop(first);
+    let mut stopped_duplicate = RunConfig {
+        container_id: Some("fixed-id".to_string()),
+        ..RunConfig::default()
+    };
+    let error = match runtime
+        .begin_container_create(&mut stopped_duplicate, None)
+        .await
+    {
+        Ok(_) => panic!("duplicate generation unexpectedly reserved"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("already exists"));
+}
+
+#[tokio::test]
+async fn second_runtime_stop_remove_waits_for_cross_process_id_writer() {
+    let data_dir = unique_temp_dir("cross-runtime-waiting-writer");
+    let owner = Runtime::new(RuntimeConfig {
+        data_dir: data_dir.clone(),
+        ..RuntimeConfig::default()
+    });
+    let contender = Runtime::new(RuntimeConfig {
+        data_dir,
+        ..RuntimeConfig::default()
+    });
+    let mut run = RunConfig {
+        container_id: Some("stable-name".to_string()),
+        ..RunConfig::default()
+    };
+    let transaction = owner.begin_container_create(&mut run, None).await.unwrap();
+    owner
+        .persist_owned(
+            &transaction,
+            ContainerInfo {
+                id: "stable-name".to_string(),
+                image: "alpine:latest".to_string(),
+                image_id: "sha256:first".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 0 },
+                created_unix_secs: 1,
+                started_unix_secs: None,
+                stopped_unix_secs: Some(2),
+                rootfs_path: None,
+                host_pid: None,
+            },
+        )
+        .unwrap();
+
+    let waiter = tokio::spawn(async move { contender.remove_container("stable-name").await });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+    drop(transaction);
+    waiter.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn second_runtime_writer_waits_for_cross_process_exec_admission() {
+    let data_dir = unique_temp_dir("cross-runtime-read-admission");
+    let reader = Runtime::new(RuntimeConfig {
+        data_dir: data_dir.clone(),
+        ..RuntimeConfig::default()
+    });
+    let writer = Runtime::new(RuntimeConfig {
+        data_dir,
+        ..RuntimeConfig::default()
+    });
+    let mut run = RunConfig {
+        container_id: Some("stable-name".to_string()),
+        ..RunConfig::default()
+    };
+    let transaction = reader.begin_container_create(&mut run, None).await.unwrap();
+    reader
+        .persist_owned(
+            &transaction,
+            ContainerInfo {
+                id: "stable-name".to_string(),
+                image: "alpine:latest".to_string(),
+                image_id: "sha256:first".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 0 },
+                created_unix_secs: 1,
+                started_unix_secs: None,
+                stopped_unix_secs: Some(2),
+                rootfs_path: None,
+                host_pid: None,
+            },
+        )
+        .unwrap();
+    drop(transaction);
+    let admission = reader
+        .acquire_container_read_admission("stable-name")
+        .await
+        .unwrap();
+    let waiter = tokio::spawn(async move { writer.begin_existing_container("stable-name").await });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+    drop(admission);
+    assert!(waiter.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn lifecycle_observer_reports_stop_request_before_writer_admission() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("lifecycle-observer-stop-order"),
+        ..RuntimeConfig::default()
+    });
+    let mut run = RunConfig {
+        container_id: Some("stable-name".to_string()),
+        ..RunConfig::default()
+    };
+    let transaction = runtime
+        .begin_container_create(&mut run, None)
+        .await
+        .unwrap();
+    runtime
+        .persist_owned(
+            &transaction,
+            ContainerInfo {
+                id: "stable-name".to_string(),
+                image: "alpine:latest".to_string(),
+                image_id: "sha256:first".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 0 },
+                created_unix_secs: 1,
+                started_unix_secs: None,
+                stopped_unix_secs: Some(2),
+                rootfs_path: None,
+                host_pid: None,
+            },
+        )
+        .unwrap();
+    drop(transaction);
+
+    let read_admission = runtime
+        .acquire_container_read_admission("stable-name")
+        .await
+        .unwrap();
+    let mut observer = runtime.install_lifecycle_observer();
+    let stopping_runtime = runtime.clone();
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            let stop = tokio::task::spawn_local(async move {
+                stopping_runtime
+                    .stop_container("stable-name", true, None, None)
+                    .await
+            });
+            let requested = observer.recv().await.unwrap();
+            assert_eq!(
+                requested.kind(),
+                RuntimeLifecycleAdmissionKind::StopWriterRequested
+            );
+            requested.resume();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), observer.recv())
+                    .await
+                    .is_err(),
+                "writer admission was reported while a read lease was held"
+            );
+            drop(read_admission);
+            let acquired = observer.recv().await.unwrap();
+            assert_eq!(
+                acquired.kind(),
+                RuntimeLifecycleAdmissionKind::StopWriterAcquired
+            );
+            acquired.resume();
+            stop.await.unwrap().unwrap();
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn explicit_remove_allows_same_name_with_higher_generation() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("container-generation-recreate"),
+        ..RuntimeConfig::default()
+    });
+    let mut first_run = RunConfig {
+        container_id: Some("stable-name".to_string()),
+        ..RunConfig::default()
+    };
+    let first = runtime
+        .begin_container_create(&mut first_run, None)
+        .await
+        .unwrap();
+    let first_generation = first.generation();
+    runtime
+        .persist_owned(
+            &first,
+            ContainerInfo {
+                id: "stable-name".to_string(),
+                image: "alpine:latest".to_string(),
+                image_id: "sha256:first".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 0 },
+                created_unix_secs: 1,
+                started_unix_secs: Some(2),
+                stopped_unix_secs: Some(3),
+                rootfs_path: None,
+                host_pid: None,
+            },
+        )
+        .unwrap();
+    drop(first);
+
+    runtime.remove_container("stable-name").await.unwrap();
+    let mut second_run = RunConfig {
+        container_id: Some("stable-name".to_string()),
+        ..RunConfig::default()
+    };
+    let second = runtime
+        .begin_container_create(&mut second_run, None)
+        .await
+        .unwrap();
+    assert!(second.generation().0 > first_generation.0);
+}
+
+#[tokio::test]
+async fn cancelled_rootfs_waiter_cleans_before_releasing_generation() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("rootfs-cancelled-waiter"),
+        ..RuntimeConfig::default()
+    });
+    let mut run = RunConfig {
+        container_id: Some("stable-name".to_string()),
+        ..RunConfig::default()
+    };
+    let mut transaction = runtime
+        .begin_container_create(&mut run, None)
+        .await
+        .unwrap();
+    let generation = transaction.generation();
+    let rootfs = runtime.data_dir().join("rootfs/stable-name");
+    fs::create_dir_all(&rootfs).unwrap();
+    fs::write(rootfs.join("assembled"), b"old generation").unwrap();
+
+    let returned = RootfsAssemblyReturn {
+        lease: Some(transaction.take_lease()),
+        result: Some(Ok(rootfs.clone())),
+        container_store: runtime.container_store.clone(),
+        container_id: "stable-name".to_string(),
+        generation,
+    };
+    drop(returned);
+    assert!(!rootfs.exists());
+
+    let mut retry = RunConfig {
+        container_id: Some("stable-name".to_string()),
+        ..RunConfig::default()
+    };
+    let replacement = runtime
+        .begin_container_create(&mut retry, None)
+        .await
+        .unwrap();
+    assert!(replacement.generation().0 > generation.0);
+}
+
+#[test]
+fn startup_orphan_cleanup_preserves_reserved_generation_writer() {
+    let data_dir = unique_temp_dir("reserved-rootfs-startup-cleanup");
+    let store = ContainerStore::new(data_dir.clone());
+    let generation = store.reserve_generation("stable-name").unwrap();
+    let rootfs = data_dir.join("rootfs/stable-name");
+    fs::create_dir_all(&rootfs).unwrap();
+    fs::write(rootfs.join("partial"), b"active generation").unwrap();
+
+    let _runtime = Runtime::new(RuntimeConfig {
+        data_dir,
+        ..RuntimeConfig::default()
+    });
+    assert!(rootfs.exists());
+    assert!(
+        store
+            .release_generation_if_absent("stable-name", generation)
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn setup_restore_identity_is_generation_and_commit_scoped() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("setup-restore-generation"),
+        ..RuntimeConfig::default()
+    });
+    let mut run = RunConfig {
+        container_id: Some("stable-name".to_string()),
+        ..RunConfig::default()
+    };
+    let transaction = runtime
+        .begin_container_create(&mut run, None)
+        .await
+        .unwrap();
+    runtime.setup_restored_containers.lock().await.insert(
+        "stable-name".to_string(),
+        SetupRestoreIdentity {
+            generation: transaction.generation(),
+            commit_ref: "commit-a".to_string(),
+        },
+    );
+    assert!(runtime.was_setup_restored("stable-name", "commit-a").await);
+    assert!(!runtime.was_setup_restored("stable-name", "commit-b").await);
+    drop(transaction);
+
+    let mut replacement = RunConfig {
+        container_id: Some("stable-name".to_string()),
+        ..RunConfig::default()
+    };
+    let _replacement = runtime
+        .begin_container_create(&mut replacement, None)
+        .await
+        .unwrap();
+    assert!(!runtime.was_setup_restored("stable-name", "commit-a").await);
+}
+
+#[tokio::test]
+async fn lifecycle_diagnostics_reports_reservations_and_map_counts() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("lifecycle-diagnostics"),
+        ..RuntimeConfig::default()
+    });
+    let mut run = RunConfig {
+        container_id: Some("stable-name".to_string()),
+        ..RunConfig::default()
+    };
+    let transaction = runtime
+        .begin_container_create(&mut run, None)
+        .await
+        .unwrap();
+    let active = runtime.lifecycle_diagnostics().await.unwrap();
+    assert_eq!(active.container_lock_slots, 1);
+    assert_eq!(active.vm_handles, 0);
+    assert_eq!(active.exec_bindings, 0);
+    assert_eq!(active.active_lifecycles, 0);
+    assert!(
+        active
+            .generations
+            .iter()
+            .any(|generation| { generation.container_id == "stable-name" && generation.reserved })
+    );
+    drop(transaction);
+    let released = runtime.lifecycle_diagnostics().await.unwrap();
+    assert!(
+        released
+            .generations
+            .iter()
+            .any(|generation| { generation.container_id == "stable-name" && !generation.reserved })
+    );
+}
+
+#[test]
+fn readiness_event_pairs_host_generation_with_complete_guest_identity() {
+    let identity = |device, inode| vz_linux::KernelObjectIdentity { device, inode };
+    let ready = container_ready_generation(
+        "stable-name",
+        ContainerGeneration(17),
+        vz_linux::ContainerGeneration {
+            container_id: "stable-name".to_string(),
+            init_pid: 42,
+            init_start_time: 9001,
+            cgroup_path: "/vz/stable-name".to_string(),
+            cgroup: Some(identity(1, 2)),
+            namespaces: Some(vz_linux::ContainerNamespaceIdentity {
+                mount: Some(identity(3, 4)),
+                network: Some(identity(5, 6)),
+                pid: Some(identity(7, 8)),
+                ipc: Some(identity(9, 10)),
+                uts: Some(identity(11, 12)),
+            }),
+            root: Some(identity(13, 14)),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(ready.lifecycle_generation, 17);
+    assert_eq!(ready.container_id, "stable-name");
+    assert_eq!(ready.init_pid, 42);
+    assert_eq!(
+        ready.cgroup,
+        KernelObjectIdentity {
+            device: 1,
+            inode: 2
+        }
+    );
+    assert_eq!(
+        ready.namespaces.pid,
+        KernelObjectIdentity {
+            device: 7,
+            inode: 8
+        }
+    );
+    assert_eq!(
+        ready.root,
+        KernelObjectIdentity {
+            device: 13,
+            inode: 14
+        }
+    );
+}
+
+#[test]
+fn readiness_rejects_guest_container_id_mismatch() {
+    let error = container_ready_generation(
+        "requested",
+        ContainerGeneration(1),
+        vz_linux::ContainerGeneration {
+            container_id: "different".to_string(),
+            ..vz_linux::ContainerGeneration::default()
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("identity mismatch"));
+}
+
+#[tokio::test]
+async fn stack_lifecycle_gate_precedes_container_generation_gate() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("stack-generation-order"),
+        ..RuntimeConfig::default()
+    });
+    let stack_write = runtime
+        .stack_lifecycle_lock("stack-a")
+        .await
+        .write_owned()
+        .await;
+    let waiter_runtime = runtime.clone();
+    let waiter = tokio::spawn(async move {
+        let mut run = RunConfig {
+            container_id: Some("service-a".to_string()),
+            ..RunConfig::default()
+        };
+        waiter_runtime
+            .begin_container_create(&mut run, Some("stack-a"))
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter.is_finished(),
+        "create must wait behind stack shutdown/boot"
+    );
+
+    let mut other_run = RunConfig {
+        container_id: Some("service-b".to_string()),
+        ..RunConfig::default()
+    };
+    let other = runtime
+        .begin_container_create(&mut other_run, Some("stack-b"))
+        .await
+        .unwrap();
+    drop(other);
+    drop(stack_write);
+    assert!(waiter.await.unwrap().is_ok());
+}
+
 #[test]
 fn ensure_checkpoint_class_supported_rejects_vm_full_without_capability() {
     let runtime = Runtime::new(RuntimeConfig {
@@ -384,10 +1350,10 @@ async fn runtime_remove_container_removes_metadata_and_rootfs() {
 
     let missing = runtime.remove_container("container-1").await;
     let err = missing.err().unwrap();
-    assert!(matches!(err, OciError::Storage(_)));
-    if let OciError::Storage(io_err) = err {
-        assert_eq!(io_err.kind(), io::ErrorKind::NotFound);
-    }
+    assert!(matches!(
+        err,
+        OciError::ContainerNotFound { ref id } if id == "container-1"
+    ));
 }
 
 #[tokio::test]
@@ -450,7 +1416,10 @@ async fn one_off_auto_remove_cleanup_path_removes_container_and_lifecycle() {
             auto_remove: true,
         },
     );
-    runtime.finalize_one_off_cleanup("one-off", true).await;
+    let transaction = runtime.begin_existing_container("one-off").await.unwrap();
+    runtime
+        .finalize_one_off_cleanup("one-off", true, &transaction)
+        .await;
 
     assert!(runtime.list_containers().unwrap().is_empty());
     assert!(!rootfs_path.exists());
@@ -1330,6 +2299,7 @@ fn exec_binding_atomically_couples_vm_generation_and_default_snapshot() {
         "container".to_string(),
         ContainerExecBinding {
             vm: Arc::clone(&first_vm),
+            generation: ContainerGeneration(1),
             defaults: ContainerExecDefaults {
                 env: vec![("GENERATION".to_string(), "one".to_string())],
                 working_dir: Some("/generation-one".to_string()),
@@ -1359,6 +2329,7 @@ fn exec_binding_atomically_couples_vm_generation_and_default_snapshot() {
         "container".to_string(),
         ContainerExecBinding {
             vm: Arc::clone(&second_vm),
+            generation: ContainerGeneration(2),
             defaults: ContainerExecDefaults {
                 env: vec![("GENERATION".to_string(), "two".to_string())],
                 working_dir: Some("/generation-two".to_string()),
@@ -1875,8 +2846,10 @@ async fn exec_container_rejects_missing_vm_handle() {
         )
         .await
         .unwrap_err();
-
-    assert!(matches!(err, OciError::InvalidConfig(_)));
+    assert!(matches!(
+        err,
+        OciError::ContainerNotFound { ref id } if id == "nonexistent"
+    ));
 }
 
 #[tokio::test]
@@ -2409,10 +3382,10 @@ async fn lifecycle_stop_missing_container_returns_error() {
         .stop_container("nonexistent", false, None, None)
         .await
         .unwrap_err();
-    assert!(matches!(err, OciError::Storage(_)));
-    if let OciError::Storage(io_err) = err {
-        assert_eq!(io_err.kind(), io::ErrorKind::NotFound);
-    }
+    assert!(matches!(
+        err,
+        OciError::ContainerNotFound { ref id } if id == "nonexistent"
+    ));
 }
 
 #[tokio::test]
@@ -2424,10 +3397,10 @@ async fn lifecycle_remove_missing_container_returns_error() {
     });
 
     let err = runtime.remove_container("nonexistent").await.unwrap_err();
-    assert!(matches!(err, OciError::Storage(_)));
-    if let OciError::Storage(io_err) = err {
-        assert_eq!(io_err.kind(), io::ErrorKind::NotFound);
-    }
+    assert!(matches!(
+        err,
+        OciError::ContainerNotFound { ref id } if id == "nonexistent"
+    ));
 }
 
 #[tokio::test]
@@ -2587,7 +3560,10 @@ async fn lifecycle_exec_on_missing_container_returns_error() {
         .await
         .unwrap_err();
 
-    assert!(matches!(err, OciError::InvalidConfig(ref msg) if msg.contains("not be running")));
+    assert!(matches!(
+        err,
+        OciError::ContainerNotFound { ref id } if id == "ghost"
+    ));
 }
 
 #[test]
@@ -2685,7 +3661,10 @@ async fn lifecycle_double_remove_returns_not_found() {
 
     // Second remove should fail with NotFound.
     let err = runtime.remove_container("once").await.unwrap_err();
-    assert!(matches!(err, OciError::Storage(_)));
+    assert!(matches!(
+        err,
+        OciError::ContainerNotFound { ref id } if id == "once"
+    ));
 }
 
 #[tokio::test]

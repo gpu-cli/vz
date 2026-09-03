@@ -148,6 +148,10 @@ message ExecEvent {
     bytes stderr = 2;
     int32 exit_code = 3;
     string error = 4;
+    // First event for every container-targeted pipe or PTY execution. The
+    // guest emits this only after the exact target has been pinned and the
+    // requested process has successfully crossed execve(2).
+    ContainerExecReady container_ready = 8;
   }
   // Monotonic sequence index within one exec stream.
   uint64 sequence = 5;
@@ -155,6 +159,34 @@ message ExecEvent {
   string request_id = 6;
   // Exec identifier for correlation (sent in first event for PTY sessions).
   uint64 exec_id = 7;
+}
+
+message KernelObjectIdentity {
+  uint64 device = 1;
+  uint64 inode = 2;
+}
+
+message ContainerNamespaceIdentity {
+  KernelObjectIdentity mount = 1;
+  KernelObjectIdentity network = 2;
+  KernelObjectIdentity pid = 3;
+  KernelObjectIdentity ipc = 4;
+  KernelObjectIdentity uts = 5;
+}
+
+// Immutable guest-observed identity for one running container generation.
+message ContainerGeneration {
+  string container_id = 1;
+  uint32 init_pid = 2;
+  uint64 init_start_time = 3;
+  string cgroup_path = 4;
+  KernelObjectIdentity cgroup = 5;
+  ContainerNamespaceIdentity namespaces = 6;
+  KernelObjectIdentity root = 7;
+}
+
+message ContainerExecReady {
+  ContainerGeneration generation = 1;
 }
 
 message StdinWriteRequest {

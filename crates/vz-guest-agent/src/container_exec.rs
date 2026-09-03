@@ -17,7 +17,7 @@ use std::path::Path;
 use anyhow::Context;
 use anyhow::bail;
 
-pub(crate) const TRAMPOLINE_MARKER: &str = "__vz_container_exec_v1";
+pub(crate) const TRAMPOLINE_MARKER: &str = "__vz_container_exec_v3";
 const SELF_EXE: &str = "/proc/self/exe";
 #[cfg(any(target_os = "linux", test))]
 const MAX_CGROUP_FILE_BYTES: usize = 64 * 1024;
@@ -26,6 +26,8 @@ const MAX_CGROUP_PATH_BYTES: usize = 4096;
 #[cfg(any(target_os = "linux", test))]
 const MAX_CGROUP_COMPONENT_BYTES: usize = 255;
 const MAX_CONTAINER_ID_BYTES: usize = 128;
+const READY_CHALLENGE_BYTES: usize = 32;
+const READY_CHALLENGE_HEX_BYTES: usize = READY_CHALLENGE_BYTES * 2;
 #[cfg(any(target_os = "linux", test))]
 const MAX_IDENTITY_FILE_BYTES: usize = 1024 * 1024;
 #[cfg(any(target_os = "linux", test))]
@@ -52,6 +54,8 @@ struct TrampolineInvocation {
     working_dir: Option<String>,
     user: Option<String>,
     retain_shell_environment: bool,
+    ready_socket: Option<String>,
+    ready_challenge: Option<String>,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -79,6 +83,19 @@ struct TargetIdentity {
 struct ObjectIdentity {
     device: u64,
     inode: u64,
+}
+
+/// Immutable guest-observed identity reported only after successful execve.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContainerReadyIdentity {
+    pub(crate) container_id: String,
+    pub(crate) pid: u32,
+    pub(crate) start_time: u64,
+    pub(crate) cgroup_path: String,
+    pub(crate) cgroup: (u64, u64),
+    pub(crate) namespaces: [(u64, u64); 5],
+    pub(crate) root: (u64, u64),
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -125,6 +142,7 @@ enum ChildSetupStage {
     GroupIdentity = 15,
     UserIdentity = 16,
     IdentityVerify = 17,
+    Execve = 18,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -148,6 +166,7 @@ impl ChildSetupStage {
             Self::GroupIdentity => "group identity selection",
             Self::UserIdentity => "user identity selection",
             Self::IdentityVerify => "execution identity verification",
+            Self::Execve => "command execve",
         }
     }
 
@@ -170,6 +189,7 @@ impl ChildSetupStage {
             15 => Self::GroupIdentity,
             16 => Self::UserIdentity,
             17 => Self::IdentityVerify,
+            18 => Self::Execve,
             _ => return None,
         })
     }
@@ -214,6 +234,7 @@ trait LauncherOps {
 }
 
 /// Build a hidden child invocation for both pipe and PTY execution.
+#[cfg(test)]
 pub(crate) fn prepare_trampoline(
     container_id: &str,
     command: &str,
@@ -221,6 +242,28 @@ pub(crate) fn prepare_trampoline(
     working_dir: Option<&str>,
     user: Option<&str>,
     retain_shell_environment: bool,
+) -> anyhow::Result<TrampolineCommand> {
+    prepare_trampoline_with_ready_socket(
+        container_id,
+        command,
+        args,
+        working_dir,
+        user,
+        retain_shell_environment,
+        None,
+    )
+}
+
+/// Build a trampoline invocation which reports an authenticated ready record
+/// to a private agent-owned Unix socket.
+pub(crate) fn prepare_trampoline_with_ready_socket(
+    container_id: &str,
+    command: &str,
+    args: &[String],
+    working_dir: Option<&str>,
+    user: Option<&str>,
+    retain_shell_environment: bool,
+    ready_handshake: Option<(&str, &str)>,
 ) -> anyhow::Result<TrampolineCommand> {
     validate_container_id(container_id)?;
     if command.is_empty() {
@@ -235,12 +278,22 @@ pub(crate) fn prepare_trampoline(
         Some(value) if !value.is_empty() => format!("s{value}"),
         _ => "n".to_string(),
     };
-    let mut trampoline_args = Vec::with_capacity(args.len() + 6);
+    let (encoded_ready_socket, encoded_ready_challenge) = match ready_handshake {
+        Some((socket, challenge)) if !socket.is_empty() && !challenge.is_empty() => {
+            validate_ready_challenge(challenge)?;
+            (format!("s{socket}"), format!("s{challenge}"))
+        }
+        Some(_) => bail!("container exec ready socket and challenge cannot be empty"),
+        None => ("n".to_string(), "n".to_string()),
+    };
+    let mut trampoline_args = Vec::with_capacity(args.len() + 8);
     trampoline_args.push(TRAMPOLINE_MARKER.to_string());
     trampoline_args.push(container_id.to_string());
     trampoline_args.push(encoded_cwd);
     trampoline_args.push(encoded_user);
     trampoline_args.push(if retain_shell_environment { "s" } else { "n" }.to_string());
+    trampoline_args.push(encoded_ready_socket);
+    trampoline_args.push(encoded_ready_challenge);
     trampoline_args.push(command.to_string());
     trampoline_args.extend(args.iter().cloned());
 
@@ -260,7 +313,18 @@ pub(crate) fn is_trampoline_request(args: &[OsString]) -> bool {
 #[cfg(target_os = "linux")]
 pub(crate) fn run_trampoline(args: Vec<OsString>) -> anyhow::Result<()> {
     let invocation = parse_trampoline_args(&args)?;
-    execute_ordered(&invocation, &mut RealLauncherOps)
+    let admission = ContainerAdmissionGuard::shared(&invocation.container_id)?;
+    let mut ops = RealLauncherOps {
+        admission: Some(admission),
+        ready_socket: invocation.ready_socket.clone(),
+        ready_challenge: invocation.ready_challenge.clone(),
+        sender_start_time: read_process_start_time(std::process::id())?,
+    };
+    let result = execute_ordered(&invocation, &mut ops);
+    if let Err(error) = &result {
+        ops.notify_failure(error);
+    }
+    result
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -294,11 +358,32 @@ fn parse_trampoline_args(args: &[OsString]) -> anyhow::Result<TrampolineInvocati
         "n" => false,
         _ => bail!("container exec trampoline SHELL policy encoding is invalid"),
     };
-    let command = required_utf8_arg(args, 5, "command")?;
+    let encoded_ready_socket = required_utf8_arg(args, 5, "ready socket")?;
+    let ready_socket = if encoded_ready_socket == "n" {
+        None
+    } else if let Some(value) = encoded_ready_socket.strip_prefix('s') {
+        validate_ready_socket(value)?;
+        Some(value.to_string())
+    } else {
+        bail!("container exec trampoline ready socket encoding is invalid");
+    };
+    let encoded_ready_challenge = required_utf8_arg(args, 6, "ready challenge")?;
+    let ready_challenge = if encoded_ready_challenge == "n" {
+        None
+    } else if let Some(value) = encoded_ready_challenge.strip_prefix('s') {
+        validate_ready_challenge(value)?;
+        Some(value.to_string())
+    } else {
+        bail!("container exec trampoline ready challenge encoding is invalid");
+    };
+    if ready_socket.is_some() != ready_challenge.is_some() {
+        bail!("container exec ready socket and challenge must be supplied together");
+    }
+    let command = required_utf8_arg(args, 7, "command")?;
     if command.is_empty() {
         bail!("container exec command cannot be empty");
     }
-    let command_args = args[6..]
+    let command_args = args[8..]
         .iter()
         .map(|arg| {
             arg.to_str()
@@ -314,7 +399,38 @@ fn parse_trampoline_args(args: &[OsString]) -> anyhow::Result<TrampolineInvocati
         working_dir,
         user,
         retain_shell_environment,
+        ready_socket,
+        ready_challenge,
     })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_ready_socket(value: &str) -> anyhow::Result<()> {
+    let path = std::path::Path::new(value);
+    if path.parent() != Some(std::path::Path::new("/run/vz-agent-exec"))
+        || !path.file_name().is_some_and(|name| {
+            let bytes = name.as_encoded_bytes();
+            !bytes.is_empty()
+                && bytes.len() <= 96
+                && bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+        })
+    {
+        bail!("container exec ready socket path is invalid");
+    }
+    Ok(())
+}
+
+fn validate_ready_challenge(value: &str) -> anyhow::Result<()> {
+    if value.len() != READY_CHALLENGE_HEX_BYTES
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!(
+            "container exec ready challenge must be exactly {READY_CHALLENGE_HEX_BYTES} hex bytes"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -422,12 +538,66 @@ pub(crate) const YOUKI_BIN: &str = "/run/vz-oci/bin/youki";
 #[cfg(target_os = "linux")]
 pub(crate) const YOUKI_ROOT: &str = "/run/vz-oci/state";
 #[cfg(target_os = "linux")]
+const CONTAINER_ADMISSION_ROOT: &str = "/run/vz-oci/admission";
+#[cfg(target_os = "linux")]
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 #[cfg(target_os = "linux")]
 const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 
 #[cfg(target_os = "linux")]
-struct RealLauncherOps;
+struct RealLauncherOps {
+    admission: Option<ContainerAdmissionGuard>,
+    ready_socket: Option<String>,
+    ready_challenge: Option<String>,
+    sender_start_time: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl RealLauncherOps {
+    fn notify_ready(&mut self, target: &TargetIdentity, pinned: &PinnedTarget) {
+        let Some(socket) = self.ready_socket.as_deref() else {
+            // Unary compatibility execution has no early-ready protocol, so
+            // retain shared admission until the command terminates.
+            return;
+        };
+        let Some(challenge) = self.ready_challenge.as_deref() else {
+            return;
+        };
+        let identity = ready_identity(target, pinned);
+        let _ = send_ready_record(
+            socket,
+            &encode_ready_identity(challenge, self.sender_start_time, &identity),
+        );
+        // The immutable descriptors and successfully exec'd child now own the
+        // old generation. Guest lifecycle mutation may safely continue.
+        self.admission.take();
+    }
+
+    fn notify_failure(&self, error: &anyhow::Error) {
+        let Some(socket) = self.ready_socket.as_deref() else {
+            return;
+        };
+        let Some(challenge) = self.ready_challenge.as_deref() else {
+            return;
+        };
+        let detail = error
+            .to_string()
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .take(2048)
+            .collect::<String>();
+        let _ = send_ready_record(
+            socket,
+            format!("ERROR\t{challenge}\t{}\t{detail}", self.sender_start_time).as_bytes(),
+        );
+    }
+}
 
 #[cfg(target_os = "linux")]
 struct PinnedTarget {
@@ -534,15 +704,45 @@ impl LauncherOps for RealLauncherOps {
 
         drop(setup_writer);
         let setup_error = read_setup_error(&setup_reader);
-        let status = wait_for_child(child)?;
         let setup_error = setup_error?;
         if let Some(error) = setup_error {
+            let status = wait_for_child(child)?;
+            if error.stage == ChildSetupStage::Execve {
+                let failure = anyhow::anyhow!(
+                    "container exec child failed at {}: {}",
+                    error.stage.description(),
+                    std::io::Error::from_raw_os_error(error.errno)
+                );
+                self.notify_failure(&failure);
+                return mirror_wait_status(status);
+            }
             bail!(
                 "container exec child setup failed at {}: {}",
                 error.stage.description(),
                 std::io::Error::from_raw_os_error(error.errno)
             );
         }
+        // CLOEXEC EOF proves execve only while the child is still live. If it
+        // already exited normally, the absence of a failure record proves it
+        // reached the requested image because every pre-exec exit writes one.
+        // A signal before observation is ambiguous and therefore fails closed.
+        let status = match try_wait_for_child(child)? {
+            Some(status) if libc::WIFSIGNALED(status) => {
+                let failure = anyhow::anyhow!(
+                    "container exec child was signaled before successful execve could be proven"
+                );
+                self.notify_failure(&failure);
+                return mirror_wait_status(status);
+            }
+            Some(status) => {
+                self.notify_ready(target, pinned);
+                status
+            }
+            None => {
+                self.notify_ready(target, pinned);
+                wait_for_child(child)?
+            }
+        };
         mirror_wait_status(status)
     }
 }
@@ -647,6 +847,13 @@ fn parse_proc_start_time(stat: &str) -> anyhow::Result<u64> {
 }
 
 #[cfg(target_os = "linux")]
+fn read_process_start_time(pid: u32) -> anyhow::Result<u64> {
+    let path = format!("/proc/{pid}/stat");
+    let stat = read_bounded_utf8(Path::new(&path), 64 * 1024, "process stat")?;
+    parse_proc_start_time(&stat)
+}
+
+#[cfg(target_os = "linux")]
 fn pin_target(target: &TargetIdentity) -> anyhow::Result<PinnedTarget> {
     let pid_fd = open_pidfd(target.pid)?;
     ensure_pid_alive(&pid_fd)?;
@@ -686,6 +893,189 @@ fn pin_target(target: &TargetIdentity) -> anyhow::Result<PinnedTarget> {
         uts_ns,
         root,
     })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct ContainerAdmissionGuard {
+    file: std::fs::File,
+}
+
+#[cfg(target_os = "linux")]
+impl ContainerAdmissionGuard {
+    pub(crate) fn shared(container_id: &str) -> anyhow::Result<Self> {
+        Self::acquire(container_id, libc::LOCK_SH)
+    }
+
+    pub(crate) fn exclusive(container_id: &str) -> anyhow::Result<Self> {
+        Self::acquire(container_id, libc::LOCK_EX)
+    }
+
+    fn acquire(container_id: &str, operation: libc::c_int) -> anyhow::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+        validate_container_id(container_id)?;
+        std::fs::create_dir_all(CONTAINER_ADMISSION_ROOT)
+            .context("failed to create container admission directory")?;
+        let directory = std::fs::symlink_metadata(CONTAINER_ADMISSION_ROOT)
+            .context("failed to inspect container admission directory")?;
+        if !directory.is_dir() || directory.file_type().is_symlink() || directory.uid() != 0 {
+            bail!("container admission directory is not a root-owned real directory");
+        }
+        std::fs::set_permissions(
+            CONTAINER_ADMISSION_ROOT,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .context("failed to secure container admission directory")?;
+
+        let path = format!("{CONTAINER_ADMISSION_ROOT}/{container_id}.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+            .with_context(|| format!("failed to open admission lock for `{container_id}`"))?;
+        let metadata = file
+            .metadata()
+            .context("failed to inspect container admission lock")?;
+        if !metadata.is_file() || metadata.uid() != 0 || metadata.nlink() != 1 {
+            bail!("container admission lock is not a root-owned regular file");
+        }
+        // SAFETY: flock operates on the live descriptor owned by this guard.
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to acquire container admission lock");
+        }
+        Ok(Self { file })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ContainerAdmissionGuard {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: unlocking a live flock descriptor is safe; close-on-drop is
+        // the final fallback if the explicit unlock is interrupted.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ready_identity(target: &TargetIdentity, pinned: &PinnedTarget) -> ContainerReadyIdentity {
+    ContainerReadyIdentity {
+        container_id: target.container_id.clone(),
+        pid: target.pid,
+        start_time: target.start_time,
+        cgroup_path: target.cgroup_path.clone(),
+        cgroup: (pinned.cgroup_identity.device, pinned.cgroup_identity.inode),
+        namespaces: [
+            (
+                target.namespaces.mount.device,
+                target.namespaces.mount.inode,
+            ),
+            (
+                target.namespaces.network.device,
+                target.namespaces.network.inode,
+            ),
+            (target.namespaces.pid.device, target.namespaces.pid.inode),
+            (target.namespaces.ipc.device, target.namespaces.ipc.inode),
+            (target.namespaces.uts.device, target.namespaces.uts.inode),
+        ],
+        root: (target.root.device, target.root.inode),
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn encode_ready_identity(
+    challenge: &str,
+    sender_start_time: u64,
+    identity: &ContainerReadyIdentity,
+) -> Vec<u8> {
+    debug_assert!(validate_ready_challenge(challenge).is_ok());
+    let mut fields = vec![
+        "READY".to_string(),
+        challenge.to_string(),
+        sender_start_time.to_string(),
+        identity.container_id.clone(),
+        identity.pid.to_string(),
+        identity.start_time.to_string(),
+        identity.cgroup_path.clone(),
+        identity.cgroup.0.to_string(),
+        identity.cgroup.1.to_string(),
+    ];
+    for (device, inode) in identity.namespaces {
+        fields.push(device.to_string());
+        fields.push(inode.to_string());
+    }
+    fields.push(identity.root.0.to_string());
+    fields.push(identity.root.1.to_string());
+    fields.join("\t").into_bytes()
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn decode_ready_identity(
+    bytes: &[u8],
+    expected_challenge: &str,
+    expected_sender_start_time: u64,
+) -> anyhow::Result<ContainerReadyIdentity> {
+    if bytes.len() > 4096 {
+        bail!("container ready record exceeds 4096 bytes");
+    }
+    validate_ready_challenge(expected_challenge)?;
+    let record = std::str::from_utf8(bytes).context("container ready record is not UTF-8")?;
+    let fields = record.split('\t').collect::<Vec<_>>();
+    if fields.len() < 3
+        || fields[1] != expected_challenge
+        || fields[2].parse::<u64>().ok() != Some(expected_sender_start_time)
+    {
+        bail!("container ready record challenge or sender generation does not match");
+    }
+    if fields[0] == "ERROR" {
+        if fields.len() != 4 {
+            bail!("container failure record is malformed");
+        }
+        bail!(
+            "container trampoline failed before readiness: {}",
+            fields[3]
+        );
+    }
+    if fields.len() != 21 || fields[0] != "READY" {
+        bail!("container ready record is malformed");
+    }
+    validate_container_id(fields[3])?;
+    let number = |index: usize| -> anyhow::Result<u64> {
+        fields[index]
+            .parse::<u64>()
+            .with_context(|| format!("container ready field {index} is invalid"))
+    };
+    let mut namespaces = [(0, 0); 5];
+    for (index, identity) in namespaces.iter_mut().enumerate() {
+        *identity = (number(9 + index * 2)?, number(10 + index * 2)?);
+    }
+    Ok(ContainerReadyIdentity {
+        container_id: fields[3].to_string(),
+        pid: u32::try_from(number(4)?).context("container ready PID exceeds u32")?,
+        start_time: number(5)?,
+        cgroup_path: validate_cgroup_path(fields[6])?,
+        cgroup: (number(7)?, number(8)?),
+        namespaces,
+        root: (number(19)?, number(20)?),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn send_ready_record(socket: &str, record: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)
+        .context("failed to connect container ready socket")?;
+    stream
+        .write_all(record)
+        .context("failed to write container ready record")
 }
 
 #[cfg(target_os = "linux")]
@@ -1362,14 +1752,17 @@ fn child_exec(fds: ChildLaunchFds, expected_cgroup: &[u8], payload: &mut ExecPay
         if errno == libc::EACCES {
             saw_access_denied = true;
         } else if errno != libc::ENOENT && errno != libc::ENOTDIR {
-            child_exit(126);
+            child_execve_fail(fds.setup_error, errno);
         }
     }
-    child_exit(exec_failure_exit_code(if saw_access_denied {
-        libc::EACCES
-    } else {
-        libc::ENOENT
-    }));
+    child_execve_fail(
+        fds.setup_error,
+        if saw_access_denied {
+            libc::EACCES
+        } else {
+            libc::ENOENT
+        },
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1577,6 +1970,17 @@ fn child_setup_fail(setup_error_fd: libc::c_int, stage: ChildSetupStage, errno: 
 }
 
 #[cfg(target_os = "linux")]
+fn child_execve_fail(setup_error_fd: libc::c_int, errno: libc::c_int) -> ! {
+    let errno = if errno == 0 { libc::EIO } else { errno };
+    let record = encode_setup_error(ChildSetupError {
+        stage: ChildSetupStage::Execve,
+        errno,
+    });
+    let _ = write_all_raw(setup_error_fd, &record);
+    child_exit(exec_failure_exit_code(errno))
+}
+
+#[cfg(target_os = "linux")]
 fn write_all_raw(fd: libc::c_int, mut bytes: &[u8]) -> Result<(), libc::c_int> {
     while !bytes.is_empty() {
         // SAFETY: `bytes` is readable and `fd` is a live pipe or
@@ -1738,6 +2142,26 @@ fn wait_for_child(child: libc::pid_t) -> anyhow::Result<libc::c_int> {
         return Err(std::io::Error::last_os_error()).context("container exec waitpid failed");
     }
     Ok(status)
+}
+
+#[cfg(target_os = "linux")]
+fn try_wait_for_child(child: libc::pid_t) -> anyhow::Result<Option<libc::c_int>> {
+    let mut status = 0;
+    loop {
+        // SAFETY: `child` is the direct child returned by fork and `status` is
+        // writable for this non-blocking observation.
+        let result = unsafe { libc::waitpid(child, &raw mut status, libc::WNOHANG) };
+        if result == child {
+            return Ok(Some(status));
+        }
+        if result == 0 {
+            return Ok(None);
+        }
+        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(std::io::Error::last_os_error()).context("container exec waitpid failed");
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1991,6 +2415,43 @@ mod tests {
         assert_eq!(parsed.working_dir.as_deref(), Some("/work dir"));
         assert_eq!(parsed.user.as_deref(), Some("dev:builders"));
         assert!(parsed.retain_shell_environment);
+        assert!(parsed.ready_socket.is_none());
+
+        let challenge = "a".repeat(READY_CHALLENGE_HEX_BYTES);
+        let command = prepare_trampoline_with_ready_socket(
+            "workspace-web",
+            "/bin/true",
+            &[],
+            None,
+            None,
+            false,
+            Some(("/run/vz-agent-exec/test.sock", &challenge)),
+        )
+        .unwrap();
+        let mut malformed = command.args.clone();
+        malformed[6] = "n".to_string();
+        assert!(
+            parse_trampoline_args(
+                &malformed
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect::<Vec<_>>()
+            )
+            .is_err()
+        );
+        let parsed = parse_trampoline_args(
+            &command
+                .args
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.ready_socket.as_deref(),
+            Some("/run/vz-agent-exec/test.sock")
+        );
+        assert_eq!(parsed.ready_challenge.as_deref(), Some(challenge.as_str()));
     }
 
     #[test]
@@ -2002,6 +2463,8 @@ mod tests {
             working_dir: Some("/workspace".to_string()),
             user: Some("1000:1001".to_string()),
             retain_shell_environment: false,
+            ready_socket: None,
+            ready_challenge: None,
         };
         let identity = ResolvedIdentity {
             uid: 1000,
@@ -2082,6 +2545,42 @@ mod tests {
         assert_eq!(error.stage.description(), "cgroup attachment");
         assert_eq!(decode_setup_error(encode_setup_error(error)), Some(error));
         assert!(decode_setup_error([u8::MAX, 0, 0, 0, 0]).is_none());
+        let execve = ChildSetupError {
+            stage: ChildSetupStage::Execve,
+            errno: libc::ENOENT,
+        };
+        assert_eq!(decode_setup_error(encode_setup_error(execve)), Some(execve));
+    }
+
+    #[test]
+    fn ready_identity_round_trips_and_failure_records_fail_closed() {
+        let challenge = "ab".repeat(READY_CHALLENGE_BYTES);
+        let other_challenge = "cd".repeat(READY_CHALLENGE_BYTES);
+        let sender_start_time = 77;
+        let identity = ContainerReadyIdentity {
+            container_id: "web".to_string(),
+            pid: 4242,
+            start_time: 123_456,
+            cgroup_path: "/youki/web".to_string(),
+            cgroup: (1, 2),
+            namespaces: [(3, 4), (5, 6), (7, 8), (9, 10), (11, 12)],
+            root: (13, 14),
+        };
+        assert_eq!(
+            decode_ready_identity(
+                &encode_ready_identity(&challenge, sender_start_time, &identity),
+                &challenge,
+                sender_start_time,
+            )
+            .unwrap(),
+            identity
+        );
+        let encoded = encode_ready_identity(&challenge, sender_start_time, &identity);
+        assert!(decode_ready_identity(&encoded, &other_challenge, sender_start_time).is_err());
+        assert!(decode_ready_identity(&encoded, &challenge, sender_start_time + 1).is_err());
+        let failure = format!("ERROR\t{challenge}\t{sender_start_time}\tcommand execve: not found");
+        assert!(decode_ready_identity(failure.as_bytes(), &challenge, sender_start_time).is_err());
+        assert!(decode_ready_identity(b"READY\tweb", &challenge, sender_start_time).is_err());
     }
 
     #[test]
@@ -2250,6 +2749,8 @@ mod tests {
             working_dir: Some("/".to_string()),
             user: None,
             retain_shell_environment: false,
+            ready_socket: None,
+            ready_challenge: None,
         }
     }
 

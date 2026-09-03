@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, process};
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 use vz::Vm;
@@ -19,9 +19,12 @@ use vz_image::{
 };
 use vz_linux::{ExecOptions, KernelPaths, LinuxError, LinuxVm, LinuxVmConfig, OciExecOptions};
 use vz_oci::bundle::{BundleMount, BundleSpec, write_oci_bundle};
-use vz_oci::container_store::{ContainerInfo, ContainerStatus, ContainerStore};
+use vz_oci::container_store::{
+    ContainerGeneration, ContainerGenerationDiagnostic, ContainerIdLease, ContainerInfo,
+    ContainerStatus, ContainerStore,
+};
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use vz::protocol::OciContainerState;
 
 use crate::config::{
@@ -57,7 +60,9 @@ use self::bundle::{
     resolve_oci_runtime_binary_path, write_hosts_file,
 };
 #[cfg(test)]
-use self::exec::{resolve_container_exec_binding, resolve_container_exec_options};
+use self::exec::{
+    container_ready_generation, resolve_container_exec_binding, resolve_container_exec_options,
+};
 #[cfg(test)]
 use self::oci_lifecycle::{
     OciLifecycleFuture, OciLifecycleOps, build_log_rotation_script, lifecycle_exec_options,
@@ -133,6 +138,12 @@ struct ActiveContainerLifecycle {
     auto_remove: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetupRestoreIdentity {
+    generation: ContainerGeneration,
+    commit_ref: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ComposeLogRotation {
     max_size_bytes: u64,
@@ -141,10 +152,109 @@ struct ComposeLogRotation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InteractiveExecEvent {
+    /// The guest proved the exact OCI target was pinned and crossed execve.
+    ContainerReady(ContainerReadyGeneration),
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     Exit(i32),
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelObjectIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerNamespaceIdentity {
+    pub mount: KernelObjectIdentity,
+    pub network: KernelObjectIdentity,
+    pub pid: KernelObjectIdentity,
+    pub ipc: KernelObjectIdentity,
+    pub uts: KernelObjectIdentity,
+}
+
+/// Host lifecycle generation paired with the full guest-observed identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerReadyGeneration {
+    pub lifecycle_generation: u64,
+    pub container_id: String,
+    pub init_pid: u32,
+    pub init_start_time: u64,
+    pub cgroup_path: String,
+    pub cgroup: KernelObjectIdentity,
+    pub namespaces: ContainerNamespaceIdentity,
+    pub root: KernelObjectIdentity,
+}
+
+/// Read-only lifecycle state used by deterministic leak/recovery diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeLifecycleDiagnostics {
+    /// Durable generation history and current reservation state.
+    pub generations: Vec<ContainerGenerationDiagnostic>,
+    /// Stable per-ID process-local admission slots.
+    pub container_lock_slots: usize,
+    /// Stable per-stack process-local admission slots.
+    pub stack_lock_slots: usize,
+    /// Published VM handles.
+    pub vm_handles: usize,
+    /// Container-to-stack recovery routes.
+    pub container_routes: usize,
+    /// Public exec bindings.
+    pub exec_bindings: usize,
+    /// Generation-scoped runtime cleanup records.
+    pub active_lifecycles: usize,
+    /// Active interactive PTY sessions.
+    pub exec_sessions: usize,
+    /// Generation-and-commit-scoped setup restore entries.
+    pub setup_restore_entries: usize,
+    /// Generations whose OCI state was deleted but guest overlay cleanup remains.
+    pub overlay_cleanup_pending: usize,
+    /// Rootfs directories currently present on disk.
+    pub rootfs_directories: usize,
+}
+
+/// Integration-test lifecycle admission points.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeLifecycleAdmissionKind {
+    CreateBeforeReservation,
+    ExecBeforeGuestRpc,
+    ExecGuestReady,
+    StackRoutePublishedBeforeOverlay,
+    StackOverlaySetupStarting,
+    StopWriterRequested,
+    StopWriterAcquired,
+    RemoveWriterAcquired,
+}
+
+/// A paused lifecycle operation. Dropping or resuming the event releases it.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct RuntimeLifecycleAdmissionEvent {
+    kind: RuntimeLifecycleAdmissionKind,
+    container_id: String,
+    resume: tokio::sync::oneshot::Sender<()>,
+}
+
+impl RuntimeLifecycleAdmissionEvent {
+    pub fn kind(&self) -> RuntimeLifecycleAdmissionKind {
+        self.kind
+    }
+
+    pub fn container_id(&self) -> &str {
+        &self.container_id
+    }
+
+    pub fn resume(self) {
+        let _ = self.resume.send(());
+    }
+}
+
+/// Receiver installed by integration tests to pause lifecycle admission points.
+#[doc(hidden)]
+pub type RuntimeLifecycleObserver =
+    tokio::sync::mpsc::UnboundedReceiver<RuntimeLifecycleAdmissionEvent>;
 
 #[derive(Clone)]
 struct InteractiveExecSession {
@@ -179,6 +289,7 @@ impl From<&RunConfig> for ContainerExecDefaults {
 struct ContainerExecBinding<V = LinuxVm> {
     vm: Arc<V>,
     defaults: ContainerExecDefaults,
+    generation: ContainerGeneration,
 }
 
 impl<V> Clone for ContainerExecBinding<V> {
@@ -186,12 +297,113 @@ impl<V> Clone for ContainerExecBinding<V> {
         Self {
             vm: Arc::clone(&self.vm),
             defaults: self.defaults.clone(),
+            generation: self.generation,
         }
     }
 }
 
 type ContainerExecBindingMap = HashMap<String, ContainerExecBinding>;
 type StackActivationLockMap = HashMap<String, Arc<Mutex<()>>>;
+type ContainerLifecycleLockMap = HashMap<String, Arc<RwLock<()>>>;
+type StackLifecycleLockMap = HashMap<String, Arc<RwLock<()>>>;
+
+/// Exclusive ownership of one caller-selected container ID generation.
+pub(crate) struct ContainerLifecycleTransaction {
+    lease: Option<ContainerLifecycleLease>,
+}
+
+struct ContainerLifecycleLease {
+    container_id: String,
+    generation: ContainerGeneration,
+    container_store: ContainerStore,
+    _os_guard: ContainerIdLease,
+    _stack_guard: Option<OwnedRwLockReadGuard<()>>,
+    _container_guard: OwnedRwLockWriteGuard<()>,
+}
+
+struct ContainerReadAdmission {
+    _os_guard: ContainerIdLease,
+    _container_guard: OwnedRwLockReadGuard<()>,
+}
+
+struct ContainerWriteAdmission {
+    container_id: String,
+    generation: Option<ContainerGeneration>,
+    _os_guard: ContainerIdLease,
+    _container_guard: OwnedRwLockWriteGuard<()>,
+}
+
+struct RootfsAssemblyReturn {
+    lease: Option<ContainerLifecycleLease>,
+    result: Option<std::io::Result<PathBuf>>,
+    container_store: ContainerStore,
+    container_id: String,
+    generation: ContainerGeneration,
+}
+
+impl RootfsAssemblyReturn {
+    fn into_parts(mut self) -> (ContainerLifecycleLease, std::io::Result<PathBuf>) {
+        let lease = match self.lease.take() {
+            Some(lease) => lease,
+            None => unreachable!("rootfs assembly return owns its lifecycle lease"),
+        };
+        let result = match self.result.take() {
+            Some(result) => result,
+            None => unreachable!("rootfs assembly return owns its result"),
+        };
+        (lease, result)
+    }
+}
+
+impl Drop for RootfsAssemblyReturn {
+    fn drop(&mut self) {
+        if let Some(Ok(rootfs)) = self.result.as_ref()
+            && self
+                .container_store
+                .current_generation(&self.container_id)
+                .is_ok_and(|current| current == Some(self.generation))
+        {
+            let _ = fs::remove_dir_all(rootfs);
+        }
+    }
+}
+
+impl Drop for ContainerLifecycleLease {
+    fn drop(&mut self) {
+        let _ = self
+            .container_store
+            .release_generation_if_absent(&self.container_id, self.generation);
+    }
+}
+
+impl ContainerLifecycleTransaction {
+    pub(crate) fn container_id(&self) -> &str {
+        &self.lease().container_id
+    }
+
+    fn generation(&self) -> ContainerGeneration {
+        self.lease().generation
+    }
+
+    fn lease(&self) -> &ContainerLifecycleLease {
+        match self.lease.as_ref() {
+            Some(lease) => lease,
+            None => unreachable!("container lifecycle transaction lease is in its worker"),
+        }
+    }
+
+    fn take_lease(&mut self) -> ContainerLifecycleLease {
+        match self.lease.take() {
+            Some(lease) => lease,
+            None => unreachable!("container lifecycle transaction lease is in its worker"),
+        }
+    }
+
+    fn restore_lease(&mut self, lease: ContainerLifecycleLease) {
+        debug_assert!(self.lease.is_none());
+        self.lease = Some(lease);
+    }
+}
 
 /// Unified runtime entrypoint.
 #[derive(Clone)]
@@ -215,6 +427,8 @@ pub struct Runtime {
     /// and final liveness validation because the bundled youki runtime has
     /// exhibited stale init state when those transactions interleave.
     stack_activation_locks: Arc<Mutex<StackActivationLockMap>>,
+    container_lifecycle_locks: Arc<Mutex<ContainerLifecycleLockMap>>,
+    stack_lifecycle_locks: Arc<Mutex<StackLifecycleLockMap>>,
     /// Maps container IDs to the stack they belong to (if any).
     ///
     /// Used to determine whether a container's VM is shared and should
@@ -253,11 +467,16 @@ pub struct Runtime {
     /// so prep runs once per live VM instance.
     interactive_pty_prep_vms: Arc<Mutex<HashSet<usize>>>,
     /// Container IDs whose overlay upperdir was prepopulated from a
-    /// setup-commit tarball at creation time. The backend reads this set
-    /// to skip `run_setup_commands` when the cache hit. Entries are added
-    /// in [`Self::create_container_in_stack`] and never proactively
-    /// removed — bounded by the lifetime of the daemon process.
-    setup_restored_containers: Arc<Mutex<HashSet<String>>>,
+    /// setup-commit tarball at creation time. The backend reads the exact
+    /// generation and commit identity to skip `run_setup_commands` on a cache
+    /// hit. Entries are cleared on every terminal lifecycle transition.
+    setup_restored_containers: Arc<Mutex<HashMap<String, SetupRestoreIdentity>>>,
+    oci_deleted_pending_overlay: Arc<std::sync::Mutex<HashMap<String, ContainerGeneration>>>,
+    lifecycle_observer: Arc<
+        std::sync::Mutex<
+            Option<tokio::sync::mpsc::UnboundedSender<RuntimeLifecycleAdmissionEvent>>,
+        >,
+    >,
 }
 
 impl Runtime {
@@ -278,6 +497,8 @@ impl Runtime {
             vm_handles: Arc::new(Mutex::new(HashMap::new())),
             stack_vms: Arc::new(Mutex::new(HashMap::new())),
             stack_activation_locks: Arc::new(Mutex::new(HashMap::new())),
+            container_lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
+            stack_lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
             container_stack: Arc::new(Mutex::new(HashMap::new())),
             port_forwards: Arc::new(Mutex::new(HashMap::new())),
             stack_port_forwards: Arc::new(Mutex::new(HashMap::new())),
@@ -286,7 +507,9 @@ impl Runtime {
             exec_sessions: Arc::new(Mutex::new(HashMap::new())),
             container_exec_bindings: Arc::new(Mutex::new(HashMap::new())),
             interactive_pty_prep_vms: Arc::new(Mutex::new(HashSet::new())),
-            setup_restored_containers: Arc::new(Mutex::new(HashSet::new())),
+            setup_restored_containers: Arc::new(Mutex::new(HashMap::new())),
+            oci_deleted_pending_overlay: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            lifecycle_observer: Arc::new(std::sync::Mutex::new(None)),
         };
 
         runtime.reconcile_stale_containers();
@@ -295,19 +518,338 @@ impl Runtime {
         runtime
     }
 
+    async fn container_lifecycle_lock(&self, id: &str) -> Arc<RwLock<()>> {
+        let mut locks = self.container_lifecycle_locks.lock().await;
+        locks
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone()
+    }
+
+    /// Install an instance-scoped lifecycle observer for deterministic integration tests.
+    #[doc(hidden)]
+    pub fn install_lifecycle_observer(&self) -> RuntimeLifecycleObserver {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .lifecycle_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sender);
+        receiver
+    }
+
+    async fn observe_lifecycle_admission(
+        &self,
+        kind: RuntimeLifecycleAdmissionKind,
+        container_id: &str,
+    ) {
+        let sender = self
+            .lifecycle_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(sender) = sender else {
+            return;
+        };
+        let (resume, paused) = tokio::sync::oneshot::channel();
+        if sender
+            .send(RuntimeLifecycleAdmissionEvent {
+                kind,
+                container_id: container_id.to_string(),
+                resume,
+            })
+            .is_ok()
+        {
+            let _ = paused.await;
+        }
+    }
+
+    fn map_container_store_error(id: &str, error: std::io::Error) -> OciError {
+        match error.kind() {
+            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::WouldBlock => {
+                OciError::ContainerAlreadyExists { id: id.to_string() }
+            }
+            std::io::ErrorKind::NotFound => OciError::ContainerNotFound { id: id.to_string() },
+            _ => OciError::Storage(error),
+        }
+    }
+
+    async fn acquire_container_os_write(&self, id: &str) -> Result<ContainerIdLease, OciError> {
+        let store = self.container_store.clone();
+        let owned_id = id.to_string();
+        tokio::task::spawn_blocking(move || store.acquire_container_write_lease(&owned_id))
+            .await
+            .map_err(|error| OciError::Storage(std::io::Error::other(error.to_string())))?
+            .map_err(|error| Self::map_container_store_error(id, error))
+    }
+
+    async fn acquire_container_read_admission(
+        &self,
+        id: &str,
+    ) -> Result<ContainerReadAdmission, OciError> {
+        let container_guard = self.container_lifecycle_lock(id).await.read_owned().await;
+        let store = self.container_store.clone();
+        let owned_id = id.to_string();
+        let os_guard =
+            tokio::task::spawn_blocking(move || store.acquire_container_read_lease(&owned_id))
+                .await
+                .map_err(|error| OciError::Storage(std::io::Error::other(error.to_string())))?
+                .map_err(|error| Self::map_container_store_error(id, error))?;
+        Ok(ContainerReadAdmission {
+            _os_guard: os_guard,
+            _container_guard: container_guard,
+        })
+    }
+
+    async fn acquire_sorted_container_write_admissions(
+        &self,
+        container_ids: &[String],
+    ) -> Result<Vec<ContainerWriteAdmission>, OciError> {
+        let mut sorted = container_ids.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        let mut admissions = Vec::with_capacity(sorted.len());
+        for container_id in sorted {
+            let container_guard = self
+                .container_lifecycle_lock(&container_id)
+                .await
+                .write_owned()
+                .await;
+            let os_guard = self.acquire_container_os_write(&container_id).await?;
+            let generation = self
+                .container_store
+                .current_generation(&container_id)
+                .map_err(|error| Self::map_container_store_error(&container_id, error))?;
+            admissions.push(ContainerWriteAdmission {
+                container_id,
+                generation,
+                _os_guard: os_guard,
+                _container_guard: container_guard,
+            });
+        }
+        Ok(admissions)
+    }
+
+    pub(super) async fn stack_lifecycle_lock(&self, stack_id: &str) -> Arc<RwLock<()>> {
+        let mut locks = self.stack_lifecycle_locks.lock().await;
+        locks
+            .entry(stack_id.to_string())
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone()
+    }
+
+    /// Reserve a new generation. Stack membership is locked before the ID,
+    /// establishing the global stack -> container -> activation ordering.
+    pub(crate) async fn begin_container_create(
+        &self,
+        run: &mut RunConfig,
+        stack_id: Option<&str>,
+    ) -> Result<ContainerLifecycleTransaction, OciError> {
+        let id = run.container_id.clone().unwrap_or_else(new_container_id);
+        validate_container_id(&id)?;
+        run.container_id = Some(id.clone());
+        let stack_guard = if let Some(stack_id) = stack_id {
+            Some(self.stack_lifecycle_lock(stack_id).await.read_owned().await)
+        } else {
+            None
+        };
+        // New-generation admission is deliberately fail-fast. Waiting here would let
+        // a duplicate create inherit the name after the current setup transaction
+        // rolls back, violating the caller-selected ID's duplicate semantics.
+        let container_guard = self
+            .container_lifecycle_lock(&id)
+            .await
+            .try_write_owned()
+            .map_err(|_| OciError::ContainerAlreadyExists { id: id.clone() })?;
+        let os_guard = self
+            .container_store
+            .try_acquire_container_write_lease(&id)
+            .map_err(|error| Self::map_container_store_error(&id, error))?;
+        self.observe_lifecycle_admission(
+            RuntimeLifecycleAdmissionKind::CreateBeforeReservation,
+            &id,
+        )
+        .await;
+        let generation = self
+            .container_store
+            .reserve_generation_with_write_lease(&id, &os_guard)
+            .map_err(|error| Self::map_container_store_error(&id, error))?;
+        self.setup_restored_containers.lock().await.remove(&id);
+        self.oci_deleted_pending_overlay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+        Ok(ContainerLifecycleTransaction {
+            lease: Some(ContainerLifecycleLease {
+                container_id: id,
+                generation,
+                container_store: self.container_store.clone(),
+                _os_guard: os_guard,
+                _stack_guard: stack_guard,
+                _container_guard: container_guard,
+            }),
+        })
+    }
+
+    async fn begin_existing_container(
+        &self,
+        id: &str,
+    ) -> Result<ContainerLifecycleTransaction, OciError> {
+        loop {
+            let routed_stack = self.container_stack.lock().await.get(id).cloned();
+            let stack_guard = if let Some(stack_id) = routed_stack.as_deref() {
+                Some(self.stack_lifecycle_lock(stack_id).await.read_owned().await)
+            } else {
+                None
+            };
+            let container_guard = self.container_lifecycle_lock(id).await.write_owned().await;
+            let current_stack = self.container_stack.lock().await.get(id).cloned();
+            if current_stack != routed_stack {
+                drop(container_guard);
+                drop(stack_guard);
+                continue;
+            }
+            // Cross-process admission precedes durable generation lookup.
+            let os_guard = self.acquire_container_os_write(id).await?;
+            let generation = self
+                .container_store
+                .current_generation(id)
+                .map_err(|error| Self::map_container_store_error(id, error))?
+                .ok_or_else(|| OciError::ContainerNotFound { id: id.to_string() })?;
+            return Ok(ContainerLifecycleTransaction {
+                lease: Some(ContainerLifecycleLease {
+                    container_id: id.to_string(),
+                    generation,
+                    container_store: self.container_store.clone(),
+                    _os_guard: os_guard,
+                    _stack_guard: stack_guard,
+                    _container_guard: container_guard,
+                }),
+            });
+        }
+    }
+
+    /// Run blocking layer assembly while the worker itself owns the lifecycle
+    /// lease. If this async caller is cancelled, the worker conditionally removes
+    /// its completed rootfs before releasing the ID; a replacement generation can
+    /// therefore never overlap the old writer.
+    async fn assemble_rootfs_in_transaction(
+        &self,
+        image_id: &str,
+        transaction: &mut ContainerLifecycleTransaction,
+    ) -> Result<PathBuf, OciError> {
+        let store = self.store.clone();
+        let image_id = image_id.to_string();
+        let container_id = transaction.container_id().to_string();
+        let generation = transaction.generation();
+        let lease = transaction.take_lease();
+        let (sender, receiver) = oneshot::channel();
+
+        tokio::task::spawn_blocking(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                store.assemble_rootfs_structured(&image_id, &container_id)
+            }))
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::other(
+                    "rootfs assembly worker panicked while holding lifecycle ownership",
+                ))
+            });
+            let returned = RootfsAssemblyReturn {
+                container_store: lease.container_store.clone(),
+                container_id,
+                generation,
+                lease: Some(lease),
+                result: Some(result),
+            };
+            // When the receiver disappeared either before or after send, the
+            // returned payload's Drop owns conditional cleanup and lease release.
+            let _ = sender.send(returned);
+        });
+
+        let returned = receiver.await.map_err(|error| {
+            OciError::Storage(std::io::Error::other(format!(
+                "rootfs assembly worker terminated without returning ownership: {error}"
+            )))
+        })?;
+        let (lease, result) = returned.into_parts();
+        transaction.restore_lease(lease);
+        result.map_err(OciError::from)
+    }
+
+    fn persist_owned(
+        &self,
+        transaction: &ContainerLifecycleTransaction,
+        container: ContainerInfo,
+    ) -> Result<(), OciError> {
+        let container_id = container.id.clone();
+        self.container_store
+            .upsert_if_generation(container, transaction.generation())
+            .map_err(|error| Self::map_container_store_error(&container_id, error))
+    }
+
+    fn cleanup_owned_rootfs(&self, transaction: &ContainerLifecycleTransaction, rootfs: &Path) {
+        if self
+            .container_store
+            .current_generation(transaction.container_id())
+            .is_ok_and(|current| current == Some(transaction.generation()))
+        {
+            self.cleanup_rootfs_dir(rootfs);
+        }
+    }
+
     /// Return configured data directory.
     /// Whether the named container's overlay upperdir was pre-populated
     /// from a cached setup-commit tarball at creation time. Backends use
     /// this to decide whether to skip `run_setup_commands`.
-    pub async fn was_setup_restored(&self, container_id: &str) -> bool {
+    pub async fn was_setup_restored(&self, container_id: &str, commit_ref: &str) -> bool {
+        let current = self
+            .container_store
+            .current_generation(container_id)
+            .ok()
+            .flatten();
         self.setup_restored_containers
             .lock()
             .await
-            .contains(container_id)
+            .get(container_id)
+            .is_some_and(|identity| {
+                Some(identity.generation) == current && identity.commit_ref == commit_ref
+            })
     }
 
     pub fn data_dir(&self) -> &PathBuf {
         &self.config.data_dir
+    }
+
+    /// Snapshot durable reservations and process-local lifecycle maps.
+    pub async fn lifecycle_diagnostics(&self) -> Result<RuntimeLifecycleDiagnostics, OciError> {
+        let generations = self
+            .container_store
+            .generation_diagnostics()
+            .map_err(OciError::from)?;
+        let rootfs_directories = fs::read_dir(self.config.data_dir.join("rootfs"))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.path().is_dir())
+                    .count()
+            })
+            .unwrap_or(0);
+        Ok(RuntimeLifecycleDiagnostics {
+            generations,
+            container_lock_slots: self.container_lifecycle_locks.lock().await.len(),
+            stack_lock_slots: self.stack_lifecycle_locks.lock().await.len(),
+            vm_handles: self.vm_handles.lock().await.len(),
+            container_routes: self.container_stack.lock().await.len(),
+            exec_bindings: self.container_exec_bindings.lock().await.len(),
+            active_lifecycles: self.active_lifecycle.lock().await.len(),
+            exec_sessions: self.exec_sessions.lock().await.len(),
+            setup_restore_entries: self.setup_restored_containers.lock().await.len(),
+            overlay_cleanup_pending: self
+                .oci_deleted_pending_overlay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            rootfs_directories,
+        })
     }
 
     /// Clone the runtime configuration used by this runtime instance.
@@ -359,16 +901,23 @@ impl Runtime {
     /// If a VM handle is still active for this container, sends an OCI delete
     /// to the guest runtime before cleaning up host metadata.
     pub async fn remove_container(&self, id: &str) -> Result<(), OciError> {
+        let transaction = self.begin_existing_container(id).await?;
+        self.observe_lifecycle_admission(RuntimeLifecycleAdmissionKind::RemoveWriterAcquired, id)
+            .await;
+        self.remove_container_in_transaction(id, &transaction).await
+    }
+
+    pub(crate) async fn remove_container_in_transaction(
+        &self,
+        id: &str,
+        transaction: &ContainerLifecycleTransaction,
+    ) -> Result<(), OciError> {
+        debug_assert_eq!(id, transaction.container_id());
         let containers = self.container_store.load_all().map_err(OciError::from)?;
         let container = containers
             .into_iter()
             .find(|container| container.id == id)
-            .ok_or_else(|| {
-                OciError::Storage(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("container '{id}' not found"),
-                ))
-            })?;
+            .ok_or_else(|| OciError::ContainerNotFound { id: id.to_string() })?;
 
         if matches!(container.status, ContainerStatus::Running) {
             return Err(OciError::InvalidConfig(format!(
@@ -392,36 +941,77 @@ impl Runtime {
         // (the per-container handle may have been removed by stop_container).
         let vm = self.vm_handles.lock().await.get(id).cloned();
         let stack_id = self.container_stack.lock().await.get(id).cloned();
-        if let Some(vm) = vm {
-            vm.oci_delete(id.to_string(), true).await.map_err(|error| {
-                OciError::InvalidConfig(format!(
-                    "cannot remove container '{id}': OCI delete failed; retained metadata, recovery routing, and rootfs for retry: {error}"
-                ))
-            })?;
-            tracing::debug!(container_id = %id, "remove_container: oci_delete via vm_handle succeeded");
-        } else if let Some(sid) = &stack_id {
-            if let Some(vm) = self.stack_vms.lock().await.get(sid) {
+        let activation_guard = if let Some(stack_id) = stack_id.as_deref() {
+            Some(self.acquire_stack_activation_guard(stack_id).await)
+        } else {
+            None
+        };
+        let guest_vm = if vm.is_some() {
+            vm
+        } else if let Some(stack_id) = stack_id.as_deref() {
+            self.stack_vms.lock().await.get(stack_id).cloned()
+        } else {
+            None
+        };
+        if let Some(vm) = guest_vm {
+            if stack_id.is_some() {
+                let already_deleted = self.overlay_cleanup_is_pending(id, transaction.generation());
+                if !already_deleted {
+                    vm.oci_delete(id.to_string(), true).await.map_err(|error| {
+                        OciError::InvalidConfig(format!(
+                            "cannot remove container '{id}': OCI delete failed; retained metadata, recovery routing, and rootfs for retry: {error}"
+                        ))
+                    })?;
+                    // Synchronous marker closes the cancellation window between
+                    // successful deletion and the fallible overlay RPC.
+                    self.mark_overlay_cleanup_pending(id, transaction.generation());
+                }
+                if let Err(overlay_error) = self
+                    .teardown_owned_stack_container_overlay(&vm, id, transaction.generation())
+                    .await
+                {
+                    return Err(OciError::InvalidConfig(format!(
+                        "cannot remove container '{id}': shared-VM overlay teardown failed; retained metadata, recovery routing, and rootfs for retry: {overlay_error}"
+                    )));
+                }
+                self.clear_overlay_cleanup_pending(id);
+            } else {
                 vm.oci_delete(id.to_string(), true).await.map_err(|error| {
                     OciError::InvalidConfig(format!(
-                        "cannot remove container '{id}' from stack '{sid}': OCI delete failed; retained metadata, recovery routing, and rootfs for retry: {error}"
+                        "cannot remove container '{id}': OCI delete failed; retained metadata, recovery routing, and rootfs for retry: {error}"
                     ))
                 })?;
-                tracing::debug!(container_id = %id, stack_id = %sid, "remove_container: oci_delete via stack_vm succeeded");
-            } else {
-                tracing::warn!(container_id = %id, stack_id = %sid, "remove_container: stack_vm not found");
             }
+            tracing::debug!(container_id = %id, "remove_container: guest cleanup succeeded");
+        } else if let Some(stack_id) = stack_id.as_deref() {
+            tracing::warn!(container_id = %id, %stack_id, "remove_container: stack VM not found; guest overlay disappeared with the VM");
         } else {
             tracing::debug!(container_id = %id, "remove_container: no vm_handle or stack_id, skipping oci_delete");
         }
+        drop(activation_guard);
+        self.clear_overlay_cleanup_pending(id);
         self.vm_handles.lock().await.remove(id);
         self.container_stack.lock().await.remove(id);
         self.active_lifecycle.lock().await.remove(id);
-
-        self.container_store.remove(id).map_err(OciError::from)?;
+        self.setup_restored_containers.lock().await.remove(id);
 
         if let Some(path) = container.rootfs_path {
-            let _ = fs::remove_dir_all(path);
+            if self
+                .container_store
+                .current_generation(transaction.container_id())
+                .is_ok_and(|current| current == Some(transaction.generation()))
+                && path.exists()
+            {
+                fs::remove_dir_all(path).map_err(OciError::from)?;
+            }
         }
+
+        // Release the durable name only after generation-owned artifacts are
+        // gone. Another process cannot reserve the next generation while the
+        // sidecar remains reserved above.
+        self.container_store
+            .remove_if_generation(id, transaction.generation())
+            .map_err(|error| Self::map_container_store_error(id, error))?;
 
         Ok(())
     }
@@ -440,24 +1030,38 @@ impl Runtime {
         signal: Option<&str>,
         grace_period: Option<Duration>,
     ) -> Result<ContainerInfo, OciError> {
+        self.observe_lifecycle_admission(RuntimeLifecycleAdmissionKind::StopWriterRequested, id)
+            .await;
+        let transaction = self.begin_existing_container(id).await?;
+        self.observe_lifecycle_admission(RuntimeLifecycleAdmissionKind::StopWriterAcquired, id)
+            .await;
+        self.stop_container_in_transaction(id, force, signal, grace_period, &transaction)
+            .await
+    }
+
+    pub(crate) async fn stop_container_in_transaction(
+        &self,
+        id: &str,
+        force: bool,
+        signal: Option<&str>,
+        grace_period: Option<Duration>,
+        transaction: &ContainerLifecycleTransaction,
+    ) -> Result<ContainerInfo, OciError> {
+        debug_assert_eq!(id, transaction.container_id());
         let mut container = self
             .container_store
             .load_all()
             .map_err(OciError::from)?
             .into_iter()
             .find(|item| item.id == id)
-            .ok_or_else(|| {
-                OciError::Storage(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("container '{id}' not found"),
-                ))
-            })?;
+            .ok_or_else(|| OciError::ContainerNotFound { id: id.to_string() })?;
 
         if !matches!(container.status, ContainerStatus::Running) {
             self.container_exec_bindings.lock().await.remove(id);
             self.active_lifecycle.lock().await.remove(id);
             self.stop_log_rotation_task(id).await;
             self.vm_handles.lock().await.remove(id);
+            self.setup_restored_containers.lock().await.remove(id);
             return Ok(container);
         }
 
@@ -477,34 +1081,66 @@ impl Runtime {
                 ))
             })?;
 
+        let stack_id = self.container_stack.lock().await.get(id).cloned();
+        let is_stack_container = stack_id.is_some();
+        let activation_guard = if let Some(stack_id) = stack_id.as_deref() {
+            Some(self.acquire_stack_activation_guard(stack_id).await)
+        } else {
+            None
+        };
         let effective_grace = grace_period.unwrap_or(STOP_GRACE_PERIOD);
         let exit_code = stop_via_oci_runtime(&*vm, id, force, effective_grace, signal).await?;
         let lifecycle = self.active_lifecycle.lock().await.remove(id);
         self.stop_log_rotation_task(id).await;
 
-        // Best-effort OCI delete.
-        let delete_succeeded = match vm.oci_delete(id.to_string(), true).await {
-            Ok(_) => {
-                tracing::debug!(container_id = %id, "stop_container: oci_delete succeeded");
-                true
+        if let Err(error) = vm.oci_delete(id.to_string(), true).await {
+            container.host_pid = None;
+            container.status = ContainerStatus::Stopped { exit_code };
+            container.stopped_unix_secs = Some(current_unix_secs());
+            let persist_error = self.persist_owned(transaction, container.clone()).err();
+            let mut message = format!(
+                "cannot stop container '{id}': OCI delete failed; retained VM and stack routing for cleanup retry: {error}"
+            );
+            if let Some(persist_error) = persist_error {
+                message.push_str(&format!(
+                    "; could not persist stopped state: {persist_error}"
+                ));
             }
-            Err(e) => {
-                tracing::warn!(container_id = %id, error = %e, "stop_container: oci_delete failed; retaining stack routing for remove retry");
-                false
+            return Err(OciError::InvalidConfig(message));
+        }
+        tracing::debug!(container_id = %id, "stop_container: oci_delete succeeded");
+
+        if is_stack_container {
+            self.mark_overlay_cleanup_pending(id, transaction.generation());
+            if let Err(error) = self
+                .teardown_owned_stack_container_overlay(&vm, id, transaction.generation())
+                .await
+            {
+                container.host_pid = None;
+                container.status = ContainerStatus::Stopped { exit_code };
+                container.stopped_unix_secs = Some(current_unix_secs());
+                let persist_error = self.persist_owned(transaction, container.clone()).err();
+                let mut message = format!(
+                    "container '{id}' stopped and OCI state was deleted, but shared-VM overlay teardown failed; retained VM, stack routing, metadata, and rootfs for cleanup retry: {error}"
+                );
+                if let Some(persist_error) = persist_error {
+                    message.push_str(&format!(
+                        "; could not persist stopped state: {persist_error}"
+                    ));
+                }
+                return Err(OciError::InvalidConfig(message));
             }
-        };
+            self.clear_overlay_cleanup_pending(id);
+        }
+        drop(activation_guard);
 
         // Only tear down the VM if the container does NOT belong to a shared stack VM.
-        let is_stack_container = self.container_stack.lock().await.contains_key(id);
         if !is_stack_container {
             let _ = vm.stop().await;
         }
         self.vm_handles.lock().await.remove(id);
-        if delete_succeeded {
-            // Avoid issuing a duplicate delete from remove_container. On
-            // failure, retain the stack route so remove can retry safely.
-            self.container_stack.lock().await.remove(id);
-        }
+        self.setup_restored_containers.lock().await.remove(id);
+        self.container_stack.lock().await.remove(id);
 
         // Shut down port forwarding for this container.
         if let Some(pf) = self.port_forwards.lock().await.remove(id) {
@@ -524,14 +1160,12 @@ impl Runtime {
         container.host_pid = None;
         container.status = ContainerStatus::Stopped { exit_code };
         container.stopped_unix_secs = Some(current_unix_secs());
-        self.container_store
-            .upsert(container.clone())
-            .map_err(OciError::from)?;
+        self.persist_owned(transaction, container.clone())?;
 
         if lifecycle.is_some_and(|state| state.auto_remove) {
             // Keep one-off semantics best-effort: cleanup failure should not
             // mask a successful stop result.
-            if let Err(err) = self.remove_container(id).await {
+            if let Err(err) = self.remove_container_in_transaction(id, transaction).await {
                 warn!(container_id = %id, error = %err, "auto-remove cleanup failed after stop");
             }
         }
@@ -559,14 +1193,24 @@ impl Runtime {
     }
 
     /// Pull an image, assemble its rootfs and execute a command.
-    pub async fn run(&self, image: &str, run: RunConfig) -> Result<ExecOutput, OciError> {
+    pub async fn run(&self, image: &str, mut run: RunConfig) -> Result<ExecOutput, OciError> {
+        let mut transaction = self.begin_container_create(&mut run, None).await?;
+        self.run_in_transaction(image, run, &mut transaction).await
+    }
+
+    async fn run_in_transaction(
+        &self,
+        image: &str,
+        run: RunConfig,
+        transaction: &mut ContainerLifecycleTransaction,
+    ) -> Result<ExecOutput, OciError> {
         if matches!(Self::select_backend(image, false), RuntimeBackend::MacOS) {
             return Err(OciError::InvalidConfig(
                 "macos backend is not supported by Runtime::run".to_string(),
             ));
         }
 
-        let container_id = run.container_id.clone().unwrap_or_else(new_container_id);
+        let container_id = transaction.container_id().to_string();
         validate_container_id(&container_id)?;
         let image_id = self.pull(image).await?;
 
@@ -583,16 +1227,10 @@ impl Runtime {
             host_pid: Some(process::id()),
         };
 
-        self.container_store
-            .upsert(container.clone())
-            .map_err(OciError::from)?;
+        self.persist_owned(transaction, container.clone())?;
 
-        // Spawn rootfs assembly in background so image config parsing runs
-        // concurrently with the heavy layer extraction I/O.
-        let rootfs_handle = self.store.spawn_assemble_rootfs(&image_id.0, &container_id);
-
-        // Parse image config concurrently with rootfs assembly (reads from
-        // local store, no dependency on assembled rootfs).
+        // Resolve fallible config before starting assembly. Assembly is kept in
+        // this transaction instead of a detached spawn_blocking task.
         let image_config = parse_image_config_summary_from_store(&self.store, &image_id.0)?;
         let run = resolve_run_config(image_config, run, &container_id)?;
         let lifecycle = resolve_container_lifecycle(
@@ -601,32 +1239,19 @@ impl Runtime {
             true,
         )?;
 
-        // Await rootfs assembly before proceeding to VM boot.
-        let rootfs_dir = match rootfs_handle.await {
-            Ok(Ok(rootfs_dir)) => rootfs_dir,
-            Ok(Err(err)) => {
+        let rootfs_dir = match self
+            .assemble_rootfs_in_transaction(&image_id.0, transaction)
+            .await
+        {
+            Ok(rootfs_dir) => rootfs_dir,
+            Err(err) => {
                 container.status = ContainerStatus::Stopped { exit_code: -1 };
                 container.stopped_unix_secs = Some(current_unix_secs());
                 container.host_pid = None;
-                self.container_store
-                    .upsert(container)
-                    .map_err(OciError::from)?;
-                self.finalize_one_off_cleanup(&container_id, lifecycle.auto_remove)
+                self.persist_owned(transaction, container)?;
+                self.finalize_one_off_cleanup(&container_id, lifecycle.auto_remove, transaction)
                     .await;
-                return Err(err.into());
-            }
-            Err(join_err) => {
-                container.status = ContainerStatus::Stopped { exit_code: -1 };
-                container.stopped_unix_secs = Some(current_unix_secs());
-                container.host_pid = None;
-                self.container_store
-                    .upsert(container)
-                    .map_err(OciError::from)?;
-                self.finalize_one_off_cleanup(&container_id, lifecycle.auto_remove)
-                    .await;
-                return Err(OciError::Storage(std::io::Error::other(
-                    join_err.to_string(),
-                )));
+                return Err(err);
             }
         };
 
@@ -634,9 +1259,7 @@ impl Runtime {
         container.status = ContainerStatus::Running;
         container.started_unix_secs = Some(current_unix_secs());
         container.host_pid = Some(process::id());
-        self.container_store
-            .upsert(container.clone())
-            .map_err(OciError::from)?;
+        self.persist_owned(transaction, container.clone())?;
         self.track_active_lifecycle(container_id.clone(), lifecycle)
             .await;
 
@@ -650,7 +1273,7 @@ impl Runtime {
 
         // Deregister VM handle after run completes.
         self.vm_handles.lock().await.remove(&container_id);
-        self.cleanup_rootfs_dir(rootfs_dir.as_ref());
+        self.cleanup_owned_rootfs(transaction, rootfs_dir.as_ref());
 
         container.status = match &output {
             Ok(exec_output) => ContainerStatus::Stopped {
@@ -661,10 +1284,8 @@ impl Runtime {
         container.stopped_unix_secs = Some(current_unix_secs());
         container.host_pid = None;
 
-        self.container_store
-            .upsert(container)
-            .map_err(OciError::from)?;
-        self.finalize_one_off_cleanup(&container_id, lifecycle.auto_remove)
+        self.persist_owned(transaction, container)?;
+        self.finalize_one_off_cleanup(&container_id, lifecycle.auto_remove, transaction)
             .await;
 
         output
@@ -679,14 +1300,29 @@ impl Runtime {
     /// [`remove_container`](Self::remove_container).
     ///
     /// Returns the container identifier.
-    pub async fn create_container(&self, image: &str, run: RunConfig) -> Result<String, OciError> {
+    pub async fn create_container(
+        &self,
+        image: &str,
+        mut run: RunConfig,
+    ) -> Result<String, OciError> {
+        let mut transaction = self.begin_container_create(&mut run, None).await?;
+        self.create_container_in_transaction(image, run, &mut transaction)
+            .await
+    }
+
+    pub(crate) async fn create_container_in_transaction(
+        &self,
+        image: &str,
+        run: RunConfig,
+        transaction: &mut ContainerLifecycleTransaction,
+    ) -> Result<String, OciError> {
         if matches!(Self::select_backend(image, false), RuntimeBackend::MacOS) {
             return Err(OciError::InvalidConfig(
                 "macos backend is not supported by Runtime::create_container".to_string(),
             ));
         }
 
-        let container_id = run.container_id.clone().unwrap_or_else(new_container_id);
+        let container_id = transaction.container_id().to_string();
         validate_container_id(&container_id)?;
         let image_id = self.pull(image).await?;
 
@@ -703,15 +1339,8 @@ impl Runtime {
             host_pid: Some(process::id()),
         };
 
-        self.container_store
-            .upsert(container.clone())
-            .map_err(OciError::from)?;
+        self.persist_owned(transaction, container.clone())?;
 
-        // Spawn rootfs assembly in background so image config parsing runs
-        // concurrently with the heavy layer extraction I/O.
-        let rootfs_handle = self.store.spawn_assemble_rootfs(&image_id.0, &container_id);
-
-        // Parse image config concurrently with rootfs assembly.
         let image_config = parse_image_config_summary_from_store(&self.store, &image_id.0)?;
         let run = resolve_run_config(image_config, run, &container_id)?;
         let lifecycle = resolve_container_lifecycle(
@@ -720,35 +1349,22 @@ impl Runtime {
             false,
         )?;
 
-        // Await rootfs assembly before booting the VM.
-        let rootfs_dir = match rootfs_handle.await {
-            Ok(Ok(rootfs_dir)) => rootfs_dir,
-            Ok(Err(err)) => {
+        let rootfs_dir = match self
+            .assemble_rootfs_in_transaction(&image_id.0, transaction)
+            .await
+        {
+            Ok(rootfs_dir) => rootfs_dir,
+            Err(err) => {
                 container.status = ContainerStatus::Stopped { exit_code: -1 };
                 container.stopped_unix_secs = Some(current_unix_secs());
                 container.host_pid = None;
-                self.container_store
-                    .upsert(container)
-                    .map_err(OciError::from)?;
-                return Err(err.into());
-            }
-            Err(join_err) => {
-                container.status = ContainerStatus::Stopped { exit_code: -1 };
-                container.stopped_unix_secs = Some(current_unix_secs());
-                container.host_pid = None;
-                self.container_store
-                    .upsert(container)
-                    .map_err(OciError::from)?;
-                return Err(OciError::Storage(std::io::Error::other(
-                    join_err.to_string(),
-                )));
+                self.persist_owned(transaction, container)?;
+                return Err(err);
             }
         };
 
         container.rootfs_path = Some(rootfs_dir.clone());
-        self.container_store
-            .upsert(container.clone())
-            .map_err(OciError::from)?;
+        self.persist_owned(transaction, container.clone())?;
 
         match self
             .boot_and_start_container(&rootfs_dir, &run, &container_id)
@@ -758,9 +1374,7 @@ impl Runtime {
                 container.status = ContainerStatus::Running;
                 container.started_unix_secs = Some(current_unix_secs());
                 container.host_pid = Some(process::id());
-                self.container_store
-                    .upsert(container)
-                    .map_err(OciError::from)?;
+                self.persist_owned(transaction, container)?;
                 self.track_active_lifecycle(container_id.clone(), lifecycle)
                     .await;
                 self.container_exec_bindings.lock().await.insert(
@@ -768,6 +1382,7 @@ impl Runtime {
                     ContainerExecBinding {
                         vm,
                         defaults: ContainerExecDefaults::from(&run),
+                        generation: transaction.generation(),
                     },
                 );
                 Ok(container_id)
@@ -776,10 +1391,8 @@ impl Runtime {
                 container.status = ContainerStatus::Stopped { exit_code: -1 };
                 container.stopped_unix_secs = Some(current_unix_secs());
                 container.host_pid = None;
-                self.container_store
-                    .upsert(container)
-                    .map_err(OciError::from)?;
-                self.cleanup_rootfs_dir(rootfs_dir.as_ref());
+                self.persist_owned(transaction, container)?;
+                self.cleanup_owned_rootfs(transaction, rootfs_dir.as_ref());
                 Err(err)
             }
         }

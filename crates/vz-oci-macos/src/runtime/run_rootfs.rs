@@ -587,7 +587,12 @@ impl Runtime {
         }
     }
 
-    pub(super) async fn finalize_one_off_cleanup(&self, container_id: &str, auto_remove: bool) {
+    pub(super) async fn finalize_one_off_cleanup(
+        &self,
+        container_id: &str,
+        auto_remove: bool,
+        transaction: &ContainerLifecycleTransaction,
+    ) {
         self.active_lifecycle.lock().await.remove(container_id);
         self.stop_log_rotation_task(container_id).await;
         self.container_exec_bindings
@@ -596,7 +601,10 @@ impl Runtime {
             .remove(container_id);
 
         if auto_remove {
-            if let Err(err) = self.remove_container(container_id).await {
+            if let Err(err) = self
+                .remove_container_in_transaction(container_id, transaction)
+                .await
+            {
                 warn!(
                     container_id = %container_id,
                     error = %err,
@@ -646,6 +654,19 @@ impl Runtime {
 
             let path = entry.path();
             if !path.is_dir() {
+                continue;
+            }
+
+            // A create transaction publishes its durable generation before
+            // assembly and may not yet have persisted rootfs_path. Never let
+            // startup orphan cleanup race that generation's active writer.
+            let container_id = entry.file_name();
+            if let Some(container_id) = container_id.to_str()
+                && self
+                    .container_store
+                    .current_generation(container_id)
+                    .is_ok_and(|generation| generation.is_some())
+            {
                 continue;
             }
 

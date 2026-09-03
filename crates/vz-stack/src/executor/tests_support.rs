@@ -81,14 +81,23 @@ impl MockContainerRuntime {
 
     /// Generate a deterministic container ID from the RunConfig.
     ///
-    /// Uses `config.container_id` (set to service name by the executor)
-    /// so that IDs are deterministic regardless of parallel execution order.
-    /// Falls back to cycling through `container_ids` if not set.
+    /// Uses the service network-namespace basename so existing executor tests
+    /// retain short, readable fixture IDs even though production requests now
+    /// carry stack-namespaced runtime IDs. Falls back to the requested runtime
+    /// ID, then cycles through `container_ids`.
     fn next_id(&self, config: &vz_runtime_contract::RunConfig) -> String {
         config
-            .container_id
-            .as_ref()
+            .network_namespace_path
+            .as_deref()
+            .and_then(|path| path.rsplit('/').next())
+            .filter(|name| !name.is_empty())
             .map(|name| format!("ctr-{name}"))
+            .or_else(|| {
+                config
+                    .container_id
+                    .as_ref()
+                    .map(|name| format!("ctr-{name}"))
+            })
             .unwrap_or_else(|| {
                 let idx = self.create_counter.fetch_add(1, Ordering::SeqCst);
                 self.container_ids[idx % self.container_ids.len()].clone()

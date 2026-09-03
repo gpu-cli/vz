@@ -80,19 +80,95 @@ fn exec_control_debug_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn kernel_object_identity(identity: vz_linux::KernelObjectIdentity) -> KernelObjectIdentity {
+    KernelObjectIdentity {
+        device: identity.device,
+        inode: identity.inode,
+    }
+}
+
+pub(super) fn container_ready_generation(
+    expected_container_id: &str,
+    lifecycle_generation: ContainerGeneration,
+    guest: vz_linux::ContainerGeneration,
+) -> Result<ContainerReadyGeneration, OciError> {
+    if guest.container_id != expected_container_id {
+        return Err(OciError::InvalidConfig(format!(
+            "container readiness identity mismatch: requested '{expected_container_id}', guest acknowledged '{}'",
+            guest.container_id
+        )));
+    }
+    let cgroup = guest.cgroup.ok_or_else(|| {
+        OciError::InvalidConfig("container readiness omitted cgroup identity".to_string())
+    })?;
+    let namespaces = guest.namespaces.ok_or_else(|| {
+        OciError::InvalidConfig("container readiness omitted namespace identities".to_string())
+    })?;
+    let required = |name: &str, identity: Option<vz_linux::KernelObjectIdentity>| {
+        identity.map(kernel_object_identity).ok_or_else(|| {
+            OciError::InvalidConfig(format!("container readiness omitted {name} identity"))
+        })
+    };
+    Ok(ContainerReadyGeneration {
+        lifecycle_generation: lifecycle_generation.0,
+        container_id: guest.container_id,
+        init_pid: guest.init_pid,
+        init_start_time: guest.init_start_time,
+        cgroup_path: guest.cgroup_path,
+        cgroup: kernel_object_identity(cgroup),
+        namespaces: ContainerNamespaceIdentity {
+            mount: required("mount namespace", namespaces.mount)?,
+            network: required("network namespace", namespaces.network)?,
+            pid: required("PID namespace", namespaces.pid)?,
+            ipc: required("IPC namespace", namespaces.ipc)?,
+            uts: required("UTS namespace", namespaces.uts)?,
+        },
+        root: required("root", guest.root)?,
+    })
+}
+
 impl Runtime {
     async fn resolve_exec_binding(
         &self,
         container_id: &str,
         exec: &ExecConfig,
-    ) -> Result<(Arc<LinuxVm>, ExecOptions), OciError> {
+    ) -> Result<(Arc<LinuxVm>, ExecOptions, ContainerGeneration), OciError> {
         let binding = self
             .container_exec_bindings
             .lock()
             .await
             .get(container_id)
             .cloned();
-        resolve_container_exec_binding(container_id, binding.as_ref(), exec)
+        let generation = match binding.as_ref() {
+            Some(binding) => binding.generation,
+            None => {
+                return if self
+                    .container_store
+                    .find(container_id)
+                    .map_err(|error| Self::map_container_store_error(container_id, error))?
+                    .is_some()
+                {
+                    Err(OciError::InvalidConfig(format!(
+                        "container '{container_id}' has no active exec binding and may not be running"
+                    )))
+                } else {
+                    Err(OciError::ContainerNotFound {
+                        id: container_id.to_string(),
+                    })
+                };
+            }
+        };
+        let current_generation = self
+            .container_store
+            .current_generation(container_id)
+            .map_err(|error| Self::map_container_store_error(container_id, error))?;
+        if current_generation != Some(generation) {
+            return Err(OciError::ContainerNotFound {
+                id: container_id.to_string(),
+            });
+        }
+        let (vm, options) = resolve_container_exec_binding(container_id, binding.as_ref(), exec)?;
+        Ok((vm, options, generation))
     }
 
     pub async fn exec_container(&self, id: &str, exec: ExecConfig) -> Result<ExecOutput, OciError> {
@@ -105,7 +181,38 @@ impl Runtime {
         &self,
         id: &str,
         exec: ExecConfig,
+        on_event: F,
+    ) -> Result<ExecOutput, OciError>
+    where
+        F: FnMut(InteractiveExecEvent),
+    {
+        let admission_guard = self.acquire_container_read_admission(id).await?;
+        self.observe_lifecycle_admission(
+            super::RuntimeLifecycleAdmissionKind::ExecBeforeGuestRpc,
+            id,
+        )
+        .await;
+        self.exec_container_streaming_admitted(id, exec, on_event, Some(admission_guard))
+            .await
+    }
+
+    pub(crate) async fn exec_container_in_transaction(
+        &self,
+        id: &str,
+        exec: ExecConfig,
+        transaction: &ContainerLifecycleTransaction,
+    ) -> Result<ExecOutput, OciError> {
+        debug_assert_eq!(id, transaction.container_id());
+        self.exec_container_streaming_admitted(id, exec, |_| {}, None)
+            .await
+    }
+
+    async fn exec_container_streaming_admitted<F>(
+        &self,
+        id: &str,
+        exec: ExecConfig,
         mut on_event: F,
+        mut admission_guard: Option<ContainerReadAdmission>,
     ) -> Result<ExecOutput, OciError>
     where
         F: FnMut(InteractiveExecEvent),
@@ -118,7 +225,7 @@ impl Runtime {
 
         let timeout = exec.timeout.unwrap_or(self.config.exec_timeout);
         let execution_id = exec.execution_id.clone();
-        let (vm, options) = self.resolve_exec_binding(id, &exec).await?;
+        let (vm, options, lifecycle_generation) = self.resolve_exec_binding(id, &exec).await?;
 
         if exec.pty {
             let Some(execution_id) = execution_id else {
@@ -162,9 +269,9 @@ impl Runtime {
                     command, args, term_rows, term_cols
                 );
             }
-            let (mut stream, guest_exec_id) = tokio::time::timeout(
+            let (mut stream, guest_exec_id, guest_generation) = tokio::time::timeout(
                 timeout,
-                vm.exec_container_interactive(
+                vm.exec_container_interactive_ready(
                     id.to_string(),
                     command,
                     &arg_refs,
@@ -180,6 +287,14 @@ impl Runtime {
                     timeout.as_secs_f64()
                 ))
             })??;
+            let ready = container_ready_generation(id, lifecycle_generation, guest_generation)?;
+            if admission_guard.is_some() {
+                self.observe_lifecycle_admission(
+                    super::RuntimeLifecycleAdmissionKind::ExecGuestReady,
+                    id,
+                )
+                .await;
+            }
             if debug {
                 debug!(
                     "[vz-oci-macos exec-control] interactive exec guest exec RPC ready execution_id={execution_id} guest_exec_id={guest_exec_id}"
@@ -194,6 +309,10 @@ impl Runtime {
                     pty_enabled: true,
                 },
             );
+            // Publish readiness only after control-plane registration, and never
+            // invoke caller code while holding host lifecycle admission.
+            drop(admission_guard.take());
+            on_event(InteractiveExecEvent::ContainerReady(ready));
 
             let stream_result = tokio::time::timeout(timeout, async {
                 let mut stdout = Vec::new();
@@ -250,14 +369,24 @@ impl Runtime {
         }
 
         tokio::time::timeout(timeout, async {
-            let mut stream = vm
-                .exec_container_stream_with_options(
+            let (mut stream, guest_generation) = vm
+                .exec_container_stream_ready_with_options(
                     id.to_string(),
                     command.clone(),
                     args.to_vec(),
                     options,
                 )
                 .await?;
+            let ready = container_ready_generation(id, lifecycle_generation, guest_generation)?;
+            if admission_guard.is_some() {
+                self.observe_lifecycle_admission(
+                    super::RuntimeLifecycleAdmissionKind::ExecGuestReady,
+                    id,
+                )
+                .await;
+            }
+            drop(admission_guard.take());
+            on_event(InteractiveExecEvent::ContainerReady(ready));
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             let mut saw_exit = false;
@@ -318,7 +447,8 @@ impl Runtime {
             .split_first()
             .ok_or_else(|| OciError::InvalidConfig("exec command must not be empty".to_string()))?;
         let timeout = exec.timeout.unwrap_or(self.config.exec_timeout);
-        let (vm, options) = self.resolve_exec_binding(id, &exec).await?;
+        let _admission_guard = self.acquire_container_read_admission(id).await?;
+        let (vm, options, _) = self.resolve_exec_binding(id, &exec).await?;
         tokio::time::timeout(
             timeout,
             vm.oci_exec(

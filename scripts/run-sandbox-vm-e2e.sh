@@ -37,7 +37,8 @@ Options:
                               default: sandbox (runtime + stack)
   --scenario <name>           Run named use-case scenario(s) (repeatable/comma-separated)
                               names:
-                                runtime-smoke, runtime-lifecycle, runtime-exec-semantics,
+                                runtime-smoke, runtime-lifecycle, runtime-container-id-ownership,
+                                runtime-exec-semantics,
                                 runtime-exec-defaults,
                                 runtime-port-forwarding, runtime-shared-vm-net, stack-real-services,
                                 stack-control-socket, stack-port-forwarding,
@@ -135,12 +136,13 @@ expand_scenario_token() {
         case "$part" in
             "")
                 ;;
-            runtime-smoke|runtime-lifecycle|runtime-exec-semantics|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net|stack-real-services|stack-control-socket|stack-port-forwarding|stack-snapshot-restore|stack-user-journey-checkpoint|buildkit-roundtrip)
+            runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net|stack-real-services|stack-control-socket|stack-port-forwarding|stack-snapshot-restore|stack-user-journey-checkpoint|buildkit-roundtrip)
                 append_unique_scenario "$part"
                 ;;
             sandbox-usecases)
                 append_unique_scenario "runtime-smoke"
                 append_unique_scenario "runtime-lifecycle"
+                append_unique_scenario "runtime-container-id-ownership"
                 append_unique_scenario "runtime-exec-semantics"
                 append_unique_scenario "runtime-exec-defaults"
                 append_unique_scenario "runtime-shared-vm-net"
@@ -152,6 +154,7 @@ expand_scenario_token() {
             all-usecases)
                 append_unique_scenario "runtime-smoke"
                 append_unique_scenario "runtime-lifecycle"
+                append_unique_scenario "runtime-container-id-ownership"
                 append_unique_scenario "runtime-exec-semantics"
                 append_unique_scenario "runtime-exec-defaults"
                 append_unique_scenario "runtime-port-forwarding"
@@ -171,7 +174,7 @@ expand_scenario_token() {
 
 scenario_suite() {
     case "$1" in
-        runtime-smoke|runtime-lifecycle|runtime-exec-semantics|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net)
+        runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net)
             echo "runtime"
             ;;
         stack-real-services|stack-control-socket|stack-port-forwarding|stack-snapshot-restore)
@@ -196,6 +199,9 @@ scenario_test_filter() {
             ;;
         runtime-lifecycle)
             echo "lifecycle_create_exec_stop_remove"
+            ;;
+        runtime-container-id-ownership)
+            echo "container_id_lifecycle_serialization_and_generation_ownership"
             ;;
         runtime-exec-semantics)
             echo "container_exec_user_environment_semantics"
@@ -337,6 +343,8 @@ RUN_DIR="$OUTPUT_ROOT/$timestamp"
 mkdir -p "$RUN_DIR"
 ln -sfn "$timestamp" "$OUTPUT_ROOT/latest"
 BUILDKIT_RUNTIME_INVENTORY_EVIDENCE="$RUN_DIR/buildkit-runtime-inventory.txt"
+CONTAINER_ID_OWNERSHIP_EVIDENCE="$RUN_DIR/container-id-ownership.json"
+CONTAINER_ID_OWNERSHIP_SHA256="$RUN_DIR/container-id-ownership.json.sha256"
 
 # The VM executes the Linux guest agent embedded in each profile's initramfs,
 # not the macOS host binary built below. Rebuild both bundles on every run so
@@ -490,6 +498,85 @@ validate_buildkit_runtime_inventory_evidence() {
     ' "$evidence_file" >/dev/null
 }
 
+validate_container_id_ownership_evidence() {
+    local evidence_file="$1"
+
+    jq -e '
+        (type == "object") and
+        (.schema_version == 1) and
+        (.scenario == "runtime-container-id-ownership") and
+        ((.container_id | type) == "string") and
+        (.standalone.in_flight_duplicate_rejected == true) and
+        (.standalone.active_duplicate_rejected == true) and
+        (.stack.duplicate_rejected_before_release == true) and
+        (.stack.loser_setup_absent == true) and
+        (.stack.failed_setup_returned_error == true) and
+        (.stack.failed_setup_clean == true) and
+        (.stack.failed_generation_released == true) and
+        (.stack.failed_guest_resources_clean == true) and
+        (.stack.failed_host_maps_clean == true) and
+        (.stack.failed_setup_commit_absent == true) and
+        (.stack.successful_setup_commit_present == true) and
+        (.stack.exec_did_not_cross_generation == true) and
+        (.stack.ready_a_matches_process_probe == true) and
+        (.stack.ready_b_matches_process_probe == true) and
+        (.stack.ready_generations_distinct == true) and
+        (.standalone.generation_a.owner == "standalone-a") and
+        (.standalone.generation_b.owner == "standalone-b") and
+        (.stack.generation_a.owner == "stack-a") and
+        (.stack.generation_b.owner == "stack-b") and
+        (.stack.ready_generation_a.container_id == .container_id) and
+        (.stack.ready_generation_b.container_id == .container_id) and
+        (.stack.ready_generation_b.lifecycle_generation > .stack.ready_generation_a.lifecycle_generation) and
+        (.stack.ready_generation_a.init_pid > 0) and
+        (.stack.ready_generation_b.init_pid > 0) and
+        (.stack.ready_generation_a.init_start_time > 0) and
+        (.stack.ready_generation_b.init_start_time > 0) and
+        (.stack.ready_generation_a.cgroup.device > 0) and
+        (.stack.ready_generation_a.cgroup.inode > 0) and
+        (.stack.ready_generation_b.cgroup.device > 0) and
+        (.stack.ready_generation_b.cgroup.inode > 0) and
+        (.stack.ready_generation_a.root.device > 0) and
+        (.stack.ready_generation_a.root.inode > 0) and
+        (.stack.ready_generation_b.root.device > 0) and
+        (.stack.ready_generation_b.root.inode > 0) and
+        ((.stack.ready_generation_a.init_start_time != .stack.ready_generation_b.init_start_time) or
+         (.stack.ready_generation_a.cgroup != .stack.ready_generation_b.cgroup) or
+         (.stack.ready_generation_a.namespaces != .stack.ready_generation_b.namespaces) or
+         (.stack.ready_generation_a.root != .stack.ready_generation_b.root)) and
+        (.standalone.generation_a.boot_id != .standalone.generation_b.boot_id) and
+        ((.stack.generation_a.guest_init_pid != .stack.generation_b.guest_init_pid) or
+         (.stack.generation_a.start_time != .stack.generation_b.start_time) or
+         (.stack.generation_a.cgroup_path != .stack.generation_b.cgroup_path) or
+         (.stack.generation_a.cgroup_identity != .stack.generation_b.cgroup_identity) or
+         (.stack.generation_a.mnt_identity != .stack.generation_b.mnt_identity) or
+         (.stack.generation_a.net_identity != .stack.generation_b.net_identity) or
+         (.stack.generation_a.pid_identity != .stack.generation_b.pid_identity) or
+         (.stack.generation_a.ipc_identity != .stack.generation_b.ipc_identity) or
+         (.stack.generation_a.uts_identity != .stack.generation_b.uts_identity) or
+         (.stack.generation_a.root_identity != .stack.generation_b.root_identity)) and
+        (.final.metadata_absent == true) and
+        (.final.rootfs_absent == true) and
+        (.final.shared_vm_absent == true) and
+        (.final.guest_resources_clean == true) and
+        (.final.stale_exec_rejected == true) and
+        (.final.generation_released == true) and
+        (.final.host_maps_clean == true) and
+        (.final.orphan_setup_tmp == [])
+    ' "$evidence_file" >/dev/null
+}
+
+write_and_validate_container_id_ownership_checksum() {
+    local evidence_file="$1"
+    local checksum_file="$2"
+    local evidence_name
+    evidence_name="$(basename "$evidence_file")"
+    local digest
+    digest="$(shasum -a 256 "$evidence_file" | cut -d' ' -f1)"
+    printf '%s  %s\n' "$digest" "$evidence_name" > "$checksum_file"
+    (cd "$(dirname "$evidence_file")" && shasum -a 256 -c "$(basename "$checksum_file")") >/dev/null
+}
+
 run_and_log() {
     local suite="$1"
     local label="$2"
@@ -509,10 +596,29 @@ run_and_log() {
         cmd_env+=("VZ_BUILDKIT_RUNTIME_INVENTORY_EVIDENCE=$BUILDKIT_RUNTIME_INVENTORY_EVIDENCE")
     fi
 
-    if [[ "$suite" == "stack" ]]; then
+    if [[ "$suite" == "stack" || "$suite" == "runtime" ]]; then
         local stack_serial_dir="$RUN_DIR/${label}-vm-serial"
         mkdir -p "$stack_serial_dir"
         cmd_env+=("VZ_STACK_SERIAL_LOG_DIR=$stack_serial_dir")
+    fi
+
+    # Stack E2Es intentionally use stable service names as container IDs. Give
+    # every harness run a private lifecycle/image store so an interrupted
+    # earlier run cannot leave durable metadata that poisons a later gate.
+    # Keep HOME unchanged so kernel artifacts and registry credentials retain
+    # their normal host resolution.
+    if [[ "$suite" == "stack" ]]; then
+        local stack_oci_data_dir="$RUN_DIR/${label}-oci"
+        mkdir -p "$stack_oci_data_dir"
+        cmd_env+=("VZ_STACK_E2E_OCI_DATA_DIR=$stack_oci_data_dir")
+    fi
+
+    if [[ "$suite" == "runtime" ]]; then
+        if [[ "$label" == "runtime" || "$label" == "runtime-container-id-ownership" ]]; then
+            rm -f "$CONTAINER_ID_OWNERSHIP_EVIDENCE"
+            rm -f "$CONTAINER_ID_OWNERSHIP_SHA256"
+        fi
+        cmd_env+=("VZ_CONTAINER_ID_OWNERSHIP_EVIDENCE=$CONTAINER_ID_OWNERSHIP_EVIDENCE")
     fi
 
     cmd_env+=("VZ_LINUX_DEVELOPER_BUNDLE_DIR=$REPO_ROOT/linux/out")
@@ -541,6 +647,24 @@ run_and_log() {
             return 87
         fi
         BUILDKIT_EVIDENCE_VALIDATED=true
+    fi
+
+    if [[ $status -eq 0 ]] && [[ "$suite" == "runtime" ]]; then
+        if [[ -f "$CONTAINER_ID_OWNERSHIP_EVIDENCE" ]]; then
+            if ! validate_container_id_ownership_evidence "$CONTAINER_ID_OWNERSHIP_EVIDENCE"; then
+                echo "container-ID ownership evidence is malformed or violates the lifecycle contract" >&2
+                return 89
+            fi
+            if ! write_and_validate_container_id_ownership_checksum \
+                "$CONTAINER_ID_OWNERSHIP_EVIDENCE" "$CONTAINER_ID_OWNERSHIP_SHA256"; then
+                echo "container-ID ownership evidence checksum creation or verification failed" >&2
+                return 90
+            fi
+            RUNTIME_ID_EVIDENCE_VALIDATED=true
+        elif [[ "$label" == "runtime" || "$label" == "runtime-container-id-ownership" ]]; then
+            echo "container-ID ownership scenario did not retain its required evidence" >&2
+            return 89
+        fi
     fi
 
     return "$status"
@@ -577,6 +701,8 @@ PASSED=()
 should_stop=false
 BUILDKIT_SUITE_RAN=false
 BUILDKIT_EVIDENCE_VALIDATED=false
+RUNTIME_ID_EVIDENCE_VALIDATED=false
+RUNTIME_ID_EVIDENCE_REQUIRED=false
 
 for suite in "${RESOLVED_SUITES[@]}"; do
     package="$(suite_package "$suite")" || err "unknown suite '$suite'"
@@ -599,6 +725,9 @@ for suite in "${RESOLVED_SUITES[@]}"; do
             fi
             test_filter="$(scenario_test_filter "$scenario")" || err "unknown scenario '$scenario'"
             scenario_args=("${RUN_ARGS[@]}" "--exact" "$test_filter")
+            if [[ "$scenario" == "runtime-container-id-ownership" ]]; then
+                RUNTIME_ID_EVIDENCE_REQUIRED=true
+            fi
 
             if run_and_log "$suite" "$scenario" "$test_binary" "${scenario_args[@]}"; then
                 echo "==> scenario passed: $scenario"
@@ -614,6 +743,9 @@ for suite in "${RESOLVED_SUITES[@]}"; do
             fi
         done
     else
+        if [[ "$suite" == "runtime" ]]; then
+            RUNTIME_ID_EVIDENCE_REQUIRED=true
+        fi
         if [[ "$suite" == "buildkit" ]]; then
             BUILDKIT_SUITE_RAN=true
         fi
@@ -644,6 +776,11 @@ if [[ "$BUILDKIT_SUITE_RAN" == "true" ]]; then
     fi
 fi
 
+if [[ "$RUNTIME_ID_EVIDENCE_REQUIRED" == "true" && "$RUNTIME_ID_EVIDENCE_VALIDATED" != "true" ]]; then
+    echo "==> required container-ID ownership evidence was not validated" >&2
+    FAILED+=("container-id-ownership-evidence:89")
+fi
+
 echo "==> summary"
 echo "passed: ${PASSED[*]:-none}"
 echo "failed: ${FAILED[*]:-none}"
@@ -656,6 +793,13 @@ action_summary="$RUN_DIR/summary.txt"
         echo "buildkit_runtime_inventory=$BUILDKIT_RUNTIME_INVENTORY_EVIDENCE"
     else
         echo "buildkit_runtime_inventory=none"
+    fi
+    if [[ "$RUNTIME_ID_EVIDENCE_VALIDATED" == "true" ]]; then
+        echo "container_id_ownership=$CONTAINER_ID_OWNERSHIP_EVIDENCE"
+        echo "container_id_ownership_sha256=$CONTAINER_ID_OWNERSHIP_SHA256"
+    else
+        echo "container_id_ownership=none"
+        echo "container_id_ownership_sha256=none"
     fi
 } > "$action_summary"
 

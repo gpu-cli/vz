@@ -162,11 +162,19 @@ fn full_pipeline_parse_apply_execute() {
 
     let web = observed.iter().find(|o| o.service_name == "web").unwrap();
     assert_eq!(web.phase, ServicePhase::Running);
-    assert_eq!(web.container_id, Some("ctr-web".to_string()));
+    assert!(
+        web.container_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("ctr-vzs1-myapp-web-"))
+    );
 
     let api = observed.iter().find(|o| o.service_name == "api").unwrap();
     assert_eq!(api.phase, ServicePhase::Running);
-    assert_eq!(api.container_id, Some("ctr-api".to_string()));
+    assert!(
+        api.container_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("ctr-vzs1-myapp-api-"))
+    );
 
     // Step 5: Verify events emitted.
     // Note: apply() also emits ServiceCreating events, so we get 2 from apply + 2 from executor = 4.

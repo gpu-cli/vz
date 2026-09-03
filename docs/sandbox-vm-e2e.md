@@ -35,6 +35,7 @@ Capability matrix:
 
 - `runtime-smoke` → `smoke_pull_and_run_alpine`
 - `runtime-lifecycle` → `lifecycle_create_exec_stop_remove`
+- `runtime-container-id-ownership` → `container_id_lifecycle_serialization_and_generation_ownership`
 - `runtime-port-forwarding` → `port_forwarding_tcp`
 - `runtime-shared-vm-net` → `shared_vm_inter_service_connectivity`
 - `stack-real-services` → `real_services_postgres_and_redis`
@@ -124,8 +125,65 @@ Each run creates a timestamped directory containing:
 - `run-info.txt` (host/profile/suites/args)
 - `<suite>.log` files or `<scenario>.log` files (scenario mode)
 - `summary.txt`
+- `container-id-ownership.json` when the runtime container-ID ownership test runs
+- `container-id-ownership.json.sha256`, verified by the harness before success
 
 A `latest` symlink points to the most recent run.
+
+Stack lanes use a run-scoped OCI data directory under the timestamped artifact
+directory. Stable service/container IDs therefore cannot collide with a user's
+normal `~/.vz/oci` state or with metadata left by an interrupted earlier gate;
+HOME remains unchanged for kernel and registry-credential discovery.
+
+### Container-ID lifecycle ownership gate
+
+Run the focused release-built Apple-silicon VM scenario with:
+
+```bash
+./scripts/run-sandbox-vm-e2e.sh \
+  --profile release \
+  --scenario runtime-container-id-ownership
+```
+
+The scenario exercises caller-selected IDs through standalone and shared-stack
+VM paths. It requires both in-flight and already-active duplicates to fail
+closed, setup failure cleanup to prove its guest resources, reservation, and
+host lifecycle maps are clean before a later explicit recreate, setup commits
+to publish atomically, and stop/remove/recreate to preserve one generation owner. The retained
+`container-id-ownership.json` contains the raw guest boot ID, init start time,
+cgroup, namespace identities, and container-root identity for each generation,
+plus final host/guest leak inventories. The harness validates this evidence and
+verifies its SHA-256 sidecar before recording both paths in `summary.txt` as
+`container_id_ownership=...` and `container_id_ownership_sha256=...`.
+
+The fixed exec/recreate schedule waits for the guest-originated container-ready
+acknowledgement, which is emitted only after the exact generation is pinned and
+the requested command crosses `execve`. Host lifecycle admission is retained
+through that acknowledgement. The test then stops, removes, and recreates the
+same ID and requires the acknowledged lifecycle generation and raw guest
+identity to differ from the replacement; ordinary process-spawn readiness is
+not accepted as evidence.
+
+After the focused scenario, run the complete release nonregression gate:
+
+```bash
+./scripts/run-sandbox-vm-e2e.sh --profile release --suite all --keep-going
+```
+
+The full gate must pass without required skips or retries. It also retains the
+ownership evidence and runs the stack-layer
+`stack_service_config_change_triggers_recreate` regression, which proves normal
+service configuration drift still performs stop, remove, and recreate.
+
+Archive at least:
+
+- `run-info.txt`
+- `summary.txt`
+- `runtime-container-id-ownership.log` from the focused run
+- `container-id-ownership.json`
+- `container-id-ownership.json.sha256`
+- `runtime.log`, `stack.log`, and `buildkit.log` from the full run
+- `runtime-test-artifacts.jsonl`, `stack-test-artifacts.jsonl`, and the VM serial logs
 
 ## Spaces Release Gate
 

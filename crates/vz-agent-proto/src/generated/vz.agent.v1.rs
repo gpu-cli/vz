@@ -102,7 +102,7 @@ pub struct ExecEvent {
     /// Exec identifier for correlation (sent in first event for PTY sessions).
     #[prost(uint64, tag = "7")]
     pub exec_id: u64,
-    #[prost(oneof = "exec_event::Event", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "exec_event::Event", tags = "1, 2, 3, 4, 8")]
     pub event: ::core::option::Option<exec_event::Event>,
 }
 /// Nested message and enum types in `ExecEvent`.
@@ -117,7 +117,55 @@ pub mod exec_event {
         ExitCode(i32),
         #[prost(string, tag = "4")]
         Error(::prost::alloc::string::String),
+        /// First event for every container-targeted pipe or PTY execution. The
+        /// guest emits this only after the exact target has been pinned and the
+        /// requested process has successfully crossed execve(2).
+        #[prost(message, tag = "8")]
+        ContainerReady(super::ContainerExecReady),
     }
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct KernelObjectIdentity {
+    #[prost(uint64, tag = "1")]
+    pub device: u64,
+    #[prost(uint64, tag = "2")]
+    pub inode: u64,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ContainerNamespaceIdentity {
+    #[prost(message, optional, tag = "1")]
+    pub mount: ::core::option::Option<KernelObjectIdentity>,
+    #[prost(message, optional, tag = "2")]
+    pub network: ::core::option::Option<KernelObjectIdentity>,
+    #[prost(message, optional, tag = "3")]
+    pub pid: ::core::option::Option<KernelObjectIdentity>,
+    #[prost(message, optional, tag = "4")]
+    pub ipc: ::core::option::Option<KernelObjectIdentity>,
+    #[prost(message, optional, tag = "5")]
+    pub uts: ::core::option::Option<KernelObjectIdentity>,
+}
+/// Immutable guest-observed identity for one running container generation.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ContainerGeneration {
+    #[prost(string, tag = "1")]
+    pub container_id: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub init_pid: u32,
+    #[prost(uint64, tag = "3")]
+    pub init_start_time: u64,
+    #[prost(string, tag = "4")]
+    pub cgroup_path: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "5")]
+    pub cgroup: ::core::option::Option<KernelObjectIdentity>,
+    #[prost(message, optional, tag = "6")]
+    pub namespaces: ::core::option::Option<ContainerNamespaceIdentity>,
+    #[prost(message, optional, tag = "7")]
+    pub root: ::core::option::Option<KernelObjectIdentity>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ContainerExecReady {
+    #[prost(message, optional, tag = "1")]
+    pub generation: ::core::option::Option<ContainerGeneration>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StdinWriteRequest {

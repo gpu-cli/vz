@@ -391,7 +391,8 @@ pub(crate) fn spawn_direct(
     cmd.args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .stdin(Stdio::piped());
+        .stdin(Stdio::piped())
+        .kill_on_drop(true);
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -426,7 +427,8 @@ pub(crate) fn spawn_as_user(
     cmd.args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .stdin(Stdio::piped());
+        .stdin(Stdio::piped())
+        .kill_on_drop(true);
 
     if clear_environment {
         cmd.env_clear();

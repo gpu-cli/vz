@@ -16,6 +16,14 @@ pub enum MacosOciError {
         path: PathBuf,
     },
 
+    /// A caller-selected container ID is already owned by another lifecycle.
+    #[error("container already exists: {id}")]
+    ContainerAlreadyExists { id: String },
+
+    /// Container metadata or generation was not found.
+    #[error("container not found: {id}")]
+    ContainerNotFound { id: String },
+
     /// Linux VM backend error.
     #[error(transparent)]
     Linux(#[from] vz_linux::LinuxError),

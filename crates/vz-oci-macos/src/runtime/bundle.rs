@@ -251,6 +251,64 @@ pub fn container_log_dir(container_id: &str) -> String {
 /// Returns `(merged_path, setup_was_restored)`. `setup_was_restored` is
 /// `true` if a commit tar was extracted; the caller should then skip
 /// `run_setup_commands`.
+const GUEST_OVERLAY_TEARDOWN_SCRIPT: &str = r#"set -eu
+base="/run/vz-oci/containers/$1"
+merged="$base/merged"
+if /bin/busybox grep -Fq " $merged " /proc/mounts; then
+    /bin/busybox umount "$merged"
+fi
+if /bin/busybox grep -Fq " $base " /proc/mounts; then
+    /bin/busybox umount "$base"
+fi
+/bin/busybox rm -rf "$base"
+/bin/busybox test ! -e "$base"
+echo 2 > /proc/sys/vm/drop_caches 2>/dev/null || true
+"#;
+
+pub(super) fn guest_overlay_teardown_command(container_id: &str) -> (String, Vec<String>) {
+    (
+        "/bin/busybox".to_string(),
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            GUEST_OVERLAY_TEARDOWN_SCRIPT.to_string(),
+            "vz-overlay-teardown".to_string(),
+            container_id.to_string(),
+        ],
+    )
+}
+
+pub(super) async fn teardown_guest_container_overlay(
+    vm: &LinuxVm,
+    container_id: &str,
+) -> Result<(), OciError> {
+    let (command, args) = guest_overlay_teardown_command(container_id);
+    let result = vm
+        .exec_collect(command, args, Duration::from_secs(10))
+        .await
+        .map_err(OciError::from)?;
+    if result.exit_code != 0 {
+        return Err(OciError::Linux(LinuxError::Protocol(format!(
+            "per-container overlay teardown failed for '{container_id}' (exit {}): {}",
+            result.exit_code,
+            result.stderr.trim()
+        ))));
+    }
+    Ok(())
+}
+
+pub(super) fn overlay_setup_error_with_cleanup(
+    setup_error: OciError,
+    cleanup: Result<(), OciError>,
+) -> OciError {
+    match cleanup {
+        Ok(()) => setup_error,
+        Err(cleanup_error) => OciError::InvalidConfig(format!(
+            "per-container overlay setup failed: {setup_error}; partial-overlay cleanup also failed: {cleanup_error}"
+        )),
+    }
+}
+
 async fn setup_guest_container_overlay(
     vm: &LinuxVm,
     vz_rootfs_path: &str,
@@ -261,24 +319,8 @@ async fn setup_guest_container_overlay(
     let guest_rootfs_path = format!("{container_overlay}/merged");
     let log_dir = container_log_dir(container_id);
 
-    // Clean up any stale overlay from a previous container with the same ID
-    // (e.g. during recreate). Best-effort: unmount merged overlay, then the
-    // tmpfs backing, then remove the directory tree.  Invalidate the VirtioFS
-    // dcache so the kernel re-reads host-side changes (the rootfs may have
-    // been deleted + reassembled on the host during recreate).
-    let cleanup_cmd = format!(
-        "umount {container_overlay}/merged 2>/dev/null; \
-         umount {container_overlay} 2>/dev/null; \
-         rm -rf {container_overlay}; \
-         echo 2 > /proc/sys/vm/drop_caches 2>/dev/null || true"
-    );
-    let _ = vm
-        .exec_collect(
-            "sh".to_string(),
-            vec!["-c".to_string(), cleanup_cmd],
-            Duration::from_secs(5),
-        )
-        .await;
+    // Recreate never stacks mounts over residue from an older generation.
+    teardown_guest_container_overlay(vm, container_id).await?;
 
     // Build the overlay-setup script. If a setup-commit tar is provided,
     // extract it into the upper dir AFTER creating it but BEFORE mounting
@@ -301,7 +343,7 @@ async fn setup_guest_container_overlay(
          mkdir -p {log_dir}"
     );
 
-    let result = vm
+    let result = match vm
         .exec_collect(
             "sh".to_string(),
             vec!["-c".to_string(), overlay_cmd],
@@ -314,14 +356,23 @@ async fn setup_guest_container_overlay(
             },
         )
         .await
-        .map_err(OciError::from)?;
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let setup_error = OciError::from(error);
+            let cleanup = teardown_guest_container_overlay(vm, container_id).await;
+            return Err(overlay_setup_error_with_cleanup(setup_error, cleanup));
+        }
+    };
 
     if result.exit_code != 0 {
-        return Err(OciError::Linux(LinuxError::Protocol(format!(
+        let setup_error = OciError::Linux(LinuxError::Protocol(format!(
             "per-container overlay setup failed (exit {}): {}",
             result.exit_code,
             result.stderr.trim()
-        ))));
+        )));
+        let cleanup = teardown_guest_container_overlay(vm, container_id).await;
+        return Err(overlay_setup_error_with_cleanup(setup_error, cleanup));
     }
 
     Ok((guest_rootfs_path, setup_commit_tar_path.is_some()))

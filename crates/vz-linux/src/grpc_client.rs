@@ -16,10 +16,10 @@ use tracing::debug;
 use vz::Vm;
 use vz::protocol::{ExecOutput, OciContainerState};
 use vz_agent_proto::{
-    ContainerExecTarget, DockerEnsureEvent, DockerEnsureRequest, ExecRequest as ProtoExecRequest,
-    NetworkSetupRequest, NetworkTeardownRequest, OciCreateRequest, OciDeleteRequest,
-    OciExecRequest, OciKillRequest, OciStartRequest, OciStateRequest, PingRequest,
-    PortForwardFrame, PortForwardOpen, ResizeExecPtyRequest, ResourceStatsRequest,
+    ContainerExecTarget, ContainerGeneration, DockerEnsureEvent, DockerEnsureRequest,
+    ExecRequest as ProtoExecRequest, NetworkSetupRequest, NetworkTeardownRequest, OciCreateRequest,
+    OciDeleteRequest, OciExecRequest, OciKillRequest, OciStartRequest, OciStateRequest,
+    PingRequest, PortForwardFrame, PortForwardOpen, ResizeExecPtyRequest, ResourceStatsRequest,
     ResourceStatsResponse, SignalRequest, StdinCloseRequest, StdinWriteRequest, SystemInfoRequest,
     SystemInfoResponse, TransportMetadata as ProtoTransportMetadata,
     agent_service_client::AgentServiceClient, exec_event,
@@ -298,6 +298,7 @@ impl GrpcAgentClient {
             Some(metadata.request_id.clone())
         };
 
+        let expected_container_id = container_target.clone();
         let request = build_exec_request(
             command,
             args,
@@ -308,10 +309,15 @@ impl GrpcAgentClient {
         );
 
         let response = self.agent.exec(request).await?;
-        Ok(GrpcExecStream::new(
-            response.into_inner(),
-            expected_request_id,
-        ))
+        let stream = GrpcExecStream::new(response.into_inner(), expected_request_id);
+        if let Some(container_id) = expected_container_id {
+            stream
+                .wait_container_ready(&container_id)
+                .await
+                .map(|(stream, _)| stream)
+        } else {
+            Ok(stream)
+        }
     }
 
     /// Execute a raw command inside a running OCI container and stream output.
@@ -326,6 +332,32 @@ impl GrpcAgentClient {
         options: ExecOptions,
     ) -> Result<GrpcExecStream, LinuxError> {
         self.exec_stream_with_target(command, args, options, Some(container_id))
+            .await
+    }
+
+    /// Start a container-targeted pipe exec and return its exact pinned guest
+    /// generation. Completion means the inner process successfully exec'd.
+    pub async fn exec_container_stream_ready(
+        &mut self,
+        container_id: String,
+        command: String,
+        args: Vec<String>,
+        options: ExecOptions,
+    ) -> Result<(GrpcExecStream, ContainerGeneration), LinuxError> {
+        let metadata = self.next_transport_metadata(Some(RuntimeOperation::ExecContainer));
+        let expected_request_id =
+            (!metadata.request_id.is_empty()).then(|| metadata.request_id.clone());
+        let request = build_exec_request(
+            command,
+            args,
+            options,
+            Some(container_id.clone()),
+            metadata,
+            ExecTerminal::default(),
+        );
+        let response = self.agent.exec(request).await?;
+        GrpcExecStream::new(response.into_inner(), expected_request_id)
+            .wait_container_ready(&container_id)
             .await
     }
 
@@ -670,6 +702,7 @@ impl GrpcAgentClient {
             );
         }
 
+        let expected_container_id = container_target.clone();
         let request = build_exec_request(
             command,
             args,
@@ -715,7 +748,11 @@ impl GrpcAgentClient {
 
         let interactive_result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            GrpcExecStream::new_interactive(inner_stream, expected_request_id),
+            GrpcExecStream::new_interactive(
+                inner_stream,
+                expected_request_id,
+                expected_container_id.as_deref(),
+            ),
         )
         .await;
         let (stream, exec_id) = match interactive_result {
@@ -771,6 +808,33 @@ impl GrpcAgentClient {
         )
         .await
     }
+
+    /// Start a container-targeted PTY exec and return its exec ID plus exact
+    /// pinned guest generation.
+    pub async fn exec_container_stream_interactive_ready(
+        &mut self,
+        container_id: String,
+        command: String,
+        args: Vec<String>,
+        options: ExecOptions,
+        rows: u32,
+        cols: u32,
+    ) -> Result<(GrpcExecStream, u64, ContainerGeneration), LinuxError> {
+        let (stream, exec_id) = self
+            .exec_stream_interactive_with_target(
+                command,
+                args,
+                options,
+                Some(container_id),
+                rows,
+                cols,
+            )
+            .await?;
+        let generation = stream.container_generation.clone().ok_or_else(|| {
+            LinuxError::Protocol("container PTY exec omitted ready generation".to_string())
+        })?;
+        Ok((stream, exec_id, generation))
+    }
 }
 
 /// A stream of exec events from a gRPC-based command execution.
@@ -783,6 +847,55 @@ pub struct GrpcExecStream {
     expected_request_id: Option<String>,
     /// Buffered first proto event consumed during interactive session setup.
     buffered_first: Option<vz_agent_proto::ExecEvent>,
+    container_generation: Option<ContainerGeneration>,
+}
+
+fn require_container_ready(
+    event: &vz_agent_proto::ExecEvent,
+    expected_container_id: &str,
+) -> Result<ContainerGeneration, LinuxError> {
+    let exec_event::Event::ContainerReady(ready) = event.event.as_ref().ok_or_else(|| {
+        LinuxError::Protocol("container exec omitted its readiness event".to_string())
+    })?
+    else {
+        return Err(LinuxError::Protocol(
+            "container exec produced output before readiness".to_string(),
+        ));
+    };
+    let generation = ready.generation.clone().ok_or_else(|| {
+        LinuxError::Protocol("container readiness omitted generation identity".to_string())
+    })?;
+    let complete_objects = generation
+        .cgroup
+        .as_ref()
+        .is_some_and(|identity| identity.inode != 0)
+        && generation
+            .root
+            .as_ref()
+            .is_some_and(|identity| identity.inode != 0)
+        && generation.namespaces.as_ref().is_some_and(|namespaces| {
+            [
+                namespaces.mount.as_ref(),
+                namespaces.network.as_ref(),
+                namespaces.pid.as_ref(),
+                namespaces.ipc.as_ref(),
+                namespaces.uts.as_ref(),
+            ]
+            .into_iter()
+            .all(|identity| identity.is_some_and(|identity| identity.inode != 0))
+        });
+    if generation.container_id != expected_container_id
+        || event.exec_id == 0
+        || generation.init_pid == 0
+        || generation.init_start_time == 0
+        || generation.cgroup_path.is_empty()
+        || !complete_objects
+    {
+        return Err(LinuxError::Protocol(
+            "container readiness contained an incomplete or mismatched generation".to_string(),
+        ));
+    }
+    Ok(generation)
 }
 
 impl GrpcExecStream {
@@ -797,6 +910,7 @@ impl GrpcExecStream {
             last_sequence: 0,
             expected_request_id,
             buffered_first: None,
+            container_generation: None,
         }
     }
 
@@ -806,6 +920,7 @@ impl GrpcExecStream {
     pub async fn new_interactive(
         mut inner: tonic::Streaming<vz_agent_proto::ExecEvent>,
         expected_request_id: Option<String>,
+        expected_container_id: Option<&str>,
     ) -> Result<(Self, u64), LinuxError> {
         // Read the first event to extract exec_id.
         let first = inner
@@ -820,11 +935,46 @@ impl GrpcExecStream {
             ));
         }
 
-        // Buffer the first event so its data is not lost.
         let mut stream = Self::new(inner, expected_request_id);
-        stream.buffered_first = Some(first);
+        if let Some(container_id) = expected_container_id {
+            validate_exec_event_metadata(
+                &mut stream.last_sequence,
+                &mut stream.expected_request_id,
+                first.sequence,
+                first.request_id.as_str(),
+            )?;
+            stream.container_generation = Some(require_container_ready(&first, container_id)?);
+        } else {
+            stream.buffered_first = Some(first);
+        }
+
+        // Buffer ordinary guest PTY correlation frames. Container readiness is
+        // protocol control data and is deliberately not exposed as stdout.
 
         Ok((stream, exec_id))
+    }
+
+    async fn wait_container_ready(
+        mut self,
+        expected_container_id: &str,
+    ) -> Result<(Self, ContainerGeneration), LinuxError> {
+        let first = self.inner.message().await?.ok_or_else(|| {
+            LinuxError::Protocol("container exec stream ended before readiness".to_string())
+        })?;
+        validate_exec_event_metadata(
+            &mut self.last_sequence,
+            &mut self.expected_request_id,
+            first.sequence,
+            first.request_id.as_str(),
+        )?;
+        let generation = require_container_ready(&first, expected_container_id)?;
+        self.container_generation = Some(generation.clone());
+        Ok((self, generation))
+    }
+
+    /// Exact guest-observed container generation pinned by this exec.
+    pub fn container_generation(&self) -> Option<&ContainerGeneration> {
+        self.container_generation.as_ref()
     }
 
     /// Read the next event from the stream.
@@ -869,6 +1019,10 @@ impl GrpcExecStream {
                             return Some(vz::protocol::ExecEvent::Exit(code));
                         }
                         Some(exec_event::Event::Error(_)) => {
+                            self.done = true;
+                            return Some(vz::protocol::ExecEvent::Exit(-1));
+                        }
+                        Some(exec_event::Event::ContainerReady(_)) => {
                             self.done = true;
                             return Some(vz::protocol::ExecEvent::Exit(-1));
                         }
@@ -1057,6 +1211,51 @@ fn buildctl_guest_command(args: Vec<String>) -> (String, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ready_generation(container_id: &str) -> ContainerGeneration {
+        let object = || vz_agent_proto::KernelObjectIdentity {
+            device: 8,
+            inode: 42,
+        };
+        ContainerGeneration {
+            container_id: container_id.to_string(),
+            init_pid: 4242,
+            init_start_time: 123_456,
+            cgroup_path: "/youki/web".to_string(),
+            cgroup: Some(object()),
+            namespaces: Some(vz_agent_proto::ContainerNamespaceIdentity {
+                mount: Some(object()),
+                network: Some(object()),
+                pid: Some(object()),
+                ipc: Some(object()),
+                uts: Some(object()),
+            }),
+            root: Some(object()),
+        }
+    }
+
+    #[test]
+    fn typed_container_readiness_requires_exact_complete_generation() {
+        let generation = ready_generation("web");
+        let event = vz_agent_proto::ExecEvent {
+            event: Some(exec_event::Event::ContainerReady(
+                vz_agent_proto::ContainerExecReady {
+                    generation: Some(generation.clone()),
+                },
+            )),
+            sequence: 1,
+            request_id: "req-ready".to_string(),
+            exec_id: 99,
+        };
+        assert_eq!(require_container_ready(&event, "web").unwrap(), generation);
+        assert!(require_container_ready(&event, "replacement").is_err());
+
+        let output_before_ready = vz_agent_proto::ExecEvent {
+            event: Some(exec_event::Event::Stdout(Vec::new())),
+            ..event
+        };
+        assert!(require_container_ready(&output_before_ready, "web").is_err());
+    }
 
     #[test]
     fn grpc_agent_port_matches_protocol_agent_port() {

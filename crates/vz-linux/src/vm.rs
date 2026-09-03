@@ -339,6 +339,25 @@ impl LinuxVm {
             .await
     }
 
+    /// Start a container pipe exec after the guest proves the exact generation
+    /// is pinned and the inner command successfully crossed execve.
+    pub async fn exec_container_stream_ready_with_options(
+        &self,
+        container_id: String,
+        command: String,
+        args: Vec<String>,
+        options: ExecOptions,
+    ) -> Result<(GrpcExecStream, vz_agent_proto::ContainerGeneration), LinuxError> {
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
+        client
+            .exec_container_stream_ready(container_id, command, args, options)
+            .await
+    }
+
     /// Run and collect a raw command inside a running OCI container.
     pub async fn exec_container_collect_with_options(
         &self,
@@ -677,6 +696,42 @@ impl LinuxVm {
         let args_owned = args.iter().map(|arg| (*arg).to_string()).collect();
         client
             .exec_container_stream_interactive(
+                container_id,
+                command.to_string(),
+                args_owned,
+                options,
+                rows,
+                cols,
+            )
+            .await
+    }
+
+    /// Start a container PTY exec and return the control ID plus exact pinned
+    /// guest generation.
+    pub async fn exec_container_interactive_ready(
+        &self,
+        container_id: String,
+        command: &str,
+        args: &[&str],
+        options: ExecOptions,
+        rows: u32,
+        cols: u32,
+    ) -> Result<
+        (
+            crate::grpc_client::GrpcExecStream,
+            u64,
+            vz_agent_proto::ContainerGeneration,
+        ),
+        LinuxError,
+    > {
+        let mut client =
+            GrpcAgentClient::connect(Arc::clone(&self.vm), vz::protocol::AGENT_PORT).await?;
+        client.ping().await?;
+        let info = client.system_info().await?;
+        validate_guest_system_info(&info)?;
+        let args_owned = args.iter().map(|arg| (*arg).to_string()).collect();
+        client
+            .exec_container_stream_interactive_ready(
                 container_id,
                 command.to_string(),
                 args_owned,

@@ -534,7 +534,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 // Single container — execute inline, no thread overhead.
                 for prep in ok_prepared {
                     let full_name = prep.full_name();
-                    let requested_container_id = prep.run_config.container_id.clone();
+                    let requested_container_id = prep
+                        .retain_failed_create_id
+                        .then(|| prep.run_config.container_id.clone())
+                        .flatten();
                     info!(service = %full_name, image = %prep.image, "creating container");
                     let create_result =
                         self.runtime
@@ -562,7 +565,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 let full_names: Vec<String> = ok_prepared.iter().map(|p| p.full_name()).collect();
                 let requested_container_ids: Vec<Option<String>> = ok_prepared
                     .iter()
-                    .map(|p| p.run_config.container_id.clone())
+                    .map(|p| {
+                        p.retain_failed_create_id
+                            .then(|| p.run_config.container_id.clone())
+                            .flatten()
+                    })
                     .collect();
                 info!(
                     services = ?full_names,

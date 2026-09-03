@@ -14,6 +14,7 @@ serde_yml = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rusqlite = { version = "0.34", features = ["bundled"] }
+sha2 = { workspace = true }
 vz-runtime-contract = { workspace = true }
 
 [dev-dependencies]
@@ -21,7 +22,6 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true }
 criterion = { workspace = true }
-sha2 = { workspace = true }
 
 [[bench]]
 name = "state_store_bench"

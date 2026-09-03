@@ -388,6 +388,15 @@ async fn execute_backend_execution(
             &execution.container_id,
             exec_config_from_execution(execution)?,
             |event| match event {
+                vz_oci_macos::InteractiveExecEvent::ContainerReady(generation) => {
+                    tracing::debug!(
+                        execution_id = %execution_id,
+                        container_id = %generation.container_id,
+                        lifecycle_generation = generation.lifecycle_generation,
+                        init_pid = generation.init_pid,
+                        "container exec target acknowledged by guest"
+                    );
+                }
                 vz_oci_macos::InteractiveExecEvent::Stdout(stdout) => {
                     let _ = daemon
                         .execution_sessions()

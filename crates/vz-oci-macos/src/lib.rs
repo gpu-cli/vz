@@ -22,11 +22,17 @@ pub use config::{
 };
 pub use error::MacosOciError;
 pub use macos_backend::MacosRuntimeBackend;
-pub use runtime::{InteractiveExecEvent, Runtime};
+pub use runtime::{
+    ContainerNamespaceIdentity, ContainerReadyGeneration, InteractiveExecEvent,
+    KernelObjectIdentity, Runtime, RuntimeLifecycleAdmissionEvent, RuntimeLifecycleAdmissionKind,
+    RuntimeLifecycleDiagnostics, RuntimeLifecycleObserver,
+};
 
 // Re-export shared types for convenience.
 pub use vz_oci::bundle::CONTAINER_LOG_FILE;
-pub use vz_oci::container_store::{ContainerInfo, ContainerStatus, ContainerStore};
+pub use vz_oci::container_store::{
+    ContainerGenerationDiagnostic, ContainerInfo, ContainerStatus, ContainerStore,
+};
 
 /// Re-export the runtime contract crate for downstream access.
 pub use vz_runtime_contract as contract;

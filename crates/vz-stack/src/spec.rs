@@ -187,10 +187,12 @@ pub struct ServiceSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ulimits: Vec<UlimitSpec>,
     // ── Container identity ───────────────────────────────────────
-    /// Explicit container name override.
+    /// Explicit, globally unique runtime container ID override.
     ///
-    /// When set, the container runtime uses this as the container identifier
-    /// instead of the service name.
+    /// When absent, vz derives a deterministic stack-namespaced runtime ID.
+    /// When set, this value is preserved as the caller-selected ID, so another
+    /// active stack requesting the same value fails closed. It does not replace
+    /// the service name used by reconciliation, DNS, logs, or exec selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_name: Option<String>,
     /// Container hostname override.

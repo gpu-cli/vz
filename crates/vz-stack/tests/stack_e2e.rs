@@ -64,6 +64,17 @@ fn require_virtualization_entitlement() -> bool {
     false
 }
 
+fn stack_e2e_oci_data_dir() -> std::path::PathBuf {
+    let data_dir = std::env::var_os("VZ_STACK_E2E_OCI_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var("HOME").expect("HOME must be set"))
+                .join(".vz/oci")
+        });
+    std::fs::create_dir_all(&data_dir).expect("failed to create stack E2E OCI data directory");
+    data_dir
+}
+
 /// Bridge the async [`MacosRuntimeBackend`] to the sync [`ContainerRuntime`] trait.
 ///
 /// Uses `MacosRuntimeBackend` (which implements `RuntimeBackend` with contract types)
@@ -693,8 +704,7 @@ services:
 "#;
 
     // Use persistent data dir for image cache (avoid Docker Hub rate limits).
-    let home = std::env::var("HOME").unwrap();
-    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -829,8 +839,7 @@ services:
 "#;
 
     // Use persistent data dir for image cache.
-    let home = std::env::var("HOME").unwrap();
-    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -989,8 +998,7 @@ services:
 "#;
 
     // Use persistent data dir for image cache.
-    let home = std::env::var("HOME").unwrap();
-    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1120,8 +1128,7 @@ services:
         condition: service_healthy
 "#;
 
-    let home = std::env::var("HOME").unwrap();
-    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1348,8 +1355,7 @@ services:
       - worker
 "#;
 
-    let home = std::env::var("HOME").unwrap();
-    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1456,8 +1462,7 @@ services:
     command: ["sleep", "300"]
 "#;
 
-    let home = std::env::var("HOME").unwrap();
-    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1559,8 +1564,7 @@ services:
     command: ["sleep", "300"]
 "#;
 
-    let home = std::env::var("HOME").unwrap();
-    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1665,8 +1669,7 @@ services:
         condition: service_healthy
 "#;
 
-    let home = std::env::var("HOME").unwrap();
-    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1794,8 +1797,7 @@ services:
       APP_NAME: "my-service"
 "#;
 
-    let home = std::env::var("HOME").unwrap();
-    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1825,9 +1827,7 @@ services:
     // We read the host-side config.json directly because exec via nsenter
     // doesn't inherit the OCI process environment, and the VM kernel lacks
     // CONFIG_PID_NS so /proc/1/environ shows the VM init, not the container.
-    let bundle_config = std::path::PathBuf::from(&home).join(format!(
-        ".vz/oci/rootfs/{cid}/run/vz-oci/bundles/{cid}/config.json"
-    ));
+    let bundle_config = oci_data.join(format!("rootfs/{cid}/run/vz-oci/bundles/{cid}/config.json"));
     let config_bytes = std::fs::read(&bundle_config).unwrap_or_else(|e| {
         panic!(
             "failed to read OCI config at {}: {e}",
@@ -1896,8 +1896,7 @@ services:
       - server
 "#;
 
-    let home = std::env::var("HOME").unwrap();
-    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -2014,8 +2013,7 @@ services:
       VERSION: "2"
 "#;
 
-    let home = std::env::var("HOME").unwrap();
-    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -2078,8 +2076,8 @@ services:
     );
 
     // Verify the recreated container's OCI bundle has VERSION=2.
-    let config_path = std::path::PathBuf::from(&home).join(format!(
-        ".vz/oci/rootfs/{cid2}/run/vz-oci/bundles/{cid2}/config.json"
+    let config_path = oci_data.join(format!(
+        "rootfs/{cid2}/run/vz-oci/bundles/{cid2}/config.json"
     ));
     let config_bytes = std::fs::read(&config_path)
         .unwrap_or_else(|e| panic!("read OCI config {}: {e}", config_path.display()));
@@ -2142,8 +2140,7 @@ services:
       - api
 "#;
 
-    let home = std::env::var("HOME").unwrap();
-    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -2257,8 +2254,7 @@ services:
     command: ["sleep", "300"]
 "#;
 
-    let home = std::env::var("HOME").unwrap();
-    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -2595,8 +2591,7 @@ volumes:
         bind_dir = bind_dir_str
     );
 
-    let home = std::env::var("HOME").unwrap();
-    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
     let db_path = tmp.path().join("state.db");
@@ -2733,8 +2728,7 @@ secrets:
         api_key = api_key_path.to_str().unwrap(),
     );
 
-    let home = std::env::var("HOME").unwrap();
-    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
     let db_path = tmp.path().join("state.db");
@@ -2842,8 +2836,7 @@ services:
       CUSTOM_VAR: injected
 "#;
 
-    let home = std::env::var("HOME").unwrap();
-    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
     let db_path = tmp.path().join("state.db");
@@ -2985,8 +2978,7 @@ networks:
   backend:
 "#;
 
-    let home = std::env::var("HOME").unwrap();
-    let oci_data = std::path::PathBuf::from(&home).join(".vz/oci");
+    let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
     let tmp = tempfile::tempdir().unwrap();

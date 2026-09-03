@@ -26,3 +26,4 @@ pub use kernel::{
 };
 pub use vm::LinuxVm;
 pub use vz::protocol::{NetworkServiceConfig, OciContainerState};
+pub use vz_agent_proto::{ContainerGeneration, ContainerNamespaceIdentity, KernelObjectIdentity};

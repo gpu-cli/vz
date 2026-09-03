@@ -574,6 +574,41 @@ fn apply_removes_deleted_services() {
             service_name: "db".to_string()
         }
     );
+    let observed = store.load_observed_state("myapp").unwrap();
+    let db = observed
+        .iter()
+        .find(|state| state.service_name == "db")
+        .unwrap();
+    assert_eq!(db.container_id.as_deref(), Some("ctr-db"));
+}
+
+#[test]
+fn apply_preserves_generated_failed_id_but_clears_unproven_explicit_id() {
+    for (container_name, expected_id) in [
+        (None, Some("owned-generated-id")),
+        (Some("global-explicit-id"), None),
+    ] {
+        let store = StateStore::in_memory().unwrap();
+        let mut service = svc("web", "nginx:latest");
+        service.container_name = container_name.map(str::to_string);
+        store
+            .save_observed_state(
+                "myapp",
+                &ServiceObservedState {
+                    service_name: "web".to_string(),
+                    phase: ServicePhase::Failed,
+                    container_id: Some(expected_id.unwrap_or("global-explicit-id").to_string()),
+                    last_error: Some("create failed".to_string()),
+                    ready: false,
+                },
+            )
+            .unwrap();
+
+        let result = apply(&spec("myapp", vec![service]), &store, &no_health()).unwrap();
+        assert_eq!(result.actions.len(), 1);
+        let observed = store.load_observed_state("myapp").unwrap();
+        assert_eq!(observed[0].container_id.as_deref(), expected_id);
+    }
 }
 
 #[test]
@@ -969,6 +1004,18 @@ fn compute_actions_noop_for_converged_replicas() {
     ];
 
     let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
+    assert!(actions.is_empty());
+    assert!(deferred.is_empty());
+}
+
+#[test]
+fn explicit_container_name_does_not_replace_observed_service_identity() {
+    let mut service = svc_with_replicas("web", "nginx:latest", 2);
+    service.container_name = Some("globally-explicit-web".to_string());
+    let observed = vec![obs_running("web"), obs_running("web-2")];
+
+    let (actions, deferred) = compute_actions(&[service], &observed, &no_health(), None);
+
     assert!(actions.is_empty());
     assert!(deferred.is_empty());
 }

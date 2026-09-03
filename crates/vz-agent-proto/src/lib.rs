@@ -18,7 +18,7 @@ pub use vz::agent::v1::*;
 ///
 /// Increment this when startup-time host assumptions require a newer guest
 /// agent capability/behavior, even if crate semver remains unchanged.
-pub const AGENT_PROTOCOL_REVISION: u32 = 3;
+pub const AGENT_PROTOCOL_REVISION: u32 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -124,6 +124,42 @@ mod tests {
         let encoded = msg.encode_to_vec();
         let decoded = ExecEvent::decode(encoded.as_slice()).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn container_exec_ready_round_trip_preserves_generation_identity() {
+        let object = || KernelObjectIdentity {
+            device: 8,
+            inode: 42,
+        };
+        let generation = ContainerGeneration {
+            container_id: "web".to_string(),
+            init_pid: 4242,
+            init_start_time: 123_456,
+            cgroup_path: "/youki/web".to_string(),
+            cgroup: Some(object()),
+            namespaces: Some(ContainerNamespaceIdentity {
+                mount: Some(object()),
+                network: Some(object()),
+                pid: Some(object()),
+                ipc: Some(object()),
+                uts: Some(object()),
+            }),
+            root: Some(object()),
+        };
+        let message = ExecEvent {
+            event: Some(exec_event::Event::ContainerReady(ContainerExecReady {
+                generation: Some(generation.clone()),
+            })),
+            sequence: 1,
+            request_id: "req-ready".to_string(),
+            exec_id: 99,
+        };
+        let decoded = ExecEvent::decode(message.encode_to_vec().as_slice()).unwrap();
+        let Some(exec_event::Event::ContainerReady(ready)) = decoded.event else {
+            panic!("expected container-ready event");
+        };
+        assert_eq!(ready.generation, Some(generation));
     }
 
     #[test]

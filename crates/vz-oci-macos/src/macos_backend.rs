@@ -12,6 +12,7 @@ use crate::runtime::Runtime;
 use vz_oci::container_store as oci_container;
 
 /// macOS backend wrapping the existing [`Runtime`].
+#[derive(Clone)]
 pub struct MacosRuntimeBackend {
     runtime: Runtime,
     build_manager: BuildManager,
@@ -35,15 +36,14 @@ impl MacosRuntimeBackend {
     /// Execute setup commands inside a running container.
     ///
     /// Runs each command as `sh -c <cmd>` in order. If any command
-    /// fails, the container is stopped and removed.
+    /// fails, the owning create transaction performs stop/remove cleanup.
     async fn run_setup_commands(
         &self,
         container_id: &str,
+        transaction: &crate::runtime::ContainerLifecycleTransaction,
         commands: &[String],
         env: &[(String, String)],
-        _working_dir: Option<&str>,
         user: Option<&str>,
-        _timeout: Option<std::time::Duration>,
     ) -> Result<(), RuntimeError> {
         // Setup commands (apt install, rustup, etc.) can take minutes.
         let setup_timeout = Some(std::time::Duration::from_secs(1800));
@@ -74,13 +74,11 @@ impl MacosRuntimeBackend {
             let oci_config = exec_config_from_contract(exec_config);
             let result = self
                 .runtime
-                .exec_container(container_id, oci_config)
+                .exec_container_in_transaction(container_id, oci_config, transaction)
                 .await
                 .map(exec_output_to_contract)
                 .map_err(oci_err)?;
             if result.exit_code != 0 {
-                let _ = self.stop_container(container_id, true, None, None).await;
-                let _ = self.remove_container(container_id).await;
                 return Err(RuntimeError::Backend {
                     message: format!(
                         "setup command failed (exit {}): {}\nstderr: {}",
@@ -110,6 +108,183 @@ impl MacosRuntimeBackend {
             .map(exec_output_to_contract)
             .map_err(oci_err)
     }
+
+    async fn rollback_failed_create(
+        &self,
+        container_id: &str,
+        transaction: &crate::runtime::ContainerLifecycleTransaction,
+        primary: RuntimeError,
+    ) -> RuntimeError {
+        let mut failures = Vec::new();
+        if let Err(error) = self
+            .runtime
+            .stop_container_in_transaction(container_id, true, None, None, transaction)
+            .await
+        {
+            failures.push(format!("stop: {}", oci_err(error)));
+        }
+        if let Err(error) = self
+            .runtime
+            .remove_container_in_transaction(container_id, transaction)
+            .await
+        {
+            failures.push(format!("remove: {}", oci_err(error)));
+        }
+        if failures.is_empty() {
+            primary
+        } else {
+            aggregate_create_rollback(primary, failures)
+        }
+    }
+
+    async fn create_container_owned(
+        &self,
+        image: &str,
+        config: contract::RunConfig,
+    ) -> Result<String, RuntimeError> {
+        let setup_commands = config.setup_commands.clone();
+        let setup_env = config.env.clone();
+        let setup_user = config.user.clone();
+        let mut oci_config = run_config_from_contract(config);
+        let mut transaction = self
+            .runtime
+            .begin_container_create(&mut oci_config, None)
+            .await
+            .map_err(oci_err)?;
+        let container_id = self
+            .runtime
+            .create_container_in_transaction(image, oci_config, &mut transaction)
+            .await
+            .map_err(oci_err)?;
+        if !setup_commands.is_empty()
+            && let Err(error) = self
+                .run_setup_commands(
+                    &container_id,
+                    &transaction,
+                    &setup_commands,
+                    &setup_env,
+                    setup_user.as_deref(),
+                )
+                .await
+        {
+            return Err(self
+                .rollback_failed_create(&container_id, &transaction, error)
+                .await);
+        }
+        Ok(container_id)
+    }
+
+    async fn create_container_in_stack_owned(
+        &self,
+        stack_id: &str,
+        image: &str,
+        config: contract::RunConfig,
+    ) -> Result<String, RuntimeError> {
+        let setup_commands = config.setup_commands.clone();
+        let setup_env = config.env.clone();
+        let setup_user = config.user.clone();
+        let mut oci_config = run_config_from_contract(config);
+        let mut transaction = self
+            .runtime
+            .begin_container_create(&mut oci_config, Some(stack_id))
+            .await
+            .map_err(oci_err)?;
+        let setup_commit_ref = (!setup_commands.is_empty())
+            .then(|| crate::Runtime::setup_commit_reference(image, &setup_commands));
+        let setup_commit_tar_guest = if let Some(commit_ref) = setup_commit_ref.as_deref() {
+            let host_path = self
+                .runtime
+                .setup_commits_host_dir()
+                .join(format!("{commit_ref}.tar"));
+            host_path
+                .is_file()
+                .then(|| format!("/vz-setup-commits/{commit_ref}.tar"))
+        } else {
+            None
+        };
+        let container_id = self
+            .runtime
+            .create_container_in_stack_transaction(
+                stack_id,
+                image,
+                oci_config,
+                setup_commit_tar_guest,
+                &mut transaction,
+            )
+            .await
+            .map_err(oci_err)?;
+        if let Some(commit_ref) = setup_commit_ref.as_deref() {
+            let restored = self
+                .runtime
+                .was_setup_restored(&container_id, commit_ref)
+                .await;
+            if restored {
+                tracing::info!(container_id = %container_id, "skipping run_setup_commands (cache hit)");
+            } else {
+                if let Err(error) = self
+                    .run_setup_commands(
+                        &container_id,
+                        &transaction,
+                        &setup_commands,
+                        &setup_env,
+                        setup_user.as_deref(),
+                    )
+                    .await
+                {
+                    return Err(self
+                        .rollback_failed_create(&container_id, &transaction, error)
+                        .await);
+                }
+                if let Err(error) = self
+                    .runtime
+                    .save_setup_commit_in_transaction(
+                        stack_id,
+                        &container_id,
+                        commit_ref,
+                        &transaction,
+                    )
+                    .await
+                {
+                    tracing::warn!(commit_ref, %error, "save_setup_commit failed");
+                }
+            }
+        }
+        Ok(container_id)
+    }
+}
+
+fn aggregate_create_rollback(primary: RuntimeError, failures: Vec<String>) -> RuntimeError {
+    RuntimeError::Backend {
+        message: format!(
+            "{primary}; create rollback also failed: {}",
+            failures.join("; ")
+        ),
+        source: Box::new(primary),
+    }
+}
+
+async fn run_owned_create<T, Factory, Future>(factory: Factory) -> Result<T, RuntimeError>
+where
+    T: Send + 'static,
+    Factory: FnOnce() -> Future + Send + 'static,
+    Future: std::future::Future<Output = Result<T, RuntimeError>> + 'static,
+{
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("vz-owned-container-create".to_string())
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(RuntimeError::Io)
+                .and_then(|runtime| runtime.block_on(factory()));
+            let _ = sender.send(result);
+        })
+        .map_err(RuntimeError::Io)?;
+    receiver.await.map_err(|error| RuntimeError::Backend {
+        message: format!("owned container create thread terminated: {error}"),
+        source: Box::new(error),
+    })?
 }
 
 impl RuntimeBackend for MacosRuntimeBackend {
@@ -158,32 +333,12 @@ impl RuntimeBackend for MacosRuntimeBackend {
         image: &str,
         config: contract::RunConfig,
     ) -> Result<String, RuntimeError> {
-        let setup_commands = config.setup_commands.clone();
-        let setup_env = config.env.clone();
-        let setup_cwd = config.working_dir.clone();
-        let setup_user = config.user.clone();
-        let setup_timeout = config.timeout;
-
-        let oci_config = run_config_from_contract(config);
-        let container_id = self
-            .runtime
-            .create_container(image, oci_config)
-            .await
-            .map_err(oci_err)?;
-
-        if !setup_commands.is_empty() {
-            self.run_setup_commands(
-                &container_id,
-                &setup_commands,
-                &setup_env,
-                setup_cwd.as_deref(),
-                setup_user.as_deref(),
-                setup_timeout,
-            )
-            .await?;
-        }
-
-        Ok(container_id)
+        let backend = self.clone();
+        let image = image.to_string();
+        run_owned_create(
+            move || async move { backend.create_container_owned(&image, config).await },
+        )
+        .await
     }
 
     async fn exec_container(
@@ -290,73 +445,15 @@ impl RuntimeBackend for MacosRuntimeBackend {
         image: &str,
         config: contract::RunConfig,
     ) -> Result<String, RuntimeError> {
-        let setup_commands = config.setup_commands.clone();
-        let setup_env = config.env.clone();
-        let setup_cwd = config.working_dir.clone();
-        let setup_user = config.user.clone();
-        let setup_timeout = config.timeout;
-
-        let oci_config = run_config_from_contract(config);
-
-        // Resolve the cached setup-commit tarball (if any) BEFORE creating
-        // the container. The runtime layer extracts it into the overlay
-        // upperdir at mount time — modifying upperdir after mount is
-        // unreliable, so the decision must happen up-front.
-        let setup_commit_tar_guest = if !setup_commands.is_empty() {
-            let commit_ref = crate::Runtime::setup_commit_reference(image, &setup_commands);
-            let host_path = self
-                .runtime
-                .setup_commits_host_dir()
-                .join(format!("{commit_ref}.tar"));
-            if host_path.is_file() {
-                Some(format!("/vz-setup-commits/{commit_ref}.tar"))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let container_id = self
-            .runtime
-            .create_container_in_stack(stack_id, image, oci_config, setup_commit_tar_guest)
-            .await
-            .map_err(oci_err)?;
-
-        // Setup commit/restore: when a cached tarball exists for the
-        // (image, setup_commands) pair, the runtime layer pre-populates the
-        // overlay upperdir BEFORE mount. We just check whether that
-        // happened and either skip setup or run+commit accordingly.
-        if !setup_commands.is_empty() {
-            let restored = self.runtime.was_setup_restored(&container_id).await;
-            if restored {
-                tracing::info!(
-                    container_id = %container_id,
-                    "skipping run_setup_commands (cache hit)"
-                );
-            } else {
-                self.run_setup_commands(
-                    &container_id,
-                    &setup_commands,
-                    &setup_env,
-                    setup_cwd.as_deref(),
-                    setup_user.as_deref(),
-                    setup_timeout,
-                )
-                .await?;
-                let commit_ref = crate::Runtime::setup_commit_reference(image, &setup_commands);
-                if let Err(error) = self
-                    .runtime
-                    .save_setup_commit(stack_id, &container_id, &commit_ref)
-                    .await
-                {
-                    // save is best-effort — boot succeeded, cache miss next time.
-                    tracing::warn!(commit_ref = %commit_ref, %error, "save_setup_commit failed");
-                }
-            }
-        }
-
-        Ok(container_id)
+        let backend = self.clone();
+        let stack_id = stack_id.to_string();
+        let image = image.to_string();
+        run_owned_create(move || async move {
+            backend
+                .create_container_in_stack_owned(&stack_id, &image, config)
+                .await
+        })
+        .await
     }
 
     async fn network_setup(
@@ -481,6 +578,15 @@ fn oci_err(e: crate::error::MacosOciError) -> RuntimeError {
     match e {
         crate::error::MacosOciError::InvalidConfig(message) => RuntimeError::InvalidConfig(message),
         crate::error::MacosOciError::InvalidRootfs { path } => RuntimeError::InvalidRootfs { path },
+        crate::error::MacosOciError::ContainerAlreadyExists { id } => {
+            RuntimeError::ContainerFailed {
+                id,
+                reason: "container ID is already owned by another lifecycle".to_string(),
+            }
+        }
+        crate::error::MacosOciError::ContainerNotFound { id } => {
+            RuntimeError::ContainerNotFound { id }
+        }
         crate::error::MacosOciError::Storage(source) => RuntimeError::Io(source),
         crate::error::MacosOciError::UnsupportedExecutionMode { mode } => {
             RuntimeError::UnsupportedOperation {
@@ -659,5 +765,81 @@ fn prune_result_to_contract(p: vz_image::PruneResult) -> contract::PruneResult {
         removed_manifests: p.removed_manifests,
         removed_configs: p.removed_configs,
         removed_layer_dirs: p.removed_layer_dirs,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use tokio::sync::Notify;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn owned_create_operation_survives_waiter_cancellation() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker_started = Arc::clone(&started);
+        let worker_release = Arc::clone(&release);
+        let worker_completed = Arc::clone(&completed);
+
+        let waiter = tokio::spawn(async move {
+            run_owned_create(move || async move {
+                worker_started.notify_one();
+                worker_release.notified().await;
+                worker_completed.store(true, Ordering::SeqCst);
+                Ok::<_, RuntimeError>(())
+            })
+            .await
+        });
+        started.notified().await;
+        waiter.abort();
+        release.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !completed.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn lifecycle_storage_conflicts_map_to_machine_semantics() {
+        let exists = oci_err(crate::error::MacosOciError::ContainerAlreadyExists {
+            id: "same-name".to_string(),
+        });
+        let missing = oci_err(crate::error::MacosOciError::ContainerNotFound {
+            id: "missing".to_string(),
+        });
+        assert_eq!(
+            exists.machine_code(),
+            vz_runtime_contract::MachineErrorCode::StateConflict
+        );
+        assert_eq!(
+            missing.machine_code(),
+            vz_runtime_contract::MachineErrorCode::NotFound
+        );
+    }
+
+    #[test]
+    fn rollback_aggregation_retains_every_failure() {
+        let error = aggregate_create_rollback(
+            RuntimeError::InvalidConfig("setup failed".to_string()),
+            vec![
+                "stop: timed out".to_string(),
+                "remove: still running".to_string(),
+            ],
+        );
+        let message = error.to_string();
+        assert!(message.contains("setup failed"));
+        assert!(message.contains("stop: timed out"));
+        assert!(message.contains("remove: still running"));
     }
 }

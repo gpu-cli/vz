@@ -25,9 +25,11 @@ use sha2::{Digest, Sha256};
 use tar::{Builder as TarBuilder, EntryType, Header};
 use vz_image::{ImageStore, parse_image_config_summary_from_store};
 use vz_oci_macos::{
-    ExecConfig, ExecutionMode, InteractiveExecEvent, KernelProfile, MountAccess, MountSpec,
-    MountType, RunConfig, Runtime, RuntimeConfig,
+    ContainerReadyGeneration, ExecConfig, ExecutionMode, InteractiveExecEvent, KernelProfile,
+    MacosRuntimeBackend, MountAccess, MountSpec, MountType, RunConfig, Runtime, RuntimeConfig,
+    RuntimeLifecycleAdmissionEvent, RuntimeLifecycleAdmissionKind, RuntimeLifecycleObserver,
 };
+use vz_runtime_contract::RuntimeBackend as _;
 
 /// Set up tracing for test diagnostics.
 fn init_tracing() {
@@ -89,6 +91,234 @@ fn require_virtualization_entitlement() -> bool {
         "VZ_E2E_REQUIRED_SKIP: runtime_e2e test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-sandbox-vm-e2e.sh --suite runtime"
     );
     false
+}
+
+async fn container_generation_evidence(rt: &Runtime, container_id: &str) -> serde_json::Value {
+    let output = rt
+        .exec_container(
+            container_id,
+            ExecConfig {
+                cmd: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "start=$(awk '{print $22}' /proc/1/stat); \
+                     cgroup=$(tr '\\n' ',' </proc/1/cgroup); \
+                     root=$(stat -Lc '%d:%i' /proc/1/root); \
+                     printf '{\"owner\":\"%s\",\"boot_id\":\"%s\",\"init_pid\":1,\"start_time\":\"%s\",\"cgroup\":\"%s\",\"mnt_ns\":\"%s\",\"net_ns\":\"%s\",\"pid_ns\":\"%s\",\"ipc_ns\":\"%s\",\"uts_ns\":\"%s\",\"root_identity\":\"%s\"}\\n' \
+                       \"$VZ_E2E_OWNER\" \"$(cat /proc/sys/kernel/random/boot_id)\" \"$start\" \"$cgroup\" \
+                       \"$(readlink /proc/1/ns/mnt)\" \"$(readlink /proc/1/ns/net)\" \
+                       \"$(readlink /proc/1/ns/pid)\" \"$(readlink /proc/1/ns/ipc)\" \
+                       \"$(readlink /proc/1/ns/uts)\" \"$root\""
+                        .into(),
+                ],
+                timeout: Some(Duration::from_secs(15)),
+                ..ExecConfig::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("capture generation evidence for '{container_id}' failed: {error}")
+        });
+    assert_eq!(
+        output.exit_code, 0,
+        "generation evidence command failed: {}",
+        output.stderr
+    );
+    serde_json::from_str(output.stdout.trim()).unwrap_or_else(|error| {
+        panic!(
+            "generation evidence was not valid JSON: {error}; stdout={}",
+            output.stdout
+        )
+    })
+}
+
+async fn guest_container_generation_evidence(
+    rt: &Runtime,
+    stack_id: &str,
+    container_id: &str,
+) -> serde_json::Value {
+    let script = format!(
+        r#"state=$(/run/vz-oci/bin/youki --root /run/vz-oci/state state {container_id}) || exit 1
+pid=$(printf '%s\n' "$state" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+test -n "$pid" || exit 2
+start=$(awk '{{print $22}}' /proc/$pid/stat)
+cgroup_path=$(sed -n 's/^[^:]*:[^:]*://p' /proc/$pid/cgroup | head -n1)
+owner=$(tr '\000' '\n' < /proc/$pid/environ | sed -n 's/^VZ_E2E_OWNER=//p' | head -n1)
+printf '{{"owner":"%s","guest_init_pid":%s,"start_time":"%s","cgroup_path":"%s","cgroup_identity":"%s","mnt_identity":"%s","net_identity":"%s","pid_identity":"%s","ipc_identity":"%s","uts_identity":"%s","root_identity":"%s"}}\n' \
+  "$owner" "$pid" "$start" "$cgroup_path" "$(stat -Lc '%d:%i' /sys/fs/cgroup$cgroup_path)" \
+  "$(stat -Lc '%d:%i' /proc/$pid/ns/mnt)" "$(stat -Lc '%d:%i' /proc/$pid/ns/net)" \
+  "$(stat -Lc '%d:%i' /proc/$pid/ns/pid)" "$(stat -Lc '%d:%i' /proc/$pid/ns/ipc)" \
+  "$(stat -Lc '%d:%i' /proc/$pid/ns/uts)" "$(stat -Lc '%d:%i' /proc/$pid/root)""#
+    );
+    let output = rt
+        .exec_in_shared_vm(
+            stack_id,
+            "/bin/sh".into(),
+            vec!["-c".into(), script],
+            Duration::from_secs(15),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("guest generation probe failed: {error}"));
+    assert_eq!(
+        output.exit_code, 0,
+        "guest generation probe failed: {}",
+        output.stderr
+    );
+    serde_json::from_str(output.stdout.trim()).unwrap_or_else(|error| {
+        panic!(
+            "guest generation probe was not JSON: {error}; stdout={}",
+            output.stdout
+        )
+    })
+}
+
+fn generation_fingerprint(evidence: &serde_json::Value) -> String {
+    [
+        "guest_init_pid",
+        "start_time",
+        "boot_id",
+        "cgroup",
+        "cgroup_path",
+        "cgroup_identity",
+        "mnt_ns",
+        "mnt_identity",
+        "net_ns",
+        "net_identity",
+        "pid_ns",
+        "pid_identity",
+        "ipc_ns",
+        "ipc_identity",
+        "uts_ns",
+        "uts_identity",
+        "root_identity",
+    ]
+    .into_iter()
+    .map(|key| evidence[key].to_string())
+    .collect::<Vec<_>>()
+    .join("|")
+}
+
+fn ready_generation_evidence(ready: &ContainerReadyGeneration) -> serde_json::Value {
+    let object = |identity: vz_oci_macos::KernelObjectIdentity| json!({"device": identity.device, "inode": identity.inode});
+    json!({
+        "lifecycle_generation": ready.lifecycle_generation,
+        "container_id": ready.container_id,
+        "init_pid": ready.init_pid,
+        "init_start_time": ready.init_start_time,
+        "cgroup_path": ready.cgroup_path,
+        "cgroup": object(ready.cgroup),
+        "namespaces": {
+            "mount": object(ready.namespaces.mount),
+            "network": object(ready.namespaces.network),
+            "pid": object(ready.namespaces.pid),
+            "ipc": object(ready.namespaces.ipc),
+            "uts": object(ready.namespaces.uts),
+        },
+        "root": object(ready.root),
+    })
+}
+
+fn ready_matches_process_probe(
+    ready: &ContainerReadyGeneration,
+    probe: &serde_json::Value,
+) -> bool {
+    let start_time = ready.init_start_time.to_string();
+    let identity =
+        |value: vz_oci_macos::KernelObjectIdentity| format!("{}:{}", value.device, value.inode);
+    ready.container_id == "id-serialization-e2e"
+        && probe["guest_init_pid"].as_u64() == Some(u64::from(ready.init_pid))
+        && probe["start_time"].as_str() == Some(start_time.as_str())
+        && probe["cgroup_path"].as_str() == Some(ready.cgroup_path.as_str())
+        && probe["cgroup_identity"].as_str() == Some(identity(ready.cgroup).as_str())
+        && probe["mnt_identity"].as_str() == Some(identity(ready.namespaces.mount).as_str())
+        && probe["net_identity"].as_str() == Some(identity(ready.namespaces.network).as_str())
+        && probe["pid_identity"].as_str() == Some(identity(ready.namespaces.pid).as_str())
+        && probe["ipc_identity"].as_str() == Some(identity(ready.namespaces.ipc).as_str())
+        && probe["uts_identity"].as_str() == Some(identity(ready.namespaces.uts).as_str())
+        && probe["root_identity"].as_str() == Some(identity(ready.root).as_str())
+}
+
+async fn capture_ready_generation(rt: &Runtime, container_id: &str) -> ContainerReadyGeneration {
+    let ready = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let observed = std::sync::Arc::clone(&ready);
+    let output = rt
+        .exec_container_streaming(
+            container_id,
+            ExecConfig {
+                cmd: vec!["/bin/true".into()],
+                timeout: Some(Duration::from_secs(15)),
+                ..ExecConfig::default()
+            },
+            move |event| {
+                if let InteractiveExecEvent::ContainerReady(generation) = event {
+                    *observed.lock().unwrap() = Some(generation);
+                }
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("ready-generation exec failed: {error}"));
+    assert_eq!(output.exit_code, 0, "ready-generation probe failed");
+    ready
+        .lock()
+        .unwrap()
+        .take()
+        .expect("container exec omitted guest readiness generation")
+}
+
+fn write_container_id_ownership_evidence(evidence: &serde_json::Value) {
+    let rendered = serde_json::to_string_pretty(evidence).unwrap();
+    eprintln!("VZ_CONTAINER_ID_OWNERSHIP_EVIDENCE={rendered}");
+    let Ok(path) = std::env::var("VZ_CONTAINER_ID_OWNERSHIP_EVIDENCE") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, format!("{rendered}\n")).unwrap();
+}
+
+fn stable_guest_network_inventory_command() -> String {
+    r#"for interface in /sys/class/net/*; do printf '%s\n' "${interface##*/}"; done | /bin/busybox sort
+echo __routes__
+/bin/busybox ip route show
+echo __netns__
+/bin/busybox ls -1 /var/run/netns 2>/dev/null | /bin/busybox sort || true"#
+        .to_string()
+}
+
+fn standalone_duplicate_id_was_rejected(
+    result: &Result<String, vz_oci_macos::MacosOciError>,
+) -> bool {
+    matches!(
+        result,
+        Err(vz_oci_macos::MacosOciError::ContainerAlreadyExists { id })
+            if id == "id-serialization-e2e"
+    )
+}
+
+fn backend_duplicate_id_was_rejected(
+    result: &Result<String, vz_runtime_contract::RuntimeError>,
+) -> bool {
+    matches!(
+        result,
+        Err(vz_runtime_contract::RuntimeError::ContainerFailed { id, reason })
+            if id == "id-serialization-e2e" && reason.contains("already owned")
+    )
+}
+
+async fn expect_lifecycle_admission(
+    observer: &mut RuntimeLifecycleObserver,
+    kind: RuntimeLifecycleAdmissionKind,
+    container_id: &str,
+) -> RuntimeLifecycleAdmissionEvent {
+    let event = tokio::time::timeout(Duration::from_secs(30), observer.recv())
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for lifecycle event {kind:?}"))
+        .unwrap_or_else(|| panic!("lifecycle observer closed before {kind:?}"));
+    assert_eq!(event.kind(), kind, "unexpected lifecycle admission event");
+    assert_eq!(event.container_id(), container_id);
+    event
 }
 
 // ── Smoke test: pull + run ──────────────────────────────────────
@@ -334,6 +564,751 @@ async fn lifecycle_create_exec_stop_remove() {
     assert!(
         !containers_after.iter().any(|c| c.id == container_id),
         "container should be removed from list"
+    );
+}
+
+/// Prove caller-selected IDs have one lifecycle owner across standalone and
+/// shared-VM stack paths, including setup failure and stop/remove/recreate.
+///
+/// The exec/recreate phase waits for the guest-originated post-pin readiness
+/// acknowledgement, then uses an in-container gate to fix the remaining
+/// schedule. The retained raw `/proc/1` identity proves that the admitted exec
+/// cannot cross to the replacement generation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn container_id_lifecycle_serialization_and_generation_ownership() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
+    init_tracing();
+
+    const IMAGE: &str = "alpine:latest";
+    const CONTAINER_ID: &str = "id-serialization-e2e";
+    const STACK_ID: &str = "id-owner-stack";
+    const SERVICE_NAME: &str = "owner";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = test_runtime(tmp.path());
+    rt.pull(IMAGE).await.unwrap();
+
+    // Standalone: a live caller-selected ID rejects a duplicate without
+    // changing its process defaults, metadata, or guest generation.
+    let standalone_config = |owner: &str| RunConfig {
+        cmd: vec!["sleep".into(), "300".into()],
+        env: vec![("VZ_E2E_OWNER".into(), owner.into())],
+        execution_mode: ExecutionMode::OciRuntime,
+        container_id: Some(CONTAINER_ID.into()),
+        ..RunConfig::default()
+    };
+    let mut standalone_admissions = rt.install_lifecycle_observer();
+    let first_runtime = rt.clone();
+    let first_standalone = tokio::spawn(async move {
+        first_runtime
+            .create_container(IMAGE, standalone_config("standalone-a"))
+            .await
+    });
+    let first_create_admission =
+        tokio::time::timeout(Duration::from_secs(10), standalone_admissions.recv())
+            .await
+            .expect("first standalone create never reached ID admission")
+            .expect("standalone lifecycle observer closed unexpectedly");
+    assert_eq!(
+        first_create_admission.kind(),
+        RuntimeLifecycleAdmissionKind::CreateBeforeReservation
+    );
+    assert_eq!(first_create_admission.container_id(), CONTAINER_ID);
+    let in_flight_standalone_duplicate = tokio::time::timeout(
+        Duration::from_secs(10),
+        rt.create_container(IMAGE, standalone_config("standalone-duplicate")),
+    )
+    .await
+    .expect("concurrent standalone duplicate queued instead of failing closed");
+    let in_flight_standalone_duplicate_rejected =
+        standalone_duplicate_id_was_rejected(&in_flight_standalone_duplicate);
+    first_create_admission.resume();
+    let first_standalone_id = tokio::time::timeout(Duration::from_secs(120), first_standalone)
+        .await
+        .expect("first standalone create timed out after admission release")
+        .expect("first standalone create task panicked")
+        .expect("first standalone create failed");
+    assert_eq!(first_standalone_id, CONTAINER_ID);
+    drop(standalone_admissions);
+
+    let standalone_a = container_generation_evidence(&rt, CONTAINER_ID).await;
+    let active_standalone_duplicate = tokio::time::timeout(
+        Duration::from_secs(10),
+        rt.create_container(IMAGE, standalone_config("standalone-active-duplicate")),
+    )
+    .await
+    .expect("active standalone duplicate queued instead of failing closed");
+    let active_standalone_duplicate_rejected =
+        standalone_duplicate_id_was_rejected(&active_standalone_duplicate);
+    let standalone_after_duplicate = container_generation_evidence(&rt, CONTAINER_ID).await;
+    assert_eq!(
+        standalone_after_duplicate["owner"], "standalone-a",
+        "duplicate create overwrote the original standalone owner"
+    );
+    assert_eq!(
+        generation_fingerprint(&standalone_after_duplicate),
+        generation_fingerprint(&standalone_a),
+        "duplicate create changed the original standalone generation"
+    );
+    assert_eq!(
+        rt.list_containers()
+            .unwrap()
+            .iter()
+            .filter(|container| container.id == CONTAINER_ID)
+            .count(),
+        1,
+        "standalone ID must have exactly one metadata record"
+    );
+
+    rt.stop_container(CONTAINER_ID, true, None, None)
+        .await
+        .unwrap();
+    rt.remove_container(CONTAINER_ID).await.unwrap();
+    rt.create_container(IMAGE, standalone_config("standalone-b"))
+        .await
+        .unwrap();
+    let standalone_b = container_generation_evidence(&rt, CONTAINER_ID).await;
+    assert_eq!(standalone_b["owner"], "standalone-b");
+    assert_ne!(
+        generation_fingerprint(&standalone_a),
+        generation_fingerprint(&standalone_b),
+        "standalone recreate must produce a distinct raw guest generation"
+    );
+    rt.stop_container(CONTAINER_ID, true, None, None)
+        .await
+        .unwrap();
+    rt.remove_container(CONTAINER_ID).await.unwrap();
+
+    // Stack: enter setup deterministically, then issue a duplicate while the
+    // complete contract-backend create transaction is still in progress.
+    rt.boot_shared_vm(STACK_ID, vec![], Default::default())
+        .await
+        .unwrap();
+    let baseline_network_inventory = rt
+        .exec_in_shared_vm(
+            STACK_ID,
+            "/bin/sh".into(),
+            vec!["-c".into(), stable_guest_network_inventory_command()],
+            Duration::from_secs(15),
+        )
+        .await
+        .unwrap();
+    assert_eq!(baseline_network_inventory.exit_code, 0);
+    rt.network_setup(
+        STACK_ID,
+        vec![vz_oci_macos::NetworkServiceConfig {
+            name: SERVICE_NAME.into(),
+            addr: "172.31.73.2/24".into(),
+            network_name: "default".into(),
+        }],
+    )
+    .await
+    .unwrap();
+
+    let backend = std::sync::Arc::new(MacosRuntimeBackend::new(rt.clone()));
+    let failed_setup_commands = vec![
+        "rm -f /setup-release; mkfifo /setup-release; printf 'entered\\n' > /setup-entered"
+            .to_string(),
+        "read _ < /setup-release; exit 37".to_string(),
+    ];
+    let failed_setup_ref = Runtime::setup_commit_reference(IMAGE, &failed_setup_commands);
+    let first_backend = std::sync::Arc::clone(&backend);
+    let first_commands = failed_setup_commands.clone();
+    let first_create = tokio::spawn(async move {
+        first_backend
+            .create_container_in_stack(
+                STACK_ID,
+                IMAGE,
+                vz_runtime_contract::RunConfig {
+                    cmd: vec!["sleep".into(), "300".into()],
+                    env: vec![("VZ_E2E_OWNER".into(), "stack-setup-failing".into())],
+                    container_id: Some(CONTAINER_ID.into()),
+                    network_namespace_path: Some(format!("/var/run/netns/{SERVICE_NAME}")),
+                    setup_commands: first_commands,
+                    ..vz_runtime_contract::RunConfig::default()
+                },
+            )
+            .await
+    });
+
+    let setup_overlay = format!("/run/vz-oci/containers/{CONTAINER_ID}/merged");
+    let entered = rt
+        .exec_in_shared_vm(
+            STACK_ID,
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                format!(
+                    "while [ ! -e {setup_overlay}/setup-entered ]; do :; done; test -e {setup_overlay}/setup-entered"
+                ),
+            ],
+            Duration::from_secs(90),
+        )
+        .await
+        .expect("first stack create never entered its gated setup transaction");
+    assert_eq!(entered.exit_code, 0, "setup entry observer failed");
+    let failed_stack_generation =
+        guest_container_generation_evidence(&rt, STACK_ID, CONTAINER_ID).await;
+
+    let duplicate_backend = std::sync::Arc::clone(&backend);
+    let duplicate_create = async move {
+        duplicate_backend
+            .create_container_in_stack(
+                STACK_ID,
+                IMAGE,
+                vz_runtime_contract::RunConfig {
+                    cmd: vec!["sleep".into(), "300".into()],
+                    env: vec![("VZ_E2E_OWNER".into(), "stack-duplicate".into())],
+                    container_id: Some(CONTAINER_ID.into()),
+                    network_namespace_path: Some(format!("/var/run/netns/{SERVICE_NAME}")),
+                    setup_commands: vec!["printf duplicate > /duplicate-setup-ran".into()],
+                    ..vz_runtime_contract::RunConfig::default()
+                },
+            )
+            .await
+    };
+    tokio::pin!(duplicate_create);
+
+    // Admission must fail closed while the first transaction owns the ID; it
+    // must not wait and become a surprise create after the first rolls back.
+    let duplicate_result = tokio::time::timeout(Duration::from_secs(10), &mut duplicate_create)
+        .await
+        .expect("duplicate stack create queued instead of failing closed");
+    let duplicate_completed_before_release = true;
+    let loser_probe = rt
+        .exec_in_shared_vm(
+            STACK_ID,
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                format!("test ! -e {setup_overlay}/duplicate-setup-ran"),
+            ],
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("failed to inspect duplicate setup marker");
+    let loser_setup_absent = loser_probe.exit_code == 0;
+
+    let release = rt
+        .exec_in_shared_vm(
+            STACK_ID,
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                format!("printf 'release\\n' > {setup_overlay}/setup-release"),
+            ],
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    assert_eq!(release.exit_code, 0, "failed to release setup gate");
+    let first_result = tokio::time::timeout(Duration::from_secs(90), first_create)
+        .await
+        .expect("first stack create did not finish after setup gate release")
+        .expect("first stack create task panicked");
+    if duplicate_result.is_ok() {
+        let _ = rt.stop_container(CONTAINER_ID, true, None, None).await;
+        let _ = rt.remove_container(CONTAINER_ID).await;
+    }
+
+    let failed_cgroup_path = failed_stack_generation["cgroup_path"]
+        .as_str()
+        .unwrap_or_default();
+    let failed_guest_inventory = rt
+        .exec_in_shared_vm(
+            STACK_ID,
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                format!(
+                    "printf 'overlay='; test -e /run/vz-oci/containers/{CONTAINER_ID} && echo present || echo absent; \
+                     printf 'youki_state='; test -e /run/vz-oci/state/{CONTAINER_ID} && echo present || echo absent; \
+                     printf 'cgroup='; test -e /sys/fs/cgroup{failed_cgroup_path} && echo present || echo absent"
+                ),
+            ],
+            Duration::from_secs(15),
+        )
+        .await
+        .expect("failed to inspect failed-setup guest cleanup");
+    let failed_setup_diagnostics = rt.lifecycle_diagnostics().await.unwrap();
+    let failed_generation_released = failed_setup_diagnostics
+        .generations
+        .iter()
+        .any(|entry| entry.container_id == CONTAINER_ID && !entry.reserved);
+    let failed_host_maps_clean = failed_setup_diagnostics.vm_handles == 0
+        && failed_setup_diagnostics.container_routes == 0
+        && failed_setup_diagnostics.exec_bindings == 0
+        && failed_setup_diagnostics.active_lifecycles == 0
+        && failed_setup_diagnostics.exec_sessions == 0
+        && failed_setup_diagnostics.setup_restore_entries == 0
+        && failed_setup_diagnostics.rootfs_directories == 0
+        && failed_setup_diagnostics.overlay_cleanup_pending == 0;
+    let failed_guest_resources_clean = failed_guest_inventory.stdout.contains("overlay=absent")
+        && failed_guest_inventory.stdout.contains("youki_state=absent")
+        && failed_guest_inventory.stdout.contains("cgroup=absent");
+    let failed_setup_clean = rt
+        .list_containers()
+        .unwrap()
+        .iter()
+        .all(|container| container.id != CONTAINER_ID)
+        && !tmp.path().join("rootfs").join(CONTAINER_ID).exists()
+        && failed_generation_released
+        && failed_host_maps_clean
+        && failed_guest_resources_clean;
+    let failed_setup_commit_absent = !rt
+        .setup_commits_host_dir()
+        .join(format!("{failed_setup_ref}.tar"))
+        .exists();
+
+    // A later explicit recreate is valid only after setup failure cleanup has
+    // completed. Its setup commit must be fully published, never left as .tmp.
+    let stack_a_setup = vec!["printf 'stack-a\\n' > /setup-owner".to_string()];
+    let stack_a_ref = Runtime::setup_commit_reference(IMAGE, &stack_a_setup);
+    backend
+        .create_container_in_stack(
+            STACK_ID,
+            IMAGE,
+            vz_runtime_contract::RunConfig {
+                cmd: vec!["sleep".into(), "300".into()],
+                env: vec![("VZ_E2E_OWNER".into(), "stack-a".into())],
+                container_id: Some(CONTAINER_ID.into()),
+                network_namespace_path: Some(format!("/var/run/netns/{SERVICE_NAME}")),
+                setup_commands: stack_a_setup,
+                ..vz_runtime_contract::RunConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    let stack_a = guest_container_generation_evidence(&rt, STACK_ID, CONTAINER_ID).await;
+    let successful_setup_commit_present = rt
+        .setup_commits_host_dir()
+        .join(format!("{stack_a_ref}.tar"))
+        .is_file();
+
+    // Fixed schedule: pause exec after it owns read admission but before its
+    // guest RPC, request the complete lifecycle replacement, then prove the
+    // writer cannot acquire until the guest-originated post-execve proof.
+    let mut lifecycle_observer = rt.install_lifecycle_observer();
+    let exec_runtime = rt.clone();
+    let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+    let (stdout_sender, stdout_receiver) = tokio::sync::oneshot::channel();
+    let streamed_stdout = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_stdout = std::sync::Arc::clone(&streamed_stdout);
+    let exec_during_recreate = tokio::spawn(async move {
+        let mut ready_sender = Some(ready_sender);
+        let mut stdout_sender = Some(stdout_sender);
+        exec_runtime
+            .exec_container_streaming(
+                CONTAINER_ID,
+                ExecConfig {
+                    execution_id: Some("id-serialization-old-exec".into()),
+                    pty: true,
+                    cmd: vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "start=$(awk '{print $22}' /proc/1/stat); \
+                         touch /exec-entered; \
+                         printf 'pinned-owner=%s start=%s mnt=%s net=%s\\n' \
+                           \"$VZ_E2E_OWNER\" \"$start\" \
+                           \"$(readlink /proc/1/ns/mnt)\" \"$(readlink /proc/1/ns/net)\"; \
+                         read _; \
+                         printf 'finished-owner=%s\\n' \"$VZ_E2E_OWNER\""
+                            .into(),
+                    ],
+                    timeout: Some(Duration::from_secs(90)),
+                    ..ExecConfig::default()
+                },
+                move |event| match event {
+                    InteractiveExecEvent::ContainerReady(generation) => {
+                        if let Some(sender) = ready_sender.take() {
+                            let _ = sender.send(generation);
+                        }
+                    }
+                    InteractiveExecEvent::Stdout(bytes) => {
+                        let mut stdout = observed_stdout.lock().unwrap();
+                        stdout.extend(bytes);
+                        if stdout
+                            .windows(b"pinned-owner=stack-a".len())
+                            .any(|window| window == b"pinned-owner=stack-a")
+                        {
+                            if let Some(sender) = stdout_sender.take() {
+                                let _ = sender.send(());
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+            )
+            .await
+    });
+
+    let exec_before_guest = expect_lifecycle_admission(
+        &mut lifecycle_observer,
+        RuntimeLifecycleAdmissionKind::ExecBeforeGuestRpc,
+        CONTAINER_ID,
+    )
+    .await;
+    let lifecycle_runtime = rt.clone();
+    let replacement = async move {
+        lifecycle_runtime
+            .stop_container(CONTAINER_ID, true, None, None)
+            .await?;
+        lifecycle_runtime.remove_container(CONTAINER_ID).await?;
+        lifecycle_runtime
+            .create_container_in_stack(
+                STACK_ID,
+                IMAGE,
+                RunConfig {
+                    cmd: vec!["sleep".into(), "300".into()],
+                    env: vec![("VZ_E2E_OWNER".into(), "stack-b".into())],
+                    execution_mode: ExecutionMode::OciRuntime,
+                    container_id: Some(CONTAINER_ID.into()),
+                    network_namespace_path: Some(format!("/var/run/netns/{SERVICE_NAME}")),
+                    ..RunConfig::default()
+                },
+                None,
+            )
+            .await
+    };
+    tokio::pin!(replacement);
+    let stop_requested = tokio::select! {
+        event = expect_lifecycle_admission(
+            &mut lifecycle_observer,
+            RuntimeLifecycleAdmissionKind::StopWriterRequested,
+            CONTAINER_ID,
+        ) => event,
+        result = &mut replacement => panic!("replacement completed before stop request was observed: {result:?}"),
+    };
+    stop_requested.resume();
+    exec_before_guest.resume();
+
+    // If stop bypasses exec's read admission, StopWriterAcquired arrives here
+    // and this exact event-order assertion fails.
+    let guest_ready_boundary = tokio::select! {
+        event = expect_lifecycle_admission(
+            &mut lifecycle_observer,
+            RuntimeLifecycleAdmissionKind::ExecGuestReady,
+            CONTAINER_ID,
+        ) => event,
+        result = &mut replacement => panic!("replacement crossed exec admission before guest readiness: {result:?}"),
+    };
+    let exec_marker = rt
+        .exec_in_shared_vm(
+            STACK_ID,
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                format!(
+                    "while [ ! -e /run/vz-oci/containers/{CONTAINER_ID}/merged/exec-entered ]; do :; done"
+                ),
+            ],
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("generation-A exec did not reach its command gate");
+    assert_eq!(exec_marker.exit_code, 0);
+    guest_ready_boundary.resume();
+
+    let stack_a_ready = tokio::time::timeout(Duration::from_secs(30), ready_receiver)
+        .await
+        .expect("exec never published guest target-ready acknowledgement")
+        .expect("exec ended before reporting its pinned generation");
+    let stop_acquired = tokio::select! {
+        event = expect_lifecycle_admission(
+            &mut lifecycle_observer,
+            RuntimeLifecycleAdmissionKind::StopWriterAcquired,
+            CONTAINER_ID,
+        ) => event,
+        result = &mut replacement => panic!("replacement completed before stop writer admission: {result:?}"),
+    };
+    tokio::time::timeout(Duration::from_secs(30), stdout_receiver)
+        .await
+        .expect("generation-A exec did not emit its owner sentinel")
+        .expect("generation-A stdout observer closed");
+    let ready_a_matches_probe = ready_matches_process_probe(&stack_a_ready, &stack_a);
+    stop_acquired.resume();
+
+    let remove_acquired = tokio::select! {
+        event = expect_lifecycle_admission(
+            &mut lifecycle_observer,
+            RuntimeLifecycleAdmissionKind::RemoveWriterAcquired,
+            CONTAINER_ID,
+        ) => event,
+        result = &mut replacement => panic!("replacement completed before remove writer admission: {result:?}"),
+    };
+    remove_acquired.resume();
+    let recreate_admitted = tokio::select! {
+        event = expect_lifecycle_admission(
+            &mut lifecycle_observer,
+            RuntimeLifecycleAdmissionKind::CreateBeforeReservation,
+            CONTAINER_ID,
+        ) => event,
+        result = &mut replacement => panic!("replacement completed before recreate admission: {result:?}"),
+    };
+    recreate_admitted.resume();
+    let recovery_route_published = tokio::select! {
+        event = expect_lifecycle_admission(
+            &mut lifecycle_observer,
+            RuntimeLifecycleAdmissionKind::StackRoutePublishedBeforeOverlay,
+            CONTAINER_ID,
+        ) => event,
+        result = &mut replacement => panic!("replacement completed before recovery route publication: {result:?}"),
+    };
+    recovery_route_published.resume();
+    let overlay_setup_starting = tokio::select! {
+        event = expect_lifecycle_admission(
+            &mut lifecycle_observer,
+            RuntimeLifecycleAdmissionKind::StackOverlaySetupStarting,
+            CONTAINER_ID,
+        ) => event,
+        result = &mut replacement => panic!("replacement completed before overlay setup admission: {result:?}"),
+    };
+    overlay_setup_starting.resume();
+    let replacement_id = tokio::time::timeout(Duration::from_secs(120), &mut replacement)
+        .await
+        .expect("stop/remove/recreate transaction timed out")
+        .expect("stop/remove/recreate transaction failed");
+    assert_eq!(replacement_id, CONTAINER_ID);
+    drop(lifecycle_observer);
+
+    // If the old pinned exec survived OCI deletion, release it only after B is
+    // active. If stop terminated it, session-not-found is the allowed stale-A
+    // outcome; either way it must never be routed into B.
+    let _ = rt
+        .write_exec_stdin("id-serialization-old-exec", b"release\n")
+        .await;
+    let raced_exec = tokio::time::timeout(Duration::from_secs(30), exec_during_recreate)
+        .await
+        .expect("old generation exec did not terminate after recreate")
+        .expect("old generation exec task panicked");
+    let stack_b = guest_container_generation_evidence(&rt, STACK_ID, CONTAINER_ID).await;
+    let stack_b_ready = capture_ready_generation(&rt, CONTAINER_ID).await;
+    let ready_b_matches_probe = ready_matches_process_probe(&stack_b_ready, &stack_b);
+    let raced_stdout = String::from_utf8_lossy(&streamed_stdout.lock().unwrap()).into_owned();
+    let exec_did_not_cross_generation =
+        raced_stdout.contains("pinned-owner=stack-a") && !raced_stdout.contains("stack-b");
+    let ready_generations_distinct = stack_b_ready.lifecycle_generation
+        > stack_a_ready.lifecycle_generation
+        && (stack_b_ready.init_start_time != stack_a_ready.init_start_time
+            || stack_b_ready.cgroup != stack_a_ready.cgroup
+            || stack_b_ready.namespaces != stack_a_ready.namespaces
+            || stack_b_ready.root != stack_a_ready.root);
+
+    rt.stop_container(CONTAINER_ID, true, None, None)
+        .await
+        .unwrap();
+    rt.remove_container(CONTAINER_ID).await.unwrap();
+    let stale_exec = rt
+        .exec_container(
+            CONTAINER_ID,
+            ExecConfig {
+                cmd: vec!["/bin/true".into()],
+                ..ExecConfig::default()
+            },
+        )
+        .await;
+    let stale_exec_rejected = matches!(
+        &stale_exec,
+        Err(vz_oci_macos::MacosOciError::ContainerNotFound { id }) if id == CONTAINER_ID
+    );
+    rt.network_teardown(STACK_ID, vec![SERVICE_NAME.into()])
+        .await
+        .unwrap();
+    let cgroup_a_path = stack_a["cgroup_path"].as_str().unwrap_or_default();
+    let cgroup_b_path = stack_b["cgroup_path"].as_str().unwrap_or_default();
+    let guest_inventory = rt
+        .exec_in_shared_vm(
+            STACK_ID,
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                format!(
+                    "printf 'overlay='; test -e /run/vz-oci/containers/{CONTAINER_ID} && echo present || echo absent; \
+                     printf 'service_netns='; test -e /var/run/netns/{SERVICE_NAME} && echo present || echo absent; \
+                     printf 'youki_state='; test -e /run/vz-oci/state/{CONTAINER_ID} && echo present || echo absent; \
+                     printf 'cgroup_a='; test -e /sys/fs/cgroup{cgroup_a_path} && echo present || echo absent; \
+                     printf 'cgroup_b='; test -e /sys/fs/cgroup{cgroup_b_path} && echo present || echo absent"
+                ),
+            ],
+            Duration::from_secs(15),
+        )
+        .await
+        .unwrap();
+    let final_network_inventory = rt
+        .exec_in_shared_vm(
+            STACK_ID,
+            "/bin/sh".into(),
+            vec!["-c".into(), stable_guest_network_inventory_command()],
+            Duration::from_secs(15),
+        )
+        .await
+        .unwrap();
+    assert_eq!(final_network_inventory.exit_code, 0);
+    let guest_resources_clean = guest_inventory.stdout.contains("overlay=absent")
+        && guest_inventory.stdout.contains("service_netns=absent")
+        && guest_inventory.stdout.contains("youki_state=absent")
+        && guest_inventory.stdout.contains("cgroup_a=absent")
+        && guest_inventory.stdout.contains("cgroup_b=absent")
+        && final_network_inventory.stdout.trim() == baseline_network_inventory.stdout.trim();
+    let lifecycle_diagnostics = rt.lifecycle_diagnostics().await.unwrap();
+    let generation_released = lifecycle_diagnostics
+        .generations
+        .iter()
+        .any(|entry| entry.container_id == CONTAINER_ID && !entry.reserved);
+    let host_maps_clean = lifecycle_diagnostics.vm_handles == 0
+        && lifecycle_diagnostics.container_routes == 0
+        && lifecycle_diagnostics.exec_bindings == 0
+        && lifecycle_diagnostics.active_lifecycles == 0
+        && lifecycle_diagnostics.exec_sessions == 0
+        && lifecycle_diagnostics.setup_restore_entries == 0
+        && lifecycle_diagnostics.rootfs_directories == 0
+        && lifecycle_diagnostics.overlay_cleanup_pending == 0;
+    rt.shutdown_shared_vm(STACK_ID).await.unwrap();
+
+    let orphan_setup_tmp: Vec<String> = std::fs::read_dir(rt.setup_commits_host_dir())
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.ends_with(".tmp").then_some(name)
+        })
+        .collect();
+    let metadata_absent = rt
+        .list_containers()
+        .unwrap()
+        .iter()
+        .all(|container| container.id != CONTAINER_ID);
+    let rootfs_absent = !tmp.path().join("rootfs").join(CONTAINER_ID).exists();
+    let shared_vm_absent = !rt.has_shared_vm(STACK_ID).await;
+
+    let evidence = json!({
+        "schema_version": 1,
+        "scenario": "runtime-container-id-ownership",
+        "container_id": CONTAINER_ID,
+        "standalone": {
+            "in_flight_duplicate_rejected": in_flight_standalone_duplicate_rejected,
+            "active_duplicate_rejected": active_standalone_duplicate_rejected,
+            "generation_a": standalone_a.clone(),
+            "generation_b": standalone_b.clone(),
+        },
+        "stack": {
+            "duplicate_rejected_before_release": duplicate_completed_before_release
+                && backend_duplicate_id_was_rejected(&duplicate_result),
+            "loser_setup_absent": loser_setup_absent,
+            "failed_setup_returned_error": first_result.is_err(),
+            "failed_setup_clean": failed_setup_clean,
+            "failed_generation": failed_stack_generation,
+            "failed_generation_released": failed_generation_released,
+            "failed_guest_resources_clean": failed_guest_resources_clean,
+            "failed_guest_inventory": failed_guest_inventory.stdout,
+            "failed_host_maps_clean": failed_host_maps_clean,
+            "failed_lifecycle_diagnostics": format!("{failed_setup_diagnostics:?}"),
+            "failed_setup_commit_absent": failed_setup_commit_absent,
+            "successful_setup_commit_present": successful_setup_commit_present,
+            "generation_a": stack_a.clone(),
+            "generation_b": stack_b.clone(),
+            "ready_generation_a": ready_generation_evidence(&stack_a_ready),
+            "ready_generation_b": ready_generation_evidence(&stack_b_ready),
+            "ready_a_matches_process_probe": ready_a_matches_probe,
+            "ready_b_matches_process_probe": ready_b_matches_probe,
+            "ready_generations_distinct": ready_generations_distinct,
+            "raced_exec_result": raced_exec.as_ref().map(|output| json!({
+                "exit_code": output.exit_code,
+                "stdout": output.stdout,
+                "stderr": output.stderr,
+            })).unwrap_or_else(|error| json!({"error": error.to_string()})),
+            "exec_did_not_cross_generation": exec_did_not_cross_generation,
+        },
+        "final": {
+            "metadata_absent": metadata_absent,
+            "rootfs_absent": rootfs_absent,
+            "shared_vm_absent": shared_vm_absent,
+            "guest_resources_clean": guest_resources_clean,
+            "stale_exec_rejected": stale_exec_rejected,
+            "generation_released": generation_released,
+            "host_maps_clean": host_maps_clean,
+            "lifecycle_diagnostics": format!("{lifecycle_diagnostics:?}"),
+            "guest_inventory": guest_inventory.stdout,
+            "baseline_network_inventory": baseline_network_inventory.stdout,
+            "final_network_inventory": final_network_inventory.stdout,
+            "orphan_setup_tmp": orphan_setup_tmp.clone(),
+        },
+    });
+    write_container_id_ownership_evidence(&evidence);
+
+    assert!(
+        in_flight_standalone_duplicate_rejected,
+        "in-flight standalone duplicate did not fail closed: {in_flight_standalone_duplicate:?}"
+    );
+    assert!(
+        active_standalone_duplicate_rejected,
+        "active standalone duplicate did not fail closed: {active_standalone_duplicate:?}"
+    );
+    assert!(
+        evidence["stack"]["duplicate_rejected_before_release"] == true,
+        "stack duplicate must fail before the owning setup transaction is released: {duplicate_result:?}"
+    );
+    assert!(first_result.is_err(), "gated setup was expected to fail");
+    assert!(
+        loser_setup_absent,
+        "duplicate setup command reached the winner"
+    );
+    assert!(failed_setup_clean, "failed setup leaked metadata or rootfs");
+    assert!(
+        failed_setup_commit_absent,
+        "failed setup published a commit"
+    );
+    assert!(
+        successful_setup_commit_present,
+        "successful setup did not atomically publish its commit"
+    );
+    assert_eq!(stack_a["owner"], "stack-a");
+    assert_eq!(stack_b["owner"], "stack-b");
+    assert_ne!(
+        generation_fingerprint(&stack_a),
+        generation_fingerprint(&stack_b),
+        "stack recreate must produce a distinct raw guest generation"
+    );
+    assert!(
+        ready_a_matches_probe,
+        "guest readiness A did not match its independent /proc probe: {stack_a_ready:?}"
+    );
+    assert!(
+        ready_b_matches_probe,
+        "guest readiness B did not match its independent /proc probe: {stack_b_ready:?}"
+    );
+    assert!(
+        ready_generations_distinct,
+        "same-ID recreate did not advance lifecycle/raw guest generation: A={stack_a_ready:?} B={stack_b_ready:?}"
+    );
+    assert!(
+        exec_did_not_cross_generation,
+        "generation-A exec crossed into replacement generation B: {raced_stdout}"
+    );
+    assert!(metadata_absent, "final metadata record leaked");
+    assert!(rootfs_absent, "final rootfs leaked");
+    assert!(shared_vm_absent, "shared VM leaked after shutdown");
+    assert!(
+        stale_exec_rejected,
+        "removed ID did not return its exact not-found result: {stale_exec:?}"
+    );
+    assert!(generation_released, "durable generation remained reserved");
+    assert!(
+        host_maps_clean,
+        "host lifecycle maps leaked: {lifecycle_diagnostics:?}"
+    );
+    assert!(
+        guest_resources_clean,
+        "guest resources leaked: {}",
+        guest_inventory.stdout
+    );
+    assert!(
+        orphan_setup_tmp.is_empty(),
+        "orphan setup commit temp files leaked"
     );
 }
 
@@ -923,21 +1898,37 @@ async fn exec_via_semantics_adapter(
     rt: &Runtime,
     container_id: &str,
     adapter: ExecSemanticsAdapter,
-    mut config: ExecConfig,
+    config: ExecConfig,
 ) -> Result<vz::protocol::ExecOutput, vz_oci_macos::MacosOciError> {
-    match adapter {
+    exec_via_semantics_adapter_with_events(rt, container_id, adapter, config)
+        .await
+        .0
+}
+
+async fn exec_via_semantics_adapter_with_events(
+    rt: &Runtime,
+    container_id: &str,
+    adapter: ExecSemanticsAdapter,
+    mut config: ExecConfig,
+) -> (
+    Result<vz::protocol::ExecOutput, vz_oci_macos::MacosOciError>,
+    Vec<InteractiveExecEvent>,
+) {
+    let mut events = Vec::new();
+    let result = match adapter {
         ExecSemanticsAdapter::OciUnary => rt.exec_container_oci_unary(container_id, config).await,
         ExecSemanticsAdapter::StreamingPipe => {
-            rt.exec_container_streaming(container_id, config, |_| {})
+            rt.exec_container_streaming(container_id, config, |event| events.push(event))
                 .await
         }
         ExecSemanticsAdapter::Pty => {
             config.pty = true;
             config.execution_id = Some(format!("exec-semantics-{}", adapter.name()));
-            rt.exec_container_streaming(container_id, config, |_| {})
+            rt.exec_container_streaming(container_id, config, |event| events.push(event))
                 .await
         }
-    }
+    };
+    (result, events)
 }
 
 fn exec_semantics_probe_config() -> ExecConfig {
@@ -1123,7 +2114,7 @@ async fn container_exec_user_environment_semantics() {
             missing_identity_results.push((
                 adapter,
                 sentinel_name.clone(),
-                exec_via_semantics_adapter(
+                exec_via_semantics_adapter_with_events(
                     &rt,
                     container_id,
                     adapter,
@@ -1201,31 +2192,53 @@ async fn container_exec_user_environment_semantics() {
         "unary and PTY canonical environments differ"
     );
 
-    for (adapter, sentinel_name, result) in missing_identity_results {
-        let output = match result {
-            Ok(output) => output,
-            Err(error) => panic!(
-                "{} identity rejection was not returned as an observable exec result: {error}",
-                adapter.name()
-            ),
-        };
-        assert_ne!(
-            output.exit_code,
-            0,
-            "{} accepted a missing named identity",
-            adapter.name()
-        );
-        let message = format!("{}{}", output.stdout, output.stderr);
-        eprintln!(
-            "container exec missing-identity evidence ({}): exit_code={} diagnostic={message:?}",
-            adapter.name(),
-            output.exit_code
-        );
-        assert!(
-            message.contains("vz-user-does-not-exist") && message.contains("does not exist"),
-            "{} returned an unactionable missing-user error: {message}",
-            adapter.name()
-        );
+    for (adapter, sentinel_name, (result, events)) in missing_identity_results {
+        match adapter {
+            ExecSemanticsAdapter::OciUnary => {
+                let output = result.expect("unary setup failure must remain result-shaped");
+                assert_ne!(
+                    output.exit_code, 0,
+                    "unary accepted a missing named identity"
+                );
+                let message = format!("{}{}", output.stdout, output.stderr);
+                eprintln!(
+                    "container exec missing-identity evidence ({}): exit_code={} diagnostic={message:?}",
+                    adapter.name(),
+                    output.exit_code
+                );
+                assert!(
+                    message.contains("vz-user-does-not-exist")
+                        && message.contains("does not exist"),
+                    "unary returned an unactionable missing-user error: {message}"
+                );
+            }
+            ExecSemanticsAdapter::StreamingPipe | ExecSemanticsAdapter::Pty => {
+                let error = result.expect_err("streaming setup failure must fail before readiness");
+                let vz_oci_macos::MacosOciError::Linux(vz_linux::LinuxError::Grpc(status)) = error
+                else {
+                    panic!(
+                        "{} returned the wrong pre-readiness error: {error}",
+                        adapter.name()
+                    );
+                };
+                assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+                assert_eq!(
+                    status.message(),
+                    "container trampoline failed before readiness: container exec user `vz-user-does-not-exist` does not exist"
+                );
+                assert!(
+                    events.is_empty(),
+                    "{} emitted events before rejecting the missing identity: {events:?}",
+                    adapter.name()
+                );
+                eprintln!(
+                    "container exec missing-identity evidence ({}): status={:?} diagnostic={:?} events=0",
+                    adapter.name(),
+                    status.code(),
+                    status.message()
+                );
+            }
+        }
         assert!(
             !sentinel_dir.join(&sentinel_name).exists(),
             "{} ran the sentinel command for a missing named identity",

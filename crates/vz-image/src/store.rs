@@ -555,6 +555,26 @@ impl ImageStore {
         Ok(rootfs)
     }
 
+    /// Assemble rootfs work in the caller's structured lifecycle scope.
+    ///
+    /// Unlike [`spawn_assemble_rootfs`](Self::spawn_assemble_rootfs), returning
+    /// or cancelling the surrounding lifecycle cannot leave an unjoined writer
+    /// mutating `rootfs/<container_id>`. Runtime adapters should invoke this on
+    /// an existing blocking bridge when lifecycle ownership matters.
+    pub fn assemble_rootfs_structured(
+        &self,
+        image_id: &str,
+        container_id: &str,
+    ) -> io::Result<PathBuf> {
+        let result = self.assemble_rootfs(image_id, container_id);
+        if result.is_err() {
+            // A failed layer copy may have populated part of the deterministic
+            // destination. The caller still owns its generation while this runs.
+            let _ = fs::remove_dir_all(self.rootfs_path(container_id));
+        }
+        result
+    }
+
     /// Assemble a rootfs for `container_id` in a blocking task.
     ///
     /// This keeps heavy filesystem traversal off the async runtime.
@@ -1628,6 +1648,25 @@ mod tests {
             fs::read(store.layer_blob_path(&digest, LayerMediaType::Tar)).unwrap(),
             b"repaired layer"
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn structured_rootfs_assembly_removes_destination_after_failure() {
+        let root = unique_temp_dir("structured-assembly-failure");
+        let store = ImageStore::new(root.clone());
+        store.ensure_layout().unwrap();
+        let destination = store.rootfs_path("stable-name");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("stale"), b"old generation").unwrap();
+
+        assert!(
+            store
+                .assemble_rootfs_structured("sha256:missing", "stable-name")
+                .is_err()
+        );
+        assert!(!destination.exists());
 
         fs::remove_dir_all(root).unwrap();
     }

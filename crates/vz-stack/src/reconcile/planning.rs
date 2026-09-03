@@ -50,12 +50,12 @@ pub(super) fn service_config_digest(svc: &ServiceSpec) -> String {
 
     format!("{:016x}", hasher.finish())
 }
-/// Compute all expected replica container names for a service.
+/// Compute all expected observed-state names for a service's replicas.
 ///
-/// Replica 1 uses the base name (container_name or service name).
-/// Replicas 2+ use `{base}-{N}`. Returns exactly `replicas` entries.
+/// These are logical service identities, not runtime container IDs. An explicit
+/// `container_name` must therefore never change reconciliation keys.
 fn replica_names(svc: &ServiceSpec) -> Vec<String> {
-    let base = svc.container_name.as_deref().unwrap_or(&svc.name);
+    let base = svc.name.as_str();
     let count = svc.resources.replicas.max(1);
     (1..=count)
         .map(|i| {
@@ -189,7 +189,7 @@ pub(super) fn compute_actions_with_mount_digests(
         // Scale-down: remove excess replicas beyond the desired count.
         // Check observed for replica names that exceed current replica count.
         let desired_set: HashSet<&str> = expected_replicas.iter().map(|s| s.as_str()).collect();
-        let base = svc.container_name.as_deref().unwrap_or(&svc.name);
+        let base = svc.name.as_str();
         for o in observed {
             // Match observed entries that belong to this service but are excess.
             // A replica belongs to this service if it equals the base name or

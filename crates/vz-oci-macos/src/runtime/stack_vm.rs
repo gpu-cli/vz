@@ -1,12 +1,10 @@
 use super::bundle::{
     container_log_dir, make_oci_runtime_share, mount_specs_to_bundle_mounts, oci_bundle_guest_path,
     oci_bundle_guest_root, oci_bundle_host_dir, resolve_oci_runtime_binary_path,
-    setup_stack_guest_container_overlay,
+    setup_stack_guest_container_overlay, teardown_guest_container_overlay,
 };
 use super::networking::{start_port_forwarding, stop_via_oci_runtime};
-use super::resolve::{
-    current_unix_secs, new_container_id, resolve_container_lifecycle, resolve_run_config,
-};
+use super::resolve::{current_unix_secs, resolve_container_lifecycle, resolve_run_config};
 use super::*;
 
 /// Owned proof that one stack's complete guest activation transaction is
@@ -73,6 +71,260 @@ pub(super) fn activation_error_with_rollback(
         Err(rollback_error) => OciError::InvalidConfig(format!(
             "stack container activation failed: {activation_error}; rollback also failed: {rollback_error}"
         )),
+    }
+}
+
+pub(super) async fn publish_recovery_route_first<V: Clone>(
+    routes: &Mutex<HashMap<String, String>>,
+    handles: &Mutex<HashMap<String, V>>,
+    stack_id: &str,
+    container_id: &str,
+    handle: &V,
+    after_route: impl Future<Output = ()>,
+) {
+    routes
+        .lock()
+        .await
+        .insert(container_id.to_string(), stack_id.to_string());
+    after_route.await;
+    handles
+        .lock()
+        .await
+        .insert(container_id.to_string(), handle.clone());
+}
+
+pub(super) async fn clear_recovery_route_last<V>(
+    routes: &Mutex<HashMap<String, String>>,
+    handles: &Mutex<HashMap<String, V>>,
+    container_id: &str,
+    after_handle: impl Future<Output = ()>,
+) {
+    handles.lock().await.remove(container_id);
+    after_handle.await;
+    routes.lock().await.remove(container_id);
+}
+
+pub(super) async fn shutdown_container_cleanup_transition<
+    Delete,
+    DeleteFuture,
+    Overlay,
+    OverlayFuture,
+>(
+    runtime: &Runtime,
+    container_id: &str,
+    generation: ContainerGeneration,
+    delete: Delete,
+    overlay: Overlay,
+) -> Result<(), OciError>
+where
+    Delete: FnOnce() -> DeleteFuture,
+    DeleteFuture: Future<Output = Result<(), OciError>>,
+    Overlay: FnOnce() -> OverlayFuture,
+    OverlayFuture: Future<Output = Result<(), OciError>>,
+{
+    if !runtime.overlay_cleanup_is_pending(container_id, generation) {
+        delete().await.map_err(|error| {
+            OciError::InvalidConfig(format!(
+                "container '{container_id}' OCI delete failed before overlay teardown; retained running metadata, recovery routing, and VM for retry: {error}"
+            ))
+        })?;
+    }
+
+    // Close the cancellation window after successful deletion before any
+    // further await. A retry that sees this marker skips the destructive
+    // delete and resumes at stopped-state publication/overlay teardown.
+    runtime.mark_overlay_cleanup_pending(container_id, generation);
+    let metadata_error = runtime
+        .record_shutdown_delete_success(container_id, generation)
+        .err();
+    let overlay_error = overlay().await.err();
+
+    if metadata_error.is_some() || overlay_error.is_some() {
+        let mut failures = Vec::new();
+        if let Some(error) = metadata_error {
+            failures.push(format!("stopped-state publication failed: {error}"));
+        }
+        if let Some(error) = overlay_error {
+            failures.push(format!("overlay teardown failed: {error}"));
+        }
+        return Err(OciError::InvalidConfig(format!(
+            "container '{container_id}' cleanup retained recovery routing, VM, and pending marker for retry: {}",
+            failures.join("; ")
+        )));
+    }
+
+    // Do not clear this member's recovery state yet. Stack shutdown is a batch:
+    // a later member may fail, and retry discovers membership from routes.
+    // The synchronous batch commit below clears every registry only after all
+    // members have completed both destructive phases.
+    Ok(())
+}
+
+pub(super) async fn commit_stack_cleanup_batch<V>(
+    runtime: &Runtime,
+    routes: &Mutex<HashMap<String, String>>,
+    handles: &Mutex<HashMap<String, V>>,
+    container_ids: &[String],
+) {
+    // Acquire every async registry before mutating any of them. Cancellation
+    // while waiting therefore leaves the complete batch discoverable. Once all
+    // guards are held, the commit contains no await and cannot be interrupted.
+    let mut handles = handles.lock().await;
+    let mut routes = routes.lock().await;
+    let mut active_lifecycle = runtime.active_lifecycle.lock().await;
+    let mut setup_restored = runtime.setup_restored_containers.lock().await;
+    let mut pending = runtime
+        .oci_deleted_pending_overlay
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for container_id in container_ids {
+        handles.remove(container_id);
+        routes.remove(container_id);
+        active_lifecycle.remove(container_id);
+        setup_restored.remove(container_id);
+        pending.remove(container_id);
+    }
+}
+
+impl Runtime {
+    async fn publish_stack_overlay_recovery_route(
+        &self,
+        stack_id: &str,
+        container_id: &str,
+        vm: &Arc<LinuxVm>,
+    ) {
+        // Route first: if cancellation occurs while acquiring the VM-handle
+        // map, stack shutdown can still discover the overlay through stack_vms.
+        publish_recovery_route_first(
+            &self.container_stack,
+            &self.vm_handles,
+            stack_id,
+            container_id,
+            vm,
+            self.observe_lifecycle_admission(
+                RuntimeLifecycleAdmissionKind::StackRoutePublishedBeforeOverlay,
+                container_id,
+            ),
+        )
+        .await;
+    }
+
+    async fn clear_stack_overlay_recovery_route(&self, container_id: &str) {
+        // Clear route last: cancellation between these operations leaves the
+        // stack fallback discoverable even after the direct handle is gone.
+        clear_recovery_route_last(
+            &self.container_stack,
+            &self.vm_handles,
+            container_id,
+            std::future::ready(()),
+        )
+        .await;
+    }
+
+    pub(super) fn mark_overlay_cleanup_pending(
+        &self,
+        container_id: &str,
+        generation: ContainerGeneration,
+    ) {
+        self.oci_deleted_pending_overlay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(container_id.to_string(), generation);
+    }
+
+    pub(super) fn overlay_cleanup_is_pending(
+        &self,
+        container_id: &str,
+        generation: ContainerGeneration,
+    ) -> bool {
+        self.oci_deleted_pending_overlay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(container_id)
+            .is_some_and(|pending| *pending == generation)
+    }
+
+    pub(super) fn clear_overlay_cleanup_pending(&self, container_id: &str) {
+        self.oci_deleted_pending_overlay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(container_id);
+    }
+
+    pub(super) fn record_shutdown_delete_success(
+        &self,
+        container_id: &str,
+        generation: ContainerGeneration,
+    ) -> Result<(), OciError> {
+        self.mark_overlay_cleanup_pending(container_id, generation);
+        let mut container = self
+            .container_store
+            .load_all()
+            .map_err(OciError::from)?
+            .into_iter()
+            .find(|container| container.id == container_id)
+            .ok_or_else(|| OciError::ContainerNotFound {
+                id: container_id.to_string(),
+            })?;
+        container.status = ContainerStatus::Stopped { exit_code: 0 };
+        container.stopped_unix_secs = Some(current_unix_secs());
+        container.host_pid = None;
+        self.container_store
+            .upsert_if_generation(container, generation)
+            .map_err(|error| Self::map_container_store_error(container_id, error))
+    }
+
+    pub(super) async fn teardown_owned_stack_container_overlay(
+        &self,
+        vm: &LinuxVm,
+        container_id: &str,
+        generation: ContainerGeneration,
+    ) -> Result<(), OciError> {
+        let current = self
+            .container_store
+            .current_generation(container_id)
+            .map_err(|error| Self::map_container_store_error(container_id, error))?;
+        if current != Some(generation) {
+            return Err(OciError::InvalidConfig(format!(
+                "refusing to tear down shared-VM overlay for stale container generation '{container_id}'"
+            )));
+        }
+        teardown_guest_container_overlay(vm, container_id).await
+    }
+
+    async fn stack_prepare_error_with_overlay_cleanup(
+        &self,
+        vm: &Arc<LinuxVm>,
+        _stack_id: &str,
+        container_id: &str,
+        generation: ContainerGeneration,
+        prepare_error: OciError,
+    ) -> OciError {
+        self.setup_restored_containers
+            .lock()
+            .await
+            .remove(container_id);
+        match self
+            .teardown_owned_stack_container_overlay(vm.as_ref(), container_id, generation)
+            .await
+        {
+            Ok(()) => {
+                self.clear_overlay_cleanup_pending(container_id);
+                self.clear_stack_overlay_recovery_route(container_id).await;
+                prepare_error
+            }
+            Err(cleanup_error) => {
+                // No OCI create has occurred on this path, so shutdown may
+                // safely retry overlay teardown without first deleting state.
+                self.mark_overlay_cleanup_pending(container_id, generation);
+                // Route and VM publication completed before the first overlay
+                // mutation. Do not await or mutate either map on this failure
+                // path: cancellation must preserve that recovery state.
+                OciError::InvalidConfig(format!(
+                    "stack container preparation failed: {prepare_error}; partial-overlay cleanup also failed and stack routing was retained for retry: {cleanup_error}"
+                ))
+            }
+        }
     }
 }
 
@@ -170,6 +422,11 @@ impl Runtime {
         ports: Vec<PortMapping>,
         resources: vz_runtime_contract::StackResourceHint,
     ) -> Result<(), OciError> {
+        let _stack_lifecycle_guard = self
+            .stack_lifecycle_lock(stack_id)
+            .await
+            .write_owned()
+            .await;
         let _activation_guard = self.acquire_stack_activation_guard(stack_id).await;
 
         // Snapshot lock-protected counters into locals so the lock guards
@@ -468,8 +725,29 @@ impl Runtime {
         &self,
         stack_id: &str,
         image: &str,
+        mut run: RunConfig,
+        setup_commit_tar_guest: Option<String>,
+    ) -> Result<String, OciError> {
+        let mut transaction = self
+            .begin_container_create(&mut run, Some(stack_id))
+            .await?;
+        self.create_container_in_stack_transaction(
+            stack_id,
+            image,
+            run,
+            setup_commit_tar_guest,
+            &mut transaction,
+        )
+        .await
+    }
+
+    pub(crate) async fn create_container_in_stack_transaction(
+        &self,
+        stack_id: &str,
+        image: &str,
         run: RunConfig,
         setup_commit_tar_guest: Option<String>,
+        transaction: &mut ContainerLifecycleTransaction,
     ) -> Result<String, OciError> {
         let vm = self
             .stack_vms
@@ -483,7 +761,7 @@ impl Runtime {
                 ))
             })?;
 
-        let container_id = run.container_id.clone().unwrap_or_else(new_container_id);
+        let container_id = transaction.container_id().to_string();
         validate_container_id(&container_id)?;
         let image_id = self.pull(image).await?;
 
@@ -500,11 +778,7 @@ impl Runtime {
             host_pid: Some(process::id()),
         };
 
-        self.container_store
-            .upsert(container.clone())
-            .map_err(OciError::from)?;
-
-        let rootfs_handle = self.store.spawn_assemble_rootfs(&image_id.0, &container_id);
+        self.persist_owned(transaction, container.clone())?;
 
         // Step 2 runs concurrently with rootfs assembly (no disk I/O dependency).
         tracing::debug!("step 2: parse_image_config_summary_from_store (concurrent with step 1)");
@@ -539,35 +813,22 @@ impl Runtime {
         let bundle_guest_root = oci_bundle_guest_root(self.config.guest_state_dir.as_deref())?;
         let bundle_relative_path = oci_bundle_guest_path(&bundle_guest_root, &oci_container_id);
 
-        let rootfs_dir = match rootfs_handle.await {
-            Ok(Ok(rootfs_dir)) => rootfs_dir,
-            Ok(Err(err)) => {
+        let rootfs_dir = match self
+            .assemble_rootfs_in_transaction(&image_id.0, transaction)
+            .await
+        {
+            Ok(rootfs_dir) => rootfs_dir,
+            Err(err) => {
                 tracing::error!(error = %err, "step 1 FAILED: assemble_rootfs");
                 container.status = ContainerStatus::Stopped { exit_code: -1 };
                 container.stopped_unix_secs = Some(current_unix_secs());
                 container.host_pid = None;
-                self.container_store
-                    .upsert(container)
-                    .map_err(OciError::from)?;
-                return Err(err.into());
-            }
-            Err(join_err) => {
-                tracing::error!(error = %join_err, "step 1 FAILED: rootfs task panicked");
-                container.status = ContainerStatus::Stopped { exit_code: -1 };
-                container.stopped_unix_secs = Some(current_unix_secs());
-                container.host_pid = None;
-                self.container_store
-                    .upsert(container)
-                    .map_err(OciError::from)?;
-                return Err(OciError::Storage(std::io::Error::other(
-                    join_err.to_string(),
-                )));
+                self.persist_owned(transaction, container)?;
+                return Err(err);
             }
         };
         container.rootfs_path = Some(rootfs_dir.clone());
-        self.container_store
-            .upsert(container.clone())
-            .map_err(OciError::from)?;
+        self.persist_owned(transaction, container.clone())?;
 
         // Host: <data_dir>/rootfs/<container_id>/<bundle_path>
         let bundle_host_dir = oci_bundle_host_dir(&rootfs_dir, &bundle_relative_path);
@@ -603,6 +864,17 @@ impl Runtime {
         // image-config resolution above remain parallel; independent stacks
         // use independent locks.
         let activation_guard = self.acquire_stack_activation_guard(stack_id).await;
+        self.publish_stack_overlay_recovery_route(stack_id, &container_id, &vm)
+            .await;
+        // Until OCI create begins, cancellation is known to leave only an
+        // overlay to clean. Shutdown may therefore skip OCI delete and retry
+        // this exact generation's teardown directly.
+        self.mark_overlay_cleanup_pending(&container_id, transaction.generation());
+        self.observe_lifecycle_admission(
+            RuntimeLifecycleAdmissionKind::StackOverlaySetupStarting,
+            &container_id,
+        )
+        .await;
 
         // Per-container overlay: VirtioFS doesn't support mknod, so we create a
         // guest-side overlay with tmpfs as upperdir for device nodes.
@@ -621,17 +893,53 @@ impl Runtime {
                 container.status = ContainerStatus::Stopped { exit_code: -1 };
                 container.stopped_unix_secs = Some(current_unix_secs());
                 container.host_pid = None;
-                self.container_store
-                    .upsert(container)
-                    .map_err(OciError::from)?;
-                return Err(err);
+                let mut error = err;
+                if let Err(persist_error) = self.persist_owned(transaction, container) {
+                    error = OciError::InvalidConfig(format!(
+                        "{error}; could not persist overlay setup failure: {persist_error}"
+                    ));
+                }
+                return Err(self
+                    .stack_prepare_error_with_overlay_cleanup(
+                        &vm,
+                        stack_id,
+                        &container_id,
+                        transaction.generation(),
+                        error,
+                    )
+                    .await);
             }
         };
         if setup_was_restored {
-            self.setup_restored_containers
-                .lock()
-                .await
-                .insert(container_id.clone());
+            let commit_ref = match setup_commit_tar_guest
+                .as_deref()
+                .and_then(|path| path.rsplit('/').next())
+                .and_then(|name| name.strip_suffix(".tar"))
+            {
+                Some(commit_ref) => commit_ref,
+                None => {
+                    let error = OciError::InvalidConfig(
+                        "setup overlay reported a restore without a valid commit reference"
+                            .to_string(),
+                    );
+                    return Err(self
+                        .stack_prepare_error_with_overlay_cleanup(
+                            &vm,
+                            stack_id,
+                            &container_id,
+                            transaction.generation(),
+                            error,
+                        )
+                        .await);
+                }
+            };
+            self.setup_restored_containers.lock().await.insert(
+                container_id.clone(),
+                SetupRestoreIdentity {
+                    generation: transaction.generation(),
+                    commit_ref: commit_ref.to_string(),
+                },
+            );
             tracing::info!(
                 container_id = %container_id,
                 "setup commit restored into overlay upperdir before mount"
@@ -698,7 +1006,7 @@ impl Runtime {
         // start (via guest exec or bind mount) fails due to VirtioFS caching
         // and youki's pivot_root creating an isolated mount tree.
 
-        write_oci_bundle(
+        if let Err(error) = write_oci_bundle(
             &bundle_host_dir,
             Path::new(&guest_rootfs_path),
             BundleSpec {
@@ -723,7 +1031,19 @@ impl Runtime {
                 hostname: run.hostname.clone(),
                 domainname: run.domainname.clone(),
             },
-        )?;
+        ) {
+            let error = self
+                .stack_prepare_error_with_overlay_cleanup(
+                    &vm,
+                    stack_id,
+                    &container_id,
+                    transaction.generation(),
+                    OciError::from(error),
+                )
+                .await;
+            self.cleanup_owned_rootfs(transaction, rootfs_dir.as_ref());
+            return Err(error);
+        }
 
         let vm_is_current = self
             .stack_vms
@@ -735,29 +1055,31 @@ impl Runtime {
             container.status = ContainerStatus::Stopped { exit_code: -1 };
             container.stopped_unix_secs = Some(current_unix_secs());
             container.host_pid = None;
-            self.container_store
-                .upsert(container)
-                .map_err(OciError::from)?;
-            self.cleanup_rootfs_dir(rootfs_dir.as_ref());
-            return Err(OciError::InvalidConfig(format!(
+            let mut error = OciError::InvalidConfig(format!(
                 "shared VM for stack '{stack_id}' changed while container '{container_id}' was being prepared"
-            )));
+            ));
+            if let Err(persist_error) = self.persist_owned(transaction, container) {
+                error = OciError::InvalidConfig(format!(
+                    "{error}; could not persist preparation failure: {persist_error}"
+                ));
+            }
+            let error = self
+                .stack_prepare_error_with_overlay_cleanup(
+                    &vm,
+                    stack_id,
+                    &container_id,
+                    transaction.generation(),
+                    error,
+                )
+                .await;
+            self.cleanup_owned_rootfs(transaction, rootfs_dir.as_ref());
+            return Err(error);
         }
 
-        // Publish recovery routing before the first guest OCI mutation. A task
-        // cancelled during create/start/rollback is therefore still visible to
-        // stack shutdown. Public exec remains unavailable until final durable
-        // Running publication below.
-        self.container_stack
-            .lock()
-            .await
-            .insert(container_id.to_string(), stack_id.to_string());
-        self.vm_handles
-            .lock()
-            .await
-            .insert(container_id.to_string(), Arc::clone(&vm));
-
         // OCI create + start inside the shared VM.
+        // From this point OCI state may exist, so cleanup must prove deletion
+        // before unmounting the overlay.
+        self.clear_overlay_cleanup_pending(&container_id);
         if let Err(err) = vm
             .oci_create(oci_container_id.clone(), bundle_guest_path.clone())
             .await
@@ -773,9 +1095,9 @@ impl Runtime {
                     &vm,
                     stack_id,
                     &oci_container_id,
-                    &container_id,
                     &mut container,
                     rootfs_dir.as_ref(),
+                    transaction,
                 )
                 .await;
             return Err(activation_error_with_rollback(error, rollback));
@@ -788,9 +1110,9 @@ impl Runtime {
                     &vm,
                     stack_id,
                     &oci_container_id,
-                    &container_id,
                     &mut container,
                     rootfs_dir.as_ref(),
+                    transaction,
                 )
                 .await;
             return Err(activation_error_with_rollback(error, rollback));
@@ -808,9 +1130,9 @@ impl Runtime {
                     &vm,
                     stack_id,
                     &oci_container_id,
-                    &container_id,
                     &mut container,
                     rootfs_dir.as_ref(),
+                    transaction,
                 )
                 .await;
             return Err(activation_error_with_rollback(error, rollback));
@@ -851,9 +1173,9 @@ impl Runtime {
                         &vm,
                         stack_id,
                         &oci_container_id,
-                        &container_id,
                         &mut container,
                         rootfs_dir.as_ref(),
+                        transaction,
                     )
                     .await;
                 return Err(activation_error_with_rollback(error, rollback));
@@ -873,9 +1195,9 @@ impl Runtime {
                     &vm,
                     stack_id,
                     &oci_container_id,
-                    &container_id,
                     &mut container,
                     rootfs_dir.as_ref(),
+                    transaction,
                 )
                 .await;
             return Err(activation_error_with_rollback(error, rollback));
@@ -890,9 +1212,9 @@ impl Runtime {
                     &vm,
                     stack_id,
                     &oci_container_id,
-                    &container_id,
                     &mut container,
                     rootfs_dir.as_ref(),
+                    transaction,
                 )
                 .await;
             return Err(activation_error_with_rollback(error, rollback));
@@ -901,21 +1223,18 @@ impl Runtime {
         container.status = ContainerStatus::Running;
         container.started_unix_secs = Some(current_unix_secs());
         container.host_pid = Some(process::id());
-        if let Err(error) = self.container_store.upsert(container.clone()) {
+        if let Err(error) = self.persist_owned(transaction, container.clone()) {
             let rollback = self
                 .rollback_stack_container_activation(
                     &vm,
                     stack_id,
                     &oci_container_id,
-                    &container_id,
                     &mut container,
                     rootfs_dir.as_ref(),
+                    transaction,
                 )
                 .await;
-            return Err(activation_error_with_rollback(
-                OciError::from(error),
-                rollback,
-            ));
+            return Err(activation_error_with_rollback(error, rollback));
         }
 
         // Reaffirm recovery routes after every required post-start action,
@@ -937,6 +1256,7 @@ impl Runtime {
             ContainerExecBinding {
                 vm: Arc::clone(&vm),
                 defaults: ContainerExecDefaults::from(&run),
+                generation: transaction.generation(),
             },
         );
         Ok(container_id)
@@ -980,10 +1300,11 @@ impl Runtime {
         vm: &Arc<LinuxVm>,
         stack_id: &str,
         oci_container_id: &str,
-        container_id: &str,
         container: &mut ContainerInfo,
         rootfs_dir: &Path,
+        transaction: &ContainerLifecycleTransaction,
     ) -> Result<(), OciError> {
+        let container_id = transaction.container_id();
         // Publish recovery routing before any await. This keeps the container
         // discoverable even if rollback is cancelled while stopping log
         // rotation, collecting diagnostics, or deleting guest OCI state.
@@ -1008,7 +1329,7 @@ impl Runtime {
             container.started_unix_secs = None;
             container.stopped_unix_secs = None;
             container.host_pid = Some(process::id());
-            let persist_error = self.container_store.upsert(container.clone()).err();
+            let persist_error = self.persist_owned(transaction, container.clone()).err();
 
             tracing::error!(
                 container_id = %oci_container_id,
@@ -1026,6 +1347,31 @@ impl Runtime {
             }
             return Err(OciError::InvalidConfig(message));
         }
+        self.mark_overlay_cleanup_pending(container_id, transaction.generation());
+        if let Err(error) = self
+            .teardown_owned_stack_container_overlay(
+                vm.as_ref(),
+                container_id,
+                transaction.generation(),
+            )
+            .await
+        {
+            container.status = ContainerStatus::Created;
+            container.started_unix_secs = None;
+            container.stopped_unix_secs = None;
+            container.host_pid = Some(process::id());
+            let persist_error = self.persist_owned(transaction, container.clone()).err();
+            let mut message = format!(
+                "activation rollback deleted OCI state but could not tear down the guest overlay for container '{oci_container_id}'; retained stack '{stack_id}' tracking and rootfs for cleanup retry: {error}"
+            );
+            if let Some(persist_error) = persist_error {
+                message.push_str(&format!(
+                    "; could not persist activation-incomplete state: {persist_error}"
+                ));
+            }
+            return Err(OciError::InvalidConfig(message));
+        }
+        self.clear_overlay_cleanup_pending(container_id);
         self.vm_handles.lock().await.remove(container_id);
         self.container_stack.lock().await.remove(container_id);
         self.active_lifecycle.lock().await.remove(container_id);
@@ -1041,11 +1387,8 @@ impl Runtime {
         container.status = ContainerStatus::Stopped { exit_code: -1 };
         container.stopped_unix_secs = Some(current_unix_secs());
         container.host_pid = None;
-        let persist_result = self
-            .container_store
-            .upsert(container.clone())
-            .map_err(OciError::from);
-        self.cleanup_rootfs_dir(rootfs_dir);
+        let persist_result = self.persist_owned(transaction, container.clone());
+        self.cleanup_owned_rootfs(transaction, rootfs_dir);
         persist_result
     }
 
@@ -1115,6 +1458,19 @@ impl Runtime {
         container_id: &str,
         commit_ref: &str,
     ) -> Result<(), OciError> {
+        let transaction = self.begin_existing_container(container_id).await?;
+        self.save_setup_commit_in_transaction(stack_id, container_id, commit_ref, &transaction)
+            .await
+    }
+
+    pub(crate) async fn save_setup_commit_in_transaction(
+        &self,
+        stack_id: &str,
+        container_id: &str,
+        commit_ref: &str,
+        transaction: &ContainerLifecycleTransaction,
+    ) -> Result<(), OciError> {
+        debug_assert_eq!(container_id, transaction.container_id());
         let vm = self
             .stack_vms
             .lock()
@@ -1126,7 +1482,11 @@ impl Runtime {
                     "no shared VM running for stack '{stack_id}'; call boot_shared_vm first"
                 ))
             })?;
-        let tar_guest_tmp = format!("/vz-setup-commits/{commit_ref}.tar.tmp");
+        let tar_guest_tmp = format!(
+            "/vz-setup-commits/{commit_ref}.{}.{}.tar.tmp",
+            transaction.container_id(),
+            transaction.generation().0
+        );
         let tar_guest = format!("/vz-setup-commits/{commit_ref}.tar");
         let upper_dir = format!("/run/vz-oci/containers/{container_id}/upper");
         // -C cd into upper, -p preserve perms, -f write to tmp file. Use
@@ -1184,8 +1544,11 @@ impl Runtime {
     /// Each container is stopped via `oci_kill` + `oci_delete`, then the
     /// shared VM is torn down. Container metadata is updated to `Stopped`.
     pub async fn shutdown_shared_vm(&self, stack_id: &str) -> Result<(), OciError> {
-        let activation_lock = self.stack_activation_lock(stack_id).await;
-        let _activation_guard = activation_lock.lock().await;
+        let _stack_lifecycle_guard = self
+            .stack_lifecycle_lock(stack_id)
+            .await
+            .write_owned()
+            .await;
         let (stack_vms_count, stack_port_forwards_count) = {
             let vms = self.stack_vms.lock().await;
             let pfs = self.stack_port_forwards.lock().await;
@@ -1206,6 +1569,14 @@ impl Runtime {
                 .map(|(container_id, _)| container_id.clone())
                 .collect()
         };
+        // Stack lifecycle is already exclusively held. Acquire every member ID
+        // in canonical order and retain those local+OS writers through guest
+        // teardown, metadata publication, map cleanup, and VM stop.
+        let container_admissions = self
+            .acquire_sorted_container_write_admissions(&stack_containers)
+            .await?;
+        let activation_lock = self.stack_activation_lock(stack_id).await;
+        let _activation_guard = activation_lock.lock().await;
         {
             let mut exec_bindings = self.container_exec_bindings.lock().await;
             for container_id in &stack_containers {
@@ -1213,7 +1584,7 @@ impl Runtime {
             }
         }
 
-        let Some(vm) = self.stack_vms.lock().await.remove(stack_id) else {
+        let Some(vm) = self.stack_vms.lock().await.get(stack_id).cloned() else {
             // Bug B fix: in-memory state can be empty after a daemon
             // respawn (kill -9 / OS reboot mid-operation). In that case
             // the SQLite state-store may still claim the sandbox is
@@ -1230,45 +1601,70 @@ impl Runtime {
             if let Some(pf) = self.stack_port_forwards.lock().await.remove(stack_id) {
                 pf.shutdown().await;
             }
-            let mut vm_handles = self.vm_handles.lock().await;
-            let mut container_stack = self.container_stack.lock().await;
-            let mut active_lifecycle = self.active_lifecycle.lock().await;
-            for container_id in &stack_containers {
-                vm_handles.remove(container_id);
-                container_stack.remove(container_id);
-                active_lifecycle.remove(container_id);
-            }
+            commit_stack_cleanup_batch(
+                self,
+                &self.container_stack,
+                &self.vm_handles,
+                &stack_containers,
+            )
+            .await;
             return Ok(());
         };
 
-        // Stop each container via OCI lifecycle.
+        // Stop each container via OCI lifecycle, then tear down and verify its
+        // generation-owned guest overlay before publishing host cleanup.
+        let mut cleanup_failures = Vec::new();
         for cid in &stack_containers {
             self.stop_log_rotation_task(cid).await;
-            let _ = stop_via_oci_runtime(&*vm, cid, false, STOP_GRACE_PERIOD, None).await;
-            let _ = vm.oci_delete(cid.to_string(), true).await;
-
-            // Update container metadata.
-            if let Ok(mut containers) = self.container_store.load_all() {
-                if let Some(container) = containers.iter_mut().find(|c| c.id == *cid) {
-                    container.status = ContainerStatus::Stopped { exit_code: 0 };
-                    container.stopped_unix_secs = Some(current_unix_secs());
-                    container.host_pid = None;
-                    let _ = self.container_store.upsert(container.clone());
-                }
+            if let Err(error) =
+                stop_via_oci_runtime(&*vm, cid, false, STOP_GRACE_PERIOD, None).await
+            {
+                tracing::warn!(container_id = %cid, %error, "stack shutdown stop failed; forcing OCI delete");
+            }
+            let generation = container_admissions
+                .iter()
+                .find(|admission| admission.container_id == *cid)
+                .and_then(|admission| admission.generation);
+            let Some(generation) = generation else {
+                cleanup_failures.push(format!(
+                    "container '{cid}' has no durable generation for guest overlay teardown"
+                ));
+                continue;
+            };
+            if let Err(error) = shutdown_container_cleanup_transition(
+                self,
+                cid,
+                generation,
+                || async {
+                    vm.oci_delete(cid.to_string(), true)
+                        .await
+                        .map_err(OciError::from)
+                },
+                || async {
+                    self.teardown_owned_stack_container_overlay(&vm, cid, generation)
+                        .await
+                },
+            )
+            .await
+            {
+                cleanup_failures.push(error.to_string());
             }
         }
 
-        // Clean up tracking maps.
-        {
-            let mut vm_handles = self.vm_handles.lock().await;
-            let mut cs = self.container_stack.lock().await;
-            let mut active_lifecycle = self.active_lifecycle.lock().await;
-            for cid in &stack_containers {
-                vm_handles.remove(cid);
-                cs.remove(cid);
-                active_lifecycle.remove(cid);
-            }
+        if !cleanup_failures.is_empty() {
+            return Err(OciError::InvalidConfig(format!(
+                "shared VM shutdown retained stack '{stack_id}' routing and VM for cleanup retry: {}",
+                cleanup_failures.join("; ")
+            )));
         }
+
+        commit_stack_cleanup_batch(
+            self,
+            &self.container_stack,
+            &self.vm_handles,
+            &stack_containers,
+        )
+        .await;
 
         // Shut down port forwarding relays for this stack.
         let pf_present = {
@@ -1301,6 +1697,7 @@ impl Runtime {
         }
 
         // Tear down the shared VM.
+        self.stack_vms.lock().await.remove(stack_id);
         let _ = vm.stop().await;
         let (stack_vms_count_after, stack_port_forwards_count_after) = {
             let vms = self.stack_vms.lock().await;
