@@ -340,11 +340,34 @@ pub struct TopologyMissingCapabilityDetail {
     #[prost(enumeration = "MachineCapability", tag = "2")]
     pub capability: i32,
 }
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyInvalidMachineProfileDetail {
+    #[prost(string, tag = "1")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "MachineProfile", tag = "2")]
+    pub profile: i32,
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyInvalidCapabilityDeclarationDetail {
+    #[prost(string, tag = "1")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TopologyContradictoryCapabilityDetail {
+    #[prost(string, tag = "1")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "MachineCapability", tag = "2")]
+    pub capability: i32,
+}
 /// Structured detail suitable for an ErrorDetail companion. Do not require
 /// clients to parse ambiguity or unsupported-target information from prose.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TopologyErrorDetail {
-    #[prost(oneof = "topology_error_detail::Detail", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "topology_error_detail::Detail", tags = "1, 2, 3, 4, 5, 6, 7")]
     pub detail: ::core::option::Option<topology_error_detail::Detail>,
 }
 /// Nested message and enum types in `TopologyErrorDetail`.
@@ -359,6 +382,12 @@ pub mod topology_error_detail {
         UnsupportedTarget(super::TopologyUnsupportedTargetDetail),
         #[prost(message, tag = "4")]
         MissingCapability(super::TopologyMissingCapabilityDetail),
+        #[prost(message, tag = "5")]
+        InvalidMachineProfile(super::TopologyInvalidMachineProfileDetail),
+        #[prost(message, tag = "6")]
+        InvalidCapabilityDeclaration(super::TopologyInvalidCapabilityDeclarationDetail),
+        #[prost(message, tag = "7")]
+        ContradictoryCapability(super::TopologyContradictoryCapabilityDetail),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]

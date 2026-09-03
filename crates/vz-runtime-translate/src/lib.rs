@@ -748,12 +748,14 @@ pub fn topology_resolution_error_from_proto(
                 name: candidate.name.clone(),
             }),
         )),
-        Detail::UnsupportedTarget(_) | Detail::MissingCapability(_) => {
-            Err(TranslationError::InvalidValue {
-                field: "topology_error_detail.detail",
-                value: "validation_error".to_string(),
-            })
-        }
+        Detail::UnsupportedTarget(_)
+        | Detail::MissingCapability(_)
+        | Detail::InvalidMachineProfile(_)
+        | Detail::InvalidCapabilityDeclaration(_)
+        | Detail::ContradictoryCapability(_) => Err(TranslationError::InvalidValue {
+            field: "topology_error_detail.detail",
+            value: "validation_error".to_string(),
+        }),
     }
 }
 
@@ -785,6 +787,30 @@ pub fn topology_validation_error_to_proto(
             machine_id,
             capability,
         } => Detail::MissingCapability(runtime_v2::TopologyMissingCapabilityDetail {
+            machine_id: machine_id.clone(),
+            capability: machine_capability_to_proto(*capability) as i32,
+        }),
+        TopologyValidationError::InvalidMachineProfile {
+            machine_id,
+            profile,
+            reason,
+        } => Detail::InvalidMachineProfile(runtime_v2::TopologyInvalidMachineProfileDetail {
+            machine_id: machine_id.clone(),
+            profile: machine_profile_to_proto(*profile) as i32,
+            reason: reason.clone(),
+        }),
+        TopologyValidationError::InvalidCapabilityDeclaration { machine_id, reason } => {
+            Detail::InvalidCapabilityDeclaration(
+                runtime_v2::TopologyInvalidCapabilityDeclarationDetail {
+                    machine_id: machine_id.clone(),
+                    reason: reason.clone(),
+                },
+            )
+        }
+        TopologyValidationError::ContradictoryCapability {
+            machine_id,
+            capability,
+        } => Detail::ContradictoryCapability(runtime_v2::TopologyContradictoryCapabilityDetail {
             machine_id: machine_id.clone(),
             capability: machine_capability_to_proto(*capability) as i32,
         }),
@@ -834,6 +860,31 @@ pub fn topology_validation_error_from_proto(
                 capability: machine_capability_from_proto(
                     detail.capability,
                     "topology_missing_capability.capability",
+                )?,
+            })
+        }
+        Detail::InvalidMachineProfile(detail) => {
+            Ok(TopologyValidationError::InvalidMachineProfile {
+                machine_id: detail.machine_id.clone(),
+                profile: machine_profile_from_proto(
+                    detail.profile,
+                    "topology_invalid_machine_profile.profile",
+                )?,
+                reason: detail.reason.clone(),
+            })
+        }
+        Detail::InvalidCapabilityDeclaration(detail) => {
+            Ok(TopologyValidationError::InvalidCapabilityDeclaration {
+                machine_id: detail.machine_id.clone(),
+                reason: detail.reason.clone(),
+            })
+        }
+        Detail::ContradictoryCapability(detail) => {
+            Ok(TopologyValidationError::ContradictoryCapability {
+                machine_id: detail.machine_id.clone(),
+                capability: machine_capability_from_proto(
+                    detail.capability,
+                    "topology_contradictory_capability.capability",
                 )?,
             })
         }
@@ -2300,6 +2351,28 @@ mod tests {
     }
 
     #[test]
+    fn topology_project_state_round_trips_through_json() {
+        let domain = topology_fixture();
+        domain.validate().expect("fixture is canonically valid");
+
+        let json = serde_json::to_string_pretty(&domain).expect("topology JSON encode");
+        let decoded: ProjectState = serde_json::from_str(&json).expect("topology JSON decode");
+        decoded.validate().expect("decoded topology remains valid");
+
+        assert_eq!(decoded, domain);
+        assert_eq!(decoded.environments.len(), 2);
+        assert!(decoded.environments.iter().all(|environment| {
+            environment.machines.iter().any(|machine| {
+                machine.target.os == OperatingSystem::Linux
+                    && machine.profile == MachineProfile::Developer
+            }) && environment
+                .machines
+                .iter()
+                .any(|machine| machine.target.os == OperatingSystem::Macos)
+        }));
+    }
+
+    #[test]
     fn topology_decode_rejects_missing_required_messages() {
         let mut wire = project_state_to_proto(&topology_fixture());
         wire.definition = None;
@@ -2374,6 +2447,73 @@ mod tests {
             machine_instance_from_proto(&machine),
             Err(TranslationError::InvalidEnumValue {
                 field: "machine_instance.profile",
+                ..
+            })
+        ));
+
+        let invalid_profile = runtime_v2::TopologyErrorDetail {
+            detail: Some(
+                runtime_v2::topology_error_detail::Detail::InvalidMachineProfile(
+                    runtime_v2::TopologyInvalidMachineProfileDetail {
+                        machine_id: "mac_native".to_string(),
+                        profile: runtime_v2::MachineProfile::Unspecified as i32,
+                        reason: "unsupported profile".to_string(),
+                    },
+                ),
+            ),
+        };
+        assert!(matches!(
+            topology_validation_error_from_proto(&invalid_profile),
+            Err(TranslationError::InvalidEnumValue {
+                field: "topology_invalid_machine_profile.profile",
+                ..
+            })
+        ));
+
+        let mut unknown_profile = invalid_profile;
+        let Some(runtime_v2::topology_error_detail::Detail::InvalidMachineProfile(detail)) =
+            unknown_profile.detail.as_mut()
+        else {
+            unreachable!("fixture detail is an invalid Machine profile");
+        };
+        detail.profile = 9_999;
+        assert!(matches!(
+            topology_validation_error_from_proto(&unknown_profile),
+            Err(TranslationError::InvalidEnumValue {
+                field: "topology_invalid_machine_profile.profile",
+                ..
+            })
+        ));
+
+        let contradictory = runtime_v2::TopologyErrorDetail {
+            detail: Some(
+                runtime_v2::topology_error_detail::Detail::ContradictoryCapability(
+                    runtime_v2::TopologyContradictoryCapabilityDetail {
+                        machine_id: "mac_linux".to_string(),
+                        capability: runtime_v2::MachineCapability::Unspecified as i32,
+                    },
+                ),
+            ),
+        };
+        assert!(matches!(
+            topology_validation_error_from_proto(&contradictory),
+            Err(TranslationError::InvalidEnumValue {
+                field: "topology_contradictory_capability.capability",
+                ..
+            })
+        ));
+
+        let mut unknown_capability = contradictory;
+        let Some(runtime_v2::topology_error_detail::Detail::ContradictoryCapability(detail)) =
+            unknown_capability.detail.as_mut()
+        else {
+            unreachable!("fixture detail is a contradictory capability");
+        };
+        detail.capability = 9_999;
+        assert!(matches!(
+            topology_validation_error_from_proto(&unknown_capability),
+            Err(TranslationError::InvalidEnumValue {
+                field: "topology_contradictory_capability.capability",
                 ..
             })
         ));
@@ -2585,16 +2725,41 @@ mod tests {
 
     #[test]
     fn representable_topology_validation_errors_round_trip() {
-        let error = TopologyValidationError::UnsupportedTarget {
-            host_os: OperatingSystem::Macos,
-            host_arch: Architecture::Aarch64,
-            target_os: OperatingSystem::Windows,
-            target_arch: Architecture::X86_64,
-            requested_capabilities: vec![MachineCapability::WindowsConsole, MachineCapability::Gui],
-        };
-        let wire = topology_validation_error_to_proto(&error).expect("representable error");
-        let decoded = topology_validation_error_from_proto(&wire).expect("validation error");
-        assert_eq!(decoded, error);
+        let errors = [
+            TopologyValidationError::UnsupportedTarget {
+                host_os: OperatingSystem::Macos,
+                host_arch: Architecture::Aarch64,
+                target_os: OperatingSystem::Windows,
+                target_arch: Architecture::X86_64,
+                requested_capabilities: vec![
+                    MachineCapability::WindowsConsole,
+                    MachineCapability::Gui,
+                ],
+            },
+            TopologyValidationError::MissingCapability {
+                machine_id: "mac_linux".to_string(),
+                capability: MachineCapability::Compose,
+            },
+            TopologyValidationError::InvalidMachineProfile {
+                machine_id: "mac_native".to_string(),
+                profile: MachineProfile::Hardened,
+                reason: "native targets support only the Developer profile".to_string(),
+            },
+            TopologyValidationError::InvalidCapabilityDeclaration {
+                machine_id: "mac_native".to_string(),
+                reason: "non-Linux target cannot declare implicit capability `DockerEngine`"
+                    .to_string(),
+            },
+            TopologyValidationError::ContradictoryCapability {
+                machine_id: "mac_linux".to_string(),
+                capability: MachineCapability::Buildx,
+            },
+        ];
+        for error in errors {
+            let wire = topology_validation_error_to_proto(&error).expect("representable error");
+            let decoded = topology_validation_error_from_proto(&wire).expect("validation error");
+            assert_eq!(decoded, error);
+        }
 
         let unrepresentable = TopologyValidationError::InvalidName {
             kind: "machine".to_string(),

@@ -1,4 +1,6 @@
-use rusqlite::{OptionalExtension, params};
+use std::collections::BTreeMap;
+
+use rusqlite::{Connection, OptionalExtension, params};
 use vz_runtime_contract::types::{
     EnvironmentInstance, LegacyMigrationError, ProjectState, TOPOLOGY_SCHEMA_VERSION,
     migrate_legacy_developer_sandbox,
@@ -123,6 +125,57 @@ const REQUIRED_TOPOLOGY_TABLES: &[&str] = &[
     "topology_ownership",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyMigrationStage {
+    TopologySchemaCreated,
+    ProjectWritten(usize),
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LegacyMigrationFailpoint {
+    AfterFirstProjectWrite,
+}
+
+fn normalized_schema_sql(sql: Option<String>) -> Option<String> {
+    sql.map(|sql| sql.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+type SchemaObjectKey = (String, String);
+type SchemaObjectDefinition = (String, Option<String>);
+type TopologySchemaShape = BTreeMap<SchemaObjectKey, SchemaObjectDefinition>;
+
+fn topology_schema_shape(connection: &Connection) -> Result<TopologySchemaShape, StackError> {
+    let mut statement = connection.prepare(
+        "SELECT type, name, tbl_name, sql
+         FROM sqlite_master
+         WHERE type IN ('table', 'index')
+         ORDER BY type, name",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+
+    let mut shape = BTreeMap::new();
+    for row in rows {
+        let (object_type, name, table_name, sql) = row?;
+        if (object_type == "table" && REQUIRED_TOPOLOGY_TABLES.contains(&name.as_str()))
+            || (object_type == "index" && REQUIRED_TOPOLOGY_TABLES.contains(&table_name.as_str()))
+        {
+            shape.insert(
+                (object_type, name),
+                (table_name, normalized_schema_sql(sql)),
+            );
+        }
+    }
+    Ok(shape)
+}
+
 impl StateStore {
     pub(super) fn create_topology_schema(&self) -> Result<(), StackError> {
         self.conn.execute_batch(TOPOLOGY_SCHEMA_DDL)?;
@@ -130,17 +183,60 @@ impl StateStore {
     }
 
     pub(super) fn validate_topology_schema(&self) -> Result<(), StackError> {
-        for table in REQUIRED_TOPOLOGY_TABLES {
-            let exists: bool = self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-                params![table],
-                |row| row.get(0),
-            )?;
-            if !exists {
-                return Err(StackError::InvalidSpec(format!(
-                    "state schema v{STORE_SCHEMA_VERSION} is missing required table `{table}`"
-                )));
-            }
+        // Build the canonical schema in a private reference database, then compare
+        // every topology table and index definition. This validates the full set of
+        // columns, CHECK/UNIQUE constraints, primary keys, indexes, and foreign-key
+        // declarations rather than accepting a database that merely reused the
+        // expected table names.
+        let reference = Connection::open_in_memory()?;
+        reference.execute_batch(TOPOLOGY_SCHEMA_DDL)?;
+        let expected = topology_schema_shape(&reference)?;
+        let actual = topology_schema_shape(&self.conn)?;
+        if actual != expected {
+            let missing = expected
+                .keys()
+                .filter(|key| !actual.contains_key(*key))
+                .map(|(kind, name)| format!("{kind}:{name}"))
+                .collect::<Vec<_>>();
+            let unexpected = actual
+                .keys()
+                .filter(|key| !expected.contains_key(*key))
+                .map(|(kind, name)| format!("{kind}:{name}"))
+                .collect::<Vec<_>>();
+            let mismatched = expected
+                .iter()
+                .filter_map(|(key, definition)| {
+                    actual
+                        .get(key)
+                        .filter(|actual_definition| *actual_definition != definition)
+                        .map(|_| format!("{}:{}", key.0, key.1))
+                })
+                .collect::<Vec<_>>();
+            return Err(StackError::InvalidSpec(format!(
+                "state schema v{STORE_SCHEMA_VERSION} topology shape mismatch: \
+                 missing={missing:?}, unexpected={unexpected:?}, mismatched={mismatched:?}"
+            )));
+        }
+
+        // Schema declarations are not enough when a database was externally
+        // modified with foreign-key enforcement disabled. Reject dangling topology
+        // ownership/child records before the daemon can perform recovery writes.
+        let violation = self
+            .conn
+            .query_row("PRAGMA foreign_key_check", [], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .optional()?;
+        if let Some((table, row_id, parent, foreign_key)) = violation {
+            return Err(StackError::InvalidSpec(format!(
+                "state schema v{STORE_SCHEMA_VERSION} contains a foreign-key violation: \
+                 table={table}, row_id={row_id:?}, parent={parent}, foreign_key={foreign_key}"
+            )));
         }
         Ok(())
     }
@@ -437,6 +533,13 @@ impl StateStore {
     }
 
     pub(super) fn migrate_legacy_v1_to_v2(&self) -> Result<(), StackError> {
+        self.migrate_legacy_v1_to_v2_with_hook(|_| Ok(()))
+    }
+
+    fn migrate_legacy_v1_to_v2_with_hook(
+        &self,
+        mut hook: impl FnMut(LegacyMigrationStage) -> Result<(), StackError>,
+    ) -> Result<(), StackError> {
         // Parse and classify every row before creating a v2 table. A malformed or
         // ambiguous legacy database therefore fails without any mutation.
         let mut migrated = Vec::new();
@@ -450,11 +553,34 @@ impl StateStore {
 
         self.with_immediate_transaction(|store| {
             store.create_topology_schema()?;
-            for state in &migrated {
+            hook(LegacyMigrationStage::TopologySchemaCreated)?;
+            for (index, state) in migrated.iter().enumerate() {
                 store.save_project_state_in_transaction(state)?;
+                hook(LegacyMigrationStage::ProjectWritten(index))?;
             }
             // The version marker is deliberately the final write in the transaction.
             store.set_schema_version(STORE_SCHEMA_VERSION)?;
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn migrate_legacy_v1_to_v2_with_failpoint(
+        &self,
+        failpoint: LegacyMigrationFailpoint,
+    ) -> Result<(), StackError> {
+        self.migrate_legacy_v1_to_v2_with_hook(|stage| {
+            if matches!(
+                (failpoint, stage),
+                (
+                    LegacyMigrationFailpoint::AfterFirstProjectWrite,
+                    LegacyMigrationStage::ProjectWritten(0)
+                )
+            ) {
+                return Err(StackError::InvalidSpec(
+                    "injected v1-to-v2 migration failure after first project write".to_string(),
+                ));
+            }
             Ok(())
         })
     }

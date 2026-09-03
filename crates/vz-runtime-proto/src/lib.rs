@@ -646,12 +646,27 @@ mod tests {
                 &[("machine_id", 1), ("capability", 2)],
             ),
             (
+                "TopologyInvalidMachineProfileDetail",
+                &[("machine_id", 1), ("profile", 2), ("reason", 3)],
+            ),
+            (
+                "TopologyInvalidCapabilityDeclarationDetail",
+                &[("machine_id", 1), ("reason", 2)],
+            ),
+            (
+                "TopologyContradictoryCapabilityDetail",
+                &[("machine_id", 1), ("capability", 2)],
+            ),
+            (
                 "TopologyErrorDetail",
                 &[
                     ("not_found", 1),
                     ("ambiguous", 2),
                     ("unsupported_target", 3),
                     ("missing_capability", 4),
+                    ("invalid_machine_profile", 5),
+                    ("invalid_capability_declaration", 6),
+                    ("contradictory_capability", 7),
                 ],
             ),
         ] {
@@ -1017,8 +1032,41 @@ mod tests {
                 capability: MachineCapability::DockerEngine as i32,
             })),
         };
+        let invalid_profile = TopologyErrorDetail {
+            detail: Some(Detail::InvalidMachineProfile(
+                TopologyInvalidMachineProfileDetail {
+                    machine_id: "mac_native".into(),
+                    profile: MachineProfile::Hardened as i32,
+                    reason: "native targets support only the Developer profile".into(),
+                },
+            )),
+        };
+        let invalid_capability = TopologyErrorDetail {
+            detail: Some(Detail::InvalidCapabilityDeclaration(
+                TopologyInvalidCapabilityDeclarationDetail {
+                    machine_id: "mac_native".into(),
+                    reason: "non-Linux target cannot declare implicit Docker capability".into(),
+                },
+            )),
+        };
+        let contradictory_capability = TopologyErrorDetail {
+            detail: Some(Detail::ContradictoryCapability(
+                TopologyContradictoryCapabilityDetail {
+                    machine_id: "mac_linux".into(),
+                    capability: MachineCapability::Compose as i32,
+                },
+            )),
+        };
 
-        for detail in [ambiguous, unsupported, not_found, missing_capability] {
+        for detail in [
+            ambiguous,
+            unsupported,
+            not_found,
+            missing_capability,
+            invalid_profile,
+            invalid_capability,
+            contradictory_capability,
+        ] {
             let encoded = detail.encode_to_vec();
             assert_eq!(
                 TopologyErrorDetail::decode(encoded.as_slice()).unwrap(),

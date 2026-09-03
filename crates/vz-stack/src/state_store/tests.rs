@@ -4705,6 +4705,93 @@ fn v0_3_20_migration_identity_uses_persisted_key_not_path_hint() {
 }
 
 #[test]
+fn v0_3_20_migration_failure_after_partial_write_rolls_back_and_retries() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("legacy-failpoint.db");
+    seed_v0_3_20_fixture(&db_path, None);
+
+    let schema_snapshot = |connection: &Connection| {
+        let mut statement = connection
+            .prepare(
+                "SELECT type, name, tbl_name, COALESCE(sql, '')
+                 FROM sqlite_master
+                 WHERE name NOT LIKE 'sqlite_%'
+                 ORDER BY type, name",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+
+    let connection = Connection::open(&db_path).unwrap();
+    let schema_before = schema_snapshot(&connection);
+    let store = StateStore {
+        conn: connection,
+        event_sender: None,
+    };
+    let error = store
+        .migrate_legacy_v1_to_v2_with_failpoint(
+            topology::LegacyMigrationFailpoint::AfterFirstProjectWrite,
+        )
+        .expect_err("injected migration failure must abort the transaction")
+        .to_string();
+    assert!(error.contains("after first project write"));
+    drop(store);
+
+    let connection = Connection::open(&db_path).unwrap();
+    assert_eq!(schema_snapshot(&connection), schema_before);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT value FROM control_metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE name IN (
+                     'project_definitions', 'environment_instances', 'workspace_bindings',
+                     'machine_instances', 'environment_networks', 'environment_endpoints',
+                     'topology_ownership'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    drop(connection);
+
+    let retried = StateStore::open(&db_path).expect("migration retry must succeed");
+    assert_eq!(retried.schema_version().unwrap(), 2);
+    let projects = retried.list_project_states().unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(
+        projects[0].environments[0]
+            .legacy_migration
+            .as_ref()
+            .map(|provenance| provenance.legacy_sandbox_id.as_str()),
+        Some("vz-run-shop-a1b2c3d4e5f6")
+    );
+    assert_eq!(retried.list_sandboxes().unwrap().len(), 3);
+}
+
+#[test]
 fn v0_3_20_ambiguous_and_malformed_state_fail_before_schema_mutation() {
     for (name, extension, message) in [
         (
@@ -4790,7 +4877,8 @@ fn future_and_incomplete_v2_schemas_are_rejected_without_repair() {
         .err()
         .expect("incomplete v2 schema must fail")
         .to_string();
-    assert!(error.contains("missing required table `environment_endpoints`"));
+    assert!(error.contains("topology shape mismatch"));
+    assert!(error.contains("table:environment_endpoints"));
     let conn = Connection::open(&incomplete_path).unwrap();
     assert_eq!(
         conn.query_row(
@@ -4801,6 +4889,79 @@ fn future_and_incomplete_v2_schemas_are_rejected_without_repair() {
         .unwrap(),
         0
     );
+}
+
+#[test]
+fn malformed_v2_columns_constraints_and_foreign_key_data_are_rejected() {
+    let column_dir = tempfile::tempdir().unwrap();
+    let column_path = column_dir.path().join("unexpected-column.db");
+    {
+        let store = StateStore::open(&column_path).unwrap();
+        store
+            .conn
+            .execute(
+                "ALTER TABLE project_definitions ADD COLUMN unexpected TEXT",
+                [],
+            )
+            .unwrap();
+    }
+    let error = StateStore::open(&column_path).err().unwrap().to_string();
+    assert!(error.contains("topology shape mismatch"));
+    assert!(error.contains("table:project_definitions"));
+
+    let constraint_dir = tempfile::tempdir().unwrap();
+    let constraint_path = constraint_dir.path().join("missing-constraints.db");
+    seed_v0_3_20_fixture(&constraint_path, None);
+    {
+        let connection = Connection::open(&constraint_path).unwrap();
+        let malformed_ddl = topology::TOPOLOGY_SCHEMA_DDL.replace(
+            "schema_version INTEGER NOT NULL CHECK(schema_version = 1)",
+            "schema_version INTEGER NOT NULL",
+        );
+        connection.execute_batch(&malformed_ddl).unwrap();
+        connection
+            .execute(
+                "UPDATE control_metadata SET value = '2' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+    }
+    let error = StateStore::open(&constraint_path)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("topology shape mismatch"));
+    assert!(error.contains("table:project_definitions"));
+
+    let foreign_key_dir = tempfile::tempdir().unwrap();
+    let foreign_key_path = foreign_key_dir.path().join("foreign-key-violation.db");
+    {
+        let store = StateStore::open(&foreign_key_path).unwrap();
+        drop(store);
+        let connection = Connection::open(&foreign_key_path).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO environment_instances
+                    (environment_id, project_id, schema_version, name, definition_digest, state,
+                     instance_json, created_at, updated_at, legacy_sandbox_id)
+                 VALUES (
+                    'env_orphan', 'prj_missing', 1, 'orphan', 'sha256:orphan',
+                    '\"stopped\"', '{}', 1, 1, NULL
+                 )",
+                [],
+            )
+            .unwrap();
+    }
+    let error = StateStore::open(&foreign_key_path)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("foreign-key violation"));
+    assert!(error.contains("table=environment_instances"));
+    assert!(error.contains("parent=project_definitions"));
 }
 
 #[test]

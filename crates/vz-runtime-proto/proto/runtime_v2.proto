@@ -344,6 +344,22 @@ message TopologyMissingCapabilityDetail {
   MachineCapability capability = 2;
 }
 
+message TopologyInvalidMachineProfileDetail {
+  string machine_id = 1;
+  MachineProfile profile = 2;
+  string reason = 3;
+}
+
+message TopologyInvalidCapabilityDeclarationDetail {
+  string machine_id = 1;
+  string reason = 2;
+}
+
+message TopologyContradictoryCapabilityDetail {
+  string machine_id = 1;
+  MachineCapability capability = 2;
+}
+
 // Structured detail suitable for an ErrorDetail companion. Do not require
 // clients to parse ambiguity or unsupported-target information from prose.
 message TopologyErrorDetail {
@@ -352,6 +368,9 @@ message TopologyErrorDetail {
     TopologyAmbiguityDetail ambiguous = 2;
     TopologyUnsupportedTargetDetail unsupported_target = 3;
     TopologyMissingCapabilityDetail missing_capability = 4;
+    TopologyInvalidMachineProfileDetail invalid_machine_profile = 5;
+    TopologyInvalidCapabilityDeclarationDetail invalid_capability_declaration = 6;
+    TopologyContradictoryCapabilityDetail contradictory_capability = 7;
   }
 }
 

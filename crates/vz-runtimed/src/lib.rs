@@ -226,6 +226,31 @@ impl RuntimeDaemon {
             path: config.state_store_path.clone(),
             source,
         })?;
+        let schema_version =
+            state_store
+                .schema_version()
+                .map_err(|source| RuntimedError::ReadSchemaVersion {
+                    path: config.state_store_path.clone(),
+                    source,
+                })?;
+        if schema_version > MAX_SUPPORTED_SCHEMA_VERSION {
+            return Err(RuntimedError::UnsupportedSchemaVersion {
+                path: config.state_store_path.clone(),
+                found: schema_version,
+                max_supported: MAX_SUPPORTED_SCHEMA_VERSION,
+            });
+        }
+        // Validate every persisted topology aggregate before any startup
+        // reconciliation can mutate execution, build, or sandbox state. Schema
+        // validation performed while opening the store protects the relational
+        // shape; this read validates the canonical JSON and cross-record domain
+        // invariants as one fail-closed startup barrier.
+        state_store.list_project_states().map_err(|source| {
+            RuntimedError::ValidateTopologyState {
+                path: config.state_store_path.clone(),
+                source,
+            }
+        })?;
         if !legacy_checkpoint_artifacts.is_empty() {
             if migrate_legacy_checkpoint_artifacts {
                 let report = migrate_legacy_checkpoint_artifacts_to_archive(
@@ -251,20 +276,6 @@ impl RuntimeDaemon {
                     paths: legacy_checkpoint_artifacts,
                 });
             }
-        }
-        let schema_version =
-            state_store
-                .schema_version()
-                .map_err(|source| RuntimedError::ReadSchemaVersion {
-                    path: config.state_store_path.clone(),
-                    source,
-                })?;
-        if schema_version > MAX_SUPPORTED_SCHEMA_VERSION {
-            return Err(RuntimedError::UnsupportedSchemaVersion {
-                path: config.state_store_path.clone(),
-                found: schema_version,
-                max_supported: MAX_SUPPORTED_SCHEMA_VERSION,
-            });
         }
         let reconciled_execution_count =
             reconcile_orphaned_executions(&state_store).map_err(|source| {
@@ -1063,6 +1074,12 @@ pub enum RuntimedError {
         #[source]
         source: StackError,
     },
+    #[error("failed to validate persisted topology state from {path}: {source}")]
+    ValidateTopologyState {
+        path: PathBuf,
+        #[source]
+        source: StackError,
+    },
     #[error("failed to reconcile execution state from {path}: {source}")]
     ReconcileExecutionState {
         path: PathBuf,
@@ -1111,6 +1128,24 @@ mod tests {
         Build, BuildSpec, BuildState, Execution, ExecutionSpec, ExecutionState, MachineProfile,
         Sandbox, SandboxBackend, SandboxSpec, SandboxState,
     };
+
+    fn queued_execution(execution_id: &str) -> Execution {
+        Execution {
+            execution_id: execution_id.to_string(),
+            container_id: "ctr-startup-validation".to_string(),
+            exec_spec: ExecutionSpec {
+                cmd: vec!["echo".to_string()],
+                args: vec![],
+                env_override: BTreeMap::new(),
+                pty: false,
+                timeout_secs: None,
+            },
+            state: ExecutionState::Queued,
+            exit_code: None,
+            started_at: None,
+            ended_at: None,
+        }
+    }
 
     #[test]
     fn default_config_has_expected_paths() {
@@ -1607,6 +1642,94 @@ mod tests {
             }) if message.contains("newer than supported version")
                 && message.contains(&(MAX_SUPPORTED_SCHEMA_VERSION + 1).to_string())
         ));
+    }
+
+    #[test]
+    fn daemon_rejects_malformed_topology_json_before_recovery_mutation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = RuntimedConfig {
+            state_store_path: tmp.path().join("state").join("stack-state.db"),
+            runtime_data_dir: tmp.path().join("runtime"),
+            socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+        };
+        std::fs::create_dir_all(cfg.state_store_path.parent().expect("state parent"))
+            .expect("create state directory");
+        let store = StateStore::open(&cfg.state_store_path).expect("state store");
+        store
+            .save_execution(&queued_execution("exec-json-corruption"))
+            .expect("save queued execution");
+        drop(store);
+
+        let connection = rusqlite::Connection::open(&cfg.state_store_path).expect("open database");
+        connection
+            .execute(
+                "INSERT INTO project_definitions
+                    (project_id, schema_version, name, definition_json, created_at, updated_at)
+                 VALUES ('prj_corrupt', 1, 'corrupt', '{not-json', 1, 1)",
+                [],
+            )
+            .expect("insert malformed topology JSON");
+        drop(connection);
+
+        let result = RuntimeDaemon::start(cfg.clone());
+        assert!(matches!(
+            result,
+            Err(RuntimedError::ValidateTopologyState { source, .. })
+                if source.to_string().contains("serialization error")
+        ));
+
+        let reopened = StateStore::open(&cfg.state_store_path).expect("reopen state store");
+        let execution = reopened
+            .load_execution("exec-json-corruption")
+            .expect("load execution")
+            .expect("execution remains present");
+        assert_eq!(execution.state, ExecutionState::Queued);
+        assert_eq!(execution.started_at, None);
+        assert_eq!(execution.ended_at, None);
+    }
+
+    #[test]
+    fn daemon_rejects_malformed_topology_schema_before_recovery_mutation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = RuntimedConfig {
+            state_store_path: tmp.path().join("state").join("stack-state.db"),
+            runtime_data_dir: tmp.path().join("runtime"),
+            socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+        };
+        std::fs::create_dir_all(cfg.state_store_path.parent().expect("state parent"))
+            .expect("create state directory");
+        let store = StateStore::open(&cfg.state_store_path).expect("state store");
+        store
+            .save_execution(&queued_execution("exec-schema-corruption"))
+            .expect("save queued execution");
+        drop(store);
+
+        let connection = rusqlite::Connection::open(&cfg.state_store_path).expect("open database");
+        connection
+            .execute("DROP INDEX idx_environment_project", [])
+            .expect("remove required topology index");
+        drop(connection);
+
+        let result = RuntimeDaemon::start(cfg.clone());
+        assert!(matches!(
+            result,
+            Err(RuntimedError::OpenStateStore {
+                source: StackError::InvalidSpec(message),
+                ..
+            }) if message.contains("topology shape mismatch")
+                && message.contains("index:idx_environment_project")
+        ));
+
+        let connection =
+            rusqlite::Connection::open(&cfg.state_store_path).expect("reopen database");
+        let state: String = connection
+            .query_row(
+                "SELECT state FROM execution_state WHERE execution_id = 'exec-schema-corruption'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("queued execution state remains readable");
+        assert_eq!(state, "\"queued\"");
     }
 
     #[test]
