@@ -150,6 +150,39 @@ pub trait ContainerRuntime: Send + Sync {
         self.create(image, config)
     }
 
+    /// Create a container while retaining runtime-issued generation ownership
+    /// when the create fails after admission.
+    fn create_in_sandbox_owned(
+        &self,
+        sandbox_id: &str,
+        image: &str,
+        config: vz_runtime_contract::RunConfig,
+    ) -> Result<
+        vz_runtime_contract::ContainerCreateReceipt,
+        vz_runtime_contract::OwnedCreateError<StackError>,
+    > {
+        self.create_in_sandbox(sandbox_id, image, config)
+            .map(|container_id| vz_runtime_contract::ContainerCreateReceipt {
+                container_id,
+                ownership: None,
+            })
+            .map_err(|error| vz_runtime_contract::OwnedCreateError {
+                error,
+                cleanup: None,
+            })
+    }
+
+    /// Remove only the exact failed-create generation named by `ownership`.
+    fn cleanup_container_generation(
+        &self,
+        _ownership: vz_runtime_contract::ContainerGenerationOwnership,
+    ) -> Result<vz_runtime_contract::GenerationCleanupOutcome, StackError> {
+        Err(StackError::Network(
+            "unsupported_operation: surface=stack; operation=cleanup_container_generation; reason=runtime did not issue generation ownership"
+                .to_string(),
+        ))
+    }
+
     /// Set up networking for services within a sandbox.
     ///
     /// Creates a bridge and per-service netns with veth pairs so that

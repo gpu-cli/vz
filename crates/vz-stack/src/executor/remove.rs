@@ -13,6 +13,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             .iter()
             .find(|o| o.service_name == service_name)
             .and_then(|o| o.container_id.clone());
+        let failed_create_ownership = observed
+            .iter()
+            .find(|o| o.service_name == service_name)
+            .and_then(|o| o.failed_create_ownership.clone());
 
         self.store.emit_event(
             &spec.name,
@@ -31,7 +35,32 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
         // Stop and remove if we have a container.
         let mut stop_error = None;
-        if let Some(ref cid) = container_id {
+        if let Some(ownership) = failed_create_ownership.as_ref() {
+            if ownership.stack_id != spec.name
+                || container_id.as_deref() != Some(ownership.container_id.as_str())
+                || ownership.generation == 0
+            {
+                let error = StackError::InvalidSpec(format!(
+                    "invalid failed-create ownership for service '{service_name}'"
+                ));
+                self.mark_failed_with_ownership(
+                    spec,
+                    service_name,
+                    &error.to_string(),
+                    failed_create_ownership,
+                )?;
+                return Err(error);
+            }
+            if let Err(error) = self.runtime.cleanup_container_generation(ownership.clone()) {
+                self.mark_failed_with_ownership(
+                    spec,
+                    service_name,
+                    &error.to_string(),
+                    failed_create_ownership,
+                )?;
+                return Err(error);
+            }
+        } else if let Some(ref cid) = container_id {
             info!(service = %service_name, container = %cid, "stopping container");
             if let Err(e) = self.runtime.stop(cid, stop_signal, stop_grace_period) {
                 error!(service = %service_name, error = %e, "VZ_STACK_TEARDOWN_VIOLATION:STOP_FAILED failed to stop container");
@@ -80,6 +109,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 service_name: service_name.to_string(),
                 phase: ServicePhase::Stopped,
                 container_id: None,
+                failed_create_ownership: None,
                 last_error: None,
                 ready: false,
             },
@@ -125,6 +155,43 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 service_name: service_name.to_string(),
                 phase: ServicePhase::Failed,
                 container_id: container_id.map(str::to_string),
+                failed_create_ownership: None,
+                last_error: Some(error_msg.to_string()),
+                ready: false,
+            },
+        )?;
+
+        self.store.emit_event(
+            &spec.name,
+            &StackEvent::ServiceFailed {
+                stack_name: spec.name.clone(),
+                service_name: service_name.to_string(),
+                error: error_msg.to_string(),
+            },
+        )?;
+
+        Ok(())
+    }
+
+    /// Mark a failed create while retaining the exact runtime-issued cleanup
+    /// authority. The token, rather than the container name, is what permits a
+    /// later reconciliation pass to remove the failed generation.
+    pub(super) fn mark_failed_with_ownership(
+        &self,
+        spec: &StackSpec,
+        service_name: &str,
+        error_msg: &str,
+        ownership: Option<vz_runtime_contract::ContainerGenerationOwnership>,
+    ) -> Result<(), StackError> {
+        self.store.save_observed_state(
+            &spec.name,
+            &ServiceObservedState {
+                service_name: service_name.to_string(),
+                phase: ServicePhase::Failed,
+                container_id: ownership
+                    .as_ref()
+                    .map(|ownership| ownership.container_id.clone()),
+                failed_create_ownership: ownership,
                 last_error: Some(error_msg.to_string()),
                 ready: false,
             },

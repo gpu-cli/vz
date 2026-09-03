@@ -555,6 +555,64 @@ fn workspace_runtime_manager_routes_stack_create_with_shared_runtime() {
 }
 
 #[test]
+fn compatibility_backend_owned_create_never_fabricates_ownership() {
+    let backend = ManagerRoutingBackend::new(RuntimeCapabilities::stack_baseline());
+    let manager = WorkspaceRuntimeManager::new(backend);
+
+    let receipt = poll_immediate(manager.create_stack_container_owned(
+        "stack-1",
+        "nginx:latest",
+        RunConfig::default(),
+    ))
+    .unwrap();
+
+    assert_eq!(receipt.container_id, "ctr-stack");
+    assert!(receipt.ownership.is_none());
+    assert_eq!(manager.backend().calls(), vec!["create_container_in_stack"]);
+}
+
+#[test]
+fn compatibility_backend_generation_cleanup_fails_closed() {
+    let backend = ManagerRoutingBackend::new(RuntimeCapabilities::stack_baseline());
+    let manager = WorkspaceRuntimeManager::new(backend);
+    let ownership = ContainerGenerationOwnership {
+        container_id: "ctr-stack".to_string(),
+        generation: 7,
+        stack_id: "stack-1".to_string(),
+    };
+
+    let error = poll_immediate(manager.cleanup_container_generation(ownership)).unwrap_err();
+
+    assert!(matches!(
+        error,
+        RuntimeError::UnsupportedOperation { ref operation, .. }
+            if operation == "cleanup_container_generation"
+    ));
+    assert!(manager.backend().calls().is_empty());
+}
+
+#[test]
+fn generation_ownership_and_cleanup_outcome_round_trip() {
+    let ownership = ContainerGenerationOwnership {
+        container_id: "ctr-stack".to_string(),
+        generation: 11,
+        stack_id: "stack-1".to_string(),
+    };
+    let json = serde_json::to_string(&ownership).unwrap();
+    assert_eq!(
+        serde_json::from_str::<ContainerGenerationOwnership>(&json).unwrap(),
+        ownership
+    );
+
+    let json = serde_json::to_string(&GenerationCleanupOutcome::AlreadyAbsent).unwrap();
+    assert_eq!(json, "\"already_absent\"");
+    assert_eq!(
+        serde_json::from_str::<GenerationCleanupOutcome>(&json).unwrap(),
+        GenerationCleanupOutcome::AlreadyAbsent
+    );
+}
+
+#[test]
 fn workspace_runtime_manager_falls_back_to_plain_create_when_shared_disabled() {
     let mut caps = RuntimeCapabilities::stack_baseline();
     caps.shared_vm = false;

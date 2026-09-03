@@ -31,6 +31,7 @@ pub(super) fn observed_from_stack_statuses(
             } else {
                 Some(service.container_id.clone())
             },
+            failed_create_ownership: None,
             last_error: if service.last_error.trim().is_empty() {
                 None
             } else {

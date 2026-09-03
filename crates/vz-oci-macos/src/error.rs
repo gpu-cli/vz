@@ -20,6 +20,15 @@ pub enum MacosOciError {
     #[error("container already exists: {id}")]
     ContainerAlreadyExists { id: String },
 
+    /// A generation-qualified cleanup proof no longer owns the container ID.
+    #[error("container generation ownership mismatch for {id}: {reason}")]
+    ContainerOwnershipMismatch {
+        /// Container identifier named by the stale or foreign proof.
+        id: String,
+        /// Concrete mismatch details for diagnostics.
+        reason: String,
+    },
+
     /// Container metadata or generation was not found.
     #[error("container not found: {id}")]
     ContainerNotFound { id: String },

@@ -67,10 +67,9 @@ pub(super) struct PreparedCreate {
     pub(super) service_name: String,
     pub(super) replica_index: u32,
     pub(super) image: String,
+    /// Exact caller-selected runtime ID whose create result this preparation owns.
+    pub(super) requested_container_id: String,
     pub(super) run_config: vz_runtime_contract::RunConfig,
-    /// Generated IDs are scoped to this stack and may be retained for cleanup
-    /// after a partial create. Explicit IDs require runtime ownership proof.
-    pub(super) retain_failed_create_id: bool,
 }
 
 impl PreparedCreate {
@@ -107,6 +106,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 service_name: service_name.to_string(),
                 phase: ServicePhase::Creating,
                 container_id: None,
+                failed_create_ownership: None,
                 last_error: None,
                 ready: false,
             },
@@ -178,7 +178,6 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         // globally unique ID. Default IDs are stack-namespaced so separate
         // developer environments may use identical service names safely.
         let replicas = svc_spec.resources.replicas.max(1);
-        let retain_failed_create_id = svc_spec.container_name.is_none();
         let container_id = if let Some(base_name) = svc_spec.container_name.as_deref() {
             if replicas > 1 && replica_index > 1 {
                 format!("{base_name}-{replica_index}")
@@ -188,7 +187,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         } else {
             generated_runtime_container_id(&spec.name, service_name, replica_index)
         };
-        run_config.container_id = Some(container_id);
+        run_config.container_id = Some(container_id.clone());
 
         // Set the VirtioFS mount tag offset for this service in sandbox mode.
         if let Some(&offset) = self.mount_tag_offsets.get(service_name) {
@@ -256,8 +255,8 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             service_name: service_name.to_string(),
             replica_index,
             image: svc_spec.image.clone(),
+            requested_container_id: container_id,
             run_config,
-            retain_failed_create_id,
         })
     }
 
@@ -274,6 +273,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 service_name: service_name.to_string(),
                 phase: ServicePhase::Running,
                 container_id: Some(container_id.to_string()),
+                failed_create_ownership: None,
                 last_error: None,
                 ready: false, // Health checks set this to true later.
             },

@@ -395,7 +395,7 @@ impl ContainerLifecycleTransaction {
         &self.lease().container_id
     }
 
-    fn generation(&self) -> ContainerGeneration {
+    pub(crate) fn generation(&self) -> ContainerGeneration {
         self.lease().generation
     }
 
@@ -745,6 +745,111 @@ impl Runtime {
                     _container_guard: container_guard,
                 }),
             });
+        }
+    }
+
+    /// Acquire lifecycle ownership only if an exact runtime-issued generation
+    /// still owns the requested ID and stack scope.
+    ///
+    /// `Ok(None)` means that no generation is currently reserved. A different
+    /// current generation or a foreign published stack route fails closed.
+    pub(crate) async fn begin_owned_container_generation(
+        &self,
+        id: &str,
+        generation: ContainerGeneration,
+        stack_id: &str,
+    ) -> Result<Option<ContainerLifecycleTransaction>, OciError> {
+        validate_container_id(id)?;
+        let stack_guard = self.stack_lifecycle_lock(stack_id).await.read_owned().await;
+        let container_guard = self.container_lifecycle_lock(id).await.write_owned().await;
+        let os_guard = self.acquire_container_os_write(id).await?;
+        let current_generation = self
+            .container_store
+            .current_generation(id)
+            .map_err(|error| Self::map_container_store_error(id, error))?;
+
+        let Some(current_generation) = current_generation else {
+            return Ok(None);
+        };
+        if current_generation != generation {
+            return Err(OciError::ContainerOwnershipMismatch {
+                id: id.to_string(),
+                reason: format!(
+                    "proof names generation {}, but current generation is {}",
+                    generation.0, current_generation.0
+                ),
+            });
+        }
+
+        let current_stack = self.container_stack.lock().await.get(id).cloned();
+        if current_stack
+            .as_deref()
+            .is_some_and(|current_stack| current_stack != stack_id)
+        {
+            return Err(OciError::ContainerOwnershipMismatch {
+                id: id.to_string(),
+                reason: format!(
+                    "proof names stack '{stack_id}', but the current route belongs to stack '{}'",
+                    current_stack.as_deref().unwrap_or_default()
+                ),
+            });
+        }
+
+        Ok(Some(ContainerLifecycleTransaction {
+            lease: Some(ContainerLifecycleLease {
+                container_id: id.to_string(),
+                generation,
+                container_store: self.container_store.clone(),
+                _os_guard: os_guard,
+                _stack_guard: Some(stack_guard),
+                _container_guard: container_guard,
+            }),
+        }))
+    }
+
+    /// Stop and remove exactly one generation owned by a stack create receipt.
+    pub(crate) async fn cleanup_owned_container_generation(
+        &self,
+        id: &str,
+        generation: ContainerGeneration,
+        stack_id: &str,
+    ) -> Result<vz_runtime_contract::GenerationCleanupOutcome, OciError> {
+        let Some(transaction) = self
+            .begin_owned_container_generation(id, generation, stack_id)
+            .await?
+        else {
+            return Ok(vz_runtime_contract::GenerationCleanupOutcome::AlreadyAbsent);
+        };
+
+        if self
+            .container_store
+            .find(id)
+            .map_err(OciError::from)?
+            .is_none()
+        {
+            drop(transaction);
+            return Ok(vz_runtime_contract::GenerationCleanupOutcome::AlreadyAbsent);
+        }
+
+        let stop_error = self
+            .stop_container_in_transaction(id, true, None, None, &transaction)
+            .await
+            .err();
+        let remove_error = match self.remove_container_in_transaction(id, &transaction).await {
+            Ok(()) => None,
+            Err(OciError::ContainerNotFound { .. }) => None,
+            Err(error) => Some(error),
+        };
+
+        match (stop_error, remove_error) {
+            (None, None) => Ok(vz_runtime_contract::GenerationCleanupOutcome::Removed),
+            (Some(stop), None) => Err(OciError::InvalidConfig(format!(
+                "generation-owned cleanup removed container '{id}' after stop failed: {stop}"
+            ))),
+            (None, Some(remove)) => Err(remove),
+            (Some(stop), Some(remove)) => Err(OciError::InvalidConfig(format!(
+                "generation-owned cleanup failed for container '{id}': stop: {stop}; remove: {remove}"
+            ))),
         }
     }
 

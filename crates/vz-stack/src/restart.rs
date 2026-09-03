@@ -230,6 +230,7 @@ mod tests {
             service_name: name.to_string(),
             phase,
             container_id: None,
+            failed_create_ownership: None,
             last_error: None,
             ready: false,
         }

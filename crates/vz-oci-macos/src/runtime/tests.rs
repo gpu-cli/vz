@@ -1383,6 +1383,221 @@ async fn caller_selected_id_is_serialized_and_duplicate_is_rejected() {
 }
 
 #[tokio::test]
+async fn generation_owned_cleanup_removes_only_the_exact_stack_generation() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("generation-owned-cleanup"),
+        ..RuntimeConfig::default()
+    });
+    let mut run = RunConfig {
+        container_id: Some("owned-failure".to_string()),
+        ..RunConfig::default()
+    };
+    let transaction = runtime
+        .begin_container_create(&mut run, Some("stack-a"))
+        .await
+        .unwrap();
+    let generation = transaction.generation();
+    runtime
+        .persist_owned(
+            &transaction,
+            ContainerInfo {
+                id: "owned-failure".to_string(),
+                image: "alpine:latest".to_string(),
+                image_id: "sha256:owned".to_string(),
+                status: ContainerStatus::Stopped { exit_code: -1 },
+                created_unix_secs: 1,
+                started_unix_secs: Some(1),
+                stopped_unix_secs: Some(2),
+                rootfs_path: None,
+                host_pid: None,
+            },
+        )
+        .unwrap();
+    runtime
+        .container_stack
+        .lock()
+        .await
+        .insert("owned-failure".to_string(), "stack-a".to_string());
+    drop(transaction);
+
+    let outcome = runtime
+        .cleanup_owned_container_generation("owned-failure", generation, "stack-a")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        vz_runtime_contract::GenerationCleanupOutcome::Removed
+    );
+    assert!(
+        runtime
+            .container_store
+            .find("owned-failure")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        runtime
+            .container_store
+            .current_generation("owned-failure")
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn generation_owned_cleanup_rejects_stale_generation_without_removal() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("generation-owned-stale"),
+        ..RuntimeConfig::default()
+    });
+    let mut run = RunConfig {
+        container_id: Some("replacement".to_string()),
+        ..RunConfig::default()
+    };
+    let transaction = runtime
+        .begin_container_create(&mut run, Some("stack-a"))
+        .await
+        .unwrap();
+    let generation = transaction.generation();
+    runtime
+        .persist_owned(
+            &transaction,
+            ContainerInfo {
+                id: "replacement".to_string(),
+                image: "alpine:latest".to_string(),
+                image_id: "sha256:replacement".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 0 },
+                created_unix_secs: 1,
+                started_unix_secs: Some(1),
+                stopped_unix_secs: Some(2),
+                rootfs_path: None,
+                host_pid: None,
+            },
+        )
+        .unwrap();
+    runtime
+        .container_stack
+        .lock()
+        .await
+        .insert("replacement".to_string(), "stack-a".to_string());
+    drop(transaction);
+
+    let error = runtime
+        .cleanup_owned_container_generation(
+            "replacement",
+            ContainerGeneration(generation.0.saturating_add(1)),
+            "stack-a",
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, OciError::ContainerOwnershipMismatch { .. }));
+    assert!(
+        runtime
+            .container_store
+            .find("replacement")
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        runtime
+            .container_store
+            .current_generation("replacement")
+            .unwrap(),
+        Some(generation)
+    );
+}
+
+#[tokio::test]
+async fn generation_owned_cleanup_rejects_foreign_stack_route_without_removal() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("generation-owned-foreign-stack"),
+        ..RuntimeConfig::default()
+    });
+    let mut run = RunConfig {
+        container_id: Some("foreign-route".to_string()),
+        ..RunConfig::default()
+    };
+    let transaction = runtime
+        .begin_container_create(&mut run, Some("stack-b"))
+        .await
+        .unwrap();
+    let generation = transaction.generation();
+    runtime
+        .persist_owned(
+            &transaction,
+            ContainerInfo {
+                id: "foreign-route".to_string(),
+                image: "alpine:latest".to_string(),
+                image_id: "sha256:foreign".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 0 },
+                created_unix_secs: 1,
+                started_unix_secs: Some(1),
+                stopped_unix_secs: Some(2),
+                rootfs_path: None,
+                host_pid: None,
+            },
+        )
+        .unwrap();
+    runtime
+        .container_stack
+        .lock()
+        .await
+        .insert("foreign-route".to_string(), "stack-b".to_string());
+    drop(transaction);
+
+    let error = runtime
+        .cleanup_owned_container_generation("foreign-route", generation, "stack-a")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, OciError::ContainerOwnershipMismatch { .. }));
+    assert!(
+        runtime
+            .container_store
+            .find("foreign-route")
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        runtime
+            .container_stack
+            .lock()
+            .await
+            .get("foreign-route")
+            .map(String::as_str),
+        Some("stack-b")
+    );
+}
+
+#[tokio::test]
+async fn generation_owned_cleanup_treats_released_unpublished_generation_as_absent() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("generation-owned-absent"),
+        ..RuntimeConfig::default()
+    });
+    let mut run = RunConfig {
+        container_id: Some("unpublished".to_string()),
+        ..RunConfig::default()
+    };
+    let transaction = runtime
+        .begin_container_create(&mut run, Some("stack-a"))
+        .await
+        .unwrap();
+    let generation = transaction.generation();
+    drop(transaction);
+
+    assert_eq!(
+        runtime
+            .cleanup_owned_container_generation("unpublished", generation, "stack-a")
+            .await
+            .unwrap(),
+        vz_runtime_contract::GenerationCleanupOutcome::AlreadyAbsent
+    );
+}
+
+#[tokio::test]
 async fn second_runtime_stop_remove_waits_for_cross_process_id_writer() {
     let data_dir = unique_temp_dir("cross-runtime-waiting-writer");
     let owner = Runtime::new(RuntimeConfig {

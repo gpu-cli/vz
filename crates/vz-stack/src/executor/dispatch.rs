@@ -1,6 +1,34 @@
 use super::create::PreparedCreate;
 use super::*;
 
+fn validate_failed_create_ownership(
+    stack_id: &str,
+    requested_container_id: &str,
+    ownership: Option<vz_runtime_contract::ContainerGenerationOwnership>,
+) -> Option<vz_runtime_contract::ContainerGenerationOwnership> {
+    match ownership {
+        Some(ownership)
+            if ownership.stack_id == stack_id
+                && ownership.container_id == requested_container_id
+                && ownership.generation > 0 =>
+        {
+            Some(ownership)
+        }
+        Some(ownership) => {
+            error!(
+                stack = %stack_id,
+                requested_container = %requested_container_id,
+                ownership_stack = %ownership.stack_id,
+                ownership_container = %ownership.container_id,
+                ownership_generation = ownership.generation,
+                "runtime returned invalid failed-create ownership; discarding cleanup authority"
+            );
+            None
+        }
+        None => None,
+    }
+}
+
 /// Group create/recreate actions into topological levels for parallel execution.
 ///
 /// Services at the same level have no dependency edges between them
@@ -534,28 +562,32 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 // Single container — execute inline, no thread overhead.
                 for prep in ok_prepared {
                     let full_name = prep.full_name();
-                    let requested_container_id = prep
-                        .retain_failed_create_id
-                        .then(|| prep.run_config.container_id.clone())
-                        .flatten();
+                    let requested_container_id = prep.requested_container_id.clone();
                     info!(service = %full_name, image = %prep.image, "creating container");
-                    let create_result =
-                        self.runtime
-                            .create_in_sandbox(&spec.name, &prep.image, prep.run_config);
+                    let create_result = self.runtime.create_in_sandbox_owned(
+                        &spec.name,
+                        &prep.image,
+                        prep.run_config,
+                    );
                     match create_result {
-                        Ok(container_id) => {
-                            self.finalize_create(spec, &full_name, &container_id)?;
+                        Ok(receipt) => {
+                            self.finalize_create(spec, &full_name, &receipt.container_id)?;
                             result.succeeded += 1;
                         }
-                        Err(e) => {
-                            self.mark_failed_with_container(
+                        Err(failure) => {
+                            let cleanup = validate_failed_create_ownership(
+                                &spec.name,
+                                &requested_container_id,
+                                failure.cleanup,
+                            );
+                            self.mark_failed_with_ownership(
                                 spec,
                                 &full_name,
-                                &e.to_string(),
-                                requested_container_id.as_deref(),
+                                &failure.error.to_string(),
+                                cleanup,
                             )?;
                             result.failed += 1;
-                            result.errors.push((full_name, e.to_string()));
+                            result.errors.push((full_name, failure.error.to_string()));
                         }
                     }
                 }
@@ -563,14 +595,6 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 // Parallel create for multiple containers at the same level.
                 // Images are already pulled; only create_in_sandbox runs in threads.
                 let full_names: Vec<String> = ok_prepared.iter().map(|p| p.full_name()).collect();
-                let requested_container_ids: Vec<Option<String>> = ok_prepared
-                    .iter()
-                    .map(|p| {
-                        p.retain_failed_create_id
-                            .then(|| p.run_config.container_id.clone())
-                            .flatten()
-                    })
-                    .collect();
                 info!(
                     services = ?full_names,
                     "creating {} containers in parallel",
@@ -579,17 +603,27 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
                 let runtime = &self.runtime;
                 let stack_name = &spec.name;
-                let outcomes: Vec<Result<String, StackError>> = std::thread::scope(|s| {
+                let outcomes: Vec<(
+                    String,
+                    Result<
+                        vz_runtime_contract::ContainerCreateReceipt,
+                        vz_runtime_contract::OwnedCreateError<StackError>,
+                    >,
+                )> = std::thread::scope(|s| {
                     let handles: Vec<_> = ok_prepared
                         .into_iter()
                         .map(|prep| {
                             let full_name = prep.full_name();
-                            s.spawn(move || -> Result<String, StackError> {
+                            let requested_container_id = prep.requested_container_id.clone();
+                            s.spawn(move || {
                                 info!(service = %full_name, image = %prep.image, "creating container");
-                                runtime.create_in_sandbox(
-                                    stack_name,
-                                    &prep.image,
-                                    prep.run_config,
+                                (
+                                    requested_container_id,
+                                    runtime.create_in_sandbox_owned(
+                                        stack_name,
+                                        &prep.image,
+                                        prep.run_config,
+                                    ),
                                 )
                             })
                         })
@@ -598,33 +632,44 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                         .into_iter()
                         .map(|h| match h.join() {
                             Ok(result) => result,
-                            Err(_) => Err(StackError::Network(
-                                "container create thread panicked".to_string(),
-                            )),
+                            Err(_) => (
+                                String::new(),
+                                Err(vz_runtime_contract::OwnedCreateError {
+                                    error: StackError::Network(
+                                        "container create thread panicked".to_string(),
+                                    ),
+                                    cleanup: None,
+                                }),
+                            ),
                         })
                         .collect()
                 });
 
                 // Serial post: update state for each outcome.
-                for ((service_name, requested_container_id), outcome) in full_names
-                    .iter()
-                    .zip(requested_container_ids.iter())
-                    .zip(outcomes)
+                for (service_name, (requested_container_id, outcome)) in
+                    full_names.iter().zip(outcomes)
                 {
                     match outcome {
-                        Ok(container_id) => {
-                            self.finalize_create(spec, service_name, &container_id)?;
+                        Ok(receipt) => {
+                            self.finalize_create(spec, service_name, &receipt.container_id)?;
                             result.succeeded += 1;
                         }
-                        Err(e) => {
-                            self.mark_failed_with_container(
+                        Err(failure) => {
+                            let cleanup = validate_failed_create_ownership(
+                                &spec.name,
+                                &requested_container_id,
+                                failure.cleanup,
+                            );
+                            self.mark_failed_with_ownership(
                                 spec,
                                 service_name,
-                                &e.to_string(),
-                                requested_container_id.as_deref(),
+                                &failure.error.to_string(),
+                                cleanup,
                             )?;
                             result.failed += 1;
-                            result.errors.push((service_name.clone(), e.to_string()));
+                            result
+                                .errors
+                                .push((service_name.clone(), failure.error.to_string()));
                         }
                     }
                 }

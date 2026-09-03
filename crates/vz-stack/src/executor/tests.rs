@@ -227,6 +227,7 @@ fn remove_service() {
                 service_name: "old".to_string(),
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-old".to_string()),
+                failed_create_ownership: None,
                 last_error: None,
                 ready: true,
             },
@@ -347,6 +348,7 @@ fn recreate_service() {
                 service_name: "web".to_string(),
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-old".to_string()),
+                failed_create_ownership: None,
                 last_error: None,
                 ready: true,
             },
@@ -430,10 +432,8 @@ fn create_failure_marks_service_failed() {
     let observed = executor.store().load_observed_state("myapp").unwrap();
     let web = observed.iter().find(|o| o.service_name == "web").unwrap();
     assert_eq!(web.phase, ServicePhase::Failed);
-    assert_eq!(
-        web.container_id.as_deref(),
-        Some(super::create::generated_runtime_container_id("myapp", "web", 1).as_str())
-    );
+    assert!(web.container_id.is_none());
+    assert!(web.failed_create_ownership.is_none());
 }
 
 #[test]
@@ -458,6 +458,249 @@ fn explicit_container_name_failure_does_not_claim_cleanup_ownership() {
     let observed = executor.store().load_observed_state("myapp").unwrap();
     assert_eq!(observed[0].phase, ServicePhase::Failed);
     assert!(observed[0].container_id.is_none());
+    assert!(observed[0].failed_create_ownership.is_none());
+
+    let applied = apply(&spec, executor.store(), &HashMap::new()).unwrap();
+    let retry = executor.execute(&spec, &applied.actions).unwrap();
+    assert_eq!(retry.failed, 1);
+    let calls = executor.runtime().call_log();
+    assert!(!calls.iter().any(|(operation, _)| matches!(
+        operation.as_str(),
+        "stop" | "remove" | "cleanup_container_generation"
+    )));
+}
+
+#[test]
+fn inline_wrong_id_ownership_is_discarded_and_never_cleaned() {
+    let mut runtime = MockContainerRuntime::new();
+    runtime.fail_create = true;
+    runtime.claim_failed_create_ownership = true;
+    let requested = super::create::generated_runtime_container_id("myapp", "web", 1);
+    runtime.override_failed_create_ownership_id(&requested, "foreign-container");
+    let mut executor = make_executor(runtime);
+    let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
+
+    let first = executor
+        .execute(
+            &spec,
+            &[Action::ServiceCreate {
+                service_name: "web".to_string(),
+            }],
+        )
+        .unwrap();
+    assert_eq!(first.failed, 1);
+    let failed = executor.store().load_observed_state("myapp").unwrap();
+    assert!(failed[0].container_id.is_none());
+    assert!(failed[0].failed_create_ownership.is_none());
+
+    let retry = apply(&spec, executor.store(), &HashMap::new()).unwrap();
+    let second = executor.execute(&spec, &retry.actions).unwrap();
+    assert_eq!(second.failed, 1);
+    assert!(
+        !executor
+            .runtime()
+            .call_log()
+            .iter()
+            .any(|(operation, _)| operation == "cleanup_container_generation")
+    );
+}
+
+#[test]
+fn owned_failed_create_survives_reconcile_and_is_cleaned_before_retry() {
+    let mut runtime = MockContainerRuntime::new();
+    runtime.fail_create = true;
+    runtime.claim_failed_create_ownership = true;
+    let mut executor = make_executor(runtime);
+    let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
+
+    let first = executor
+        .execute(
+            &spec,
+            &[Action::ServiceCreate {
+                service_name: "web".to_string(),
+            }],
+        )
+        .unwrap();
+    assert_eq!(first.failed, 1);
+
+    let expected_id = super::create::generated_runtime_container_id("myapp", "web", 1);
+    let failed = executor.store().load_observed_state("myapp").unwrap();
+    let ownership = failed[0]
+        .failed_create_ownership
+        .clone()
+        .expect("admitted failure must retain ownership");
+    assert_eq!(ownership.container_id, expected_id);
+    assert_eq!(ownership.generation, 41);
+    assert_eq!(ownership.stack_id, "myapp");
+    assert_eq!(
+        failed[0].container_id.as_deref(),
+        Some(expected_id.as_str())
+    );
+
+    let applied = apply(&spec, executor.store(), &HashMap::new()).unwrap();
+    let pending = executor.store().load_observed_state("myapp").unwrap();
+    assert_eq!(pending[0].failed_create_ownership, Some(ownership.clone()));
+
+    executor.runtime_mut().fail_create = false;
+    let retry = executor.execute(&spec, &applied.actions).unwrap();
+    assert!(retry.all_succeeded());
+    let calls = executor.runtime().call_log();
+    let cleanup_index = calls
+        .iter()
+        .rposition(|(operation, _)| operation == "cleanup_container_generation")
+        .unwrap();
+    let create_index = calls
+        .iter()
+        .rposition(|(operation, _)| operation == "create_in_sandbox")
+        .unwrap();
+    assert!(cleanup_index < create_index);
+    assert_eq!(calls[cleanup_index].1, format!("myapp:{expected_id}:41"));
+    assert!(
+        !calls
+            .iter()
+            .any(|(operation, _)| matches!(operation.as_str(), "stop" | "remove"))
+    );
+
+    let running = executor.store().load_observed_state("myapp").unwrap();
+    assert_eq!(running[0].phase, ServicePhase::Running);
+    assert!(running[0].failed_create_ownership.is_none());
+}
+
+#[test]
+fn failed_generation_cleanup_retains_ownership_and_blocks_recreate() {
+    let mut runtime = MockContainerRuntime::new();
+    runtime.fail_create = true;
+    runtime.claim_failed_create_ownership = true;
+    let mut executor = make_executor(runtime);
+    let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
+
+    executor
+        .execute(
+            &spec,
+            &[Action::ServiceCreate {
+                service_name: "web".to_string(),
+            }],
+        )
+        .unwrap();
+    let ownership = executor.store().load_observed_state("myapp").unwrap()[0]
+        .failed_create_ownership
+        .clone()
+        .unwrap();
+
+    executor.runtime_mut().fail_create = false;
+    executor.runtime_mut().fail_generation_cleanup = true;
+    let applied = apply(&spec, executor.store(), &HashMap::new()).unwrap();
+    let retry = executor.execute(&spec, &applied.actions).unwrap();
+    assert_eq!(retry.failed, 1);
+    let calls = executor.runtime().call_log();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|(operation, _)| operation == "cleanup_container_generation")
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|(operation, _)| operation == "create_in_sandbox")
+            .count(),
+        1,
+        "cleanup failure must prevent a second create"
+    );
+    let failed = executor.store().load_observed_state("myapp").unwrap();
+    assert_eq!(failed[0].phase, ServicePhase::Failed);
+    assert_eq!(failed[0].failed_create_ownership, Some(ownership));
+}
+
+#[test]
+fn parallel_owned_failures_keep_their_generation_tokens_associated() {
+    let mut runtime = MockContainerRuntime::new();
+    runtime.fail_create = true;
+    runtime.claim_failed_create_ownership = true;
+    let mut executor = make_executor(runtime);
+    let spec = stack(
+        "myapp",
+        vec![svc("api", "alpine:latest"), svc("worker", "alpine:latest")],
+    );
+
+    let result = executor
+        .execute(
+            &spec,
+            &[
+                Action::ServiceCreate {
+                    service_name: "api".to_string(),
+                },
+                Action::ServiceCreate {
+                    service_name: "worker".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(result.failed, 2);
+
+    let observed = executor.store().load_observed_state("myapp").unwrap();
+    for service_name in ["api", "worker"] {
+        let service = observed
+            .iter()
+            .find(|state| state.service_name == service_name)
+            .unwrap();
+        let ownership = service.failed_create_ownership.as_ref().unwrap();
+        let expected_id = super::create::generated_runtime_container_id("myapp", service_name, 1);
+        assert_eq!(ownership.container_id, expected_id);
+        assert_eq!(service.container_id.as_deref(), Some(expected_id.as_str()));
+        assert_eq!(ownership.generation, 41);
+        assert_eq!(ownership.stack_id, "myapp");
+    }
+}
+
+#[test]
+fn parallel_swapped_ownership_ids_are_discarded_and_never_cleaned() {
+    let mut runtime = MockContainerRuntime::new();
+    runtime.fail_create = true;
+    runtime.claim_failed_create_ownership = true;
+    let api_id = super::create::generated_runtime_container_id("myapp", "api", 1);
+    let worker_id = super::create::generated_runtime_container_id("myapp", "worker", 1);
+    runtime.override_failed_create_ownership_id(&api_id, &worker_id);
+    runtime.override_failed_create_ownership_id(&worker_id, &api_id);
+    let mut executor = make_executor(runtime);
+    let spec = stack(
+        "myapp",
+        vec![svc("api", "alpine:latest"), svc("worker", "alpine:latest")],
+    );
+
+    let first = executor
+        .execute(
+            &spec,
+            &[
+                Action::ServiceCreate {
+                    service_name: "api".to_string(),
+                },
+                Action::ServiceCreate {
+                    service_name: "worker".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(first.failed, 2);
+    let failed = executor.store().load_observed_state("myapp").unwrap();
+    assert!(failed.iter().all(|state| state.container_id.is_none()));
+    assert!(
+        failed
+            .iter()
+            .all(|state| state.failed_create_ownership.is_none())
+    );
+
+    let retry = apply(&spec, executor.store(), &HashMap::new()).unwrap();
+    let second = executor.execute(&spec, &retry.actions).unwrap();
+    assert_eq!(second.failed, 2);
+    assert!(
+        !executor
+            .runtime()
+            .call_log()
+            .iter()
+            .any(|(operation, _)| operation == "cleanup_container_generation")
+    );
 }
 
 #[test]
@@ -503,6 +746,7 @@ fn remove_with_no_container_id() {
                 service_name: "orphan".to_string(),
                 phase: ServicePhase::Pending,
                 container_id: None,
+                failed_create_ownership: None,
                 last_error: None,
                 ready: false,
             },
@@ -619,6 +863,7 @@ fn stop_failure_is_reported_after_successful_remove_and_state_update() {
                 service_name: "web".to_string(),
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-1".to_string()),
+                failed_create_ownership: None,
                 last_error: None,
                 ready: true,
             },
@@ -1944,6 +2189,7 @@ fn stop_failure_still_attempts_remove() {
                 service_name: "web".to_string(),
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-web".to_string()),
+                failed_create_ownership: None,
                 last_error: None,
                 ready: false,
             },
@@ -1992,6 +2238,7 @@ fn remove_failure_retains_failed_state_and_container_for_retry() {
                 service_name: "web".to_string(),
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-web".to_string()),
+                failed_create_ownership: None,
                 last_error: None,
                 ready: false,
             },
@@ -2034,6 +2281,7 @@ fn stop_and_remove_failure_retains_container_for_retry() {
                 service_name: "web".to_string(),
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-web".to_string()),
+                failed_create_ownership: None,
                 last_error: None,
                 ready: false,
             },
@@ -2060,11 +2308,16 @@ fn stop_and_remove_failure_retains_container_for_retry() {
 }
 
 #[test]
-fn failed_cleanup_blocks_deterministic_id_recreation() {
-    let mut runtime = MockContainerRuntime::new();
-    runtime.fail_remove = true;
+fn malformed_failed_create_ownership_fails_closed() {
+    let runtime = MockContainerRuntime::new();
     let mut executor = make_executor(runtime);
     let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
+
+    let ownership = vz_runtime_contract::ContainerGenerationOwnership {
+        container_id: "owned-web".to_string(),
+        generation: 41,
+        stack_id: "different-stack".to_string(),
+    };
 
     executor
         .store()
@@ -2073,7 +2326,8 @@ fn failed_cleanup_blocks_deterministic_id_recreation() {
             &ServiceObservedState {
                 service_name: "web".to_string(),
                 phase: ServicePhase::Failed,
-                container_id: Some("web".to_string()),
+                container_id: Some(ownership.container_id.clone()),
+                failed_create_ownership: Some(ownership.clone()),
                 last_error: Some("activation rollback retained OCI state".to_string()),
                 ready: false,
             },
@@ -2091,23 +2345,27 @@ fn failed_cleanup_blocks_deterministic_id_recreation() {
 
     assert_eq!(result.failed, 1);
     let calls = executor.runtime().call_log();
-    assert!(calls.iter().any(|(operation, _)| operation == "remove"));
-    assert!(
-        !calls
-            .iter()
-            .any(|(operation, _)| operation == "create_in_sandbox")
-    );
+    assert!(!calls.iter().any(|(operation, _)| matches!(
+        operation.as_str(),
+        "stop" | "remove" | "cleanup_container_generation" | "create_in_sandbox"
+    )));
     let observed = executor.store().load_observed_state("myapp").unwrap();
     assert_eq!(observed[0].phase, ServicePhase::Failed);
-    assert_eq!(observed[0].container_id.as_deref(), Some("web"));
+    assert_eq!(observed[0].failed_create_ownership, Some(ownership));
 }
 
 #[test]
-fn already_absent_cleanup_allows_deterministic_id_recreation() {
+fn already_absent_generation_cleanup_allows_recreation() {
     let mut runtime = MockContainerRuntime::new();
-    runtime.remove_not_found = true;
+    runtime.generation_cleanup_already_absent = true;
     let mut executor = make_executor(runtime);
     let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
+
+    let ownership = vz_runtime_contract::ContainerGenerationOwnership {
+        container_id: "owned-web".to_string(),
+        generation: 41,
+        stack_id: "myapp".to_string(),
+    };
 
     executor
         .store()
@@ -2116,7 +2374,8 @@ fn already_absent_cleanup_allows_deterministic_id_recreation() {
             &ServiceObservedState {
                 service_name: "web".to_string(),
                 phase: ServicePhase::Failed,
-                container_id: Some("web".to_string()),
+                container_id: Some(ownership.container_id.clone()),
+                failed_create_ownership: Some(ownership.clone()),
                 last_error: Some("create failed before OCI state existed".to_string()),
                 ready: false,
             },
@@ -2134,7 +2393,14 @@ fn already_absent_cleanup_allows_deterministic_id_recreation() {
 
     assert!(result.all_succeeded());
     let calls = executor.runtime().call_log();
-    assert!(calls.iter().any(|(operation, _)| operation == "remove"));
+    assert!(calls.iter().any(|(operation, argument)| {
+        operation == "cleanup_container_generation" && argument == "myapp:owned-web:41"
+    }));
+    assert!(
+        !calls
+            .iter()
+            .any(|(operation, _)| matches!(operation.as_str(), "stop" | "remove"))
+    );
     assert!(
         calls
             .iter()
@@ -2238,6 +2504,7 @@ fn replica_scale_down_removes_excess_replicas() {
                     service_name: name.to_string(),
                     phase: ServicePhase::Running,
                     container_id: Some(cid.to_string()),
+                    failed_create_ownership: None,
                     last_error: None,
                     ready: false,
                 },

@@ -17,6 +17,16 @@ pub struct MockContainerRuntime {
     pub fail_pull: bool,
     /// Whether create should fail.
     pub fail_create: bool,
+    /// Whether a failed create was admitted and owns a durable generation.
+    pub claim_failed_create_ownership: bool,
+    /// Generation reported for admitted failed creates.
+    pub failed_create_generation: u64,
+    /// Runtime-ID substitutions used to exercise malformed ownership responses.
+    pub failed_create_ownership_id_overrides: Mutex<HashMap<String, String>>,
+    /// Whether generation-qualified cleanup should fail.
+    pub fail_generation_cleanup: bool,
+    /// Whether successful generation cleanup reports the target already absent.
+    pub generation_cleanup_already_absent: bool,
     /// Whether stop should fail.
     pub fail_stop: bool,
     /// Whether remove should fail.
@@ -52,6 +62,11 @@ impl MockContainerRuntime {
             container_ids: vec!["ctr-001".to_string()],
             fail_pull: false,
             fail_create: false,
+            claim_failed_create_ownership: false,
+            failed_create_generation: 41,
+            failed_create_ownership_id_overrides: Mutex::new(HashMap::new()),
+            fail_generation_cleanup: false,
+            generation_cleanup_already_absent: false,
             fail_stop: false,
             fail_remove: false,
             remove_not_found: false,
@@ -77,6 +92,13 @@ impl MockContainerRuntime {
 
     pub fn call_log(&self) -> Vec<(String, String)> {
         self.calls.lock().unwrap().clone()
+    }
+
+    pub fn override_failed_create_ownership_id(&self, requested: &str, returned: &str) {
+        self.failed_create_ownership_id_overrides
+            .lock()
+            .unwrap()
+            .insert(requested.to_string(), returned.to_string());
     }
 
     /// Generate a deterministic container ID from the RunConfig.
@@ -247,6 +269,65 @@ impl ContainerRuntime for MockContainerRuntime {
             .unwrap()
             .push((id.clone(), config));
         Ok(id)
+    }
+
+    fn create_in_sandbox_owned(
+        &self,
+        sandbox_id: &str,
+        image: &str,
+        config: vz_runtime_contract::RunConfig,
+    ) -> Result<
+        vz_runtime_contract::ContainerCreateReceipt,
+        vz_runtime_contract::OwnedCreateError<StackError>,
+    > {
+        let requested_id = config.container_id.clone();
+        self.create_in_sandbox(sandbox_id, image, config)
+            .map(|container_id| vz_runtime_contract::ContainerCreateReceipt {
+                container_id,
+                ownership: None,
+            })
+            .map_err(|error| vz_runtime_contract::OwnedCreateError {
+                error,
+                cleanup: self.claim_failed_create_ownership.then(|| {
+                    let requested_id =
+                        requested_id.expect("owned create test must request a container ID");
+                    let container_id = self
+                        .failed_create_ownership_id_overrides
+                        .lock()
+                        .unwrap()
+                        .get(&requested_id)
+                        .cloned()
+                        .unwrap_or(requested_id);
+                    vz_runtime_contract::ContainerGenerationOwnership {
+                        container_id,
+                        generation: self.failed_create_generation,
+                        stack_id: sandbox_id.to_string(),
+                    }
+                }),
+            })
+    }
+
+    fn cleanup_container_generation(
+        &self,
+        ownership: vz_runtime_contract::ContainerGenerationOwnership,
+    ) -> Result<vz_runtime_contract::GenerationCleanupOutcome, StackError> {
+        self.calls.lock().unwrap().push((
+            "cleanup_container_generation".to_string(),
+            format!(
+                "{}:{}:{}",
+                ownership.stack_id, ownership.container_id, ownership.generation
+            ),
+        ));
+        if self.fail_generation_cleanup {
+            return Err(StackError::InvalidSpec(
+                "mock generation cleanup failure".to_string(),
+            ));
+        }
+        if self.generation_cleanup_already_absent {
+            Ok(vz_runtime_contract::GenerationCleanupOutcome::AlreadyAbsent)
+        } else {
+            Ok(vz_runtime_contract::GenerationCleanupOutcome::Removed)
+        }
     }
 
     fn setup_sandbox_network(

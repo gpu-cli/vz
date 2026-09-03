@@ -119,6 +119,7 @@ fn bench_save_observed_state(c: &mut Criterion) {
                     service_name: "web".to_string(),
                     phase: ServicePhase::Running,
                     container_id: Some("ctr-abc".to_string()),
+                    failed_create_ownership: None,
                     last_error: None,
                     ready: true,
                 };
@@ -141,6 +142,7 @@ fn bench_load_observed_state(c: &mut Criterion) {
                         service_name: format!("svc-{i}"),
                         phase: ServicePhase::Running,
                         container_id: Some(format!("ctr-{i}")),
+                        failed_create_ownership: None,
                         last_error: None,
                         ready: true,
                     };

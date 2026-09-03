@@ -92,6 +92,7 @@ fn obs(name: &str, phase: ServicePhase) -> ServiceObservedState {
         service_name: name.to_string(),
         phase,
         container_id: None,
+        failed_create_ownership: None,
         last_error: None,
         ready: false,
     }
@@ -490,6 +491,7 @@ fn running_obs(name: &str, container_id: &str) -> ServiceObservedState {
         service_name: name.to_string(),
         phase: ServicePhase::Running,
         container_id: Some(container_id.to_string()),
+        failed_create_ownership: None,
         last_error: None,
         ready: false,
     }
@@ -632,6 +634,7 @@ fn poller_skips_non_running_services() {
                 service_name: "web".to_string(),
                 phase: ServicePhase::Pending,
                 container_id: None,
+                failed_create_ownership: None,
                 last_error: None,
                 ready: false,
             },

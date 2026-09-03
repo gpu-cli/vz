@@ -396,6 +396,7 @@ fn restart_policy_generates_actions_for_failed_services() {
             service_name: "worker".to_string(),
             phase: ServicePhase::Failed,
             container_id: None,
+            failed_create_ownership: None,
             last_error: Some("crash".to_string()),
             ready: false,
         },
@@ -403,6 +404,7 @@ fn restart_policy_generates_actions_for_failed_services() {
             service_name: "cron".to_string(),
             phase: ServicePhase::Failed,
             container_id: None,
+            failed_create_ownership: None,
             last_error: Some("crash".to_string()),
             ready: false,
         },
@@ -442,6 +444,7 @@ services:
         service_name: "worker".to_string(),
         phase: ServicePhase::Failed,
         container_id: None,
+        failed_create_ownership: None,
         last_error: Some("crash".to_string()),
         ready: false,
     }];

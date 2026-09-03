@@ -135,7 +135,49 @@ fn map_runtime_error(operation: &str, error: vz_runtime_contract::RuntimeError) 
             operation,
             format!("backend_operation={backend_operation}; {reason}"),
         ),
-        other => StackError::Network(format!("{operation} failed: {other}")),
+        other => StackError::Machine {
+            code: other.machine_code(),
+            message: format!("{operation} failed: {other}"),
+        },
+    }
+}
+
+#[cfg(test)]
+mod runtime_error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_state_conflict_keeps_its_machine_classification() {
+        let mapped = map_runtime_error(
+            "cleanup_container_generation",
+            vz_runtime_contract::RuntimeError::ContainerFailed {
+                id: "owned-id".to_string(),
+                reason: "generation changed".to_string(),
+            },
+        );
+
+        assert_eq!(
+            mapped.machine_code(),
+            vz_runtime_contract::MachineErrorCode::StateConflict
+        );
+        assert!(mapped.to_string().contains("generation changed"));
+    }
+
+    #[test]
+    fn runtime_unsupported_operation_keeps_stack_surface_context() {
+        let mapped = map_runtime_error(
+            "cleanup_container_generation",
+            vz_runtime_contract::RuntimeError::UnsupportedOperation {
+                operation: "cleanup_container_generation".to_string(),
+                reason: "backend lacks generation cleanup".to_string(),
+            },
+        );
+
+        assert_eq!(
+            mapped.machine_code(),
+            vz_runtime_contract::MachineErrorCode::UnsupportedOperation
+        );
+        assert!(mapped.to_string().contains("surface=stack"));
     }
 }
 
@@ -264,6 +306,43 @@ impl ContainerRuntime for DaemonContainerRuntime {
         })
     }
 
+    fn create_in_sandbox_owned(
+        &self,
+        sandbox_id: &str,
+        image: &str,
+        config: vz_runtime_contract::RunConfig,
+    ) -> Result<
+        vz_runtime_contract::ContainerCreateReceipt,
+        vz_runtime_contract::OwnedCreateError<StackError>,
+    > {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(
+                    self.daemon
+                        .manager()
+                        .create_stack_container_owned(sandbox_id, image, config),
+                )
+                .map_err(|failure| {
+                    failure.map_error(|error| map_runtime_error("create_in_sandbox", error))
+                })
+        })
+    }
+
+    fn cleanup_container_generation(
+        &self,
+        ownership: vz_runtime_contract::ContainerGenerationOwnership,
+    ) -> Result<vz_runtime_contract::GenerationCleanupOutcome, StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(
+                    self.daemon
+                        .manager()
+                        .cleanup_container_generation(ownership),
+                )
+                .map_err(|error| map_runtime_error("cleanup_container_generation", error))
+        })
+    }
+
     fn setup_sandbox_network(
         &self,
         sandbox_id: &str,
@@ -369,6 +448,7 @@ fn default_stopped_service(service_name: &str) -> ServiceObservedState {
         service_name: service_name.to_string(),
         phase: ServicePhase::Stopped,
         container_id: None,
+        failed_create_ownership: None,
         last_error: None,
         ready: false,
     }

@@ -244,7 +244,7 @@ mod tests {
     async fn shared_provider_failure_keeps_runtime_free_context() {
         let temp = tempdir().unwrap();
         let error = ensure_buildkit_artifacts_in(temp.path().to_path_buf(), |_| {
-            Err(vz_oci::buildkit::BuildkitError::LocalArchiveChecksumRequired)
+            Err(vz_oci::buildkit::BuildkitError::LocalArchiveOverrideIncomplete)
         })
         .await
         .unwrap_err();

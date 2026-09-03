@@ -174,21 +174,29 @@ impl MacosRuntimeBackend {
         Ok(container_id)
     }
 
-    async fn create_container_in_stack_owned(
+    async fn create_container_in_stack_with_ownership(
         &self,
         stack_id: &str,
         image: &str,
         config: contract::RunConfig,
-    ) -> Result<String, RuntimeError> {
+    ) -> Result<contract::ContainerCreateReceipt, contract::OwnedCreateError<RuntimeError>> {
         let setup_commands = config.setup_commands.clone();
         let setup_env = config.env.clone();
         let setup_user = config.user.clone();
         let mut oci_config = run_config_from_contract(config);
-        let mut transaction = self
+        let mut transaction = match self
             .runtime
             .begin_container_create(&mut oci_config, Some(stack_id))
             .await
-            .map_err(oci_err)?;
+        {
+            Ok(transaction) => transaction,
+            Err(error) => return Err(contract::OwnedCreateError::unowned(oci_err(error))),
+        };
+        let ownership = contract::ContainerGenerationOwnership {
+            container_id: transaction.container_id().to_string(),
+            generation: transaction.generation().0,
+            stack_id: stack_id.to_string(),
+        };
         let setup_commit_ref = (!setup_commands.is_empty())
             .then(|| crate::Runtime::setup_commit_reference(image, &setup_commands));
         let setup_commit_tar_guest = if let Some(commit_ref) = setup_commit_ref.as_deref() {
@@ -202,7 +210,7 @@ impl MacosRuntimeBackend {
         } else {
             None
         };
-        let container_id = self
+        let container_id = match self
             .runtime
             .create_container_in_stack_transaction(
                 stack_id,
@@ -212,7 +220,15 @@ impl MacosRuntimeBackend {
                 &mut transaction,
             )
             .await
-            .map_err(oci_err)?;
+        {
+            Ok(container_id) => container_id,
+            Err(error) => {
+                return Err(contract::OwnedCreateError {
+                    error: oci_err(error),
+                    cleanup: Some(ownership),
+                });
+            }
+        };
         if let Some(commit_ref) = setup_commit_ref.as_deref() {
             let restored = self
                 .runtime
@@ -231,9 +247,12 @@ impl MacosRuntimeBackend {
                     )
                     .await
                 {
-                    return Err(self
-                        .rollback_failed_create(&container_id, &transaction, error)
-                        .await);
+                    return Err(contract::OwnedCreateError {
+                        error: self
+                            .rollback_failed_create(&container_id, &transaction, error)
+                            .await,
+                        cleanup: Some(ownership),
+                    });
                 }
                 if let Err(error) = self
                     .runtime
@@ -249,7 +268,10 @@ impl MacosRuntimeBackend {
                 }
             }
         }
-        Ok(container_id)
+        Ok(contract::ContainerCreateReceipt {
+            container_id,
+            ownership: Some(ownership),
+        })
     }
 }
 
@@ -445,15 +467,54 @@ impl RuntimeBackend for MacosRuntimeBackend {
         image: &str,
         config: contract::RunConfig,
     ) -> Result<String, RuntimeError> {
+        self.create_container_in_stack_owned(stack_id, image, config)
+            .await
+            .map(|receipt| receipt.container_id)
+            .map_err(|failure| failure.error)
+    }
+
+    async fn create_container_in_stack_owned(
+        &self,
+        stack_id: &str,
+        image: &str,
+        config: contract::RunConfig,
+    ) -> Result<contract::ContainerCreateReceipt, contract::OwnedCreateError<RuntimeError>> {
         let backend = self.clone();
         let stack_id = stack_id.to_string();
         let image = image.to_string();
-        run_owned_create(move || async move {
-            backend
-                .create_container_in_stack_owned(&stack_id, &image, config)
-                .await
+        match run_owned_create(move || async move {
+            Ok(backend
+                .create_container_in_stack_with_ownership(&stack_id, &image, config)
+                .await)
         })
         .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(contract::OwnedCreateError::unowned(error)),
+        }
+    }
+
+    async fn cleanup_container_generation(
+        &self,
+        ownership: contract::ContainerGenerationOwnership,
+    ) -> Result<contract::GenerationCleanupOutcome, RuntimeError> {
+        if ownership.container_id.trim().is_empty()
+            || ownership.stack_id.trim().is_empty()
+            || ownership.generation == 0
+        {
+            return Err(RuntimeError::InvalidConfig(
+                "container generation ownership requires non-empty container_id/stack_id and generation > 0"
+                    .to_string(),
+            ));
+        }
+        self.runtime
+            .cleanup_owned_container_generation(
+                &ownership.container_id,
+                oci_container::ContainerGeneration(ownership.generation),
+                &ownership.stack_id,
+            )
+            .await
+            .map_err(oci_err)
     }
 
     async fn network_setup(
@@ -583,6 +644,9 @@ fn oci_err(e: crate::error::MacosOciError) -> RuntimeError {
                 id,
                 reason: "container ID is already owned by another lifecycle".to_string(),
             }
+        }
+        crate::error::MacosOciError::ContainerOwnershipMismatch { id, reason } => {
+            RuntimeError::ContainerFailed { id, reason }
         }
         crate::error::MacosOciError::ContainerNotFound { id } => {
             RuntimeError::ContainerNotFound { id }
@@ -775,6 +839,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use tempfile::tempdir;
     use tokio::sync::Notify;
 
     use super::*;
@@ -808,6 +873,101 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn owned_stack_create_failure_after_reservation_carries_exact_cleanup_proof() {
+        let temp = tempdir().unwrap();
+        let runtime = crate::Runtime::new(oci_config::RuntimeConfig {
+            data_dir: temp.path().to_path_buf(),
+            ..oci_config::RuntimeConfig::default()
+        });
+        let backend = MacosRuntimeBackend::new(runtime);
+
+        let failure = backend
+            .create_container_in_stack_owned(
+                "missing-stack",
+                "alpine:latest",
+                contract::RunConfig {
+                    container_id: Some("post-reservation-failure".to_string()),
+                    ..contract::RunConfig::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        let ownership = failure.cleanup.expect("reservation must issue ownership");
+        assert_eq!(ownership.container_id, "post-reservation-failure");
+        assert_eq!(ownership.generation, 1);
+        assert_eq!(ownership.stack_id, "missing-stack");
+        assert_eq!(
+            backend
+                .cleanup_container_generation(ownership)
+                .await
+                .unwrap(),
+            contract::GenerationCleanupOutcome::AlreadyAbsent
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_create_admission_never_issues_cleanup_proof() {
+        let temp = tempdir().unwrap();
+        let runtime = crate::Runtime::new(oci_config::RuntimeConfig {
+            data_dir: temp.path().to_path_buf(),
+            ..oci_config::RuntimeConfig::default()
+        });
+        let mut owner_config = oci_config::RunConfig {
+            container_id: Some("foreign-owner".to_string()),
+            ..oci_config::RunConfig::default()
+        };
+        let owner = runtime
+            .begin_container_create(&mut owner_config, Some("owner-stack"))
+            .await
+            .unwrap();
+        let backend = MacosRuntimeBackend::new(runtime);
+
+        let failure = backend
+            .create_container_in_stack_owned(
+                "contender-stack",
+                "alpine:latest",
+                contract::RunConfig {
+                    container_id: Some("foreign-owner".to_string()),
+                    ..contract::RunConfig::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(failure.cleanup.is_none());
+        assert_eq!(
+            failure.error.machine_code(),
+            vz_runtime_contract::MachineErrorCode::StateConflict
+        );
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn generation_cleanup_rejects_structurally_invalid_proof() {
+        let temp = tempdir().unwrap();
+        let runtime = crate::Runtime::new(oci_config::RuntimeConfig {
+            data_dir: temp.path().to_path_buf(),
+            ..oci_config::RuntimeConfig::default()
+        });
+        let backend = MacosRuntimeBackend::new(runtime);
+
+        let error = backend
+            .cleanup_container_generation(contract::ContainerGenerationOwnership {
+                container_id: "container".to_string(),
+                generation: 0,
+                stack_id: "stack".to_string(),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.machine_code(),
+            vz_runtime_contract::MachineErrorCode::ValidationError
+        );
     }
 
     #[test]

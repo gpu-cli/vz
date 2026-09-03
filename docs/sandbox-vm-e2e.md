@@ -43,6 +43,7 @@ Capability matrix:
 - `stack-real-services` → `real_services_postgres_and_redis`
 - `stack-control-socket` → `exec_via_control_socket`
 - `stack-port-forwarding` → `stack_port_forwarding`
+- `stack-container-ownership` → `stack_container_generation_ownership`
 - `stack-snapshot-restore` → `complex_stack_snapshot_restore_rewinds_shared_vm_state`
 - `stack-user-journey-checkpoint` → `complex_stack_snapshot_restore_rewinds_shared_vm_state`
 - `buildkit-roundtrip` → `buildkit_builds_dockerfile_and_run_uses_built_image`
@@ -133,6 +134,10 @@ Each run creates a timestamped directory containing:
   scenario or complete stack lane runs
 - `stack-port-forwarding-teardown.json.sha256`, verified by the harness before
   stack success
+- `stack-container-ownership.json` when the focused container-ownership
+  scenario or complete stack lane runs
+- `stack-container-ownership.json.sha256`, verified by the harness before
+  stack success
 - `buildkit-artifact/` when a BuildKit lane is selected, containing the
   immutable archive, checksum sidecar, validated manifest and inventory,
   validation report, candidate build provenance when available, and a
@@ -145,9 +150,10 @@ second, the later run gets a collision-safe suffix rather than sharing or
 overwriting the first run's evidence.
 
 Stack lanes use a run-scoped OCI data directory under the timestamped artifact
-directory. Stable service/container IDs therefore cannot collide with a user's
-normal `~/.vz/oci` state or with metadata left by an interrupted earlier gate;
-HOME remains unchanged for kernel and registry-credential discovery.
+directory. Stack-namespaced generated IDs and explicit container names
+therefore cannot collide with a user's normal `~/.vz/oci` state or with
+metadata left by an interrupted earlier gate; HOME remains unchanged for
+kernel and registry-credential discovery.
 
 ### Stack teardown ownership gate
 
@@ -174,6 +180,38 @@ Run the focused release gate with:
 ./scripts/run-sandbox-vm-e2e.sh \
   --profile release \
   --scenario stack-port-forwarding
+```
+
+### Stack container-generation ownership gate
+
+`stack-container-ownership` runs two stacks with the same `db` service against
+one runtime. Both creates must reach the runtime admission barrier before
+either is released, then converge with distinct stable generated IDs and exact
+container-to-stack routes.
+
+The scenario next injects one lost control-plane acknowledgement after the real
+runtime has published a running generation. Reconciliation must retain the
+runtime-issued `{container_id, generation, stack_id}` proof, remove precisely
+that generation, prove its metadata, route, rootfs, overlay, youki state, and
+cgroup are absent before recreation, and publish a higher replacement
+generation. Finally, two stacks request the same explicit `container_name`.
+The contender must return `state_conflict` without cleanup authority while the
+owner's route, generation, and raw guest process identity remain unchanged.
+
+The retained `stack-container-ownership.json` records raw lifecycle generation
+inventories, route pairs, guest boot/process/cgroup/namespace/root identities,
+the ordered generation-cleanup operation, and final leak inventory. The harness
+validates its exact schema and invariants with `jq`, verifies its SHA-256
+sidecar, and refuses stack success when either artifact is absent or malformed.
+The expected reconciliation recovery is executed exactly once; there are no
+test retries or fallback cleanup by container ID.
+
+Run the focused release gate with:
+
+```bash
+./scripts/run-sandbox-vm-e2e.sh \
+  --profile release \
+  --scenario stack-container-ownership
 ```
 
 ### Container-ID lifecycle ownership gate

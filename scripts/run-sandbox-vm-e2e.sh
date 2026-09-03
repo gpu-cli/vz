@@ -42,6 +42,7 @@ Options:
                                 runtime-exec-defaults,
                                 runtime-port-forwarding, runtime-shared-vm-net, stack-real-services,
                                 stack-control-socket, stack-port-forwarding,
+                                stack-container-ownership,
                                 stack-snapshot-restore, buildkit-roundtrip,
                                 sandbox-usecases, all-usecases
                               note: when set, suite selection is derived from scenarios
@@ -140,7 +141,7 @@ expand_scenario_token() {
         case "$part" in
             "")
                 ;;
-            runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net|stack-real-services|stack-control-socket|stack-port-forwarding|stack-snapshot-restore|stack-user-journey-checkpoint|buildkit-roundtrip)
+            runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net|stack-real-services|stack-control-socket|stack-port-forwarding|stack-container-ownership|stack-snapshot-restore|stack-user-journey-checkpoint|buildkit-roundtrip)
                 append_unique_scenario "$part"
                 ;;
             sandbox-usecases)
@@ -153,6 +154,7 @@ expand_scenario_token() {
                 append_unique_scenario "stack-real-services"
                 append_unique_scenario "stack-control-socket"
                 append_unique_scenario "stack-port-forwarding"
+                append_unique_scenario "stack-container-ownership"
                 append_unique_scenario "stack-snapshot-restore"
                 ;;
             all-usecases)
@@ -166,6 +168,7 @@ expand_scenario_token() {
                 append_unique_scenario "stack-real-services"
                 append_unique_scenario "stack-control-socket"
                 append_unique_scenario "stack-port-forwarding"
+                append_unique_scenario "stack-container-ownership"
                 append_unique_scenario "stack-snapshot-restore"
                 append_unique_scenario "buildkit-roundtrip"
                 ;;
@@ -181,7 +184,7 @@ scenario_suite() {
         runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net)
             echo "runtime"
             ;;
-        stack-real-services|stack-control-socket|stack-port-forwarding|stack-snapshot-restore)
+        stack-real-services|stack-control-socket|stack-port-forwarding|stack-container-ownership|stack-snapshot-restore)
             echo "stack"
             ;;
         stack-user-journey-checkpoint)
@@ -227,6 +230,9 @@ scenario_test_filter() {
             ;;
         stack-port-forwarding)
             echo "stack_port_forwarding"
+            ;;
+        stack-container-ownership)
+            echo "stack_container_generation_ownership"
             ;;
         stack-snapshot-restore)
             echo "complex_stack_snapshot_restore_rewinds_shared_vm_state"
@@ -420,6 +426,8 @@ CONTAINER_ID_OWNERSHIP_EVIDENCE="$RUN_DIR/container-id-ownership.json"
 CONTAINER_ID_OWNERSHIP_SHA256="$RUN_DIR/container-id-ownership.json.sha256"
 STACK_TEARDOWN_EVIDENCE="$RUN_DIR/stack-port-forwarding-teardown.json"
 STACK_TEARDOWN_SHA256="$RUN_DIR/stack-port-forwarding-teardown.json.sha256"
+STACK_CONTAINER_OWNERSHIP_EVIDENCE="$RUN_DIR/stack-container-ownership.json"
+STACK_CONTAINER_OWNERSHIP_SHA256="$RUN_DIR/stack-container-ownership.json.sha256"
 
 BUILDKIT_ARCHIVE_BASENAME="vz-buildkit-v0.19.0-linux-arm64.tar"
 BUILDKIT_SHA256_BASENAME="$BUILDKIT_ARCHIVE_BASENAME.sha256"
@@ -936,6 +944,210 @@ validate_stack_teardown_evidence() {
     ' "$evidence_file" >/dev/null
 }
 
+validate_stack_container_ownership_evidence() {
+    local evidence_file="$1"
+
+    jq -e '
+        def ownership:
+            ((keys | sort) == (["container_id", "generation", "stack_id"] | sort)) and
+            ((.container_id | type) == "string" and (.container_id | length) > 0) and
+            ((.generation | type) == "number" and .generation > 0 and
+                .generation == (.generation | floor)) and
+            ((.stack_id | type) == "string" and (.stack_id | length) > 0);
+        def guest:
+            ((keys | sort) == ([
+                "boot_id", "cgroup_identity", "cgroup_path", "guest_init_pid",
+                "ipc_identity", "mnt_identity", "net_identity", "owner",
+                "pid_identity", "root_identity", "start_time", "uts_identity"
+            ] | sort)) and
+            ((.owner | type) == "string" and (.owner | length) > 0) and
+            ((.boot_id | type) == "string" and (.boot_id | length) > 0) and
+            ((.guest_init_pid | type) == "number" and .guest_init_pid > 0 and
+                .guest_init_pid == (.guest_init_pid | floor)) and
+            (all([
+                .start_time, .cgroup_path, .cgroup_identity, .mnt_identity,
+                .net_identity, .pid_identity, .ipc_identity, .uts_identity,
+                .root_identity
+            ][]; type == "string" and length > 0));
+        def lifecycle:
+            ((keys | sort) == ([
+                "active_lifecycles", "container_lock_slots", "container_route_pairs",
+                "container_routes", "exec_bindings", "exec_sessions", "generations",
+                "overlay_cleanup_pending", "rootfs_directories", "setup_restore_entries",
+                "stack_lock_slots", "stack_port_forward_ids", "stack_port_forwards",
+                "stack_vm_ids", "stack_vms", "vm_handle_ids", "vm_handles"
+            ] | sort)) and
+            (all([
+                .active_lifecycles, .container_lock_slots, .container_routes,
+                .exec_bindings, .exec_sessions, .overlay_cleanup_pending,
+                .rootfs_directories, .setup_restore_entries, .stack_lock_slots,
+                .stack_port_forwards, .stack_vms, .vm_handles
+            ][]; type == "number" and . >= 0 and . == floor)) and
+            (.container_routes == (.container_route_pairs | length)) and
+            (.stack_port_forwards == (.stack_port_forward_ids | length)) and
+            (.stack_vms == (.stack_vm_ids | length)) and
+            (.vm_handles == (.vm_handle_ids | length)) and
+            (all(.container_route_pairs[];
+                type == "array" and length == 2 and
+                all(.[]; type == "string" and length > 0))) and
+            (all(.generations[];
+                ((keys | sort) == ([
+                    "container_id", "generation", "owner_alive", "owner_pid", "reserved"
+                ] | sort)) and
+                ((.container_id | type) == "string" and (.container_id | length) > 0) and
+                ((.generation | type) == "number" and .generation > 0 and
+                    .generation == (.generation | floor)) and
+                ((.owner_pid | type) == "number" and .owner_pid >= 0 and
+                    .owner_pid == (.owner_pid | floor)) and
+                ((.reserved | type) == "boolean") and ((.owner_alive | type) == "boolean"))) and
+            ((.generations | map(.container_id) | unique | length) == (.generations | length));
+
+        (type == "object") and
+        ((keys | sort) == ([
+            "concurrent_same_service", "final", "foreign_collision", "owned_failure",
+            "scenario", "schema_version"
+        ] | sort)) and
+        (.schema_version == 1) and
+        (.scenario == "stack-container-ownership") and
+
+        (.concurrent_same_service as $same |
+            (($same | keys | sort) == (["barrier", "lifecycle", "service_name", "stacks"] | sort)) and
+            ($same.service_name == "db") and
+            (($same.barrier | keys | sort) == (["both_reached_before_release", "container_ids", "kind"] | sort)) and
+            ($same.barrier.kind == "create_before_reservation") and
+            ($same.barrier.both_reached_before_release == true) and
+            (($same.stacks | type) == "array" and ($same.stacks | length) == 2) and
+            (($same.stacks | map(.stack_id) | sort) == ["same-a", "same-b"]) and
+            (($same.stacks | map(.container_id) | unique | length) == 2) and
+            (($same.barrier.container_ids | sort) == ($same.stacks | map(.container_id) | sort)) and
+            ($same.lifecycle | lifecycle) and
+            (all($same.stacks[];
+                ((keys | sort) == (["container_id", "guest", "ownership", "stack_id"] | sort)) and
+                (.ownership | ownership) and (.guest | guest) and
+                (.container_id == .ownership.container_id) and
+                (.stack_id == .ownership.stack_id) and
+                (.container_id | startswith("vzs1-")) and
+                (.guest.owner == (.stack_id + "-db")) and
+                (.container_id as $id | .stack_id as $stack |
+                    any($same.lifecycle.container_route_pairs[]; . == [$id, $stack])) and
+                (.ownership.generation as $generation | .container_id as $id |
+                    any($same.lifecycle.generations[];
+                        .container_id == $id and .generation == $generation and .reserved == true))))
+        ) and
+
+        (.owned_failure as $owned |
+            (($owned | keys | sort) == ([
+                "after_remove_before_recreate", "cleanup_operations", "failed_guest",
+                "failed_lifecycle", "failure_token", "injected_error_code",
+                "injection_point", "observed_token", "replacement_guest",
+                "replacement_lifecycle", "replacement_token", "service_name", "stack_id"
+            ] | sort)) and
+            ($owned.stack_id == "owned") and ($owned.service_name == "worker") and
+            ($owned.injection_point == "after_runtime_publication_before_executor_finalize") and
+            ($owned.injected_error_code == "injected_post_publication") and
+            ($owned.failure_token | ownership) and ($owned.observed_token | ownership) and
+            ($owned.failure_token == $owned.observed_token) and
+            ($owned.failure_token.stack_id == $owned.stack_id) and
+            ($owned.failed_guest | guest) and
+            ($owned.failed_guest.owner == "owned-generation-a") and
+            ($owned.failed_lifecycle | lifecycle) and
+            ($owned.failure_token as $token |
+                any($owned.failed_lifecycle.generations[];
+                    .container_id == $token.container_id and
+                    .generation == $token.generation and .reserved == true)) and
+            ($owned.failure_token as $token |
+                any($owned.failed_lifecycle.container_route_pairs[];
+                    . == [$token.container_id, $token.stack_id])) and
+            (($owned.cleanup_operations | length) == 1) and
+            ($owned.cleanup_operations[0] as $cleanup |
+                (($cleanup | keys | sort) == (["operation", "outcome", "ownership"] | sort)) and
+                ($cleanup.operation == "cleanup_container_generation") and
+                ($cleanup.outcome == "removed") and
+                ($cleanup.ownership == $owned.failure_token)) and
+            ($owned.after_remove_before_recreate as $removed |
+                (($removed | keys | sort) == ([
+                    "guest_cgroup_absent", "guest_overlay_absent", "guest_youki_state_absent",
+                    "lifecycle", "metadata_absent", "rootfs_absent"
+                ] | sort)) and
+                ($removed.metadata_absent == true) and ($removed.rootfs_absent == true) and
+                ($removed.guest_overlay_absent == true) and
+                ($removed.guest_youki_state_absent == true) and
+                ($removed.guest_cgroup_absent == true) and
+                ($removed.lifecycle | lifecycle) and
+                ($owned.failure_token as $token |
+                    (all($removed.lifecycle.container_route_pairs[]; .[0] != $token.container_id)) and
+                    any($removed.lifecycle.generations[];
+                        .container_id == $token.container_id and
+                        .generation == $token.generation and .reserved == false))) and
+            ($owned.replacement_token | ownership) and ($owned.replacement_guest | guest) and
+            ($owned.replacement_lifecycle | lifecycle) and
+            ($owned.replacement_token.container_id == $owned.failure_token.container_id) and
+            ($owned.replacement_token.stack_id == $owned.failure_token.stack_id) and
+            ($owned.replacement_token.generation > $owned.failure_token.generation) and
+            ($owned.replacement_guest.owner == "owned-generation-b") and
+            ($owned.replacement_guest != $owned.failed_guest) and
+            ($owned.replacement_token as $token |
+                any($owned.replacement_lifecycle.container_route_pairs[];
+                    . == [$token.container_id, $token.stack_id]) and
+                any($owned.replacement_lifecycle.generations[];
+                    .container_id == $token.container_id and
+                    .generation == $token.generation and .reserved == true))
+        ) and
+
+        (.foreign_collision as $foreign |
+            (($foreign | keys | sort) == ([
+                "after_lifecycle", "before_lifecycle", "cleanup_operations",
+                "collision_cleanup", "collision_error_code", "container_id",
+                "contender_observed_cleanup", "contender_stack_id", "owner_after_guest",
+                "owner_before_guest", "owner_stack_id", "owner_token"
+            ] | sort)) and
+            ($foreign.owner_stack_id == "foreign-owner") and
+            ($foreign.contender_stack_id == "foreign-contender") and
+            ($foreign.container_id == "shared-explicit-id") and
+            ($foreign.owner_token | ownership) and
+            ($foreign.owner_token.container_id == $foreign.container_id) and
+            ($foreign.owner_token.stack_id == $foreign.owner_stack_id) and
+            ($foreign.collision_error_code == "state_conflict") and
+            ($foreign.collision_cleanup == null) and
+            ($foreign.contender_observed_cleanup == null) and
+            ($foreign.cleanup_operations == []) and
+            ($foreign.owner_before_guest | guest) and ($foreign.owner_after_guest | guest) and
+            ($foreign.owner_before_guest == $foreign.owner_after_guest) and
+            ($foreign.owner_before_guest.owner == "foreign-owner") and
+            ($foreign.before_lifecycle | lifecycle) and ($foreign.after_lifecycle | lifecycle) and
+            ($foreign.owner_token as $token |
+                any($foreign.before_lifecycle.container_route_pairs[];
+                    . == [$token.container_id, $token.stack_id]) and
+                any($foreign.after_lifecycle.container_route_pairs[];
+                    . == [$token.container_id, $token.stack_id]) and
+                all($foreign.after_lifecycle.container_route_pairs[];
+                    .[0] != $token.container_id or .[1] != $foreign.contender_stack_id) and
+                any($foreign.after_lifecycle.generations[];
+                    .container_id == $token.container_id and
+                    .generation == $token.generation and .reserved == true))
+        ) and
+
+        (.final as $final |
+            (($final | keys | sort) == (["lifecycle", "tested_container_ids", "tracked_container_ids"] | sort)) and
+            ($final.lifecycle | lifecycle) and
+            ($final.tracked_container_ids == []) and
+            (($final.tested_container_ids | type) == "array") and
+            (($final.tested_container_ids | unique | length) == 4) and
+            ($final.lifecycle.vm_handles == 0) and ($final.lifecycle.vm_handle_ids == []) and
+            ($final.lifecycle.stack_vms == 0) and ($final.lifecycle.stack_vm_ids == []) and
+            ($final.lifecycle.container_routes == 0) and ($final.lifecycle.container_route_pairs == []) and
+            ($final.lifecycle.stack_port_forwards == 0) and
+            ($final.lifecycle.stack_port_forward_ids == []) and
+            ($final.lifecycle.exec_bindings == 0) and ($final.lifecycle.active_lifecycles == 0) and
+            ($final.lifecycle.exec_sessions == 0) and ($final.lifecycle.setup_restore_entries == 0) and
+            ($final.lifecycle.overlay_cleanup_pending == 0) and ($final.lifecycle.rootfs_directories == 0) and
+            ([$final.tested_container_ids[] as $id |
+                any($final.lifecycle.generations[];
+                    .container_id == $id and .reserved == false)] | all)
+        )
+    ' "$evidence_file" >/dev/null
+}
+
 write_and_validate_container_id_ownership_checksum() {
     local evidence_file="$1"
     local checksum_file="$2"
@@ -948,6 +1160,17 @@ write_and_validate_container_id_ownership_checksum() {
 }
 
 write_and_validate_stack_teardown_checksum() {
+    local evidence_file="$1"
+    local checksum_file="$2"
+    local evidence_name
+    evidence_name="$(basename "$evidence_file")"
+    local digest
+    digest="$(shasum -a 256 "$evidence_file" | cut -d' ' -f1)"
+    printf '%s  %s\n' "$digest" "$evidence_name" > "$checksum_file"
+    (cd "$(dirname "$evidence_file")" && shasum -a 256 -c "$(basename "$checksum_file")") >/dev/null
+}
+
+write_and_validate_stack_container_ownership_checksum() {
     local evidence_file="$1"
     local checksum_file="$2"
     local evidence_name
@@ -999,6 +1222,11 @@ run_and_log() {
             rm -f "$STACK_TEARDOWN_SHA256"
             cmd_env+=("VZ_STACK_TEARDOWN_EVIDENCE=$STACK_TEARDOWN_EVIDENCE")
         fi
+        if [[ "$label" == "stack" || "$label" == "stack-container-ownership" ]]; then
+            rm -f "$STACK_CONTAINER_OWNERSHIP_EVIDENCE"
+            rm -f "$STACK_CONTAINER_OWNERSHIP_SHA256"
+            cmd_env+=("VZ_STACK_CONTAINER_OWNERSHIP_EVIDENCE=$STACK_CONTAINER_OWNERSHIP_EVIDENCE")
+        fi
     fi
 
     if [[ "$suite" == "runtime" ]]; then
@@ -1045,6 +1273,15 @@ run_and_log() {
         return 96
     fi
 
+    if [[ $status -eq 0 && "$PROFILE" == "release" \
+        && "$suite" == "stack" && "$label" == "stack" ]] \
+        && ! grep -Fqx \
+            "test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished" \
+            <(sed -E 's/; finished in .*/; finished/' "$log_file"); then
+        echo "complete stack suite did not report exactly 21/21 real-VM tests with zero ignored failures" >&2
+        return 99
+    fi
+
     if [[ $status -eq 0 ]] && [[ "$suite" == "stack" ]] \
         && [[ "$label" == "stack" || "$label" == "stack-port-forwarding" ]]; then
         local violation_artifact="$RUN_DIR/${label}-teardown-violations.txt"
@@ -1080,6 +1317,21 @@ run_and_log() {
             return 93
         fi
         STACK_TEARDOWN_EVIDENCE_VALIDATED=true
+    fi
+
+    if [[ $status -eq 0 ]] && [[ "$suite" == "stack" ]] \
+        && [[ "$label" == "stack" || "$label" == "stack-container-ownership" ]]; then
+        if [[ ! -f "$STACK_CONTAINER_OWNERSHIP_EVIDENCE" ]] \
+            || ! validate_stack_container_ownership_evidence "$STACK_CONTAINER_OWNERSHIP_EVIDENCE"; then
+            echo "stack container-ownership evidence is missing, malformed, or violates generation ownership" >&2
+            return 97
+        fi
+        if ! write_and_validate_stack_container_ownership_checksum \
+            "$STACK_CONTAINER_OWNERSHIP_EVIDENCE" "$STACK_CONTAINER_OWNERSHIP_SHA256"; then
+            echo "stack container-ownership evidence checksum creation or verification failed" >&2
+            return 98
+        fi
+        STACK_CONTAINER_OWNERSHIP_EVIDENCE_VALIDATED=true
     fi
 
     if [[ $status -eq 0 ]] && [[ "$suite" == "buildkit" ]]; then
@@ -1158,6 +1410,8 @@ RUNTIME_ID_EVIDENCE_VALIDATED=false
 RUNTIME_ID_EVIDENCE_REQUIRED=false
 STACK_TEARDOWN_EVIDENCE_VALIDATED=false
 STACK_TEARDOWN_EVIDENCE_REQUIRED=false
+STACK_CONTAINER_OWNERSHIP_EVIDENCE_VALIDATED=false
+STACK_CONTAINER_OWNERSHIP_EVIDENCE_REQUIRED=false
 
 for suite in "${RESOLVED_SUITES[@]}"; do
     package="$(suite_package "$suite")" || err "unknown suite '$suite'"
@@ -1165,6 +1419,10 @@ for suite in "${RESOLVED_SUITES[@]}"; do
     if [[ "$suite" == "stack" ]] && { [[ ${#RESOLVED_SCENARIOS[@]} -eq 0 ]] \
         || [[ " ${RESOLVED_SCENARIOS[*]} " == *" stack-port-forwarding "* ]]; }; then
         STACK_TEARDOWN_EVIDENCE_REQUIRED=true
+    fi
+    if [[ "$suite" == "stack" ]] && { [[ ${#RESOLVED_SCENARIOS[@]} -eq 0 ]] \
+        || [[ " ${RESOLVED_SCENARIOS[*]} " == *" stack-container-ownership "* ]]; }; then
+        STACK_CONTAINER_OWNERSHIP_EVIDENCE_REQUIRED=true
     fi
 
     echo "==> building [$suite] ($package::$test_name)"
@@ -1242,6 +1500,12 @@ if [[ "$STACK_TEARDOWN_EVIDENCE_REQUIRED" == "true" && "$STACK_TEARDOWN_EVIDENCE
     FAILED+=("stack-teardown-evidence:92")
 fi
 
+if [[ "$STACK_CONTAINER_OWNERSHIP_EVIDENCE_REQUIRED" == "true" \
+    && "$STACK_CONTAINER_OWNERSHIP_EVIDENCE_VALIDATED" != "true" ]]; then
+    echo "==> required stack container-ownership evidence was not validated" >&2
+    FAILED+=("stack-container-ownership-evidence:97")
+fi
+
 if [[ "$BUILDKIT_RELEASE_GATE_QUALIFIED" == "pending" ]]; then
     if [[ "$BUILDKIT_EVIDENCE_VALIDATED" == "true" && ${#FAILED[@]} -eq 0 ]]; then
         BUILDKIT_RELEASE_GATE_QUALIFIED="true"
@@ -1288,6 +1552,13 @@ action_summary="$RUN_DIR/summary.txt"
     else
         echo "stack_teardown=none"
         echo "stack_teardown_sha256=none"
+    fi
+    if [[ "$STACK_CONTAINER_OWNERSHIP_EVIDENCE_VALIDATED" == "true" ]]; then
+        echo "stack_container_ownership=$STACK_CONTAINER_OWNERSHIP_EVIDENCE"
+        echo "stack_container_ownership_sha256=$STACK_CONTAINER_OWNERSHIP_SHA256"
+    else
+        echo "stack_container_ownership=none"
+        echo "stack_container_ownership_sha256=none"
     fi
 } > "$action_summary"
 

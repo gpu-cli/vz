@@ -14,9 +14,9 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use vz_runtime_contract::{
     Build, BuildSpec, BuildState, Checkpoint, CheckpointClass, CheckpointFileEntry,
-    CheckpointState, Container, ContainerSpec, ContainerState, Execution, ExecutionSpec,
-    ExecutionState, Lease, LeaseState, MachineErrorCode, Sandbox, SandboxBackend, SandboxSpec,
-    SandboxState,
+    CheckpointState, Container, ContainerGenerationOwnership, ContainerSpec, ContainerState,
+    Execution, ExecutionSpec, ExecutionState, Lease, LeaseState, MachineErrorCode, Sandbox,
+    SandboxBackend, SandboxSpec, SandboxState,
 };
 
 use crate::StackSpec;
@@ -85,6 +85,12 @@ pub struct ServiceObservedState {
     /// OCI container identifier, if assigned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
+    /// Exact runtime generation retained after an owned create failure.
+    ///
+    /// This is the only authority reconciliation may use to clean up a failed
+    /// create. A caller-selected ID by itself never proves ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_create_ownership: Option<ContainerGenerationOwnership>,
     /// Last error message, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,

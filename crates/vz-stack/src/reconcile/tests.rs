@@ -90,6 +90,7 @@ fn obs(name: &str, phase: ServicePhase) -> ServiceObservedState {
         service_name: name.to_string(),
         phase,
         container_id: None,
+        failed_create_ownership: None,
         last_error: None,
         ready: false,
     }
@@ -100,6 +101,7 @@ fn obs_running(name: &str) -> ServiceObservedState {
         service_name: name.to_string(),
         phase: ServicePhase::Running,
         container_id: Some(format!("ctr-{name}")),
+        failed_create_ownership: None,
         last_error: None,
         ready: true,
     }
@@ -534,6 +536,7 @@ fn apply_is_idempotent_when_running() {
                 service_name: "web".to_string(),
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-1".to_string()),
+                failed_create_ownership: None,
                 last_error: None,
                 ready: true,
             },
@@ -583,11 +586,8 @@ fn apply_removes_deleted_services() {
 }
 
 #[test]
-fn apply_preserves_generated_failed_id_but_clears_unproven_explicit_id() {
-    for (container_name, expected_id) in [
-        (None, Some("owned-generated-id")),
-        (Some("global-explicit-id"), None),
-    ] {
+fn apply_clears_all_unproven_failed_ids() {
+    for container_name in [None, Some("global-explicit-id")] {
         let store = StateStore::in_memory().unwrap();
         let mut service = svc("web", "nginx:latest");
         service.container_name = container_name.map(str::to_string);
@@ -597,7 +597,8 @@ fn apply_preserves_generated_failed_id_but_clears_unproven_explicit_id() {
                 &ServiceObservedState {
                     service_name: "web".to_string(),
                     phase: ServicePhase::Failed,
-                    container_id: Some(expected_id.unwrap_or("global-explicit-id").to_string()),
+                    container_id: Some("unproven-id".to_string()),
+                    failed_create_ownership: None,
                     last_error: Some("create failed".to_string()),
                     ready: false,
                 },
@@ -607,7 +608,44 @@ fn apply_preserves_generated_failed_id_but_clears_unproven_explicit_id() {
         let result = apply(&spec("myapp", vec![service]), &store, &no_health()).unwrap();
         assert_eq!(result.actions.len(), 1);
         let observed = store.load_observed_state("myapp").unwrap();
-        assert_eq!(observed[0].container_id.as_deref(), expected_id);
+        assert!(observed[0].container_id.is_none());
+        assert!(observed[0].failed_create_ownership.is_none());
+    }
+}
+
+#[test]
+fn apply_preserves_runtime_ownership_independent_of_container_name() {
+    for container_name in [None, Some("global-explicit-id")] {
+        let store = StateStore::in_memory().unwrap();
+        let mut service = svc("web", "nginx:latest");
+        service.container_name = container_name.map(str::to_string);
+        let ownership = vz_runtime_contract::ContainerGenerationOwnership {
+            container_id: "runtime-owned-id".to_string(),
+            generation: 29,
+            stack_id: "myapp".to_string(),
+        };
+        store
+            .save_observed_state(
+                "myapp",
+                &ServiceObservedState {
+                    service_name: "web".to_string(),
+                    phase: ServicePhase::Failed,
+                    container_id: Some(ownership.container_id.clone()),
+                    failed_create_ownership: Some(ownership.clone()),
+                    last_error: Some("create failed after admission".to_string()),
+                    ready: false,
+                },
+            )
+            .unwrap();
+
+        let result = apply(&spec("myapp", vec![service]), &store, &no_health()).unwrap();
+        assert_eq!(result.actions.len(), 1);
+        let observed = store.load_observed_state("myapp").unwrap();
+        assert_eq!(
+            observed[0].container_id.as_deref(),
+            Some("runtime-owned-id")
+        );
+        assert_eq!(observed[0].failed_create_ownership, Some(ownership));
     }
 }
 

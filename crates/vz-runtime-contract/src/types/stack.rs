@@ -1,5 +1,87 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
+/// Runtime-issued proof that one stack reserved a specific container-ID generation.
+///
+/// The tuple is intentionally generation-qualified: callers must never use the
+/// container ID alone to clean up a failed create because a later lifecycle may
+/// have reused the same ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerGenerationOwnership {
+    /// Caller-selected runtime container identifier.
+    pub container_id: String,
+    /// Monotonic durable generation reserved for this create transaction.
+    pub generation: u64,
+    /// Stack/sandbox scope that reserved the generation.
+    pub stack_id: String,
+}
+
+/// Successful container creation result with optional generation ownership proof.
+///
+/// Backends that implement generation-owned cleanup return `Some`; compatibility
+/// backends may return `None` and therefore cannot authorize failed-create cleanup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerCreateReceipt {
+    /// Runtime container identifier returned by the backend.
+    pub container_id: String,
+    /// Runtime-issued generation ownership, when supported by the backend.
+    pub ownership: Option<ContainerGenerationOwnership>,
+}
+
+/// Container creation failure that may retain cleanup ownership.
+///
+/// `cleanup` is present only when the backend actually admitted the create and
+/// reserved the reported generation. Admission failures such as a foreign
+/// duplicate must return `None`.
+#[derive(Debug)]
+pub struct OwnedCreateError<E> {
+    /// Underlying backend or adapter error.
+    pub error: E,
+    /// Exact failed generation the caller may attempt to clean up.
+    pub cleanup: Option<ContainerGenerationOwnership>,
+}
+
+impl<E> OwnedCreateError<E> {
+    /// Construct a failure that carries no cleanup authority.
+    pub fn unowned(error: E) -> Self {
+        Self {
+            error,
+            cleanup: None,
+        }
+    }
+
+    /// Transform the underlying error while preserving cleanup ownership.
+    pub fn map_error<T>(self, map: impl FnOnce(E) -> T) -> OwnedCreateError<T> {
+        OwnedCreateError {
+            error: map(self.error),
+            cleanup: self.cleanup,
+        }
+    }
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for OwnedCreateError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for OwnedCreateError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Result of generation-qualified failed-create cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationCleanupOutcome {
+    /// The exact owned generation and its artifacts were removed.
+    Removed,
+    /// The generation was already fully absent and no replacement was touched.
+    AlreadyAbsent,
+}
+
 /// Cached image reference and manifest identifier pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageInfo {

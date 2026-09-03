@@ -429,18 +429,26 @@ fn reconcile_progress_round_trip_and_clear() {
 fn observed_state_round_trip() {
     let store = StateStore::in_memory().unwrap();
 
+    let ownership = ContainerGenerationOwnership {
+        container_id: "ctr-abc".to_string(),
+        generation: 17,
+        stack_id: "myapp".to_string(),
+    };
+
     let state1 = ServiceObservedState {
         service_name: "web".to_string(),
-        phase: ServicePhase::Running,
+        phase: ServicePhase::Failed,
         container_id: Some("ctr-abc".to_string()),
-        last_error: None,
-        ready: true,
+        failed_create_ownership: Some(ownership.clone()),
+        last_error: Some("create failed after admission".to_string()),
+        ready: false,
     };
 
     let state2 = ServiceObservedState {
         service_name: "db".to_string(),
         phase: ServicePhase::Pending,
         container_id: None,
+        failed_create_ownership: None,
         last_error: None,
         ready: false,
     };
@@ -450,8 +458,24 @@ fn observed_state_round_trip() {
 
     let states = store.load_observed_state("myapp").unwrap();
     assert_eq!(states.len(), 2);
-    assert!(states.iter().any(|s| s.service_name == "web"));
+    let web = states.iter().find(|s| s.service_name == "web").unwrap();
+    assert_eq!(web.failed_create_ownership, Some(ownership));
     assert!(states.iter().any(|s| s.service_name == "db"));
+}
+
+#[test]
+fn observed_state_legacy_json_defaults_failed_create_ownership() {
+    let legacy = r#"{
+        "service_name":"web",
+        "phase":"Failed",
+        "container_id":"ctr-abc",
+        "last_error":"legacy create failure",
+        "ready":false
+    }"#;
+
+    let state: ServiceObservedState = serde_json::from_str(legacy).unwrap();
+    assert_eq!(state.container_id.as_deref(), Some("ctr-abc"));
+    assert!(state.failed_create_ownership.is_none());
 }
 
 #[test]
@@ -468,6 +492,7 @@ fn resolve_service_tty_for_container_returns_desired_service_tty() {
                 service_name: "web".to_string(),
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-web-1".to_string()),
+                failed_create_ownership: None,
                 last_error: None,
                 ready: true,
             },
@@ -491,6 +516,7 @@ fn resolve_service_tty_for_container_returns_none_when_unmapped() {
                 service_name: "web".to_string(),
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-web-1".to_string()),
+                failed_create_ownership: None,
                 last_error: None,
                 ready: true,
             },
@@ -518,6 +544,7 @@ fn resolve_service_exec_pty_default_for_container_uses_stdin_open_or_tty() {
                 service_name: "web".to_string(),
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-web-stdin".to_string()),
+                failed_create_ownership: None,
                 last_error: None,
                 ready: true,
             },
@@ -541,6 +568,7 @@ fn resolve_service_exec_pty_default_for_container_returns_none_when_unmapped() {
                 service_name: "web".to_string(),
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-web-1".to_string()),
+                failed_create_ownership: None,
                 last_error: None,
                 ready: true,
             },
@@ -561,6 +589,7 @@ fn observed_state_upsert_updates_service() {
         service_name: "web".to_string(),
         phase: ServicePhase::Creating,
         container_id: None,
+        failed_create_ownership: None,
         last_error: None,
         ready: false,
     };
@@ -571,6 +600,7 @@ fn observed_state_upsert_updates_service() {
         service_name: "web".to_string(),
         phase: ServicePhase::Running,
         container_id: Some("ctr-xyz".to_string()),
+        failed_create_ownership: None,
         last_error: None,
         ready: true,
     };
@@ -2909,6 +2939,7 @@ fn phase3_drift_orphaned_observed_state() {
                 service_name: "web".to_string(),
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-1".to_string()),
+                failed_create_ownership: None,
                 last_error: None,
                 ready: true,
             },
@@ -2921,6 +2952,7 @@ fn phase3_drift_orphaned_observed_state() {
                 service_name: "cache".to_string(),
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-2".to_string()),
+                failed_create_ownership: None,
                 last_error: None,
                 ready: true,
             },
@@ -3014,6 +3046,7 @@ fn phase3_drift_clean_state_returns_no_findings() {
                 service_name: "web".to_string(),
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-1".to_string()),
+                failed_create_ownership: None,
                 last_error: None,
                 ready: true,
             },
@@ -3026,6 +3059,7 @@ fn phase3_drift_clean_state_returns_no_findings() {
                 service_name: "db".to_string(),
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-2".to_string()),
+                failed_create_ownership: None,
                 last_error: None,
                 ready: true,
             },
@@ -3732,6 +3766,7 @@ fn phase3_validation_full_recovery_lifecycle() {
                     service_name: svc.name.clone(),
                     phase: ServicePhase::Running,
                     container_id: Some(format!("ctr-{}", svc.name)),
+                    failed_create_ownership: None,
                     last_error: None,
                     ready: true,
                 },
@@ -3810,6 +3845,7 @@ fn phase2_validation_drift_orphaned_observed() {
                     service_name: name.to_string(),
                     phase: ServicePhase::Running,
                     container_id: Some(format!("ctr-{name}")),
+                    failed_create_ownership: None,
                     last_error: None,
                     ready: true,
                 },
@@ -4018,6 +4054,7 @@ fn capacity_100_concurrent_stacks_isolation() {
                     service_name: format!("svc-{i}"),
                     phase: ServicePhase::Running,
                     container_id: Some(format!("ctr-{i}")),
+                    failed_create_ownership: None,
                     last_error: None,
                     ready: true,
                 },
@@ -4169,6 +4206,7 @@ fn regression_observed_state_20_services_under_200ms() {
             service_name: format!("svc-{i}"),
             phase: ServicePhase::Running,
             container_id: Some(format!("ctr-{i}")),
+            failed_create_ownership: None,
             last_error: None,
             ready: true,
         };
@@ -5039,6 +5077,7 @@ fn migration_old_data_readable_after_schema_update() {
         service_name: "web".to_string(),
         phase: ServicePhase::Running,
         container_id: Some("ctr-web-001".to_string()),
+        failed_create_ownership: None,
         last_error: None,
         ready: true,
     };
@@ -5094,6 +5133,7 @@ fn migration_new_tables_dont_break_old_queries() {
         service_name: "svc".to_string(),
         phase: ServicePhase::Pending,
         container_id: None,
+        failed_create_ownership: None,
         last_error: None,
         ready: false,
     };

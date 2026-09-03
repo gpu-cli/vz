@@ -18,13 +18,18 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use vz_oci_macos::{MacosRuntimeBackend, RuntimeConfig, RuntimeLifecycleDiagnostics};
+use vz_oci_macos::{
+    MacosRuntimeBackend, Runtime, RuntimeConfig, RuntimeLifecycleAdmissionKind,
+    RuntimeLifecycleDiagnostics,
+};
 use vz_runtime_contract::{
-    Container, ContainerState, ContractInvariantError, ExecConfig, Lease, LeaseState,
-    MachineErrorCode, NetworkServiceConfig, PortMapping, RunConfig, RuntimeBackend, Sandbox,
-    SandboxBackend, SandboxSpec, SandboxState,
+    Container, ContainerCreateReceipt, ContainerGenerationOwnership, ContainerState,
+    ContractInvariantError, ExecConfig, GenerationCleanupOutcome, Lease, LeaseState,
+    MachineErrorCode, NetworkServiceConfig, OwnedCreateError, PortMapping, RunConfig,
+    RuntimeBackend, Sandbox, SandboxBackend, SandboxSpec, SandboxState,
 };
 use vz_stack::{
     Action, ContainerRuntime, ImagePolicy, OrchestrationConfig, ServicePhase, StackError,
@@ -80,9 +85,11 @@ fn stack_e2e_oci_data_dir() -> std::path::PathBuf {
 ///
 /// Uses `MacosRuntimeBackend` (which implements `RuntimeBackend` with contract types)
 /// rather than `vz_oci_macos::Runtime` directly, avoiding manual type conversions.
+#[derive(Clone)]
 struct OciContainerRuntime {
     backend: MacosRuntimeBackend,
     handle: tokio::runtime::Handle,
+    data_dir: std::path::PathBuf,
 }
 
 impl OciContainerRuntime {
@@ -94,10 +101,15 @@ impl OciContainerRuntime {
             exec_timeout: Duration::from_secs(30),
             ..RuntimeConfig::default()
         };
-        let runtime = vz_oci_macos::Runtime::new(config);
+        let runtime = Runtime::new(config);
+        Self::from_runtime(runtime, data_dir)
+    }
+
+    fn from_runtime(runtime: Runtime, data_dir: &Path) -> Self {
         Self {
             backend: MacosRuntimeBackend::new(runtime),
             handle: tokio::runtime::Handle::current(),
+            data_dir: data_dir.to_path_buf(),
         }
     }
 
@@ -261,6 +273,157 @@ fn write_stack_teardown_evidence(evidence: &serde_json::Value) {
     std::fs::rename(&temporary, &path).expect("stack teardown evidence should publish atomically");
 }
 
+fn write_stack_container_ownership_evidence(evidence: &serde_json::Value) {
+    let Some(path) =
+        std::env::var_os("VZ_STACK_CONTAINER_OWNERSHIP_EVIDENCE").map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(evidence)
+            .expect("stack container-ownership evidence should serialize"),
+    )
+    .expect("stack container-ownership evidence should be writable");
+    std::fs::rename(&temporary, &path)
+        .expect("stack container-ownership evidence should publish atomically");
+}
+
+fn ownership_json(ownership: &ContainerGenerationOwnership) -> serde_json::Value {
+    serde_json::json!({
+        "container_id": ownership.container_id,
+        "generation": ownership.generation,
+        "stack_id": ownership.stack_id,
+    })
+}
+
+async fn stack_guest_generation_evidence(
+    runtime: &Runtime,
+    stack_id: &str,
+    container_id: &str,
+) -> serde_json::Value {
+    let script = format!(
+        r#"state=$(/run/vz-oci/bin/youki --root /run/vz-oci/state state {container_id}) || exit 1
+pid=$(printf '%s\n' "$state" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+test -n "$pid" || exit 2
+start=$(awk '{{print $22}}' /proc/$pid/stat)
+cgroup_path=$(sed -n 's/^[^:]*:[^:]*://p' /proc/$pid/cgroup | head -n1)
+owner=$(tr '\000' '\n' < /proc/$pid/environ | sed -n 's/^VZ_E2E_OWNER=//p' | head -n1)
+printf '{{"owner":"%s","boot_id":"%s","guest_init_pid":%s,"start_time":"%s","cgroup_path":"%s","cgroup_identity":"%s","mnt_identity":"%s","net_identity":"%s","pid_identity":"%s","ipc_identity":"%s","uts_identity":"%s","root_identity":"%s"}}\n' \
+  "$owner" "$(cat /proc/sys/kernel/random/boot_id)" "$pid" "$start" "$cgroup_path" \
+  "$(stat -Lc '%d:%i' /sys/fs/cgroup$cgroup_path)" "$(stat -Lc '%d:%i' /proc/$pid/ns/mnt)" \
+  "$(stat -Lc '%d:%i' /proc/$pid/ns/net)" "$(stat -Lc '%d:%i' /proc/$pid/ns/pid)" \
+  "$(stat -Lc '%d:%i' /proc/$pid/ns/ipc)" "$(stat -Lc '%d:%i' /proc/$pid/ns/uts)" \
+  "$(stat -Lc '%d:%i' /proc/$pid/root)""#
+    );
+    let output = runtime
+        .exec_in_shared_vm(
+            stack_id,
+            "/bin/sh".to_string(),
+            vec!["-c".to_string(), script],
+            Duration::from_secs(15),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("guest generation probe failed: {error}"));
+    assert_eq!(
+        output.exit_code, 0,
+        "guest generation probe failed: {}",
+        output.stderr
+    );
+    serde_json::from_str(output.stdout.trim()).unwrap_or_else(|error| {
+        panic!(
+            "guest generation probe was not JSON: {error}; stdout={}",
+            output.stdout
+        )
+    })
+}
+
+#[derive(Debug, Default)]
+struct StackOwnershipFaultState {
+    inject_stack_id: Option<String>,
+    injected: bool,
+    injected_ownership: Option<ContainerGenerationOwnership>,
+    failed_cgroup_path: Option<String>,
+    cleanup_operations: Vec<serde_json::Value>,
+    after_remove_before_recreate: Option<serde_json::Value>,
+    unowned_failures: Vec<(String, MachineErrorCode)>,
+    successful_ownership: Vec<ContainerGenerationOwnership>,
+}
+
+#[derive(Clone)]
+struct StackOwnershipE2eRuntime {
+    inner: OciContainerRuntime,
+    faults: Arc<Mutex<StackOwnershipFaultState>>,
+}
+
+impl StackOwnershipE2eRuntime {
+    fn new(inner: OciContainerRuntime) -> Self {
+        Self {
+            inner,
+            faults: Arc::new(Mutex::new(StackOwnershipFaultState::default())),
+        }
+    }
+
+    fn inject_once_after_publication(&self, stack_id: &str) {
+        let mut faults = self.faults.lock().unwrap();
+        faults.inject_stack_id = Some(stack_id.to_string());
+        faults.injected = false;
+        faults.injected_ownership = None;
+    }
+
+    fn set_failed_cgroup_path(&self, cgroup_path: &str) {
+        self.faults.lock().unwrap().failed_cgroup_path = Some(cgroup_path.to_string());
+    }
+
+    fn injected_ownership(&self) -> ContainerGenerationOwnership {
+        self.faults
+            .lock()
+            .unwrap()
+            .injected_ownership
+            .clone()
+            .expect("owned fault did not retain the runtime-issued ownership proof")
+    }
+
+    fn cleanup_operations(&self) -> Vec<serde_json::Value> {
+        self.faults.lock().unwrap().cleanup_operations.clone()
+    }
+
+    fn cleanup_checkpoint(&self) -> serde_json::Value {
+        self.faults
+            .lock()
+            .unwrap()
+            .after_remove_before_recreate
+            .clone()
+            .expect("generation cleanup omitted its pre-recreate checkpoint")
+    }
+
+    fn unowned_failure_code(&self, stack_id: &str) -> MachineErrorCode {
+        self.faults
+            .lock()
+            .unwrap()
+            .unowned_failures
+            .iter()
+            .rev()
+            .find_map(|(observed_stack, code)| (observed_stack == stack_id).then_some(*code))
+            .unwrap_or_else(|| {
+                panic!("stack '{stack_id}' did not record an unowned create failure")
+            })
+    }
+
+    fn latest_successful_ownership(&self, stack_id: &str) -> ContainerGenerationOwnership {
+        self.faults
+            .lock()
+            .unwrap()
+            .successful_ownership
+            .iter()
+            .rev()
+            .find(|ownership| ownership.stack_id == stack_id)
+            .cloned()
+            .unwrap_or_else(|| panic!("stack '{stack_id}' did not return generation ownership"))
+    }
+}
+
 impl ContainerRuntime for OciContainerRuntime {
     fn pull(&self, image: &str) -> Result<String, StackError> {
         tokio::task::block_in_place(|| {
@@ -345,6 +508,33 @@ impl ContainerRuntime for OciContainerRuntime {
         })
     }
 
+    fn create_in_sandbox_owned(
+        &self,
+        sandbox_id: &str,
+        image: &str,
+        config: RunConfig,
+    ) -> Result<ContainerCreateReceipt, OwnedCreateError<StackError>> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(
+                    self.backend
+                        .create_container_in_stack_owned(sandbox_id, image, config),
+                )
+                .map_err(|failure| failure.map_error(StackError::from))
+        })
+    }
+
+    fn cleanup_container_generation(
+        &self,
+        ownership: ContainerGenerationOwnership,
+    ) -> Result<GenerationCleanupOutcome, StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.backend.cleanup_container_generation(ownership))
+                .map_err(StackError::from)
+        })
+    }
+
     fn setup_sandbox_network(
         &self,
         sandbox_id: &str,
@@ -380,6 +570,596 @@ impl ContainerRuntime for OciContainerRuntime {
     fn has_sandbox(&self, sandbox_id: &str) -> bool {
         self.backend.has_shared_vm(sandbox_id)
     }
+}
+
+impl ContainerRuntime for StackOwnershipE2eRuntime {
+    fn pull(&self, image: &str) -> Result<String, StackError> {
+        self.inner.pull(image)
+    }
+
+    fn create(&self, image: &str, config: RunConfig) -> Result<String, StackError> {
+        self.inner.create(image, config)
+    }
+
+    fn stop(
+        &self,
+        container_id: &str,
+        signal: Option<&str>,
+        grace_period: Option<Duration>,
+    ) -> Result<(), StackError> {
+        self.inner.stop(container_id, signal, grace_period)
+    }
+
+    fn remove(&self, container_id: &str) -> Result<(), StackError> {
+        self.inner.remove(container_id)
+    }
+
+    fn exec(&self, container_id: &str, command: &[String]) -> Result<i32, StackError> {
+        self.inner.exec(container_id, command)
+    }
+
+    fn create_sandbox(
+        &self,
+        sandbox_id: &str,
+        ports: Vec<PortMapping>,
+        resources: vz_runtime_contract::StackResourceHint,
+    ) -> Result<(), StackError> {
+        self.inner.create_sandbox(sandbox_id, ports, resources)
+    }
+
+    fn create_in_sandbox(
+        &self,
+        sandbox_id: &str,
+        image: &str,
+        config: RunConfig,
+    ) -> Result<String, StackError> {
+        self.inner.create_in_sandbox(sandbox_id, image, config)
+    }
+
+    fn create_in_sandbox_owned(
+        &self,
+        sandbox_id: &str,
+        image: &str,
+        config: RunConfig,
+    ) -> Result<ContainerCreateReceipt, OwnedCreateError<StackError>> {
+        let result = self
+            .inner
+            .create_in_sandbox_owned(sandbox_id, image, config);
+        match result {
+            Ok(receipt) => {
+                if let Some(ownership) = receipt.ownership.clone() {
+                    self.faults
+                        .lock()
+                        .unwrap()
+                        .successful_ownership
+                        .push(ownership);
+                }
+                let should_inject = {
+                    let faults = self.faults.lock().unwrap();
+                    !faults.injected && faults.inject_stack_id.as_deref() == Some(sandbox_id)
+                };
+                if should_inject {
+                    let ownership = receipt.ownership.clone().unwrap_or_else(|| {
+                        panic!("macOS runtime published a container without generation ownership")
+                    });
+                    let mut faults = self.faults.lock().unwrap();
+                    faults.injected = true;
+                    faults.injected_ownership = Some(ownership.clone());
+                    return Err(OwnedCreateError {
+                        error: StackError::Network(
+                            "injected_post_publication: control-plane acknowledgement lost after runtime publication"
+                                .to_string(),
+                        ),
+                        cleanup: Some(ownership),
+                    });
+                }
+                Ok(receipt)
+            }
+            Err(failure) => {
+                if failure.cleanup.is_none() {
+                    self.faults
+                        .lock()
+                        .unwrap()
+                        .unowned_failures
+                        .push((sandbox_id.to_string(), failure.error.machine_code()));
+                }
+                Err(failure)
+            }
+        }
+    }
+
+    fn cleanup_container_generation(
+        &self,
+        ownership: ContainerGenerationOwnership,
+    ) -> Result<GenerationCleanupOutcome, StackError> {
+        let outcome = self.inner.cleanup_container_generation(ownership.clone())?;
+        let outcome_name = match outcome {
+            GenerationCleanupOutcome::Removed => "removed",
+            GenerationCleanupOutcome::AlreadyAbsent => "already_absent",
+        };
+
+        let cgroup_path = self
+            .faults
+            .lock()
+            .unwrap()
+            .failed_cgroup_path
+            .clone()
+            .expect("owned failure did not record its guest cgroup path before cleanup");
+        let probe = self
+            .inner
+            .exec_in_shared_vm(
+                &ownership.stack_id,
+                "/bin/sh",
+                vec![
+                    "-c".to_string(),
+                    format!(
+                        "printf 'overlay='; test -e /run/vz-oci/containers/{id} && echo present || echo absent; \
+                         printf 'youki_state='; test -e /run/vz-oci/state/{id} && echo present || echo absent; \
+                         printf 'cgroup='; test -e /sys/fs/cgroup{cgroup} && echo present || echo absent",
+                        id = ownership.container_id,
+                        cgroup = cgroup_path,
+                    ),
+                ],
+                Duration::from_secs(15),
+            )
+            .expect("failed to inspect generation cleanup before replacement create");
+        assert_eq!(probe.0, 0, "generation cleanup probe failed: {}", probe.2);
+        let diagnostics = self.inner.lifecycle_diagnostics();
+        let checkpoint = serde_json::json!({
+            "metadata_absent": !self
+                .inner
+                .tracked_container_ids()
+                .contains(&ownership.container_id),
+            "rootfs_absent": !self
+                .inner
+                .data_dir
+                .join("rootfs")
+                .join(&ownership.container_id)
+                .exists(),
+            "guest_overlay_absent": probe.1.contains("overlay=absent"),
+            "guest_youki_state_absent": probe.1.contains("youki_state=absent"),
+            "guest_cgroup_absent": probe.1.contains("cgroup=absent"),
+            "lifecycle": lifecycle_inventory(&diagnostics),
+        });
+
+        let mut faults = self.faults.lock().unwrap();
+        faults.cleanup_operations.push(serde_json::json!({
+            "operation": "cleanup_container_generation",
+            "ownership": ownership_json(&ownership),
+            "outcome": outcome_name,
+        }));
+        faults.after_remove_before_recreate = Some(checkpoint);
+        Ok(outcome)
+    }
+
+    fn setup_sandbox_network(
+        &self,
+        sandbox_id: &str,
+        services: Vec<NetworkServiceConfig>,
+    ) -> Result<(), StackError> {
+        self.inner.setup_sandbox_network(sandbox_id, services)
+    }
+
+    fn teardown_sandbox_network(
+        &self,
+        sandbox_id: &str,
+        service_names: Vec<String>,
+    ) -> Result<(), StackError> {
+        self.inner
+            .teardown_sandbox_network(sandbox_id, service_names)
+    }
+
+    fn shutdown_sandbox(&self, sandbox_id: &str) -> Result<(), StackError> {
+        self.inner.shutdown_sandbox(sandbox_id)
+    }
+
+    fn has_sandbox(&self, sandbox_id: &str) -> bool {
+        self.inner.has_sandbox(sandbox_id)
+    }
+}
+
+fn stack_ownership_spec(
+    stack_id: &str,
+    service_name: &str,
+    owner: &str,
+    container_name: Option<&str>,
+) -> vz_stack::StackSpec {
+    let container_name = container_name
+        .map(|name| format!("    container_name: {name}\n"))
+        .unwrap_or_default();
+    parse_compose(
+        &format!(
+            r#"services:
+  {service_name}:
+    image: alpine:latest
+    command: ["sleep", "300"]
+    environment:
+      VZ_E2E_OWNER: {owner}
+{container_name}"#
+        ),
+        stack_id,
+    )
+    .unwrap()
+}
+
+fn stack_ownership_orchestrator(
+    runtime: StackOwnershipE2eRuntime,
+    root: &Path,
+    stack_id: &str,
+) -> StackOrchestrator<StackOwnershipE2eRuntime> {
+    let stack_dir = root.join(stack_id);
+    std::fs::create_dir_all(&stack_dir).unwrap();
+    let db_path = stack_dir.join("state.db");
+    let executor = StackExecutor::new(runtime, StateStore::open(&db_path).unwrap(), &stack_dir);
+    StackOrchestrator::new(
+        executor,
+        StateStore::open(&db_path).unwrap(),
+        OrchestrationConfig {
+            poll_interval: Some(0),
+            max_rounds: 1,
+            image_policy: ImagePolicy::AllowAll,
+        },
+    )
+}
+
+fn stop_stack_strict(
+    orchestrator: &mut StackOrchestrator<StackOwnershipE2eRuntime>,
+    stack_id: &str,
+) {
+    let down = orchestrator
+        .run(
+            &vz_stack::StackSpec {
+                name: stack_id.to_string(),
+                services: vec![],
+                networks: vec![],
+                volumes: vec![],
+                secrets: vec![],
+                disk_size_mb: None,
+            },
+            None,
+        )
+        .unwrap_or_else(|error| panic!("stack '{stack_id}' down failed: {error}"));
+    assert!(down.converged, "stack '{stack_id}' down did not converge");
+    assert_eq!(down.services_failed, 0, "stack '{stack_id}' down failed");
+    orchestrator
+        .executor()
+        .runtime()
+        .shutdown_sandbox(stack_id)
+        .unwrap_or_else(|error| panic!("stack '{stack_id}' VM shutdown failed: {error}"));
+}
+
+/// Prove that stack-generated IDs are namespace-stable and that only an exact
+/// runtime-issued generation token authorizes failed-create cleanup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn stack_container_generation_ownership() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,vz_oci_macos=debug,vz_linux=debug,vz_stack=debug")
+        .with_test_writer()
+        .try_init();
+
+    const IMAGE: &str = "alpine:latest";
+    let oci_data = stack_e2e_oci_data_dir();
+    let raw_runtime = Runtime::new(RuntimeConfig {
+        data_dir: oci_data.clone(),
+        require_exact_agent_version: false,
+        agent_ready_timeout: Duration::from_secs(15),
+        exec_timeout: Duration::from_secs(30),
+        ..RuntimeConfig::default()
+    });
+    raw_runtime.pull(IMAGE).await.unwrap();
+    let bridge = StackOwnershipE2eRuntime::new(OciContainerRuntime::from_runtime(
+        raw_runtime.clone(),
+        &oci_data,
+    ));
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut evidence = serde_json::json!({
+        "schema_version": 1,
+        "scenario": "stack-container-ownership",
+        "concurrent_same_service": serde_json::Value::Null,
+        "owned_failure": serde_json::Value::Null,
+        "foreign_collision": serde_json::Value::Null,
+        "final": serde_json::Value::Null,
+    });
+    write_stack_container_ownership_evidence(&evidence);
+
+    // Boot both stack VMs before installing the admission barrier. VM startup
+    // is intentionally serialized by the macOS runtime, while container
+    // admission is the ownership boundary this scenario must exercise
+    // concurrently. Pre-booting also ensures the barrier cannot deadlock with
+    // that unrelated VM-start serialization.
+    bridge
+        .create_sandbox(
+            "same-a",
+            vec![],
+            vz_runtime_contract::StackResourceHint::default(),
+        )
+        .expect("failed to pre-boot same-a sandbox");
+    bridge
+        .create_sandbox(
+            "same-b",
+            vec![],
+            vz_runtime_contract::StackResourceHint::default(),
+        )
+        .expect("failed to pre-boot same-b sandbox");
+    for stack_id in ["same-a", "same-b"] {
+        bridge
+            .setup_sandbox_network(
+                stack_id,
+                vec![NetworkServiceConfig {
+                    name: "db".to_string(),
+                    addr: "172.20.0.2/24".to_string(),
+                    network_name: "default".to_string(),
+                }],
+            )
+            .unwrap_or_else(|error| panic!("failed to preconfigure {stack_id} network: {error}"));
+    }
+
+    // Both stack container creates must reach runtime admission before either
+    // is released. Distinct generated IDs therefore exercise real concurrent
+    // ownership in one Runtime rather than two independent fixture stores.
+    let spec_a = stack_ownership_spec("same-a", "db", "same-a-db", None);
+    let spec_b = stack_ownership_spec("same-b", "db", "same-b-db", None);
+    let orchestrator_a = stack_ownership_orchestrator(bridge.clone(), tmp.path(), "same-a");
+    let orchestrator_b = stack_ownership_orchestrator(bridge.clone(), tmp.path(), "same-b");
+    let mut observer = raw_runtime.install_lifecycle_observer();
+    let task_a = tokio::task::spawn_blocking(move || {
+        let mut orchestrator = orchestrator_a;
+        let result = orchestrator.run(&spec_a, None);
+        (orchestrator, result)
+    });
+    let task_b = tokio::task::spawn_blocking(move || {
+        let mut orchestrator = orchestrator_b;
+        let result = orchestrator.run(&spec_b, None);
+        (orchestrator, result)
+    });
+    let admission_a = tokio::time::timeout(Duration::from_secs(120), observer.recv())
+        .await
+        .expect("first concurrent stack never reached create admission")
+        .expect("lifecycle observer closed before first concurrent create");
+    let admission_b = tokio::time::timeout(Duration::from_secs(120), observer.recv())
+        .await
+        .expect("second concurrent stack never reached create admission")
+        .expect("lifecycle observer closed before second concurrent create");
+    assert_eq!(
+        admission_a.kind(),
+        RuntimeLifecycleAdmissionKind::CreateBeforeReservation
+    );
+    assert_eq!(
+        admission_b.kind(),
+        RuntimeLifecycleAdmissionKind::CreateBeforeReservation
+    );
+    let mut barrier_ids = vec![
+        admission_a.container_id().to_string(),
+        admission_b.container_id().to_string(),
+    ];
+    barrier_ids.sort();
+    barrier_ids.dedup();
+    assert_eq!(barrier_ids.len(), 2, "generated IDs collided at admission");
+    drop(observer);
+    admission_a.resume();
+    admission_b.resume();
+
+    let (mut orchestrator_a, result_a) = tokio::time::timeout(Duration::from_secs(180), task_a)
+        .await
+        .expect("same-a create timed out")
+        .expect("same-a orchestration task panicked");
+    let (mut orchestrator_b, result_b) = tokio::time::timeout(Duration::from_secs(180), task_b)
+        .await
+        .expect("same-b create timed out")
+        .expect("same-b orchestration task panicked");
+    let result_a = result_a.unwrap();
+    let result_b = result_b.unwrap();
+    assert!(result_a.converged && result_b.converged);
+    assert_eq!(result_a.services_failed + result_b.services_failed, 0);
+
+    let same_a = bridge.latest_successful_ownership("same-a");
+    let same_b = bridge.latest_successful_ownership("same-b");
+    assert_ne!(same_a.container_id, same_b.container_id);
+    let same_a_guest =
+        stack_guest_generation_evidence(&raw_runtime, "same-a", &same_a.container_id).await;
+    let same_b_guest =
+        stack_guest_generation_evidence(&raw_runtime, "same-b", &same_b.container_id).await;
+    let same_lifecycle = raw_runtime.lifecycle_diagnostics().await.unwrap();
+    evidence["concurrent_same_service"] = serde_json::json!({
+        "service_name": "db",
+        "barrier": {
+            "kind": "create_before_reservation",
+            "both_reached_before_release": true,
+            "container_ids": barrier_ids,
+        },
+        "stacks": [
+            {
+                "stack_id": "same-a",
+                "container_id": same_a.container_id,
+                "ownership": ownership_json(&same_a),
+                "guest": same_a_guest,
+            },
+            {
+                "stack_id": "same-b",
+                "container_id": same_b.container_id,
+                "ownership": ownership_json(&same_b),
+                "guest": same_b_guest,
+            }
+        ],
+        "lifecycle": lifecycle_inventory(&same_lifecycle),
+    });
+    write_stack_container_ownership_evidence(&evidence);
+    stop_stack_strict(&mut orchestrator_a, "same-a");
+    stop_stack_strict(&mut orchestrator_b, "same-b");
+
+    // Inject a lost acknowledgement after the real backend has published the
+    // running generation. The returned ownership proof must survive the failed
+    // observed state and authorize exactly one cleanup before replacement.
+    bridge.inject_once_after_publication("owned");
+    let spec_owned_a = stack_ownership_spec("owned", "worker", "owned-generation-a", None);
+    let mut owned_orchestrator = stack_ownership_orchestrator(bridge.clone(), tmp.path(), "owned");
+    let first_owned = owned_orchestrator.run(&spec_owned_a, None).unwrap();
+    assert_eq!(first_owned.services_failed, 1);
+    let failure_token = bridge.injected_ownership();
+    let failed_state = owned_orchestrator
+        .executor()
+        .store()
+        .load_observed_state("owned")
+        .unwrap();
+    let observed_token = failed_state
+        .iter()
+        .find(|state| state.service_name == "worker")
+        .and_then(|state| state.failed_create_ownership.clone())
+        .expect("owned post-publication failure lost its cleanup proof");
+    assert_eq!(observed_token, failure_token);
+    let failed_guest =
+        stack_guest_generation_evidence(&raw_runtime, "owned", &failure_token.container_id).await;
+    bridge.set_failed_cgroup_path(
+        failed_guest["cgroup_path"]
+            .as_str()
+            .expect("failed generation omitted cgroup path"),
+    );
+    let failed_lifecycle = raw_runtime.lifecycle_diagnostics().await.unwrap();
+
+    let spec_owned_b = stack_ownership_spec("owned", "worker", "owned-generation-b", None);
+    let replacement_result = owned_orchestrator.run(&spec_owned_b, None).unwrap();
+    assert!(replacement_result.converged);
+    assert_eq!(replacement_result.services_failed, 0);
+    let replacement_token = bridge.latest_successful_ownership("owned");
+    assert_eq!(replacement_token.container_id, failure_token.container_id);
+    assert!(replacement_token.generation > failure_token.generation);
+    let replacement_guest =
+        stack_guest_generation_evidence(&raw_runtime, "owned", &replacement_token.container_id)
+            .await;
+    let replacement_lifecycle = raw_runtime.lifecycle_diagnostics().await.unwrap();
+    evidence["owned_failure"] = serde_json::json!({
+        "stack_id": "owned",
+        "service_name": "worker",
+        "injection_point": "after_runtime_publication_before_executor_finalize",
+        "injected_error_code": "injected_post_publication",
+        "failure_token": ownership_json(&failure_token),
+        "observed_token": ownership_json(&observed_token),
+        "failed_guest": failed_guest,
+        "failed_lifecycle": lifecycle_inventory(&failed_lifecycle),
+        "cleanup_operations": bridge.cleanup_operations(),
+        "after_remove_before_recreate": bridge.cleanup_checkpoint(),
+        "replacement_token": ownership_json(&replacement_token),
+        "replacement_guest": replacement_guest,
+        "replacement_lifecycle": lifecycle_inventory(&replacement_lifecycle),
+    });
+    write_stack_container_ownership_evidence(&evidence);
+    stop_stack_strict(&mut owned_orchestrator, "owned");
+
+    // A foreign explicit container_name collision carries no authority. The
+    // contender must fail closed without invoking generation cleanup or
+    // changing the foreign generation, route, or raw guest process identity.
+    let owner_spec = stack_ownership_spec(
+        "foreign-owner",
+        "owner",
+        "foreign-owner",
+        Some("shared-explicit-id"),
+    );
+    let mut owner_orchestrator =
+        stack_ownership_orchestrator(bridge.clone(), tmp.path(), "foreign-owner");
+    let owner_result = owner_orchestrator.run(&owner_spec, None).unwrap();
+    assert!(owner_result.converged);
+    assert_eq!(owner_result.services_failed, 0);
+    let owner_token = bridge.latest_successful_ownership("foreign-owner");
+    let owner_before_guest =
+        stack_guest_generation_evidence(&raw_runtime, "foreign-owner", &owner_token.container_id)
+            .await;
+    let before_collision = raw_runtime.lifecycle_diagnostics().await.unwrap();
+    let cleanup_count_before_collision = bridge.cleanup_operations().len();
+
+    let contender_spec = stack_ownership_spec(
+        "foreign-contender",
+        "contender",
+        "foreign-contender",
+        Some("shared-explicit-id"),
+    );
+    let mut contender_orchestrator =
+        stack_ownership_orchestrator(bridge.clone(), tmp.path(), "foreign-contender");
+    let contender_result = contender_orchestrator.run(&contender_spec, None).unwrap();
+    assert_eq!(contender_result.services_failed, 1);
+    let contender_state = contender_orchestrator
+        .executor()
+        .store()
+        .load_observed_state("foreign-contender")
+        .unwrap();
+    let contender_cleanup = contender_state
+        .iter()
+        .find(|state| state.service_name == "contender")
+        .and_then(|state| state.failed_create_ownership.clone());
+    assert!(contender_cleanup.is_none());
+    assert_eq!(
+        bridge.unowned_failure_code("foreign-contender"),
+        MachineErrorCode::StateConflict
+    );
+    assert_eq!(
+        bridge.cleanup_operations().len(),
+        cleanup_count_before_collision,
+        "foreign collision invoked generation cleanup"
+    );
+    let owner_after_guest =
+        stack_guest_generation_evidence(&raw_runtime, "foreign-owner", &owner_token.container_id)
+            .await;
+    assert_eq!(owner_before_guest, owner_after_guest);
+    let after_collision = raw_runtime.lifecycle_diagnostics().await.unwrap();
+    evidence["foreign_collision"] = serde_json::json!({
+        "owner_stack_id": "foreign-owner",
+        "contender_stack_id": "foreign-contender",
+        "container_id": "shared-explicit-id",
+        "owner_token": ownership_json(&owner_token),
+        "collision_error_code": MachineErrorCode::StateConflict.as_str(),
+        "collision_cleanup": serde_json::Value::Null,
+        "contender_observed_cleanup": serde_json::Value::Null,
+        "cleanup_operations": [],
+        "owner_before_guest": owner_before_guest,
+        "owner_after_guest": owner_after_guest,
+        "before_lifecycle": lifecycle_inventory(&before_collision),
+        "after_lifecycle": lifecycle_inventory(&after_collision),
+    });
+    write_stack_container_ownership_evidence(&evidence);
+
+    stop_stack_strict(&mut contender_orchestrator, "foreign-contender");
+    stop_stack_strict(&mut owner_orchestrator, "foreign-owner");
+
+    let final_diagnostics = raw_runtime.lifecycle_diagnostics().await.unwrap();
+    let final_tracked = raw_runtime
+        .list_containers()
+        .unwrap()
+        .into_iter()
+        .map(|container| container.id)
+        .collect::<Vec<_>>();
+    let tested_container_ids = vec![
+        same_a.container_id,
+        same_b.container_id,
+        replacement_token.container_id,
+        owner_token.container_id,
+    ];
+    evidence["final"] = serde_json::json!({
+        "tracked_container_ids": final_tracked,
+        "tested_container_ids": tested_container_ids,
+        "lifecycle": lifecycle_inventory(&final_diagnostics),
+    });
+    write_stack_container_ownership_evidence(&evidence);
+
+    assert!(raw_runtime.list_containers().unwrap().is_empty());
+    assert_eq!(final_diagnostics.vm_handles, 0);
+    assert_eq!(final_diagnostics.stack_vms, 0);
+    assert_eq!(final_diagnostics.container_routes, 0);
+    assert_eq!(final_diagnostics.exec_bindings, 0);
+    assert_eq!(final_diagnostics.active_lifecycles, 0);
+    assert_eq!(final_diagnostics.exec_sessions, 0);
+    assert_eq!(final_diagnostics.setup_restore_entries, 0);
+    assert_eq!(final_diagnostics.overlay_cleanup_pending, 0);
+    assert_eq!(final_diagnostics.rootfs_directories, 0);
+    assert!(
+        final_diagnostics
+            .generations
+            .iter()
+            .all(|entry| !entry.reserved)
+    );
 }
 
 #[test]

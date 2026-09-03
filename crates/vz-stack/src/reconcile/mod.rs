@@ -192,29 +192,24 @@ pub fn apply(
     for action in &actions {
         match action {
             Action::ServiceCreate { service_name } => {
-                let service = desired_service_map.get(service_name.as_str()).copied();
                 if let Some(service) = desired_service_map.get(service_name.as_str()) {
                     let digest = service_config_digest(service);
                     store.save_service_mount_digest(&spec.name, service_name, &digest)?;
                 }
-                // A generated runtime ID is stack-scoped, so retaining it lets
-                // the executor finish cleanup after an owned partial create.
-                // Explicit IDs are global caller selections and must not be
-                // reclaimed without a runtime-issued ownership token.
-                let existing_cid = service
-                    .filter(|service| service.container_name.is_none())
-                    .and_then(|_| {
-                        observed
-                            .iter()
-                            .find(|state| state.service_name == *service_name)
-                            .and_then(|state| state.container_id.clone())
-                    });
+                let failed_create_ownership = observed
+                    .iter()
+                    .find(|state| state.service_name == *service_name)
+                    .and_then(|state| state.failed_create_ownership.clone());
+                let existing_cid = failed_create_ownership
+                    .as_ref()
+                    .map(|ownership| ownership.container_id.clone());
                 store.save_observed_state(
                     &spec.name,
                     &ServiceObservedState {
                         service_name: service_name.clone(),
                         phase: ServicePhase::Pending,
                         container_id: existing_cid,
+                        failed_create_ownership,
                         last_error: None,
                         ready: false,
                     },
@@ -252,12 +247,17 @@ pub fn apply(
                     .iter()
                     .find(|o| o.service_name == *service_name)
                     .and_then(|o| o.container_id.clone());
+                let failed_create_ownership = observed
+                    .iter()
+                    .find(|o| o.service_name == *service_name)
+                    .and_then(|o| o.failed_create_ownership.clone());
                 store.save_observed_state(
                     &spec.name,
                     &ServiceObservedState {
                         service_name: service_name.clone(),
                         phase: ServicePhase::Pending,
                         container_id: existing_cid,
+                        failed_create_ownership,
                         last_error: None,
                         ready: false,
                     },
@@ -278,6 +278,10 @@ pub fn apply(
                     .iter()
                     .find(|state| state.service_name == *service_name)
                     .and_then(|state| state.container_id.clone());
+                let failed_create_ownership = observed
+                    .iter()
+                    .find(|state| state.service_name == *service_name)
+                    .and_then(|state| state.failed_create_ownership.clone());
                 store.save_observed_state(
                     &spec.name,
                     &ServiceObservedState {
@@ -287,6 +291,7 @@ pub fn apply(
                         // actually completed stop + remove. This also makes a
                         // crash between planning and execution retryable.
                         container_id: existing_cid,
+                        failed_create_ownership,
                         last_error: None,
                         ready: false,
                     },

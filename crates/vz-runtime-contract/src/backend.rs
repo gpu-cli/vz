@@ -1,9 +1,10 @@
 use std::future::Future;
 
 use crate::{
-    Build, BuildSpec, ContainerInfo, ContainerLogs, Event, ExecConfig, ExecOutput, ImageInfo,
-    IsolationLevel, NetworkServiceConfig, PortMapping, PruneResult, RunConfig, RuntimeCapabilities,
-    RuntimeError, RuntimeOperation, SandboxSpec, StackResourceHint,
+    Build, BuildSpec, ContainerCreateReceipt, ContainerGenerationOwnership, ContainerInfo,
+    ContainerLogs, Event, ExecConfig, ExecOutput, GenerationCleanupOutcome, ImageInfo,
+    IsolationLevel, NetworkServiceConfig, OwnedCreateError, PortMapping, PruneResult, RunConfig,
+    RuntimeCapabilities, RuntimeError, RuntimeOperation, SandboxSpec, StackResourceHint,
 };
 
 /// Workspace-oriented runtime manager that routes stack operations
@@ -119,6 +120,40 @@ impl<B: RuntimeBackend> WorkspaceRuntimeManager<B> {
         } else {
             self.backend.create_container(image, config).await
         }
+    }
+
+    /// Create a stack service container and retain runtime-issued generation ownership.
+    ///
+    /// Compatibility backends may return a receipt without ownership. Such a
+    /// receipt does not authorize generation-qualified failed-create cleanup.
+    pub async fn create_stack_container_owned(
+        &self,
+        stack_id: &str,
+        image: &str,
+        config: RunConfig,
+    ) -> Result<ContainerCreateReceipt, OwnedCreateError<RuntimeError>> {
+        if self.capabilities().shared_vm {
+            self.backend
+                .create_container_in_stack_owned(stack_id, image, config)
+                .await
+        } else {
+            self.backend
+                .create_container(image, config)
+                .await
+                .map(|container_id| ContainerCreateReceipt {
+                    container_id,
+                    ownership: None,
+                })
+                .map_err(OwnedCreateError::unowned)
+        }
+    }
+
+    /// Clean up exactly the generation named by a runtime-issued ownership proof.
+    pub async fn cleanup_container_generation(
+        &self,
+        ownership: ContainerGenerationOwnership,
+    ) -> Result<GenerationCleanupOutcome, RuntimeError> {
+        self.backend.cleanup_container_generation(ownership).await
     }
 
     /// Configure stack service networking when capability is available.
@@ -268,6 +303,18 @@ impl<B: RuntimeBackend> WorkspaceRuntimeManager<B> {
     ) -> Result<String, RuntimeError> {
         self.backend
             .create_container_in_stack(sandbox_id, image, config)
+            .await
+    }
+
+    /// Create a container within a sandbox and retain generation ownership.
+    pub async fn create_container_in_sandbox_owned(
+        &self,
+        sandbox_id: &str,
+        image: &str,
+        config: RunConfig,
+    ) -> Result<ContainerCreateReceipt, OwnedCreateError<RuntimeError>> {
+        self.backend
+            .create_container_in_stack_owned(sandbox_id, image, config)
             .await
     }
 
@@ -583,6 +630,44 @@ pub trait RuntimeBackend: Send + Sync {
         config: RunConfig,
     ) -> impl Future<Output = Result<String, RuntimeError>> {
         self.create_container(image, config)
+    }
+
+    /// Create a stack container with generation-qualified ownership metadata.
+    ///
+    /// The compatibility implementation deliberately returns no ownership:
+    /// only a backend that actually controls generation admission may mint it.
+    fn create_container_in_stack_owned(
+        &self,
+        stack_id: &str,
+        image: &str,
+        config: RunConfig,
+    ) -> impl Future<Output = Result<ContainerCreateReceipt, OwnedCreateError<RuntimeError>>> {
+        async move {
+            self.create_container_in_stack(stack_id, image, config)
+                .await
+                .map(|container_id| ContainerCreateReceipt {
+                    container_id,
+                    ownership: None,
+                })
+                .map_err(OwnedCreateError::unowned)
+        }
+    }
+
+    /// Clean up one exact container-ID generation.
+    ///
+    /// There is no ID-only fallback: doing so could remove a replacement or a
+    /// foreign container generation.
+    fn cleanup_container_generation(
+        &self,
+        _ownership: ContainerGenerationOwnership,
+    ) -> impl Future<Output = Result<GenerationCleanupOutcome, RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: "cleanup_container_generation".to_string(),
+                reason: "backend does not support generation-qualified container cleanup"
+                    .to_string(),
+            })
+        }
     }
 
     /// Set up per-service networking within a stack.
