@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>vz: Reproducible Developer Environments (Product Specification)</title>
-<meta name="description" content="vz creates reproducible, parallel Developer Environments on local hardware. Linux is the universal target, with native macOS environments today and native Windows planned.">
+<meta name="description" content="vz creates reproducible, parallel multi-Machine Developer Environment topologies on local hardware. Linux is universal, with native macOS Machines today and native Windows planned.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..900&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
@@ -322,7 +322,7 @@
 <body>
 <!--
 DIRECTION CONTRACT — seed 074dd045 · mode PERSUADE · code-led
-THESIS: vz is specified, not marketed — the page is a semiconductor datasheet for reproducible, parallel Developer Environments, with the host×target matrix and environment ownership model as the pitch.
+THESIS: vz is specified, not marketed — the page is a semiconductor datasheet for reproducible, parallel Developer Environment topologies, with Project→Environment→Machine ownership and the host×Machine-target matrix as the pitch.
 OWN-WORLD: cream laid-paper ground, warm ink, engineering blue for measured/live data, signal red for planned/guarded states; hairline rules, flat print surfaces, zero radius, zero shadow; Archivo expanded grotesque for the part identity, IBM Plex Sans/Mono for document body and data (Plex is the subject's native lettering — engineered documentation).
 STORY: a developer evaluating local environments reads vz like a part they can order: the schematic separates host from target, the register map names one environment lifecycle, the bench shows independent environments, and the roadmap labels every future pairing honestly.
 FIRST VIEWPORT: datasheet masthead — gpu-cli brandline, "FUTURE-STATE SPECIFICATION" stamp, giant part number vz with the function line, document meta table right (doc no, rev, date, status), then features column beside general description prose, all above the fold rules.
@@ -369,22 +369,23 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     <div>
       <h2 class="feat-h" id="feat-h">Features</h2>
       <ul class="features">
-        <li><span class="tick">▪</span><span><b>Environment first.</b> One identity owns target, files, compute, network, state, tools, and lifecycle</span></li>
+        <li><span class="tick">▪</span><span><b>Environment first.</b> Each isolated project instance owns a topology of target-native Machines</span></li>
         <li><span class="tick">▪</span><span><b>Linux everywhere.</b> Linux-on-macOS now; Linux-on-Linux next; Linux-on-Windows later</span></li>
         <li><span class="tick">▪</span><span><b>Native where it matters.</b> macOS-on-macOS now; Windows-on-Windows follows Linux-on-Windows</span></li>
-        <li><span class="tick">▪</span><span><b>Docker is implicit for Linux.</b> Each Linux environment owns a private Engine, context, state, and cache</span></li>
-        <li><span class="tick">▪</span><span><b>Parallel by construction.</b> No shared mutable identity, socket, port, network, cache, or credential state</span></li>
-        <li><span class="tick">▪</span><span><b>Honest capabilities.</b> Host×target support is reported as ACTIVE, DEV, or PLANNED</span></li>
+        <li><span class="tick">▪</span><span><b>Docker is implicit for Linux.</b> Each Linux Machine owns a private Engine, context, state, and cache</span></li>
+        <li><span class="tick">▪</span><span><b>Parallel on both axes.</b> Many isolated Environments per project; many cooperating Machines per Environment</span></li>
+        <li><span class="tick">▪</span><span><b>Public-like, still local.</b> Declared DNS, TLS, ingress, NAT, firewall, and network faults without accidental exposure</span></li>
+        <li><span class="tick">▪</span><span><b>Honest capabilities.</b> Host×Machine-target support is ACTIVE, DEV, or PLANNED</span></li>
         <li><span class="tick">▪</span><span><b>Hardened when requested.</b> Lockdown remains a secondary profile, not the product center</span></li>
       </ul>
     </div>
     <div>
       <h2 class="desc-h" id="desc-h">1 · General description</h2>
       <div class="desc">
-        <p class="lede"><strong>vz</strong> creates reproducible, parallel Developer Environments on local hardware. The environment—not its VM, container, or sandbox—is the product object. It binds a project or worktree to a target operating system, stable identity, compute, files, tools, network, persistent state, and lifecycle.</p>
-        <p><span class="none-em">Linux is the universal target.</span> It runs in a Virtualization.framework VM on macOS today, will run natively on Linux, and later runs through an appropriate Windows virtualization backend. Native macOS complements Linux now; native Windows comes after Linux-on-Windows.</p>
-        <p>Every Linux Developer Environment includes private Docker as part of readiness: its own Engine, containerd, BuildKit cache, images, volumes, networks, endpoint, and managed Docker context. There is no global vz Docker socket and no fallback to Docker Desktop or another environment.</p>
-        <p>Current runtime and VM mechanisms are real; the unified <code>vz dev</code> lifecycle and full host-Docker-CLI parity remain in development. Native targets report their own capabilities instead of silently inheriting Linux or OCI behavior.</p>
+        <p class="lede"><strong>vz</strong> creates reproducible, parallel Developer Environments on local hardware. A project defines a topology that can be instantiated many times; each isolated Environment contains one or more target-native Machines plus its storage, networks, endpoints, policies, and lifecycle.</p>
+        <p><span class="none-em">Linux is the universal Machine target.</span> Linux and native macOS Machines can coexist in one Environment on macOS; Linux moves next to Linux hosts and later Windows, with native Windows last.</p>
+        <p>Every Linux Machine includes private Docker readiness: its own Engine, containerd, BuildKit cache, images, volumes, networks, endpoint, and managed context. There is no Environment-wide/global socket and no fallback to Docker Desktop, a sibling Machine, or another Environment.</p>
+        <p>Current runtime and VM mechanisms are real; the five-verb <code>vz up/exec/status/stop/delete</code> lifecycle, topology fabric, and full host-Docker-CLI parity remain in development.</p>
         <p class="foot">Status vocabulary: <span class="tag tag-active">ACTIVE</span> shipped in v0.3.20 · <span class="tag tag-dev">DEV</span> in development · <span class="tag tag-planned">PLANNED</span> committed roadmap, subject to change.</p>
       </div>
     </div>
@@ -398,10 +399,10 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       <h2 id="arch-h"><span class="no">2</span>Typical application: the boundary</h2>
       <span class="seclabel">Figure 1</span>
     </div>
-    <p>This is the current Linux-on-macOS backend, one implementation of the shared Developer Environment contract. The host runs clients and the control plane; Linux workloads, dockerd, containerd, BuildKit, and youki execute inside the selected environment's VM. Native macOS environments use a separate macOS target adapter.</p>
+    <p>This figure zooms into one Linux Machine inside a Developer Environment topology. The host runs clients and the control plane; Linux workloads, dockerd, containerd, BuildKit, and youki execute inside that Machine's backend. Other Linux and native macOS Machines may join the same Environment through declared networks.</p>
     <div class="figure">
       <div class="figwrap">
-        <svg viewBox="0 0 1180 560" role="img" aria-label="Linux-on-macOS schematic: host clients and control plane on the left; one selected Linux Developer Environment on the right with kernel, guest agent, youki, dockerd, containerd, and BuildKit; connected by declared control, project-share, network, and private Engine endpoint channels.">
+        <svg viewBox="0 0 1180 560" role="img" aria-label="Linux-on-macOS schematic: host clients and control plane on the left; one Linux Machine on the right with kernel, guest agent, youki, dockerd, containerd, and BuildKit; connected by declared control, workspace, network, and private Engine endpoint channels.">
           <!-- boundary -->
           <line x1="640" y1="24" x2="640" y2="520" stroke="#a33327" stroke-width="1.4" stroke-dasharray="7 5"/>
           <text x="640" y="542" text-anchor="middle" font-family="IBM Plex Mono" font-size="11.5" letter-spacing="2.0" fill="#a33327">ENVIRONMENT BOUNDARY · HOST EFFECTS REQUIRE DECLARED CHANNELS</text>
@@ -417,7 +418,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
           <rect x="92" y="184" width="190" height="58" fill="none" stroke="#1f1c18" stroke-width="1.3"/>
           <text x="108" y="208" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#1f1c18">vz CLI</text>
-          <text x="108" y="227" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">vz dev · current compatibility commands</text>
+          <text x="108" y="227" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">up · exec · status · stop · delete</text>
 
           <rect x="308" y="184" width="190" height="58" fill="none" stroke="#1f1c18" stroke-width="1.3"/>
           <text x="324" y="208" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#1f1c18">vz-runtimed</text>
@@ -425,7 +426,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
           <rect x="92" y="262" width="406" height="58" fill="none" stroke="#a33327" stroke-width="1.2" stroke-dasharray="5 4"/>
           <text x="108" y="286" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#a33327">MANAGED DOCKER CONTEXT</text>
-          <text x="108" y="305" font-family="IBM Plex Mono" font-size="10.5" fill="#a33327">one private endpoint per Linux environment · DEV</text>
+          <text x="108" y="305" font-family="IBM Plex Mono" font-size="10.5" fill="#a33327">one private endpoint per Linux Machine · DEV</text>
 
           <rect x="92" y="340" width="406" height="120" fill="none" stroke="#1f1c18" stroke-width="1.2"/>
           <text x="108" y="364" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#1f1c18">STATE</text>
@@ -442,7 +443,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           <text x="560" y="482" font-family="IBM Plex Mono" font-size="10.5" letter-spacing="1.6" fill="#0f4c81">VIRTIOFS · PROJECT MOUNTS</text>
 
           <!-- guest block -->
-          <text x="700" y="52" font-family="Archivo" font-size="15" font-weight="700" letter-spacing="2.2" fill="#1f1c18">TARGET · LINUX · ENVIRONMENT</text>
+          <text x="700" y="52" font-family="Archivo" font-size="15" font-weight="700" letter-spacing="2.2" fill="#1f1c18">TARGET · LINUX · MACHINE</text>
           <rect x="700" y="66" width="420" height="440" fill="rgba(15,76,129,0.045)" stroke="#0f4c81" stroke-width="1.8"/>
           <text x="716" y="88" font-family="IBM Plex Mono" font-size="10.5" fill="#0f4c81">STABLE IDENTITY · PRIVATE MUTABLE STATE</text>
 
@@ -464,7 +465,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
           <rect x="724" y="298" width="372" height="46" fill="rgba(163,51,39,0.05)" stroke="#a33327" stroke-width="1.2" stroke-dasharray="5 4"/>
           <text x="740" y="318" font-family="IBM Plex Sans" font-weight="700" font-size="13" fill="#a33327">dockerd + containerd</text>
-          <text x="740" y="335" font-family="IBM Plex Mono" font-size="10.5" fill="#a33327">PRIVATE DOCKER PER ENVIRONMENT · DEV §5</text>
+          <text x="740" y="335" font-family="IBM Plex Mono" font-size="10.5" fill="#a33327">PRIVATE DOCKER PER MACHINE · DEV §5</text>
 
           <rect x="724" y="362" width="372" height="44" fill="none" stroke="#1f1c18" stroke-width="1.2"/>
           <text x="740" y="381" font-family="IBM Plex Sans" font-weight="700" font-size="12.5" fill="#1f1c18">CHECKPOINT / RESTORE · fs_quick · vm_full</text>
@@ -478,7 +479,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           <text x="1080" y="452" text-anchor="middle" font-family="IBM Plex Mono" font-size="9.6" fill="#a33327">EGRESS POLICY · PLANNED §6</text>
         </svg>
       </div>
-      <p class="figcap"><b>Figure 1.</b> Linux-on-macOS. Dashed elements remain in development. The host Docker client selects one managed context; its daemon and mutable Docker state belong to that Linux environment. Other host×target pairs keep the same identity and lifecycle while changing backend adapters.</p>
+      <p class="figcap"><b>Figure 1.</b> One Linux Machine on macOS. The host Docker client selects its managed context; daemon and mutable Docker state belong to that Machine. The surrounding Environment may contain more Machines and owns their declared topology.</p>
     </div>
   </section>
 
@@ -498,7 +499,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         </thead>
         <tbody>
           <tr><td>Linux-on-macOS cold boot to first command</td><td>–</td><td class="t-mono">~3<sup class="fn">2</sup></td><td>–</td><td class="t-dim">s, repository-stated typical; warm reuse follows</td></tr>
-          <tr><td>Mutable Docker owners per Linux environment</td><td>1</td><td class="t-mono">1</td><td class="t-mono">1</td><td class="t-dim">Engine, state, cache, network, endpoint, context</td></tr>
+          <tr><td>Mutable Docker owners per Linux Machine</td><td>1</td><td class="t-mono">1</td><td class="t-mono">1</td><td class="t-dim">Engine, state, cache, network, endpoint, context</td></tr>
           <tr><td>Host bytes visible to an environment</td><td>–</td><td class="t-mono">declared shares only</td><td class="t-mono">policy bounded</td><td class="t-dim">target-specific share backend</td></tr>
           <tr><td>Concurrent macOS guest VMs</td><td>1</td><td class="t-mono">–</td><td class="t-mono">2</td><td class="t-dim">kernel-enforced; Linux guest VMs not so limited</td></tr>
           <tr><td>Memory / CPUs per environment</td><td class="t-mono">–</td><td class="t-mono">8 / 4</td><td class="t-mono">host RAM − reserve</td><td class="t-dim">GiB / cores, configurable per definition</td></tr>
@@ -515,13 +516,13 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   <!-- ─────────────── 4 · pin configuration: MCP interface ─────────────── -->
   <section class="sec" aria-labelledby="pin-h">
     <div class="sec-h">
-      <h2 id="pin-h"><span class="no">4</span>Pin configuration: environment lifecycle</h2>
-      <span class="seclabel">Figure 2 · proposed unified surface</span>
+      <h2 id="pin-h"><span class="no">4</span>Pin configuration: typed topology API</h2>
+      <span class="seclabel">Figure 2 · aggregate and child resources</span>
     </div>
-    <p>Humans, agents, IDEs, and automation should address the same Developer Environment. This proposed register names the unified lifecycle; current compatibility commands remain available while the surface is <span class="tag tag-dev">DEV</span>.</p>
+    <p>Humans, agents, IDEs, and automation address the same Environment topology and select Machines explicitly when needed. The public lifecycle has five verbs; richer Machine, network, file, checkpoint, and fault operations remain typed API resources.</p>
     <div class="figure">
       <div class="figwrap">
-        <svg viewBox="0 0 1180 470" role="img" aria-label="IC package diagram for the proposed Developer Environment lifecycle: create, start, exec, read file, write file, checkpoint, restore, set network, inspect, and delete.">
+        <svg viewBox="0 0 1180 470" role="img" aria-label="IC package diagram for the typed topology API: Environment aggregate operations plus Machine exec/files and topology reconciliation.">
           <!-- left pin wires -->
           <g font-family="IBM Plex Mono" font-size="12.5" fill="#1f1c18">
             <line x1="300" y1="90"  x2="470" y2="90"  stroke="#1f1c18" stroke-width="1.3"/><rect x="470" y="86" width="10" height="8" fill="#1f1c18"/>
@@ -529,18 +530,18 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
             <line x1="300" y1="150" x2="470" y2="150" stroke="#1f1c18" stroke-width="1.3"/><rect x="470" y="146" width="10" height="8" fill="#1f1c18"/>
             <text x="292" y="154" text-anchor="end">2 · environment_start</text>
             <line x1="300" y1="210" x2="470" y2="210" stroke="#1f1c18" stroke-width="1.3"/><rect x="470" y="206" width="10" height="8" fill="#1f1c18"/>
-            <text x="292" y="214" text-anchor="end">3 · environment_exec</text>
+            <text x="292" y="214" text-anchor="end">3 · machine_exec</text>
             <line x1="300" y1="270" x2="470" y2="270" stroke="#1f1c18" stroke-width="1.3"/><rect x="470" y="266" width="10" height="8" fill="#1f1c18"/>
-            <text x="292" y="274" text-anchor="end">4 · environment_read_file</text>
+            <text x="292" y="274" text-anchor="end">4 · machine_read_file</text>
             <line x1="300" y1="330" x2="470" y2="330" stroke="#1f1c18" stroke-width="1.3"/><rect x="470" y="326" width="10" height="8" fill="#1f1c18"/>
-            <text x="292" y="334" text-anchor="end">5 · environment_write_file</text>
+            <text x="292" y="334" text-anchor="end">5 · machine_write_file</text>
 
             <line x1="710" y1="90"  x2="880" y2="90"  stroke="#1f1c18" stroke-width="1.3"/><rect x="700" y="86" width="10" height="8" fill="#1f1c18"/>
             <text x="898" y="94">6 · environment_checkpoint</text>
             <line x1="710" y1="150" x2="880" y2="150" stroke="#1f1c18" stroke-width="1.3"/><rect x="700" y="146" width="10" height="8" fill="#1f1c18"/>
             <text x="898" y="154">7 · environment_restore</text>
             <line x1="710" y1="210" x2="880" y2="210" stroke="#1f1c18" stroke-width="1.3"/><rect x="700" y="206" width="10" height="8" fill="#1f1c18"/>
-            <text x="898" y="214">8 · environment_set_network</text>
+            <text x="898" y="214">8 · topology_reconcile</text>
             <line x1="710" y1="270" x2="880" y2="270" stroke="#1f1c18" stroke-width="1.3"/><rect x="700" y="266" width="10" height="8" fill="#1f1c18"/>
             <text x="898" y="274">9 · environment_inspect</text>
             <line x1="710" y1="330" x2="880" y2="330" stroke="#1f1c18" stroke-width="1.3"/><rect x="700" y="326" width="10" height="8" fill="#1f1c18"/>
@@ -573,7 +574,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           </g>
         </svg>
       </div>
-      <p class="figcap"><b>Figure 2.</b> Proposed unified lifecycle, package view. Exact command and API spelling remains DEV; the stable semantics are identity, target, lifecycle, capabilities, and fail-closed selection.</p>
+          <p class="figcap"><b>Figure 2.</b> Aggregate and child-resource API package view. Public CLI remains five verbs; typed APIs carry Machine selectors and topology resources with streaming, fail-closed semantics.</p>
     </div>
 
     <div class="tbl-wrap">
@@ -582,15 +583,15 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           <tr><th>Pin</th><th>Tool</th><th>Function</th><th>Primitive</th><th>Status</th></tr>
         </thead>
         <tbody>
-          <tr><td class="t-num">1</td><td class="t-mono">environment_create</td><td>Persist identity, target specification, ownership, and reproducible inputs</td><td class="t-dim">environment service</td><td><span class="tag tag-dev">DEV</span></td></tr>
-          <tr><td class="t-num">2</td><td class="t-mono">environment_start</td><td>Reconcile the target backend and standard target capabilities</td><td class="t-dim">host + target adapters</td><td><span class="tag tag-dev">DEV</span></td></tr>
-          <tr><td class="t-num">3</td><td class="t-mono">environment_exec</td><td>Stream command I/O, PTY, signals, cancellation, and exit status</td><td class="t-dim">guest agent / native adapter</td><td><span class="tag tag-active">ACTIVE</span> <span class="tag tag-dev">DEV</span></td></tr>
-          <tr><td class="t-num">4</td><td class="t-mono">environment_read_file</td><td>Read target file bytes or text within policy</td><td class="t-dim">files API</td><td><span class="tag tag-dev">DEV</span></td></tr>
-          <tr><td class="t-num">5</td><td class="t-mono">environment_write_file</td><td>Write a target file atomically within policy</td><td class="t-dim">files API</td><td><span class="tag tag-dev">DEV</span></td></tr>
-          <tr><td class="t-num">6</td><td class="t-mono">environment_checkpoint</td><td>Snapshot state where the target reports support</td><td class="t-dim">checkpoint adapter</td><td><span class="tag tag-active">ACTIVE</span></td></tr>
-          <tr><td class="t-num">7</td><td class="t-mono">environment_restore</td><td>Restore or fork with target-qualified portability</td><td class="t-dim">checkpoint adapter</td><td><span class="tag tag-active">ACTIVE</span></td></tr>
-          <tr><td class="t-num">8</td><td class="t-mono">environment_set_network</td><td>Apply explicit egress and published-port policy</td><td class="t-dim">network adapter</td><td><span class="tag tag-planned">PLANNED</span></td></tr>
-          <tr><td class="t-num">9</td><td class="t-mono">environment_inspect</td><td>Report host, target, backend, lifecycle, ownership, and capabilities</td><td class="t-dim">environment service</td><td><span class="tag tag-dev">DEV</span></td></tr>
+          <tr><td class="t-num">1</td><td class="t-mono">environment_create</td><td>Persist Project/Environment identity, topology digest, ownership, and reproducible inputs</td><td class="t-dim">environment service</td><td><span class="tag tag-dev">DEV</span></td></tr>
+          <tr><td class="t-num">2</td><td class="t-mono">environment_start</td><td>Reconcile Machines, dependencies, networks, and standard capabilities</td><td class="t-dim">environment supervisor</td><td><span class="tag tag-dev">DEV</span></td></tr>
+          <tr><td class="t-num">3</td><td class="t-mono">machine_exec</td><td>Stream command I/O, PTY, signals, cancellation, and exit status on one Machine</td><td class="t-dim">guest agent / native adapter</td><td><span class="tag tag-active">ACTIVE</span> <span class="tag tag-dev">DEV</span></td></tr>
+          <tr><td class="t-num">4</td><td class="t-mono">machine_read_file</td><td>Read selected Machine file bytes or text within policy</td><td class="t-dim">files API</td><td><span class="tag tag-dev">DEV</span></td></tr>
+          <tr><td class="t-num">5</td><td class="t-mono">machine_write_file</td><td>Write a selected Machine file atomically within policy</td><td class="t-dim">files API</td><td><span class="tag tag-dev">DEV</span></td></tr>
+          <tr><td class="t-num">6</td><td class="t-mono">environment_checkpoint</td><td>Snapshot state where the target reports support</td><td class="t-dim">checkpoint adapter</td><td><span class="tag tag-active">ACTIVE</span> primitive · <span class="tag tag-dev">DEV</span> aggregate</td></tr>
+          <tr><td class="t-num">7</td><td class="t-mono">environment_restore</td><td>Restore or fork with target-qualified portability</td><td class="t-dim">checkpoint adapter</td><td><span class="tag tag-active">ACTIVE</span> primitive · <span class="tag tag-dev">DEV</span> aggregate</td></tr>
+          <tr><td class="t-num">8</td><td class="t-mono">topology_reconcile</td><td>Apply segments, paths, DNS, ingress, policy, faults, and peer grants</td><td class="t-dim">network fabric</td><td><span class="tag tag-dev">DEV</span></td></tr>
+          <tr><td class="t-num">9</td><td class="t-mono">environment_inspect</td><td>Report topology, Machines, targets, lifecycle, ownership, and capabilities</td><td class="t-dim">environment service</td><td><span class="tag tag-dev">DEV</span></td></tr>
           <tr><td class="t-num">10</td><td class="t-mono">environment_delete</td><td>Remove only the selected environment's owned state and endpoints</td><td class="t-dim">environment service</td><td><span class="tag tag-dev">DEV</span></td></tr>
         </tbody>
       </table>
@@ -608,17 +609,17 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     <div class="clauses">
 
       <article class="clause">
-        <div class="clause-h"><span class="cno">5.1</span>Environment identity &amp; target</div>
+        <div class="clause-h"><span class="cno">5.1</span>Project, Environment &amp; Machine identity</div>
         <div class="clause-b">
-          <p>One stable identity owns an immutable target specification, project binding, state, resources, endpoints, and lifecycle. The daemon selects a backend from host OS, target OS, and architecture. Unsupported pairs fail explicitly; the VM, container, sandbox, or native process boundary remains an inspectable implementation detail.</p>
+          <p>A ProjectDefinition may create many Environment instances, including several for one worktree. Each Environment owns a topology of Machines; each Machine owns its immutable target specification and target-native state. Unsupported host/Machine-target pairs fail explicitly.</p>
           <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> backend primitives · <span class="tag tag-dev">DEV</span> unified environment aggregate</div>
         </div>
       </article>
 
       <article class="clause">
-        <div class="clause-h"><span class="cno">5.2</span>Linux target &amp; current workloads</div>
+        <div class="clause-h"><span class="cno">5.2</span>Machine targets &amp; topology</div>
         <div class="clause-b">
-          <p>On macOS, Linux workloads execute inside the selected Linux VM. OCI images pull, run, exec, and log through pinned <b>youki</b>; Compose-class stacks reconcile deterministically through vz-stack. The same Linux target contract moves next to Linux hosts and later to Windows hosts.</p>
+          <p>On macOS, Linux and native macOS Machines can form one Environment through declared private or simulated-public paths. Linux OCI execution uses pinned <b>youki</b>; the same Linux Machine contract moves next to Linux and Windows hosts.</p>
           <pre class="cmdline"><span class="cmt"># bring a whole environment up, stream its logs, tear it down</span>
 vz stack up -f compose.yaml -n demo
 vz stack logs demo --service web --follow
@@ -630,28 +631,27 @@ vz stack down demo --volumes</pre>
       <article class="clause">
         <div class="clause-h"><span class="cno">5.3</span>Docker compatibility belongs to Linux</div>
         <div class="clause-b">
-          <p>Every Linux Developer Environment implicitly owns a private dockerd, containerd, BuildKit cache, images, volumes, networks, endpoint, and Docker context. The normal host Docker CLI selects that environment. No global socket, default-context mutation, Docker Desktop fallback, or cross-environment routing is allowed.</p>
-          <pre class="cmdline"><span class="cmt"># select one Linux environment explicitly</span>
-export DOCKER_CONTEXT="$(vz dev context)"
-docker ps
-docker compose up
-docker build -t app .</pre>
+          <p>Every Linux Machine owns a private dockerd, containerd, BuildKit cache, images, volumes, networks, endpoint, and context. The host Docker CLI selects that exact Environment/Machine. No Environment-wide/global socket, default-context mutation, fallback, or cross-routing is allowed.</p>
+          <pre class="cmdline"><span class="cmt"># use the Machine context reported by vz status</span>
+docker --context vz-agent-a-api ps
+docker --context vz-agent-a-api compose up
+docker --context vz-agent-a-api build -t app .</pre>
           <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> guarded vz Docker shim primitives · <span class="tag tag-dev">DEV</span> implicit Engine + context + full host-client parity</div>
         </div>
       </article>
 
       <article class="clause">
-        <div class="clause-h"><span class="cno">5.4</span>Native macOS target</div>
+        <div class="clause-h"><span class="cno">5.4</span>Native macOS Machine</div>
         <div class="clause-b">
-          <p>Native macOS environments reuse pinned IPSW/base images, provisioning, guest-agent execution, patching, and save/restore flows. They run Darwin and Apple toolchains in a macOS VM and do not silently create a Linux sidecar for Docker.</p>
+          <p>Native macOS Machines reuse pinned images, provisioning, guest-agent execution, patching, and save/restore. They can communicate with declared Linux Machines but never inherit their Docker capability.</p>
           <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> native VM mechanisms · <span class="tag tag-dev">DEV</span> unified Developer Environment lifecycle</div>
         </div>
       </article>
 
       <article class="clause">
-        <div class="clause-h"><span class="cno">5.5</span>Parallelism &amp; persistence</div>
+        <div class="clause-h"><span class="cno">5.5</span>Parallelism, network &amp; persistence</div>
         <div class="clause-b">
-          <p>Multiple environments run concurrently without sharing mutable disks, processes, sockets, ports, networks, caches, credentials, or lifecycle events. Stop preserves declared persistent state; restart reuses it; delete removes only state proven to belong to that identity.</p>
+          <p>Many Environment instances and many Machines run concurrently. Separate Environments share no mutable state or routes. Machines use declared paths, including a local public-like DNS/TLS/ingress/NAT edge. Stop preserves declared state; delete removes only the selected ownership graph.</p>
           <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> checkpoint foundations · <span class="tag tag-dev">DEV</span> durable unified ownership and isolation gates</div>
         </div>
       </article>
@@ -659,7 +659,7 @@ docker build -t app .</pre>
       <article class="clause">
         <div class="clause-h"><span class="cno">5.6</span>Platform expansion</div>
         <div class="clause-b">
-          <p>The ordered matrix is Linux-on-macOS and macOS-on-macOS now; Linux-on-Linux next; Linux-on-Windows later; and Windows-on-Windows finally. Linux remains the portable target across all three hosts, while native targets preserve their operating-system semantics.</p>
+          <p>The ordered Machine-target matrix is Linux-on-macOS and macOS-on-macOS now; Linux-on-Linux next; Linux-on-Windows later; Windows-on-Windows finally. Linux remains portable; native Machines preserve their operating-system semantics.</p>
           <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> Mac backend primitives · <span class="tag tag-dev">DEV</span> Linux-host parity · <span class="tag tag-planned">PLANNED</span> Windows host/targets</div>
         </div>
       </article>
@@ -724,10 +724,10 @@ docker build -t app .</pre>
   <!-- ─────────────── 7 · truth table ─────────────── -->
   <section class="sec truth" aria-labelledby="truth-h">
     <div class="sec-h">
-      <h2 id="truth-h"><span class="no">7</span>Host × target truth table</h2>
+      <h2 id="truth-h"><span class="no">7</span>Host × Machine-target truth table</h2>
       <span class="seclabel">Linux universal · native additive</span>
     </div>
-    <p>Support is earned per host×target pair. Linux travels across all hosts; native targets are added where their operating-system toolchains matter.</p>
+    <p>Support is earned per host×Machine-target pair. Linux travels across all hosts; native Machines are added where their operating-system toolchains matter.</p>
     <div class="tbl-wrap">
       <table class="tbl" aria-label="Host and target support matrix">
         <thead>
@@ -741,7 +741,7 @@ docker build -t app .</pre>
           <tr><td class="t-mono">Windows</td><td>Windows</td><td><span class="tag tag-planned">PLANNED</span> native Windows target after Linux-on-Windows</td></tr>
         </tbody>
         <tfoot>
-          <tr><td colspan="3">Docker is implicit only for Linux targets. Each Linux environment owns a private Engine, containerd, BuildKit cache, images, volumes, networks, endpoint, and context. Native macOS and Windows targets do not silently start Linux.</td></tr>
+          <tr><td colspan="3">Docker is implicit only for Linux Machines. Each owns a private Engine, containerd, BuildKit cache, images, volumes, networks, endpoint, and context. Native macOS and Windows Machines do not silently start Linux.</td></tr>
         </tfoot>
       </table>
     </div>
@@ -787,7 +787,7 @@ docker build -t app .</pre>
           </tr>
           <tr>
             <td class="t-mono">vz-agent-skill</td>
-            <td>Claude plugin + skill: agents pick vz up with zero config</td>
+            <td>Claude plugin + skill: agents drive the shipped vz run workflow</td>
             <td class="t-mono">.claude-plugin/ (in repo)</td>
             <td><span class="tag tag-active">ACTIVE</span></td>
           </tr>
@@ -817,11 +817,11 @@ docker build -t app .</pre>
           </tr>
           <tr>
             <td class="t-mono">F.1</td><td class="t-dim">in dev</td><td><span class="tag tag-dev">DEV</span></td>
-            <td>Unified Developer Environment identity/lifecycle; streaming data plane; native macOS adapter; Linux per-environment Docker, networking, storage, and isolation</td>
+            <td>Project/Environment/Machine identity; five-verb lifecycle; mixed targets; per-Linux-Machine Docker; isolated private and public-like topology networking</td>
           </tr>
           <tr>
             <td class="t-mono">F.2</td><td class="t-dim">planned</td><td><span class="tag tag-planned">PLANNED</span></td>
-            <td>Linux-on-macOS and macOS-on-macOS release gates; private managed Docker contexts; full Mac Docker CLI/Compose/buildx compatibility for the Linux target</td>
+            <td>Linux, native macOS, and aggregate topology gates; private per-Machine Docker contexts; full Mac Docker CLI/Compose/buildx compatibility</td>
           </tr>
           <tr>
             <td class="t-mono">F.3</td><td class="t-dim">planned</td><td><span class="tag tag-planned">PLANNED</span></td>
@@ -839,8 +839,8 @@ docker build -t app .</pre>
     <ol>
       <li>The current Linux-on-macOS backend uses a Linux VM on Apple Virtualization.framework; native macOS environments use macOS VMs. macOS 14+ (Sonoma) is required for VM state save/restore.</li>
       <li>Boot and reuse behavior as stated in the vz repository documentation (v0.3.20): ~3 s typical cold boot to first command; setup cached by hash; warm reuse instant. Subject to the project's measured-claims policy; no independent benchmark is claimed here.</li>
-      <li>For Linux-on-macOS, Linux workloads—including each environment's future private dockerd—execute in the selected Linux VM. Declared host clients and bridges remain visible parts of the contract.</li>
-      <li>The lifecycle register in §4 is proposed UX. Current mechanisms retain their shipped command names while convergence is DEV.</li>
+      <li>For Linux-on-macOS, Linux workloads—including each Linux Machine's future private dockerd—execute in that Machine's backend. Declared host clients and bridges remain visible parts of the contract.</li>
+      <li>The typed API register in §4 is proposed. The shipped 0.3 skill uses legacy command names; 0.4 replaces them with the five-verb surface while convergence is DEV.</li>
       <li>Guest kernel 6.12.85 currently builds <code>developer</code> and legacy <code>container</code> profiles; the public restricted profile becomes <code>Hardened</code>.</li>
     </ol>
   </section>
@@ -888,7 +888,7 @@ docker build -t app .</pre>
     dind: {
       cmd: "docker compose up --build",
       guest: { kind: "FULL DOCKER, IN THE GUEST", body: "Daemon, containers, volumes, and BuildKit all execute inside the VM on the guest kernel (rev F.2). The host contributes a client and a socket that is a proxy, nothing more." },
-      recovery: "Run docker compose down -v, stop the Linux environment while preserving state, or delete that environment and its owned Docker state."
+      recovery: "Run docker compose down -v, stop the owning Environment while preserving its Linux Machine state, or delete that Environment and all of its owned Machine Docker state."
     }
   };
 

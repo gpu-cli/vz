@@ -5,48 +5,65 @@ Status: current planning authority. The historical foundation that follows is re
 
 ## Mission
 
-vz delivers reproducible, parallel **Developer Environments** with native-feeling target operating systems. The Developer Environment—not a sandbox, VM, container, or resident agent—is the product object. It owns identity, project binding, target OS, configuration, mutable state, tools, services, resources, policy, endpoints, evidence, and lifecycle.
+vz delivers reproducible, parallel **Developer Environments**. A project defines
+a topology that can be instantiated many times, including several times for one
+worktree. Each Environment is an isolation/lifecycle aggregate containing one or
+more target-native **Machines** plus owned storage, networks, endpoints, policy,
+and evidence. Sandboxes, VMs, containers, and resident agents are mechanisms.
 
 Lockdown remains a selectable policy and sandboxing remains a powerful implementation primitive. Neither is the primary product value. The default Developer profile favors complete, reproducible development workflows and safe parallelism on local hardware.
 
-## Host×target rollout
+## Host×Machine-target rollout
 
 Implementation and conformance proceed in this exact order:
 
 | Order | Host | Target | Product intent |
 |---:|---|---|---|
-| 1 | macOS | Linux | Universal Linux Developer Environment; environment-local Docker driven by the normal Mac Docker CLI |
-| 2 | macOS | macOS | Native Apple-platform Developer Environment |
-| 3 | Linux | Linux | The same portable Linux environment contract on its native host |
-| 4 | Windows | Linux | The same portable Linux environment contract on Windows |
-| 5 | Windows | Windows | Native Windows Developer Environment |
+| 1 | macOS | Linux | Universal Linux Machine; private per-Machine Docker driven by the normal Mac Docker CLI |
+| 2 | macOS | macOS | Native Apple-platform Machine, including mixed Linux/macOS topologies |
+| 3 | Linux | Linux | The same portable Linux Machine/topology contract on its native host |
+| 4 | Windows | Linux | The same portable Linux Machine/topology contract on Windows |
+| 5 | Windows | Windows | Native Windows Machines in the shared topology |
 
-Linux is universal: macOS, Linux, and Windows hosts all gain the Linux target. Native macOS is immediate alongside Linux-on-macOS because Apple development requires a real macOS target. Native Windows is the final target in this sequence.
+Linux is universal: macOS, Linux, and Windows hosts all gain the Linux Machine
+target. Native macOS is immediate; native Windows is last.
 
-Each host×target pair earns support through its own real end-to-end conformance evidence. Shared lifecycle semantics do not imply identical backend capabilities.
+Each host×Machine-target pair earns support through real end-to-end evidence.
+Shared lifecycle semantics do not imply identical backend capabilities.
 
 ## Developer Environment invariants
 
-- One project may have several named environments, and several environments may run concurrently.
+- One project or worktree may have several named Environments; each Environment
+  may have several target-native Machines.
 - Definitions and artifacts are reproducible, pinned, checksummed, inspectable, repairable, and portable wherever the same target contract is supported.
-- Mutable state, files, processes, endpoints, ports, caches, credentials, events, and lifecycle ownership are isolated per environment.
+- Mutable state and networking are isolated per Environment; Machine-owned
+  target state and capabilities are additionally isolated per Machine.
+- Machines communicate only through declared private/public-like paths. Separate
+  Environments are default-deny except for explicit service peer grants.
 - VMs, OCI containers, native isolation, pools, sandboxes, worktrees, harness residency, brokers, and shims are internal primitives or optional environment capabilities.
 - Humans, local agents, IDEs, scripts, CI jobs, and orchestrators use the same lifecycle and capability truth.
 - Target-specific behavior is declared through versioned capabilities and fails closed when unavailable.
 
 ## Docker contract
 
-Docker compatibility is implicit when creating a Developer-profile **Linux** environment on a host×target pair that has passed the Docker conformance suite. It is target-qualified, never global:
+Docker compatibility is implicit for every Developer-profile **Linux Machine**
+on a host×Machine-target pair that has passed conformance. It is Machine-scoped,
+never Environment-global:
 
-- every Linux environment owns its own Engine, containerd, BuildKit cache, images, volumes, networks, credentials scope, data root, host endpoint, and Docker context;
-- the normal host Docker CLI, Compose, and buildx explicitly select one environment;
+- every Linux Machine owns its own Engine, containerd, BuildKit cache, images,
+  volumes, networks, credentials, data root, endpoint, and Docker context;
+- the normal host Docker CLI, Compose, and buildx select one exact
+  Environment/Machine;
 - vz never mutates the user's default Docker context and never falls back to Docker Desktop, system Docker, or another environment;
 - concurrent environments must have no Docker state, socket, network, port, or lifecycle cross-talk;
-- native macOS and native Windows environments do not inherit Docker claims from Linux.
+- native macOS and native Windows Machines do not inherit Docker claims from
+  Linux Machines.
 
 ## Planning interpretation
 
-Current planning should be organized around the Developer Environment contract and the ordered host×target matrix. Existing sandbox, runtime, Docker, macOS VM, guest agent, networking, storage, checkpoint, broker, and harness work should be retained and reclassified beneath that contract rather than discarded. Historical nouns in old documents do not by themselves define the current product API.
+Current planning follows the Developer Environment topology contract and ordered
+host×Machine-target matrix. Existing backend work is retained beneath it;
+historical nouns do not define the current product API.
 
 ---
 

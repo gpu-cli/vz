@@ -16,11 +16,25 @@ bd dolt push          # Push issue DB to the beads remote
 
 ## Product Mission
 
-- The primary product object is a reproducible, parallel **Developer Environment**. Sandboxes, containers, VMs, and processes are implementation mechanisms or advanced capabilities.
-- Host OS and target OS are separate dimensions. Linux is the universal target: Linux-on-macOS now, Linux-on-Linux next, and Linux-on-Windows later. Native macOS-on-macOS is also current; native Windows-on-Windows follows Linux-on-Windows.
-- Docker is implicit, private, and scoped to each Linux-target Developer Environment. There is no global vz Docker socket or fallback daemon. Native macOS and native Windows targets do not implicitly provide Docker.
+- A project defines a topology and may have multiple named **Developer
+  Environment** instances; a worktree is a binding/default selector, not
+  identity. Each Environment is an isolation/lifecycle boundary containing one
+  or more target-native **Machines**.
+- Host OS and Machine target OS are separate dimensions. One Environment may
+  contain Linux and native macOS Machines. Linux is the universal Machine target:
+  Linux-on-macOS now, Linux-on-Linux next, and Linux-on-Windows later; native
+  Windows-on-Windows follows Linux-on-Windows.
+- Docker is implicit, private, and scoped to each Linux Machine. There is no
+  Environment-wide/global vz Docker socket or fallback daemon. Native macOS and
+  native Windows Machines do not implicitly provide Docker.
+- Machines communicate through declared private or Environment-local
+  public-like paths. Separate Environments are default-deny; cross-Environment
+  access requires an explicit directional service grant.
+- The 0.4 public lifecycle CLI is `vz up`, `vz exec`, `vz status`, `vz stop`,
+  and `vz delete`; richer topology operations belong to typed APIs.
 - Linux-target OCI execution is youki-only. The public locked-down profile is **Hardened** and remains a secondary, restricted mode.
-- Capability and release claims are qualified by host×target pair and must distinguish ACTIVE, DEV, and PLANNED behavior.
+- Capability and release claims are qualified by host×Machine-target pair and
+  must distinguish ACTIVE, DEV, and PLANNED behavior.
 
 ## Remote-backed DB coordination (READ BEFORE ANY bd WRITE)
 
@@ -67,12 +81,17 @@ This beads DB is remote-backed (Dolt). When bd refuses writes with a schema-migr
 ## Verification Standard for Beads/Tasks
 
 - Do NOT consider any bead/task complete based only on unit tests.
-- Completion requires real end-to-end verification on the relevant host×target backend.
+- Completion requires real end-to-end verification on the relevant
+  host×Machine-target backend and, for topology work, the aggregate Environment
+  gate in `planning/developer-environments/GOAL-0.4.0.md`.
 - On macOS hosts, Linux-target verification should run inside a local `vz`-managed Linux VM first (via the `vz vm ...` flows), not an arbitrary external SSH host.
 - Do not use ad-hoc external SSH Linux hosts for release-gate evidence collection.
-- If the applicable host×target end-to-end gate has not run and passed, keep the bead/task open.
+- If the applicable host×Machine-target end-to-end gate has not run and passed,
+  keep the bead/task open.
 - For container/stack runtime work, run `scripts/run-sandbox-vm-e2e.sh --suite all` and attach the artifact logs as evidence.
 - For Linux-target Docker work (including beads `vz-5in`/`vz-yr9`/`vz-k3v`/`vz-7ez`), evidence must show youki as the only OCI runtime binary present in the target; ship and run `scripts/run-linux-docker-e2e.sh --suite all` from the host when the wave lands.
-- Native macOS work requires the native macOS-on-macOS gate; Docker evidence from a neighboring Linux environment does not certify the macOS target.
-- Future Linux-on-Linux, Linux-on-Windows, and Windows-on-Windows claims require their own release-built host×target conformance evidence.
+- Native macOS work requires the native macOS-on-macOS gate; Docker evidence from
+  a sibling or neighboring Linux Machine does not certify the macOS target.
+- Future Linux-on-Linux, Linux-on-Windows, and Windows-on-Windows claims require
+  their own release-built host×Machine-target conformance evidence.
 - For btrfs portability changes, run `scripts/run-linux-btrfs-e2e.sh` and attach `.artifacts/linux-btrfs-e2e/<timestamp>/summary.txt` + logs as evidence.

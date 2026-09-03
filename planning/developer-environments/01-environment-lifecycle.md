@@ -1,42 +1,64 @@
-# First-class Developer Environment identity and lifecycle
+# First-class Environment topology, Machine identity, and durable lifecycle
 
 Depends on: Product contract and terminology
 
 ## Purpose
 
-Replace inferred `vz.run.*` behavior with a versioned runtime contract for Developer Environments and correct stop/delete semantics.
+Replace inferred `vz.run.*` behavior with a versioned aggregate contract for
+Projects, Environment instances, and target-native Machines, including durable
+ownership and correct stop/delete semantics.
 
-## Step 1: Add explicit environment class
+## Step 1: Add the aggregate schema
 
-- Extend runtime-contract and wire types with an environment class, immutable `TargetSpec` (`os`, `arch`, image/version/channel), requested requirements, and negotiated capabilities.
-- Persist and return the class through manager, gRPC, API, CLI JSON, receipts, and inspection.
-- Migrate legacy project records deterministically without confusing Hardened sandboxes with Developer environments.
+- Add versioned `ProjectDefinition`, `WorkspaceBinding`, `EnvironmentInstance`,
+  `MachineSpec`, `MachineInstance`, `MachineIncarnation`, `Network`, `Endpoint`,
+  and ownership records.
+- Put immutable `TargetSpec` (`os`, `arch`, image/version/channel), requested
+  requirements, backend, and negotiated capabilities on each Machine.
+- Persist and return project/environment/machine IDs through manager, gRPC,
+  APIs, status JSON, events, errors, receipts, and inspection.
+- Migrate a legacy project record deterministically to one Environment with one
+  Machine without confusing Hardened sandboxes with Developer Machines.
 
 ## Step 2: Make profile selection explicit
 
-- Select a backend from `(host OS, target OS, architecture)` and fail explicitly for unsupported tuples.
-- Select the Developer kernel/profile for Linux Developer environments at the backend boundary.
-- Select pinned native image metadata and TargetAdapter for macOS/Windows environments.
+- Select a Machine backend from `(host OS, Machine target OS, architecture)` and
+  fail explicitly for unsupported tuples.
+- Select the Developer kernel/profile for Linux Machines at the backend boundary.
+- Select pinned native image metadata and TargetAdapter for macOS/Windows Machines.
 - Retain Container as a deprecated internal alias for Hardened during migration.
 - Fail closed on artifact/profile mismatches.
 
-## Step 3: Separate stop from delete
+## Step 3: Reconcile aggregate and child lifecycle
 
-- Add a resumable stopped state and valid transitions.
-- Implement stop/start/restart without deleting persistent disks or managed contexts.
+- Reconcile Machines, networks, endpoints, volumes, and dependencies as one
+  idempotent Environment operation with streamed progress and a terminal receipt.
+- Add resumable aggregate and Machine states with explicit degraded/failure
+  behavior and replaceable Machine incarnations.
+- Implement stop/start/restart without deleting persistent disks or
+  Machine-specific managed contexts.
 - Keep delete explicit, destructive, ownership-checked, and recoverable where practical.
-- Ensure daemon restart reconstructs authoritative environment state and cleans stale live resources.
+- Ensure daemon restart reconstructs authoritative Environment/Machine/topology
+  state and cleans stale live resources.
 
 ## Step 4: Define resource ownership
 
-Persist the environment-to-VM/container/disk/socket/context/network mapping in one daemon-owned record. Use bounded collision-checked keys for filesystem and socket resources.
+Persist the Environment ownership graph, including every
+Machine/VM/container/disk/socket/context/network/endpoint mapping, in
+daemon-owned records. Use bounded collision-checked keys containing Environment
+and Machine identity where applicable.
 
-Define `HostBackend`, `TargetAdapter`, and `CapabilitySet` contracts for isolation, process/console semantics, filesystem sharing, networking, service supervision, capability endpoints, suspend/resume, and checkpoints. Unsupported capabilities are explicit status fields and errors rather than silent target substitution.
+Define `EnvironmentSupervisor`, `HostBackend`, `TargetAdapter`, `CapabilitySet`,
+`StorageBackend`, `WorkspaceBackend`, and `NetworkBackend` contracts. Unsupported
+capabilities are explicit rather than silently substituting another Machine.
 
 ## Validation
 
-- Contract serialization/migration tests across old and new records.
-- State-machine and idempotency tests for create/start/stop/restart/delete/failure.
-- Real local VM test proving stopped state resumes with the same environment identity and disk.
+- Contract serialization/migration tests across old and new aggregate records.
+- State-machine and idempotency tests for aggregate and Machine lifecycle.
+- Real local VM tests proving multiple Environments per project/worktree,
+  multiple Machines per Environment, and identity-preserving stop/up.
+- Failure during reconciliation recovers without duplicate or cross-owned
+  resources; ambiguous selection fails with candidates.
 - Hardened artifact selection remains unchanged and rejects Developer metadata.
 - Contract fixtures and JSON/protobuf round trips are identical on macOS, Linux, and Windows builds.

@@ -18,8 +18,9 @@ description: >
 Run commands inside the current Linux-on-macOS Developer Environment backend,
 implemented by a lightweight Linux VM through Apple's Virtualization.framework.
 The repository documents ~3s boot, a VirtioFS project mount, and persistent
-reuse. Native macOS environments and the unified `vz dev` lifecycle are product
-direction but are not substituted for the current commands below.
+reuse. Multi-Machine/mixed-target Environments and the five-verb
+`vz up/exec/status/stop/delete` lifecycle are 0.4 product direction but are not
+substituted for the currently shipped commands below.
 
 ## Detection
 

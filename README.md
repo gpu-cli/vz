@@ -1,44 +1,51 @@
 # vz
 
-Reproducible Developer Environments, with Linux as the universal target.
+Reproducible Developer Environment topologies, with Linux as the universal
+Machine target.
 
 A **Developer Environment** is the primary `vz` product object: a named,
-persistent, reproducible workspace with an operating-system target, compute,
-storage, networking, lifecycle, and workload runtime. It is not a synonym for
-one container. Containers, stacks, VMs, and host/guest transports are
-implementation and workload surfaces behind that environment.
+isolated realization of a project topology containing one or more target-native
+Machines plus their storage, networks, DNS, endpoints, credentials, lifecycle,
+and workload state. It is not a synonym for one VM or container. A project and
+even one worktree may have several Environment instances; a single Environment
+may contain Linux and native macOS Machines.
 
 The target model is deliberately asymmetric:
 
-- **Linux is universal.** Linux Developer Environments run on macOS today and
-  are planned for Linux and Windows hosts.
-- **Native targets follow the host.** Native macOS environments run on macOS;
-  native Windows environments are planned for Windows.
-- **Docker belongs to each Linux environment.** The complete Docker-compatible
-  workflow is in progress. Each Linux Developer Environment will implicitly own
-  its private Docker Engine, containerd, BuildKit cache, image and volume state,
-  network namespace, host proxy socket, and Docker context. There is no global
-  `vz` Docker daemon and no Docker capability implied for native macOS or
-  Windows targets.
+- **Linux is universal.** Linux Machines run on macOS today and are planned for
+  Linux and Windows hosts.
+- **Native targets follow the host.** Native macOS Machines run on macOS;
+  native Windows Machines are planned for Windows.
+- **Docker belongs to each Linux Machine.** The complete Docker-compatible
+  workflow is in progress. Every Linux Machine will implicitly own its private
+  Docker Engine, containerd, BuildKit cache, image and volume state, networks,
+  endpoint, and Docker context. There is no Environment-global or global `vz`
+  Docker daemon and no Docker capability implied for native macOS/Windows
+  Machines.
+- **Networking can be realistic without being public.** Machines use declared
+  private paths or an Environment-local simulated-public DNS/TLS/ingress/NAT
+  edge. Separate Environments are default-deny.
 - **Hardened environments are secondary.** The constrained `container` kernel
   profile remains available for locked-down workloads, but it is not a peer
   product or the default Developer Environment.
 
 Today, `vz` ships Linux VM/OCI/BuildKit primitives and native macOS VM automation
 on Apple Silicon. Their convergence into the complete Developer Environment
-contract—including private per-environment Docker—is in development. Additional
-host/target combinations below are roadmap work, not shipped functionality.
+contract—including topology and private per-Linux-Machine Docker—is in
+development. Additional
+host/Machine-target combinations below are roadmap work, not shipped functionality.
 
 ## Why vz
 
-- **Environment-first.** Project configuration, state, workloads, and lifecycle
-  belong to one reproducible Developer Environment.
+- **Environment-first.** A project definition creates isolated reproducible
+  topology instances, each with one or more Machines.
 - **Linux everywhere.** Keep the Linux target consistent while choosing the
   best isolation backend for macOS, Linux, or Windows.
 - **Native where it matters.** Use native macOS environments on Apple hardware;
   native Windows is a later target for Windows hosts.
-- **Private by construction.** Linux Docker state and endpoints are scoped to a
-  specific environment rather than shared through a global daemon.
+- **Private by construction.** Linux Docker state is scoped to one Machine;
+  Environment routing, DNS, storage, credentials, and endpoints cannot leak into
+  another instance.
 - **Script-friendly.** Consistent command flows and `--json` output support
   automation.
 
@@ -81,7 +88,7 @@ cd linux && make docker-build KERNEL_PROFILE=container
 Release CI caches the developer/container kernel images by kernel inputs, then
 rebuilds the initramfs and metadata for each `vz` release.
 
-## Host and target roadmap
+## Host and Machine-target roadmap
 
 Status describes backend maturity, not complete product parity.
 
@@ -91,10 +98,16 @@ Status describes backend maturity, not complete product parity.
 | Linux | **DEV:** partial `linux-native` backend; complete Developer Environment parity remains in progress | Not applicable | Not applicable |
 | Windows | **PLANNED:** Linux Developer Environments using the appropriate Windows virtualization backend | Not applicable | **PLANNED later:** native Windows Developer Environments |
 
-Linux is the universal target across all three hosts. Native macOS and native
-Windows complement it; they do not replace it.
+Linux is the universal Machine target across all three hosts. Native macOS and
+native Windows Machines complement it; they do not replace it. On macOS, Linux
+and native macOS Machines may participate in the same declared Environment
+topology.
 
-## Quick start (shipped macOS/Linux-target workflow)
+## Quick start (current legacy macOS/Linux-target workflow)
+
+The commands below document the shipped 0.3 single-Linux-VM surface. They are
+being replaced for 0.4 by `vz up`, `vz exec`, `vz status`, `vz stop`, and
+`vz delete`; they do not define the future product object model.
 
 ### 1. Run commands in a Linux VM
 
@@ -125,8 +138,8 @@ The first `vz run` boots the environment's Linux VM (~3s), pulls the base
 image, and runs setup commands from `vz.json`. Subsequent runs reuse that
 environment and skip setup when the setup hash is unchanged.
 
-The intended Developer Environment UX will also start and select that
-environment's private Docker endpoint implicitly. Until the Docker roadmap is
+The intended Developer Environment UX will also start each declared Linux
+Machine's private Docker service and report its managed context. Until the Docker roadmap is
 complete, do not assume that host `docker`, Compose, or buildx commands have
 full compatibility merely because the OCI workflows below are available.
 
@@ -281,15 +294,15 @@ vz vm patch apply-delta \
 vz vm run --image ~/.vz/images/base-patched.img --name delta-test --headless
 ```
 
-## Command groups
+## Current 0.3 command groups
 
 ### Dev environments
 
 `init`, `run`, `run -i`, `stop`, `status`, `logs`
 
-These are the primary user-facing lifecycle commands. The groups below are
-current workload and infrastructure surfaces within the environment model, not
-separate environment products.
+These are the shipped legacy lifecycle commands. They and the infrastructure
+groups below are removed from the 0.4 public surface in favor of `up`, `exec`,
+`status`, `stop`, and `delete`; advanced operations move to typed APIs.
 
 ### OCI workloads
 

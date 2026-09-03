@@ -1,18 +1,17 @@
-# Linux Target and Linux-Host Support
+# Linux Machine Target and Linux-Host Support
 
-Linux is the universal `vz` Developer Environment target. The product roadmap
-supports Linux environments on macOS, Linux, and Windows hosts:
+Linux is the universal `vz` Machine target. The product roadmap supports Linux
+Machines inside Developer Environment topologies on macOS, Linux, and Windows:
 
-| Host | Linux Developer Environment status | Backend direction |
+| Host | Linux Machine status | Backend direction |
 | --- | --- | --- |
 | Apple Silicon macOS | **ACTIVE** Linux VM/OCI/BuildKit primitives; unified lifecycle and private Docker are **DEV** | Apple Virtualization.framework |
 | Linux | **DEV:** the partial `linux-native` OCI backend exists, but complete Developer Environment parity is not shipped | Native namespaces and cgroup v2 |
 | Windows | **PLANNED:** no shipped backend yet | Windows virtualization appropriate for a Linux guest |
 
-Native macOS Developer Environments are also a current product direction on
-macOS. Native Windows Developer Environments come later on Windows. Those
-native targets do not imply Docker: Docker is an implicit, private capability
-of each **Linux** Developer Environment only.
+Native macOS Machines are also immediate on macOS; native Windows Machines come
+later. Native Machines do not inherit Docker: it is an implicit, private
+capability of each **Linux Machine** only.
 
 The sections below document the current experimental Linux-host backend. They
 are not a declaration of full cross-host or Docker compatibility.
@@ -111,12 +110,12 @@ supported fallback.
 | Resource limits (CPU) | VM-level CPU count | cgroup v2 `cpu.max` |
 | Resource limits (memory) | VM-level memory | cgroup v2 `memory.max` (planned) |
 
-The end-state is one Developer Environment model despite different host
-backends. Every Linux environment owns its state and, once Docker compatibility
-lands, its own Docker Engine, containerd, BuildKit cache, image store, volumes,
-networks, proxy socket, and Docker context. No host uses a global `vz` Docker
-daemon, and one environment must never fall back to another environment or to
-Docker Desktop.
+The end-state is one Environment topology model despite different host backends.
+Every Linux Machine owns its target state and, once Docker compatibility lands,
+its own Docker Engine, containerd, BuildKit cache, image store, volumes,
+networks, endpoint, and context. No host uses an Environment-global or global
+`vz` daemon, and a Machine never falls back to a sibling, another Environment,
+system Docker, or Docker Desktop.
 
 ## Known Limitations
 

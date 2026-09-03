@@ -1,15 +1,20 @@
-# Linux-on-Linux Developer Environment parity
+# Linux-Machine topology parity on Linux hosts
 
 Depends on: macOS migration, documentation, and launch
 
 ## Purpose
 
-Implement the universal Linux-target Developer Environment on Linux hosts after Mac GA, using Linux-native isolation without a host-root Docker dependency.
+Implement Linux Machines and the same multi-instance/multi-Machine Environment
+topology contract on Linux hosts after Mac GA, using native isolation without a
+host-root Docker dependency.
 
 ## Step 1: Implement the Linux backend
 
-- Map the durable environment aggregate onto the rootless outer-sandbox design.
-- Provide the same workspace container, implicit private Docker Engine, persistent state, managed Docker context, networking, ports, mounts, status, stop/restart/delete semantics, and youki-only runtime invariant.
+- Map each Machine plus the Environment aggregate onto the rootless
+  outer-sandbox design.
+- Provide per-Linux-Machine Docker, persistent state, contexts, workspace
+  projections, topology networks, public-like edge, faults, peering, status,
+  lifecycle, and youki-only behavior.
 - Use host-neutral contract types; do not introduce a second Linux-only product model.
 
 ## Step 2: Resolve Linux-specific boundaries
@@ -19,7 +24,9 @@ Implement the universal Linux-target Developer Environment on Linux hosts after 
 
 ## Step 3: Reuse the scenario suite
 
-Run the same lifecycle, Docker, buildx, Compose, storage, networking, recovery, concurrency, and isolation scenarios through a Linux host driver. Host-specific assertions are capability-labelled additions, not replacements for shared scenarios.
+Run the same stable 0.4 topology, lifecycle, Docker, buildx, Compose, storage,
+networking, recovery, concurrency, and isolation scenario IDs through a Linux
+host driver. Host-specific assertions are additions, not replacements.
 
 ## Validation
 

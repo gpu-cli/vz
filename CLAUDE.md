@@ -99,15 +99,23 @@ rm -rf linux/src/linux-6.12.85 && cd linux && make docker-build
 
 ### Key Design Decisions
 
-- **Developer Environment is the product object** — sandboxes, containers, VMs, and processes are backends or advanced capabilities
-- **Linux is the universal target** — Linux-on-macOS now, Linux-on-Linux next, Linux-on-Windows later; native macOS is current and native Windows follows
-- **Docker is implicit per Linux environment** — private Engine/state/context, no global socket or fallback daemon; native targets do not inherit Docker
+- **Developer Environment is a topology instance** — projects/worktrees may have
+  several isolated instances, and each instance may contain several Machines
+- **Machine owns target OS** — Linux is universal across hosts; Linux and native
+  macOS Machines can coexist in one Environment on macOS
+- **Docker is implicit per Linux Machine** — private Engine/state/context, no
+  Environment-wide/global socket or fallback; native Machines do not inherit it
+- **Declared topology only** — private and simulated-public paths are explicit;
+  cross-Environment access is default-deny and service-scoped
+- **Five public lifecycle verbs** — `up`, `exec`, `status`, `stop`, `delete`;
+  infrastructure operations remain typed APIs
 - **youki-only for Linux OCI** — no runc/crun fallback; `Container` is a legacy internal name for the public Hardened profile
 - **macOS 14 (Sonoma) minimum** — required for save/restore VM state
 - **Apple Silicon only** — macOS guest VMs require Apple Silicon
 - **objc2-virtualization for FFI** — auto-generated bindings, no hand-written sys crate, compile-time verification
 - **Async-first (tokio)** — all VM ops bridge ObjC completion handlers to tokio futures
-- **Long-lived VM model** — single VM stays running, project dirs swapped via VirtioFS mounts
+- **Machine lifecycle is backend-owned** — pooling or long-lived VMs may optimize
+  an implementation but cannot collapse distinct Machine identities/state
 - **vsock for communication** — host↔guest channel without network config
 - **Dual backend** — `RuntimeBackend` trait in `vz-runtime-contract` with macOS (VM) and Linux-native implementations
 - **Linux-native uses youki** — shells out to the pinned youki runtime for container lifecycle and uses `ip` commands for networking

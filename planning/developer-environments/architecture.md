@@ -1,95 +1,192 @@
-# Architecture: project-scoped Developer Environments
+# Architecture: multi-instance Developer Environment topologies
 
-## Object model
-
-```text
-Developer Environment (stable public identity)
-├── immutable TargetSpec { os, arch, image/version, requirements }
-├── host record, class, lifecycle, capabilities, and ownership
-├── HostBackend selected from (host OS, target OS, architecture)
-├── TargetAdapter for native boot/process/service/shutdown semantics
-├── workspace and persistent state
-├── environment-scoped network/share/credential/endpoint policy
-└── target-qualified capabilities
-    ├── Linux: implicit private Docker/containerd/BuildKit + youki
-    ├── macOS: native launchd/process/APFS/VM capabilities
-    └── Windows: native service/process/NTFS/isolation capabilities
-```
-
-`Sandbox` remains a low-level runtime-contract name for an isolation boundary during migration. It is not a peer user journey. A Linux workspace may be a resident container; macOS and Windows workspaces are target-native. `Docker container` specifically means a workload created inside a Docker-capable Linux target.
-
-## Identity
-
-An environment has one stable ID. It is explicitly named or bound to a canonical project/worktree identity. Display names are human-readable; storage, endpoint-routing, and context keys are bounded, collision-checked identifiers owned by `vz-runtimed`. Persisted identity is not the native path string, so moving a project or crossing path syntaxes does not silently create or alias an environment.
-
-The target is persisted independently of detected host data and cannot change in place. The daemon selects a backend only for a supported `(host, target, arch)` tuple. `vz status --json` reports host, target, backend diagnostics, target image/build, architecture, and negotiated capabilities.
-
-Users never construct transport paths. Capability endpoints are backend-owned. For Docker-capable Linux targets, the Engine Endpoint Adapter preserves Docker streams and connection hijacking while authorizing/translating native host bind paths into Linux paths.
-
-## Lifecycle
-
-Environment lifecycle distinguishes stopped from deleted:
+## Aggregate model
 
 ```text
-Creating -> Ready <-> Stopped -> Deleting -> Deleted
-    |          |         |          |
-    +----------+---------+--------> Failed
+ProjectDefinition (versioned desired topology)
+└── EnvironmentInstance (isolation, ownership, lifecycle, and evidence root)
+    ├── WorkspaceBinding[]
+    ├── MachineInstance[]
+    │   ├── TargetSpec { os, arch, image/version, requirements }
+    │   ├── HostBackend + TargetAdapter + CapabilitySet
+    │   ├── MachineIncarnation and target-native persistent state
+    │   └── Linux only: private Docker/containerd/BuildKit + youki
+    ├── Network[] + NIC attachments + declared service paths
+    ├── Endpoint[] + DNS/ingress/TLS/NAT/firewall/egress
+    └── Volume[], SecretBinding[], Fault[], Execution[], Receipt[]
 ```
 
-- `stop` shuts down live compute and endpoints while retaining identity and persistent state, including Docker state and context for Linux targets.
-- `restart` preserves identity and persistent state.
-- `delete` is the destructive operation and removes only resources proven to belong to that environment.
-- Direct Docker access to a stopped, missing, ambiguous, or unauthorized environment fails closed and never falls back to Docker Desktop or another environment.
+The Environment is a topology aggregate, not a VM or one target OS. A
+single-Machine topology is the default simple case. Target OS and target-native
+capabilities live on each Machine, permitting Linux and native macOS Machines in
+one Environment on macOS today and Windows Machines on Windows later.
 
-## Target capabilities
+`Sandbox` remains a low-level runtime-contract name for an isolation primitive
+during migration. A Linux Docker container is a workload inside one Linux
+Machine. Neither is a peer product journey.
 
-Docker is a default Linux-target capability, not a universal Environment invariant. Linux environment reconciliation installs/verifies pinned artifacts, prepares private storage/configuration, registers the private endpoint/context, and may socket-activate dockerd/containerd on first API request.
+## Definitions and identity
 
-macOS targets use native macOS process, launchd, filesystem, network, update, and VM lifecycle semantics. They do not spawn Linux just to provide Docker. Windows targets later use Windows-native process, service, console, filesystem, network, and isolation semantics rather than OCI/youki.
+- `ProjectDefinition`: versioned machines, networks, services, endpoints,
+  workspace projections, volumes, policies, and reproducible inputs.
+- `WorkspaceBinding`: associates a checkout/worktree with a project and an
+  Environment without making the native path a persistent identity.
+- `EnvironmentInstance`: immutable ID, human name, definition digest,
+  parameters, ownership graph, aggregate state, and zero or more bindings.
+- `MachineInstance`: immutable ID and stable name within an Environment, target
+  specification, resources, capabilities, attachments, logical state, and a
+  replaceable incarnation.
 
-## Runtime boundary
+Canonical resource identity is `(project_id, environment_id, machine_id)` where
+applicable. Names and paths are selectors. Every persisted child resource
+includes `environment_id`; Machine-owned resources also include `machine_id`.
+Identifiers used in paths, sockets, contexts, networks, and routes are bounded
+and collision checked.
 
-- Linux Developer targets select the Developer kernel/profile explicitly; it includes `USER_NS` and required Docker/cgroup/networking capabilities.
-- The public name `Hardened` replaces `Container` over a compatibility window. Hardened remains restricted and does not acquire Developer/Docker capabilities.
-- Linux-on-macOS may run dockerd rootful inside the Linux environment VM because that VM is the host isolation boundary.
-- Linux parity uses the rootless-in-sandbox design so no host-root Docker daemon is introduced.
-- macOS Developer targets select pinned macOS image/build/channel metadata and a native macOS TargetAdapter.
-- Windows-on-Windows uses a separately selected native Windows backend; the public API does not assume OCI, POSIX, Unix sockets, or a hypervisor.
-- youki remains the sole OCI runtime in Linux targets only.
+Selection order is explicit ID/name, process-scoped selector, unambiguous
+workspace binding, then a declared default or sole Machine. Ambiguity fails with
+candidates. No mutable global current-Environment symlink or Docker selector is
+permitted.
 
-## Host selection UX
+## Reconciliation and lifecycle
 
-Linux-target creation automatically creates or repairs a Docker context, but never mutates Docker's global default context. Supported selection paths are:
+The Environment state machine owns aggregate reconciliation:
+
+```text
+Creating -> Reconciling -> Ready <-> Stopped -> Deleting -> Deleted
+    |            |          |          |           |
+    +------------+----------+----------+---------> Failed
+```
+
+Machines have child state and ordered dependencies. Environment `up` plans the
+topology, allocates only owned resources, starts dependency closure, waits for
+declared readiness, and streams progress. A Machine may fail independently; the
+aggregate reports degraded/failed state without identity substitution.
+
+- `stop` removes live compute and endpoints while preserving the Environment,
+  Machine identities, declared topology, and persistent state.
+- Machine rebuild changes its incarnation but not logical identity or endpoints.
+- `delete` traverses the Environment ownership graph and cannot select or remove
+  a sibling Environment's resources.
+- Daemon restart reconstructs routes, DNS, sockets, contexts, and state from the
+  authoritative aggregate, removing only provably stale owned resources.
+- Long-running mutations use idempotency keys, stream progress, and terminate
+  with a receipt. Unary APIs remain for short bounded reads.
+
+## Machine backends and capabilities
+
+The daemon selects a Machine backend from `(host OS, Machine target OS,
+architecture, requested capabilities)`. Unsupported tuples fail explicitly.
+
+- `HostBackend`: compute isolation, disks, native shares, host networking, and
+  target transport for one Machine.
+- `TargetAdapter`: native boot, process/console, service supervision, shutdown,
+  and target inspection.
+- `CapabilitySet`: Docker/OCI, POSIX TTY/signals, Windows console, filesystems,
+  ports, suspend, snapshot, checkpoint, GUI, and target-specific behavior.
+- `EnvironmentSupervisor`: topology ordering, aggregate lifecycle, resource
+  ownership, endpoint readiness, and recovery.
+- `WorkspaceBackend`: authorized projection as read-write, read-only, or
+  snapshot with explicit writer semantics.
+- `StorageBackend`: Machine disks plus Environment-owned volumes; multi-Machine
+  sharing requires a protocol and consistency contract, never silent block
+  multi-attach.
+
+Virtualization.framework, vsock, VirtioFS, Linux namespaces, WSL/Hyper-V,
+gateway addresses, and endpoint paths remain diagnostics rather than portable
+configuration.
+
+## Linux Machine Docker boundary
+
+Each Linux Machine reconciles an independent private Docker Engine, containerd,
+BuildKit state, image/volume stores, networks, credentials, endpoint, and Docker
+context. Even Machines in the same Environment cannot share a daemon implicitly.
+Shared registries/caches must be declared topology resources.
+
+The Engine Endpoint Adapter authorizes and routes each request by
+`(environment_id, machine_id)`, preserves Docker streaming/hijacking semantics,
+and performs only narrowly authorized host-path translation. `vz status`
+returns a context for every Linux Machine. Normal use is:
 
 ```bash
-vz dev docker -- ps
-docker --context "$(vz dev context)" ps
-eval "$(vz dev env)"   # exports a session-scoped DOCKER_CONTEXT
+docker --context <context-from-vz-status> ps
 ```
 
-The first form executes the host's installed Docker CLI with the resolved context; it is not an Engine API translation shim. The second proves verbatim client compatibility. The third is convenient for a project shell.
+vz never changes Docker's default context, exposes an Environment-wide socket,
+or falls back to Docker Desktop, system Docker, another Machine, or another
+Environment. Stopped/missing/ambiguous/unauthorized targets fail closed. Native
+macOS and Windows Machines have no implicit Docker capability. Pinned youki is
+the only OCI runtime in Linux Machines.
 
-These commands are host-neutral. Docker contexts hide whether the backend endpoint is a Unix socket, named pipe, or another authenticated local transport.
+## Environment network fabric
 
-Targets without the Docker capability return a structured unsupported-capability error. Target-native shell/exec/status/stop/restart/delete remain universal.
+Each Environment gets a separate routing domain, split DNS view, gateways, NAT
+state, firewall, port registry, ingress, impairment state, and credentials.
+Overlapping CIDRs and repeated DNS/service names across Environments are valid.
+No trusted flat network is created implicitly.
 
-## Host backend boundaries
+Machines attach to declared networks and service paths:
 
-- `HostBackend`: isolation, disks, endpoint publication, shares, and host networking.
-- `TargetAdapter`: native boot, process/console, service supervision, and shutdown.
-- `CapabilitySet`: negotiated Docker/OCI, POSIX TTY/signals, Windows console, sharing, ports, suspend, snapshot, and checkpoint behavior.
-- `StorageBackend`: persistent environment and Docker state.
-- `ShareBackend`: authorize native host paths and translate them to Linux environment paths.
-- `NetworkBackend`: egress, host aliases, and published TCP/UDP ports.
-- `EngineEndpointBackend`: publish/remove the Docker endpoint, enforce permissions, and reconnect.
-- `TargetSupervisor`: reconcile Linux services, macOS launchd services, or future Windows services and readiness.
+- private segments provide explicit Environment-local connectivity;
+- simulated-public segments put clients and services behind separate routing
+  and force DNS, ingress, TLS, firewall, and NAT behavior through an
+  Environment-local edge;
+- external egress is independently offline, enabled, or allowlisted;
+- host imports/exports are explicit, loopback-only by default, and
+  collision-safe; physical LAN publication is a separate high-friction policy.
 
-Virtualization.framework, VirtioFS, vsock, Linux namespaces, WSL distribution IDs, Hyper-V sockets, Windows isolation APIs, gateway IPs, and physical endpoint names remain backend diagnostics. They do not appear in portable configuration or normal lifecycle APIs.
+Per-Environment authoritative DNS allows aliases such as `api.shop.test` to
+resolve differently in simultaneous instances. Managed TLS uses
+Environment-scoped trust; host trust installation is explicit. Container port
+publication first enters the Machine/Environment boundary and never silently
+claims a global host port.
 
-## Compatibility and migration
+Baseline and runtime fault policies cover seeded latency, jitter, loss,
+duplication, reordering, bandwidth, queueing, MTU, reset, DNS failure, and
+partition. Runtime faults have scope, TTL, and receipts so they cannot outlive
+the test that created them.
 
-- Existing `vz init/run/stop/status/logs` project behavior remains as aliases while the `vz dev` namespace becomes canonical.
-- Existing Sandbox APIs remain available to runtime consumers, with explicit environment class added rather than inferred from ID prefixes or labels.
-- `vz docker` translation behavior is deprecated separately; a context-selecting passthrough may exist only if its behavior is clearly distinct and it invokes the host Docker CLI.
-- Old global socket references are invalid. No mutable “current environment” symlink is introduced because it races under parallel agents.
-- Public claims distinguish active, development, and planned capabilities until the release-built E2E gate passes.
+Cross-Environment traffic is default-deny. A directional `EnvironmentPeerGrant`
+may expose one declared endpoint/protocol/port with owner and expiry. It does not
+merge routes, permit transitivity, or grant control-plane, Docker, storage,
+credential, or private-DNS access. Full L3 peering is not part of the public 0.4
+product.
+
+## Public CLI and API
+
+The public Developer Environment CLI contains exactly:
+
+```text
+vz up
+vz exec
+vz status
+vz stop
+vz delete
+```
+
+`--environment` selects an instance; `--machine` selects exec/status scope.
+Topology is declared in the project definition and operated as a unit. No
+public or hidden `vz dev`, `run`, `shell`, `list`, `logs`, `restart`, `docker`,
+`stack`, `network`, `machine`, or `vm` family survives the 0.4 migration. Bare
+`vz` is read-only. Docker operations remain Docker operations.
+
+The typed API is intentionally richer:
+
+- Environment create/reconcile/get/list/watch/start/stop/delete;
+- Machine get/list/watch/start/stop/restart/rebuild/exec;
+- files, workspace projections, volumes, snapshots, and secrets;
+- networks, endpoints, DNS, ingress, egress, faults, and peer grants;
+- streaming events/logs/execution/progress and terminal receipts; and
+- authorized Admin APIs for backend images, provisioning, diagnostics, and raw
+  primitives that are not product-level CLI concepts.
+
+## Compatibility and release rule
+
+Legacy records migrate deterministically into a ProjectDefinition containing one
+Environment with one Machine. Legacy command spellings receive actionable
+migration errors; they are not hidden aliases. Hardened keeps its low-level
+security contract and does not inherit Developer/Docker capabilities.
+
+Public status remains **DEV** until the strict local-Mac, release-built gates in
+[`GOAL-0.4.0.md`](GOAL-0.4.0.md) pass with complete evidence. A one-Machine demo,
+unit tests, or guest-local Docker commands do not establish product completion.

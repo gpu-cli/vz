@@ -1,37 +1,69 @@
-# Converged Developer Environment CLI
+# Minimal five-verb Developer Environment CLI
 
-Depends on: First-class Developer Environment identity and lifecycle
+Depends on: First-class Environment topology, Machine identity, and durable lifecycle
 
 ## Purpose
 
-Make the normal workflow project-first and obvious while keeping automation stable.
+Expose the complete normal Developer Environment workflow without leaking
+backend or infrastructure nouns into the public CLI. Project configuration and
+typed APIs define topology; five top-level verbs operate it.
 
-## Step 1: Introduce the canonical namespace
+## Step 1: Ship exactly five lifecycle verbs
 
-Provide `vz dev up --target <linux|macos|windows>`, `run`, `shell`, `exec`, `status`, `logs`, `stop`, `restart`, `delete`, and `list`. Target is immutable after creation. Current-project resolution uses the nearest config plus canonical project/worktree identity; explicit name/ID overrides are supported.
+```text
+vz up [--environment <name-or-id>]
+vz exec [--environment <name-or-id>] [--machine <name-or-id>] -- <command>
+vz status [--environment <name-or-id> | --all] [--machine <name-or-id>] [--json]
+vz stop [--environment <name-or-id>]
+vz delete [--environment <name-or-id>]
+```
 
-## Step 2: Converge legacy entry points
+- `up` creates or reconciles the selected complete Environment topology.
+- `exec` selects the declared default/only Machine or fails with candidates; it
+  auto-reconciles that Machine and its dependency closure.
+- `status` is read-only and reports Projects, Environments, Machines, targets,
+  topology, health, endpoints, capability gaps, and per-Linux-Machine Docker
+  contexts. `--all` lists instances for the resolved project.
+- `stop` preserves identity and declared state. `delete` removes the selected
+  Environment ownership graph.
+- Bare `vz` shows help/read-only status and never creates or mutates resources.
 
-- Route top-level `vz init/run/stop/status/logs` through the same Developer Environment service as aliases during a documented deprecation window.
-- Reconcile the separate `vz create`/space flow without maintaining a second lifecycle implementation.
-- Outside a project or when selection is ambiguous, fail with a list of candidates rather than guessing.
+## Step 2: Resolve identity without global state
 
-## Step 3: Make Docker selection implicit
+Selection order is explicit immutable ID/name, process-scoped Environment and
+Machine selectors, unambiguous project/worktree binding, then a declared default
+or sole Machine. A worktree may resolve more than one named Environment;
+ambiguity fails with a bounded candidate list. There is no mutable global current
+Environment, Machine, socket, or Docker context.
 
-- Linux-target `up` and first `run` create/repair the managed per-environment Docker context automatically.
-- `vz dev docker -- ...` invokes the host's installed Docker CLI with that context; it does not translate Engine API calls.
-- `context` prints the stable context name.
-- `env` emits shell-safe session variables, preferring `DOCKER_CONTEXT` over raw `DOCKER_HOST`.
-- Never change Docker's global default context.
-- Docker/context/env commands on targets without `capabilities.docker` fail with an actionable structured error.
+## Step 3: Remove infrastructure command families
 
-## Step 4: Provide machine-readable status
+0.4 does not retain public or hidden `vz dev`, `init`, `create`, `run`, `shell`,
+`list`, `logs`, `restart`, `docker`, `stack`, `build`, `image`, `network`,
+`machine`, `sandbox`, or `vm` execution paths. Old spellings return actionable
+migration errors. They are not aliases and do not maintain a second lifecycle.
 
-`vz dev status --json` includes environment identity/class/state, host/target/architecture, backend diagnostics, target image/build, negotiated capabilities, native runtime state, persistent storage, ports, and last actionable failure. Docker fields appear only when negotiated.
+Files, logs, topology mutation, snapshots, faults, peering, diagnostics, and
+individual Machine administration remain typed API operations. Docker work is
+performed with the unmodified Docker CLI/API using a context returned by
+`vz status`; vz never mutates the user's default context.
+
+## Step 4: Provide stable automation behavior
+
+All commands have stable exit classes, versioned structured errors, `--json`
+where meaningful, request correlation, explicit timeouts/cancellation, and no
+interactive prompts in non-interactive mode. Interactive/long-running work uses
+streaming gRPC progress and a terminal result. Status JSON and events identify
+the exact project, Environment, Machine, incarnation, and topology digest.
 
 ## Validation
 
-- CLI parsing/snapshot tests and stable JSON schema tests.
-- Current-project, worktree, explicit-name, ambiguity, stopped, and missing cases.
-- Verify context helpers preserve the user's default Docker context.
-- Real Mac smoke: create environment, immediately run host `docker info`, stop, restart, and delete.
+- CLI parser/snapshot tests prove exactly five public lifecycle verbs; hidden
+  help exposes no legacy product command family.
+- Project, worktree, explicit instance, multiple instances per worktree,
+  default/ambiguous Machine, stopped, missing, and unsupported target cases.
+- Bare `vz` is read-only; old verbs reject with migration guidance.
+- Two simultaneous Linux Machines return distinct Docker contexts and preserve
+  the user's default context.
+- Real local-Mac black-box tests cover all five verbs against multi-instance,
+  multi-Machine, and mixed Linux/macOS topologies.

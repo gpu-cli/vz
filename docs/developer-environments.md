@@ -2,170 +2,225 @@
 
 Date: 2026-09-02
 Status: committed direction; implementation status is tagged below
+Release definition of done: [`../planning/developer-environments/GOAL-0.4.0.md`](../planning/developer-environments/GOAL-0.4.0.md)
 
-This document is the canonical product contract for vz. When older documents use
-`sandbox`, `container`, or `VM` as the top-level product object, interpret those
-as implementation mechanisms unless that document explicitly describes a
-low-level API.
+This is the canonical vz product contract. When older documents use `sandbox`,
+`container`, or `VM` as the top-level product object, interpret those as
+implementation mechanisms unless the document explicitly describes a low-level
+API or the currently shipped legacy CLI.
 
 ## Product definition
 
 **vz creates reproducible, parallel Developer Environments on local hardware.**
 
-A Developer Environment is the user-facing object. It owns a stable identity, a
-project or worktree binding, compute and filesystem state, lifecycle, networking,
-tooling, and agent sessions. A sandbox, VM, container, or process boundary is a
-backend selected to implement that environment; it is not a competing product
-concept the user must assemble.
+A project defines a reproducible topology. That definition can be instantiated
+as any number of independently named Developer Environments for worktrees,
+agents, comparisons, tests, and releases. A Developer Environment is the stable
+user-facing isolation, ownership, and lifecycle boundary. It contains one or
+more target-native Machines plus the storage, networks, DNS, endpoints,
+credentials, policies, faults, executions, and evidence that make those Machines
+one reproducible system.
 
-The environment target is an operating system, independent of the host operating
-system. Linux is the universal target: the same Linux Developer Environment
-contract is available on macOS today and will extend to Linux and Windows hosts.
-Native targets complement that universal target where the host platform permits
-them.
+```text
+ProjectDefinition
+└── EnvironmentInstance[]
+    ├── MachineInstance[]
+    ├── Network[] and declared service paths
+    ├── Endpoint[] and environment-local public-like ingress
+    └── Volume[], SecretBinding[], Fault[], Execution[], and Receipt[]
+```
 
-## Host and target matrix
+A worktree is a workspace binding and convenient default selector, not an
+Environment identity and not a one-instance limit. One worktree may own several
+Environments; one Environment may contain several Machines. A sandbox, VM,
+container, process boundary, or native OS facility implements a Machine or a
+capability behind this contract and is not a competing product concept.
+
+Target OS belongs to a Machine and is independent of the host OS. An Environment
+may be heterogeneous. On macOS it may contain Linux Machines and native macOS
+Machines that communicate through declared topology. Linux is the universal
+Machine target across macOS, Linux, and Windows hosts. Native targets complement
+Linux where the host permits them.
+
+## Host and Machine-target matrix
 
 Status labels describe backend availability, not complete feature parity:
 
 - **ACTIVE**: working backend capabilities exist in the repository today.
-- **DEV**: implementation exists or is actively being unified, but the full
-  Developer Environment contract is not complete.
-- **PLANNED**: committed direction with no claim of a complete implementation.
-- **N/A**: not a supported host/target pairing.
+- **DEV**: implementation exists or is being unified, but the 0.4 contract is
+  not complete.
+- **PLANNED**: committed direction with no complete implementation claim.
+- **N/A**: not a supported host/Machine-target pairing.
 
-| Host | Linux target | macOS target | Windows target |
+| Host | Linux Machine target | macOS Machine target | Windows Machine target |
 |---|---|---|---|
-| macOS on Apple silicon | **ACTIVE** — local Linux VM, OCI, BuildKit, and environment primitives; unified lifecycle and full Docker workflow are **DEV** | **ACTIVE** — native macOS VM flows; unified Developer Environment lifecycle is **DEV** | N/A |
-| Linux | **DEV** — native Linux backend exists; contract and conformance parity remain in progress | N/A | N/A |
-| Windows | **PLANNED** — Linux environment through the appropriate Windows virtualization backend | N/A | **PLANNED** — native Windows environment, delivered after Linux-on-Windows |
+| macOS on Apple silicon | **ACTIVE** primitives; unified lifecycle, per-Machine Docker, and topology are **DEV** | **ACTIVE** VM flows; unified Machine lifecycle and mixed topology are **DEV** | N/A |
+| Linux | **DEV** native backend; contract parity remains in progress | N/A | N/A |
+| Windows | **PLANNED** using the selected Windows virtualization backend | N/A | **PLANNED**, after Linux-on-Windows |
 
-Delivery order is therefore:
+Delivery order is Linux-on-macOS and macOS-on-macOS, Linux-on-Linux,
+Linux-on-Windows, then Windows-on-Windows. Linux being universal does not require
+the same backend: Virtualization.framework, Linux-native isolation, and future
+Windows virtualization may implement the same observable Machine contract.
 
-1. Linux and native macOS targets on macOS.
-2. Linux target on Linux.
-3. Linux target on Windows.
-4. Native Windows target on Windows.
+## Identity, selection, and ownership
 
-Linux being universal does not mean every host uses the same isolation
-mechanism. macOS and Windows host Linux through virtualization; Linux can use
-native namespaces, cgroups, and optional VM backends. The observable environment
-contract and evidence requirements remain consistent.
-
-## Shared core contract
-
-Every Developer Environment, regardless of target, must provide:
-
-- stable environment identity and deterministic project/worktree association;
-- create, start, attach, stop, restart, inspect, and delete lifecycle semantics;
-- reproducible inputs and an inspectable description of the realized environment;
-- persistent and disposable state with explicit ownership and cleanup;
-- streaming exec, stdin, stdout/stderr, PTY, cancellation, and exit status;
-- explicit file sharing, networking, port forwarding, credentials, and policy;
-- isolation from the host and from every other concurrent environment;
-- independent names, sockets, ports, mounts, caches, processes, and credentials;
-- agent- and human-facing control surfaces over the same runtime contract;
-- release-built, end-to-end verification on the real host/target backend.
-
-Backend-specific capabilities may differ, but differences must be declared and
-must not silently weaken isolation or redirect an operation to another
-environment.
-
-## Target capabilities
-
-### Linux target
-
-Docker compatibility is an implicit capability of every Linux Developer
-Environment. It is not an optional facade and is not a global service. Creating
-or starting the environment makes its Docker endpoint available as part of
-environment readiness.
-
-Each Linux Developer Environment owns an independent Docker Engine, containerd
-instance, image and volume stores, networks, BuildKit cache, persistent data,
-host proxy endpoint, and Docker context. Host `docker`, `docker compose`, and
-`docker buildx` clients select a specific environment through a vz-managed
-context or environment emitted for that environment. vz must never automatically
-replace the user's default Docker context or fall back to Docker Desktop, a
-global daemon, or a different environment.
-
-There is no global `~/.vz/docker.sock`. Socket paths are private implementation
-details resolved from stable environment identity and kept within platform path
-limits. Users and integrations address an environment by identity or managed
-Docker context rather than constructing a socket pathname.
-
-The Linux target also owns OCI execution, Linux images, Compose workloads,
-BuildKit builds, Linux networking, and Linux checkpoint capabilities. On the
-current macOS backend, those workloads execute inside the environment's Linux VM.
-The committed runtime invariant is that guest container execution uses the
-pinned, verified youki runtime without an undeclared runc/crun fallback.
-
-Full host-Docker-CLI parity and its dedicated local-Mac end-to-end gate are
-**DEV**, not an ACTIVE claim.
-
-### macOS target
-
-A macOS Developer Environment runs native macOS workloads in a macOS VM and
-supports macOS toolchains and behaviors that cannot be represented by a Linux
-container. Docker is not implicit because Docker Engine is a Linux-target
-capability. A workflow that needs Docker selects or creates a Linux Developer
-Environment rather than hiding a shared Linux daemon behind the macOS target.
-
-Existing macOS VM lifecycle, base, validation, and patch capabilities are
-**ACTIVE**. Their consolidation behind the shared Developer Environment contract
-is **DEV**.
-
-### Windows target
-
-Linux-on-Windows is delivered before native Windows-on-Windows. Linux
-environments retain the Linux contract, including per-environment Docker.
-Native Windows environments provide Windows workloads and Windows-native tooling;
-Docker is not implicit in that target contract. Both Windows pairings are
-**PLANNED**.
-
-## User experience contract
-
-The normal workflow names the environment, not its backend:
+Canonical identity has three independent levels:
 
 ```text
-vz dev create
-vz dev start
-vz dev exec -- <command>
-vz dev stop
+project_id / environment_id / machine_id
 ```
 
-Exact command spelling may evolve while the unified surface is **DEV**, but these
-semantics are fixed:
+Each level has an immutable internal ID. Human names, worktree bindings, and
+configuration paths are selectors, not storage or ownership keys. Selection
+uses an explicit Environment/Machine ID or name first, then a process-scoped
+selector, then an unambiguous project/worktree binding and declared default
+Machine. Ambiguity fails closed and lists candidates. vz has no mutable global
+current Environment.
 
-- environment creation realizes the target's standard capabilities;
-- Linux environment readiness includes its private Docker service;
-- commands may select an environment explicitly or by an unambiguous project /
-  worktree association;
-- parallel environments are the default design case;
-- ambiguous selection fails closed;
-- stopping an environment removes live endpoints but preserves declared
-  persistent state;
-- deleting an environment removes its managed endpoints and owned state;
-- legacy `sandbox`, `container`, `vm`, `run`, and `stack` surfaces remain honest
-  descriptions of current mechanisms while they converge on this contract.
+An Environment exclusively owns its Machines, disks, shares, credentials,
+networks, DNS view, ingress, NAT state, ports, faults, events, and endpoints.
+Every resource key includes `environment_id`; Machine-owned resources also
+include `machine_id`. Repeated Machine names, service names, DNS aliases, guest
+CIDRs, and internal ports are valid in other Environments. Stop preserves
+identity and declared state. Delete traverses only the selected Environment's
+ownership graph.
 
-## Product boundary
+Workspace projection is explicit per Machine: read-write, read-only, or
+snapshot. Shared-writer and shared-volume semantics require a declared
+consistency contract. vz never silently multi-attaches a writable block disk.
 
-vz is local-first. Hosted placement may reuse the runtime contract later, but is
-not required to define the product. The value is reproducible parallel
-environments with explicit boundaries and native host/target support—not a claim
-that lockdown alone is sufficient.
+## Machine contract
 
-The locked-down Hardened profile (currently stored and accepted under the legacy
-`Container` name during migration) remains a specialized Linux isolation option.
-It must not constrain the Developer profile from enabling user namespaces,
-cgroups, networking, Docker, or other capabilities required by reproducible
-development workflows. Security posture is explicit per profile and target.
+Every Machine has an immutable target specification containing OS,
+architecture, image/version, and requested capabilities. It also has resources,
+filesystem state, network attachments, lifecycle, negotiated capabilities, and
+a replaceable incarnation. Rebuild may change the incarnation without changing
+the logical Machine identity or declared endpoints.
 
-## Documentation rule
+Every supported Machine provides target-native execution, streaming stdin and
+stdout/stderr, PTY where supported, cancellation, exit status, inspectable
+state, and lifecycle behavior. Unsupported host/Machine-target pairs or capabilities
+fail explicitly and never substitute another Machine or target.
 
-Product, planning, CLI, and architecture documents should use **Developer
-Environment** for the primary user-facing object. Use `sandbox`, `container`,
-`VM`, and `process` when naming a compatibility command, protocol entity, security
-boundary, or backend implementation. Capability claims must carry **ACTIVE**,
-**DEV**, or **PLANNED** status whenever a reader could mistake direction for
-shipped behavior.
+### Linux Machines and Docker
+
+Docker compatibility is implicit for every Linux Developer Machine. Each Linux
+Machine owns its own Docker Engine, containerd, BuildKit state, image and volume
+stores, Docker networks, endpoint, credentials scope, and managed Docker
+context. A multi-Machine Environment therefore has multiple independent Docker
+engines and contexts; it never collapses them onto one shared daemon.
+
+Host `docker`, `docker compose`, and `docker buildx` select an exact
+`(environment_id, machine_id)` through the context returned by `vz status`.
+vz never changes Docker's global default context and never falls back to Docker
+Desktop, a system daemon, another Machine, or another Environment. There is no
+global `~/.vz/docker.sock` and no Environment-wide `DOCKER_HOST` selector.
+Transport paths are private backend details.
+
+Linux Machines also own OCI execution and Linux checkpoint capabilities. On
+macOS they execute inside vz-managed Linux VMs. The pinned, verified youki
+binary is the only OCI runtime allowed in the guest; runc/crun installation,
+override, or fallback fails the release gate. Full host-Docker compatibility is
+**DEV** until the dedicated release-built local-Mac lane passes.
+
+### Native macOS and Windows Machines
+
+A native macOS Machine runs macOS workloads in a macOS VM and supports Xcode,
+Swift, Darwin processes, launchd, APFS, and other target-native behavior. It
+does not advertise Docker or silently create a Linux sidecar; a Linux Machine is
+declared in the same or another Environment when Linux containers are required.
+Existing macOS VM primitives are **ACTIVE**; their integration into the shared
+topology contract is **DEV**.
+
+Linux-on-Windows precedes Windows-on-Windows. Native Windows Machines will expose
+Windows process, service, console, NTFS, and isolation capabilities without
+inheriting Linux OCI/youki assumptions. Both Windows pairings are **PLANNED**.
+
+## Network topology contract
+
+Every Environment owns a distinct route domain, DNS view, gateway/NAT state,
+firewall, port registry, ingress, impairment state, and network credentials.
+Project membership never grants connectivity and overlapping guest CIDRs are
+allowed because route domains do not merge.
+
+There is no implicit trusted flat LAN. Machines attach to named networks and
+communicate only through declared service paths:
+
+- `private` paths provide Environment-local connectivity and DNS;
+- a simulated-public edge forces traffic through routed ingress, split DNS,
+  firewall/NAT, and optional TLS using synthetic `.test` names while remaining
+  local and isolated;
+- real Internet egress is separately controlled as offline, allowed, or
+  domain/CIDR allowlisted;
+- host imports and exports are explicit capabilities; exports default to
+  collision-safe loopback listeners and never expose the LAN by accident.
+
+Deterministic latency, jitter, loss, bandwidth, reset, DNS failure, and
+partition controls are scoped to a declared path, seeded, bounded by TTL, and
+produce receipts. Runtime faults expire rather than stranding connectivity.
+
+Separate Environments cannot resolve, route to, inspect, or control one another.
+When independently managed Environments must interact, a directional,
+service-scoped, least-privilege, expiring peer grant may expose one declared
+endpoint. It never merges L2/L3 networks, becomes transitive, or grants access
+to storage, credentials, Docker, private DNS, or the control plane. Systems that
+share lifecycle should normally be Machines in one Environment instead.
+
+## Public UX and API contract
+
+The 0.4 Developer Environment CLI has five top-level lifecycle verbs:
+
+```text
+vz up [--environment <name-or-id>]
+vz exec [--environment <name-or-id>] [--machine <name-or-id>] -- <command>
+vz status [--environment <name-or-id> | --all] [--machine <name-or-id>] [--json]
+vz stop [--environment <name-or-id>]
+vz delete [--environment <name-or-id>]
+```
+
+`up`, `stop`, and `delete` operate on the complete topology. `exec` targets the
+declared default/only Machine or requires `--machine`; it can reconcile that
+Machine and its dependencies. `status` reports topology, identities, targets,
+capabilities, health, endpoints, and a Docker context for each Linux Machine.
+Bare `vz` is read-only help or status and never creates resources.
+
+There is no canonical `vz dev` namespace and no public or hidden `run`, `shell`,
+`list`, `logs`, `restart`, `docker`, `stack`, `network`, `machine`, or `vm`
+compatibility family in 0.4. Advanced lifecycle, topology, files, logs,
+snapshots, faults, and peering are typed API resources; native Docker clients use
+the Docker API. Migration guidance may explain replacements without preserving
+old execution paths.
+
+The root Environment API owns topology create/reconcile/get/list/watch/start/
+stop/delete. Child Machine APIs expose get/list/watch/lifecycle/exec and
+capability discovery. Network, Endpoint, Volume, SecretBinding, Fault,
+Execution, and Receipt resources are explicitly scoped. Interactive and
+long-running operations stream progress and terminal results; unary APIs are
+limited to short, bounded operations.
+
+## Product boundary and profiles
+
+vz is local-first. Hosted placement may reuse the contract later but is not
+required for 0.4. The primary value is reproducibility and high-concurrency
+agentic development, not lockdown alone.
+
+The locked-down Hardened profile, temporarily represented by the legacy
+`Container` name on disk during migration, remains a specialized Linux policy.
+It must not constrain Developer Machines from using cgroups, networking, Docker,
+or other required development capabilities.
+
+## Completion and documentation rule
+
+The product is not complete based on unit tests or a one-Machine demonstration.
+The normative pass/fail scenarios, required local-Mac lanes, prohibited
+shortcuts, evidence schema, and terminal definition of done are in
+[`GOAL-0.4.0.md`](../planning/developer-environments/GOAL-0.4.0.md). Missing,
+skipped, flaky, or malformed required evidence leaves the release open.
+
+Product, planning, CLI, API, site, skill, and architecture documents use
+**Developer Environment** for the topology instance and **Machine** for a
+target-native compute member. Use `sandbox`, `container`, `VM`, and `process`
+only for a current compatibility command, protocol entity, security boundary,
+or backend. Claims carry **ACTIVE**, **DEV**, or **PLANNED** whenever direction
+could be mistaken for shipped behavior.

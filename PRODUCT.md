@@ -29,23 +29,24 @@ with native Windows environments.
 
 **vz creates reproducible, parallel Developer Environments on local hardware.**
 
-The Developer Environment is the product object. It binds a project or worktree
-to stable identity, target OS, compute, files, tools, network, persistent state,
-and agent sessions. VMs, containers, sandboxes, and processes are backend
-mechanisms selected for the host/target pair.
+The Developer Environment is the product object: an isolated realization of a
+project topology. A project or worktree can have multiple named Environment
+instances, and each Environment can contain multiple target-native Machines plus
+their storage, network fabric, endpoints, policies, and agent sessions. VMs,
+containers, sandboxes, and processes are backend mechanisms for Machines.
 
-Linux is the universal target across macOS, Linux, and Windows hosts. Native
-macOS environments are also part of the current macOS product; native Windows
-environments follow Linux-on-Windows. This is a multi-target product, not a
-Linux-only sandbox with future host ports.
+Target OS belongs to each Machine. Linux is the universal Machine target across
+macOS, Linux, and Windows hosts. Native macOS Machines are also part of the
+current macOS product; native Windows Machines follow Linux-on-Windows. A single
+Environment may contain heterogeneous Machines.
 
 ## Core positioning
 
-vz makes local parallel environments explicit, inspectable, reproducible, and
-addressable. Workloads run inside the selected environment boundary, while host
-effects occur only through declared mounts, ports, credentials, and control
-channels. The concrete isolation mechanism may be a VM or a native OS facility;
-the user-facing contract remains stable.
+vz makes local parallel topology instances explicit, inspectable, reproducible,
+and addressable. Machines communicate only through declared private or
+public-like paths; host effects occur only through declared workspace
+projections, endpoints, credentials, and control channels. Separate Environments
+are mutually isolated by default.
 
 The main value is productive, repeatable development at high concurrency.
 Locked-down execution remains an available profile, but is not the organizing
@@ -53,15 +54,15 @@ principle of the Developer Environment product.
 
 ## Docker contract
 
-Docker is implicit for Linux Developer Environments. Every Linux environment has
-its own Docker Engine, state, BuildKit cache, networks, proxy endpoint, and Docker
-context. There is no global vz Docker socket and no optional shared Docker
-facade. The unmodified host Docker CLI must address a specific environment and
-must never fall back to Docker Desktop or another environment.
+Docker is implicit for Linux Developer Machines. Every Linux Machine has its own
+Docker Engine, state, BuildKit cache, networks, endpoint, and Docker context.
+There is no Environment-global or global vz Docker socket. The unmodified host
+Docker CLI addresses one exact Environment/Machine and never falls back to
+Docker Desktop, a sibling Machine, or another Environment.
 
 Docker is not an implicit capability of native macOS or native Windows targets.
-Those workflows select a Linux Developer Environment when they require the Linux
-Docker contract.
+Those workflows declare a Linux Machine when they require the Linux Docker
+contract.
 
 ## Current status
 
@@ -69,9 +70,9 @@ Docker contract.
   primitives; native macOS VM flows; deterministic stacks; checkpoint
   primitives; gRPC/HTTP runtime services; current sandbox/run/vm command
   surfaces.
-- **DEV:** one unified Developer Environment lifecycle; implicit per-environment
-  Docker driven by the local Mac's Docker/Compose/buildx clients; full isolation
-  and conformance evidence; Linux-host contract parity.
+- **DEV:** Project/Environment/Machine topology lifecycle; implicit per-Linux-
+  Machine Docker driven by the local Mac's Docker/Compose/buildx clients;
+  realistic network topology, full isolation, and conformance evidence.
 - **PLANNED:** Linux Developer Environments on Windows, followed by native
   Windows Developer Environments; hosted placement may reuse the contract later.
 
@@ -80,31 +81,36 @@ backend into a full-product parity claim.
 
 ## Operating context
 
-Humans and agents select a Developer Environment explicitly or through an
-unambiguous project/worktree association. A Linux environment starts with Docker
-as part of readiness; its managed Docker context is scoped to that environment.
-Multiple environments must run simultaneously without sharing identity, daemon
-state, sockets, ports, files, images, volumes, caches, networks, or credentials.
+Humans and agents select an Environment explicitly or through an unambiguous
+project/worktree association, then select a default or named Machine. A worktree
+may have multiple Environments. Every Linux Machine starts with Docker readiness
+and a Machine-specific context. Environment instances may repeat Machine names,
+ports, DNS aliases, and CIDRs without sharing identity or mutable state.
 
 Existing commands such as `vz run`, `vz stack`, `vz build`, `vz docker`, and
-`vz vm` describe ACTIVE mechanisms. Their migration toward the unified `vz dev`
-experience is DEV; documentation must not present proposed command spelling as
-already shipped.
+`vz vm` describe ACTIVE legacy mechanisms. Their replacement by the five-verb
+`vz up/exec/status/stop/delete` surface is DEV; proposed spelling must not be
+presented as already shipped.
 
 ## Product principles
 
-1. Developer Environment first: users choose a target and environment, not a bag
-   of backend mechanisms.
-2. Linux everywhere: one Linux target contract across macOS, Linux, and Windows.
-3. Native where it matters: macOS-on-macOS now; Windows-on-Windows after
+1. Developer Environment first: users instantiate an isolated project topology,
+   not a bag of backend mechanisms.
+2. Multiple on both axes: many Environment instances per project/worktree and
+   many target-native Machines per Environment.
+3. Linux everywhere: one Linux Machine contract across macOS, Linux, and Windows.
+4. Native where it matters: macOS-on-macOS now; Windows-on-Windows after
    Linux-on-Windows.
-4. Parallel by construction: identity and all mutable resources are scoped per
+5. Parallel by construction: identity and all mutable resources are scoped per
    environment.
-5. Docker belongs to Linux environment readiness, not to a global daemon or
+6. Docker belongs to each Linux Machine, not to an Environment-global daemon or
    optional compatibility tier.
-6. Explicit host effects: mounts, ports, credentials, and policy are declared and
+7. Network realism without exposure: declared private paths and a local
+   simulated-public DNS/TLS/ingress/NAT edge; cross-Environment access is
+   explicit and least-privilege.
+8. Explicit host effects: mounts, ports, credentials, and policy are declared and
    inspectable.
-7. Measured and status-tagged claims: commands and end-to-end evidence precede
+9. Measured and status-tagged claims: commands and end-to-end evidence precede
    parity claims.
 
 ## Evidence and constraints

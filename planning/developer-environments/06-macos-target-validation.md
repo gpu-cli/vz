@@ -1,14 +1,21 @@
 # Native macOS-on-macOS validation
 
-Depends on: Converged Developer Environment CLI; Native macOS-on-macOS Developer Environments; Environment isolation, storage, and networking
+Depends on: Minimal five-verb Developer Environment CLI; native macOS Machines;
+multi-environment isolation and topology networking
 
 ## Purpose
 
-Release-gate the native macOS target on an Apple Silicon Mac and prove it participates in the same core Environment contract without inheriting Linux/Docker assumptions.
+Release-gate native macOS Machines on an Apple Silicon Mac and prove they
+participate in aggregate and mixed-target Environment topologies without
+inheriting Linux/Docker assumptions.
 
 ## Step 1: Add the target-native harness
 
-Create a release-built local harness using only the public `vz dev` lifecycle. Cover pinned image provisioning/verification, native shell and exec, PTY/signals, launchd services, project sharing, APFS/native path behavior, networking, ports, persistence, stop/restart/delete, update/retirement, and recovery.
+Create `scripts/run-macos-developer-environment-e2e.sh --suite all` using
+release-built artifacts, the five public lifecycle verbs, and typed APIs where
+the CLI intentionally has no operation. Cover pinned image verification, native
+exec, PTY/signals, launchd, workspace projection, APFS, networking, persistence,
+stop/up/delete, update/retirement, and recovery.
 
 ## Step 2: Run shared and target suites
 
@@ -19,8 +26,15 @@ Create a release-built local harness using only the public `vz dev` lifecycle. C
 
 ## Step 3: Cross-target isolation
 
-Run Linux and macOS Developer Environments simultaneously on the same Mac. Prove lifecycle, disks, mounts, ports, credentials, logs, endpoints, and processes cannot cross. Docker access remains present only on the Linux target.
+Run Linux and macOS Machines in the same Environment through declared private
+and public-like paths, then run equivalent Machines in separate Environments.
+Prove lifecycle, disks, mounts, ports, credentials, events, endpoints, and
+processes do not cross ownership boundaries. A macOS Machine cannot inherit or
+select a sibling Linux Machine's Docker endpoint.
 
 ## Validation
 
-Run clean and persisted release-built gates twice on the current Mac and retain machine-readable evidence under `.artifacts/developer-environment-e2e/<timestamp>/`.
+Run clean and persisted release-built gates twice on the current Mac and retain
+machine-readable evidence under
+`.artifacts/macos-developer-environment-e2e/<timestamp>/`. Missing or skipped
+required evidence is failure.

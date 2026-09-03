@@ -1,14 +1,23 @@
 # Linux-on-macOS Docker validation
 
-Depends on: Converged Developer Environment CLI; Implicit private Docker service; Environment isolation, storage, and networking; Per-environment host Docker bridge and contexts
+Depends on: Minimal five-verb Developer Environment CLI; implicit Docker per
+Linux Machine; multi-environment topology isolation; per-Linux-Machine Engine
+Endpoint Adapter and contexts
 
 ## Purpose
 
-Release-gate the universal Linux target's Docker capability from the current Apple Silicon Mac. This is one of two immediate Mac target gates, not the universal Environment test contract.
+Release-gate the universal Linux Machine target's Docker capability from the
+current Apple Silicon Mac. This target gate feeds the aggregate topology gate;
+it does not replace it.
 
 ## Step 1: Build the dedicated harness
 
-Create `scripts/run-linux-docker-e2e.sh` with focused suites for bootstrap/API, lifecycle, images/registry, builds/buildx, Compose, networking, storage, recovery/concurrency, and security, plus `--suite all`. It must use a local vz-managed Developer VM and the Mac's installed Docker CLI/plugins through a managed context—never Docker Desktop's daemon, internal API shortcuts, guest-side substitutes, ad-hoc SSH, or external hosts.
+Create `scripts/run-linux-docker-e2e.sh` with focused suites for bootstrap/API,
+lifecycle, images/registry, builds/buildx, Compose, networking, storage,
+recovery/concurrency, and security, plus `--suite all`. It must use local
+vz-managed Linux Machines and the Mac's installed Docker CLI/plugins through
+Machine-specific managed contexts—never Docker Desktop, internal shortcuts,
+guest-side substitutes, ad-hoc SSH, or external hosts.
 
 ## Step 2: Exercise the compatibility matrix
 
@@ -18,11 +27,17 @@ Create `scripts/run-linux-docker-e2e.sh` with focused suites for bootstrap/API, 
 - Builds: Dockerfile and multi-stage behavior, args/secrets/SSH, cache import/export/prune/persistence, cancellation, parallel buildx, load/push.
 - Compose: config/pull/build/up/ps/logs/exec/restart/down, dependencies, health gates, volumes, binds, networks, ports.
 - Networking/storage: DNS, TCP/UDP/HTTPS egress, host reachability, ports, named volumes, approved Mac bind mounts, Unicode/spaces/symlinks/RO, large/many files, disk-full recovery.
-- Reliability: cold/warm boots, at least 20 containers, parallel environments, daemon/proxy crash, abrupt VM stop, interrupted operations, sleep/wake where automatable, and leak checks.
+- Reliability: cold/warm boots, at least 20 containers, parallel Machines and
+  Environments, daemon/adapter crash, abrupt VM stop, interrupted operations,
+  sleep/wake where automatable, and leak checks.
 
 ## Step 3: Prove isolation and runtime invariants
 
-Run two environments simultaneously and prove no state/control cross-talk. Recursively inventory guest-visible artifacts and capture execution proof that native runtime, BuildKit, Docker, and containerd invoke pinned youki only.
+Run at least two Linux Machines in one Environment plus simultaneous Linux
+Machines in another Environment. Prove each has an independent Engine, context,
+images, volumes, networks, BuildKit cache, sockets, events, and lifecycle.
+Recursively inventory guest-visible artifacts and capture execution proof that
+BuildKit, Docker, and containerd invoke pinned youki only.
 
 ## Step 4: Release-built repeatability
 
@@ -30,7 +45,12 @@ Run all focused suites and `--suite all` twice against release-built artifacts: 
 
 ## Evidence contract
 
-Write `.artifacts/linux-docker-e2e/<timestamp>/` with per-command logs, exit status/timing, host client/plugin versions, Engine API version, environment/profile/kernel versions, artifact hashes, configs, daemon/proxy logs, image digests, runtime inventory/execution proof, leak checks, and machine-readable summary. Tests fail if evidence is absent or malformed.
+Write `.artifacts/linux-docker-e2e/<timestamp>/` with per-command logs, exit
+status/timing, Environment/Machine identity, host client/plugin versions, Engine
+API version, profile/kernel versions, hashes, configs, daemon/adapter logs,
+image digests, runtime inventory/invocation proof, cross-context denial, leak
+checks, `summary.json`, and `summary.txt`. Tests fail if evidence is absent,
+malformed, skipped, or inconsistent.
 
 ## Validation
 

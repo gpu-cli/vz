@@ -1,10 +1,12 @@
-# Windows-on-Windows Developer Environment parity
+# Native Windows Machine topology parity on Windows hosts
 
-Depends on: Linux-on-Windows Developer Environment parity
+Depends on: Linux-Machine topology parity on Windows hosts
 
 ## Purpose
 
-Implement native Windows-target Developer Environments on Windows hosts after Linux-on-Windows is stable. This target uses Windows-native execution and isolation rather than Linux OCI or youki.
+Implement native Windows Machines within the shared Environment topology on
+Windows hosts after Linux-on-Windows is stable. These Machines use Windows-native
+execution and isolation rather than Linux OCI or youki.
 
 ## Step 1: Select the Windows-native isolation backend
 
@@ -12,12 +14,18 @@ Evaluate Windows process isolation, Windows containers, Hyper-V isolation, base-
 
 ## Step 2: Implement native target semantics
 
-- Add Windows TargetAdapter and TargetSupervisor behavior for processes, services, PowerShell, ConPTY, exit/cancellation, NTFS, ACLs, junctions/reparse points, named pipes, networking, firewall, ports, persistent state, stop/restart/delete, and observability.
+- Add Windows TargetAdapter and Machine supervision for processes, services,
+  PowerShell, ConPTY, exit/cancellation, NTFS, ACLs, junctions/reparse points,
+  named pipes, network attachments, firewall, ports, persistent state,
+  lifecycle, and observability.
 - Add any Windows-native container capability as an explicit negotiated capability; do not present Docker/OCI/youki as universal.
 
 ## Step 3: Preserve the common product contract
 
-Use the same environment identity, config shape, lifecycle, ownership, status, project/worktree resolution, and fail-closed isolation. Target-specific differences appear in capabilities and documented errors.
+Use the same Project/Environment/Machine identity, configuration, aggregate and
+child lifecycle, topology, ownership, status, workspace resolution, and
+fail-closed isolation. Target-specific differences appear as capabilities and
+documented errors.
 
 ## Validation
 
