@@ -75,7 +75,7 @@ fn require_virtualization_entitlement() -> bool {
     }
 
     eprintln!(
-        "skipping runtime_e2e: test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-sandbox-vm-e2e.sh --suite runtime"
+        "VZ_E2E_REQUIRED_SKIP: runtime_e2e test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-sandbox-vm-e2e.sh --suite runtime"
     );
     false
 }
@@ -656,12 +656,13 @@ async fn pull_nonexistent_image_fails() {
 
 // ── Cgroup resource limits ───────────────────────────────────────
 
-/// Verify that cgroup cpu.max is correctly enforced inside the container.
+/// Verify that cgroup v2 CPU bandwidth is enforced inside the container.
 ///
 /// Creates a container with `cpu_quota=50000` and `cpu_period=100000`
 /// (equivalent to `cpus=0.5`), then reads `/sys/fs/cgroup/cpu.max` inside
-/// the running container and asserts the kernel exposes the expected
-/// `"50000 100000"` throttle values.
+/// the running container, asserts the kernel exposes the expected
+/// `"50000 100000"` throttle values, and proves a bounded CPU load increments
+/// the cgroup's throttling counter.
 #[tokio::test]
 #[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn cgroup_cpu_max_enforcement() {
@@ -672,12 +673,19 @@ async fn cgroup_cpu_max_enforcement() {
     let tmp = tempfile::tempdir().unwrap();
     let rt = test_runtime(tmp.path());
 
-    // Create a long-lived container with cpu_quota=50000 / cpu_period=100000 (0.5 CPU).
+    // Create a long-lived container with cpu_quota=50000 / cpu_period=100000
+    // (0.5 CPU). Its init process saturates one CPU for at most 30 seconds,
+    // leaving ample time for the observer exec below while bounding the load
+    // independently of test cleanup.
     let container_id = rt
         .create_container(
             "alpine:latest",
             RunConfig {
-                cmd: vec!["sleep".into(), "300".into()],
+                cmd: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "/bin/busybox timeout 30 /bin/busybox sh -c 'while :; do :; done' || true; exec /bin/busybox sleep 300".into(),
+                ],
                 execution_mode: ExecutionMode::OciRuntime,
                 cpu_quota: Some(50_000),
                 cpu_period: Some(100_000),
@@ -687,76 +695,83 @@ async fn cgroup_cpu_max_enforcement() {
         .await
         .unwrap();
 
-    // Read CPU throttling values inside the container.
-    //
-    // Some guests expose cgroup v2 (`cpu.max`), while others still expose
-    // cgroup v1 (`cpu.cfs_quota_us` + `cpu.cfs_period_us`).
-    let exec_out = rt
+    // Require the declared cgroup v2 contract and observe the init process's
+    // bounded CPU load. Exec is intentionally only an observer: exec cgroup
+    // membership is covered separately from creation-time quota enforcement.
+    let exec_result = rt
         .exec_container(
             &container_id,
             ExecConfig {
                 cmd: vec![
                     "sh".into(),
                     "-c".into(),
-                    "if [ -f /sys/fs/cgroup/cpu.max ]; then \
-                        cat /sys/fs/cgroup/cpu.max; \
-                    elif [ -f /sys/fs/cgroup/cpu/cpu.cfs_quota_us ] && [ -f /sys/fs/cgroup/cpu/cpu.cfs_period_us ]; then \
-                        cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us /sys/fs/cgroup/cpu/cpu.cfs_period_us; \
-                    else \
-                        echo 'missing cpu cgroup controls' >&2; \
-                        exit 1; \
-                    fi"
+                    "set -eu; \
+                     grep -q ' /sys/fs/cgroup cgroup2 ' /proc/mounts; \
+                     controllers=$(cat /sys/fs/cgroup/cgroup.controllers); \
+                     echo \"$controllers\" | grep -qw cpu; \
+                     cpu_max=$(cat /sys/fs/cgroup/cpu.max); \
+                     before=$(awk '$1 == \"nr_throttled\" { print $2 }' /sys/fs/cgroup/cpu.stat); \
+                     test -n \"$before\"; \
+                     sleep 3; \
+                     after=$(awk '$1 == \"nr_throttled\" { print $2 }' /sys/fs/cgroup/cpu.stat); \
+                     test -n \"$after\"; \
+                     printf 'cgroup_filesystem=cgroup2\\ncontrollers=%s\\ncpu_max=%s\\nnr_throttled_before=%s\\nnr_throttled_after=%s\\n' \
+                         \"$controllers\" \"$cpu_max\" \"$before\" \"$after\"; \
+                     test \"$after\" -gt \"$before\""
                         .into(),
                 ],
                 ..ExecConfig::default()
             },
         )
-        .await
-        .unwrap();
+        .await;
 
-    if exec_out.exit_code != 0 {
-        if exec_out.stderr.contains("missing cpu cgroup controls") {
-            eprintln!(
-                "skipping cgroup_cpu_max_enforcement: guest does not expose cpu cgroup controls"
-            );
-            let _ = rt.stop_container(&container_id, true, None, None).await;
-            let _ = rt.remove_container(&container_id).await;
-            return;
-        }
+    // Always attempt cleanup before evaluating evidence so a failing
+    // assertion cannot leave the CPU workload or VM running.
+    let stop_result = rt.stop_container(&container_id, true, None, None).await;
+    let remove_result = rt.remove_container(&container_id).await;
 
-        panic!(
-            "reading cpu cgroup throttling controls should succeed: stderr={}",
-            exec_out.stderr
-        );
-    }
-    let normalized = exec_out.stdout.trim();
-    if normalized.contains(' ') {
-        assert_eq!(
-            normalized, "50000 100000",
-            "cpu.max should reflect quota=50000 period=100000 (0.5 CPU), got: {normalized}"
-        );
-    } else {
-        let lines: Vec<&str> = normalized.lines().map(str::trim).collect();
-        assert_eq!(
-            lines.len(),
-            2,
-            "expected cgroup v1 output with quota and period lines, got: {normalized}"
-        );
-        assert_eq!(
-            lines[0], "50000",
-            "cpu.cfs_quota_us should be 50000, got: {}",
-            lines[0]
-        );
-        assert_eq!(
-            lines[1], "100000",
-            "cpu.cfs_period_us should be 100000, got: {}",
-            lines[1]
-        );
-    }
+    let exec_out = exec_result.unwrap();
+    eprintln!("cgroup CPU enforcement evidence:\n{}", exec_out.stdout);
 
-    // Cleanup.
-    let _ = rt.stop_container(&container_id, true, None, None).await;
-    let _ = rt.remove_container(&container_id).await;
+    assert_eq!(
+        exec_out.exit_code, 0,
+        "cgroup v2 CPU enforcement probe should succeed: stdout={} stderr={}",
+        exec_out.stdout, exec_out.stderr
+    );
+
+    let evidence: std::collections::HashMap<&str, &str> = exec_out
+        .stdout
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    assert_eq!(evidence.get("cgroup_filesystem"), Some(&"cgroup2"));
+    assert!(
+        evidence
+            .get("controllers")
+            .is_some_and(|controllers| controllers.split_whitespace().any(|item| item == "cpu")),
+        "cgroup.controllers should contain cpu: {}",
+        exec_out.stdout
+    );
+    assert_eq!(
+        evidence.get("cpu_max"),
+        Some(&"50000 100000"),
+        "cpu.max should reflect quota=50000 period=100000 (0.5 CPU): {}",
+        exec_out.stdout
+    );
+    let before: u64 = evidence["nr_throttled_before"].parse().unwrap();
+    let after: u64 = evidence["nr_throttled_after"].parse().unwrap();
+    assert!(
+        after > before,
+        "CPU saturation should increment nr_throttled: before={before} after={after}"
+    );
+    assert!(
+        stop_result.is_ok(),
+        "container cleanup stop failed: {stop_result:?}"
+    );
+    assert!(
+        remove_result.is_ok(),
+        "container cleanup remove failed: {remove_result:?}"
+    );
 }
 
 // ── Shared VM inter-service connectivity ────────────────────────

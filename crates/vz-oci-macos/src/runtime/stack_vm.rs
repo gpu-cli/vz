@@ -1,13 +1,20 @@
 use super::bundle::{
     container_log_dir, make_oci_runtime_share, mount_specs_to_bundle_mounts, oci_bundle_guest_path,
     oci_bundle_guest_root, oci_bundle_host_dir, resolve_oci_runtime_binary_path,
-    setup_guest_container_overlay,
+    setup_stack_guest_container_overlay,
 };
 use super::networking::{start_port_forwarding, stop_via_oci_runtime};
 use super::resolve::{
     current_unix_secs, new_container_id, resolve_container_lifecycle, resolve_run_config,
 };
 use super::*;
+
+/// Owned proof that one stack's complete guest activation transaction is
+/// serialized. The first overlay mutation requires this value, and its drop
+/// scope extends through OCI activation and post-start validation.
+pub(super) struct StackActivationGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
 
 pub(super) fn require_running_pid(
     container_id: &str,
@@ -79,6 +86,16 @@ impl Runtime {
             .clone()
     }
 
+    pub(super) async fn acquire_stack_activation_guard(
+        &self,
+        stack_id: &str,
+    ) -> StackActivationGuard {
+        let lock = self.stack_activation_lock(stack_id).await;
+        StackActivationGuard {
+            _guard: lock.lock_owned().await,
+        }
+    }
+
     /// Return the rootfs store directory where assembled rootfs trees are stored.
     ///
     /// This is the parent directory of all per-container rootfs directories.
@@ -139,8 +156,7 @@ impl Runtime {
         ports: Vec<PortMapping>,
         resources: vz_runtime_contract::StackResourceHint,
     ) -> Result<(), OciError> {
-        let activation_lock = self.stack_activation_lock(stack_id).await;
-        let _activation_guard = activation_lock.lock().await;
+        let _activation_guard = self.acquire_stack_activation_guard(stack_id).await;
 
         // Snapshot lock-protected counters into locals so the lock guards
         // don't span the tracing::info! call (which was captured across
@@ -565,14 +581,23 @@ impl Runtime {
         // under /vz-setup-commits — those fields are stripped during the
         // contract → oci_config conversion so they can't be derived here.
 
+        // Serialize the complete guest-critical activation transaction for
+        // this stack. In particular, overlay cleanup performs a VM-global
+        // drop_caches operation, so it must not overlap a sibling service's
+        // overlay mount or OCI create/start. Image pull, rootfs assembly, and
+        // image-config resolution above remain parallel; independent stacks
+        // use independent locks.
+        let activation_guard = self.acquire_stack_activation_guard(stack_id).await;
+
         // Per-container overlay: VirtioFS doesn't support mknod, so we create a
         // guest-side overlay with tmpfs as upperdir for device nodes.
         let vz_rootfs_path = format!("/vz-rootfs/{container_id}");
-        let (guest_rootfs_path, setup_was_restored) = match setup_guest_container_overlay(
+        let (guest_rootfs_path, setup_was_restored) = match setup_stack_guest_container_overlay(
             vm.as_ref(),
             &vz_rootfs_path,
             &container_id,
             setup_commit_tar_guest.as_deref(),
+            &activation_guard,
         )
         .await
         {
@@ -684,12 +709,6 @@ impl Runtime {
                 domainname: run.domainname.clone(),
             },
         )?;
-
-        // Serialize only the guest-critical activation transaction for this
-        // stack. Rootfs assembly and bundle generation above remain parallel,
-        // while independent stacks use independent locks.
-        let activation_lock = self.stack_activation_lock(stack_id).await;
-        let _activation_guard = activation_lock.lock().await;
 
         let vm_is_current = self
             .stack_vms

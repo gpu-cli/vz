@@ -251,7 +251,7 @@ pub fn container_log_dir(container_id: &str) -> String {
 /// Returns `(merged_path, setup_was_restored)`. `setup_was_restored` is
 /// `true` if a commit tar was extracted; the caller should then skip
 /// `run_setup_commands`.
-pub(super) async fn setup_guest_container_overlay(
+async fn setup_guest_container_overlay(
     vm: &LinuxVm,
     vz_rootfs_path: &str,
     container_id: &str,
@@ -325,6 +325,29 @@ pub(super) async fn setup_guest_container_overlay(
     }
 
     Ok((guest_rootfs_path, setup_commit_tar_path.is_some()))
+}
+
+/// Set up an overlay for a VM that is private to one container operation.
+pub(super) async fn setup_unshared_guest_container_overlay(
+    vm: &LinuxVm,
+    vz_rootfs_path: &str,
+    container_id: &str,
+    setup_commit_tar_path: Option<&str>,
+) -> Result<(String, bool), OciError> {
+    setup_guest_container_overlay(vm, vz_rootfs_path, container_id, setup_commit_tar_path).await
+}
+
+/// Set up a shared-stack overlay while the complete guest activation permit
+/// is held. Requiring the permit here makes it impossible to move the first
+/// guest mutation back outside the per-stack critical section accidentally.
+pub(super) async fn setup_stack_guest_container_overlay(
+    vm: &LinuxVm,
+    vz_rootfs_path: &str,
+    container_id: &str,
+    setup_commit_tar_path: Option<&str>,
+    _activation_guard: &super::stack_vm::StackActivationGuard,
+) -> Result<(String, bool), OciError> {
+    setup_guest_container_overlay(vm, vz_rootfs_path, container_id, setup_commit_tar_path).await
 }
 
 pub(super) fn expand_home_dir(path: &Path) -> PathBuf {

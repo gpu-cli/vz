@@ -519,6 +519,11 @@ run_and_log() {
         return 86
     fi
 
+    if [[ $status -eq 0 ]] && grep -q "VZ_E2E_REQUIRED_SKIP:" "$log_file"; then
+        echo "scenario/suite reported a required skip despite a successful exit ($label/$suite)" >&2
+        return 88
+    fi
+
     if [[ $status -eq 0 ]] && [[ "$suite" == "buildkit" ]]; then
         if ! validate_buildkit_runtime_inventory_evidence "$BUILDKIT_RUNTIME_INVENTORY_EVIDENCE"; then
             echo "BuildKit runtime inventory evidence is missing, malformed, or violates the youki-only contract" >&2

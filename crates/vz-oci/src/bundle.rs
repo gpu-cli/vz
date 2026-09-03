@@ -304,10 +304,9 @@ fn build_runtime_spec(spec: BundleSpec, rootfs_path: &str) -> Result<Spec, OciEr
         set_network_namespace_path(&mut spec, &netns_path);
     }
 
-    // Strip namespaces and resources unsupported by the minimal VM kernel.
-    // The kernel has CONFIG_NAMESPACES=y and CONFIG_NET_NS=y, but lacks
-    // CONFIG_PID_NS, CONFIG_IPC_NS, CONFIG_UTS_NS, and cgroup controllers.
-    // Keep only mount (always available) and network namespaces.
+    // Strip namespaces unsupported by the VM kernel. Keep the mount, network,
+    // and cgroup namespaces used by the container runtime; PID, IPC, and UTS
+    // namespaces are not available in the minimal kernel profile.
     strip_unsupported_namespaces(&mut spec);
     clear_default_linux_resources(&mut spec);
 
@@ -361,10 +360,8 @@ fn remove_network_namespace(spec: &mut Spec) {
 
 /// Keep only namespaces supported by the minimal VM kernel.
 ///
-/// The kernel has `CONFIG_NAMESPACES=y` (mount ns) and `CONFIG_NET_NS=y`,
-/// but lacks `CONFIG_PID_NS`, `CONFIG_IPC_NS`, `CONFIG_UTS_NS`, and
-/// cgroup controller support. Unsupported namespace types cause youki to
-/// hang on `unshare()`.
+/// Mount, network, and cgroup namespaces are available. Unsupported namespace
+/// types cause youki to hang on `unshare()`.
 fn strip_unsupported_namespaces(spec: &mut Spec) {
     let Some(linux) = spec.linux_mut() else {
         return;
@@ -375,7 +372,7 @@ fn strip_unsupported_namespaces(spec: &mut Spec) {
     namespaces.retain(|ns| {
         matches!(
             ns.typ(),
-            LinuxNamespaceType::Mount | LinuxNamespaceType::Network
+            LinuxNamespaceType::Mount | LinuxNamespaceType::Network | LinuxNamespaceType::Cgroup
         )
     });
 }
@@ -383,8 +380,8 @@ fn strip_unsupported_namespaces(spec: &mut Spec) {
 /// Clear default linux resources (CPU, memory, pids, devices) from the spec.
 ///
 /// `Linux::default()` populates these with empty values, but their presence
-/// causes youki to attempt cgroup controller setup. The minimal VM kernel
-/// lacks the necessary controllers, so we strip them entirely.
+/// causes youki to attempt unnecessary cgroup controller setup. Explicit
+/// resource requests are added back after the defaults are cleared.
 fn clear_default_linux_resources(spec: &mut Spec) {
     let Some(linux) = spec.linux_mut() else {
         return;
@@ -933,6 +930,108 @@ mod tests {
         ));
         fs::create_dir_all(&base).unwrap();
         base
+    }
+
+    fn generate_minimal_bundle(
+        name: &str,
+        cpu_quota: Option<i64>,
+        cpu_period: Option<u64>,
+    ) -> Spec {
+        let temp = unique_temp_dir(name);
+        let rootfs = temp.join("rootfs");
+        fs::create_dir_all(&rootfs).unwrap();
+
+        let bundle_dir = temp.join("bundle");
+        write_oci_bundle(
+            &bundle_dir,
+            &rootfs,
+            BundleSpec {
+                cmd: vec!["/bin/sh".to_string()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                mounts: Vec::new(),
+                oci_annotations: Vec::new(),
+                network_namespace_path: None,
+                share_host_network: false,
+                cpu_quota,
+                cpu_period,
+                capture_logs: false,
+                cap_add: Vec::new(),
+                cap_drop: Vec::new(),
+                privileged: false,
+                read_only_rootfs: false,
+                sysctls: HashMap::new(),
+                ulimits: Vec::new(),
+                pids_limit: None,
+                hostname: None,
+                domainname: None,
+            },
+        )
+        .unwrap();
+
+        Spec::load(bundle_dir.join(OCI_CONFIG_FILENAME)).unwrap()
+    }
+
+    #[test]
+    fn write_oci_bundle_preserves_cgroup_namespace() {
+        let spec = generate_minimal_bundle("cgroup-namespace", None, None);
+        let namespaces = spec
+            .linux()
+            .as_ref()
+            .expect("linux section should exist")
+            .namespaces()
+            .as_ref()
+            .expect("namespaces should exist");
+
+        assert!(
+            namespaces
+                .iter()
+                .any(|namespace| namespace.typ() == LinuxNamespaceType::Cgroup),
+            "cgroup namespace should survive supported-namespace filtering"
+        );
+    }
+
+    #[test]
+    fn write_oci_bundle_preserves_read_only_cgroup2_mount() {
+        let spec = generate_minimal_bundle("cgroup2-mount", None, None);
+        let cgroup_mount = spec
+            .mounts()
+            .as_ref()
+            .expect("mounts should exist")
+            .iter()
+            .find(|mount| mount.destination() == Path::new("/sys/fs/cgroup"))
+            .expect("cgroup mount should exist");
+
+        assert_eq!(cgroup_mount.typ().as_deref(), Some("cgroup2"));
+        assert_eq!(cgroup_mount.source().as_deref(), Some(Path::new("cgroup2")));
+        assert!(
+            cgroup_mount
+                .options()
+                .as_ref()
+                .expect("cgroup mount options should exist")
+                .iter()
+                .any(|option| option == "ro"),
+            "cgroup2 mount should remain read-only"
+        );
+    }
+
+    #[test]
+    fn write_oci_bundle_serializes_cpu_bandwidth_limits() {
+        let spec = generate_minimal_bundle("cpu-bandwidth", Some(50_000), Some(100_000));
+        let cpu = spec
+            .linux()
+            .as_ref()
+            .expect("linux section should exist")
+            .resources()
+            .as_ref()
+            .expect("linux resources should exist")
+            .cpu()
+            .as_ref()
+            .expect("CPU resources should exist");
+
+        assert_eq!(cpu.quota(), Some(50_000));
+        assert_eq!(cpu.period(), Some(100_000));
     }
 
     #[test]

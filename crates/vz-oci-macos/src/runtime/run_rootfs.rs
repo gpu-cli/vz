@@ -1,7 +1,7 @@
 use super::bundle::{
     container_log_dir, make_oci_runtime_share, mount_specs_to_bundle_mounts,
     mount_specs_to_shared_dirs, oci_bundle_guest_path, oci_bundle_guest_root, oci_bundle_host_dir,
-    resolve_oci_runtime_binary_path, setup_guest_container_overlay, write_hosts_file,
+    resolve_oci_runtime_binary_path, setup_unshared_guest_container_overlay, write_hosts_file,
 };
 use super::networking::start_port_forwarding;
 use super::oci_lifecycle::{run_oci_lifecycle, spawn_log_rotation_task};
@@ -138,7 +138,7 @@ impl Runtime {
         // Set up per-container overlay so youki can mknod on tmpfs.
         // Non-stack path: no setup-commit cache, always start fresh.
         if let Err(err) =
-            setup_guest_container_overlay(&vm, "/vz-rootfs", &oci_container_id, None).await
+            setup_unshared_guest_container_overlay(&vm, "/vz-rootfs", &oci_container_id, None).await
         {
             let _ = vm.stop().await;
             return Err(err);
@@ -329,7 +329,7 @@ impl Runtime {
         // Set up per-container overlay so youki can mknod on tmpfs.
         // Non-stack path: no setup-commit cache, always start fresh.
         if let Err(err) =
-            setup_guest_container_overlay(&vm, "/vz-rootfs", &container_id, None).await
+            setup_unshared_guest_container_overlay(&vm, "/vz-rootfs", &container_id, None).await
         {
             let _ = vm.stop().await;
             return Err(err);

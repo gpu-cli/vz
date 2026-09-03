@@ -135,6 +135,28 @@ async fn activation_locks_serialize_one_stack_but_not_distinct_stacks() {
     waiter.await.unwrap();
 }
 
+#[tokio::test]
+async fn activation_guard_proves_the_same_stack_lock_is_held() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("activation-guard"),
+        ..RuntimeConfig::default()
+    });
+    let same_stack = runtime.stack_activation_lock("stack-a").await;
+    let distinct_stack = runtime.stack_activation_lock("stack-b").await;
+
+    let activation_guard = runtime.acquire_stack_activation_guard("stack-a").await;
+    assert!(
+        same_stack.try_lock().is_err(),
+        "activation permit must own the same-stack lock"
+    );
+    assert!(
+        distinct_stack.try_lock().is_ok(),
+        "activation permit must not serialize independent stacks"
+    );
+    drop(activation_guard);
+    assert!(same_stack.try_lock().is_ok());
+}
+
 #[test]
 fn ensure_checkpoint_class_supported_rejects_vm_full_without_capability() {
     let runtime = Runtime::new(RuntimeConfig {
@@ -524,6 +546,24 @@ fn resolve_run_config_preserves_execution_mode() {
 
     let resolved = resolve_run_config(image_config, run, "container-123").unwrap();
     assert_eq!(resolved.execution_mode, ExecutionMode::OciRuntime);
+}
+
+#[test]
+fn resolve_run_config_preserves_cpu_bandwidth_limits() {
+    let image_config = ImageConfigSummary {
+        cmd: Some(vec!["default".to_string()]),
+        ..ImageConfigSummary::default()
+    };
+
+    let run = RunConfig {
+        cpu_quota: Some(50_000),
+        cpu_period: Some(100_000),
+        ..RunConfig::default()
+    };
+
+    let resolved = resolve_run_config(image_config, run, "container-123").unwrap();
+    assert_eq!(resolved.cpu_quota, Some(50_000));
+    assert_eq!(resolved.cpu_period, Some(100_000));
 }
 
 #[test]

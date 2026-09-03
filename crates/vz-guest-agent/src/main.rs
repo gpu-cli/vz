@@ -12,6 +12,8 @@ mod grpc_server;
 mod listener;
 #[cfg(target_os = "linux")]
 pub(crate) mod network;
+#[cfg(any(target_os = "linux", test))]
+mod network_holder;
 mod process_table;
 
 use std::ffi::{OsStr, OsString};

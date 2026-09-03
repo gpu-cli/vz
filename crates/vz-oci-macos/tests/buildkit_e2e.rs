@@ -142,7 +142,7 @@ async fn assert_and_retain_runtime_inventory(config: &RuntimeConfig) {
 async fn buildkit_builds_dockerfile_and_run_uses_built_image() {
     if !has_virtualization_entitlement() {
         eprintln!(
-            "skipping buildkit_e2e: test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-sandbox-vm-e2e.sh --suite buildkit"
+            "VZ_E2E_REQUIRED_SKIP: buildkit_e2e test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-sandbox-vm-e2e.sh --suite buildkit"
         );
         return;
     }
@@ -186,7 +186,7 @@ CMD ["cat", "/message.txt"]
 async fn buildkit_cache_disk_usage_health_smoke() {
     if !has_virtualization_entitlement() {
         eprintln!(
-            "skipping buildkit_e2e: test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-sandbox-vm-e2e.sh --suite buildkit"
+            "VZ_E2E_REQUIRED_SKIP: buildkit_e2e test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-sandbox-vm-e2e.sh --suite buildkit"
         );
         return;
     }
@@ -211,7 +211,7 @@ async fn buildkit_cache_disk_usage_health_smoke() {
 async fn buildkit_cache_survives_context_switch_vm_restart() {
     if !has_virtualization_entitlement() {
         eprintln!(
-            "skipping buildkit_e2e: test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-sandbox-vm-e2e.sh --suite buildkit"
+            "VZ_E2E_REQUIRED_SKIP: buildkit_e2e test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-sandbox-vm-e2e.sh --suite buildkit"
         );
         return;
     }

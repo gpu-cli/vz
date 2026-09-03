@@ -33,7 +33,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Path;
@@ -42,6 +42,10 @@ use std::time::Duration;
 
 use tracing::info;
 use vz::protocol::NetworkServiceConfig;
+
+use crate::network_holder::{
+    NamespaceHolderOps, complete_namespace_handoff, prepare_namespace_holder, retry_waitpid,
+};
 
 /// Directory where named network namespaces are stored.
 const NETNS_RUN_DIR: &str = "/var/run/netns";
@@ -409,6 +413,7 @@ fn move_link_to_netns(dev: &str, ns_path: &str) -> io::Result<()> {
     // before the child completes setns(), producing a successful no-op move
     // into the root namespace and an irrecoverable in-namespace rename failure.
     unsafe {
+        let mut holder_ops = LinuxNamespaceHolderOps;
         let pid = libc::fork();
         if pid < 0 {
             let error = io::Error::last_os_error();
@@ -419,19 +424,8 @@ fn move_link_to_netns(dev: &str, ns_path: &str) -> io::Result<()> {
 
         if pid == 0 {
             libc::close(ready_pipe[0]);
-            if libc::setns(ns_fd, libc::CLONE_NEWNET) != 0 {
-                libc::_exit(1);
-            }
-            let ready = [1_u8];
-            loop {
-                let written = libc::write(ready_pipe[1], ready.as_ptr().cast(), ready.len());
-                if written == 1 {
-                    break;
-                }
-                if written < 0 && *libc::__errno_location() == libc::EINTR {
-                    continue;
-                }
-                libc::_exit(2);
+            if let Err(failure) = prepare_namespace_holder(&mut holder_ops, ns_fd, ready_pipe[1]) {
+                libc::_exit(failure.exit_code());
             }
             libc::close(ready_pipe[1]);
             libc::alarm(30);
@@ -442,40 +436,54 @@ fn move_link_to_netns(dev: &str, ns_path: &str) -> io::Result<()> {
 
         libc::close(ready_pipe[1]);
         let mut ready_reader = fs::File::from_raw_fd(ready_pipe[0]);
-        if let Err(error) = wait_for_namespace_holder_ready(&mut ready_reader) {
-            libc::kill(pid, libc::SIGKILL);
-            let mut status: libc::c_int = 0;
-            libc::waitpid(pid, &mut status, 0);
-            return Err(io::Error::new(
-                error.kind(),
-                format!("namespace holder for {ns_path} failed before handoff: {error}"),
-            ));
-        }
-
-        // The child has completed setns, so its PID now names the intended
-        // target namespace for the BusyBox ip handoff.
-        let pid_str = pid.to_string();
-        let result = ip_run(&["link", "set", dev, "netns", &pid_str]);
-
-        // Kill the waiting child and reap it.
-        libc::kill(pid, libc::SIGKILL);
-        let mut status: libc::c_int = 0;
-        libc::waitpid(pid, &mut status, 0);
-
-        result
+        complete_namespace_handoff(&mut holder_ops, &mut ready_reader, dev, ns_path, pid)
     }
 }
 
-fn wait_for_namespace_holder_ready(reader: &mut impl Read) -> io::Result<()> {
-    let mut ready = [0_u8; 1];
-    reader.read_exact(&mut ready)?;
-    if ready[0] != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unexpected namespace readiness byte {}", ready[0]),
-        ));
+struct LinuxNamespaceHolderOps;
+
+impl NamespaceHolderOps for LinuxNamespaceHolderOps {
+    fn setns(&mut self, ns_fd: std::os::fd::RawFd) -> bool {
+        unsafe { libc::setns(ns_fd, libc::CLONE_NEWNET) == 0 }
     }
-    Ok(())
+
+    fn signal_ready(&mut self, ready_fd: std::os::fd::RawFd) -> bool {
+        let ready = [1_u8];
+        loop {
+            let written = unsafe { libc::write(ready_fd, ready.as_ptr().cast(), ready.len()) };
+            if written == 1 {
+                return true;
+            }
+            if written < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
+                continue;
+            }
+            return false;
+        }
+    }
+
+    fn move_link(&mut self, dev: &str, pid: libc::pid_t) -> io::Result<()> {
+        let pid_string = pid.to_string();
+        ip_run(&["link", "set", dev, "netns", &pid_string])
+    }
+
+    fn terminate(&mut self, pid: libc::pid_t) -> io::Result<()> {
+        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn reap(&mut self, pid: libc::pid_t) -> io::Result<()> {
+        retry_waitpid(pid, |pid| {
+            let mut status: libc::c_int = 0;
+            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if waited < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(waited)
+            }
+        })
+    }
 }
 
 // ── Command-based network operations ───────────────────────────────
@@ -642,16 +650,5 @@ mod tests {
     fn transient_link_rename_error_detection_rejects_unrelated_messages() {
         let err = io::Error::other("permission denied");
         assert!(!is_transient_link_rename_error(&err));
-    }
-
-    #[test]
-    fn namespace_holder_readiness_requires_success_byte() {
-        wait_for_namespace_holder_ready(&mut &b"\x01"[..]).unwrap();
-
-        let unexpected = wait_for_namespace_holder_ready(&mut &b"\x02"[..]).unwrap_err();
-        assert_eq!(unexpected.kind(), io::ErrorKind::InvalidData);
-
-        let missing = wait_for_namespace_holder_ready(&mut &b""[..]).unwrap_err();
-        assert_eq!(missing.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

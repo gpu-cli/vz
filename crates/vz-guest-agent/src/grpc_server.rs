@@ -1540,8 +1540,9 @@ async fn run_youki_output(
 /// Patch OCI config.json to be compatible with the minimal guest VM kernel.
 ///
 /// The guest VM runs a stripped kernel that may lack certain filesystem types
-/// (e.g. mqueue, cgroup v1). This function removes or adjusts mounts that
-/// would cause youki to fail or hang.
+/// (e.g. mqueue and cgroup v1). This function removes or adjusts mounts that
+/// would cause youki to fail or hang while preserving the cgroup v2 surface
+/// required for OCI resource enforcement.
 #[cfg(target_os = "linux")]
 async fn patch_oci_config(config_path: &str) -> Result<(), Status> {
     let content = tokio::fs::read_to_string(config_path)
@@ -1551,12 +1552,28 @@ async fn patch_oci_config(config_path: &str) -> Result<(), Status> {
     let mut config: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| Status::internal(format!("parse config.json: {e}")))?;
 
+    normalize_oci_config(&mut config);
+
+    let patched = serde_json::to_string_pretty(&config)
+        .map_err(|e| Status::internal(format!("serialize config.json: {e}")))?;
+
+    tokio::fs::write(config_path, patched)
+        .await
+        .map_err(|e| Status::internal(format!("write config.json: {e}")))?;
+
+    Ok(())
+}
+
+/// Normalize an OCI config for the guest kernel without discarding the
+/// read-only cgroup v2 view used to inspect and enforce container resources.
+#[cfg(any(target_os = "linux", test))]
+fn normalize_oci_config(config: &mut serde_json::Value) {
     // Remove mounts with filesystem types not available in the minimal kernel.
-    // Only keep types known to work: proc, tmpfs, bind, overlay.
-    // Types that hang or fail: mqueue (CONFIG_POSIX_MQUEUE), devpts, sysfs,
-    // cgroup/cgroup2 — these can cause youki to hang during container init.
+    // cgroup2 is explicitly supported and must retain the read-only options
+    // supplied by the host bundle. Types that still hang or fail include
+    // mqueue (CONFIG_POSIX_MQUEUE), devpts, sysfs, and cgroup v1.
     if let Some(mounts) = config.pointer_mut("/mounts").and_then(|v| v.as_array_mut()) {
-        let supported_types = ["proc", "tmpfs", "bind"];
+        let supported_types = ["proc", "tmpfs", "bind", "cgroup2"];
         mounts.retain(|m| {
             let typ = m.get("type").and_then(|t| t.as_str()).unwrap_or("");
             if !supported_types.contains(&typ) {
@@ -1583,9 +1600,9 @@ async fn patch_oci_config(config_path: &str) -> Result<(), Status> {
             if obj.remove("readonlyPaths").is_some() {
                 tracing::info!("stripped readonlyPaths from OCI config");
             }
-            // Strip unsupported namespaces but preserve mount and network.
-            // The host-side bundle already strips PID/IPC/UTS/cgroup, but
-            // older bundles or third-party configs may still include them.
+            // Strip unsupported namespaces but preserve mount, network, and
+            // cgroup. The cgroup namespace makes the container's delegated
+            // cgroup appear at the root of its read-only cgroup2 mount.
             // Network namespaces MUST be preserved — multi-service stacks
             // use per-service netns (e.g. /var/run/netns/svc-web) for
             // container network isolation and service discovery.
@@ -1593,7 +1610,7 @@ async fn patch_oci_config(config_path: &str) -> Result<(), Status> {
                 let before = namespaces.len();
                 namespaces.retain(|ns| {
                     let typ = ns.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    matches!(typ, "mount" | "network")
+                    matches!(typ, "mount" | "network" | "cgroup")
                 });
                 let stripped = before - namespaces.len();
                 if stripped > 0 {
@@ -1602,15 +1619,6 @@ async fn patch_oci_config(config_path: &str) -> Result<(), Status> {
             }
         }
     }
-
-    let patched = serde_json::to_string_pretty(&config)
-        .map_err(|e| Status::internal(format!("serialize config.json: {e}")))?;
-
-    tokio::fs::write(config_path, patched)
-        .await
-        .map_err(|e| Status::internal(format!("write config.json: {e}")))?;
-
-    Ok(())
 }
 
 /// Read and log the contents of a youki log file for diagnostics.
@@ -1916,5 +1924,63 @@ mod tests {
 
         assert!(error.contains("CONFIG_USER_NS=y"));
         assert!(error.contains("uid_map"));
+    }
+
+    #[test]
+    fn oci_normalization_preserves_read_only_cgroup2_mount_and_namespace() {
+        let mut config = serde_json::json!({
+            "mounts": [
+                { "destination": "/proc", "type": "proc", "source": "proc" },
+                {
+                    "destination": "/sys/fs/cgroup",
+                    "type": "cgroup2",
+                    "source": "cgroup2",
+                    "options": ["nosuid", "noexec", "nodev", "relatime", "ro"]
+                },
+                { "destination": "/sys", "type": "sysfs", "source": "sysfs" }
+            ],
+            "linux": {
+                "maskedPaths": ["/proc/kcore"],
+                "readonlyPaths": ["/proc/sys"],
+                "resources": {
+                    "cpu": {
+                        "quota": 50000,
+                        "period": 100000
+                    }
+                },
+                "namespaces": [
+                    { "type": "mount" },
+                    { "type": "network" },
+                    { "type": "cgroup" },
+                    { "type": "pid" }
+                ]
+            }
+        });
+        let resources_before = config["linux"]["resources"].clone();
+
+        normalize_oci_config(&mut config);
+
+        let mounts = config["mounts"].as_array().expect("mounts");
+        assert_eq!(mounts.len(), 2);
+        let cgroup2 = mounts
+            .iter()
+            .find(|mount| mount["type"] == "cgroup2")
+            .expect("cgroup2 mount must survive normalization");
+        assert_eq!(cgroup2["destination"], "/sys/fs/cgroup");
+        assert_eq!(
+            cgroup2["options"],
+            serde_json::json!(["nosuid", "noexec", "nodev", "relatime", "ro"])
+        );
+
+        let namespace_types: Vec<&str> = config["linux"]["namespaces"]
+            .as_array()
+            .expect("namespaces")
+            .iter()
+            .map(|namespace| namespace["type"].as_str().expect("namespace type"))
+            .collect();
+        assert_eq!(namespace_types, ["mount", "network", "cgroup"]);
+        assert_eq!(config["linux"]["resources"], resources_before);
+        assert!(config["linux"].get("maskedPaths").is_none());
+        assert!(config["linux"].get("readonlyPaths").is_none());
     }
 }

@@ -66,6 +66,22 @@ enum LayerMediaType {
     Tar,
 }
 
+/// Filesystem lock guarding publication of one unpacked layer directory.
+///
+/// The directory is created atomically, works across threads and processes,
+/// and is removed on every normal return path. Waiters never infer readiness
+/// from the destination directory itself; only the `.done` marker publishes a
+/// fully normalized layer.
+struct LayerExtractionLock {
+    path: PathBuf,
+}
+
+impl Drop for LayerExtractionLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
 impl LayerMediaType {
     fn extension(self) -> &'static str {
         match self {
@@ -385,32 +401,51 @@ impl ImageStore {
         let src = self.resolve_layer_blob_path(digest, media)?;
         let destination = self.unpacked_layer_dir(digest);
         let done_marker = destination.with_extension("done");
+        let lock_dir = destination.with_extension("lock");
 
         // Fast path: extraction already completed by a previous or concurrent call.
         if done_marker.exists() {
             return Ok(destination);
         }
 
-        // Directory exists but no `.done` marker. Either:
-        // (a) Another thread is extracting right now (`.tmp` sibling exists) — wait.
-        // (b) Legacy extraction from before the marker was introduced — stamp it.
-        if destination.exists() {
-            let tmp_dir = destination.with_extension("tmp");
-            if tmp_dir.exists() {
-                Self::wait_for_done(&done_marker)?;
-            } else {
-                // Legacy extraction or marker was lost — treat as complete.
-                File::create(&done_marker)?;
+        // Exactly one caller may extract, normalize, and publish this layer.
+        // A destination without `.done` is never considered ready: it may be a
+        // legacy extraction, a recovered interrupted publish, or an active
+        // writer from another process.
+        let _extraction_lock = loop {
+            match fs::create_dir(&lock_dir) {
+                Ok(()) => {
+                    break LayerExtractionLock {
+                        path: lock_dir.clone(),
+                    };
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    if Self::wait_for_done_or_unlock(&done_marker, &lock_dir)? {
+                        return Ok(destination);
+                    }
+                }
+                Err(error) => return Err(error),
             }
+        };
+
+        // Re-check after acquiring the lock because another publisher may
+        // have completed between the initial fast path and lock acquisition.
+        if done_marker.exists() {
             return Ok(destination);
         }
 
-        // Race-safe creation: use a temp directory and rename. If rename fails
-        // with AlreadyExists, another thread won the race — wait for their marker.
-        let tmp_dir = destination.with_extension("tmp");
-        if tmp_dir.exists() {
-            let _ = fs::remove_dir_all(&tmp_dir);
+        // Recover a legacy or interrupted destination only while holding the
+        // publication lock. Ownership normalization must finish before `.done`
+        // becomes visible to consumers.
+        if destination.exists() {
+            fix_ownership(&destination)?;
+            File::create(&done_marker)?;
+            return Ok(destination);
         }
+
+        // Each publisher owns a unique temporary tree. A concurrent caller can
+        // therefore never delete another extractor's active workspace.
+        let tmp_dir = unique_temp_path(&destination);
         fs::create_dir_all(&tmp_dir)?;
 
         let output = match media {
@@ -455,36 +490,36 @@ impl ImageStore {
             )));
         }
 
-        // Atomically move to final destination.
-        match fs::rename(&tmp_dir, &destination) {
-            Ok(()) => {
-                // We won the race — write the completion marker.
-                File::create(&done_marker)?;
-                // Fix ownership: layers extracted from tar preserve root ownership,
-                // which causes permission denied when host user tries to access them.
-                fix_ownership(&destination)?;
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                // Another thread beat us. Clean up our temp dir and wait for theirs.
-                let _ = fs::remove_dir_all(&tmp_dir);
-                Self::wait_for_done(&done_marker)?;
-            }
-            Err(e) => {
-                let _ = fs::remove_dir_all(&tmp_dir);
-                return Err(e);
-            }
+        // Normalize private temporary inodes before publishing the directory.
+        // After rename, consumers may discover the path, so no inode metadata
+        // may change between rename and `.done` publication.
+        if let Err(error) = fix_ownership(&tmp_dir) {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Err(error);
         }
+        if let Err(error) = fs::rename(&tmp_dir, &destination) {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Err(error);
+        }
+        File::create(&done_marker)?;
 
         Ok(destination)
     }
 
-    /// Wait for a `.done` marker file to appear, polling with backoff.
-    fn wait_for_done(done_marker: &Path) -> io::Result<()> {
+    /// Wait for a `.done` marker or for the current publisher to release its
+    /// lock after an error. Returns `true` only for a published layer.
+    fn wait_for_done_or_unlock(done_marker: &Path, lock_dir: &Path) -> io::Result<bool> {
         let mut elapsed = std::time::Duration::ZERO;
         let timeout = std::time::Duration::from_secs(120);
         let poll_interval = std::time::Duration::from_millis(100);
 
-        while !done_marker.exists() {
+        loop {
+            if done_marker.exists() {
+                return Ok(true);
+            }
+            if !lock_dir.exists() {
+                return Ok(false);
+            }
             if elapsed >= timeout {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -497,7 +532,6 @@ impl ImageStore {
             std::thread::sleep(poll_interval);
             elapsed += poll_interval;
         }
-        Ok(())
     }
 
     /// Assemble and apply all image layers into `rootfs/<container_id>/`.
@@ -517,10 +551,6 @@ impl ImageStore {
             let layer_root = self.unpack_layer(&layer.digest, &layer.media_type)?;
             overlay_copy_layer(&layer_root, &rootfs)?;
         }
-
-        // Fix ownership: files from container images are often owned by root (UID 0),
-        // which causes permission denied errors when the host user tries to access them.
-        fix_ownership(&rootfs)?;
 
         Ok(rootfs)
     }
@@ -952,8 +982,7 @@ fn overlay_copy_layer(source_layer_dir: &Path, rootfs_dir: &Path) -> io::Result<
                     io::Error::new(io::ErrorKind::InvalidInput, "layer entry has no parent")
                 })?;
                 fs::create_dir_all(parent)?;
-                hard_link_or_copy_file(&src, &destination)?;
-                fs::set_permissions(&destination, metadata.permissions())?;
+                copy_file_independent(&src, &destination)?;
             }
         }
     }
@@ -1011,21 +1040,17 @@ fn copy_symlink(source: &Path, destination: &Path) -> io::Result<()> {
     unix_fs::symlink(target, destination)
 }
 
-fn hard_link_or_copy_file(source: &Path, destination: &Path) -> io::Result<()> {
+/// Copy a cached layer file into an independently mutable rootfs inode.
+///
+/// `std::fs::copy` uses clonefile/COW on Apple filesystems when available, so
+/// this keeps APFS assembly cheap without aliasing metadata between parallel
+/// containers. Other platforms use their standard copy implementation.
+fn copy_file_independent(source: &Path, destination: &Path) -> io::Result<()> {
     remove_path_if_exists(destination)?;
-    match fs::hard_link(source, destination) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            let mut src = File::open(source)?;
-            let mut dst = File::create(destination)?;
-            io::copy(&mut src, &mut dst)?;
-            Ok(())
-        }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
     }
+    fs::copy(source, destination).map(|_| ())
 }
 
 /// Fix ownership of a directory tree to match the current user.
@@ -1265,17 +1290,180 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
-    fn hard_link_or_copy_falls_back_when_linking_fails() {
-        let root = unique_temp_dir("fallback");
+    fn copied_layer_file_is_independent_and_preserves_executable_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = unique_temp_dir("independent-copy");
         let source = root.join("src_file");
         let destination = root.join("nested").join("dest");
 
         fs::write(&source, b"payload").unwrap();
-        hard_link_or_copy_file(&source, &destination).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        copy_file_independent(&source, &destination).unwrap();
 
         assert_eq!(fs::read_to_string(&destination).unwrap(), "payload");
-        assert!(destination.metadata().unwrap().is_file());
+        let source_metadata = source.metadata().unwrap();
+        let destination_metadata = destination.metadata().unwrap();
+        assert_ne!(source_metadata.ino(), destination_metadata.ino());
+        assert_eq!(destination_metadata.permissions().mode() & 0o777, 0o755);
+
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&destination, b"changed").unwrap();
+        assert_eq!(fs::read_to_string(&source).unwrap(), "payload");
+        assert_eq!(
+            source.metadata().unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_rootfs_assembly_does_not_share_cached_layer_inodes() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = unique_temp_dir("parallel-independent-copies");
+        let layer = root.join("layer");
+        let first_rootfs = root.join("first-rootfs");
+        let second_rootfs = root.join("second-rootfs");
+        fs::create_dir_all(layer.join("bin")).unwrap();
+        fs::create_dir_all(&first_rootfs).unwrap();
+        fs::create_dir_all(&second_rootfs).unwrap();
+        let cached_binary = layer.join("bin/tool");
+        fs::write(&cached_binary, b"cached executable").unwrap();
+        fs::set_permissions(&cached_binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let first_layer = layer.clone();
+        let first_destination = first_rootfs.clone();
+        let second_layer = layer.clone();
+        let second_destination = second_rootfs.clone();
+        let first = std::thread::spawn(move || {
+            overlay_copy_layer(&first_layer, &first_destination).unwrap();
+        });
+        let second = std::thread::spawn(move || {
+            overlay_copy_layer(&second_layer, &second_destination).unwrap();
+        });
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let first_binary = first_rootfs.join("bin/tool");
+        let second_binary = second_rootfs.join("bin/tool");
+        let cached_inode = cached_binary.metadata().unwrap().ino();
+        let first_inode = first_binary.metadata().unwrap().ino();
+        let second_inode = second_binary.metadata().unwrap().ino();
+        assert_ne!(cached_inode, first_inode);
+        assert_ne!(cached_inode, second_inode);
+        assert_ne!(first_inode, second_inode);
+
+        fs::set_permissions(&first_binary, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&first_binary, b"first changed").unwrap();
+        assert_eq!(fs::read(&cached_binary).unwrap(), b"cached executable");
+        assert_eq!(fs::read(&second_binary).unwrap(), b"cached executable");
+        assert_eq!(
+            cached_binary.metadata().unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            second_binary.metadata().unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn layer_waiter_requires_done_and_retries_after_unlock() {
+        let root = unique_temp_dir("layer-publication-wait");
+        let done = root.join("layer.done");
+        let lock = root.join("layer.lock");
+        fs::create_dir(&lock).unwrap();
+
+        let waiter_done = done.clone();
+        let waiter_lock = lock.clone();
+        let waiter = std::thread::spawn(move || {
+            ImageStore::wait_for_done_or_unlock(&waiter_done, &waiter_lock).unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            !waiter.is_finished(),
+            "lock alone must not publish the layer"
+        );
+
+        fs::remove_dir(&lock).unwrap();
+        assert!(!waiter.join().unwrap(), "unlock without .done must retry");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cold_concurrent_layer_unpack_publishes_one_complete_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Barrier};
+
+        let root = unique_temp_dir("cold-concurrent-unpack");
+        let store = ImageStore::new(root.clone());
+        store.ensure_layout().unwrap();
+
+        let input = root.join("tar-input");
+        fs::create_dir_all(input.join("bin")).unwrap();
+        let input_binary = input.join("bin/tool");
+        fs::write(&input_binary, b"complete executable").unwrap();
+        fs::set_permissions(&input_binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let digest = "sha256:cold-concurrent-layer";
+        let blob = store.layer_blob_path(digest, LayerMediaType::Tar);
+        let tar = Command::new("tar")
+            .arg("-cpf")
+            .arg(&blob)
+            .arg("-C")
+            .arg(&input)
+            .arg(".")
+            .output()
+            .unwrap();
+        assert!(
+            tar.status.success(),
+            "tar failed: {}",
+            String::from_utf8_lossy(&tar.stderr)
+        );
+
+        let barrier = Arc::new(Barrier::new(3));
+        let first_store = store.clone();
+        let first_barrier = Arc::clone(&barrier);
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_store.unpack_layer(digest, "application/vnd.oci.image.layer.v1.tar")
+        });
+        let second_store = store.clone();
+        let second_barrier = Arc::clone(&barrier);
+        let second = std::thread::spawn(move || {
+            second_barrier.wait();
+            second_store.unpack_layer(digest, "application/vnd.oci.image.layer.v1.tar")
+        });
+        barrier.wait();
+
+        let first_path = first.join().unwrap().unwrap();
+        let second_path = second.join().unwrap().unwrap();
+        assert_eq!(first_path, second_path);
+        assert_eq!(
+            fs::read(first_path.join("bin/tool")).unwrap(),
+            b"complete executable"
+        );
+        assert_eq!(
+            first_path
+                .join("bin/tool")
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert!(first_path.with_extension("done").is_file());
+        assert!(!first_path.with_extension("lock").exists());
+
         fs::remove_dir_all(root).unwrap();
     }
 

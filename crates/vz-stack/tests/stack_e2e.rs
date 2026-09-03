@@ -59,7 +59,7 @@ fn require_virtualization_entitlement() -> bool {
     }
 
     eprintln!(
-        "skipping stack_e2e: test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-sandbox-vm-e2e.sh --suite stack"
+        "VZ_E2E_REQUIRED_SKIP: stack_e2e test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-sandbox-vm-e2e.sh --suite stack"
     );
     false
 }
