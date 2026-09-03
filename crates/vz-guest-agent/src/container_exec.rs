@@ -26,6 +26,14 @@ const MAX_CGROUP_PATH_BYTES: usize = 4096;
 #[cfg(any(target_os = "linux", test))]
 const MAX_CGROUP_COMPONENT_BYTES: usize = 255;
 const MAX_CONTAINER_ID_BYTES: usize = 128;
+#[cfg(any(target_os = "linux", test))]
+const MAX_IDENTITY_FILE_BYTES: usize = 1024 * 1024;
+#[cfg(any(target_os = "linux", test))]
+const MAX_IDENTITY_RECORD_BYTES: usize = 16 * 1024;
+#[cfg(any(target_os = "linux", test))]
+const MAX_IDENTITY_NAME_BYTES: usize = 256;
+#[cfg(any(target_os = "linux", test))]
+const MAX_SUPPLEMENTARY_GROUPS: usize = 1024;
 
 /// A command which starts the hidden, same-binary trampoline.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +50,16 @@ struct TrampolineInvocation {
     command: String,
     args: Vec<String>,
     working_dir: Option<String>,
+    user: Option<String>,
+    retain_shell_environment: bool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedIdentity {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    supplementary_groups: Vec<libc::gid_t>,
 }
 
 /// Immutable identity of a running container target.
@@ -82,6 +100,8 @@ struct ExecPayload {
     argv_ptrs: Vec<*const libc::c_char>,
     environment: Vec<CString>,
     environment_ptrs: Vec<*const libc::c_char>,
+    identity: ResolvedIdentity,
+    identity_verification_groups: Vec<libc::gid_t>,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -101,6 +121,10 @@ enum ChildSetupStage {
     CloseDescriptors = 11,
     SignalState = 12,
     TargetRace = 13,
+    SupplementaryGroups = 14,
+    GroupIdentity = 15,
+    UserIdentity = 16,
+    IdentityVerify = 17,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -120,6 +144,10 @@ impl ChildSetupStage {
             Self::CloseDescriptors => "descriptor closure",
             Self::SignalState => "signal state reset",
             Self::TargetRace => "target init liveness check",
+            Self::SupplementaryGroups => "supplementary group selection",
+            Self::GroupIdentity => "group identity selection",
+            Self::UserIdentity => "user identity selection",
+            Self::IdentityVerify => "execution identity verification",
         }
     }
 
@@ -138,6 +166,10 @@ impl ChildSetupStage {
             11 => Self::CloseDescriptors,
             12 => Self::SignalState,
             13 => Self::TargetRace,
+            14 => Self::SupplementaryGroups,
+            15 => Self::GroupIdentity,
+            16 => Self::UserIdentity,
+            17 => Self::IdentityVerify,
             _ => return None,
         })
     }
@@ -187,6 +219,8 @@ pub(crate) fn prepare_trampoline(
     command: &str,
     args: &[String],
     working_dir: Option<&str>,
+    user: Option<&str>,
+    retain_shell_environment: bool,
 ) -> anyhow::Result<TrampolineCommand> {
     validate_container_id(container_id)?;
     if command.is_empty() {
@@ -197,10 +231,16 @@ pub(crate) fn prepare_trampoline(
         Some(value) => format!("s{value}"),
         None => "n".to_string(),
     };
-    let mut trampoline_args = Vec::with_capacity(args.len() + 4);
+    let encoded_user = match user {
+        Some(value) if !value.is_empty() => format!("s{value}"),
+        _ => "n".to_string(),
+    };
+    let mut trampoline_args = Vec::with_capacity(args.len() + 6);
     trampoline_args.push(TRAMPOLINE_MARKER.to_string());
     trampoline_args.push(container_id.to_string());
     trampoline_args.push(encoded_cwd);
+    trampoline_args.push(encoded_user);
+    trampoline_args.push(if retain_shell_environment { "s" } else { "n" }.to_string());
     trampoline_args.push(command.to_string());
     trampoline_args.extend(args.iter().cloned());
 
@@ -238,11 +278,27 @@ fn parse_trampoline_args(args: &[OsString]) -> anyhow::Result<TrampolineInvocati
     } else {
         bail!("container exec trampoline working directory encoding is invalid");
     };
-    let command = required_utf8_arg(args, 3, "command")?;
+    let encoded_user = required_utf8_arg(args, 3, "user")?;
+    let user = if encoded_user == "n" {
+        None
+    } else if let Some(value) = encoded_user
+        .strip_prefix('s')
+        .filter(|value| !value.is_empty())
+    {
+        Some(value.to_string())
+    } else {
+        bail!("container exec trampoline user encoding is invalid");
+    };
+    let retain_shell_environment = match required_utf8_arg(args, 4, "SHELL policy")?.as_str() {
+        "s" => true,
+        "n" => false,
+        _ => bail!("container exec trampoline SHELL policy encoding is invalid"),
+    };
+    let command = required_utf8_arg(args, 5, "command")?;
     if command.is_empty() {
         bail!("container exec command cannot be empty");
     }
-    let command_args = args[4..]
+    let command_args = args[6..]
         .iter()
         .map(|arg| {
             arg.to_str()
@@ -256,6 +312,8 @@ fn parse_trampoline_args(args: &[OsString]) -> anyhow::Result<TrampolineInvocati
         command,
         args: command_args,
         working_dir,
+        user,
+        retain_shell_environment,
     })
 }
 
@@ -428,7 +486,8 @@ impl LauncherOps for RealLauncherOps {
             &pinned.root,
             invocation.working_dir.as_deref().unwrap_or("/"),
         )?;
-        let payload = prepare_exec_payload(invocation)?;
+        let identity = resolve_container_identity(&pinned.root, invocation.user.as_deref())?;
+        let mut payload = prepare_exec_payload(invocation, identity)?;
         let expected_cgroup = format!("0::{}", target.cgroup_path).into_bytes();
 
         // A pidfd remains meaningful across PID namespaces and closes the
@@ -470,7 +529,7 @@ impl LauncherOps for RealLauncherOps {
             // SAFETY: the child does not use the reader and never returns to
             // run its inherited Rust destructors.
             unsafe { libc::close(setup_reader.as_raw_fd()) };
-            child_exec(child_fds, &expected_cgroup, &payload);
+            child_exec(child_fds, &expected_cgroup, &mut payload);
         }
 
         drop(setup_writer);
@@ -751,8 +810,310 @@ fn open_container_working_dir(
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
+#[cfg(target_os = "linux")]
+fn open_container_file(
+    root: &std::os::fd::OwnedFd,
+    path: &str,
+) -> anyhow::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const RESOLVE_IN_ROOT: u64 = 0x10;
+
+    let path = CString::new(path).context("container identity path contains NUL")?;
+    let how = OpenHow {
+        flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS,
+    };
+    // SAFETY: `root`, `path`, and `how` are valid for the duration of the
+    // syscall. Resolution is anchored beneath the already-pinned root.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            path.as_ptr(),
+            &raw const how,
+            std::mem::size_of::<OpenHow>(),
+        ) as libc::c_int
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to open `{}` beneath container root",
+                path.to_string_lossy()
+            )
+        });
+    }
+    // SAFETY: openat2 returned a fresh owned descriptor.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn read_optional_container_identity_file(
+    root: &std::os::fd::OwnedFd,
+    path: &str,
+) -> anyhow::Result<String> {
+    use std::io::Read as _;
+
+    let descriptor = match open_container_file(root, path) {
+        Ok(descriptor) => descriptor,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error)
+                == Some(libc::ENOENT) =>
+        {
+            return Ok(String::new());
+        }
+        Err(error) => return Err(error),
+    };
+    let file = std::fs::File::from(descriptor);
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect `{path}` beneath container root"))?;
+    if !metadata.is_file() {
+        bail!("container identity database `{path}` is not a regular file");
+    }
+    let mut bytes = Vec::new();
+    file.take((MAX_IDENTITY_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read `{path}` beneath container root"))?;
+    if bytes.len() > MAX_IDENTITY_FILE_BYTES {
+        bail!("container identity database `{path}` exceeds {MAX_IDENTITY_FILE_BYTES} bytes");
+    }
+    String::from_utf8(bytes)
+        .with_context(|| format!("container identity database `{path}` is not valid UTF-8"))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_container_identity(
+    root: &std::os::fd::OwnedFd,
+    user: Option<&str>,
+) -> anyhow::Result<ResolvedIdentity> {
+    let passwd = read_optional_container_identity_file(root, "/etc/passwd")?;
+    let group = read_optional_container_identity_file(root, "/etc/group")?;
+    resolve_identity(user, &passwd, &group)
+}
+
 #[cfg(any(target_os = "linux", test))]
-fn prepare_exec_payload(invocation: &TrampolineInvocation) -> anyhow::Result<ExecPayload> {
+#[derive(Debug, Clone, Copy)]
+struct PasswdRecord<'a> {
+    name: &'a str,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy)]
+struct GroupRecord<'a> {
+    name: &'a str,
+    gid: libc::gid_t,
+    members: &'a str,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_identity_database(content: &str, description: &str) -> anyhow::Result<()> {
+    if content.len() > MAX_IDENTITY_FILE_BYTES {
+        bail!("{description} exceeds {MAX_IDENTITY_FILE_BYTES} bytes");
+    }
+    if content
+        .split_terminator('\n')
+        .any(|record| record.len() > MAX_IDENTITY_RECORD_BYTES)
+    {
+        bail!("{description} contains a record exceeding {MAX_IDENTITY_RECORD_BYTES} bytes");
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_numeric_identity(value: &str, description: &str) -> anyhow::Result<libc::uid_t> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("{description} is not an unsigned decimal identifier");
+    }
+    let identifier = value
+        .parse::<u32>()
+        .with_context(|| format!("{description} exceeds u32"))?;
+    if identifier > i32::MAX as u32 {
+        bail!(
+            "{description} exceeds the Docker-compatible maximum {0}",
+            i32::MAX
+        );
+    }
+    Ok(identifier)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_identity_name(name: &str, description: &str) -> anyhow::Result<()> {
+    if name.is_empty()
+        || name.len() > MAX_IDENTITY_NAME_BYTES
+        || name.contains(':')
+        || name.contains(',')
+        || name
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        bail!("{description} is empty, invalid, or too long");
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn passwd_records(content: &str) -> impl Iterator<Item = anyhow::Result<PasswdRecord<'_>>> {
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let fields = line.split(':').collect::<Vec<_>>();
+            if fields.len() != 7 {
+                bail!("container passwd contains a malformed record");
+            }
+            validate_identity_name(fields[0], "container passwd user name")?;
+            Ok(PasswdRecord {
+                name: fields[0],
+                uid: parse_numeric_identity(fields[2], "container passwd uid")?,
+                gid: parse_numeric_identity(fields[3], "container passwd gid")?,
+            })
+        })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn group_records(content: &str) -> impl Iterator<Item = anyhow::Result<GroupRecord<'_>>> {
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let fields = line.split(':').collect::<Vec<_>>();
+            if fields.len() != 4 {
+                bail!("container group database contains a malformed record");
+            }
+            validate_identity_name(fields[0], "container group name")?;
+            for member in fields[3].split(',').filter(|member| !member.is_empty()) {
+                validate_identity_name(member, "container group member name")?;
+            }
+            Ok(GroupRecord {
+                name: fields[0],
+                gid: parse_numeric_identity(fields[2], "container group gid")?,
+                members: fields[3],
+            })
+        })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn resolve_identity(
+    user_spec: Option<&str>,
+    passwd: &str,
+    group: &str,
+) -> anyhow::Result<ResolvedIdentity> {
+    validate_identity_database(passwd, "container passwd")?;
+    validate_identity_database(group, "container group database")?;
+    let passwd_records = passwd_records(passwd).collect::<anyhow::Result<Vec<_>>>()?;
+    let group_records = group_records(group).collect::<anyhow::Result<Vec<_>>>()?;
+
+    let Some(user_spec) = user_spec.filter(|value| !value.is_empty()) else {
+        return Ok(ResolvedIdentity {
+            uid: 0,
+            gid: 0,
+            supplementary_groups: vec![0],
+        });
+    };
+    if user_spec.matches(':').count() > 1 {
+        bail!("container exec user must be USER, UID, USER:GROUP, or UID:GID");
+    }
+    let (user_part, group_part) = user_spec
+        .split_once(':')
+        .map_or((user_spec, None), |(user, group)| (user, Some(group)));
+    if user_part.is_empty() || group_part == Some("") {
+        bail!("container exec user and group components cannot be empty");
+    }
+
+    let numeric_uid = user_part.bytes().all(|byte| byte.is_ascii_digit());
+    let matching_user = if numeric_uid {
+        let uid = parse_numeric_identity(user_part, "container exec uid")?;
+        passwd_records
+            .iter()
+            .copied()
+            .find(|record| record.uid == uid)
+    } else {
+        validate_identity_name(user_part, "container exec user name")?;
+        passwd_records
+            .iter()
+            .copied()
+            .find(|record| record.name == user_part)
+    };
+    if !numeric_uid && matching_user.is_none() {
+        bail!("container exec user `{user_part}` does not exist");
+    }
+    let uid = if numeric_uid {
+        parse_numeric_identity(user_part, "container exec uid")?
+    } else if let Some(record) = matching_user {
+        record.uid
+    } else {
+        bail!("container exec user `{user_part}` does not exist");
+    };
+    let mut gid = matching_user.map_or(0, |record| record.gid);
+
+    if let Some(group_part) = group_part {
+        let numeric_gid = group_part.bytes().all(|byte| byte.is_ascii_digit());
+        gid = if numeric_gid {
+            parse_numeric_identity(group_part, "container exec gid")?
+        } else {
+            validate_identity_name(group_part, "container exec group name")?;
+            group_records
+                .iter()
+                .find(|record| record.name == group_part)
+                .map(|record| record.gid)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("container exec group `{group_part}` does not exist")
+                })?
+        };
+    }
+
+    // Docker-compatible named-user execution initializes memberships from
+    // /etc/group only when no explicit group overrides the user's group set.
+    // Moby carries the effective primary gid in AdditionalGids, followed by
+    // named-user memberships. Keep the set sorted and deduplicated so every
+    // adapter produces the same observable `getgroups(2)` result.
+    let mut supplementary_groups = vec![gid];
+    if group_part.is_none() {
+        if let Some(user_name) = matching_user.map(|record| record.name) {
+            for record in &group_records {
+                if record.members.split(',').any(|member| member == user_name)
+                    && !supplementary_groups.contains(&record.gid)
+                {
+                    if supplementary_groups.len() >= MAX_SUPPLEMENTARY_GROUPS {
+                        bail!(
+                            "container user belongs to more than {MAX_SUPPLEMENTARY_GROUPS} supplementary groups"
+                        );
+                    }
+                    supplementary_groups.push(record.gid);
+                }
+            }
+        }
+    }
+    supplementary_groups.sort_unstable();
+
+    Ok(ResolvedIdentity {
+        uid,
+        gid,
+        supplementary_groups,
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn prepare_exec_payload(
+    invocation: &TrampolineInvocation,
+    identity: ResolvedIdentity,
+) -> anyhow::Result<ExecPayload> {
     let mut argv = Vec::with_capacity(invocation.args.len() + 1);
     argv.push(
         CString::new(invocation.command.as_bytes())
@@ -769,18 +1130,29 @@ fn prepare_exec_payload(invocation: &TrampolineInvocation) -> anyhow::Result<Exe
         .chain(std::iter::once(std::ptr::null()))
         .collect();
 
-    let mut environment = Vec::new();
+    let mut raw_environment = std::env::vars_os()
+        .map(|(key, value)| {
+            (
+                key.as_os_str().as_bytes().to_vec(),
+                value.as_os_str().as_bytes().to_vec(),
+            )
+        })
+        // portable-pty injects SHELL while constructing its child Command.
+        // Strip that adapter-only value unless it was part of the normalized
+        // request environment, keeping unary, pipe, and PTY exec identical.
+        .filter(|(key, _)| invocation.retain_shell_environment || key != b"SHELL")
+        .collect::<Vec<_>>();
+    raw_environment.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut environment = Vec::with_capacity(raw_environment.len());
     let mut search_path = None;
-    for (key, value) in std::env::vars_os() {
-        let key = key.as_os_str().as_bytes();
-        let value = value.as_os_str().as_bytes();
+    for (key, value) in raw_environment {
         if key == b"PATH" {
-            search_path = Some(value.to_vec());
+            search_path = Some(value.clone());
         }
         let mut entry = Vec::with_capacity(key.len() + value.len() + 1);
-        entry.extend_from_slice(key);
+        entry.extend_from_slice(&key);
         entry.push(b'=');
-        entry.extend_from_slice(value);
+        entry.extend_from_slice(&value);
         environment.push(CString::new(entry).context("container exec environment contains NUL")?);
     }
     let environment_ptrs = environment
@@ -793,12 +1165,15 @@ fn prepare_exec_payload(invocation: &TrampolineInvocation) -> anyhow::Result<Exe
         search_path.as_deref().unwrap_or(b"/bin:/usr/bin"),
     )?;
 
+    let identity_verification_groups = vec![0; identity.supplementary_groups.len()];
     Ok(ExecPayload {
         command_candidates,
         argv,
         argv_ptrs,
         environment,
         environment_ptrs,
+        identity,
+        identity_verification_groups,
     })
 }
 
@@ -849,7 +1224,7 @@ fn enter_namespace(
 /// Child half of the direct launcher. This function never returns and avoids
 /// allocation after `fork(2)`.
 #[cfg(target_os = "linux")]
-fn child_exec(fds: ChildLaunchFds, expected_cgroup: &[u8], payload: &ExecPayload) -> ! {
+fn child_exec(fds: ChildLaunchFds, expected_cgroup: &[u8], payload: &mut ExecPayload) -> ! {
     // Keep the CString storage visibly live for the raw pointer arrays.
     let _storage = (&payload.argv, &payload.environment);
 
@@ -929,6 +1304,8 @@ fn child_exec(fds: ChildLaunchFds, expected_cgroup: &[u8], payload: &ExecPayload
         );
     }
 
+    child_apply_identity(fds.setup_error, payload);
+
     // Do not leak the agent's signal policy into the requested program.
     // SAFETY: the signal set is initialized before use and affects only this
     // post-fork child.
@@ -993,6 +1370,111 @@ fn child_exec(fds: ChildLaunchFds, expected_cgroup: &[u8], payload: &ExecPayload
     } else {
         libc::ENOENT
     }));
+}
+
+#[cfg(target_os = "linux")]
+fn child_apply_identity(setup_error_fd: libc::c_int, payload: &mut ExecPayload) {
+    let identity = &payload.identity;
+    // SAFETY: the supplementary group slice was fully allocated before fork.
+    if unsafe {
+        libc::setgroups(
+            identity.supplementary_groups.len(),
+            identity.supplementary_groups.as_ptr(),
+        )
+    } != 0
+    {
+        child_setup_fail(
+            setup_error_fd,
+            ChildSetupStage::SupplementaryGroups,
+            current_errno(),
+        );
+    }
+    // Drop group privileges before user privileges; all three real/effective/
+    // saved IDs are set so the requested process cannot regain guest root.
+    if unsafe { libc::setresgid(identity.gid, identity.gid, identity.gid) } != 0 {
+        child_setup_fail(
+            setup_error_fd,
+            ChildSetupStage::GroupIdentity,
+            current_errno(),
+        );
+    }
+    if unsafe { libc::setresuid(identity.uid, identity.uid, identity.uid) } != 0 {
+        child_setup_fail(
+            setup_error_fd,
+            ChildSetupStage::UserIdentity,
+            current_errno(),
+        );
+    }
+
+    let mut real_uid = 0;
+    let mut effective_uid = 0;
+    let mut saved_uid = 0;
+    let mut real_gid = 0;
+    let mut effective_gid = 0;
+    let mut saved_gid = 0;
+    // SAFETY: each pointer names initialized writable storage in this child.
+    if unsafe {
+        libc::getresuid(
+            &raw mut real_uid,
+            &raw mut effective_uid,
+            &raw mut saved_uid,
+        )
+    } != 0
+    {
+        child_setup_fail(
+            setup_error_fd,
+            ChildSetupStage::IdentityVerify,
+            current_errno(),
+        );
+    }
+    if unsafe {
+        libc::getresgid(
+            &raw mut real_gid,
+            &raw mut effective_gid,
+            &raw mut saved_gid,
+        )
+    } != 0
+    {
+        child_setup_fail(
+            setup_error_fd,
+            ChildSetupStage::IdentityVerify,
+            current_errno(),
+        );
+    }
+    if real_uid != identity.uid
+        || effective_uid != identity.uid
+        || saved_uid != identity.uid
+        || real_gid != identity.gid
+        || effective_gid != identity.gid
+        || saved_gid != identity.gid
+    {
+        child_setup_fail(setup_error_fd, ChildSetupStage::IdentityVerify, libc::EPERM);
+    }
+
+    let group_count = if payload.identity_verification_groups.is_empty() {
+        // A null pointer is required when the expected group count is zero.
+        unsafe { libc::getgroups(0, std::ptr::null_mut()) }
+    } else {
+        unsafe {
+            libc::getgroups(
+                payload.identity_verification_groups.len() as libc::c_int,
+                payload.identity_verification_groups.as_mut_ptr(),
+            )
+        }
+    };
+    if group_count < 0 {
+        child_setup_fail(
+            setup_error_fd,
+            ChildSetupStage::IdentityVerify,
+            current_errno(),
+        );
+    }
+    payload.identity_verification_groups.sort_unstable();
+    if group_count as usize != identity.supplementary_groups.len()
+        || payload.identity_verification_groups != identity.supplementary_groups
+    {
+        child_setup_fail(setup_error_fd, ChildSetupStage::IdentityVerify, libc::EPERM);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1490,6 +1972,8 @@ mod tests {
             "/bin/printf",
             &original_args,
             Some("/work dir"),
+            Some("dev:builders"),
+            true,
         )
         .unwrap();
         assert_eq!(command.program, SELF_EXE);
@@ -1505,6 +1989,8 @@ mod tests {
         assert_eq!(parsed.command, "/bin/printf");
         assert_eq!(parsed.args, original_args);
         assert_eq!(parsed.working_dir.as_deref(), Some("/work dir"));
+        assert_eq!(parsed.user.as_deref(), Some("dev:builders"));
+        assert!(parsed.retain_shell_environment);
     }
 
     #[test]
@@ -1514,8 +2000,15 @@ mod tests {
             command: "/bin/printf".to_string(),
             args: vec!["%s".to_string(), "$HOME;literal".to_string()],
             working_dir: Some("/workspace".to_string()),
+            user: Some("1000:1001".to_string()),
+            retain_shell_environment: false,
         };
-        let payload = prepare_exec_payload(&invocation).unwrap();
+        let identity = ResolvedIdentity {
+            uid: 1000,
+            gid: 1001,
+            supplementary_groups: vec![27, 1001],
+        };
+        let payload = prepare_exec_payload(&invocation, identity.clone()).unwrap();
         let argv = payload
             .argv
             .iter()
@@ -1529,6 +2022,8 @@ mod tests {
         assert!(!payload.environment.is_empty());
         assert!(payload.argv_ptrs.last().unwrap().is_null());
         assert!(payload.environment_ptrs.last().unwrap().is_null());
+        assert_eq!(payload.identity, identity);
+        assert_eq!(payload.identity_verification_groups, [0, 0]);
     }
 
     #[test]
@@ -1592,8 +2087,106 @@ mod tests {
     #[test]
     fn trampoline_rejects_ambiguous_container_identifiers() {
         for id in ["", "../web", "web/service", "web\nother", "--root"] {
-            assert!(prepare_trampoline(id, "/bin/true", &[], None).is_err());
+            assert!(prepare_trampoline(id, "/bin/true", &[], None, None, false).is_err());
         }
+    }
+
+    #[test]
+    fn identity_resolution_supports_docker_user_forms_and_memberships() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\ndev:x:1000:1001:Dev:/home/dev:/bin/sh\n";
+        let group = "root:x:0:\nstaff:x:1001:\nvideo:x:27:dev\ndocker:x:998:dev,other\n";
+
+        assert_eq!(
+            resolve_identity(Some("dev"), passwd, group).unwrap(),
+            ResolvedIdentity {
+                uid: 1000,
+                gid: 1001,
+                supplementary_groups: vec![27, 998, 1001],
+            }
+        );
+        assert_eq!(
+            resolve_identity(Some("dev:video"), passwd, group).unwrap(),
+            ResolvedIdentity {
+                uid: 1000,
+                gid: 27,
+                supplementary_groups: vec![27],
+            }
+        );
+        assert_eq!(
+            resolve_identity(Some("1000:42"), passwd, group).unwrap(),
+            ResolvedIdentity {
+                uid: 1000,
+                gid: 42,
+                supplementary_groups: vec![42],
+            }
+        );
+        assert_eq!(
+            resolve_identity(Some("1000:video"), passwd, group).unwrap(),
+            ResolvedIdentity {
+                uid: 1000,
+                gid: 27,
+                supplementary_groups: vec![27],
+            }
+        );
+        assert_eq!(
+            resolve_identity(Some("dev:42"), passwd, group).unwrap(),
+            ResolvedIdentity {
+                uid: 1000,
+                gid: 42,
+                supplementary_groups: vec![42],
+            }
+        );
+        assert_eq!(
+            resolve_identity(Some("4242"), passwd, group).unwrap(),
+            ResolvedIdentity {
+                uid: 4242,
+                gid: 0,
+                supplementary_groups: vec![0],
+            }
+        );
+        assert_eq!(resolve_identity(None, passwd, group).unwrap().uid, 0);
+        assert_eq!(
+            resolve_identity(
+                Some("dev"),
+                &format!("# image metadata\n{passwd}"),
+                &format!("  # image metadata\n{group}"),
+            )
+            .unwrap()
+            .uid,
+            1000
+        );
+    }
+
+    #[test]
+    fn identity_resolution_rejects_missing_malformed_and_unbounded_inputs() {
+        let passwd = "dev:x:1000:1001:Dev:/home/dev:/bin/sh\n";
+        let group = "staff:x:1001:\n";
+        for invalid in [
+            "missing",
+            "dev:missing",
+            ":1000",
+            "dev:",
+            "dev:a:b",
+            "-1",
+            "dev user",
+            "2147483648",
+        ] {
+            assert!(
+                resolve_identity(Some(invalid), passwd, group).is_err(),
+                "expected identity rejection for {invalid:?}"
+            );
+        }
+        assert!(resolve_identity(Some("dev"), "malformed\n", group).is_err());
+        assert!(resolve_identity(Some("dev"), passwd, "malformed\n").is_err());
+        assert!(resolve_identity(Some("dev"), &format!("{passwd}malformed\n"), group).is_err());
+        assert!(
+            resolve_identity(Some("dev:staff"), passwd, &format!("{group}malformed\n")).is_err()
+        );
+        assert!(
+            resolve_identity(Some("dev"), &"x".repeat(MAX_IDENTITY_FILE_BYTES + 1), group).is_err()
+        );
+        let oversized_record = format!("{}\n", "x".repeat(MAX_IDENTITY_RECORD_BYTES + 1));
+        assert!(resolve_identity(Some("dev"), passwd, &oversized_record).is_err());
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1655,6 +2248,8 @@ mod tests {
             command: "/bin/true".to_string(),
             args: Vec::new(),
             working_dir: Some("/".to_string()),
+            user: None,
+            retain_shell_environment: false,
         }
     }
 

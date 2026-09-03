@@ -17,8 +17,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use vz_oci_macos::{
-    ExecConfig, ExecutionMode, InteractiveExecEvent, KernelProfile, RunConfig, Runtime,
-    RuntimeConfig,
+    ExecConfig, ExecutionMode, InteractiveExecEvent, KernelProfile, MountAccess, MountSpec,
+    MountType, RunConfig, Runtime, RuntimeConfig,
 };
 
 /// Set up tracing for test diagnostics.
@@ -877,6 +877,353 @@ async fn cgroup_cpu_max_enforcement() {
     assert_cgroup_probe("pty", &pty);
     assert_callback_stdout_precedes_exit("streaming", &streaming_events);
     assert_callback_stdout_precedes_exit("pty", &pty_events);
+}
+
+// ── Container exec process semantics ───────────────────────────
+
+const EXEC_SEMANTICS_IMAGE: &str = "alpine:3.20";
+const EXEC_SEMANTICS_PROBE: &str = r#"/bin/busybox printf 'VZ_UID='
+/bin/busybox id -u
+/bin/busybox printf 'VZ_GID='
+/bin/busybox id -g
+/bin/busybox printf 'VZ_GROUPS='
+/bin/busybox awk '$1 == "Groups:" { $1 = ""; sub(/^ /, ""); print }' /proc/self/status
+/bin/busybox printf 'VZ_CWD='
+/bin/busybox pwd
+/bin/busybox printf 'VZ_ENV_BEGIN\n'
+/bin/busybox tr '\000' '\n' < /proc/$$/environ
+/bin/busybox printf 'VZ_ENV_END\n'"#;
+
+#[derive(Debug, Clone, Copy)]
+enum ExecSemanticsAdapter {
+    OciUnary,
+    StreamingPipe,
+    Pty,
+}
+
+impl ExecSemanticsAdapter {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::OciUnary => "oci-unary",
+            Self::StreamingPipe => "streaming-pipe",
+            Self::Pty => "pty",
+        }
+    }
+}
+
+async fn exec_via_semantics_adapter(
+    rt: &Runtime,
+    container_id: &str,
+    adapter: ExecSemanticsAdapter,
+    mut config: ExecConfig,
+) -> Result<vz::protocol::ExecOutput, vz_oci_macos::MacosOciError> {
+    match adapter {
+        ExecSemanticsAdapter::OciUnary => rt.exec_container_oci_unary(container_id, config).await,
+        ExecSemanticsAdapter::StreamingPipe => {
+            rt.exec_container_streaming(container_id, config, |_| {})
+                .await
+        }
+        ExecSemanticsAdapter::Pty => {
+            config.pty = true;
+            config.execution_id = Some(format!("exec-semantics-{}", adapter.name()));
+            rt.exec_container_streaming(container_id, config, |_| {})
+                .await
+        }
+    }
+}
+
+fn exec_semantics_probe_config() -> ExecConfig {
+    ExecConfig {
+        cmd: vec![
+            "/bin/busybox".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            EXEC_SEMANTICS_PROBE.to_string(),
+        ],
+        working_dir: Some("/tmp".to_string()),
+        env: vec![
+            ("PATH".to_string(), "/vz/exec-semantics/bin".to_string()),
+            ("TERM".to_string(), "vz-exec-semantics".to_string()),
+            ("VZ_EXEC".to_string(), "from-exec".to_string()),
+            ("VZ_OVERRIDE".to_string(), "from-exec".to_string()),
+        ],
+        user: Some("developer".to_string()),
+        timeout: Some(Duration::from_secs(30)),
+        ..ExecConfig::default()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ExecSemanticsEvidence {
+    uid: u32,
+    gid: u32,
+    supplementary_groups: Vec<u32>,
+    cwd: String,
+    canonical_environment: Vec<u8>,
+}
+
+fn parse_exec_semantics_evidence(
+    adapter: ExecSemanticsAdapter,
+    output: &vz::protocol::ExecOutput,
+) -> ExecSemanticsEvidence {
+    assert_eq!(
+        output.exit_code,
+        0,
+        "{} semantics probe failed: stdout={} stderr={}",
+        adapter.name(),
+        output.stdout,
+        output.stderr
+    );
+    let normalized = output.stdout.replace('\r', "");
+    let mut uid = None;
+    let mut gid = None;
+    let mut supplementary_groups = None;
+    let mut cwd = None;
+    let mut environment = Vec::new();
+    let mut reading_environment = false;
+
+    for line in normalized.lines() {
+        match line {
+            "VZ_ENV_BEGIN" => reading_environment = true,
+            "VZ_ENV_END" => reading_environment = false,
+            _ if reading_environment => environment.push(line.to_string()),
+            _ => {
+                if let Some(value) = line.strip_prefix("VZ_UID=") {
+                    uid = Some(value.parse().unwrap());
+                } else if let Some(value) = line.strip_prefix("VZ_GID=") {
+                    gid = Some(value.parse().unwrap());
+                } else if let Some(value) = line.strip_prefix("VZ_GROUPS=") {
+                    supplementary_groups = Some(
+                        value
+                            .split_whitespace()
+                            .map(|group| group.parse().unwrap())
+                            .collect(),
+                    );
+                } else if let Some(value) = line.strip_prefix("VZ_CWD=") {
+                    cwd = Some(value.to_string());
+                }
+            }
+        }
+    }
+
+    environment.sort_unstable();
+    let mut canonical_environment = environment.join("\n").into_bytes();
+    canonical_environment.push(b'\n');
+    ExecSemanticsEvidence {
+        uid: uid.unwrap(),
+        gid: gid.unwrap(),
+        supplementary_groups: supplementary_groups.unwrap(),
+        cwd: cwd.unwrap(),
+        canonical_environment,
+    }
+}
+
+/// Verify the three container exec adapters share one Docker-compatible
+/// process contract for identity, environment, and working directory.
+#[allow(clippy::print_stderr)]
+#[tokio::test]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn container_exec_user_environment_semantics() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
+    init_tracing();
+    let tmp = tempfile::tempdir().unwrap();
+    let sentinel_dir = tmp.path().join("sentinels");
+    let identity_dir = tmp.path().join("identity");
+    std::fs::create_dir(&sentinel_dir).unwrap();
+    std::fs::create_dir(&identity_dir).unwrap();
+    let passwd_file = identity_dir.join("passwd");
+    let group_file = identity_dir.join("group");
+    std::fs::write(
+        &passwd_file,
+        "root:x:0:0:root:/root:/bin/sh\ndeveloper:x:1234:2345:Developer:/tmp:/bin/sh\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &group_file,
+        "root:x:0:root\ndevprimary:x:2345:\ndevextra:x:3456:developer\ndevextra2:x:4567:other,developer\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&sentinel_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    }
+    let rt = test_runtime(tmp.path());
+
+    let create_result = rt
+        .create_container(
+            EXEC_SEMANTICS_IMAGE,
+            RunConfig {
+                cmd: vec!["/bin/busybox".into(), "sleep".into(), "300".into()],
+                execution_mode: ExecutionMode::OciRuntime,
+                env: vec![
+                    ("VZ_BASE".into(), "from-create".into()),
+                    ("VZ_OVERRIDE".into(), "from-create".into()),
+                ],
+                mounts: vec![
+                    MountSpec {
+                        source: Some(sentinel_dir.clone()),
+                        target: "/vz-e2e".into(),
+                        mount_type: MountType::Bind,
+                        access: MountAccess::ReadWrite,
+                        subpath: None,
+                    },
+                    MountSpec {
+                        source: Some(passwd_file),
+                        target: "/etc/passwd".into(),
+                        mount_type: MountType::Bind,
+                        access: MountAccess::ReadOnly,
+                        subpath: Some("passwd".to_string()),
+                    },
+                    MountSpec {
+                        source: Some(group_file),
+                        target: "/etc/group".into(),
+                        mount_type: MountType::Bind,
+                        access: MountAccess::ReadOnly,
+                        subpath: Some("group".to_string()),
+                    },
+                ],
+                ..RunConfig::default()
+            },
+        )
+        .await;
+
+    let mut valid_results = Vec::new();
+    let mut missing_identity_results = Vec::new();
+    let mut stop_result = None;
+    let mut remove_result = None;
+    if let Ok(container_id) = &create_result {
+        for adapter in [
+            ExecSemanticsAdapter::OciUnary,
+            ExecSemanticsAdapter::StreamingPipe,
+            ExecSemanticsAdapter::Pty,
+        ] {
+            valid_results.push((
+                adapter,
+                exec_via_semantics_adapter(
+                    &rt,
+                    container_id,
+                    adapter,
+                    exec_semantics_probe_config(),
+                )
+                .await,
+            ));
+
+            let sentinel_name = format!("missing-user-{}-ran", adapter.name());
+            missing_identity_results.push((
+                adapter,
+                sentinel_name.clone(),
+                exec_via_semantics_adapter(
+                    &rt,
+                    container_id,
+                    adapter,
+                    ExecConfig {
+                        cmd: vec![
+                            "/bin/busybox".into(),
+                            "touch".into(),
+                            format!("/vz-e2e/{sentinel_name}"),
+                        ],
+                        user: Some("vz-user-does-not-exist".into()),
+                        timeout: Some(Duration::from_secs(30)),
+                        ..ExecConfig::default()
+                    },
+                )
+                .await,
+            ));
+        }
+        stop_result = Some(rt.stop_container(container_id, true, None, None).await);
+        remove_result = Some(rt.remove_container(container_id).await);
+    }
+
+    let container_id = create_result.unwrap();
+    assert!(
+        stop_result.unwrap().is_ok(),
+        "container cleanup stop failed for {container_id}"
+    );
+    assert!(
+        remove_result.unwrap().is_ok(),
+        "container cleanup remove failed for {container_id}"
+    );
+
+    let mut evidence = Vec::new();
+    for (adapter, result) in valid_results {
+        evidence.push((
+            adapter,
+            parse_exec_semantics_evidence(adapter, &result.unwrap()),
+        ));
+    }
+    assert_eq!(evidence.len(), 3);
+    for (adapter, actual) in &evidence {
+        eprintln!(
+            "container exec semantics evidence ({}): uid={} gid={} groups={:?} cwd={} environment=\n{}",
+            adapter.name(),
+            actual.uid,
+            actual.gid,
+            actual.supplementary_groups,
+            actual.cwd,
+            String::from_utf8_lossy(&actual.canonical_environment)
+        );
+        assert_eq!(actual.uid, 1234, "{} uid", adapter.name());
+        assert_eq!(actual.gid, 2345, "{} gid", adapter.name());
+        assert_eq!(
+            actual.supplementary_groups,
+            vec![2345, 3456, 4567],
+            "{} supplementary groups",
+            adapter.name()
+        );
+        assert_eq!(actual.cwd, "/tmp", "{} cwd", adapter.name());
+        let expected_environment = format!(
+            "PATH=/vz/exec-semantics/bin\nTERM=vz-exec-semantics\nVZ_BASE=from-create\nVZ_CONTAINER_ID={container_id}\nVZ_EXEC=from-exec\nVZ_OVERRIDE=from-exec\n"
+        );
+        assert_eq!(
+            actual.canonical_environment,
+            expected_environment.into_bytes(),
+            "{} received an unexpected or leaked environment",
+            adapter.name()
+        );
+    }
+    assert_eq!(
+        evidence[0].1.canonical_environment, evidence[1].1.canonical_environment,
+        "unary and streaming-pipe canonical environments differ"
+    );
+    assert_eq!(
+        evidence[0].1.canonical_environment, evidence[2].1.canonical_environment,
+        "unary and PTY canonical environments differ"
+    );
+
+    for (adapter, sentinel_name, result) in missing_identity_results {
+        let output = match result {
+            Ok(output) => output,
+            Err(error) => panic!(
+                "{} identity rejection was not returned as an observable exec result: {error}",
+                adapter.name()
+            ),
+        };
+        assert_ne!(
+            output.exit_code,
+            0,
+            "{} accepted a missing named identity",
+            adapter.name()
+        );
+        let message = format!("{}{}", output.stdout, output.stderr);
+        eprintln!(
+            "container exec missing-identity evidence ({}): exit_code={} diagnostic={message:?}",
+            adapter.name(),
+            output.exit_code
+        );
+        assert!(
+            message.contains("vz-user-does-not-exist") && message.contains("does not exist"),
+            "{} returned an unactionable missing-user error: {message}",
+            adapter.name()
+        );
+        assert!(
+            !sentinel_dir.join(&sentinel_name).exists(),
+            "{} ran the sentinel command for a missing named identity",
+            adapter.name()
+        );
+    }
 }
 
 // ── Shared VM inter-service connectivity ────────────────────────

@@ -37,8 +37,8 @@ Options:
                               default: sandbox (runtime + stack)
   --scenario <name>           Run named use-case scenario(s) (repeatable/comma-separated)
                               names:
-                                runtime-smoke, runtime-lifecycle, runtime-port-forwarding,
-                                runtime-shared-vm-net, stack-real-services,
+                                runtime-smoke, runtime-lifecycle, runtime-exec-semantics,
+                                runtime-port-forwarding, runtime-shared-vm-net, stack-real-services,
                                 stack-control-socket, stack-port-forwarding,
                                 stack-snapshot-restore, buildkit-roundtrip,
                                 sandbox-usecases, all-usecases
@@ -134,12 +134,13 @@ expand_scenario_token() {
         case "$part" in
             "")
                 ;;
-            runtime-smoke|runtime-lifecycle|runtime-port-forwarding|runtime-shared-vm-net|stack-real-services|stack-control-socket|stack-port-forwarding|stack-snapshot-restore|stack-user-journey-checkpoint|buildkit-roundtrip)
+            runtime-smoke|runtime-lifecycle|runtime-exec-semantics|runtime-port-forwarding|runtime-shared-vm-net|stack-real-services|stack-control-socket|stack-port-forwarding|stack-snapshot-restore|stack-user-journey-checkpoint|buildkit-roundtrip)
                 append_unique_scenario "$part"
                 ;;
             sandbox-usecases)
                 append_unique_scenario "runtime-smoke"
                 append_unique_scenario "runtime-lifecycle"
+                append_unique_scenario "runtime-exec-semantics"
                 append_unique_scenario "runtime-shared-vm-net"
                 append_unique_scenario "stack-real-services"
                 append_unique_scenario "stack-control-socket"
@@ -149,6 +150,7 @@ expand_scenario_token() {
             all-usecases)
                 append_unique_scenario "runtime-smoke"
                 append_unique_scenario "runtime-lifecycle"
+                append_unique_scenario "runtime-exec-semantics"
                 append_unique_scenario "runtime-port-forwarding"
                 append_unique_scenario "runtime-shared-vm-net"
                 append_unique_scenario "stack-real-services"
@@ -166,7 +168,7 @@ expand_scenario_token() {
 
 scenario_suite() {
     case "$1" in
-        runtime-smoke|runtime-lifecycle|runtime-port-forwarding|runtime-shared-vm-net)
+        runtime-smoke|runtime-lifecycle|runtime-exec-semantics|runtime-port-forwarding|runtime-shared-vm-net)
             echo "runtime"
             ;;
         stack-real-services|stack-control-socket|stack-port-forwarding|stack-snapshot-restore)
@@ -191,6 +193,9 @@ scenario_test_filter() {
             ;;
         runtime-lifecycle)
             echo "lifecycle_create_exec_stop_remove"
+            ;;
+        runtime-exec-semantics)
+            echo "container_exec_user_environment_semantics"
             ;;
         runtime-port-forwarding)
             echo "port_forwarding_tcp"

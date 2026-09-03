@@ -382,6 +382,7 @@ pub(crate) fn spawn_direct(
     args: &[String],
     working_dir: Option<&str>,
     env: &[(String, String)],
+    clear_environment: bool,
 ) -> anyhow::Result<tokio::process::Child> {
     use std::process::Stdio;
     use tokio::process::Command;
@@ -394,6 +395,10 @@ pub(crate) fn spawn_direct(
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
+    }
+
+    if clear_environment {
+        cmd.env_clear();
     }
 
     for (key, value) in env {
@@ -410,6 +415,7 @@ pub(crate) fn spawn_as_user(
     args: &[String],
     working_dir: Option<&str>,
     env: &[(String, String)],
+    clear_environment: bool,
 ) -> anyhow::Result<tokio::process::Child> {
     use std::process::Stdio;
     use tokio::process::Command;
@@ -421,6 +427,10 @@ pub(crate) fn spawn_as_user(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::piped());
+
+    if clear_environment {
+        cmd.env_clear();
+    }
 
     // Set the user's home directory and shell environment
     cmd.env("HOME", &home);

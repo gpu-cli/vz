@@ -237,26 +237,84 @@ struct PreparedAgentExec {
     args: Vec<String>,
     spawn_working_dir: Option<String>,
     spawn_user: Option<String>,
+    spawn_environment: Vec<(String, String)>,
+    clear_environment: bool,
     container_targeted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContainerExecProcessSpec {
+    trampoline: crate::container_exec::TrampolineCommand,
+    environment: Vec<(String, String)>,
+}
+
+const DEFAULT_CONTAINER_EXEC_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+fn normalized_container_environment(
+    environment: &HashMap<String, String>,
+) -> Result<Vec<(String, String)>, Status> {
+    let mut normalized = environment
+        .iter()
+        .map(|(key, value)| {
+            if key.is_empty() || key.contains('=') || key.contains('\0') || value.contains('\0') {
+                return Err(Status::invalid_argument(
+                    "container exec environment contains an invalid key or NUL byte",
+                ));
+            }
+            Ok((key.clone(), value.clone()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !environment.contains_key("PATH") {
+        normalized.push(("PATH".to_string(), DEFAULT_CONTAINER_EXEC_PATH.to_string()));
+    }
+    normalized.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(normalized)
+}
+
+fn normalized_container_exec(
+    container_id: &str,
+    command: &str,
+    args: &[String],
+    working_dir: Option<&str>,
+    user: Option<&str>,
+    environment: &HashMap<String, String>,
+) -> Result<ContainerExecProcessSpec, Status> {
+    let environment = normalized_container_environment(environment)?;
+    let trampoline = crate::container_exec::prepare_trampoline(
+        container_id,
+        command,
+        args,
+        working_dir,
+        user,
+        environment.iter().any(|(key, _)| key == "SHELL"),
+    )
+    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    Ok(ContainerExecProcessSpec {
+        trampoline,
+        environment,
+    })
 }
 
 fn prepare_agent_exec(req: &ExecRequest) -> Result<PreparedAgentExec, Status> {
     if let Some(target) = &req.container_target {
-        let trampoline = crate::container_exec::prepare_trampoline(
+        let spec = normalized_container_exec(
             &target.container_id,
             &req.command,
             &req.args,
             (!req.working_dir.is_empty()).then_some(req.working_dir.as_str()),
-        )
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            (!req.user.is_empty()).then_some(req.user.as_str()),
+            &req.env,
+        )?;
         return Ok(PreparedAgentExec {
-            command: trampoline.program,
-            args: trampoline.args,
-            // Cwd and user are container properties. Applying either to the
-            // trampoline in the guest namespace would be incorrect. Existing
-            // container exec paths do not implement user switching.
+            command: spec.trampoline.program,
+            args: spec.trampoline.args,
+            // Cwd and user are applied inside the pinned container root and
+            // namespaces, never to the trampoline in the guest namespace.
             spawn_working_dir: None,
             spawn_user: None,
+            spawn_environment: spec.environment,
+            clear_environment: true,
             container_targeted: true,
         });
     }
@@ -266,21 +324,26 @@ fn prepare_agent_exec(req: &ExecRequest) -> Result<PreparedAgentExec, Status> {
         args: req.args.clone(),
         spawn_working_dir: (!req.working_dir.is_empty()).then(|| req.working_dir.clone()),
         spawn_user: (!req.user.is_empty()).then(|| req.user.clone()),
+        spawn_environment: req
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        clear_environment: false,
         container_targeted: false,
     })
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn prepare_oci_exec(
-    req: &OciExecRequest,
-) -> Result<crate::container_exec::TrampolineCommand, Status> {
-    crate::container_exec::prepare_trampoline(
+fn prepare_oci_exec(req: &OciExecRequest) -> Result<ContainerExecProcessSpec, Status> {
+    normalized_container_exec(
         &req.container_id,
         &req.command,
         &req.args,
         (!req.working_dir.is_empty()).then_some(req.working_dir.as_str()),
+        (!req.user.is_empty()).then_some(req.user.as_str()),
+        &req.env,
     )
-    .map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
 impl AgentServiceImpl {
@@ -299,22 +362,22 @@ impl AgentServiceImpl {
         use tokio::io::AsyncReadExt;
 
         let launch = prepare_agent_exec(&req)?;
-        let env: Vec<(String, String)> = req.env.into_iter().collect();
-
         let spawn_result = if let Some(ref username) = launch.spawn_user {
             crate::spawn_as_user(
                 username,
                 &launch.command,
                 &launch.args,
                 launch.spawn_working_dir.as_deref(),
-                &env,
+                &launch.spawn_environment,
+                launch.clear_environment,
             )
         } else {
             crate::spawn_direct(
                 &launch.command,
                 &launch.args,
                 launch.spawn_working_dir.as_deref(),
-                &env,
+                &launch.spawn_environment,
+                launch.clear_environment,
             )
         };
 
@@ -514,8 +577,12 @@ impl AgentServiceImpl {
             cmd.cwd(working_dir);
         }
 
-        cmd.env("TERM", "xterm-256color");
-        for (key, value) in &req.env {
+        if launch.clear_environment {
+            cmd.env_clear();
+        } else {
+            cmd.env("TERM", "xterm-256color");
+        }
+        for (key, value) in &launch.spawn_environment {
             cmd.env(key, value);
         }
 
@@ -1219,21 +1286,15 @@ impl oci_service_server::OciService for OciServiceImpl {
             "oci: exec"
         );
 
-        let trampoline = prepare_oci_exec(&req)?;
+        let spec = prepare_oci_exec(&req)?;
+        let trampoline = spec.trampoline;
         info!(args = ?trampoline.args, "oci: exec via verified container trampoline");
 
         let mut cmd = tokio::process::Command::new(&trampoline.program);
         cmd.args(&trampoline.args);
 
         cmd.env_clear();
-        let has_path = req.env.keys().any(|k| k == "PATH");
-        if !has_path {
-            cmd.env(
-                "PATH",
-                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            );
-        }
-        cmd.envs(&req.env);
+        cmd.envs(spec.environment);
         cmd.kill_on_drop(true);
 
         let output = match tokio::time::timeout(YOUKI_EXEC_TIMEOUT, cmd.output()).await {
@@ -1811,7 +1872,6 @@ async fn do_network_teardown(
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-    use std::collections::HashMap;
     use std::ffi::OsString;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1875,6 +1935,14 @@ mod tests {
         ));
         assert!(pipe.spawn_working_dir.is_none());
         assert!(pipe.spawn_user.is_none());
+        assert!(pipe.clear_environment);
+        assert_eq!(
+            pipe.spawn_environment,
+            [
+                ("MODE".to_string(), "test".to_string()),
+                ("PATH".to_string(), DEFAULT_CONTAINER_EXEC_PATH.to_string())
+            ]
+        );
     }
 
     #[test]
@@ -1884,15 +1952,68 @@ mod tests {
             container_id: "web".to_string(),
             command: "/bin/printf".to_string(),
             args: vec!["%s".to_string(), "$HOME;not-a-shell".to_string()],
-            env: HashMap::new(),
+            env: [("MODE".to_string(), "test".to_string())]
+                .into_iter()
+                .collect(),
             working_dir: "/workspace".to_string(),
             user: String::new(),
             metadata: None,
         })
         .unwrap();
 
-        assert_eq!(agent.command, unary.program);
-        assert_eq!(agent.args, unary.args);
+        assert_eq!(agent.command, unary.trampoline.program);
+        assert_eq!(agent.args, unary.trampoline.args);
+        assert_eq!(agent.spawn_environment, unary.environment);
+    }
+
+    #[test]
+    fn every_container_exec_adapter_has_one_exact_environment_and_user_spec() {
+        let mut request = exec_request(Some("web"), false);
+        request.user = "dev:builders".to_string();
+        request
+            .env
+            .insert("PATH".to_string(), "/custom/bin".to_string());
+        request.env.insert("Z_LAST".to_string(), "last".to_string());
+
+        let pipe = prepare_agent_exec(&request).unwrap();
+        request.allocate_pty = true;
+        let pty = prepare_agent_exec(&request).unwrap();
+        let unary = prepare_oci_exec(&OciExecRequest {
+            container_id: "web".to_string(),
+            command: request.command,
+            args: request.args,
+            env: request.env,
+            working_dir: request.working_dir,
+            user: request.user,
+            metadata: None,
+        })
+        .unwrap();
+
+        assert_eq!(pipe, pty);
+        assert_eq!(pipe.args, unary.trampoline.args);
+        assert_eq!(pipe.spawn_environment, unary.environment);
+        assert_eq!(
+            pipe.spawn_environment,
+            [
+                ("MODE".to_string(), "test".to_string()),
+                ("PATH".to_string(), "/custom/bin".to_string()),
+                ("Z_LAST".to_string(), "last".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn container_exec_environment_rejects_invalid_entries() {
+        for key in ["", "BAD=KEY", "BAD\0KEY"] {
+            let environment = [(key.to_string(), "value".to_string())]
+                .into_iter()
+                .collect();
+            assert!(normalized_container_environment(&environment).is_err());
+        }
+        let environment = [("KEY".to_string(), "bad\0value".to_string())]
+            .into_iter()
+            .collect();
+        assert!(normalized_container_environment(&environment).is_err());
     }
 
     #[tokio::test]
