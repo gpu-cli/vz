@@ -3,6 +3,72 @@ use super::oci_lifecycle::parse_signal_number;
 use super::*;
 use tracing::debug;
 
+fn non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn overlay_environment(target: &mut Vec<(String, String)>, overlay: &[(String, String)]) {
+    for (key, value) in overlay {
+        if let Some((_, existing_value)) = target.iter_mut().find(|(item, _)| item == key) {
+            *existing_value = value.clone();
+        } else {
+            target.push((key.clone(), value.clone()));
+        }
+    }
+}
+
+/// Resolve one exec request against an immutable activation-time snapshot.
+///
+/// This is deliberately transport-independent: unary, streaming pipe, and PTY
+/// execution all consume the same resolved values. Empty cwd/user fields mean
+/// "omitted" and inherit the container defaults; `/` is used only when neither
+/// the request nor the resolved container configuration supplies a cwd.
+pub(super) fn resolve_container_exec_options(
+    defaults: &ContainerExecDefaults,
+    exec: &ExecConfig,
+) -> ExecOptions {
+    let mut env = Vec::with_capacity(defaults.env.len() + exec.env.len());
+    overlay_environment(&mut env, &defaults.env);
+    overlay_environment(&mut env, &exec.env);
+
+    let working_dir = non_empty(exec.working_dir.as_deref())
+        .or_else(|| non_empty(defaults.working_dir.as_deref()))
+        .unwrap_or_else(|| "/".to_string());
+    let user = non_empty(exec.user.as_deref()).or_else(|| non_empty(defaults.user.as_deref()));
+
+    ExecOptions {
+        working_dir: Some(working_dir),
+        env,
+        user,
+    }
+}
+
+pub(super) fn resolve_container_exec_binding<V>(
+    container_id: &str,
+    binding: Option<&ContainerExecBinding<V>>,
+    exec: &ExecConfig,
+) -> Result<(Arc<V>, ExecOptions), OciError> {
+    let binding = binding.ok_or_else(|| {
+        OciError::InvalidConfig(format!(
+            "no active exec binding for container '{container_id}'; container may not be running, may still be activating, or its activation invariant was violated"
+        ))
+    })?;
+    Ok((
+        Arc::clone(&binding.vm),
+        resolve_container_exec_options(&binding.defaults, exec),
+    ))
+}
+
+fn into_oci_exec_options(options: ExecOptions) -> OciExecOptions {
+    OciExecOptions {
+        env: options.env,
+        cwd: options.working_dir,
+        user: options.user,
+    }
+}
+
 fn exec_control_debug_enabled() -> bool {
     std::env::var("VZ_OCI_EXEC_CONTROL_DEBUG")
         .map(|value| {
@@ -15,6 +81,20 @@ fn exec_control_debug_enabled() -> bool {
 }
 
 impl Runtime {
+    async fn resolve_exec_binding(
+        &self,
+        container_id: &str,
+        exec: &ExecConfig,
+    ) -> Result<(Arc<LinuxVm>, ExecOptions), OciError> {
+        let binding = self
+            .container_exec_bindings
+            .lock()
+            .await
+            .get(container_id)
+            .cloned();
+        resolve_container_exec_binding(container_id, binding.as_ref(), exec)
+    }
+
     pub async fn exec_container(&self, id: &str, exec: ExecConfig) -> Result<ExecOutput, OciError> {
         self.exec_container_streaming(id, exec, |_| {}).await
     }
@@ -31,18 +111,6 @@ impl Runtime {
         F: FnMut(InteractiveExecEvent),
     {
         let debug = exec_control_debug_enabled();
-        let vm = self
-            .vm_handles
-            .lock()
-            .await
-            .get(id)
-            .cloned()
-            .ok_or_else(|| {
-                OciError::InvalidConfig(format!(
-                    "no active VM handle for container '{id}'; container may not be running"
-                ))
-            })?;
-
         let (command, args) = exec
             .cmd
             .split_first()
@@ -50,20 +118,7 @@ impl Runtime {
 
         let timeout = exec.timeout.unwrap_or(self.config.exec_timeout);
         let execution_id = exec.execution_id.clone();
-        let mut merged_env = self
-            .container_exec_env
-            .lock()
-            .await
-            .get(id)
-            .cloned()
-            .unwrap_or_default();
-        for (key, value) in &exec.env {
-            if let Some((_, existing_value)) = merged_env.iter_mut().find(|(k, _)| k == key) {
-                *existing_value = value.clone();
-            } else {
-                merged_env.push((key.clone(), value.clone()));
-            }
-        }
+        let (vm, options) = self.resolve_exec_binding(id, &exec).await?;
 
         if exec.pty {
             let Some(execution_id) = execution_id else {
@@ -76,12 +131,6 @@ impl Runtime {
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let term_rows = u32::from(exec.term_rows.unwrap_or(DEFAULT_INTERACTIVE_EXEC_ROWS));
             let term_cols = u32::from(exec.term_cols.unwrap_or(DEFAULT_INTERACTIVE_EXEC_COLS));
-            let options = ExecOptions {
-                working_dir: exec.working_dir.clone(),
-                env: merged_env,
-                user: exec.user.clone(),
-            };
-
             let vm_key = Arc::as_ptr(&vm) as usize;
             let should_prepare_pty = {
                 let mut prepared = self.interactive_pty_prep_vms.lock().await;
@@ -200,18 +249,6 @@ impl Runtime {
             return result;
         }
 
-        // Always set a container cwd so execution never inherits the guest
-        // agent's cwd from outside the target mount namespace.
-        let wd = exec
-            .working_dir
-            .filter(|directory| !directory.is_empty())
-            .unwrap_or_else(|| "/".to_string());
-        let options = ExecOptions {
-            working_dir: Some(wd),
-            env: merged_env,
-            user: exec.user.clone(),
-        };
-
         tokio::time::timeout(timeout, async {
             let mut stream = vm
                 .exec_container_stream_with_options(
@@ -276,47 +313,19 @@ impl Runtime {
                 reason: "OCI unary exec does not support PTY allocation".to_string(),
             });
         }
-        let vm = self
-            .vm_handles
-            .lock()
-            .await
-            .get(id)
-            .cloned()
-            .ok_or_else(|| {
-                OciError::InvalidConfig(format!(
-                    "no active VM handle for container '{id}'; container may not be running"
-                ))
-            })?;
         let (command, args) = exec
             .cmd
             .split_first()
             .ok_or_else(|| OciError::InvalidConfig("exec command must not be empty".to_string()))?;
         let timeout = exec.timeout.unwrap_or(self.config.exec_timeout);
-        let mut merged_env = self
-            .container_exec_env
-            .lock()
-            .await
-            .get(id)
-            .cloned()
-            .unwrap_or_default();
-        for (key, value) in exec.env {
-            if let Some((_, existing_value)) = merged_env.iter_mut().find(|(k, _)| k == &key) {
-                *existing_value = value;
-            } else {
-                merged_env.push((key, value));
-            }
-        }
+        let (vm, options) = self.resolve_exec_binding(id, &exec).await?;
         tokio::time::timeout(
             timeout,
             vm.oci_exec(
                 id.to_string(),
                 command.clone(),
                 args.to_vec(),
-                OciExecOptions {
-                    env: merged_env,
-                    cwd: exec.working_dir,
-                    user: exec.user,
-                },
+                into_oci_exec_options(options),
             ),
         )
         .await

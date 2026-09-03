@@ -45,6 +45,72 @@ fn checkpoint_capabilities_disable_vm_full_by_default() {
     vz_runtime_contract::validate_backend_adapter_parity(caps).unwrap();
 }
 
+#[test]
+fn container_id_validation_rejects_path_bearing_and_non_ascii_identifiers() {
+    let oversized = "x".repeat(129);
+    let invalid = [
+        "",
+        "/absolute/path",
+        "../escape",
+        ".hidden",
+        "_hidden",
+        "-option",
+        "dir/name",
+        "dir\\name",
+        "développeur",
+        "has space",
+        "line\nbreak",
+        "control\u{0001}byte",
+        oversized.as_str(),
+    ];
+
+    for container_id in invalid {
+        let error = validate_container_id(container_id).unwrap_err();
+        assert!(
+            matches!(error, OciError::InvalidConfig(_)),
+            "invalid ID must fail closed: {container_id:?}"
+        );
+    }
+}
+
+#[test]
+fn container_id_validation_accepts_exact_guest_grammar_and_length_bound() {
+    let valid_128 = format!("a{}", "-".repeat(127));
+
+    for container_id in ["a", "A0_name-with.dots-9", valid_128.as_str()] {
+        validate_container_id(container_id).unwrap();
+    }
+    assert_eq!(valid_128.len(), MAX_CONTAINER_ID_BYTES);
+}
+
+#[test]
+fn every_container_creation_path_validates_id_before_pull() {
+    fn assert_validation_precedes_pull(source: &str, function: &str) {
+        let body = source
+            .split_once(function)
+            .unwrap_or_else(|| panic!("missing function marker {function}"))
+            .1;
+        let validation = body
+            .find("validate_container_id(&container_id)?")
+            .unwrap_or_else(|| panic!("missing container ID validation in {function}"));
+        let pull = body
+            .find("self.pull(image).await?")
+            .unwrap_or_else(|| panic!("missing image pull in {function}"));
+        assert!(
+            validation < pull,
+            "{function} must reject unsafe IDs before image-store mutation"
+        );
+    }
+
+    let runtime_source = include_str!("mod.rs");
+    assert_validation_precedes_pull(runtime_source, "pub async fn run(");
+    assert_validation_precedes_pull(runtime_source, "pub async fn create_container(");
+    assert_validation_precedes_pull(
+        include_str!("stack_vm.rs"),
+        "pub async fn create_container_in_stack(",
+    );
+}
+
 #[tokio::test]
 async fn shared_vm_for_returns_none_when_stack_absent() {
     let runtime = Runtime::new(RuntimeConfig {
@@ -384,7 +450,6 @@ async fn one_off_auto_remove_cleanup_path_removes_container_and_lifecycle() {
             auto_remove: true,
         },
     );
-
     runtime.finalize_one_off_cleanup("one-off", true).await;
 
     assert!(runtime.list_containers().unwrap().is_empty());
@@ -1095,6 +1160,251 @@ fn resolve_run_config_merges_env_with_run_precedence() {
             ("VZ_CONTAINER_ID".to_string(), "container-123".to_string()),
         ],
     );
+}
+
+#[test]
+fn resolved_exec_defaults_inherit_image_user_and_working_directory() {
+    let image_config = ImageConfigSummary {
+        cmd: Some(vec!["default".to_string()]),
+        env: Some(vec!["IMAGE_DEFAULT=image".to_string()]),
+        working_dir: Some("/workspace/image".to_string()),
+        user: Some("image-user:image-group".to_string()),
+        ..ImageConfigSummary::default()
+    };
+
+    let resolved =
+        resolve_run_config(image_config, RunConfig::default(), "image-container").unwrap();
+    let defaults = ContainerExecDefaults::from(&resolved);
+
+    assert_eq!(defaults.working_dir, Some("/workspace/image".to_string()));
+    assert_eq!(defaults.user, Some("image-user:image-group".to_string()));
+    assert_eq!(
+        defaults.env,
+        vec![
+            ("IMAGE_DEFAULT".to_string(), "image".to_string()),
+            ("VZ_CONTAINER_ID".to_string(), "image-container".to_string(),),
+        ]
+    );
+}
+
+#[test]
+fn resolved_exec_defaults_capture_image_and_run_overrides() {
+    let image_config = ImageConfigSummary {
+        cmd: Some(vec!["default".to_string()]),
+        env: Some(vec![
+            "IMAGE_ONLY=image".to_string(),
+            "OVERRIDE=image".to_string(),
+        ]),
+        working_dir: Some("/workspace/image".to_string()),
+        user: Some("image-user:image-group".to_string()),
+        ..ImageConfigSummary::default()
+    };
+    let run = RunConfig {
+        env: vec![("OVERRIDE".to_string(), "run".to_string())],
+        working_dir: Some("/workspace/run".to_string()),
+        user: Some("run-user:run-group".to_string()),
+        ..RunConfig::default()
+    };
+
+    let resolved = resolve_run_config(image_config, run, "defaults-container").unwrap();
+    let defaults = ContainerExecDefaults::from(&resolved);
+
+    assert_eq!(defaults.working_dir, Some("/workspace/run".to_string()));
+    assert_eq!(defaults.user, Some("run-user:run-group".to_string()));
+    assert_eq!(
+        defaults.env,
+        vec![
+            ("IMAGE_ONLY".to_string(), "image".to_string()),
+            ("OVERRIDE".to_string(), "run".to_string()),
+            (
+                "VZ_CONTAINER_ID".to_string(),
+                "defaults-container".to_string(),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn omitted_and_empty_exec_fields_inherit_resolved_defaults() {
+    let defaults = ContainerExecDefaults {
+        env: vec![("BASE".to_string(), "configured".to_string())],
+        working_dir: Some("/workspace/default".to_string()),
+        user: Some("developer:staff".to_string()),
+    };
+
+    for exec in [
+        ExecConfig::default(),
+        ExecConfig {
+            working_dir: Some(String::new()),
+            user: Some(String::new()),
+            ..ExecConfig::default()
+        },
+    ] {
+        let options = resolve_container_exec_options(&defaults, &exec);
+        assert_eq!(options.working_dir, Some("/workspace/default".to_string()));
+        assert_eq!(options.user, Some("developer:staff".to_string()));
+        assert_eq!(
+            options.env,
+            vec![("BASE".to_string(), "configured".to_string())]
+        );
+    }
+}
+
+#[test]
+fn explicit_exec_values_override_defaults_with_last_environment_value_winning() {
+    let defaults = ContainerExecDefaults {
+        env: vec![
+            ("BASE".to_string(), "first".to_string()),
+            ("DUPLICATE".to_string(), "old-a".to_string()),
+            ("DUPLICATE".to_string(), "old-b".to_string()),
+        ],
+        working_dir: Some("/workspace/default".to_string()),
+        user: Some("developer".to_string()),
+    };
+    let before = defaults.clone();
+    let exec = ExecConfig {
+        env: vec![
+            ("DUPLICATE".to_string(), "exec-a".to_string()),
+            ("EXEC_ONLY".to_string(), "present".to_string()),
+            ("DUPLICATE".to_string(), "exec-b".to_string()),
+        ],
+        working_dir: Some("/workspace/exec".to_string()),
+        user: Some("operator:wheel".to_string()),
+        ..ExecConfig::default()
+    };
+
+    let options = resolve_container_exec_options(&defaults, &exec);
+
+    assert_eq!(options.working_dir, Some("/workspace/exec".to_string()));
+    assert_eq!(options.user, Some("operator:wheel".to_string()));
+    assert_eq!(
+        options.env,
+        vec![
+            ("BASE".to_string(), "first".to_string()),
+            ("DUPLICATE".to_string(), "exec-b".to_string()),
+            ("EXEC_ONLY".to_string(), "present".to_string()),
+        ]
+    );
+    assert_eq!(
+        defaults, before,
+        "exec resolution must not mutate the cache"
+    );
+}
+
+#[test]
+fn exec_defaults_use_root_only_when_no_working_directory_is_configured() {
+    let defaults = ContainerExecDefaults {
+        env: Vec::new(),
+        working_dir: None,
+        user: None,
+    };
+
+    let options = resolve_container_exec_options(&defaults, &ExecConfig::default());
+
+    assert_eq!(options.working_dir, Some("/".to_string()));
+    assert!(options.user.is_none());
+}
+
+#[test]
+fn absent_exec_binding_fails_closed_during_activation_or_after_shutdown() {
+    let error =
+        resolve_container_exec_binding::<String>("not-published", None, &ExecConfig::default())
+            .unwrap_err();
+
+    assert!(matches!(
+        error,
+        OciError::InvalidConfig(ref message)
+            if message.contains("not-published")
+                && message.contains("no active exec binding")
+                && message.contains("may not be running")
+                && message.contains("activating")
+    ));
+}
+
+#[test]
+fn exec_binding_atomically_couples_vm_generation_and_default_snapshot() {
+    let first_vm = Arc::new("vm-generation-one".to_string());
+    let second_vm = Arc::new("vm-generation-two".to_string());
+    let mut bindings: HashMap<String, ContainerExecBinding<String>> = HashMap::new();
+    bindings.insert(
+        "container".to_string(),
+        ContainerExecBinding {
+            vm: Arc::clone(&first_vm),
+            defaults: ContainerExecDefaults {
+                env: vec![("GENERATION".to_string(), "one".to_string())],
+                working_dir: Some("/generation-one".to_string()),
+                user: Some("user-one".to_string()),
+            },
+        },
+    );
+
+    let (resolved_vm, resolved_options) = resolve_container_exec_binding(
+        "container",
+        bindings.get("container"),
+        &ExecConfig::default(),
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(&resolved_vm, &first_vm));
+    assert_eq!(
+        resolved_options.working_dir,
+        Some("/generation-one".to_string())
+    );
+    assert_eq!(resolved_options.user, Some("user-one".to_string()));
+    assert_eq!(
+        resolved_options.env,
+        vec![("GENERATION".to_string(), "one".to_string())]
+    );
+
+    bindings.insert(
+        "container".to_string(),
+        ContainerExecBinding {
+            vm: Arc::clone(&second_vm),
+            defaults: ContainerExecDefaults {
+                env: vec![("GENERATION".to_string(), "two".to_string())],
+                working_dir: Some("/generation-two".to_string()),
+                user: Some("user-two".to_string()),
+            },
+        },
+    );
+    let (resolved_vm, resolved_options) = resolve_container_exec_binding(
+        "container",
+        bindings.get("container"),
+        &ExecConfig::default(),
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(&resolved_vm, &second_vm));
+    assert_eq!(
+        resolved_options.working_dir,
+        Some("/generation-two".to_string())
+    );
+    assert_eq!(resolved_options.user, Some("user-two".to_string()));
+    assert_eq!(
+        resolved_options.env,
+        vec![("GENERATION".to_string(), "two".to_string())]
+    );
+}
+
+#[test]
+fn concrete_lifecycle_adapter_preserves_options_and_applies_final_cwd_fallback() {
+    let options = lifecycle_exec_options(OciExecOptions {
+        env: vec![("LIFECYCLE".to_string(), "preserved".to_string())],
+        cwd: Some("/workspace/lifecycle".to_string()),
+        user: Some("1234:2345".to_string()),
+    });
+    assert_eq!(
+        options.working_dir,
+        Some("/workspace/lifecycle".to_string())
+    );
+    assert_eq!(
+        options.env,
+        vec![("LIFECYCLE".to_string(), "preserved".to_string())]
+    );
+    assert_eq!(options.user, Some("1234:2345".to_string()));
+
+    let fallback = lifecycle_exec_options(OciExecOptions::default());
+    assert_eq!(fallback.working_dir, Some("/".to_string()));
+    assert!(fallback.env.is_empty());
+    assert!(fallback.user.is_none());
 }
 
 #[test]

@@ -50,6 +50,19 @@ pub(super) trait OciLifecycleOps {
     fn oci_delete<'a>(&'a self, id: String, force: bool) -> OciLifecycleFuture<'a, ()>;
 }
 
+pub(super) fn lifecycle_exec_options(options: OciExecOptions) -> ExecOptions {
+    ExecOptions {
+        working_dir: Some(
+            options
+                .cwd
+                .filter(|directory| !directory.is_empty())
+                .unwrap_or_else(|| "/".to_string()),
+        ),
+        env: options.env,
+        user: options.user,
+    }
+}
+
 impl OciLifecycleOps for LinuxVm {
     fn oci_create<'a>(&'a self, id: String, bundle_path: String) -> OciLifecycleFuture<'a, ()> {
         Box::pin(async move {
@@ -68,7 +81,7 @@ impl OciLifecycleOps for LinuxVm {
         id: String,
         command: String,
         args: Vec<String>,
-        _options: OciExecOptions,
+        options: OciExecOptions,
     ) -> OciLifecycleFuture<'a, ExecOutput> {
         Box::pin(async move {
             let result = self
@@ -77,10 +90,7 @@ impl OciLifecycleOps for LinuxVm {
                     command,
                     args,
                     Duration::from_secs(300),
-                    ExecOptions {
-                        working_dir: Some("/".to_string()),
-                        ..ExecOptions::default()
-                    },
+                    lifecycle_exec_options(options),
                 )
                 .await
                 .map_err(OciError::from)?;

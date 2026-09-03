@@ -232,10 +232,7 @@ fn exec_config_from_execution(
         execution_id: Some(execution.execution_id.clone()),
         cmd: build_exec_command(&execution.exec_spec),
         env,
-        // Default to `/` so nsenter uses `--wd=/` instead of inheriting
-        // the guest agent's CWD, which may be invalid inside the container's
-        // mount namespace (causing getcwd() failures).
-        working_dir: Some("/".to_string()),
+        working_dir: None,
         user: None,
         pty: execution.exec_spec.pty,
         term_rows: if execution.exec_spec.pty {
@@ -1597,7 +1594,7 @@ mod tests {
     }
 
     #[test]
-    fn exec_config_from_execution_resolves_runtime_env_references() {
+    fn exec_config_from_execution_preserves_omitted_cwd_and_resolves_runtime_env_references() {
         let home = std::env::var("HOME").expect("HOME should be set for test");
         let execution = Execution {
             execution_id: "exec-runtime-ref".to_string(),
@@ -1623,6 +1620,7 @@ mod tests {
 
         let resolved =
             exec_config_from_execution(&execution).expect("env references should resolve");
+        assert_eq!(resolved.working_dir, None);
         let resolved_env: BTreeMap<_, _> = resolved.env.into_iter().collect();
         assert_eq!(
             resolved_env.get("workspace_home").map(String::as_str),

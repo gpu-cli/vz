@@ -13,9 +13,17 @@
 
 #![allow(clippy::unwrap_used)]
 
+use std::io::Cursor;
+use std::path::Path;
 use std::process::Command;
+use std::str::FromStr;
 use std::time::Duration;
 
+use oci_distribution::Reference;
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use tar::{Builder as TarBuilder, EntryType, Header};
+use vz_image::{ImageStore, parse_image_config_summary_from_store};
 use vz_oci_macos::{
     ExecConfig, ExecutionMode, InteractiveExecEvent, KernelProfile, MountAccess, MountSpec,
     MountType, RunConfig, Runtime, RuntimeConfig,
@@ -1222,6 +1230,412 @@ async fn container_exec_user_environment_semantics() {
             !sentinel_dir.join(&sentinel_name).exists(),
             "{} ran the sentinel command for a missing named identity",
             adapter.name()
+        );
+    }
+}
+
+// ── Container exec image-default inheritance ───────────────────
+
+const EXEC_DEFAULTS_IMAGE: &str = "localhost/vz-e2e-exec-defaults:latest";
+const EXEC_DEFAULTS_LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
+
+#[derive(Debug)]
+struct ExecDefaultsImageFixture {
+    reference: String,
+    manifest_digest: String,
+    config_digest: String,
+    layer_digest: String,
+    busybox_digest: String,
+}
+
+fn sha256_digest(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn append_exec_defaults_tar_entry(
+    archive: &mut TarBuilder<Vec<u8>>,
+    path: &str,
+    entry_type: EntryType,
+    mode: u32,
+    bytes: &[u8],
+) {
+    let mut header = Header::new_gnu();
+    header.set_entry_type(entry_type);
+    header.set_mode(mode);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_size(bytes.len() as u64);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, path, Cursor::new(bytes))
+        .unwrap();
+}
+
+fn build_exec_defaults_layer(busybox: &[u8]) -> Vec<u8> {
+    let mut archive = TarBuilder::new(Vec::new());
+    for directory in [
+        "bin/",
+        "dev/",
+        "etc/",
+        "proc/",
+        "run/",
+        "sys/",
+        "tmp/",
+        "workspace/",
+        "workspace/image-default/",
+        "workspace/override/",
+    ] {
+        append_exec_defaults_tar_entry(
+            &mut archive,
+            directory,
+            EntryType::Directory,
+            if directory == "tmp/" { 0o1777 } else { 0o755 },
+            &[],
+        );
+    }
+    append_exec_defaults_tar_entry(
+        &mut archive,
+        "bin/busybox",
+        EntryType::Regular,
+        0o755,
+        busybox,
+    );
+    append_exec_defaults_tar_entry(
+        &mut archive,
+        "etc/passwd",
+        EntryType::Regular,
+        0o644,
+        b"root:x:0:0:root:/root:/bin/busybox\ndeveloper:x:1234:2345:Developer:/workspace/image-default:/bin/busybox\n",
+    );
+    append_exec_defaults_tar_entry(
+        &mut archive,
+        "etc/group",
+        EntryType::Regular,
+        0o644,
+        b"root:x:0:root\ndevprimary:x:2345:\ndevextra:x:3456:developer\ndevextra2:x:4567:other,developer\n",
+    );
+    archive.into_inner().unwrap()
+}
+
+fn install_exec_defaults_image(data_dir: &Path) -> ExecDefaultsImageFixture {
+    let bundle_dir = std::env::var_os("VZ_LINUX_DEVELOPER_BUNDLE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let busybox_path = bundle_dir.join("busybox");
+    let busybox = std::fs::read(&busybox_path).unwrap();
+    assert!(
+        busybox.len() >= 20 && &busybox[..4] == b"\x7fELF",
+        "release BusyBox is not an ELF binary: {}",
+        busybox_path.display()
+    );
+    assert_eq!(
+        &busybox[18..20],
+        &[0xb7, 0x00],
+        "release BusyBox is not Linux/arm64 (ELF e_machine): {}",
+        busybox_path.display()
+    );
+
+    let busybox_digest = sha256_digest(&busybox);
+    let layer = build_exec_defaults_layer(&busybox);
+    let layer_digest = sha256_digest(&layer);
+    let config = serde_json::to_vec(&json!({
+        "architecture": "arm64",
+        "config": {
+            "Cmd": ["/bin/busybox", "sleep", "300"],
+            "Env": [
+                "PATH=/vz/image-default/bin",
+                "TERM=vz-image-default",
+                "VZ_IMAGE=from-image",
+                "VZ_OVERRIDE=from-image"
+            ],
+            "User": "developer",
+            "WorkingDir": "/workspace/image-default"
+        },
+        "os": "linux",
+        "rootfs": {
+            "diff_ids": [&layer_digest],
+            "type": "layers"
+        }
+    }))
+    .unwrap();
+    let config_digest = sha256_digest(&config);
+    let manifest = serde_json::to_vec(&json!({
+        "config": {
+            "digest": &config_digest,
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": config.len()
+        },
+        "layers": [{
+            "digest": &layer_digest,
+            "mediaType": EXEC_DEFAULTS_LAYER_MEDIA_TYPE,
+            "size": layer.len()
+        }],
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "schemaVersion": 2
+    }))
+    .unwrap();
+    let manifest_digest = sha256_digest(&manifest);
+
+    let store = ImageStore::new(data_dir.to_path_buf());
+    store.ensure_layout().unwrap();
+    store
+        .write_layer_blob(&layer_digest, EXEC_DEFAULTS_LAYER_MEDIA_TYPE, &layer)
+        .unwrap();
+    store
+        .write_manifest_json(&manifest_digest, &manifest)
+        .unwrap();
+    store.write_config_json(&manifest_digest, &config).unwrap();
+    let canonical_reference = Reference::from_str(EXEC_DEFAULTS_IMAGE).unwrap().whole();
+    store
+        .write_reference(&canonical_reference, &manifest_digest)
+        .unwrap();
+    if canonical_reference != EXEC_DEFAULTS_IMAGE {
+        store
+            .write_reference(EXEC_DEFAULTS_IMAGE, &manifest_digest)
+            .unwrap();
+    }
+
+    ExecDefaultsImageFixture {
+        reference: EXEC_DEFAULTS_IMAGE.to_string(),
+        manifest_digest,
+        config_digest,
+        layer_digest,
+        busybox_digest,
+    }
+}
+
+async fn exec_via_defaults_adapter(
+    rt: &Runtime,
+    container_id: &str,
+    case: &str,
+    adapter: ExecSemanticsAdapter,
+    mut config: ExecConfig,
+) -> Result<vz::protocol::ExecOutput, vz_oci_macos::MacosOciError> {
+    match adapter {
+        ExecSemanticsAdapter::OciUnary => rt.exec_container_oci_unary(container_id, config).await,
+        ExecSemanticsAdapter::StreamingPipe => {
+            rt.exec_container_streaming(container_id, config, |_| {})
+                .await
+        }
+        ExecSemanticsAdapter::Pty => {
+            config.pty = true;
+            config.execution_id = Some(format!("exec-defaults-{case}-{}", adapter.name()));
+            rt.exec_container_streaming(container_id, config, |_| {})
+                .await
+        }
+    }
+}
+
+fn exec_defaults_probe_config(explicit_override: bool) -> ExecConfig {
+    ExecConfig {
+        cmd: vec![
+            "/bin/busybox".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            EXEC_SEMANTICS_PROBE.to_string(),
+        ],
+        working_dir: explicit_override.then(|| "/workspace/override".to_string()),
+        env: if explicit_override {
+            vec![
+                ("PATH".to_string(), "/vz/exec-override/bin".to_string()),
+                ("TERM".to_string(), "vz-exec-override".to_string()),
+                ("VZ_EXEC".to_string(), "from-exec".to_string()),
+                ("VZ_OVERRIDE".to_string(), "from-exec".to_string()),
+            ]
+        } else {
+            Vec::new()
+        },
+        user: explicit_override.then(|| "0:0".to_string()),
+        timeout: Some(Duration::from_secs(30)),
+        ..ExecConfig::default()
+    }
+}
+
+/// Build a deterministic offline OCI fixture from the pinned release BusyBox,
+/// then prove image `User` and `WorkingDir` inheritance (and explicit exec
+/// precedence) through every OCI exec adapter.
+#[allow(clippy::print_stderr)]
+#[tokio::test]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
+async fn container_exec_inherits_image_process_defaults() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
+    init_tracing();
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = install_exec_defaults_image(tmp.path());
+    let installed_config = parse_image_config_summary_from_store(
+        &ImageStore::new(tmp.path().to_path_buf()),
+        &fixture.manifest_digest,
+    )
+    .unwrap();
+    eprintln!(
+        "container exec defaults OCI fixture evidence: reference={} manifest={} config={} layer={} busybox={} image_user={:?} image_working_dir={:?}",
+        fixture.reference,
+        fixture.manifest_digest,
+        fixture.config_digest,
+        fixture.layer_digest,
+        fixture.busybox_digest,
+        installed_config.user,
+        installed_config.working_dir
+    );
+    assert_eq!(installed_config.user.as_deref(), Some("developer"));
+    assert_eq!(
+        installed_config.working_dir.as_deref(),
+        Some("/workspace/image-default")
+    );
+    let rt = test_runtime(tmp.path());
+
+    let create_result = rt
+        .create_container(
+            &fixture.reference,
+            RunConfig {
+                cmd: vec!["/bin/busybox".into(), "sleep".into(), "300".into()],
+                execution_mode: ExecutionMode::OciRuntime,
+                env: vec![
+                    ("VZ_CREATE".into(), "from-create".into()),
+                    ("VZ_OVERRIDE".into(), "from-create".into()),
+                ],
+                ..RunConfig::default()
+            },
+        )
+        .await;
+
+    let mut results = Vec::new();
+    let mut stop_result = None;
+    let mut remove_result = None;
+    if let Ok(container_id) = &create_result {
+        for adapter in [
+            ExecSemanticsAdapter::OciUnary,
+            ExecSemanticsAdapter::StreamingPipe,
+            ExecSemanticsAdapter::Pty,
+        ] {
+            results.push((
+                "image-default",
+                adapter,
+                exec_via_defaults_adapter(
+                    &rt,
+                    container_id,
+                    "image-default",
+                    adapter,
+                    exec_defaults_probe_config(false),
+                )
+                .await,
+            ));
+            results.push((
+                "explicit-override",
+                adapter,
+                exec_via_defaults_adapter(
+                    &rt,
+                    container_id,
+                    "explicit-override",
+                    adapter,
+                    exec_defaults_probe_config(true),
+                )
+                .await,
+            ));
+        }
+        stop_result = Some(rt.stop_container(container_id, true, None, None).await);
+        remove_result = Some(rt.remove_container(container_id).await);
+    }
+
+    let container_id = create_result.unwrap();
+    assert!(
+        stop_result.unwrap().is_ok(),
+        "container cleanup stop failed for {container_id}"
+    );
+    assert!(
+        remove_result.unwrap().is_ok(),
+        "container cleanup remove failed for {container_id}"
+    );
+
+    assert_eq!(results.len(), 6);
+    let expected_inherited_environment = format!(
+        "PATH=/vz/image-default/bin\nTERM=vz-image-default\nVZ_CONTAINER_ID={container_id}\nVZ_CREATE=from-create\nVZ_IMAGE=from-image\nVZ_OVERRIDE=from-create\n"
+    )
+    .into_bytes();
+    let expected_override_environment = format!(
+        "PATH=/vz/exec-override/bin\nTERM=vz-exec-override\nVZ_CONTAINER_ID={container_id}\nVZ_CREATE=from-create\nVZ_EXEC=from-exec\nVZ_IMAGE=from-image\nVZ_OVERRIDE=from-exec\n"
+    )
+    .into_bytes();
+    let mut inherited_environments = Vec::new();
+    let mut override_environments = Vec::new();
+    for (case, adapter, result) in results {
+        let actual = parse_exec_semantics_evidence(adapter, &result.unwrap());
+        eprintln!(
+            "container exec defaults evidence ({case}/{}): uid={} gid={} groups={:?} cwd={} environment=\n{}",
+            adapter.name(),
+            actual.uid,
+            actual.gid,
+            actual.supplementary_groups,
+            actual.cwd,
+            String::from_utf8_lossy(&actual.canonical_environment)
+        );
+        match case {
+            "image-default" => {
+                assert_eq!(actual.uid, 1234, "{} inherited uid", adapter.name());
+                assert_eq!(actual.gid, 2345, "{} inherited gid", adapter.name());
+                assert_eq!(
+                    actual.supplementary_groups,
+                    vec![2345, 3456, 4567],
+                    "{} inherited supplementary groups",
+                    adapter.name()
+                );
+                assert_eq!(
+                    actual.cwd,
+                    "/workspace/image-default",
+                    "{} inherited working directory",
+                    adapter.name()
+                );
+                assert_eq!(
+                    actual.canonical_environment,
+                    expected_inherited_environment,
+                    "{case}/{} received an unexpected or leaked environment",
+                    adapter.name()
+                );
+                inherited_environments.push(actual.canonical_environment);
+            }
+            "explicit-override" => {
+                assert_eq!(actual.uid, 0, "{} override uid", adapter.name());
+                assert_eq!(actual.gid, 0, "{} override gid", adapter.name());
+                assert_eq!(
+                    actual.supplementary_groups,
+                    vec![0],
+                    "{} override supplementary groups",
+                    adapter.name()
+                );
+                assert_eq!(
+                    actual.cwd,
+                    "/workspace/override",
+                    "{} override working directory",
+                    adapter.name()
+                );
+                assert_eq!(
+                    actual.canonical_environment,
+                    expected_override_environment,
+                    "{case}/{} received an unexpected or leaked environment",
+                    adapter.name()
+                );
+                override_environments.push(actual.canonical_environment);
+            }
+            unexpected => panic!("unexpected defaults test case: {unexpected}"),
+        }
+    }
+    assert_eq!(inherited_environments.len(), 3);
+    assert_eq!(override_environments.len(), 3);
+    for environment in &inherited_environments {
+        assert_eq!(
+            environment, &inherited_environments[0],
+            "inherited canonical environment differs across adapters"
+        );
+    }
+    for environment in &override_environments {
+        assert_eq!(
+            environment, &override_environments[0],
+            "override canonical environment differs across adapters"
         );
     }
 }

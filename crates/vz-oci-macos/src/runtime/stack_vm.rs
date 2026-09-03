@@ -483,8 +483,9 @@ impl Runtime {
                 ))
             })?;
 
-        let image_id = self.pull(image).await?;
         let container_id = run.container_id.clone().unwrap_or_else(new_container_id);
+        validate_container_id(&container_id)?;
+        let image_id = self.pull(image).await?;
 
         let created_unix_secs = current_unix_secs();
         let mut container = ContainerInfo {
@@ -743,10 +744,10 @@ impl Runtime {
             )));
         }
 
-        // Publish the stack route before the first guest OCI mutation. A task
+        // Publish recovery routing before the first guest OCI mutation. A task
         // cancelled during create/start/rollback is therefore still visible to
-        // stack shutdown. The per-container handle is published second because
-        // container_stack alone is sufficient to reach the shared VM.
+        // stack shutdown. Public exec remains unavailable until final durable
+        // Running publication below.
         self.container_stack
             .lock()
             .await
@@ -917,9 +918,10 @@ impl Runtime {
             ));
         }
 
-        // Publish in-memory handles only after every required post-start
-        // action, final liveness validation, and durable Running metadata have
-        // succeeded. The map updates themselves are infallible.
+        // Reaffirm recovery routes after every required post-start action,
+        // final liveness validation, and durable Running metadata have
+        // succeeded. Only then publish active lifecycle state and the atomic
+        // public exec binding for this exact VM generation/default snapshot.
         self.vm_handles
             .lock()
             .await
@@ -930,11 +932,13 @@ impl Runtime {
             .insert(container_id.to_string(), stack_id.to_string());
         self.track_active_lifecycle(container_id.clone(), lifecycle)
             .await;
-        self.container_exec_env
-            .lock()
-            .await
-            .insert(container_id.clone(), run.env.clone());
-
+        self.container_exec_bindings.lock().await.insert(
+            container_id.clone(),
+            ContainerExecBinding {
+                vm: Arc::clone(&vm),
+                defaults: ContainerExecDefaults::from(&run),
+            },
+        );
         Ok(container_id)
     }
 
@@ -1025,7 +1029,10 @@ impl Runtime {
         self.vm_handles.lock().await.remove(container_id);
         self.container_stack.lock().await.remove(container_id);
         self.active_lifecycle.lock().await.remove(container_id);
-        self.container_exec_env.lock().await.remove(container_id);
+        self.container_exec_bindings
+            .lock()
+            .await
+            .remove(container_id);
         self.setup_restored_containers
             .lock()
             .await
@@ -1191,6 +1198,21 @@ impl Runtime {
             stack_port_forwards_count,
             "[L4/stack-vm] shutdown_shared_vm entry"
         );
+        let stack_containers: Vec<String> = {
+            let routes = self.container_stack.lock().await;
+            routes
+                .iter()
+                .filter(|(_, member_stack_id)| *member_stack_id == stack_id)
+                .map(|(container_id, _)| container_id.clone())
+                .collect()
+        };
+        {
+            let mut exec_bindings = self.container_exec_bindings.lock().await;
+            for container_id in &stack_containers {
+                exec_bindings.remove(container_id);
+            }
+        }
+
         let Some(vm) = self.stack_vms.lock().await.remove(stack_id) else {
             // Bug B fix: in-memory state can be empty after a daemon
             // respawn (kill -9 / OS reboot mid-operation). In that case
@@ -1208,16 +1230,15 @@ impl Runtime {
             if let Some(pf) = self.stack_port_forwards.lock().await.remove(stack_id) {
                 pf.shutdown().await;
             }
+            let mut vm_handles = self.vm_handles.lock().await;
+            let mut container_stack = self.container_stack.lock().await;
+            let mut active_lifecycle = self.active_lifecycle.lock().await;
+            for container_id in &stack_containers {
+                vm_handles.remove(container_id);
+                container_stack.remove(container_id);
+                active_lifecycle.remove(container_id);
+            }
             return Ok(());
-        };
-
-        // Find all containers belonging to this stack.
-        let stack_containers: Vec<String> = {
-            let cs = self.container_stack.lock().await;
-            cs.iter()
-                .filter(|(_, sid)| *sid == stack_id)
-                .map(|(cid, _)| cid.clone())
-                .collect()
         };
 
         // Stop each container via OCI lifecycle.
@@ -1242,12 +1263,10 @@ impl Runtime {
             let mut vm_handles = self.vm_handles.lock().await;
             let mut cs = self.container_stack.lock().await;
             let mut active_lifecycle = self.active_lifecycle.lock().await;
-            let mut container_exec_env = self.container_exec_env.lock().await;
             for cid in &stack_containers {
                 vm_handles.remove(cid);
                 cs.remove(cid);
                 active_lifecycle.remove(cid);
-                container_exec_env.remove(cid);
             }
         }
 

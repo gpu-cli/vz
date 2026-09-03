@@ -575,6 +575,13 @@ impl AgentServiceImpl {
 
         if let Some(working_dir) = &launch.spawn_working_dir {
             cmd.cwd(working_dir);
+        } else if launch.container_targeted {
+            // portable-pty otherwise falls back to the guest user's passwd
+            // home (typically /root) and unconditionally uses it as the
+            // trampoline's cwd. Minimal guests need not provide that
+            // directory. The requested container cwd is applied later by the
+            // verified trampoline, after namespace entry and chroot.
+            cmd.cwd("/");
         }
 
         if launch.clear_environment {

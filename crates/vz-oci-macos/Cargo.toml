@@ -32,6 +32,7 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+tar = "0.4"
 
 [lints]
 workspace = true

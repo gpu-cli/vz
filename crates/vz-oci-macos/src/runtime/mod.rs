@@ -57,9 +57,11 @@ use self::bundle::{
     resolve_oci_runtime_binary_path, write_hosts_file,
 };
 #[cfg(test)]
+use self::exec::{resolve_container_exec_binding, resolve_container_exec_options};
+#[cfg(test)]
 use self::oci_lifecycle::{
-    OciLifecycleFuture, OciLifecycleOps, build_log_rotation_script, parse_signal_number,
-    run_oci_lifecycle,
+    OciLifecycleFuture, OciLifecycleOps, build_log_rotation_script, lifecycle_exec_options,
+    parse_signal_number, run_oci_lifecycle,
 };
 #[cfg(test)]
 use self::resolve::parse_compose_log_rotation;
@@ -78,6 +80,29 @@ const OCI_ANNOTATION_CONTAINER_CLASS: &str = "io.vz.container.class";
 const OCI_ANNOTATION_AUTO_REMOVE: &str = "io.vz.container.auto_remove";
 const OCI_ANNOTATION_COMPOSE_LOGGING_DRIVER: &str = "io.vz.compose.logging.driver";
 const OCI_ANNOTATION_COMPOSE_LOGGING_OPTIONS: &str = "io.vz.compose.logging.options";
+const MAX_CONTAINER_ID_BYTES: usize = 128;
+
+fn validate_container_id(container_id: &str) -> Result<(), OciError> {
+    if container_id.is_empty() || container_id.len() > MAX_CONTAINER_ID_BYTES {
+        return Err(OciError::InvalidConfig(format!(
+            "container ID must contain 1..={MAX_CONTAINER_ID_BYTES} bytes"
+        )));
+    }
+    if !container_id
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphanumeric)
+        || !container_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(OciError::InvalidConfig(
+            "container ID must start with an ASCII alphanumeric byte and contain only ASCII alphanumeric, '_', '-', or '.' bytes"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContainerLifecycleClass {
@@ -128,7 +153,44 @@ struct InteractiveExecSession {
     pty_enabled: bool,
 }
 
-type ContainerExecEnvMap = HashMap<String, Vec<(String, String)>>;
+/// Immutable process defaults captured from the fully resolved container
+/// configuration. Ad-hoc exec requests resolve against this snapshot instead
+/// of consulting mutable guest process state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContainerExecDefaults {
+    env: Vec<(String, String)>,
+    working_dir: Option<String>,
+    user: Option<String>,
+}
+
+impl From<&RunConfig> for ContainerExecDefaults {
+    fn from(run: &RunConfig) -> Self {
+        Self {
+            env: run.env.clone(),
+            working_dir: run.working_dir.clone(),
+            user: run.user.clone(),
+        }
+    }
+}
+
+/// Atomically couples one live VM generation to the immutable defaults that
+/// were resolved for that same activation. Public container exec clones this
+/// whole record under one map lock, so it cannot mix generations.
+struct ContainerExecBinding<V = LinuxVm> {
+    vm: Arc<V>,
+    defaults: ContainerExecDefaults,
+}
+
+impl<V> Clone for ContainerExecBinding<V> {
+    fn clone(&self) -> Self {
+        Self {
+            vm: Arc::clone(&self.vm),
+            defaults: self.defaults.clone(),
+        }
+    }
+}
+
+type ContainerExecBindingMap = HashMap<String, ContainerExecBinding>;
 type StackActivationLockMap = HashMap<String, Arc<Mutex<()>>>;
 
 /// Unified runtime entrypoint.
@@ -180,11 +242,11 @@ pub struct Runtime {
     log_rotation_tasks: Arc<Mutex<HashMap<String, LogRotationTask>>>,
     /// Active interactive execution sessions keyed by daemon execution_id.
     exec_sessions: Arc<Mutex<HashMap<String, InteractiveExecSession>>>,
-    /// Resolved container environment captured at create/start time.
+    /// Public exec bindings for durably running containers.
     ///
-    /// Used to provide docker-compatible exec behavior where ad-hoc exec
-    /// commands inherit the container's configured environment by default.
-    container_exec_env: Arc<Mutex<ContainerExecEnvMap>>,
+    /// Each record atomically couples a VM generation to its immutable
+    /// activation-time environment, working directory, and user defaults.
+    container_exec_bindings: Arc<Mutex<ContainerExecBindingMap>>,
     /// VM instances that already ran interactive PTY prerequisite setup.
     ///
     /// Keyed by `Arc<LinuxVm>` pointer identity (`Arc::as_ptr` cast to usize)
@@ -222,7 +284,7 @@ impl Runtime {
             active_lifecycle: Arc::new(Mutex::new(HashMap::new())),
             log_rotation_tasks: Arc::new(Mutex::new(HashMap::new())),
             exec_sessions: Arc::new(Mutex::new(HashMap::new())),
-            container_exec_env: Arc::new(Mutex::new(HashMap::new())),
+            container_exec_bindings: Arc::new(Mutex::new(HashMap::new())),
             interactive_pty_prep_vms: Arc::new(Mutex::new(HashSet::new())),
             setup_restored_containers: Arc::new(Mutex::new(HashSet::new())),
         };
@@ -314,6 +376,10 @@ impl Runtime {
             )));
         }
 
+        // Removal is a terminal transition: stop admitting new public execs
+        // before any guest cleanup or recovery routing changes.
+        self.container_exec_bindings.lock().await.remove(id);
+
         // Shut down port forwarding for this container.
         if let Some(pf) = self.port_forwards.lock().await.remove(id) {
             pf.shutdown().await;
@@ -350,7 +416,6 @@ impl Runtime {
         self.vm_handles.lock().await.remove(id);
         self.container_stack.lock().await.remove(id);
         self.active_lifecycle.lock().await.remove(id);
-        self.container_exec_env.lock().await.remove(id);
 
         self.container_store.remove(id).map_err(OciError::from)?;
 
@@ -389,11 +454,16 @@ impl Runtime {
             })?;
 
         if !matches!(container.status, ContainerStatus::Running) {
+            self.container_exec_bindings.lock().await.remove(id);
             self.active_lifecycle.lock().await.remove(id);
             self.stop_log_rotation_task(id).await;
-            self.container_exec_env.lock().await.remove(id);
+            self.vm_handles.lock().await.remove(id);
             return Ok(container);
         }
+
+        // Atomically stop admitting new exec calls before shutdown begins.
+        // Recovery/lifecycle routing remains available through vm_handles.
+        self.container_exec_bindings.lock().await.remove(id);
 
         let vm = self
             .vm_handles
@@ -411,7 +481,6 @@ impl Runtime {
         let exit_code = stop_via_oci_runtime(&*vm, id, force, effective_grace, signal).await?;
         let lifecycle = self.active_lifecycle.lock().await.remove(id);
         self.stop_log_rotation_task(id).await;
-        self.container_exec_env.lock().await.remove(id);
 
         // Best-effort OCI delete.
         let delete_succeeded = match vm.oci_delete(id.to_string(), true).await {
@@ -497,8 +566,9 @@ impl Runtime {
             ));
         }
 
-        let image_id = self.pull(image).await?;
         let container_id = run.container_id.clone().unwrap_or_else(new_container_id);
+        validate_container_id(&container_id)?;
+        let image_id = self.pull(image).await?;
 
         let created_unix_secs = current_unix_secs();
         let mut container = ContainerInfo {
@@ -616,8 +686,9 @@ impl Runtime {
             ));
         }
 
-        let image_id = self.pull(image).await?;
         let container_id = run.container_id.clone().unwrap_or_else(new_container_id);
+        validate_container_id(&container_id)?;
+        let image_id = self.pull(image).await?;
 
         let created_unix_secs = current_unix_secs();
         let mut container = ContainerInfo {
@@ -683,7 +754,7 @@ impl Runtime {
             .boot_and_start_container(&rootfs_dir, &run, &container_id)
             .await
         {
-            Ok(()) => {
+            Ok(vm) => {
                 container.status = ContainerStatus::Running;
                 container.started_unix_secs = Some(current_unix_secs());
                 container.host_pid = Some(process::id());
@@ -692,10 +763,13 @@ impl Runtime {
                     .map_err(OciError::from)?;
                 self.track_active_lifecycle(container_id.clone(), lifecycle)
                     .await;
-                self.container_exec_env
-                    .lock()
-                    .await
-                    .insert(container_id.clone(), run.env.clone());
+                self.container_exec_bindings.lock().await.insert(
+                    container_id.clone(),
+                    ContainerExecBinding {
+                        vm,
+                        defaults: ContainerExecDefaults::from(&run),
+                    },
+                );
                 Ok(container_id)
             }
             Err(err) => {

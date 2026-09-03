@@ -14,7 +14,7 @@ impl Runtime {
         rootfs_dir: &Path,
         run: &RunConfig,
         container_id: &str,
-    ) -> Result<(), OciError> {
+    ) -> Result<Arc<LinuxVm>, OciError> {
         if !rootfs_dir.is_dir() {
             return Err(OciError::InvalidRootfs {
                 path: rootfs_dir.to_path_buf(),
@@ -170,12 +170,6 @@ impl Runtime {
             return Err(OciError::from(err));
         }
 
-        // Register VM handle for exec/stop/remove.
-        self.vm_handles
-            .lock()
-            .await
-            .insert(container_id.to_string(), Arc::clone(&vm));
-
         // Keep port forwarding alive for the container's lifetime.
         if let Some(pf) = port_forwarding {
             self.port_forwards
@@ -186,7 +180,15 @@ impl Runtime {
         self.start_log_rotation_task_if_needed(container_id, Arc::clone(&vm), run)
             .await?;
 
-        Ok(())
+        // This is recovery/lifecycle routing only. Runtime::create_container
+        // publishes the public exec binding after durable Running metadata and
+        // active lifecycle state have both succeeded.
+        self.vm_handles
+            .lock()
+            .await
+            .insert(container_id.to_string(), Arc::clone(&vm));
+
+        Ok(vm)
     }
 
     pub(super) async fn run_rootfs_with_oci_runtime(
@@ -335,7 +337,9 @@ impl Runtime {
             return Err(err);
         }
 
-        // Register VM handle so external stop/remove can reach the guest.
+        // One-off execution is transient and carries its resolved options
+        // directly through run_oci_lifecycle. It intentionally has no public
+        // container-exec binding; this handle is recovery/lifecycle routing.
         let vm = Arc::new(vm);
         self.vm_handles
             .lock()
@@ -586,7 +590,10 @@ impl Runtime {
     pub(super) async fn finalize_one_off_cleanup(&self, container_id: &str, auto_remove: bool) {
         self.active_lifecycle.lock().await.remove(container_id);
         self.stop_log_rotation_task(container_id).await;
-        self.container_exec_env.lock().await.remove(container_id);
+        self.container_exec_bindings
+            .lock()
+            .await
+            .remove(container_id);
 
         if auto_remove {
             if let Err(err) = self.remove_container(container_id).await {
