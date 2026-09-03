@@ -15,11 +15,12 @@
 #![allow(clippy::unwrap_used)]
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use vz_oci_macos::{MacosRuntimeBackend, RuntimeConfig};
+use vz_oci_macos::{MacosRuntimeBackend, RuntimeConfig, RuntimeLifecycleDiagnostics};
 use vz_runtime_contract::{
     Container, ContainerState, ContractInvariantError, ExecConfig, Lease, LeaseState,
     MachineErrorCode, NetworkServiceConfig, PortMapping, RunConfig, RuntimeBackend, Sandbox,
@@ -180,6 +181,84 @@ impl OciContainerRuntime {
             Ok((out.exit_code, out.stdout, out.stderr))
         })
     }
+
+    fn lifecycle_diagnostics(&self) -> RuntimeLifecycleDiagnostics {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.backend.inner().lifecycle_diagnostics())
+                .expect("lifecycle diagnostics should be available")
+        })
+    }
+
+    fn tracked_container_ids(&self) -> Vec<String> {
+        let mut ids = self
+            .backend
+            .inner()
+            .list_containers()
+            .expect("container metadata should be readable")
+            .into_iter()
+            .map(|container| container.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+}
+
+fn lifecycle_inventory(diagnostics: &RuntimeLifecycleDiagnostics) -> serde_json::Value {
+    let mut generations = diagnostics
+        .generations
+        .iter()
+        .map(|generation| {
+            serde_json::json!({
+                "container_id": generation.container_id,
+                "generation": generation.generation.0,
+                "reserved": generation.reserved,
+                "owner_pid": generation.owner_pid,
+                // An unreserved generation has no active owner even when its
+                // historical owner PID is this still-running test process.
+                "owner_alive": generation.reserved && generation.owner_alive,
+            })
+        })
+        .collect::<Vec<_>>();
+    generations.sort_by(|left, right| {
+        left["container_id"]
+            .as_str()
+            .cmp(&right["container_id"].as_str())
+    });
+
+    serde_json::json!({
+        "generations": generations,
+        "container_lock_slots": diagnostics.container_lock_slots,
+        "stack_lock_slots": diagnostics.stack_lock_slots,
+        "vm_handles": diagnostics.vm_handles,
+        "vm_handle_ids": diagnostics.vm_handle_ids,
+        "stack_vms": diagnostics.stack_vms,
+        "stack_vm_ids": diagnostics.stack_vm_ids,
+        "container_routes": diagnostics.container_routes,
+        "container_route_pairs": diagnostics.container_route_pairs,
+        "stack_port_forwards": diagnostics.stack_port_forwards,
+        "stack_port_forward_ids": diagnostics.stack_port_forward_ids,
+        "exec_bindings": diagnostics.exec_bindings,
+        "active_lifecycles": diagnostics.active_lifecycles,
+        "exec_sessions": diagnostics.exec_sessions,
+        "setup_restore_entries": diagnostics.setup_restore_entries,
+        "overlay_cleanup_pending": diagnostics.overlay_cleanup_pending,
+        "rootfs_directories": diagnostics.rootfs_directories,
+    })
+}
+
+fn write_stack_teardown_evidence(evidence: &serde_json::Value) {
+    let Some(path) = std::env::var_os("VZ_STACK_TEARDOWN_EVIDENCE").map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(evidence).expect("stack teardown evidence should serialize"),
+    )
+    .expect("stack teardown evidence should be writable");
+    std::fs::rename(&temporary, &path).expect("stack teardown evidence should publish atomically");
 }
 
 impl ContainerRuntime for OciContainerRuntime {
@@ -530,6 +609,11 @@ services:
         "teardown should succeed: {:?}",
         down_result.errors
     );
+    assert!(down_result.all_succeeded());
+    executor
+        .runtime()
+        .shutdown_sandbox("e2e-test")
+        .expect("e2e-test shared VM shutdown should succeed");
 }
 
 /// Parse and reconcile, then execute a single service and verify exec works.
@@ -579,7 +663,17 @@ services:
     let down = vec![Action::ServiceRemove {
         service_name: "app".into(),
     }];
-    executor.execute(&spec, &down).unwrap();
+    let down_result = executor.execute(&spec, &down).unwrap();
+    assert_eq!(
+        down_result.failed, 0,
+        "teardown should succeed: {:?}",
+        down_result.errors
+    );
+    assert!(down_result.all_succeeded());
+    executor
+        .runtime()
+        .shutdown_sandbox("exec-test")
+        .expect("exec-test shared VM shutdown should succeed");
 }
 
 /// Exercise the orchestration loop: deploy 2 services through the
@@ -658,6 +752,12 @@ services:
     };
     let down_result = orchestrator.run(&down_spec, None).unwrap();
     assert!(down_result.converged);
+    assert_eq!(down_result.services_failed, 0);
+    orchestrator
+        .executor()
+        .runtime()
+        .shutdown_sandbox("orch-test")
+        .expect("orch-test shared VM shutdown should succeed");
 }
 
 // ── Real service tests ──────────────────────────────────────────
@@ -799,10 +899,11 @@ services:
     assert!(down_result.converged, "teardown should converge");
 
     // Shut down the shared VM.
-    let _ = orchestrator
+    orchestrator
         .executor()
         .runtime()
-        .shutdown_sandbox("real-svc");
+        .shutdown_sandbox("real-svc")
+        .expect("real-svc shared VM shutdown should succeed");
 }
 
 /// End-to-end test for exec via Unix control socket.
@@ -959,17 +1060,20 @@ services:
         secrets: vec![],
         disk_size_mb: None,
     };
-    let _ = orchestrator.run(&down_spec, None);
-    let _ = orchestrator
+    let down = orchestrator.run(&down_spec, None).unwrap();
+    assert!(down.converged, "exec-sock teardown should converge");
+    orchestrator
         .executor()
         .runtime()
-        .shutdown_sandbox("exec-sock");
+        .shutdown_sandbox("exec-sock")
+        .expect("exec-sock shared VM shutdown should succeed");
 }
 
 /// Boot a 2-service stack with port forwarding, then connect from the host
 /// and verify TCP data round-trip through the per-service network namespace.
 ///
-/// Service "echo" runs `nc -l -p 8080` mapped to host:18090 with
+/// Service "echo" runs `nc -l -p 8080` mapped to a dynamically reserved
+/// loopback port with
 /// `target_host` pointing at its per-service netns IP. The host connects
 /// and reads the response, proving the full port-forwarding path works:
 /// host → vsock → guest agent → netns bridge → container.
@@ -984,18 +1088,28 @@ async fn stack_port_forwarding() {
         .with_test_writer()
         .try_init();
 
-    let yaml = r#"
+    let before_listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("a dynamic loopback port must be available before stack startup");
+    let host_port = before_listener
+        .local_addr()
+        .expect("dynamic loopback listener must have an address")
+        .port();
+    drop(before_listener);
+
+    let yaml = format!(
+        r#"
 services:
   echo:
     image: alpine:latest
     command: ["sh", "-c", "echo pong | nc -l -p 8080"]
     ports:
-      - "18090:8080"
+      - "{host_port}:8080"
 
   sidecar:
     image: alpine:latest
     command: ["sleep", "300"]
-"#;
+"#
+    );
 
     // Use persistent data dir for image cache.
     let oci_data = stack_e2e_oci_data_dir();
@@ -1004,7 +1118,7 @@ services:
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("state.db");
 
-    let spec = parse_compose(yaml, "port-fwd").unwrap();
+    let spec = parse_compose(&yaml, "port-fwd").unwrap();
     assert_eq!(spec.services.len(), 2);
 
     let bridge = OciContainerRuntime::new(&oci_data);
@@ -1019,7 +1133,66 @@ services:
     };
     let mut orchestrator = StackOrchestrator::new(executor, reconcile_store, orch_config);
 
-    let result = orchestrator.run(&spec, None).unwrap();
+    const STACK_ID: &str = "port-fwd";
+    let before = orchestrator.executor().runtime().lifecycle_diagnostics();
+    assert_eq!(before.stack_vms, 0);
+    assert_eq!(before.stack_port_forwards, 0);
+    assert!(
+        orchestrator
+            .executor()
+            .runtime()
+            .tracked_container_ids()
+            .is_empty()
+    );
+
+    let mut teardown_evidence = serde_json::json!({
+        "schema_version": 1,
+        "scenario": "stack-port-forwarding-teardown",
+        "stack_id": STACK_ID,
+        "host_listener": {
+            "address": "127.0.0.1",
+            "port": host_port,
+            "free_before_start": true,
+            "owned_while_active": false,
+            "owned_after_service_down": false,
+            "rebound_after_vm_shutdown": false,
+        },
+        "operations": {
+            "up": { "succeeded": false, "error": "not completed" },
+            "down": { "succeeded": false, "error": "not completed" },
+            "shutdown": { "succeeded": false, "error": "not completed" },
+        },
+        "container_ids": [],
+        "before": {
+            "tracked_container_ids": [],
+            "lifecycle": lifecycle_inventory(&before),
+        },
+        "active": serde_json::Value::Null,
+        "after_service_down": serde_json::Value::Null,
+        "after_vm_shutdown": serde_json::Value::Null,
+    });
+    write_stack_teardown_evidence(&teardown_evidence);
+
+    let result = match orchestrator.run(&spec, None) {
+        Ok(result) => result,
+        Err(error) => {
+            teardown_evidence["operations"]["up"]["error"] = serde_json::json!(error.to_string());
+            write_stack_teardown_evidence(&teardown_evidence);
+            panic!("stack startup failed: {error}");
+        }
+    };
+    teardown_evidence["operations"]["up"] = serde_json::json!({
+        "succeeded": result.converged && result.services_failed == 0,
+        "error": if result.converged && result.services_failed == 0 {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(format!(
+                "startup did not converge cleanly: ready={}, failed={}",
+                result.services_ready, result.services_failed
+            ))
+        },
+    });
+    write_stack_teardown_evidence(&teardown_evidence);
     assert!(
         result.converged,
         "stack should converge: ready={}, failed={}",
@@ -1027,26 +1200,47 @@ services:
     );
     assert_eq!(result.services_ready, 2);
 
+    let active_container_ids = orchestrator.executor().runtime().tracked_container_ids();
+    assert_eq!(active_container_ids.len(), 2);
+    let active = orchestrator.executor().runtime().lifecycle_diagnostics();
+    assert_eq!(active.vm_handle_ids, active_container_ids);
+    assert_eq!(active.stack_vm_ids, [STACK_ID]);
+    assert_eq!(active.stack_port_forward_ids, [STACK_ID]);
+    assert_eq!(active.container_routes, 2);
+    assert!(
+        active
+            .container_route_pairs
+            .iter()
+            .all(
+                |(container_id, stack_id)| active_container_ids.contains(container_id)
+                    && stack_id == STACK_ID
+            )
+    );
+    let active_bind_error = std::net::TcpListener::bind(("127.0.0.1", host_port))
+        .expect_err("active host forwarding listener must own the exact loopback port");
+    teardown_evidence["container_ids"] = serde_json::json!(active_container_ids);
+    teardown_evidence["active"] = serde_json::json!({
+        "tracked_container_ids": active_container_ids,
+        "lifecycle": lifecycle_inventory(&active),
+    });
+    teardown_evidence["host_listener"]["owned_while_active"] =
+        serde_json::json!(active_bind_error.kind() == ErrorKind::AddrInUse);
+    write_stack_teardown_evidence(&teardown_evidence);
+    assert_eq!(active_bind_error.kind(), ErrorKind::AddrInUse);
+
     // Give the nc listener a moment to start inside the container.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Connect from the host — retry to allow port forwarding relay to start.
+    // Connect exactly once: convergence publishes the active forwarding
+    // listener, so a test retry would mask an admission/readiness defect.
     use tokio::io::AsyncReadExt;
-    let mut conn = None;
-    for attempt in 1..=5 {
-        match tokio::net::TcpStream::connect("127.0.0.1:18090").await {
-            Ok(stream) => {
-                conn = Some(stream);
-                break;
-            }
-            Err(e) if attempt < 5 => {
-                eprintln!("port forward attempt {attempt}/5 failed: {e}, retrying...");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            Err(e) => panic!("port forwarding connection failed after 5 attempts: {e}"),
-        }
-    }
-    let mut conn = conn.unwrap();
+    let mut conn = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::TcpStream::connect(("127.0.0.1", host_port)),
+    )
+    .await
+    .expect("port forwarding connect timed out")
+    .expect("port forwarding connection failed");
     let mut buf = vec![0u8; 64];
     let n = tokio::time::timeout(Duration::from_secs(10), conn.read(&mut buf))
         .await
@@ -1070,11 +1264,95 @@ services:
         secrets: vec![],
         disk_size_mb: None,
     };
-    let _ = orchestrator.run(&down_spec, None);
-    let _ = orchestrator
-        .executor()
-        .runtime()
-        .shutdown_sandbox("port-fwd");
+    let down = match orchestrator.run(&down_spec, None) {
+        Ok(result) => result,
+        Err(error) => {
+            teardown_evidence["operations"]["down"]["error"] = serde_json::json!(error.to_string());
+            write_stack_teardown_evidence(&teardown_evidence);
+            panic!("service down failed: {error}");
+        }
+    };
+    teardown_evidence["operations"]["down"] = serde_json::json!({
+        "succeeded": down.converged && down.services_failed == 0,
+        "error": if down.converged && down.services_failed == 0 {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(format!(
+                "service down did not converge cleanly: ready={}, failed={}",
+                down.services_ready, down.services_failed
+            ))
+        },
+    });
+    write_stack_teardown_evidence(&teardown_evidence);
+    assert!(down.converged);
+    assert_eq!(down.services_ready, 0);
+    assert_eq!(down.services_failed, 0);
+    assert!(
+        orchestrator
+            .executor()
+            .runtime()
+            .tracked_container_ids()
+            .is_empty()
+    );
+    let after_service_down = orchestrator.executor().runtime().lifecycle_diagnostics();
+    assert_eq!(after_service_down.vm_handles, 0);
+    assert_eq!(after_service_down.container_routes, 0);
+    assert_eq!(after_service_down.exec_bindings, 0);
+    assert_eq!(after_service_down.active_lifecycles, 0);
+    assert_eq!(after_service_down.stack_vm_ids, [STACK_ID]);
+    assert_eq!(after_service_down.stack_port_forward_ids, [STACK_ID]);
+    let down_bind_error = std::net::TcpListener::bind(("127.0.0.1", host_port))
+        .expect_err("stack listener must remain owned until VM shutdown");
+    teardown_evidence["after_service_down"] = serde_json::json!({
+        "tracked_container_ids": [],
+        "lifecycle": lifecycle_inventory(&after_service_down),
+    });
+    teardown_evidence["host_listener"]["owned_after_service_down"] =
+        serde_json::json!(down_bind_error.kind() == ErrorKind::AddrInUse);
+    write_stack_teardown_evidence(&teardown_evidence);
+    assert_eq!(down_bind_error.kind(), ErrorKind::AddrInUse);
+
+    if let Err(error) = orchestrator.executor().runtime().shutdown_sandbox(STACK_ID) {
+        teardown_evidence["operations"]["shutdown"]["error"] = serde_json::json!(error.to_string());
+        write_stack_teardown_evidence(&teardown_evidence);
+        panic!("shared VM shutdown failed: {error}");
+    }
+    teardown_evidence["operations"]["shutdown"] =
+        serde_json::json!({ "succeeded": true, "error": serde_json::Value::Null });
+    let after_vm_shutdown = orchestrator.executor().runtime().lifecycle_diagnostics();
+    assert!(
+        orchestrator
+            .executor()
+            .runtime()
+            .tracked_container_ids()
+            .is_empty()
+    );
+    assert_eq!(after_vm_shutdown.vm_handles, 0);
+    assert!(after_vm_shutdown.vm_handle_ids.is_empty());
+    assert_eq!(after_vm_shutdown.stack_vms, 0);
+    assert!(after_vm_shutdown.stack_vm_ids.is_empty());
+    assert_eq!(after_vm_shutdown.container_routes, 0);
+    assert!(after_vm_shutdown.container_route_pairs.is_empty());
+    assert_eq!(after_vm_shutdown.stack_port_forwards, 0);
+    assert!(after_vm_shutdown.stack_port_forward_ids.is_empty());
+    assert_eq!(after_vm_shutdown.exec_bindings, 0);
+    assert_eq!(after_vm_shutdown.active_lifecycles, 0);
+    assert_eq!(after_vm_shutdown.exec_sessions, 0);
+    assert_eq!(after_vm_shutdown.setup_restore_entries, 0);
+    assert_eq!(after_vm_shutdown.overlay_cleanup_pending, 0);
+    assert_eq!(after_vm_shutdown.rootfs_directories, 0);
+    assert!(after_vm_shutdown.generations.iter().all(|generation| {
+        !active_container_ids.contains(&generation.container_id) || !generation.reserved
+    }));
+    let rebound_listener = std::net::TcpListener::bind(("127.0.0.1", host_port))
+        .expect("exact loopback port must be reusable after shared VM shutdown");
+    teardown_evidence["host_listener"]["rebound_after_vm_shutdown"] = serde_json::json!(true);
+    teardown_evidence["after_vm_shutdown"] = serde_json::json!({
+        "tracked_container_ids": [],
+        "lifecycle": lifecycle_inventory(&after_vm_shutdown),
+    });
+    write_stack_teardown_evidence(&teardown_evidence);
+    drop(rebound_listener);
 }
 
 /// Use-case scenario:
@@ -1235,6 +1513,7 @@ services:
                 break;
             }
             Err(err) => {
+                eprintln!("VZ_STACK_TEARDOWN_VIOLATION:TEST_RETRY");
                 eprintln!("restore marker read attempt {attempt}/20 failed: {err}; retrying...");
             }
         }
@@ -1268,6 +1547,7 @@ services:
                 break;
             }
             Err(err) => {
+                eprintln!("VZ_STACK_TEARDOWN_VIOLATION:TEST_RETRY");
                 eprintln!(
                     "post-reconcile marker read attempt {attempt}/10 failed: {err}; retrying..."
                 );
@@ -1297,6 +1577,7 @@ services:
             services_ready_count = Some(ready);
             break;
         }
+        eprintln!("VZ_STACK_TEARDOWN_VIOLATION:TEST_RETRY");
         eprintln!(
             "post-restore observed-state attempt {attempt}/10 has ready={ready}; retrying..."
         );
@@ -1316,11 +1597,13 @@ services:
         secrets: vec![],
         disk_size_mb: None,
     };
-    let _ = orchestrator.run(&down_spec, None);
-    let _ = orchestrator
+    let down = orchestrator.run(&down_spec, None).unwrap();
+    assert!(down.converged, "snapshot-stack teardown should converge");
+    orchestrator
         .executor()
         .runtime()
-        .shutdown_sandbox("snapshot-stack");
+        .shutdown_sandbox("snapshot-stack")
+        .expect("snapshot-stack shared VM shutdown should succeed");
 }
 
 /// Verify sandbox lifecycle: create_sandbox → services up → shutdown_sandbox.
@@ -1538,10 +1821,11 @@ services:
         "should have ServiceStopped event after teardown"
     );
 
-    let _ = orchestrator
+    orchestrator
         .executor()
         .runtime()
-        .shutdown_sandbox("phase-track");
+        .shutdown_sandbox("phase-track")
+        .expect("phase-track shared VM shutdown should succeed");
 }
 
 /// Verify orchestrator idempotency: running the same spec twice should
@@ -1622,11 +1906,13 @@ services:
         secrets: vec![],
         disk_size_mb: None,
     };
-    let _ = orchestrator.run(&down_spec, None);
-    let _ = orchestrator
+    let down = orchestrator.run(&down_spec, None).unwrap();
+    assert!(down.converged, "idempotent teardown should converge");
+    orchestrator
         .executor()
         .runtime()
-        .shutdown_sandbox("idempotent");
+        .shutdown_sandbox("idempotent")
+        .expect("idempotent shared VM shutdown should succeed");
 }
 
 /// Verify that `depends_on` with `service_healthy` blocks dependent services
@@ -1765,11 +2051,13 @@ services:
         secrets: vec![],
         disk_size_mb: None,
     };
-    let _ = orchestrator.run(&down_spec, None);
-    let _ = orchestrator
+    let down = orchestrator.run(&down_spec, None).unwrap();
+    assert!(down.converged, "dep-healthy teardown should converge");
+    orchestrator
         .executor()
         .runtime()
-        .shutdown_sandbox("dep-healthy");
+        .shutdown_sandbox("dep-healthy")
+        .expect("dep-healthy shared VM shutdown should succeed");
 }
 
 /// Verify environment variables are correctly passed to containers in a stack.
@@ -1860,11 +2148,13 @@ services:
         secrets: vec![],
         disk_size_mb: None,
     };
-    let _ = orchestrator.run(&down_spec, None);
-    let _ = orchestrator
+    let down = orchestrator.run(&down_spec, None).unwrap();
+    assert!(down.converged, "env-test teardown should converge");
+    orchestrator
         .executor()
         .runtime()
-        .shutdown_sandbox("env-test");
+        .shutdown_sandbox("env-test")
+        .expect("env-test shared VM shutdown should succeed");
 }
 
 /// Verify inter-service DNS connectivity within a stack sandbox.
@@ -1971,11 +2261,13 @@ services:
         secrets: vec![],
         disk_size_mb: None,
     };
-    let _ = orchestrator.run(&down_spec, None);
-    let _ = orchestrator
+    let down = orchestrator.run(&down_spec, None).unwrap();
+    assert!(down.converged, "net-conn teardown should converge");
+    orchestrator
         .executor()
         .runtime()
-        .shutdown_sandbox("net-conn");
+        .shutdown_sandbox("net-conn")
+        .expect("net-conn shared VM shutdown should succeed");
 }
 
 /// Verify stack handles service update (config change → recreate).
@@ -2100,11 +2392,13 @@ services:
         secrets: vec![],
         disk_size_mb: None,
     };
-    let _ = orchestrator.run(&down_spec, None);
-    let _ = orchestrator
+    let down = orchestrator.run(&down_spec, None).unwrap();
+    assert!(down.converged, "update-test teardown should converge");
+    orchestrator
         .executor()
         .runtime()
-        .shutdown_sandbox("update-test");
+        .shutdown_sandbox("update-test")
+        .expect("update-test shared VM shutdown should succeed");
 }
 
 /// Verify three-service dependency chain: C depends on B, B depends on A.
@@ -2225,11 +2519,13 @@ services:
         secrets: vec![],
         disk_size_mb: None,
     };
-    let _ = orchestrator.run(&down_spec, None);
-    let _ = orchestrator
+    let down = orchestrator.run(&down_spec, None).unwrap();
+    assert!(down.converged, "chain-3 teardown should converge");
+    orchestrator
         .executor()
         .runtime()
-        .shutdown_sandbox("chain-3");
+        .shutdown_sandbox("chain-3")
+        .expect("chain-3 shared VM shutdown should succeed");
 }
 
 /// Verify exec_with_output works correctly through the stack runtime bridge.
@@ -2336,11 +2632,13 @@ services:
         secrets: vec![],
         disk_size_mb: None,
     };
-    let _ = orchestrator.run(&down_spec, None);
-    let _ = orchestrator
+    let down = orchestrator.run(&down_spec, None).unwrap();
+    assert!(down.converged, "exec-out teardown should converge");
+    orchestrator
         .executor()
         .runtime()
-        .shutdown_sandbox("exec-out");
+        .shutdown_sandbox("exec-out")
+        .expect("exec-out shared VM shutdown should succeed");
 }
 
 /// Deploy a service with replicas=3 and verify 3 running containers with distinct IDs.
@@ -2430,8 +2728,14 @@ services:
         disk_size_mb: None,
     };
     let down_result = apply(&down_spec, executor.store(), &health).unwrap();
-    let _ = executor.execute(&down_spec, &down_result.actions);
-    let _ = executor.runtime().shutdown_sandbox("replica-e2e");
+    let execution = executor
+        .execute(&down_spec, &down_result.actions)
+        .expect("replica teardown execution should return");
+    assert!(execution.all_succeeded(), "replica teardown should succeed");
+    executor
+        .runtime()
+        .shutdown_sandbox("replica-e2e")
+        .expect("replica shared VM shutdown should succeed");
 }
 
 /// Deploy replicas=3, then redeploy with replicas=1 and verify scale-down.
@@ -2534,8 +2838,14 @@ services:
         disk_size_mb: None,
     };
     let down_result = apply(&down_spec, executor.store(), &health).unwrap();
-    let _ = executor.execute(&down_spec, &down_result.actions);
-    let _ = executor.runtime().shutdown_sandbox("scale-e2e");
+    let execution = executor
+        .execute(&down_spec, &down_result.actions)
+        .expect("scale teardown execution should return");
+    assert!(execution.all_succeeded(), "scale teardown should succeed");
+    executor
+        .runtime()
+        .shutdown_sandbox("scale-e2e")
+        .expect("scale shared VM shutdown should succeed");
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -2678,11 +2988,13 @@ volumes:
         secrets: vec![],
         disk_size_mb: None,
     };
-    let _ = orchestrator.run(&down_spec, None);
-    let _ = orchestrator
+    let down = orchestrator.run(&down_spec, None).unwrap();
+    assert!(down.converged, "vol-e2e teardown should converge");
+    orchestrator
         .executor()
         .runtime()
-        .shutdown_sandbox("vol-e2e");
+        .shutdown_sandbox("vol-e2e")
+        .expect("vol-e2e shared VM shutdown should succeed");
 }
 
 /// Verify file-based secrets are injected at /run/secrets/<name> inside sandbox containers.
@@ -2794,11 +3106,13 @@ secrets:
         secrets: vec![],
         disk_size_mb: None,
     };
-    let _ = orchestrator.run(&down_spec, None);
-    let _ = orchestrator
+    let down = orchestrator.run(&down_spec, None).unwrap();
+    assert!(down.converged, "secret-e2e teardown should converge");
+    orchestrator
         .executor()
         .runtime()
-        .shutdown_sandbox("secret-e2e");
+        .shutdown_sandbox("secret-e2e")
+        .expect("secret-e2e shared VM shutdown should succeed");
 }
 
 /// Verify env_file variables are loaded and inline environment takes precedence.
@@ -2923,11 +3237,13 @@ services:
         secrets: vec![],
         disk_size_mb: None,
     };
-    let _ = orchestrator.run(&down_spec, None);
-    let _ = orchestrator
+    let down = orchestrator.run(&down_spec, None).unwrap();
+    assert!(down.converged, "envfile-e2e teardown should converge");
+    orchestrator
         .executor()
         .runtime()
-        .shutdown_sandbox("envfile-e2e");
+        .shutdown_sandbox("envfile-e2e")
+        .expect("envfile-e2e shared VM shutdown should succeed");
 }
 
 /// Verify multi-network isolation: services on different networks cannot reach each other.
@@ -3114,9 +3430,11 @@ networks:
         secrets: vec![],
         disk_size_mb: None,
     };
-    let _ = orchestrator.run(&down_spec, None);
-    let _ = orchestrator
+    let down = orchestrator.run(&down_spec, None).unwrap();
+    assert!(down.converged, "multinet-e2e teardown should converge");
+    orchestrator
         .executor()
         .runtime()
-        .shutdown_sandbox("multinet-e2e");
+        .shutdown_sandbox("multinet-e2e")
+        .expect("multinet-e2e shared VM shutdown should succeed");
 }

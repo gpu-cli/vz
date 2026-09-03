@@ -378,18 +378,12 @@ impl Runtime {
             ))
         })?;
 
-        if let Some(port_forwards) = port_forwards {
-            port_forwards.shutdown().await;
-        }
-
+        let forwarding_shutdown = match port_forwards {
+            Some(mut port_forwards) => port_forwards.shutdown().await,
+            None => Ok(()),
+        };
         let stop = vm.stop().await;
-
-        match (lifecycle, stop) {
-            (Ok(output), Ok(())) => Ok(output),
-            (Err(exec_err), Ok(())) => Err(exec_err),
-            (Ok(_), Err(stop_err)) => Err(stop_err.into()),
-            (Err(exec_err), Err(_stop_err)) => Err(exec_err),
-        }
+        finish_transient_execution(lifecycle, forwarding_shutdown, stop)
     }
 
     /// Run a command against a local rootfs mounted as VirtioFS `rootfs`.
@@ -514,18 +508,12 @@ impl Runtime {
             )
             .await;
 
-        if let Some(port_forwards) = port_forwards {
-            port_forwards.shutdown().await;
-        }
-
+        let forwarding_shutdown = match port_forwards {
+            Some(mut port_forwards) => port_forwards.shutdown().await,
+            None => Ok(()),
+        };
         let stop = vm.stop().await;
-
-        match (exec, stop) {
-            (Ok(output), Ok(())) => Ok(output),
-            (Err(exec_err), Ok(())) => Err(exec_err.into()),
-            (Ok(_), Err(stop_err)) => Err(stop_err.into()),
-            (Err(exec_err), Err(_stop_err)) => Err(exec_err.into()),
-        }
+        finish_transient_execution(exec, forwarding_shutdown, stop)
     }
 
     /// Reconcile containers whose managing host PID is no longer alive.
@@ -675,5 +663,88 @@ impl Runtime {
                 let _ = fs::remove_dir_all(path);
             }
         }
+    }
+}
+
+fn finish_transient_execution<E, S>(
+    execution: Result<ExecOutput, E>,
+    forwarding_shutdown: Result<(), OciError>,
+    vm_stop: Result<(), S>,
+) -> Result<ExecOutput, OciError>
+where
+    E: std::fmt::Display + Into<OciError>,
+    S: std::fmt::Display,
+{
+    if forwarding_shutdown.is_ok() && vm_stop.is_ok() {
+        return execution.map_err(Into::into);
+    }
+
+    let mut failures = Vec::new();
+    let output = match execution {
+        Ok(output) => Some(output),
+        Err(error) => {
+            failures.push(format!("execution failed: {error}"));
+            None
+        }
+    };
+    if let Err(error) = forwarding_shutdown {
+        failures.push(error.to_string());
+    }
+    if let Err(error) = vm_stop {
+        failures.push(format!("VM stop failed: {error}"));
+    }
+
+    match (output, failures.is_empty()) {
+        (Some(output), true) => Ok(output),
+        (_, false) => Err(OciError::InvalidConfig(format!(
+            "transient VM cleanup failed: {}",
+            failures.join("; ")
+        ))),
+        (None, true) => Err(OciError::InvalidConfig(
+            "transient execution produced neither output nor an error".to_string(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_execution_aggregates_forwarding_and_vm_stop_failures() {
+        let error = finish_transient_execution::<OciError, OciError>(
+            Ok(ExecOutput {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+            Err(OciError::InvalidConfig(
+                "injected forwarding failure".to_string(),
+            )),
+            Err(OciError::InvalidConfig(
+                "injected VM stop failure".to_string(),
+            )),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("injected forwarding failure"));
+        assert!(error.to_string().contains("injected VM stop failure"));
+    }
+
+    #[test]
+    fn transient_execution_preserves_execution_error_when_cleanup_succeeds() {
+        let error = finish_transient_execution::<OciError, OciError>(
+            Err(OciError::ContainerNotFound {
+                id: "original-error".to_string(),
+            }),
+            Ok(()),
+            Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OciError::ContainerNotFound { ref id } if id == "original-error"
+        ));
     }
 }

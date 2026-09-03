@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use vz_stack::{
-    Action, ComposeBuildSpec, ContainerLogs, ContainerRuntime, OrchestrationConfig,
-    ServiceObservedState, ServicePhase, StackExecutor, StackOrchestrator, StackSpec, VolumeManager,
-    apply, collect_compose_build_specs_with_dir, parse_compose_with_dir,
+    Action, ComposeBuildSpec, ContainerLogs, ContainerRuntime, ExecutionResult,
+    OrchestrationConfig, ServiceObservedState, ServicePhase, StackExecutor, StackOrchestrator,
+    StackSpec, VolumeManager, apply, collect_compose_build_specs_with_dir, parse_compose_with_dir,
 };
 
 const STACK_BUILD_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -137,6 +137,19 @@ fn map_runtime_error(operation: &str, error: vz_runtime_contract::RuntimeError) 
         ),
         other => StackError::Network(format!("{operation} failed: {other}")),
     }
+}
+
+async fn shutdown_stack_runtime_for_teardown(
+    daemon: Arc<RuntimeDaemon>,
+    stack_id: String,
+) -> Result<(), StackError> {
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        handle.block_on(daemon.manager().shutdown_stack_runtime(&stack_id))
+    })
+    .await
+    .map_err(|error| StackError::Network(format!("shutdown_sandbox task failed: {error}")))?
+    .map_err(|error| map_runtime_error("shutdown_sandbox", error))
 }
 
 impl ContainerRuntime for DaemonContainerRuntime {
@@ -302,8 +315,6 @@ impl ContainerRuntime for DaemonContainerRuntime {
     }
 
     fn shutdown_sandbox(&self, sandbox_id: &str) -> Result<(), StackError> {
-        let capabilities = self.capabilities();
-        self.ensure_capability("shutdown_sandbox", "shared_vm", capabilities.shared_vm)?;
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(self.daemon.manager().shutdown_stack_runtime(sandbox_id))
@@ -572,6 +583,49 @@ fn execute_stack_service_action(
     }
 
     Ok(())
+}
+
+fn teardown_execution_failure_response(
+    result: &ExecutionResult,
+    request_id: &str,
+    events: &mut Vec<Result<runtime_v2::TeardownStackEvent, Status>>,
+) -> Option<Response<TeardownStackEventStream>> {
+    if result.failed == 0 {
+        return None;
+    }
+
+    let errors = result
+        .errors
+        .iter()
+        .map(|(action, message)| format!("{action}: {message}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let message = if errors.is_empty() {
+        format!(
+            "stack teardown execution failed for {} action(s)",
+            result.failed
+        )
+    } else {
+        format!(
+            "stack teardown execution failed for {} action(s): {errors}",
+            result.failed
+        )
+    };
+
+    let status = status_from_machine_error(MachineError::new(
+        MachineErrorCode::BackendUnavailable,
+        message,
+        Some(request_id.to_string()),
+        BTreeMap::from([
+            ("failed_actions".to_string(), result.failed.to_string()),
+            (
+                "succeeded_actions".to_string(),
+                result.succeeded.to_string(),
+            ),
+        ]),
+    ));
+    events.push(Err(status));
+    Some(stack_stream_response(std::mem::take(events), None))
 }
 
 fn parse_stack_spec(

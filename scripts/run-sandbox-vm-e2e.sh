@@ -345,6 +345,8 @@ ln -sfn "$timestamp" "$OUTPUT_ROOT/latest"
 BUILDKIT_RUNTIME_INVENTORY_EVIDENCE="$RUN_DIR/buildkit-runtime-inventory.txt"
 CONTAINER_ID_OWNERSHIP_EVIDENCE="$RUN_DIR/container-id-ownership.json"
 CONTAINER_ID_OWNERSHIP_SHA256="$RUN_DIR/container-id-ownership.json.sha256"
+STACK_TEARDOWN_EVIDENCE="$RUN_DIR/stack-port-forwarding-teardown.json"
+STACK_TEARDOWN_SHA256="$RUN_DIR/stack-port-forwarding-teardown.json.sha256"
 
 # The VM executes the Linux guest agent embedded in each profile's initramfs,
 # not the macOS host binary built below. Rebuild both bundles on every run so
@@ -566,7 +568,172 @@ validate_container_id_ownership_evidence() {
     ' "$evidence_file" >/dev/null
 }
 
+validate_stack_teardown_evidence() {
+    local evidence_file="$1"
+
+    jq -e '
+        .container_ids as $container_ids |
+        (type == "object") and
+        ((keys | sort) == ([
+            "active", "after_service_down", "after_vm_shutdown", "before",
+            "container_ids", "host_listener", "operations", "scenario",
+            "schema_version", "stack_id"
+        ] | sort)) and
+        (.schema_version == 1) and
+        (.scenario == "stack-port-forwarding-teardown") and
+        (.stack_id == "port-fwd") and
+        ((.host_listener | keys | sort) == ([
+            "address", "free_before_start", "owned_after_service_down",
+            "owned_while_active", "port", "rebound_after_vm_shutdown"
+        ] | sort)) and
+        (.host_listener.address == "127.0.0.1") and
+        ((.host_listener.port | type) == "number") and
+        (.host_listener.port == (.host_listener.port | floor)) and
+        (.host_listener.port > 0 and .host_listener.port <= 65535) and
+        (.host_listener.free_before_start == true) and
+        (.host_listener.owned_while_active == true) and
+        (.host_listener.owned_after_service_down == true) and
+        (.host_listener.rebound_after_vm_shutdown == true) and
+        ((.operations | keys | sort) == (["down", "shutdown", "up"] | sort)) and
+        (all(.operations[];
+            ((keys | sort) == (["error", "succeeded"] | sort)) and
+            .succeeded == true and .error == null
+        )) and
+        ((.container_ids | type) == "array") and
+        ((.container_ids | length) == 2) and
+        ((.container_ids | unique | length) == 2) and
+        (all(.container_ids[]; type == "string" and length > 0)) and
+        (all([.before, .active, .after_service_down, .after_vm_shutdown][];
+            ((keys | sort) == (["lifecycle", "tracked_container_ids"] | sort)) and
+            ((.tracked_container_ids | type) == "array") and
+            ((.tracked_container_ids | unique | length) == (.tracked_container_ids | length)) and
+            (all(.tracked_container_ids[]; type == "string" and length > 0)) and
+            ((.lifecycle | keys | sort) == ([
+                "active_lifecycles", "container_lock_slots", "container_route_pairs",
+                "container_routes", "exec_bindings", "exec_sessions", "generations",
+                "overlay_cleanup_pending", "rootfs_directories", "setup_restore_entries",
+                "stack_lock_slots", "stack_port_forward_ids", "stack_port_forwards",
+                "stack_vm_ids", "stack_vms", "vm_handle_ids", "vm_handles"
+            ] | sort)) and
+            ([
+                .lifecycle.active_lifecycles, .lifecycle.container_lock_slots,
+                .lifecycle.container_routes, .lifecycle.exec_bindings,
+                .lifecycle.exec_sessions, .lifecycle.overlay_cleanup_pending,
+                .lifecycle.rootfs_directories, .lifecycle.setup_restore_entries,
+                .lifecycle.stack_lock_slots, .lifecycle.stack_port_forwards,
+                .lifecycle.stack_vms, .lifecycle.vm_handles
+            ] | all(type == "number" and . >= 0 and . == floor)) and
+            ([
+                .lifecycle.vm_handle_ids[], .lifecycle.stack_vm_ids[],
+                .lifecycle.stack_port_forward_ids[]
+            ] | all(type == "string" and length > 0)) and
+            ((.lifecycle.vm_handle_ids | unique | length) == (.lifecycle.vm_handle_ids | length)) and
+            ((.lifecycle.stack_vm_ids | unique | length) == (.lifecycle.stack_vm_ids | length)) and
+            ((.lifecycle.stack_port_forward_ids | unique | length) == (.lifecycle.stack_port_forward_ids | length)) and
+            (.lifecycle.vm_handles == (.lifecycle.vm_handle_ids | length)) and
+            (.lifecycle.stack_vms == (.lifecycle.stack_vm_ids | length)) and
+            (.lifecycle.container_routes == (.lifecycle.container_route_pairs | length)) and
+            (.lifecycle.stack_port_forwards == (.lifecycle.stack_port_forward_ids | length)) and
+            (all(.lifecycle.generations[];
+                ((keys | sort) == ([
+                    "container_id", "generation", "owner_alive", "owner_pid", "reserved"
+                ] | sort)) and
+                ((.container_id | type) == "string") and
+                ((.generation | type) == "number") and
+                (.generation > 0 and .generation == (.generation | floor)) and
+                ((.reserved | type) == "boolean") and
+                ((.owner_pid | type) == "number") and
+                (.owner_pid >= 0 and .owner_pid == (.owner_pid | floor)) and
+                ((.owner_alive | type) == "boolean")
+            )) and
+            ((.lifecycle.generations | map(.container_id) | unique | length) ==
+                (.lifecycle.generations | length))
+        )) and
+        (.before.tracked_container_ids == []) and
+        (.before.lifecycle.vm_handles == 0) and
+        (.before.lifecycle.vm_handle_ids == []) and
+        (.before.lifecycle.stack_vms == 0) and
+        (.before.lifecycle.stack_vm_ids == []) and
+        (.before.lifecycle.container_routes == 0) and
+        (.before.lifecycle.container_route_pairs == []) and
+        (.before.lifecycle.stack_port_forwards == 0) and
+        (.before.lifecycle.stack_port_forward_ids == []) and
+        ((.active.tracked_container_ids | sort) == (.container_ids | sort)) and
+        (.active.lifecycle.vm_handles == 2) and
+        ((.active.lifecycle.vm_handle_ids | sort) == (.container_ids | sort)) and
+        (.active.lifecycle.stack_vms == 1) and
+        (.active.lifecycle.stack_vm_ids == ["port-fwd"]) and
+        (.active.lifecycle.container_routes == 2) and
+        ((.active.lifecycle.container_route_pairs | length) == 2) and
+        ((.active.lifecycle.container_route_pairs | map(.[0]) | sort) ==
+            ($container_ids | sort)) and
+        (all(.active.lifecycle.container_route_pairs[];
+            (type == "array") and (length == 2) and
+            ((.[0] | type) == "string") and ((.[1] | type) == "string") and
+            (.[0] as $container_id |
+                .[1] == "port-fwd" and any($container_ids[]; . == $container_id))
+        )) and
+        (.active.lifecycle.stack_port_forwards == 1) and
+        (.active.lifecycle.stack_port_forward_ids == ["port-fwd"]) and
+        ([.container_ids[] as $container_id |
+            any(.active.lifecycle.generations[];
+                .container_id == $container_id and .reserved == true and .generation > 0)
+        ] | all) and
+        (([.active.lifecycle.generations[] | select(.reserved) | .container_id] | sort) ==
+            ($container_ids | sort)) and
+        (.after_service_down.tracked_container_ids == []) and
+        (.after_service_down.lifecycle.vm_handles == 0) and
+        (.after_service_down.lifecycle.vm_handle_ids == []) and
+        (.after_service_down.lifecycle.container_routes == 0) and
+        (.after_service_down.lifecycle.container_route_pairs == []) and
+        (.after_service_down.lifecycle.exec_bindings == 0) and
+        (.after_service_down.lifecycle.active_lifecycles == 0) and
+        (.after_service_down.lifecycle.stack_vms == 1) and
+        (.after_service_down.lifecycle.stack_vm_ids == ["port-fwd"]) and
+        (.after_service_down.lifecycle.stack_port_forwards == 1) and
+        (.after_service_down.lifecycle.stack_port_forward_ids == ["port-fwd"]) and
+        ([.container_ids[] as $container_id |
+            any(.after_service_down.lifecycle.generations[];
+                .container_id == $container_id and .reserved == false and .generation > 0)
+        ] | all) and
+        (all(.after_service_down.lifecycle.generations[]; .reserved == false)) and
+        (.after_vm_shutdown.tracked_container_ids == []) and
+        (.after_vm_shutdown.lifecycle.vm_handles == 0) and
+        (.after_vm_shutdown.lifecycle.vm_handle_ids == []) and
+        (.after_vm_shutdown.lifecycle.stack_vms == 0) and
+        (.after_vm_shutdown.lifecycle.stack_vm_ids == []) and
+        (.after_vm_shutdown.lifecycle.container_routes == 0) and
+        (.after_vm_shutdown.lifecycle.container_route_pairs == []) and
+        (.after_vm_shutdown.lifecycle.stack_port_forwards == 0) and
+        (.after_vm_shutdown.lifecycle.stack_port_forward_ids == []) and
+        (.after_vm_shutdown.lifecycle.exec_bindings == 0) and
+        (.after_vm_shutdown.lifecycle.active_lifecycles == 0) and
+        (.after_vm_shutdown.lifecycle.exec_sessions == 0) and
+        (.after_vm_shutdown.lifecycle.setup_restore_entries == 0) and
+        (.after_vm_shutdown.lifecycle.overlay_cleanup_pending == 0) and
+        (.after_vm_shutdown.lifecycle.rootfs_directories == 0) and
+        (all(.after_vm_shutdown.lifecycle.generations[]; .reserved == false)) and
+        ((.after_vm_shutdown.lifecycle.generations |
+            map(select(.container_id as $container_id |
+                any($container_ids[]; . == $container_id)))) as $selected_generations |
+            ($selected_generations | length) == 2 and
+            all($selected_generations[];
+                .reserved == false and .owner_alive == false and .generation > 0))
+    ' "$evidence_file" >/dev/null
+}
+
 write_and_validate_container_id_ownership_checksum() {
+    local evidence_file="$1"
+    local checksum_file="$2"
+    local evidence_name
+    evidence_name="$(basename "$evidence_file")"
+    local digest
+    digest="$(shasum -a 256 "$evidence_file" | cut -d' ' -f1)"
+    printf '%s  %s\n' "$digest" "$evidence_name" > "$checksum_file"
+    (cd "$(dirname "$evidence_file")" && shasum -a 256 -c "$(basename "$checksum_file")") >/dev/null
+}
+
+write_and_validate_stack_teardown_checksum() {
     local evidence_file="$1"
     local checksum_file="$2"
     local evidence_name
@@ -611,6 +778,11 @@ run_and_log() {
         local stack_oci_data_dir="$RUN_DIR/${label}-oci"
         mkdir -p "$stack_oci_data_dir"
         cmd_env+=("VZ_STACK_E2E_OCI_DATA_DIR=$stack_oci_data_dir")
+        if [[ "$label" == "stack" || "$label" == "stack-port-forwarding" ]]; then
+            rm -f "$STACK_TEARDOWN_EVIDENCE"
+            rm -f "$STACK_TEARDOWN_SHA256"
+            cmd_env+=("VZ_STACK_TEARDOWN_EVIDENCE=$STACK_TEARDOWN_EVIDENCE")
+        fi
     fi
 
     if [[ "$suite" == "runtime" ]]; then
@@ -628,8 +800,15 @@ run_and_log() {
 
     set +e
     env "${cmd_env[@]}" "$binary" "${args[@]}" 2>&1 | tee "$log_file"
-    local status=${PIPESTATUS[0]}
+    local pipeline_status=("${PIPESTATUS[@]}")
+    local status="${pipeline_status[0]}"
+    local tee_status="${pipeline_status[1]}"
     set -e
+
+    if [[ $tee_status -ne 0 ]]; then
+        echo "artifact log capture failed ($label/$suite, tee exit $tee_status)" >&2
+        return 94
+    fi
 
     if [[ $status -eq 0 ]] && grep -q "^running 0 tests$" "$log_file"; then
         echo "scenario/suite executed zero tests ($label/$suite); check scenario_test_filter mapping" >&2
@@ -639,6 +818,43 @@ run_and_log() {
     if [[ $status -eq 0 ]] && grep -q "VZ_E2E_REQUIRED_SKIP:" "$log_file"; then
         echo "scenario/suite reported a required skip despite a successful exit ($label/$suite)" >&2
         return 88
+    fi
+
+    if [[ $status -eq 0 ]] && [[ "$suite" == "stack" ]] \
+        && [[ "$label" == "stack" || "$label" == "stack-port-forwarding" ]]; then
+        local violation_artifact="$RUN_DIR/${label}-teardown-violations.txt"
+        local violation_marker='VZ_STACK_TEARDOWN_VIOLATION:[A-Z0-9_]+'
+        set +e
+        grep -n -E "$violation_marker" "$log_file" > "$violation_artifact"
+        local violation_scan_status=$?
+        set -e
+        case "$violation_scan_status" in
+            0)
+                echo "stack teardown emitted a code-owned failure or retry sentinel ($label/$suite)" >&2
+                sed -n '1,120p' "$violation_artifact" >&2
+                return 91
+                ;;
+            1)
+                rm -f "$violation_artifact"
+                ;;
+            *)
+                echo "stack teardown sentinel scan failed closed ($label/$suite, grep exit $violation_scan_status)" \
+                    > "$violation_artifact"
+                echo "stack teardown sentinel scan failed ($label/$suite)" >&2
+                return 95
+                ;;
+        esac
+        if [[ ! -f "$STACK_TEARDOWN_EVIDENCE" ]] \
+            || ! validate_stack_teardown_evidence "$STACK_TEARDOWN_EVIDENCE"; then
+            echo "stack teardown evidence is missing, malformed, or violates cleanup ownership" >&2
+            return 92
+        fi
+        if ! write_and_validate_stack_teardown_checksum \
+            "$STACK_TEARDOWN_EVIDENCE" "$STACK_TEARDOWN_SHA256"; then
+            echo "stack teardown evidence checksum creation or verification failed" >&2
+            return 93
+        fi
+        STACK_TEARDOWN_EVIDENCE_VALIDATED=true
     fi
 
     if [[ $status -eq 0 ]] && [[ "$suite" == "buildkit" ]]; then
@@ -703,10 +919,16 @@ BUILDKIT_SUITE_RAN=false
 BUILDKIT_EVIDENCE_VALIDATED=false
 RUNTIME_ID_EVIDENCE_VALIDATED=false
 RUNTIME_ID_EVIDENCE_REQUIRED=false
+STACK_TEARDOWN_EVIDENCE_VALIDATED=false
+STACK_TEARDOWN_EVIDENCE_REQUIRED=false
 
 for suite in "${RESOLVED_SUITES[@]}"; do
     package="$(suite_package "$suite")" || err "unknown suite '$suite'"
     test_name="$(suite_test_name "$suite")" || err "unknown suite '$suite'"
+    if [[ "$suite" == "stack" ]] && { [[ ${#RESOLVED_SCENARIOS[@]} -eq 0 ]] \
+        || [[ " ${RESOLVED_SCENARIOS[*]} " == *" stack-port-forwarding "* ]]; }; then
+        STACK_TEARDOWN_EVIDENCE_REQUIRED=true
+    fi
 
     echo "==> building [$suite] ($package::$test_name)"
     test_artifact_log="$RUN_DIR/${suite}-test-artifacts.jsonl"
@@ -781,6 +1003,11 @@ if [[ "$RUNTIME_ID_EVIDENCE_REQUIRED" == "true" && "$RUNTIME_ID_EVIDENCE_VALIDAT
     FAILED+=("container-id-ownership-evidence:89")
 fi
 
+if [[ "$STACK_TEARDOWN_EVIDENCE_REQUIRED" == "true" && "$STACK_TEARDOWN_EVIDENCE_VALIDATED" != "true" ]]; then
+    echo "==> required stack teardown evidence was not validated" >&2
+    FAILED+=("stack-teardown-evidence:92")
+fi
+
 echo "==> summary"
 echo "passed: ${PASSED[*]:-none}"
 echo "failed: ${FAILED[*]:-none}"
@@ -800,6 +1027,13 @@ action_summary="$RUN_DIR/summary.txt"
     else
         echo "container_id_ownership=none"
         echo "container_id_ownership_sha256=none"
+    fi
+    if [[ "$STACK_TEARDOWN_EVIDENCE_VALIDATED" == "true" ]]; then
+        echo "stack_teardown=$STACK_TEARDOWN_EVIDENCE"
+        echo "stack_teardown_sha256=$STACK_TEARDOWN_SHA256"
+    else
+        echo "stack_teardown=none"
+        echo "stack_teardown_sha256=none"
     fi
 } > "$action_summary"
 

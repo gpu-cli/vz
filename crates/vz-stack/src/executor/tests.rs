@@ -605,7 +605,7 @@ fn service_with_ports_creates_correctly() {
 }
 
 #[test]
-fn stop_failure_does_not_prevent_state_update() {
+fn stop_failure_is_reported_after_successful_remove_and_state_update() {
     let mut runtime = MockContainerRuntime::new();
     runtime.fail_stop = true;
     let mut executor = make_executor(runtime);
@@ -630,8 +630,9 @@ fn stop_failure_does_not_prevent_state_update() {
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
-    // Still counts as succeeded (best-effort stop).
-    assert!(result.all_succeeded());
+    assert_eq!(result.failed, 1);
+    assert!(!result.all_succeeded());
+    assert!(result.errors[0].1.contains("mock stop failure"));
 
     // State still updated to Stopped.
     let observed = executor.store().load_observed_state("myapp").unwrap();
@@ -1954,10 +1955,8 @@ fn stop_failure_still_attempts_remove() {
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
-    assert!(
-        result.all_succeeded(),
-        "remove should succeed despite stop failure"
-    );
+    assert_eq!(result.failed, 1, "stop failure must fail teardown");
+    assert!(!result.all_succeeded());
 
     // Verify both stop AND remove were attempted.
     let calls = executor.runtime().call_log();
@@ -2048,11 +2047,16 @@ fn stop_and_remove_failure_retains_container_for_retry() {
     let result = executor.execute(&spec, &actions).unwrap();
     assert_eq!(result.failed, 1);
     assert!(!result.all_succeeded());
+    assert!(result.errors[0].1.contains("mock stop failure"));
+    assert!(result.errors[0].1.contains("mock remove failure"));
 
     let observed = executor.store().load_observed_state("myapp").unwrap();
     let web = observed.iter().find(|o| o.service_name == "web").unwrap();
     assert_eq!(web.phase, ServicePhase::Failed);
     assert_eq!(web.container_id.as_deref(), Some("ctr-web"));
+    let last_error = web.last_error.as_deref().unwrap();
+    assert!(last_error.contains("mock stop failure"));
+    assert!(last_error.contains("mock remove failure"));
 }
 
 #[test]
@@ -2168,7 +2172,7 @@ fn ports_released_on_remove_even_when_stop_fails() {
         service_name: "web".to_string(),
     }];
     let result = executor.execute(&remove_spec, &remove_actions).unwrap();
-    assert!(result.all_succeeded());
+    assert_eq!(result.failed, 1, "stop failure must fail teardown");
     assert!(
         !executor.ports().in_use().contains(&8080),
         "port 8080 should be released even when stop fails"

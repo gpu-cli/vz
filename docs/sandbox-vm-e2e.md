@@ -127,6 +127,10 @@ Each run creates a timestamped directory containing:
 - `summary.txt`
 - `container-id-ownership.json` when the runtime container-ID ownership test runs
 - `container-id-ownership.json.sha256`, verified by the harness before success
+- `stack-port-forwarding-teardown.json` when the focused port-forwarding
+  scenario or complete stack lane runs
+- `stack-port-forwarding-teardown.json.sha256`, verified by the harness before
+  stack success
 
 A `latest` symlink points to the most recent run.
 
@@ -134,6 +138,33 @@ Stack lanes use a run-scoped OCI data directory under the timestamped artifact
 directory. Stable service/container IDs therefore cannot collide with a user's
 normal `~/.vz/oci` state or with metadata left by an interrupted earlier gate;
 HOME remains unchanged for kernel and registry-credential discovery.
+
+### Stack teardown ownership gate
+
+`stack-port-forwarding` uses a dynamically allocated loopback port and connects
+exactly once after stack convergence. Its evidence records exact container IDs,
+durable generations, container-to-stack routes, VM handles, shared-stack VMs,
+and stack port-forward registries before startup, while active, after service
+down, and after shared-VM shutdown. The active and service-down inventories
+must prove the selected port is owned; the final inventory must prove the exact
+port can be rebound and that containers, routes, handles, listeners, overlays,
+and generation reservations are gone.
+
+Both the focused scenario and complete stack lane fail if service down or VM
+shutdown returns an error, if the test log cannot be captured, if the evidence
+or checksum is missing or malformed, or if the host test log contains a
+code-owned `VZ_STACK_TEARDOWN_VIOLATION:<stable_code>` sentinel for a teardown
+failure, forbidden fallback, or actual test retry. Sentinel scan errors fail
+closed and preserve a diagnostic artifact. A successful test process alone is
+therefore insufficient.
+
+Run the focused release gate with:
+
+```bash
+./scripts/run-sandbox-vm-e2e.sh \
+  --profile release \
+  --scenario stack-port-forwarding
+```
 
 ### Container-ID lifecycle ownership gate
 

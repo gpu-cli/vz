@@ -466,6 +466,33 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
                     let _ = self.reconcile_store.complete_reconcile_session(&session_id);
                 }
 
+                // A failed removal cannot be represented by convergence over
+                // the desired services: an empty desired spec has no service
+                // whose Failed/Pending phase could keep convergence false.
+                // Surface teardown failures immediately instead of returning a
+                // false successful `converged=true` result.
+                let removal_failures = result
+                    .errors
+                    .iter()
+                    .filter(|(service_name, _)| {
+                        apply_result.actions.iter().any(|action| {
+                            matches!(
+                                action,
+                                Action::ServiceRemove {
+                                    service_name: removed
+                                } if removed == service_name
+                            )
+                        })
+                    })
+                    .map(|(service_name, error)| format!("{service_name}: {error}"))
+                    .collect::<Vec<_>>();
+                if !removal_failures.is_empty() {
+                    return Err(StackError::Network(format!(
+                        "service teardown failed: {}",
+                        removal_failures.join("; ")
+                    )));
+                }
+
                 Some(result)
             } else {
                 self.reconcile_store.clear_reconcile_progress(&spec.name)?;
@@ -939,6 +966,27 @@ mod tests {
         assert_eq!(result.rounds, 1);
         assert_eq!(result.services_ready, 0);
         assert_eq!(result.services_failed, 0);
+    }
+
+    #[test]
+    fn empty_down_spec_propagates_service_stop_failure_after_cleanup() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
+        let (mut orch, _tmp) = make_orchestrator_shared(runtime);
+        let up_spec = stack("app", vec![svc("web")]);
+        assert!(orch.run(&up_spec, None).unwrap().converged);
+
+        orch.executor.runtime_mut().fail_stop = true;
+        let down_spec = stack("app", vec![]);
+        let error = orch.run(&down_spec, None).unwrap_err();
+
+        assert!(error.to_string().contains("service teardown failed"));
+        assert!(error.to_string().contains("mock stop failure"));
+        let calls = orch.executor.runtime().call_log();
+        assert!(calls.iter().any(|(operation, _)| operation == "stop"));
+        assert!(calls.iter().any(|(operation, _)| operation == "remove"));
+        let observed = orch.executor.store().load_observed_state("app").unwrap();
+        assert_eq!(observed[0].phase, ServicePhase::Stopped);
+        assert!(observed[0].container_id.is_none());
     }
 
     // ── Real-time event streaming tests ──

@@ -30,11 +30,15 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             .map(std::time::Duration::from_secs);
 
         // Stop and remove if we have a container.
+        let mut stop_error = None;
         if let Some(ref cid) = container_id {
             info!(service = %service_name, container = %cid, "stopping container");
             if let Err(e) = self.runtime.stop(cid, stop_signal, stop_grace_period) {
-                error!(service = %service_name, error = %e, "failed to stop container");
-                // Continue with remove attempt.
+                error!(service = %service_name, error = %e, "VZ_STACK_TEARDOWN_VIOLATION:STOP_FAILED failed to stop container");
+                // Continue with remove so a stopped/absent runtime object can
+                // still be cleaned, but retain the error: a teardown must not
+                // report success after any lifecycle operation failed.
+                stop_error = Some(e);
             }
 
             info!(service = %service_name, container = %cid, "removing container");
@@ -44,14 +48,24 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     info!(service = %service_name, container = %cid, "container already absent; treating remove as complete");
                 }
                 Err(e) => {
-                    error!(service = %service_name, error = %e, "failed to remove container");
+                    error!(service = %service_name, error = %e, "VZ_STACK_TEARDOWN_VIOLATION:REMOVE_FAILED failed to remove container");
+                    let cleanup_message = match stop_error.as_ref() {
+                        Some(stop_error) => format!(
+                            "container cleanup failed after both lifecycle operations: stop: {stop_error}; remove: {e}"
+                        ),
+                        None => format!("container cleanup failed: {e}"),
+                    };
+                    let cleanup_error = match stop_error.as_ref() {
+                        Some(_) => StackError::Network(cleanup_message.clone()),
+                        None => e,
+                    };
                     self.mark_failed_with_container(
                         spec,
                         service_name,
-                        &format!("container cleanup failed: {e}"),
+                        &cleanup_message,
                         Some(cid),
                     )?;
-                    return Err(e);
+                    return Err(cleanup_error);
                 }
             }
         }
@@ -81,7 +95,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         )?;
 
         info!(service = %service_name, "service stopped");
-        Ok(())
+        match stop_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
     /// Mark a service as failed with an error message.
     pub(super) fn mark_failed(

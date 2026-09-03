@@ -373,10 +373,34 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             };
             let runtime = DaemonContainerRuntime::new(self.daemon.clone());
             let mut executor = StackExecutor::new(runtime, exec_store, &stack_dir);
-            if let Err(error) = executor.execute(&empty_spec, &apply_result.actions) {
-                events.push(Err(status_from_stack_error(error, &request_id)));
-                return Ok(stack_stream_response(events, None));
+            let execution_result = match executor.execute(&empty_spec, &apply_result.actions) {
+                Ok(result) => result,
+                Err(error) => {
+                    events.push(Err(status_from_stack_error(error, &request_id)));
+                    return Ok(stack_stream_response(events, None));
+                }
+            };
+            if let Some(response) =
+                teardown_execution_failure_response(&execution_result, &request_id, &mut events)
+            {
+                // Do not remove volumes or persist StackDestroyed/a success receipt after a
+                // partially failed teardown.
+                return Ok(response);
             }
+        }
+
+        sequence += 1;
+        events.push(Ok(teardown_stack_progress_event(
+            &request_id,
+            sequence,
+            "shutting_down_runtime",
+            "shutting down stack runtime",
+        )));
+        if let Err(error) =
+            shutdown_stack_runtime_for_teardown(self.daemon.clone(), stack_name.clone()).await
+        {
+            events.push(Err(status_from_stack_error(error, &request_id)));
+            return Ok(stack_stream_response(events, None));
         }
 
         if request.remove_volumes {
@@ -1292,6 +1316,251 @@ mod tests {
     use std::sync::Mutex;
     use tokio_stream::StreamExt;
     use vz_runtime_contract::{Build, RuntimeError};
+
+    #[tokio::test]
+    async fn teardown_execution_failure_returns_only_a_terminal_error() {
+        let result = ExecutionResult {
+            succeeded: 1,
+            failed: 2,
+            errors: vec![
+                ("api".to_string(), "stop failed".to_string()),
+                ("worker".to_string(), "remove failed".to_string()),
+            ],
+            skipped_mounts: Vec::new(),
+        };
+        let mut events = vec![Ok(teardown_stack_progress_event(
+            "req-teardown-failure",
+            1,
+            "executing",
+            "executing stack teardown actions",
+        ))];
+
+        let Some(response) =
+            teardown_execution_failure_response(&result, "req-teardown-failure", &mut events)
+        else {
+            panic!("failed teardown actions must terminate the stream");
+        };
+        assert!(response.metadata().get("x-receipt-id").is_none());
+
+        let mut stream = response.into_inner();
+        let first = stream
+            .next()
+            .await
+            .unwrap_or_else(|| panic!("expected executing progress event"))
+            .unwrap_or_else(|error| panic!("expected progress before failure: {error}"));
+        assert!(matches!(
+            first.payload,
+            Some(runtime_v2::teardown_stack_event::Payload::Progress(_))
+        ));
+        let error = match stream.next().await {
+            Some(Err(error)) => error,
+            Some(Ok(event)) => panic!("expected terminal error, got event: {event:?}"),
+            None => panic!("expected terminal teardown stream error"),
+        };
+
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains("backend_unavailable"));
+        assert!(error.message().contains("failed for 2 action(s)"));
+        assert!(error.message().contains("api: stop failed"));
+        assert!(error.message().contains("worker: remove failed"));
+        assert!(error.message().contains("request_id=req-teardown-failure"));
+        assert!(
+            stream.next().await.is_none(),
+            "error must terminate the stream"
+        );
+    }
+
+    #[test]
+    fn teardown_execution_success_allows_completion_phases() {
+        let mut events = Vec::new();
+        assert!(
+            teardown_execution_failure_response(
+                &ExecutionResult::default(),
+                "req-teardown-success",
+                &mut events,
+            )
+            .is_none(),
+            "successful execution should continue teardown"
+        );
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn teardown_runtime_shutdown_failure_has_no_success_side_effects() {
+        let (tmp, daemon) = stack_test_daemon();
+        let stack_name = "shutdown-failure";
+        let empty_spec = StackSpec {
+            name: stack_name.to_string(),
+            services: Vec::new(),
+            networks: Vec::new(),
+            volumes: Vec::new(),
+            secrets: Vec::new(),
+            disk_size_mb: None,
+        };
+        daemon
+            .with_state_store(|store| store.save_desired_state(stack_name, &empty_spec))
+            .unwrap_or_else(|error| panic!("persist desired stack: {error}"));
+        daemon
+            .manager()
+            .ensure_stack_runtime(stack_name, Vec::new(), Default::default())
+            .await
+            .unwrap_or_else(|error| panic!("boot test stack runtime: {error}"));
+        daemon.manager().backend().fail_next_shared_vm_shutdown();
+
+        let volume_path = tmp
+            .path()
+            .join("runtime")
+            .join("stacks")
+            .join(stack_name)
+            .join("volumes")
+            .join("data");
+        std::fs::create_dir_all(&volume_path)
+            .unwrap_or_else(|error| panic!("create test volume: {error}"));
+
+        let service = StackServiceImpl::new(daemon.clone());
+        let response = runtime_v2::stack_service_server::StackService::teardown_stack(
+            &service,
+            tonic::Request::new(runtime_v2::TeardownStackRequest {
+                metadata: Some(runtime_v2::RequestMetadata {
+                    request_id: "req-shutdown-failure".to_string(),
+                    idempotency_key: String::new(),
+                    trace_id: String::new(),
+                }),
+                stack_name: stack_name.to_string(),
+                remove_volumes: true,
+                dry_run: false,
+            }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("teardown stream should start: {error}"));
+        assert!(response.metadata().get("x-receipt-id").is_none());
+
+        let mut stream = response.into_inner();
+        let mut phases = Vec::new();
+        let mut completion_seen = false;
+        let mut terminal_error = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(event) => match event.payload {
+                    Some(runtime_v2::teardown_stack_event::Payload::Progress(progress)) => {
+                        phases.push(progress.phase);
+                    }
+                    Some(runtime_v2::teardown_stack_event::Payload::Completion(_)) => {
+                        completion_seen = true;
+                    }
+                    None => {}
+                },
+                Err(error) => terminal_error = Some(error),
+            }
+        }
+
+        let error = terminal_error
+            .unwrap_or_else(|| panic!("shutdown failure must terminate the teardown stream"));
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains("shutdown_sandbox failed"));
+        assert!(error.message().contains("req-shutdown-failure"));
+        assert!(phases.iter().any(|phase| phase == "shutting_down_runtime"));
+        assert!(!phases.iter().any(|phase| phase == "removing_volumes"));
+        assert!(!phases.iter().any(|phase| phase == "persisting"));
+        assert!(!completion_seen);
+        assert!(volume_path.exists(), "volume deletion must not run");
+        assert!(
+            daemon.manager().has_stack_runtime(stack_name),
+            "failed shutdown should leave the runtime active"
+        );
+
+        let (receipts, stack_events) = daemon
+            .with_state_store(|store| {
+                Ok((
+                    store.list_receipts_for_entity("stack", stack_name)?,
+                    store.load_events(stack_name)?,
+                ))
+            })
+            .unwrap_or_else(|error| panic!("inspect teardown persistence: {error}"));
+        assert!(
+            receipts
+                .iter()
+                .all(|receipt| receipt.operation != "teardown_stack")
+        );
+        assert!(
+            stack_events
+                .iter()
+                .all(|event| !matches!(event, StackEvent::StackDestroyed { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn teardown_runtime_shutdown_succeeds_on_current_thread_runtime() {
+        let (_tmp, daemon) = stack_test_daemon();
+        let stack_name = "shutdown-success";
+        let empty_spec = StackSpec {
+            name: stack_name.to_string(),
+            services: Vec::new(),
+            networks: Vec::new(),
+            volumes: Vec::new(),
+            secrets: Vec::new(),
+            disk_size_mb: None,
+        };
+        daemon
+            .with_state_store(|store| store.save_desired_state(stack_name, &empty_spec))
+            .unwrap_or_else(|error| panic!("persist desired stack: {error}"));
+        daemon
+            .manager()
+            .ensure_stack_runtime(stack_name, Vec::new(), Default::default())
+            .await
+            .unwrap_or_else(|error| panic!("boot test stack runtime: {error}"));
+
+        let service = StackServiceImpl::new(daemon.clone());
+        let response = runtime_v2::stack_service_server::StackService::teardown_stack(
+            &service,
+            tonic::Request::new(runtime_v2::TeardownStackRequest {
+                metadata: Some(runtime_v2::RequestMetadata {
+                    request_id: "req-shutdown-success".to_string(),
+                    idempotency_key: String::new(),
+                    trace_id: String::new(),
+                }),
+                stack_name: stack_name.to_string(),
+                remove_volumes: false,
+                dry_run: false,
+            }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("teardown stream should start: {error}"));
+        assert!(response.metadata().get("x-receipt-id").is_some());
+
+        let mut stream = response.into_inner();
+        let mut completion_seen = false;
+        while let Some(item) = stream.next().await {
+            let event = item.unwrap_or_else(|error| panic!("teardown should succeed: {error}"));
+            if matches!(
+                event.payload,
+                Some(runtime_v2::teardown_stack_event::Payload::Completion(_))
+            ) {
+                completion_seen = true;
+            }
+        }
+        assert!(completion_seen);
+        assert!(!daemon.manager().has_stack_runtime(stack_name));
+
+        let (receipts, stack_events) = daemon
+            .with_state_store(|store| {
+                Ok((
+                    store.list_receipts_for_entity("stack", stack_name)?,
+                    store.load_events(stack_name)?,
+                ))
+            })
+            .unwrap_or_else(|error| panic!("inspect teardown persistence: {error}"));
+        assert!(
+            receipts
+                .iter()
+                .any(|receipt| receipt.operation == "teardown_stack")
+        );
+        assert!(
+            stack_events
+                .iter()
+                .any(|event| matches!(event, StackEvent::StackDestroyed { .. }))
+        );
+    }
 
     #[test]
     fn parse_stack_build_specs_collects_build_entries() {

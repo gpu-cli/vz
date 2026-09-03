@@ -3,7 +3,9 @@ use super::bundle::{
     oci_bundle_guest_root, oci_bundle_host_dir, resolve_oci_runtime_binary_path,
     setup_stack_guest_container_overlay, teardown_guest_container_overlay,
 };
-use super::networking::{start_port_forwarding, stop_via_oci_runtime};
+use super::networking::{
+    shutdown_port_forwarding_registry_entry, start_port_forwarding, stop_or_reuse_exit_code,
+};
 use super::resolve::{current_unix_secs, resolve_container_lifecycle, resolve_run_config};
 use super::*;
 
@@ -122,6 +124,9 @@ where
     Overlay: FnOnce() -> OverlayFuture,
     OverlayFuture: Future<Output = Result<(), OciError>>,
 {
+    if runtime.stack_guest_cleanup_is_complete(container_id, generation) {
+        return Ok(());
+    }
     if !runtime.overlay_cleanup_is_pending(container_id, generation) {
         delete().await.map_err(|error| {
             OciError::InvalidConfig(format!(
@@ -153,6 +158,8 @@ where
         )));
     }
 
+    runtime.mark_stack_guest_cleanup_complete(container_id, generation);
+
     // Do not clear this member's recovery state yet. Stack shutdown is a batch:
     // a later member may fail, and retry discovers membership from routes.
     // The synchronous batch commit below clears every registry only after all
@@ -183,10 +190,97 @@ pub(super) async fn commit_stack_cleanup_batch<V>(
         active_lifecycle.remove(container_id);
         setup_restored.remove(container_id);
         pending.remove(container_id);
+        runtime
+            .stack_guest_cleanup_complete
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(container_id);
     }
 }
 
 impl Runtime {
+    pub(super) fn stack_guest_cleanup_is_complete(
+        &self,
+        container_id: &str,
+        generation: ContainerGeneration,
+    ) -> bool {
+        self.stack_guest_cleanup_complete
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(container_id)
+            .is_some_and(|complete| *complete == generation)
+    }
+
+    fn mark_stack_guest_cleanup_complete(
+        &self,
+        container_id: &str,
+        generation: ContainerGeneration,
+    ) {
+        self.stack_guest_cleanup_complete
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(container_id.to_string(), generation);
+    }
+
+    pub(super) fn stack_vm_stop_is_complete(&self, stack_id: &str) -> bool {
+        self.stack_vm_stop_complete
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(stack_id)
+    }
+
+    pub(super) fn mark_stack_vm_stop_complete(&self, stack_id: &str) {
+        self.stack_vm_stop_complete
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(stack_id.to_string());
+    }
+
+    pub(super) fn clear_stack_vm_stop_complete(&self, stack_id: &str) {
+        self.stack_vm_stop_complete
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(stack_id);
+    }
+
+    async fn ensure_stack_not_tearing_down(
+        &self,
+        stack_id: &str,
+        operation: &str,
+    ) -> Result<(), OciError> {
+        let stack_container_ids = self
+            .container_stack
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(container_id, member_stack_id)| {
+                (member_stack_id == stack_id).then_some(container_id.clone())
+            })
+            .collect::<HashSet<_>>();
+        let guest_cleanup_complete = self
+            .stack_guest_cleanup_complete
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .any(|container_id| stack_container_ids.contains(container_id));
+        let guest_cleanup_pending = self
+            .oci_deleted_pending_overlay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .any(|container_id| stack_container_ids.contains(container_id));
+
+        if self.stack_vm_stop_is_complete(stack_id)
+            || guest_cleanup_complete
+            || guest_cleanup_pending
+        {
+            return Err(OciError::InvalidConfig(format!(
+                "cannot {operation} stack '{stack_id}' while teardown cleanup is pending"
+            )));
+        }
+        Ok(())
+    }
+
     async fn publish_stack_overlay_recovery_route(
         &self,
         stack_id: &str,
@@ -309,8 +403,8 @@ impl Runtime {
             .await
         {
             Ok(()) => {
-                self.clear_overlay_cleanup_pending(container_id);
                 self.clear_stack_overlay_recovery_route(container_id).await;
+                self.clear_overlay_cleanup_pending(container_id);
                 prepare_error
             }
             Err(cleanup_error) => {
@@ -1371,23 +1465,15 @@ impl Runtime {
             }
             return Err(OciError::InvalidConfig(message));
         }
-        self.clear_overlay_cleanup_pending(container_id);
-        self.vm_handles.lock().await.remove(container_id);
-        self.container_stack.lock().await.remove(container_id);
-        self.active_lifecycle.lock().await.remove(container_id);
-        self.container_exec_bindings
-            .lock()
-            .await
-            .remove(container_id);
-        self.setup_restored_containers
-            .lock()
-            .await
-            .remove(container_id);
+        self.mark_stack_guest_cleanup_complete(container_id, transaction.generation());
 
         container.status = ContainerStatus::Stopped { exit_code: -1 };
         container.stopped_unix_secs = Some(current_unix_secs());
         container.host_pid = None;
         let persist_result = self.persist_owned(transaction, container.clone());
+        if persist_result.is_ok() {
+            self.commit_container_cleanup_ownership(container_id).await;
+        }
         self.cleanup_owned_rootfs(transaction, rootfs_dir);
         persist_result
     }
@@ -1598,9 +1684,7 @@ impl Runtime {
                 stack_id,
                 "shutdown_shared_vm: no in-memory VM (likely after daemon respawn); treating as already-stopped"
             );
-            if let Some(pf) = self.stack_port_forwards.lock().await.remove(stack_id) {
-                pf.shutdown().await;
-            }
+            shutdown_port_forwarding_registry_entry(&self.stack_port_forwards, stack_id).await?;
             commit_stack_cleanup_batch(
                 self,
                 &self.container_stack,
@@ -1608,6 +1692,7 @@ impl Runtime {
                 &stack_containers,
             )
             .await;
+            self.clear_stack_vm_stop_complete(stack_id);
             return Ok(());
         };
 
@@ -1616,11 +1701,15 @@ impl Runtime {
         let mut cleanup_failures = Vec::new();
         for cid in &stack_containers {
             self.stop_log_rotation_task(cid).await;
-            if let Err(error) =
-                stop_via_oci_runtime(&*vm, cid, false, STOP_GRACE_PERIOD, None).await
-            {
-                tracing::warn!(container_id = %cid, %error, "stack shutdown stop failed; forcing OCI delete");
-            }
+            let status = match self.container_store.find(cid).map_err(OciError::from)? {
+                Some(container) => container.status,
+                None => {
+                    cleanup_failures.push(format!(
+                        "container '{cid}' metadata is missing during shared VM shutdown"
+                    ));
+                    continue;
+                }
+            };
             let generation = container_admissions
                 .iter()
                 .find(|admission| admission.container_id == *cid)
@@ -1631,6 +1720,22 @@ impl Runtime {
                 ));
                 continue;
             };
+            if let Err(error) = stop_or_reuse_exit_code(
+                &*vm,
+                cid,
+                &status,
+                self.overlay_cleanup_is_pending(cid, generation),
+                false,
+                STOP_GRACE_PERIOD,
+                None,
+            )
+            .await
+            {
+                cleanup_failures.push(format!(
+                    "container '{cid}' stop failed before OCI delete: {error}"
+                ));
+                continue;
+            }
             if let Err(error) = shutdown_container_cleanup_transition(
                 self,
                 cid,
@@ -1658,6 +1763,60 @@ impl Runtime {
             )));
         }
 
+        // Shut down relays and the VM while every ownership registry remains
+        // published. Retry can therefore resume from stopped metadata without
+        // re-signalling or losing the shared VM handle.
+        let mut infrastructure_failures = Vec::new();
+        let pf_present = {
+            let mut guard = self.stack_port_forwards.lock().await;
+            if let Some(pf) = guard.get_mut(stack_id) {
+                tracing::info!(
+                    target: "vz_post_stop",
+                    stack_id = %stack_id,
+                    "[L4/stack-vm] shutdown_shared_vm: awaiting PortForwarding::shutdown"
+                );
+                let started = std::time::Instant::now();
+                if let Err(error) = pf.shutdown().await {
+                    infrastructure_failures.push(error.to_string());
+                }
+                tracing::info!(
+                    target: "vz_post_stop",
+                    stack_id = %stack_id,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "[L4/stack-vm] shutdown_shared_vm: PortForwarding::shutdown returned"
+                );
+                true
+            } else {
+                false
+            }
+        };
+        if !pf_present {
+            tracing::info!(
+                target: "vz_post_stop",
+                stack_id = %stack_id,
+                "[L4/stack-vm] shutdown_shared_vm: no PortForwarding registered for stack"
+            );
+        }
+
+        if !self.stack_vm_stop_is_complete(stack_id) {
+            match vm.stop().await {
+                Ok(()) => self.mark_stack_vm_stop_complete(stack_id),
+                Err(error) => infrastructure_failures.push(format!("VM stop failed: {error}")),
+            }
+        }
+        if !infrastructure_failures.is_empty() {
+            return Err(OciError::InvalidConfig(format!(
+                "VZ_STACK_TEARDOWN_VIOLATION:SHARED_VM_STOP_FAILED shared VM shutdown retained stack '{stack_id}' ownership for retry: {}",
+                infrastructure_failures.join("; ")
+            )));
+        }
+
+        // No fallible teardown remains: publish the complete registry commit.
+        if pf_present {
+            self.stack_port_forwards.lock().await.remove(stack_id);
+        }
+        self.stack_vms.lock().await.remove(stack_id);
+        self.clear_stack_vm_stop_complete(stack_id);
         commit_stack_cleanup_batch(
             self,
             &self.container_stack,
@@ -1665,40 +1824,6 @@ impl Runtime {
             &stack_containers,
         )
         .await;
-
-        // Shut down port forwarding relays for this stack.
-        let pf_present = {
-            let mut guard = self.stack_port_forwards.lock().await;
-            guard.remove(stack_id)
-        };
-        match pf_present {
-            Some(pf) => {
-                tracing::info!(
-                    target: "vz_post_stop",
-                    stack_id = %stack_id,
-                    "[L4/stack-vm] shutdown_shared_vm: awaiting PortForwarding::shutdown"
-                );
-                let started = std::time::Instant::now();
-                pf.shutdown().await;
-                tracing::info!(
-                    target: "vz_post_stop",
-                    stack_id = %stack_id,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "[L4/stack-vm] shutdown_shared_vm: PortForwarding::shutdown returned"
-                );
-            }
-            None => {
-                tracing::info!(
-                    target: "vz_post_stop",
-                    stack_id = %stack_id,
-                    "[L4/stack-vm] shutdown_shared_vm: no PortForwarding registered for stack"
-                );
-            }
-        }
-
-        // Tear down the shared VM.
-        self.stack_vms.lock().await.remove(stack_id);
-        let _ = vm.stop().await;
         let (stack_vms_count_after, stack_port_forwards_count_after) = {
             let vms = self.stack_vms.lock().await;
             let pfs = self.stack_port_forwards.lock().await;
@@ -1719,21 +1844,6 @@ impl Runtime {
         self.stack_vms.lock().await.contains_key(stack_id)
     }
 
-    /// Return the shared Linux VM hosting the given stack, if any.
-    ///
-    /// Returns `None` if the stack is not currently up. Intended for
-    /// consumers that embed [`Runtime`] as a library and need direct
-    /// access to the underlying VM handle for vsock operations
-    /// (e.g., installing capability shims that dial back to a host
-    /// broker via [`vz::Vm::vsock_listen`]).
-    ///
-    /// The returned [`Arc`] keeps the VM alive for as long as the
-    /// caller holds it; normal lifecycle (shutdown via
-    /// [`Self::shutdown_shared_vm`]) remains the caller's contract.
-    pub async fn shared_vm_for(&self, stack_id: &str) -> Option<Arc<LinuxVm>> {
-        self.stack_vms.lock().await.get(stack_id).cloned()
-    }
-
     /// Save a shared stack VM snapshot to disk.
     ///
     /// The VM is paused, state is saved, then the VM is resumed and the guest
@@ -1743,6 +1853,13 @@ impl Runtime {
         stack_id: &str,
         state_path: impl AsRef<Path>,
     ) -> Result<(), OciError> {
+        let _stack_lifecycle_guard = self
+            .stack_lifecycle_lock(stack_id)
+            .await
+            .write_owned()
+            .await;
+        self.ensure_stack_not_tearing_down(stack_id, "save a shared VM snapshot for")
+            .await?;
         let vm = self
             .stack_vms
             .lock()
@@ -1772,6 +1889,13 @@ impl Runtime {
         stack_id: &str,
         state_path: impl AsRef<Path>,
     ) -> Result<(), OciError> {
+        let _stack_lifecycle_guard = self
+            .stack_lifecycle_lock(stack_id)
+            .await
+            .write_owned()
+            .await;
+        self.ensure_stack_not_tearing_down(stack_id, "restore a shared VM snapshot for")
+            .await?;
         let vm = self
             .stack_vms
             .lock()
@@ -1806,6 +1930,9 @@ impl Runtime {
         args: Vec<String>,
         timeout: Duration,
     ) -> Result<ExecOutput, OciError> {
+        let _stack_lifecycle_guard = self.stack_lifecycle_lock(stack_id).await.read_owned().await;
+        self.ensure_stack_not_tearing_down(stack_id, "execute in")
+            .await?;
         let vm = self
             .stack_vms
             .lock()
@@ -1834,6 +1961,9 @@ impl Runtime {
         stack_id: &str,
         services: Vec<vz::protocol::NetworkServiceConfig>,
     ) -> Result<(), OciError> {
+        let _stack_lifecycle_guard = self.stack_lifecycle_lock(stack_id).await.read_owned().await;
+        self.ensure_stack_not_tearing_down(stack_id, "configure networking in")
+            .await?;
         let vm = self
             .stack_vms
             .lock()
@@ -1855,6 +1985,9 @@ impl Runtime {
         stack_id: &str,
         service_names: Vec<String>,
     ) -> Result<(), OciError> {
+        let _stack_lifecycle_guard = self.stack_lifecycle_lock(stack_id).await.read_owned().await;
+        self.ensure_stack_not_tearing_down(stack_id, "tear down networking in")
+            .await?;
         let vm = self
             .stack_vms
             .lock()

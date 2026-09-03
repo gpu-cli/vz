@@ -2685,12 +2685,10 @@ async fn shared_vm_inter_service_connectivity() {
         .await
         .unwrap();
 
-    // 1b. Accessor sanity: shared_vm_for must return Some for a booted
-    // stack and None for an unknown one. Embedding consumers (e.g. the
-    // AGENTS.jsonc broker) use this to reach `vm.vsock_listen` for
-    // capability-shim installation.
-    assert!(rt.shared_vm_for(stack_id).await.is_some());
-    assert!(rt.shared_vm_for("not-booted").await.is_none());
+    // 1b. Diagnostic sanity: has_shared_vm reports a booted stack and false
+    // for an unknown one without exposing a lifecycle-mutable VM handle.
+    assert!(rt.has_shared_vm(stack_id).await);
+    assert!(!rt.has_shared_vm("not-booted").await);
 
     // 2. Set up per-service networking.
     let services = vec![

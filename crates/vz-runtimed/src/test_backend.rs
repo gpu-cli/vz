@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::{Future, ready};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vz_runtime_contract::{
@@ -33,6 +33,7 @@ struct MockBuildRecord {
 pub struct TestRuntimeBackend {
     next_container_seq: AtomicU64,
     next_build_seq: AtomicU64,
+    fail_next_shared_vm_shutdown: AtomicBool,
     shared_vms: Mutex<HashSet<String>>,
     containers: Mutex<HashMap<String, MockContainerRecord>>,
     live_exec_sessions: Mutex<HashSet<String>>,
@@ -40,6 +41,12 @@ pub struct TestRuntimeBackend {
 }
 
 impl TestRuntimeBackend {
+    #[cfg(test)]
+    pub(crate) fn fail_next_shared_vm_shutdown(&self) {
+        self.fail_next_shared_vm_shutdown
+            .store(true, Ordering::SeqCst);
+    }
+
     fn lock_poisoned_error(resource: &str) -> RuntimeError {
         RuntimeError::Backend {
             message: format!("test runtime backend lock poisoned: {resource}"),
@@ -413,15 +420,21 @@ impl RuntimeBackend for TestRuntimeBackend {
 
     fn shutdown_shared_vm(&self, stack_id: &str) -> impl Future<Output = Result<(), RuntimeError>> {
         let result = (|| {
+            if self
+                .fail_next_shared_vm_shutdown
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(RuntimeError::Backend {
+                    message: format!("injected shared VM shutdown failure for stack '{stack_id}'"),
+                    source: Box::new(std::io::Error::other("injected shared VM shutdown failure")),
+                });
+            }
             let mut shared_vms = self
                 .shared_vms
                 .lock()
                 .map_err(|_| Self::lock_poisoned_error("shared_vms"))?;
-            if shared_vms.remove(stack_id) {
-                Ok(())
-            } else {
-                Err(Self::missing_shared_vm_error(stack_id))
-            }
+            shared_vms.remove(stack_id);
+            Ok(())
         })();
         ready(result)
     }

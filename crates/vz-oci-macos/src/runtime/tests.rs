@@ -112,12 +112,11 @@ fn every_container_creation_path_validates_id_before_pull() {
 }
 
 #[tokio::test]
-async fn shared_vm_for_returns_none_when_stack_absent() {
+async fn has_shared_vm_returns_false_when_stack_absent() {
     let runtime = Runtime::new(RuntimeConfig {
         data_dir: unique_temp_dir("shared-vm-for-none"),
         ..RuntimeConfig::default()
     });
-    assert!(runtime.shared_vm_for("never-booted").await.is_none());
     assert!(!runtime.has_shared_vm("never-booted").await);
 }
 
@@ -453,6 +452,337 @@ async fn cleanup_failures_retain_recovery_state_and_successful_retry_clears_it()
 }
 
 #[tokio::test]
+async fn pending_delete_marker_skips_signal_and_delete_after_publication_failure() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("shutdown-publication-retry"),
+        ..RuntimeConfig::default()
+    });
+    let lease = runtime
+        .container_store
+        .try_acquire_container_write_lease("publication-retry")
+        .unwrap();
+    let generation = runtime
+        .container_store
+        .reserve_generation_with_write_lease("publication-retry", &lease)
+        .unwrap();
+    let delete_count = std::sync::atomic::AtomicUsize::new(0);
+
+    let publication_error = shutdown_container_cleanup_transition(
+        &runtime,
+        "publication-retry",
+        generation,
+        || async {
+            delete_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+        || async { Ok(()) },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        publication_error
+            .to_string()
+            .contains("stopped-state publication failed")
+    );
+    assert!(runtime.overlay_cleanup_is_pending("publication-retry", generation));
+
+    runtime
+        .container_store
+        .upsert_if_generation(
+            ContainerInfo {
+                id: "publication-retry".to_string(),
+                image: "alpine:latest".to_string(),
+                image_id: "sha256:publication-retry".to_string(),
+                status: ContainerStatus::Running,
+                created_unix_secs: 1,
+                started_unix_secs: Some(2),
+                stopped_unix_secs: None,
+                rootfs_path: None,
+                host_pid: Some(process::id()),
+            },
+            generation,
+        )
+        .unwrap();
+    let mock = MockOciLifecycleOps::new(ExecOutput {
+        exit_code: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+    });
+    let exit_code = stop_or_reuse_exit_code(
+        &mock,
+        "publication-retry",
+        &ContainerStatus::Running,
+        true,
+        false,
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(exit_code, 0);
+    assert!(mock.calls.lock().unwrap().is_empty());
+
+    shutdown_container_cleanup_transition(
+        &runtime,
+        "publication-retry",
+        generation,
+        || async {
+            delete_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+        || async { Ok(()) },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        delete_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "generation-scoped pending marker must prevent a second OCI delete"
+    );
+    assert!(matches!(
+        runtime
+            .container_store
+            .find("publication-retry")
+            .unwrap()
+            .unwrap()
+            .status,
+        ContainerStatus::Stopped { exit_code: 0 }
+    ));
+}
+
+#[tokio::test]
+async fn stopped_publication_failure_retains_completed_guest_cleanup_for_retry() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("individual-stop-publication-failure"),
+        ..RuntimeConfig::default()
+    });
+    let lease = runtime
+        .container_store
+        .try_acquire_container_write_lease("publication-failure")
+        .unwrap();
+    let generation = runtime
+        .container_store
+        .reserve_generation_with_write_lease("publication-failure", &lease)
+        .unwrap();
+    let stopped = ContainerInfo {
+        id: "publication-failure".to_string(),
+        image: "alpine:latest".to_string(),
+        image_id: "sha256:publication-failure".to_string(),
+        status: ContainerStatus::Stopped { exit_code: 0 },
+        created_unix_secs: 1,
+        started_unix_secs: Some(2),
+        stopped_unix_secs: Some(3),
+        rootfs_path: None,
+        host_pid: None,
+    };
+    runtime
+        .container_store
+        .upsert_if_generation(stopped.clone(), generation)
+        .unwrap();
+    runtime
+        .container_stack
+        .lock()
+        .await
+        .insert(stopped.id.clone(), "stack".to_string());
+    runtime.mark_container_vm_stop_complete(&stopped.id, generation);
+
+    let delete_count = std::sync::atomic::AtomicUsize::new(0);
+    let overlay_count = std::sync::atomic::AtomicUsize::new(0);
+    shutdown_container_cleanup_transition(
+        &runtime,
+        &stopped.id,
+        generation,
+        || async {
+            delete_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+        || async {
+            overlay_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+
+    let error = runtime
+        .persist_generation_and_commit_cleanup(
+            stopped.clone(),
+            ContainerGeneration(generation.0 + 1),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        OciError::ContainerAlreadyExists { ref id } if id == &stopped.id
+    ));
+    assert!(runtime.overlay_cleanup_is_pending(&stopped.id, generation));
+    assert!(runtime.stack_guest_cleanup_is_complete(&stopped.id, generation));
+    assert!(runtime.container_vm_stop_is_complete(&stopped.id, generation));
+    assert!(
+        runtime
+            .container_stack
+            .lock()
+            .await
+            .contains_key(&stopped.id)
+    );
+
+    shutdown_container_cleanup_transition(
+        &runtime,
+        &stopped.id,
+        generation,
+        || async {
+            delete_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+        || async {
+            overlay_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(delete_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(overlay_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    runtime
+        .persist_generation_and_commit_cleanup(stopped.clone(), generation)
+        .await
+        .unwrap();
+    assert!(!runtime.overlay_cleanup_is_pending(&stopped.id, generation));
+    assert!(!runtime.stack_guest_cleanup_is_complete(&stopped.id, generation));
+    assert!(!runtime.container_vm_stop_is_complete(&stopped.id, generation));
+    assert!(
+        !runtime
+            .container_stack
+            .lock()
+            .await
+            .contains_key(&stopped.id)
+    );
+}
+
+#[tokio::test]
+async fn cancelled_individual_cleanup_commit_retains_all_retry_ownership() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("individual-stop-commit-cancel"),
+        ..RuntimeConfig::default()
+    });
+    let lease = runtime
+        .container_store
+        .try_acquire_container_write_lease("commit-cancel")
+        .unwrap();
+    let generation = runtime
+        .container_store
+        .reserve_generation_with_write_lease("commit-cancel", &lease)
+        .unwrap();
+    let stopped = ContainerInfo {
+        id: "commit-cancel".to_string(),
+        image: "alpine:latest".to_string(),
+        image_id: "sha256:commit-cancel".to_string(),
+        status: ContainerStatus::Stopped { exit_code: 0 },
+        created_unix_secs: 1,
+        started_unix_secs: Some(2),
+        stopped_unix_secs: Some(3),
+        rootfs_path: None,
+        host_pid: None,
+    };
+    runtime
+        .container_store
+        .upsert_if_generation(stopped.clone(), generation)
+        .unwrap();
+    runtime
+        .container_stack
+        .lock()
+        .await
+        .insert(stopped.id.clone(), "stack".to_string());
+    runtime.mark_container_vm_stop_complete(&stopped.id, generation);
+
+    let delete_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let overlay_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let deletes = Arc::clone(&delete_count);
+    let overlays = Arc::clone(&overlay_count);
+    shutdown_container_cleanup_transition(
+        &runtime,
+        &stopped.id,
+        generation,
+        || async move {
+            deletes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+        || async move {
+            overlays.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+
+    let blocked_commit_guard = runtime.setup_restored_containers.lock().await;
+    let task_runtime = runtime.clone();
+    let task_container = stopped.clone();
+    let commit = tokio::spawn(async move {
+        task_runtime
+            .persist_generation_and_commit_cleanup(task_container, generation)
+            .await
+    });
+    for _ in 0..100 {
+        if runtime.active_lifecycle.try_lock().is_err() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        runtime.active_lifecycle.try_lock().is_err(),
+        "cleanup commit must reach the blocked map-lock window"
+    );
+    assert!(runtime.overlay_cleanup_is_pending(&stopped.id, generation));
+    assert!(runtime.stack_guest_cleanup_is_complete(&stopped.id, generation));
+    assert!(runtime.container_vm_stop_is_complete(&stopped.id, generation));
+    commit.abort();
+    assert!(commit.await.unwrap_err().is_cancelled());
+    drop(blocked_commit_guard);
+    assert!(
+        runtime
+            .container_stack
+            .lock()
+            .await
+            .contains_key(&stopped.id)
+    );
+
+    shutdown_container_cleanup_transition(
+        &runtime,
+        &stopped.id,
+        generation,
+        || async {
+            delete_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+        || async {
+            overlay_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(delete_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(overlay_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    runtime
+        .persist_generation_and_commit_cleanup(stopped.clone(), generation)
+        .await
+        .unwrap();
+    assert!(
+        !runtime
+            .container_stack
+            .lock()
+            .await
+            .contains_key(&stopped.id)
+    );
+    assert!(!runtime.overlay_cleanup_is_pending(&stopped.id, generation));
+    assert!(!runtime.stack_guest_cleanup_is_complete(&stopped.id, generation));
+    assert!(!runtime.container_vm_stop_is_complete(&stopped.id, generation));
+}
+
+#[tokio::test]
 async fn stack_cleanup_batch_retains_earlier_success_until_later_failure_is_retried() {
     let runtime = Runtime::new(RuntimeConfig {
         data_dir: unique_temp_dir("shutdown-overlay-multi-container"),
@@ -601,7 +931,11 @@ async fn stack_cleanup_batch_retains_earlier_success_until_later_failure_is_retr
     .unwrap();
     assert_eq!(delete_a.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(delete_b.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(overlay_a.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(
+        overlay_a.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "completed guest cleanup must not rerun while another member is retried"
+    );
     assert_eq!(overlay_b.load(std::sync::atomic::Ordering::SeqCst), 2);
 
     commit_stack_cleanup_batch(
@@ -633,6 +967,231 @@ async fn stack_cleanup_batch_retains_earlier_success_until_later_failure_is_retr
         ));
     }
     drop(leases);
+}
+
+#[tokio::test]
+async fn shared_infra_retry_skips_completed_guest_cleanup_and_vm_stop() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("shared-infra-retry"),
+        ..RuntimeConfig::default()
+    });
+    let lease = runtime
+        .container_store
+        .try_acquire_container_write_lease("shared-member")
+        .unwrap();
+    let generation = runtime
+        .container_store
+        .reserve_generation_with_write_lease("shared-member", &lease)
+        .unwrap();
+    runtime
+        .container_store
+        .upsert_if_generation(
+            ContainerInfo {
+                id: "shared-member".to_string(),
+                image: "alpine:latest".to_string(),
+                image_id: "sha256:shared-member".to_string(),
+                status: ContainerStatus::Running,
+                created_unix_secs: 1,
+                started_unix_secs: Some(2),
+                stopped_unix_secs: None,
+                rootfs_path: None,
+                host_pid: Some(process::id()),
+            },
+            generation,
+        )
+        .unwrap();
+
+    runtime
+        .container_stack
+        .lock()
+        .await
+        .insert("shared-member".to_string(), "shared-stack".to_string());
+    let handles = Mutex::new(HashMap::from([(
+        "shared-member".to_string(),
+        "shared-vm".to_string(),
+    )]));
+    let stack_vms = Mutex::new(HashMap::from([(
+        "shared-stack".to_string(),
+        "shared-vm".to_string(),
+    )]));
+    let delete_count = std::sync::atomic::AtomicUsize::new(0);
+    let overlay_count = std::sync::atomic::AtomicUsize::new(0);
+    shutdown_container_cleanup_transition(
+        &runtime,
+        "shared-member",
+        generation,
+        || async {
+            delete_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+        || async {
+            overlay_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+
+    let failing_listener = tokio::spawn(async move {
+        panic!("injected first-attempt forwarding failure");
+        #[allow(unreachable_code)]
+        Ok::<(), String>(())
+    });
+    runtime.stack_port_forwards.lock().await.insert(
+        "shared-stack".to_string(),
+        test_port_forwarding(failing_listener),
+    );
+    shutdown_port_forwarding_registry_entry(&runtime.stack_port_forwards, "shared-stack")
+        .await
+        .unwrap_err();
+    runtime.mark_stack_vm_stop_complete("shared-stack");
+
+    assert!(
+        runtime
+            .container_stack
+            .lock()
+            .await
+            .contains_key("shared-member")
+    );
+    assert!(handles.lock().await.contains_key("shared-member"));
+    assert!(stack_vms.lock().await.contains_key("shared-stack"));
+    assert!(
+        runtime
+            .stack_port_forwards
+            .lock()
+            .await
+            .contains_key("shared-stack")
+    );
+    let snapshot_path = unique_temp_dir("shared-infra-retry-snapshot").join("state.vz");
+    let restore_error = runtime
+        .restore_shared_vm_snapshot("shared-stack", &snapshot_path)
+        .await
+        .unwrap_err();
+    assert!(
+        restore_error
+            .to_string()
+            .contains("teardown cleanup is pending")
+    );
+    let save_error = runtime
+        .save_shared_vm_snapshot("shared-stack", &snapshot_path)
+        .await
+        .unwrap_err();
+    assert!(
+        save_error
+            .to_string()
+            .contains("teardown cleanup is pending")
+    );
+    runtime.clear_stack_vm_stop_complete("shared-stack");
+    assert!(
+        runtime
+            .restore_shared_vm_snapshot("shared-stack", &snapshot_path)
+            .await
+            .is_err_and(|error| error.to_string().contains("teardown cleanup is pending")),
+        "completed generation-scoped guest cleanup independently blocks restore"
+    );
+    runtime.mark_stack_vm_stop_complete("shared-stack");
+
+    let mock = MockOciLifecycleOps::new(ExecOutput {
+        exit_code: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+    });
+    let persisted = runtime
+        .container_store
+        .find("shared-member")
+        .unwrap()
+        .unwrap();
+    stop_or_reuse_exit_code(
+        &mock,
+        "shared-member",
+        &persisted.status,
+        runtime.overlay_cleanup_is_pending("shared-member", generation),
+        false,
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+    .unwrap();
+    shutdown_container_cleanup_transition(
+        &runtime,
+        "shared-member",
+        generation,
+        || async {
+            delete_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+        || async {
+            overlay_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert!(mock.calls.lock().unwrap().is_empty());
+    assert_eq!(delete_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(overlay_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    shutdown_port_forwarding_registry_entry(&runtime.stack_port_forwards, "shared-stack")
+        .await
+        .unwrap();
+    let vm_stop_count = std::sync::atomic::AtomicUsize::new(1);
+    if !runtime.stack_vm_stop_is_complete("shared-stack") {
+        vm_stop_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    assert_eq!(vm_stop_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    stack_vms.lock().await.remove("shared-stack");
+    runtime.clear_stack_vm_stop_complete("shared-stack");
+    commit_stack_cleanup_batch(
+        &runtime,
+        &runtime.container_stack,
+        &handles,
+        &["shared-member".to_string()],
+    )
+    .await;
+
+    assert!(runtime.container_stack.lock().await.is_empty());
+    assert!(handles.lock().await.is_empty());
+    assert!(stack_vms.lock().await.is_empty());
+    assert!(runtime.stack_port_forwards.lock().await.is_empty());
+    let post_cleanup_restore = runtime
+        .restore_shared_vm_snapshot("shared-stack", &snapshot_path)
+        .await
+        .unwrap_err();
+    assert!(
+        post_cleanup_restore
+            .to_string()
+            .contains("no shared VM running")
+    );
+    assert!(
+        !post_cleanup_restore
+            .to_string()
+            .contains("teardown cleanup is pending")
+    );
+}
+
+#[tokio::test]
+async fn snapshot_restore_waits_for_stack_lifecycle_writer() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("snapshot-stack-lifecycle-lock"),
+        ..RuntimeConfig::default()
+    });
+    let stack_lock = runtime.stack_lifecycle_lock("locked-stack").await;
+    let guard = stack_lock.write_owned().await;
+    let restore_runtime = runtime.clone();
+    let restore = tokio::spawn(async move {
+        restore_runtime
+            .restore_shared_vm_snapshot("locked-stack", Path::new("unused-snapshot"))
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !restore.is_finished(),
+        "restore must wait behind the active stack lifecycle writer"
+    );
+
+    drop(guard);
+    let error = restore.await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("no shared VM running"));
 }
 
 #[test]
@@ -1135,6 +1694,13 @@ async fn lifecycle_diagnostics_reports_reservations_and_map_counts() {
     let active = runtime.lifecycle_diagnostics().await.unwrap();
     assert_eq!(active.container_lock_slots, 1);
     assert_eq!(active.vm_handles, 0);
+    assert!(active.vm_handle_ids.is_empty());
+    assert_eq!(active.stack_vms, 0);
+    assert!(active.stack_vm_ids.is_empty());
+    assert_eq!(active.container_routes, 0);
+    assert!(active.container_route_pairs.is_empty());
+    assert_eq!(active.stack_port_forwards, 0);
+    assert!(active.stack_port_forward_ids.is_empty());
     assert_eq!(active.exec_bindings, 0);
     assert_eq!(active.active_lifecycles, 0);
     assert!(
@@ -1449,6 +2015,161 @@ async fn stop_via_oci_runtime_sends_sigterm_and_polls_state() {
     let calls = mock.calls.lock().unwrap();
     assert!(calls.contains(&"kill:SIGTERM"));
     assert!(calls.contains(&"state"));
+}
+
+#[tokio::test]
+async fn stop_via_oci_runtime_already_stopped_is_idempotent_without_kill() {
+    let mock = MockOciLifecycleOps::new(ExecOutput {
+        exit_code: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+    });
+    *mock.state_status.lock().unwrap() = "stopped".to_string();
+
+    let exit_code =
+        stop_via_oci_runtime(&mock, "svc-finished", false, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+
+    assert_eq!(exit_code, 0);
+    assert_eq!(*mock.calls.lock().unwrap(), vec!["state"]);
+}
+
+#[tokio::test]
+async fn stop_via_oci_runtime_accepts_natural_exit_racing_with_kill() {
+    let mut mock = MockOciLifecycleOps::new(ExecOutput {
+        exit_code: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+    });
+    mock.fail_kill = true;
+    mock.stop_on_failed_kill = true;
+
+    let exit_code = stop_via_oci_runtime(&mock, "svc-raced", false, Duration::from_secs(5), None)
+        .await
+        .unwrap();
+
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        *mock.calls.lock().unwrap(),
+        vec!["state", "kill:SIGTERM", "state"]
+    );
+}
+
+#[tokio::test]
+async fn stopped_retry_reuses_exit_code_and_retries_oci_delete() {
+    let mut mock = MockOciLifecycleOps::new(ExecOutput {
+        exit_code: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+    });
+    mock.fail_delete_calls = 1;
+
+    let first_exit = stop_or_reuse_exit_code(
+        &mock,
+        "svc-delete-retry",
+        &ContainerStatus::Running,
+        false,
+        false,
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+    .unwrap();
+    let first_delete = mock
+        .oci_delete("svc-delete-retry".to_string(), true)
+        .await
+        .unwrap_err();
+    assert!(first_delete.to_string().contains("mock OCI delete failure"));
+
+    let retry_exit = stop_or_reuse_exit_code(
+        &mock,
+        "svc-delete-retry",
+        &ContainerStatus::Stopped {
+            exit_code: first_exit,
+        },
+        false,
+        false,
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+    .unwrap();
+    mock.oci_delete("svc-delete-retry".to_string(), true)
+        .await
+        .unwrap();
+
+    assert_eq!(retry_exit, first_exit);
+    assert_eq!(
+        *mock.calls.lock().unwrap(),
+        vec!["state", "kill:SIGTERM", "state", "delete", "delete"],
+        "retry must resume at OCI delete without re-signalling"
+    );
+}
+
+#[tokio::test]
+async fn stop_via_oci_runtime_preserves_kill_error_while_still_running() {
+    let mut mock = MockOciLifecycleOps::new(ExecOutput {
+        exit_code: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+    });
+    mock.fail_kill = true;
+
+    let error = stop_via_oci_runtime(&mock, "svc-running", false, Duration::from_secs(5), None)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("mock kill failure"));
+    assert_eq!(
+        *mock.calls.lock().unwrap(),
+        vec!["state", "kill:SIGTERM", "state"]
+    );
+}
+
+#[tokio::test]
+async fn stop_via_oci_runtime_preserves_kill_error_when_race_recheck_transport_fails() {
+    let mut mock = MockOciLifecycleOps::new(ExecOutput {
+        exit_code: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+    });
+    mock.fail_kill = true;
+    mock.fail_state_on_call = Some(2);
+
+    let error = stop_via_oci_runtime(
+        &mock,
+        "svc-race-unknown",
+        false,
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("mock kill failure"));
+    assert!(!error.to_string().contains("mock state transport failure"));
+    assert_eq!(
+        *mock.calls.lock().unwrap(),
+        vec!["state", "kill:SIGTERM", "state"]
+    );
+}
+
+#[tokio::test]
+async fn stop_via_oci_runtime_preserves_authoritative_state_transport_error() {
+    let mut mock = MockOciLifecycleOps::new(ExecOutput {
+        exit_code: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+    });
+    mock.fail_state = true;
+
+    let error = stop_via_oci_runtime(&mock, "svc-unknown", false, Duration::from_secs(5), None)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("mock state transport failure"));
+    assert_eq!(*mock.calls.lock().unwrap(), vec!["state"]);
 }
 
 #[tokio::test]
@@ -1878,6 +2599,13 @@ struct MockOciLifecycleOps {
     exec_call: std::sync::Mutex<Option<RecordedOciExec>>,
     exec_output: ExecOutput,
     fail_start: bool,
+    fail_kill: bool,
+    stop_on_failed_kill: bool,
+    fail_state: bool,
+    fail_state_on_call: Option<usize>,
+    fail_delete_calls: usize,
+    state_calls: std::sync::atomic::AtomicUsize,
+    delete_calls: std::sync::atomic::AtomicUsize,
     state_status: std::sync::Mutex<String>,
 }
 
@@ -1888,6 +2616,13 @@ impl MockOciLifecycleOps {
             exec_call: std::sync::Mutex::new(None),
             exec_output,
             fail_start: false,
+            fail_kill: false,
+            stop_on_failed_kill: false,
+            fail_state: false,
+            fail_state_on_call: None,
+            fail_delete_calls: 0,
+            state_calls: std::sync::atomic::AtomicUsize::new(0),
+            delete_calls: std::sync::atomic::AtomicUsize::new(0),
             state_status: std::sync::Mutex::new("running".to_string()),
         }
     }
@@ -1935,6 +2670,14 @@ impl OciLifecycleOps for MockOciLifecycleOps {
         } else {
             "kill:SIGTERM"
         });
+        if self.fail_kill {
+            if self.stop_on_failed_kill {
+                *self.state_status.lock().unwrap() = "stopped".to_string();
+            }
+            return Box::pin(async {
+                Err(OciError::InvalidConfig("mock kill failure".to_string()))
+            });
+        }
         // Simulate: after kill, container becomes stopped.
         *self.state_status.lock().unwrap() = "stopped".to_string();
         Box::pin(async { Ok(()) })
@@ -1942,6 +2685,17 @@ impl OciLifecycleOps for MockOciLifecycleOps {
 
     fn oci_state<'a>(&'a self, id: String) -> OciLifecycleFuture<'a, OciContainerState> {
         self.calls.lock().unwrap().push("state");
+        let call = self
+            .state_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if self.fail_state || self.fail_state_on_call == Some(call) {
+            return Box::pin(async {
+                Err(OciError::InvalidConfig(
+                    "mock state transport failure".to_string(),
+                ))
+            });
+        }
         let status = self.state_status.lock().unwrap().clone();
         Box::pin(async move {
             Ok(OciContainerState {
@@ -1955,7 +2709,20 @@ impl OciLifecycleOps for MockOciLifecycleOps {
 
     fn oci_delete<'a>(&'a self, _id: String, _force: bool) -> OciLifecycleFuture<'a, ()> {
         self.calls.lock().unwrap().push("delete");
-        Box::pin(async { Ok(()) })
+        let call = self
+            .delete_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let should_fail = call <= self.fail_delete_calls;
+        Box::pin(async move {
+            if should_fail {
+                Err(OciError::InvalidConfig(
+                    "mock OCI delete failure".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        })
     }
 }
 
