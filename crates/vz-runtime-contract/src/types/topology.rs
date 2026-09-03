@@ -129,6 +129,18 @@ pub enum MachineCapability {
     WindowsConsole,
 }
 
+/// Explicit operating profile for one Machine.
+///
+/// Developer Linux Machines implicitly provide their own private Docker stack.
+/// Hardened Machines are Linux-only and must never expose Docker, Compose, or
+/// buildx capabilities.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineProfile {
+    Developer,
+    Hardened,
+}
+
 /// Deterministically ordered set of Machine capabilities.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapabilitySet {
@@ -192,6 +204,7 @@ pub struct WorkspaceProjection {
 pub struct MachineSpec {
     pub schema_version: u32,
     pub name: String,
+    pub profile: MachineProfile,
     pub target: TargetSpec,
     #[serde(default)]
     pub resources: MachineResources,
@@ -325,6 +338,7 @@ pub struct MachineInstance {
     pub machine_id: MachineId,
     pub environment_id: EnvironmentId,
     pub name: String,
+    pub profile: MachineProfile,
     pub target: TargetSpec,
     #[serde(default)]
     pub resources: MachineResources,
@@ -499,6 +513,12 @@ pub enum TopologyValidationError {
     },
     #[error("invalid capability declaration for Machine `{machine_id}`: {reason}")]
     InvalidCapabilityDeclaration { machine_id: String, reason: String },
+    #[error("invalid {profile:?} profile for Machine `{machine_id}`: {reason}")]
+    InvalidMachineProfile {
+        machine_id: String,
+        profile: MachineProfile,
+        reason: String,
+    },
     #[error(
         "Environment `{environment_id}` definition digest mismatch: expected `{expected}`, found `{found}`"
     )]
@@ -598,6 +618,13 @@ impl EnvironmentSpec {
             validate_name("machine", &machine.name)?;
             validate_target(&machine.target)?;
             validate_requested_capabilities(&machine.name, &machine.requested_capabilities)?;
+            validate_machine_profile(
+                &machine.name,
+                machine.profile,
+                &machine.target,
+                &machine.requested_capabilities,
+                None,
+            )?;
         }
         for network in &self.networks {
             validate_schema(network.schema_version)?;
@@ -827,7 +854,13 @@ impl MachineInstance {
         validate_name("machine", &self.name)?;
         validate_target(&self.target)?;
         validate_requested_capabilities(&self.name, &self.requested_capabilities)?;
-        reject_non_linux_docker(&self.name, &self.target, &self.negotiated_capabilities)?;
+        validate_machine_profile(
+            self.machine_id.as_str(),
+            self.profile,
+            &self.target,
+            &self.requested_capabilities,
+            Some(&self.negotiated_capabilities),
+        )?;
         if let Some(incarnation) = &self.incarnation {
             validate_schema(incarnation.schema_version)?;
             incarnation.incarnation_id.validate()?;
@@ -878,20 +911,6 @@ impl MachineInstance {
                 capability,
             });
         }
-        if self.target.os == OperatingSystem::Linux {
-            for capability in [
-                MachineCapability::DockerEngine,
-                MachineCapability::Compose,
-                MachineCapability::Buildx,
-            ] {
-                if !self.negotiated_capabilities.contains(capability) {
-                    return Err(TopologyValidationError::MissingCapability {
-                        machine_id: self.machine_id.to_string(),
-                        capability,
-                    });
-                }
-            }
-        }
         Ok(())
     }
 }
@@ -928,6 +947,12 @@ fn validate_definition_instance(
             return definition_topology_mismatch(
                 &environment_id,
                 format!("Machine `{}` target differs", desired.name),
+            );
+        }
+        if actual.profile != desired.profile {
+            return definition_topology_mismatch(
+                &environment_id,
+                format!("Machine `{}` profile differs", desired.name),
             );
         }
         if actual.requested_capabilities != desired.requested_capabilities {
@@ -1031,26 +1056,72 @@ fn validate_requested_capabilities(
     })
 }
 
-fn reject_non_linux_docker(
+fn validate_machine_profile(
     machine: &str,
+    profile: MachineProfile,
     target: &TargetSpec,
-    capabilities: &CapabilitySet,
+    requested: &CapabilitySet,
+    negotiated: Option<&CapabilitySet>,
 ) -> Result<(), TopologyValidationError> {
-    if target.os == OperatingSystem::Linux {
-        return Ok(());
-    }
-    if let Some(capability) = [
+    const DOCKER_CAPABILITIES: [MachineCapability; 3] = [
         MachineCapability::DockerEngine,
         MachineCapability::Compose,
         MachineCapability::Buildx,
-    ]
-    .into_iter()
-    .find(|capability| capabilities.contains(*capability))
-    {
-        return Err(TopologyValidationError::InvalidCapabilityDeclaration {
+    ];
+
+    if target.os != OperatingSystem::Linux && profile != MachineProfile::Developer {
+        return Err(TopologyValidationError::InvalidMachineProfile {
             machine_id: machine.to_string(),
-            reason: format!("non-Linux target cannot provide implicit capability `{capability:?}`"),
+            profile,
+            reason: "native targets support only the Developer profile".to_string(),
         });
+    }
+
+    match profile {
+        MachineProfile::Developer if target.os == OperatingSystem::Linux => {
+            if let Some(negotiated) = negotiated {
+                for capability in DOCKER_CAPABILITIES {
+                    if negotiated.contains(capability) {
+                        continue;
+                    }
+                    return Err(TopologyValidationError::MissingCapability {
+                        machine_id: machine.to_string(),
+                        capability,
+                    });
+                }
+            }
+        }
+        MachineProfile::Developer => {
+            for capabilities in std::iter::once(requested).chain(negotiated) {
+                if let Some(capability) = DOCKER_CAPABILITIES.into_iter().find(|capability| {
+                    capabilities.contains(*capability)
+                        || capabilities.unsupported.contains_key(capability)
+                }) {
+                    return Err(TopologyValidationError::InvalidCapabilityDeclaration {
+                        machine_id: machine.to_string(),
+                        reason: format!(
+                            "non-Linux target cannot declare implicit capability `{capability:?}`"
+                        ),
+                    });
+                }
+            }
+        }
+        MachineProfile::Hardened => {
+            for capabilities in std::iter::once(requested).chain(negotiated) {
+                if let Some(capability) = DOCKER_CAPABILITIES.into_iter().find(|capability| {
+                    capabilities.contains(*capability)
+                        || capabilities.unsupported.contains_key(capability)
+                }) {
+                    return Err(TopologyValidationError::InvalidMachineProfile {
+                        machine_id: machine.to_string(),
+                        profile,
+                        reason: format!(
+                            "Hardened Machines cannot declare capability `{capability:?}`"
+                        ),
+                    });
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1111,6 +1182,7 @@ pub fn migrate_legacy_developer_sandbox(
     let machine_spec = MachineSpec {
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         name: "linux".to_string(),
+        profile: MachineProfile::Developer,
         target: target.clone(),
         resources: MachineResources {
             cpus: sandbox.spec.cpus,
@@ -1155,6 +1227,7 @@ pub fn migrate_legacy_developer_sandbox(
         machine_id: machine_id.clone(),
         environment_id: environment_id.clone(),
         name: "linux".to_string(),
+        profile: MachineProfile::Developer,
         target,
         resources: MachineResources {
             cpus: sandbox.spec.cpus,
@@ -1355,6 +1428,7 @@ mod tests {
         MachineSpec {
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             name: name.to_string(),
+            profile: MachineProfile::Developer,
             target: TargetSpec {
                 os: OperatingSystem::Linux,
                 arch: Architecture::Aarch64,
@@ -1394,6 +1468,7 @@ mod tests {
                     MachineSpec {
                         schema_version: TOPOLOGY_SCHEMA_VERSION,
                         name: "ios".to_string(),
+                        profile: MachineProfile::Developer,
                         target: TargetSpec {
                             os: OperatingSystem::Macos,
                             arch: Architecture::Aarch64,
@@ -1465,6 +1540,132 @@ mod tests {
         let json = serde_json::to_string_pretty(&definition).unwrap();
         let decoded: ProjectDefinition = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, definition);
+        assert_eq!(
+            serde_json::to_value(&definition).unwrap()["environment"]["machines"][0]["profile"],
+            "developer"
+        );
+    }
+
+    #[test]
+    fn profile_is_required_in_definition_and_instance_json() {
+        let mut definition = serde_json::to_value(project_definition()).unwrap();
+        definition["environment"]["machines"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("profile");
+        assert!(serde_json::from_value::<ProjectDefinition>(definition).is_err());
+
+        let migrated = migrate_legacy_developer_sandbox(&legacy_sandbox("/shop")).unwrap();
+        let mut machine = serde_json::to_value(&migrated.environments[0].machines[0]).unwrap();
+        machine.as_object_mut().unwrap().remove("profile");
+        assert!(serde_json::from_value::<MachineInstance>(machine).is_err());
+    }
+
+    #[test]
+    fn machine_profiles_enforce_target_and_docker_contract() {
+        let mut implicit_docker = project_definition();
+        for capability in [
+            MachineCapability::DockerEngine,
+            MachineCapability::Compose,
+            MachineCapability::Buildx,
+        ] {
+            implicit_docker.environment.machines[0]
+                .requested_capabilities
+                .capabilities
+                .remove(&capability);
+        }
+        implicit_docker.validate().unwrap();
+
+        let mut hardened = project_definition();
+        let hardened_machine = &mut hardened.environment.machines[0];
+        hardened_machine.profile = MachineProfile::Hardened;
+        for capability in [
+            MachineCapability::DockerEngine,
+            MachineCapability::Compose,
+            MachineCapability::Buildx,
+        ] {
+            hardened_machine
+                .requested_capabilities
+                .capabilities
+                .remove(&capability);
+        }
+        hardened.validate().unwrap();
+
+        hardened.environment.machines[0]
+            .requested_capabilities
+            .capabilities
+            .insert(MachineCapability::DockerEngine);
+        assert!(matches!(
+            hardened.validate(),
+            Err(TopologyValidationError::InvalidMachineProfile {
+                profile: MachineProfile::Hardened,
+                ..
+            })
+        ));
+
+        let mut native_hardened = project_definition();
+        native_hardened.environment.machines[1].profile = MachineProfile::Hardened;
+        assert!(matches!(
+            native_hardened.validate(),
+            Err(TopologyValidationError::InvalidMachineProfile {
+                profile: MachineProfile::Hardened,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn machine_instance_profiles_enforce_negotiation_and_definition_match() {
+        let migrated = migrate_legacy_developer_sandbox(&legacy_sandbox("/shop")).unwrap();
+        let mut developer = migrated.environments[0].machines[0].clone();
+        for capability in [
+            MachineCapability::DockerEngine,
+            MachineCapability::Compose,
+            MachineCapability::Buildx,
+        ] {
+            developer
+                .requested_capabilities
+                .capabilities
+                .remove(&capability);
+        }
+        developer.validate().unwrap();
+        developer
+            .negotiated_capabilities
+            .capabilities
+            .remove(&MachineCapability::Compose);
+        assert!(matches!(
+            developer.validate(),
+            Err(TopologyValidationError::MissingCapability {
+                capability: MachineCapability::Compose,
+                ..
+            })
+        ));
+
+        let mut hardened = migrated.environments[0].machines[0].clone();
+        hardened.profile = MachineProfile::Hardened;
+        for capability in [
+            MachineCapability::DockerEngine,
+            MachineCapability::Compose,
+            MachineCapability::Buildx,
+        ] {
+            hardened
+                .requested_capabilities
+                .capabilities
+                .remove(&capability);
+            hardened
+                .negotiated_capabilities
+                .capabilities
+                .remove(&capability);
+        }
+        hardened.validate().unwrap();
+
+        let mut drift = migrated;
+        drift.environments[0].machines[0] = hardened;
+        assert!(matches!(
+            drift.validate(),
+            Err(TopologyValidationError::DefinitionTopologyMismatch { details, .. })
+                if details.contains("profile differs")
+        ));
     }
 
     #[test]
@@ -1481,6 +1682,16 @@ mod tests {
     fn unsupported_target_is_structured_and_never_substituted() {
         let mut definition = project_definition();
         definition.environment.machines[0].target.os = OperatingSystem::Windows;
+        for capability in [
+            MachineCapability::DockerEngine,
+            MachineCapability::Compose,
+            MachineCapability::Buildx,
+        ] {
+            definition.environment.machines[0]
+                .requested_capabilities
+                .capabilities
+                .remove(&capability);
+        }
         let error = definition
             .validate_for_host(HostSpec {
                 os: OperatingSystem::Macos,
@@ -1507,7 +1718,7 @@ mod tests {
                 os: OperatingSystem::Macos,
                 arch: Architecture::Aarch64,
             }),
-            Err(TopologyValidationError::UnsupportedTarget { .. })
+            Err(TopologyValidationError::InvalidCapabilityDeclaration { .. })
         ));
     }
 
@@ -1578,6 +1789,11 @@ mod tests {
             second.environments[0].bindings[0].path_hint
         );
         let machine = &first.environments[0].machines[0];
+        assert_eq!(
+            first.definition.environment.machines[0].profile,
+            MachineProfile::Developer
+        );
+        assert_eq!(machine.profile, MachineProfile::Developer);
         assert_eq!(machine.target.version, None);
         assert!(
             machine
@@ -1596,6 +1812,13 @@ mod tests {
 
     #[test]
     fn hardened_and_ambiguous_legacy_records_are_never_adopted() {
+        let mut generic = legacy_sandbox("/shop");
+        generic.labels.remove(LEGACY_DEVELOPER_MARKER);
+        assert!(matches!(
+            migrate_legacy_developer_sandbox(&generic),
+            Err(LegacyMigrationError::NotDeveloper { .. })
+        ));
+
         let mut hardened = legacy_sandbox("/shop");
         hardened.labels.remove(LEGACY_DEVELOPER_MARKER);
         hardened.labels.insert(

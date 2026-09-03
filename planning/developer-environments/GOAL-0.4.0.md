@@ -63,7 +63,8 @@ ProjectDefinition
 0.4.0 includes all of the following:
 
 1. Versioned ProjectDefinition, WorkspaceBinding, EnvironmentSpec/Instance,
-   MachineSpec/Instance/Incarnation with required Developer/Hardened profile,
+   MachineSpec and MachineInstance with a required Developer/Hardened profile,
+   replaceable MachineIncarnation,
    Network, Endpoint, HostImport, HostExport, EgressPolicy, Volume,
    SecretBinding, PeerGrant, Fault, Execution, Receipt, lifecycle, and ownership schemas
    with migration from legacy records. Immutable IDs, human selectors, and

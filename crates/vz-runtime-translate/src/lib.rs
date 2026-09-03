@@ -20,12 +20,13 @@ use vz_runtime_contract::{
     EnvironmentState, Event, EventScope, Execution, ExecutionSpec, ExecutionState, HostSpec, Lease,
     LeaseState, LegacyMigrationProvenance, MachineBackend, MachineCapability, MachineError,
     MachineErrorCode, MachineId, MachineIncarnation, MachineIncarnationId, MachineInstance,
-    MachineResources, MachineSpec, MachineState, NetworkId, NetworkInstance, NetworkKind,
-    NetworkSpec, OperatingSystem, OwnedResourceKind, OwnershipRecord, ProjectDefinition, ProjectId,
-    ProjectState, RequestMetadata, RuntimeCapabilities, SANDBOX_LABEL_BASE_IMAGE_REF,
-    SANDBOX_LABEL_MAIN_CONTAINER, Sandbox, SandboxBackend, SandboxSpec, SandboxState, TargetSpec,
-    TopologyCandidate, TopologyResolutionError, TopologyValidationError, WorkspaceBinding,
-    WorkspaceBindingId, WorkspaceProjection, WorkspaceProjectionMode,
+    MachineProfile, MachineResources, MachineSpec, MachineState, NetworkId, NetworkInstance,
+    NetworkKind, NetworkSpec, OperatingSystem, OwnedResourceKind, OwnershipRecord,
+    ProjectDefinition, ProjectId, ProjectState, RequestMetadata, RuntimeCapabilities,
+    SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER, Sandbox, SandboxBackend,
+    SandboxSpec, SandboxState, TargetSpec, TopologyCandidate, TopologyResolutionError,
+    TopologyValidationError, WorkspaceBinding, WorkspaceBindingId, WorkspaceProjection,
+    WorkspaceProjectionMode,
 };
 use vz_runtime_proto::runtime_v2;
 
@@ -150,6 +151,7 @@ pub fn machine_spec_to_proto(spec: &MachineSpec) -> runtime_v2::MachineSpec {
     runtime_v2::MachineSpec {
         schema_version: spec.schema_version,
         name: spec.name.clone(),
+        profile: machine_profile_to_proto(spec.profile) as i32,
         target: Some(target_spec_to_proto(&spec.target)),
         resources: Some(machine_resources_to_proto(&spec.resources)),
         requested_capabilities: Some(capability_set_to_proto(&spec.requested_capabilities)),
@@ -164,6 +166,7 @@ pub fn machine_spec_from_proto(
     Ok(MachineSpec {
         schema_version: spec.schema_version,
         name: spec.name.clone(),
+        profile: machine_profile_from_proto(spec.profile, "machine_spec.profile")?,
         target: target_spec_from_proto(required(spec.target.as_ref(), "machine_spec.target")?)?,
         resources: machine_resources_from_proto(required(
             spec.resources.as_ref(),
@@ -446,6 +449,7 @@ pub fn machine_instance_to_proto(machine: &MachineInstance) -> runtime_v2::Machi
         machine_id: machine.machine_id.to_string(),
         environment_id: machine.environment_id.to_string(),
         name: machine.name.clone(),
+        profile: machine_profile_to_proto(machine.profile) as i32,
         target: Some(target_spec_to_proto(&machine.target)),
         resources: Some(machine_resources_to_proto(&machine.resources)),
         requested_capabilities: Some(capability_set_to_proto(&machine.requested_capabilities)),
@@ -470,6 +474,7 @@ pub fn machine_instance_from_proto(
         machine_id: MachineId::new(machine.machine_id.clone())?,
         environment_id: EnvironmentId::new(machine.environment_id.clone())?,
         name: machine.name.clone(),
+        profile: machine_profile_from_proto(machine.profile, "machine_instance.profile")?,
         target: target_spec_from_proto(required(
             machine.target.as_ref(),
             "machine_instance.target",
@@ -1067,6 +1072,24 @@ fn machine_state_from_proto(raw: i32) -> Result<MachineState, TranslationError> 
         runtime_v2::MachineState::Stopped => Ok(MachineState::Stopped),
         runtime_v2::MachineState::Failed => Ok(MachineState::Failed),
         runtime_v2::MachineState::Unspecified => Err(invalid_enum(field, raw)),
+    }
+}
+
+fn machine_profile_to_proto(value: MachineProfile) -> runtime_v2::MachineProfile {
+    match value {
+        MachineProfile::Developer => runtime_v2::MachineProfile::Developer,
+        MachineProfile::Hardened => runtime_v2::MachineProfile::Hardened,
+    }
+}
+
+fn machine_profile_from_proto(
+    raw: i32,
+    field: &'static str,
+) -> Result<MachineProfile, TranslationError> {
+    match runtime_v2::MachineProfile::try_from(raw).map_err(|_| invalid_enum(field, raw))? {
+        runtime_v2::MachineProfile::Developer => Ok(MachineProfile::Developer),
+        runtime_v2::MachineProfile::Hardened => Ok(MachineProfile::Hardened),
+        runtime_v2::MachineProfile::Unspecified => Err(invalid_enum(field, raw)),
     }
 }
 
@@ -2024,6 +2047,7 @@ mod tests {
         MachineSpec {
             schema_version: V,
             name: name.to_string(),
+            profile: MachineProfile::Developer,
             target: target(os, name),
             resources: MachineResources {
                 cpus: Some(12),
@@ -2107,6 +2131,7 @@ mod tests {
                     machine_id: linux_id.clone(),
                     environment_id: environment_id.clone(),
                     name: "linux".to_string(),
+                    profile: MachineProfile::Developer,
                     target: linux_spec.target.clone(),
                     resources: MachineResources {
                         cpus: Some(16),
@@ -2132,6 +2157,7 @@ mod tests {
                     machine_id: macos_id.clone(),
                     environment_id: environment_id.clone(),
                     name: "macos".to_string(),
+                    profile: MachineProfile::Developer,
                     target: macos_spec.target.clone(),
                     resources: MachineResources {
                         cpus: Some(8),
@@ -2240,6 +2266,13 @@ mod tests {
                 .all(|environment| environment.definition_digest == definition_digest)
         );
         assert_eq!(decoded.environments[0].bindings[0].name, "source");
+        assert!(
+            decoded
+                .environments
+                .iter()
+                .flat_map(|environment| &environment.machines)
+                .all(|machine| machine.profile == MachineProfile::Developer)
+        );
         assert_eq!(
             decoded.environments[0].bindings[0].workspace_key,
             decoded.environments[1].bindings[0].workspace_key
@@ -2307,6 +2340,80 @@ mod tests {
                 ..
             })
         ));
+
+        let mut spec = machine_spec_to_proto(&machine_spec("linux", OperatingSystem::Linux));
+        spec.profile = runtime_v2::MachineProfile::Unspecified as i32;
+        assert!(matches!(
+            machine_spec_from_proto(&spec),
+            Err(TranslationError::InvalidEnumValue {
+                field: "machine_spec.profile",
+                ..
+            })
+        ));
+        spec.profile = 9_999;
+        assert!(matches!(
+            machine_spec_from_proto(&spec),
+            Err(TranslationError::InvalidEnumValue {
+                field: "machine_spec.profile",
+                ..
+            })
+        ));
+
+        let mut machine =
+            machine_instance_to_proto(&topology_fixture().environments[0].machines[0]);
+        machine.profile = runtime_v2::MachineProfile::Unspecified as i32;
+        assert!(matches!(
+            machine_instance_from_proto(&machine),
+            Err(TranslationError::InvalidEnumValue {
+                field: "machine_instance.profile",
+                ..
+            })
+        ));
+        machine.profile = 9_999;
+        assert!(matches!(
+            machine_instance_from_proto(&machine),
+            Err(TranslationError::InvalidEnumValue {
+                field: "machine_instance.profile",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn hardened_machine_profile_round_trips_losslessly() {
+        let mut spec = machine_spec("linux", OperatingSystem::Linux);
+        spec.profile = MachineProfile::Hardened;
+        for capability in [
+            MachineCapability::DockerEngine,
+            MachineCapability::Compose,
+            MachineCapability::Buildx,
+        ] {
+            spec.requested_capabilities.capabilities.remove(&capability);
+        }
+        let decoded = machine_spec_from_proto(&machine_spec_to_proto(&spec))
+            .expect("Hardened MachineSpec decode");
+        assert_eq!(decoded, spec);
+
+        let mut machine = topology_fixture().environments[0].machines[0].clone();
+        machine.profile = MachineProfile::Hardened;
+        for capability in [
+            MachineCapability::DockerEngine,
+            MachineCapability::Compose,
+            MachineCapability::Buildx,
+        ] {
+            machine
+                .requested_capabilities
+                .capabilities
+                .remove(&capability);
+            machine
+                .negotiated_capabilities
+                .capabilities
+                .remove(&capability);
+        }
+        machine.validate().expect("valid Hardened Machine");
+        let decoded = machine_instance_from_proto(&machine_instance_to_proto(&machine))
+            .expect("Hardened MachineInstance decode");
+        assert_eq!(decoded, machine);
     }
 
     #[test]

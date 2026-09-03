@@ -119,6 +119,12 @@ message WorkspaceProjection {
   WorkspaceProjectionMode mode = 3;
 }
 
+enum MachineProfile {
+  MACHINE_PROFILE_UNSPECIFIED = 0;
+  MACHINE_PROFILE_DEVELOPER = 1;
+  MACHINE_PROFILE_HARDENED = 2;
+}
+
 message MachineSpec {
   uint32 schema_version = 1;
   string name = 2;
@@ -126,6 +132,7 @@ message MachineSpec {
   MachineResources resources = 4;
   CapabilitySet requested_capabilities = 5;
   optional WorkspaceProjection workspace = 6;
+  MachineProfile profile = 7;
 }
 
 enum NetworkKind {
@@ -235,6 +242,7 @@ message MachineInstance {
   optional MachineIncarnation incarnation = 11;
   MachineState state = 12;
   optional string legacy_sandbox_id = 13;
+  MachineProfile profile = 14;
 }
 
 message NetworkInstance {

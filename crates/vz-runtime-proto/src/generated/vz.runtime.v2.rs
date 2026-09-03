@@ -91,6 +91,8 @@ pub struct MachineSpec {
     pub requested_capabilities: ::core::option::Option<CapabilitySet>,
     #[prost(message, optional, tag = "6")]
     pub workspace: ::core::option::Option<WorkspaceProjection>,
+    #[prost(enumeration = "MachineProfile", tag = "7")]
+    pub profile: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NetworkSpec {
@@ -201,6 +203,8 @@ pub struct MachineInstance {
     pub state: i32,
     #[prost(string, optional, tag = "13")]
     pub legacy_sandbox_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "MachineProfile", tag = "14")]
+    pub profile: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NetworkInstance {
@@ -2396,6 +2400,35 @@ impl WorkspaceProjectionMode {
             "WORKSPACE_PROJECTION_MODE_READ_WRITE" => Some(Self::ReadWrite),
             "WORKSPACE_PROJECTION_MODE_READ_ONLY" => Some(Self::ReadOnly),
             "WORKSPACE_PROJECTION_MODE_SNAPSHOT" => Some(Self::Snapshot),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MachineProfile {
+    Unspecified = 0,
+    Developer = 1,
+    Hardened = 2,
+}
+impl MachineProfile {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MACHINE_PROFILE_UNSPECIFIED",
+            Self::Developer => "MACHINE_PROFILE_DEVELOPER",
+            Self::Hardened => "MACHINE_PROFILE_HARDENED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MACHINE_PROFILE_UNSPECIFIED" => Some(Self::Unspecified),
+            "MACHINE_PROFILE_DEVELOPER" => Some(Self::Developer),
+            "MACHINE_PROFILE_HARDENED" => Some(Self::Hardened),
             _ => None,
         }
     }

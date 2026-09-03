@@ -48,7 +48,7 @@ pub use types::{
     HOST_INTERNAL_ALIAS, HOST_INTERNAL_GATEWAY_IPV4, HostSpec, Image, ImageInfo, IsolationLevel,
     Lease, LeaseState, LegacyMigrationError, LegacyMigrationProvenance, MachineBackend,
     MachineCapability, MachineId, MachineIncarnation, MachineIncarnationId, MachineInstance,
-    MachineResources, MachineSpec, MachineState, MountAccess, MountSpec, MountType,
+    MachineProfile, MachineResources, MachineSpec, MachineState, MountAccess, MountSpec, MountType,
     NamespaceConfig, NetworkDomain, NetworkDomainState, NetworkId, NetworkInstance, NetworkKind,
     NetworkServiceConfig, NetworkSpec, OperatingSystem, OwnedResourceKind, OwnershipRecord,
     PortMapping, PortProtocol, ProjectDefinition, ProjectId, ProjectState, PruneResult,

@@ -1108,8 +1108,8 @@ mod tests {
 
     use super::*;
     use vz_runtime_contract::{
-        Build, BuildSpec, BuildState, Execution, ExecutionSpec, ExecutionState, Sandbox,
-        SandboxBackend, SandboxSpec, SandboxState,
+        Build, BuildSpec, BuildState, Execution, ExecutionSpec, ExecutionState, MachineProfile,
+        Sandbox, SandboxBackend, SandboxSpec, SandboxState,
     };
 
     #[test]
@@ -1543,6 +1543,14 @@ mod tests {
                 assert_eq!(projects[0].environments.len(), 1);
                 assert_eq!(projects[0].environments[0].machines.len(), 1);
                 assert_eq!(
+                    projects[0].definition.environment.machines[0].profile,
+                    MachineProfile::Developer
+                );
+                assert_eq!(
+                    projects[0].environments[0].machines[0].profile,
+                    MachineProfile::Developer
+                );
+                assert_eq!(
                     projects[0].environments[0]
                         .legacy_migration
                         .as_ref()
@@ -1558,7 +1566,16 @@ mod tests {
         reopened
             .with_state_store(|store| {
                 assert_eq!(store.schema_version()?, MAX_SUPPORTED_SCHEMA_VERSION);
-                assert_eq!(store.list_project_states()?.len(), 1);
+                let projects = store.list_project_states()?;
+                assert_eq!(projects.len(), 1);
+                assert_eq!(
+                    projects[0].definition.environment.machines[0].profile,
+                    MachineProfile::Developer
+                );
+                assert_eq!(
+                    projects[0].environments[0].machines[0].profile,
+                    MachineProfile::Developer
+                );
                 Ok(())
             })
             .expect("reopened topology should remain readable");

@@ -7,11 +7,11 @@ use std::collections::HashMap;
 use vz_runtime_contract::types::{
     Architecture, CapabilitySet, EndpointId, EndpointInstance, EndpointProtocol,
     EndpointSpec as TopologyEndpointSpec, EnvironmentId, EnvironmentInstance, EnvironmentSpec,
-    EnvironmentState, MachineCapability, MachineId, MachineInstance, MachineResources, MachineSpec,
-    MachineState, NetworkId, NetworkInstance, NetworkKind, NetworkSpec as TopologyNetworkSpec,
-    OperatingSystem, OwnedResourceKind, OwnershipRecord, ProjectDefinition, ProjectId,
-    ProjectState, TOPOLOGY_SCHEMA_VERSION, TargetSpec, WorkspaceBinding, WorkspaceBindingId,
-    WorkspaceProjection, WorkspaceProjectionMode,
+    EnvironmentState, MachineCapability, MachineId, MachineInstance, MachineProfile,
+    MachineResources, MachineSpec, MachineState, NetworkId, NetworkInstance, NetworkKind,
+    NetworkSpec as TopologyNetworkSpec, OperatingSystem, OwnedResourceKind, OwnershipRecord,
+    ProjectDefinition, ProjectId, ProjectState, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
+    WorkspaceBinding, WorkspaceBindingId, WorkspaceProjection, WorkspaceProjectionMode,
 };
 
 const V0_3_20_FIXTURE: &str = include_str!("../../tests/fixtures/v0.3.20-state.sql");
@@ -20,7 +20,7 @@ const V0_3_20_MALFORMED_FIXTURE: &str = include_str!("../../tests/fixtures/v0.3.
 const V0_3_20_FIXTURE_SHA256: &str =
     "51b7f3cbe9d7e1ad1219e819d862fdb4c832d6ece32842267d87fefb8b2f5529";
 const V0_3_20_AMBIGUOUS_FIXTURE_SHA256: &str =
-    "e2e1f97ca643a4d73921fe8cb0fd594e5e991bba14ee7af961129f580e0205a3";
+    "a591d2e0af4578d94d96fe66423c1d59979d33648d10f8f0a69087d1f5ba2ad7";
 const V0_3_20_MALFORMED_FIXTURE_SHA256: &str =
     "e99a5c6bd2a82c9ef2389ffe12fc00cd637a4f341def67e37e741e7b0b27db38";
 
@@ -90,6 +90,7 @@ fn topology_project_state(
     let machine_spec = MachineSpec {
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         name: "linux".to_string(),
+        profile: MachineProfile::Developer,
         target: target.clone(),
         resources: MachineResources::default(),
         requested_capabilities: linux_capabilities.clone(),
@@ -153,6 +154,7 @@ fn topology_project_state(
                     machine_id: machine_id.clone(),
                     environment_id: environment_id.clone(),
                     name: "linux".to_string(),
+                    profile: MachineProfile::Developer,
                     target: target.clone(),
                     resources: MachineResources::default(),
                     requested_capabilities: linux_capabilities.clone(),
@@ -194,6 +196,41 @@ fn topology_project_state(
         definition,
         environments,
     }
+}
+
+fn hardened_topology_project_state(project_id: &str, environment_name: &str) -> ProjectState {
+    let mut state = topology_project_state(project_id, &[environment_name], "/checkout");
+    let machine_spec = &mut state.definition.environment.machines[0];
+    machine_spec.profile = MachineProfile::Hardened;
+    for capability in [
+        MachineCapability::DockerEngine,
+        MachineCapability::Compose,
+        MachineCapability::Buildx,
+    ] {
+        machine_spec
+            .requested_capabilities
+            .capabilities
+            .remove(&capability);
+    }
+    let definition_digest = state.definition.digest().unwrap();
+    let machine = &mut state.environments[0].machines[0];
+    machine.profile = MachineProfile::Hardened;
+    for capability in [
+        MachineCapability::DockerEngine,
+        MachineCapability::Compose,
+        MachineCapability::Buildx,
+    ] {
+        machine
+            .requested_capabilities
+            .capabilities
+            .remove(&capability);
+        machine
+            .negotiated_capabilities
+            .capabilities
+            .remove(&capability);
+    }
+    state.environments[0].definition_digest = definition_digest;
+    state
 }
 
 fn sample_spec() -> StackSpec {
@@ -4264,6 +4301,29 @@ fn topology_complete_aggregate_round_trips_after_database_relocation() {
         store.save_project_state(&expected).unwrap();
         assert_eq!(store.list_project_states().unwrap(), vec![expected.clone()]);
         assert_eq!(store.schema_version().unwrap(), 2);
+        let definition_json: String = store
+            .conn
+            .query_row(
+                "SELECT definition_json FROM project_definitions WHERE project_id = 'prj_shop'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let definition_json: serde_json::Value = serde_json::from_str(&definition_json).unwrap();
+        assert_eq!(
+            definition_json["environment"]["machines"][0]["profile"],
+            "developer"
+        );
+        let machine_json: String = store
+            .conn
+            .query_row(
+                "SELECT instance_json FROM machine_instances WHERE machine_id = 'mac_agent-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let machine_json: serde_json::Value = serde_json::from_str(&machine_json).unwrap();
+        assert_eq!(machine_json["profile"], "developer");
         assert_eq!(
             store
                 .conn
@@ -4325,18 +4385,137 @@ fn topology_complete_aggregate_round_trips_after_database_relocation() {
     let actual = reopened.load_project_state("prj_shop").unwrap().unwrap();
     assert_eq!(actual, expected);
     assert_eq!(actual.environments.len(), 2);
-    assert!(
-        actual
-            .environments
-            .iter()
-            .all(|environment| environment.machines[0].name == "linux")
+    assert_eq!(
+        actual.definition.environment.machines[0].profile,
+        MachineProfile::Developer
     );
+    assert!(actual.environments.iter().all(|environment| {
+        environment.machines[0].name == "linux"
+            && environment.machines[0].profile == MachineProfile::Developer
+    }));
     assert!(
         actual
             .environments
             .iter()
             .all(|environment| { environment.bindings[0].workspace_key == "same-worktree-key" })
     );
+}
+
+#[test]
+fn hardened_machine_profile_round_trips_durably_without_docker_capabilities() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("hardened.db");
+    let expected = hardened_topology_project_state("prj_hardened", "secure");
+
+    {
+        let store = StateStore::open(&db_path).unwrap();
+        store.save_project_state(&expected).unwrap();
+        let definition_json: String = store
+            .conn
+            .query_row(
+                "SELECT definition_json FROM project_definitions WHERE project_id = 'prj_hardened'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let definition_json: serde_json::Value = serde_json::from_str(&definition_json).unwrap();
+        assert_eq!(
+            definition_json["environment"]["machines"][0]["profile"],
+            "hardened"
+        );
+        let machine_json: String = store
+            .conn
+            .query_row(
+                "SELECT instance_json FROM machine_instances WHERE machine_id = 'mac_secure'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let machine_json: serde_json::Value = serde_json::from_str(&machine_json).unwrap();
+        assert_eq!(machine_json["profile"], "hardened");
+    }
+
+    let reopened = StateStore::open(&db_path).unwrap();
+    let actual = reopened
+        .load_project_state("prj_hardened")
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        actual.definition.environment.machines[0].profile,
+        MachineProfile::Hardened
+    );
+    assert_eq!(
+        actual.environments[0].machines[0].profile,
+        MachineProfile::Hardened
+    );
+}
+
+#[test]
+fn stored_definition_without_machine_profile_fails_closed() {
+    let store = StateStore::in_memory().unwrap();
+    let state = topology_project_state("prj_missing_definition_profile", &["agent"], "/checkout");
+    store.save_project_state(&state).unwrap();
+
+    let definition_json: String = store
+        .conn
+        .query_row(
+            "SELECT definition_json FROM project_definitions
+             WHERE project_id = 'prj_missing_definition_profile'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut definition_json: serde_json::Value = serde_json::from_str(&definition_json).unwrap();
+    definition_json["environment"]["machines"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("profile");
+    store
+        .conn
+        .execute(
+            "UPDATE project_definitions SET definition_json = ?1
+             WHERE project_id = 'prj_missing_definition_profile'",
+            params![serde_json::to_string(&definition_json).unwrap()],
+        )
+        .unwrap();
+
+    let error = store
+        .load_project_state("prj_missing_definition_profile")
+        .expect_err("missing persisted definition profile must fail closed")
+        .to_string();
+    assert!(error.contains("profile"), "unexpected error: {error}");
+}
+
+#[test]
+fn stored_machine_instance_without_profile_fails_closed() {
+    let store = StateStore::in_memory().unwrap();
+    let state = topology_project_state("prj_missing_instance_profile", &["agent"], "/checkout");
+    store.save_project_state(&state).unwrap();
+
+    let machine_json: String = store
+        .conn
+        .query_row(
+            "SELECT instance_json FROM machine_instances WHERE machine_id = 'mac_agent'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut machine_json: serde_json::Value = serde_json::from_str(&machine_json).unwrap();
+    machine_json.as_object_mut().unwrap().remove("profile");
+    store
+        .conn
+        .execute(
+            "UPDATE machine_instances SET instance_json = ?1 WHERE machine_id = 'mac_agent'",
+            params![serde_json::to_string(&machine_json).unwrap()],
+        )
+        .unwrap();
+
+    let error = store
+        .load_project_state("prj_missing_instance_profile")
+        .expect_err("missing persisted Machine instance profile must fail closed")
+        .to_string();
+    assert!(error.contains("profile"), "unexpected error: {error}");
 }
 
 #[test]
@@ -4395,6 +4574,11 @@ fn v0_3_20_developer_migration_is_atomic_idempotent_and_preserves_legacy_rows() 
         assert_eq!(environment.bindings[0].path_hint, None);
         assert_eq!(environment.bindings[0].name, "workspace");
         assert_eq!(
+            project.definition.environment.machines[0].profile,
+            MachineProfile::Developer
+        );
+        assert_eq!(environment.machines[0].profile, MachineProfile::Developer);
+        assert_eq!(
             project.definition.environment.machines[0]
                 .workspace
                 .as_ref()
@@ -4441,7 +4625,16 @@ fn v0_3_20_developer_migration_is_atomic_idempotent_and_preserves_legacy_rows() 
     };
 
     let reopened = StateStore::open(&db_path).unwrap();
-    assert_eq!(reopened.list_project_states().unwrap(), vec![migrated]);
+    let reopened_projects = reopened.list_project_states().unwrap();
+    assert_eq!(reopened_projects, vec![migrated]);
+    assert_eq!(
+        reopened_projects[0].definition.environment.machines[0].profile,
+        MachineProfile::Developer
+    );
+    assert_eq!(
+        reopened_projects[0].environments[0].machines[0].profile,
+        MachineProfile::Developer
+    );
     assert_eq!(reopened.list_sandboxes().unwrap().len(), 3);
     assert_eq!(legacy_non_developer_rows(&db_path), untouched_legacy_rows);
     let dependent_rows: i64 = reopened

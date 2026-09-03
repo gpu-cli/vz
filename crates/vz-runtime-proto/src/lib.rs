@@ -481,6 +481,7 @@ mod tests {
                     ("resources", 4),
                     ("requested_capabilities", 5),
                     ("workspace", 6),
+                    ("profile", 7),
                 ],
             ),
             (
@@ -555,6 +556,7 @@ mod tests {
                     ("incarnation", 11),
                     ("state", 12),
                     ("legacy_sandbox_id", 13),
+                    ("profile", 14),
                 ],
             ),
             (
@@ -708,6 +710,14 @@ mod tests {
                 ],
             ),
             (
+                "MachineProfile",
+                &[
+                    ("MACHINE_PROFILE_UNSPECIFIED", 0),
+                    ("MACHINE_PROFILE_DEVELOPER", 1),
+                    ("MACHINE_PROFILE_HARDENED", 2),
+                ],
+            ),
+            (
                 "NetworkKind",
                 &[
                     ("NETWORK_KIND_UNSPECIFIED", 0),
@@ -839,6 +849,7 @@ mod tests {
         let machine_spec = MachineSpec {
             schema_version: 1,
             name: "api".into(),
+            profile: MachineProfile::Developer as i32,
             target: Some(target.clone()),
             resources: Some(resources),
             requested_capabilities: Some(requested_capabilities.clone()),
@@ -888,6 +899,7 @@ mod tests {
             machine_id: "mac_api".into(),
             environment_id: "env_agent_a".into(),
             name: "api".into(),
+            profile: MachineProfile::Developer as i32,
             target: Some(target),
             resources: Some(resources),
             requested_capabilities: Some(requested_capabilities),
